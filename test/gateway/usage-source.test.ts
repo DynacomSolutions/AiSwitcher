@@ -117,6 +117,19 @@ test("a kept figure is shown but never refuses: an account reset upstream gets t
   expect(await pickIdentity(app, deps)).toEqual({ reject: "reserve" }); // a fresh figure refuses again
 });
 
+// Incident 16 Nov 2026: while the usage endpoint backs off after a 429, the claude reading repeats the last good figures
+// (100% for a full account) as "rate-limited". Taken as fresh, it kept a member that had been reset out of band refused
+// even after its quota hold ended.
+test("a claude reading served during the usage 429 backoff (old figures) is stale; codex at 100% is not", async () => {
+  const backoff: PoolUsage = { status: "rate-limited", maxUtilization: 100, windows: [{ label: "seven-day", utilization: 100 }], error: "usage endpoint answered HTTP 429", capturedAt: "b" };
+  const src = createUsageSource({ fetchUsage: async () => backoff });
+  await src.prefill("claude", "id1");
+  expect(await src.get("claude", "id1")).toMatchObject({ maxUtilization: 100, stale: true });
+  expect(await pickIdentity(app, { usageFor: src.get, poolMembers: async () => ["id1"] })).toEqual({ identity: "id1" });
+  await src.prefill("codex", "id1");
+  expect((await src.get("codex", "id1"))?.stale).toBeUndefined(); // codex says "rate-limited" for a live reading at 100%
+});
+
 test("a failed fetch also marks the kept figure stale", async () => {
   let fail = false;
   let t = 0;

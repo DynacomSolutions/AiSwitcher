@@ -741,6 +741,101 @@ describe("failover and refresh", () => {
     expect(who()).toEqual(["Bearer tok-a"]);
   });
 
+  // Incident 16 Nov 2026: the owner spent a limit reset on an exhausted member out of band. The usage endpoint kept
+  // answering 429 (stale reading), so the one read after the 429 never ended the hold and the pool answered
+  // "no-headroom:exhausted" for days on every replica that had seen the 429.
+  test("a proven-exhaustion hold is probed upstream at a bounded interval; a 200 ends it", async () => {
+    const { clock, who } = await burstSetup("pair");
+    deps.refreshUsage = async (_p, id) => {
+      usage[id] = { ...live(100), stale: true }; // the usage API answers 429: the last figure, marked stale
+    };
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "poolp", target: { kind: "pool" } }));
+    const send = async () => {
+      const r = await gw.request("http://gw.test/poolp/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } });
+      return new Response(await r.arrayBuffer(), { status: r.status });
+    };
+    const resetAt = Math.floor((clock.ms + 6 * 86_400_000) / 1000);
+    let reset = false;
+    handler = (_req, s) =>
+      reset && s.headers.get("authorization") === "Bearer tok-a"
+        ? new Response(anthropicJson, { headers: { "content-type": "application/json" } })
+        : new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-7d-status": "rejected", "anthropic-ratelimit-unified-reset": String(resetAt) } });
+    expect((await send()).status).toBe(429);
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+    await settle();
+    // The reset is spent out of band; nothing the gateway reads says so.
+    reset = true;
+    seen.length = 0;
+    clock.ms += 60_000;
+    expect((await send()).status).toBe(429); // within the probe interval: no upstream call
+    expect(who()).toEqual([]);
+    clock.ms += 5 * 60_000;
+    expect((await send()).status).toBe(200); // one request probes a held member; Anthropic's 200 ends the hold
+    expect(who()).toEqual(["Bearer tok-a"]);
+    seen.length = 0;
+    expect((await send()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a"]);
+  });
+
+  test("a probe that is refused again keeps the hold and waits another interval", async () => {
+    const { clock, who } = await burstSetup("pair");
+    deps.refreshUsage = async (_p, id) => {
+      usage[id] = { ...live(100), stale: true };
+    };
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "poolq", target: { kind: "pool" } }));
+    const send = async () => {
+      const r = await gw.request("http://gw.test/poolq/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } });
+      return new Response(await r.arrayBuffer(), { status: r.status });
+    };
+    const resetAt = Math.floor((clock.ms + 6 * 86_400_000) / 1000);
+    handler = () => new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-7d-status": "rejected", "anthropic-ratelimit-unified-reset": String(resetAt) } });
+    await send();
+    await settle();
+    clock.ms += 6 * 60_000;
+    seen.length = 0;
+    expect((await send()).status).toBe(429);
+    expect(who()).toEqual(["Bearer tok-a"]); // one probe, refused: the client gets Anthropic's own 429, no failover to b (held)
+    seen.length = 0;
+    expect((await send()).status).toBe(429);
+    expect(who()).toEqual(["Bearer tok-b"]); // b's probe is due too; a's is not
+    seen.length = 0;
+    for (let i = 0; i < 5; i++) await send();
+    expect(who()).toEqual([]); // both probed: nothing goes upstream until the next interval
+    clock.ms += 5 * 60_000;
+    await send();
+    expect(who().length).toBe(1);
+  });
+
+  test("a model-scoped hold is probed too, and a 200 for that model ends it", async () => {
+    const { clock, who } = await burstSetup("single");
+    deps.poolMembers = async () => ["a"];
+    deps.refreshUsage = async (_p, id) => {
+      usage[id] = fableReading(10, 100, { stale: true });
+    };
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "poolm", target: { kind: "pool" } }));
+    const send = async (model: string) => {
+      const r = await gw.request("http://gw.test/poolm/v1/messages", { method: "POST", body: JSON.stringify({ model, max_tokens: 1, messages: [] }), headers: { authorization: `Bearer ${t}` } });
+      return new Response(await r.arrayBuffer(), { status: r.status });
+    };
+    const resetAt = Math.floor((clock.ms + 6 * 86_400_000) / 1000);
+    let reset = false;
+    handler = () => (reset ? new Response(anthropicJson, { headers: { "content-type": "application/json" } }) : new Response("{}", { status: 429, headers: fableHeaders(resetAt) }));
+    expect((await send("claude-fable-5-2")).status).toBe(429);
+    await settle();
+    reset = true;
+    seen.length = 0;
+    clock.ms += 60_000;
+    expect((await send("claude-fable-5-2")).status).toBe(429);
+    expect(who()).toEqual([]);
+    clock.ms += 5 * 60_000;
+    expect((await send("claude-fable-5-2")).status).toBe(200);
+    expect((await send("claude-fable-5-2")).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-a"]);
+  });
+
   test("scopedResetUntil: the rejected scoped window's own reset, else the general one", () => {
     const now = NOW.getTime();
     const own = Math.floor((now + 3 * 86_400_000) / 1000);

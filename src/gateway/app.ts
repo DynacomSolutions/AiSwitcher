@@ -432,8 +432,10 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const sideCounts = new Map<string, number>(); // fallback only, while the store is down
   /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
   const holds = new Map<string, Hold>();
+  /** Quota holds (proven exhaustion, model-scoped): the time from which one request may probe the member again, by hold key. */
+  const probes = new Map<string, number>();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, resetCredits, sideCounts, sideGate, accountState).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -443,7 +445,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -693,6 +695,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       if (until <= deps.now().getTime()) {
         exhausted.delete(k);
         holds.delete(k);
+        probes.delete(k);
       } else if (k.startsWith(`${app.provider}\u0000`)) {
         const rest = k.slice(app.provider.length + 1);
         const scoped = rest.indexOf(MODEL_HOLD_SEP);
@@ -753,6 +756,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
    */
   const bridgeUntilReading = (name: string, key: string, until: number): void => {
     exhausted.set(key, until);
+    probes.set(key, deps.now().getTime() + QUOTA_PROBE_INTERVAL_MS);
     if (!deps.refreshUsage) return; // no source to read again: the provider's reset decides alone
     const forModel = model;
     void refreshFromSource(name).then(async () => {
@@ -760,8 +764,36 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       const reading = await deps.usageFor(app.provider, name).catch(() => undefined);
       if (!reading || reading.stale || reading.status !== "live") return;
       const util = utilisationOf(usageForModel(reading, forModel));
-      if (util !== undefined && util < 100 && exhausted.get(key) === until) exhausted.delete(key);
+      if (util !== undefined && util < 100 && exhausted.get(key) === until) {
+        exhausted.delete(key);
+        probes.delete(key);
+      }
     });
+  };
+  /** The hold keys that keep `name` out of this request: its account-wide hold and its hold for this request's model. */
+  const holdKeysFor = (name: string): string[] => [exKey(name), ...(model !== undefined ? [`${exKey(name)}${MODEL_HOLD_SEP}${model}`] : [])].filter((k) => exhausted.has(k));
+  /**
+   * A held member whose quota-hold probe is due: only quota holds (no short burst or credential hold) whose interval
+   * has passed. Claims the probe at once (no await between the check and the claim), so one request per member and
+   * interval probes on this replica.
+   */
+  const claimProbe = (held: ReadonlySet<string>): string | undefined => {
+    const now = deps.now().getTime();
+    for (const name of held) {
+      const keys = holdKeysFor(name);
+      if (keys.length === 0 || keys.some((k) => holds.has(k) || (probes.get(k) ?? 0) > now)) continue;
+      for (const k of keys) probes.set(k, now + QUOTA_PROBE_INTERVAL_MS);
+      return name;
+    }
+    return undefined;
+  };
+  /** A member answered the request without a quota error: its account-wide hold and its hold for this model are over. */
+  const releaseHolds = (name: string): void => {
+    for (const k of holdKeysFor(name)) {
+      exhausted.delete(k);
+      holds.delete(k);
+      probes.delete(k);
+    }
   };
   // While the pool still has headroom and only short holds (burst 429s, brief credential retries) stand in the way,
   // the gateway waits for the first hold to end instead of answering 429: a client CLI treats a 429 as a hard limit.
@@ -785,6 +817,21 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   };
   let picked = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined, model);
   while ("reject" in picked && picked.reject === "no-headroom" && (await waitForShortHold())) picked = await pickIdentity(app, deps, await exhaustedNames(), model);
+  if ("reject" in picked && picked.reject === "no-headroom" && app.target.kind === "pool") {
+    // Nobody has headroom and a quota hold stands in the way. The hold only ends early on a live usage reading, and the
+    // usage endpoint itself answers 429 for full accounts, so a reset spent out of band (or an early provider reset) would
+    // otherwise wait out the whole week. At most once per interval and member, this request goes to the held member:
+    // the provider's own answer is the ground truth (a 200 ends the hold; a refusal renews it and passes through).
+    const held = await exhaustedNames();
+    const probe = claimProbe(held);
+    if (probe !== undefined) {
+      const p = await pickIdentity(app, deps, new Set([...held].filter((n) => n !== probe)), model);
+      if ("identity" in p) {
+        log(JSON.stringify({ event: "quota_probe", app: app.name, provider: app.provider, identity: p.identity, ...(model !== undefined ? { model } : {}) }));
+        picked = p;
+      }
+    }
+  }
   const pick = picked;
   if ("reject" in pick) {
     deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
@@ -891,6 +938,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   };
 
   identity = await canon(pick.identity);
+  /** The pool member (as named in the pool) whose answer the client gets. */
+  let servedBy = pick.identity;
   let up: Response;
   try {
     const poolReplay = app.target.kind === "pool" && replayable;
@@ -958,6 +1007,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         deps.metrics.failover(app.name);
         cur = sq.res;
         identity = await canon(next.identity);
+        servedBy = next.identity;
         quota = sq.quota;
         if (quota) holdQuota(name, cur);
       }
@@ -965,6 +1015,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     if (!cur) throw credErr;
     up = cur;
+    if (app.target.kind === "pool" && !side && up.status < 400) releaseHolds(servedBy);
   } catch (err) {
     req.signal.removeEventListener("abort", onAbort);
     if (ctrl.signal.aborted) {
@@ -1062,6 +1113,8 @@ async function credentialSignature(deps: GatewayDeps, provider: GatewayProvider,
 }
 
 const BURST_HOLD_DEFAULT_MS = 15_000;
+/** How often (per member, per replica) one request may probe a member held for quota while the pool has no headroom. */
+const QUOTA_PROBE_INTERVAL_MS = 5 * 60_000;
 /** Longest a request waits in total for short member holds to end before the client gets the 429. */
 const SHORT_HOLD_WAIT_BUDGET_MS = 90_000;
 const SHORT_HOLD_MAX_WAITS = 8;
