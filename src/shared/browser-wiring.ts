@@ -1,5 +1,5 @@
-import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { expandPath } from "../identities/match.ts";
 import { allowedAccounts, isSwapPool, type PoolIdentity } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
@@ -42,15 +42,41 @@ const normaliseDir = (dir: string): string => {
   return r.length > 1 ? r.replace(/\/+$/, "") : r;
 };
 
+/** Transcript folders a launcher's own config folder may link into an identity's folder (Claude, Codex). */
+const TRANSCRIPT_LINKS = ["projects", "sessions"];
+
+const realOrNormal = (dir: string, real: (p: string) => string): string => {
+  try {
+    return normaliseDir(real(expandPath(dir)));
+  } catch {
+    return normaliseDir(dir);
+  }
+};
+
 /**
- * Registered identity (pool or plain) whose config dir is `configDir`, for a launch whose
- * CLAUDE_CONFIG_DIR / CODEX_HOME was preset (T3 Code, other launchers). Identity resolution
- * skips the registry then, but the browser wiring still needs to know it is a pool. Retired
- * identities are never returned.
+ * Registered identity (pool or plain) a preset CLAUDE_CONFIG_DIR / CODEX_HOME belongs to (T3 Code,
+ * other launchers). Identity resolution skips the registry then, but the browser wiring still needs
+ * the identity. Match: the folder is the identity's config dir, or (a launcher's own folder, such as
+ * T3's per-account ~/.t3/gateway/t3-claude-<name>) its `projects` / `sessions` link points into the
+ * identity's config dir. Retired identities are never returned.
  */
-export function identityForConfigDir(file: IdentitiesFile, configDir: string): Identity | undefined {
+export function identityForConfigDir(file: IdentitiesFile, configDir: string, real: (p: string) => string = realpathSync): Identity | undefined {
+  const live = file.identities.filter((i) => !isRetired(i));
   const target = normaliseDir(configDir);
-  return file.identities.find((i) => !isRetired(i) && normaliseDir(i.configDir) === target);
+  const direct = live.find((i) => normaliseDir(i.configDir) === target);
+  if (direct) return direct;
+  for (const sub of TRANSCRIPT_LINKS) {
+    let linked: string;
+    try {
+      linked = normaliseDir(dirname(real(join(expandPath(configDir), sub))));
+    } catch {
+      continue;
+    }
+    if (linked === realOrNormal(configDir, real)) continue;
+    const owner = live.find((i) => realOrNormal(i.configDir, real) === linked);
+    if (owner) return owner;
+  }
+  return undefined;
 }
 
 /**

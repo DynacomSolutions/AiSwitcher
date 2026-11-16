@@ -1,5 +1,6 @@
 import type { ResolvedIdentity, ToolConfig } from "../identities/types.ts";
 import { basename, join } from "node:path";
+import { expandPath } from "../identities/match.ts";
 import { resolveIdentity } from "../identities/resolve.ts";
 import { PromptCancelledError, RetiredIdentityError } from "../identities/errors.ts";
 import { isRetired } from "../identities/retired.ts";
@@ -188,7 +189,9 @@ export async function runWrapper(
     const browserIdentity = resolved.identity ?? (resolved.source === "env" ? await loadIdentitiesFile(cfg.identitiesJsonPath).then((f) => identityForConfigDir(f, resolved.configDirValue), () => undefined) : undefined);
     const browserPool = await browserPoolWiring(cfg.toolName, browserIdentity, () => loadIdentitiesFile(cfg.identitiesJsonPath));
     const browserIdentityName = browserIdentity?.name ?? activeIdentity;
-    const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, browserIdentity, resolveInstalledAisBinary(), {
+    // The token lives in the identity's folder, not in a launcher's own folder that only links to it.
+    const browserConfigDir = browserIdentity && !resolved.identity ? expandPath(browserIdentity.configDir) : resolved.configDirValue;
+    const browserArgs = browserMcpArgs(cfg.toolName, browserConfigDir, browserIdentity, resolveInstalledAisBinary(), {
       ...(browserIdentityName !== undefined ? { identityName: browserIdentityName } : {}),
       ...(gatewayUrl ? { gateway: gatewayUrl } : {}),
       ...(browserPool ? { pool: browserPool } : {}),

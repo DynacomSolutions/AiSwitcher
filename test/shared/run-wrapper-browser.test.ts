@@ -102,3 +102,26 @@ test("preset config dir (T3 Code) maps back to its registered pool, which then g
   const args = browserMcpArgs("claude", "/ids/swap", found, "/bin/ais", { exists: (p) => p === "/m/b/ais-browser-token", identityName: found!.name, pool: wiring! });
   expect(JSON.parse(args[0]!.slice("--mcp-config=".length)).mcpServers["ais-browser"].args).toEqual(["browser", "mcp", "--pool", "team-pool", "--tool", "claude"]);
 });
+
+test("a launcher's own folder maps to the identity its transcript link points into; unrelated links do not", () => {
+  const id = (name: string, dir: string, extra: object = {}) => ({ name, label: name, configDir: dir, ...extra });
+  const file: any = { version: 1, identities: [id("work", "/ids/work"), id("old", "/ids/old", { retired: true }), id("cx", "/cx/cx")] };
+  const links: Record<string, string> = {
+    "/t3/claude-work/projects": "/ids/work/projects",
+    "/t3/codex-cx/sessions": "/cx/cx/sessions",
+    "/t3/claude-old/projects": "/ids/old/projects",
+    "/t3/stray/projects": "/elsewhere/projects",
+    "/t3/plain/projects": "/t3/plain/projects",
+  };
+  const real = (p: string): string => {
+    if (p in links) return links[p]!;
+    if (p.endsWith("/projects") || p.endsWith("/sessions")) throw new Error("ENOENT");
+    return p;
+  };
+  expect(identityForConfigDir(file, "/t3/claude-work", real)?.name).toBe("work");
+  expect(identityForConfigDir(file, "/t3/codex-cx", real)?.name).toBe("cx");
+  expect(identityForConfigDir(file, "/t3/claude-old", real)).toBeUndefined();
+  expect(identityForConfigDir(file, "/t3/stray", real)).toBeUndefined();
+  expect(identityForConfigDir(file, "/t3/plain", real)).toBeUndefined();
+  expect(identityForConfigDir(file, "/t3/none", real)).toBeUndefined();
+});
