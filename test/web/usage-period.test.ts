@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyPeriod, buildBuckets, bucketKey, periodLabel, type Granularity } from "../../apps/web/src/lib/usage-period.ts";
+import { applyPeriod, buildBuckets, bucketKey, periodLabel, providersByTokens, type Granularity } from "../../apps/web/src/lib/usage-period.ts";
 import type { Identity, TokscaleReport, UsageResult } from "../../apps/web/src/types/api.ts";
 
 const identity: Identity = { name: "SYNTHETIC_FIXTURE_identity", label: "SYNTHETIC_FIXTURE_identity", configDir: "SYNTHETIC_FIXTURE_dir" };
@@ -99,5 +99,43 @@ describe("token buckets", () => {
     expect(buckets[0]!.date).toBe("2026-09-28");
     expect(Number(buckets[0]!.a)).toBe(12);
     expect(buckets.length).toBeGreaterThan(5);
+  });
+});
+
+describe("cost buckets", () => {
+  const t = (cost: number): [number, number, number, number, number, number] => [100, 50, 0, 0, 1, cost];
+  // Provider "a" has more tokens, "b" has more cost: cost mode ranks by cost.
+  const rows = [
+    row({ provider: "a", dailyUsage: { "2026-10-01": 1000, "2026-10-02": 1000 }, dailyTotals: { "2026-10-01": t(0.5), "2026-10-02": t(0.25) } }),
+    row({ provider: "b", dailyUsage: { "2026-10-02": 10 }, dailyTotals: { "2026-10-02": t(4) } }),
+    // Tokens per day but no exact per-day totals: no cost bars, as in period totals.
+    row({ provider: "c", dailyUsage: { "2026-10-03": 7 } }),
+  ];
+  const now = new Date(2026, 10, 3, 12).getTime();
+
+  test("daily cost buckets stack the estimated USD by provider", () => {
+    const buckets = buildBuckets(rows, "day", 0, now, "cost");
+    expect(buckets.map((b) => b.date)).toEqual(["2026-10-01", "2026-10-02"]);
+    expect(Number(buckets[0]!.a)).toBe(0.5);
+    expect(Number(buckets[1]!.a)).toBe(0.25);
+    expect(Number(buckets[1]!.b)).toBe(4);
+    expect(buckets.some((b) => "c" in b)).toBe(false);
+  });
+
+  test("monthly cost sums the per-day cost totals", () => {
+    const buckets = buildBuckets(rows, "month", 0, now, "cost");
+    expect(buckets).toHaveLength(1);
+    expect(Number(buckets[0]!.a) + Number(buckets[0]!.b)).toBe(4.75);
+  });
+
+  test("tokens stay the default metric", () => {
+    const buckets = buildBuckets(rows, "day", 0, now);
+    expect(buckets.map((b) => b.date)).toEqual(["2026-10-01", "2026-10-02", "2026-10-03"]);
+    expect(Number(buckets[2]!.c)).toBe(7);
+  });
+
+  test("providers rank by the chosen metric", () => {
+    expect(providersByTokens(rows, 0, now, "tokens")).toEqual(["a", "b", "c"]);
+    expect(providersByTokens(rows, 0, now, "cost")).toEqual(["b", "a"]);
   });
 });

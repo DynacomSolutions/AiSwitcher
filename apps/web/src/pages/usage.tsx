@@ -35,7 +35,7 @@ import {
 } from "@/components/ui/table";
 import { useGatewayUsageQuery, useUsageQuery } from "@/hooks/queries";
 import { formatCount, formatDateMs, formatMoney, formatTokens } from "@/lib/format";
-import { applyPeriod, buildBuckets, periodLabel, providersByTokens, type Bucket, type Granularity, type SinceDays } from "@/lib/usage-period";
+import { applyPeriod, buildBuckets, periodLabel, providersByTokens, type Bucket, type ChartMetric, type Granularity, type SinceDays } from "@/lib/usage-period";
 import { classifyUsageError, hasPartialUsageCoverage, usageErrorLabel } from "@/lib/usage-summary";
 import type { GatewayUsageResponse, RealCostInfo, TokscaleEntry, UsageResult } from "@/types/api";
 
@@ -45,6 +45,14 @@ const GRANULARITIES: { value: Granularity; label: string }[] = [
   { value: "week", label: "Weekly" },
   { value: "month", label: "Monthly" },
 ];
+
+const METRICS: { value: ChartMetric; label: string }[] = [
+  { value: "tokens", label: "Tokens" },
+  { value: "cost", label: "Cost" },
+];
+
+/** Compact dollar ticks for the cost axis: $0.50, $12, $1.2K. */
+const AXIS_MONEY = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 2 });
 
 const SINCE_OPTIONS: { value: SinceDays; label: string }[] = [
   { value: 7, label: "Last 7 days" },
@@ -157,7 +165,8 @@ const CHART_THEME = {
   grid: { line: { stroke: "var(--border)", strokeWidth: 1 } },
 };
 
-function UsageChart({ buckets, providers }: { buckets: Bucket[]; providers: string[] }) {
+function UsageChart({ buckets, providers, metric }: { buckets: Bucket[]; providers: string[]; metric: ChartMetric }) {
+  const formatValue = metric === "cost" ? formatMoney : formatTokens;
   const keys = useMemo(
     () => [...providers, ...(buckets.some((b) => (b.other as number) > 0) ? ["other"] : [])],
     [buckets, providers],
@@ -188,15 +197,15 @@ function UsageChart({ buckets, providers }: { buckets: Bucket[]; providers: stri
           tickValues,
           format: (value: string) => value.slice(5),
         }}
-        axisLeft={{ tickSize: 4, tickPadding: 6, format: (value: number) => formatTokens(value) }}
+        axisLeft={{ tickSize: 4, tickPadding: 6, format: (value: number) => (metric === "cost" ? AXIS_MONEY.format(value) : formatTokens(value)) }}
         enableGridY
         enableLabel={false}
         theme={CHART_THEME}
         tooltip={(props: BarTooltipProps<Bucket>) => {
           const rows = keys
-            .map((key) => ({ key, tokens: Number(props.data[key] ?? 0) }))
-            .filter((row) => row.tokens > 0);
-          const total = rows.reduce((sum, row) => sum + row.tokens, 0);
+            .map((key) => ({ key, value: Number(props.data[key] ?? 0) }))
+            .filter((row) => row.value > 0);
+          const total = rows.reduce((sum, row) => sum + row.value, 0);
           return (
             <div className="w-max rounded-lg border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">
               <p className="whitespace-nowrap font-mono font-medium">{props.data.date}</p>
@@ -208,13 +217,13 @@ function UsageChart({ buckets, providers }: { buckets: Bucket[]; providers: stri
                   >
                     <span className="size-2.5 shrink-0 rounded-sm" style={{ background: colourOf(row.key) }} />
                     <span>{row.key}</span>
-                    <span className="ml-auto pl-4 tabular-nums">{formatTokens(row.tokens)}</span>
+                    <span className="ml-auto pl-4 tabular-nums">{formatValue(row.value)}</span>
                   </li>
                 ))}
               </ul>
               <div className="mt-1.5 flex items-center gap-2 whitespace-nowrap border-t pt-1.5 font-bold">
                 <span>Total</span>
-                <span className="ml-auto pl-4 tabular-nums">{formatTokens(total)} tokens</span>
+                <span className="ml-auto pl-4 tabular-nums">{metric === "cost" ? `${formatMoney(total)} est.` : `${formatTokens(total)} tokens`}</span>
               </div>
             </div>
           );
@@ -371,6 +380,7 @@ export function UsagePage() {
   const [model, setModel] = useState("all");
   const [since, setSince] = useState<SinceDays>(0);
   const [granularity, setGranularity] = useState<Granularity>("day");
+  const [metric, setMetric] = useState<ChartMetric>("tokens");
 
   const filtered = useMemo(
     () => filterResults(results, { provider, identity, model }),
@@ -384,8 +394,10 @@ export function UsagePage() {
     [results],
   );
 
-  const buckets = useMemo(() => buildBuckets(filtered, granularity, since), [filtered, granularity, since]);
-  const bucketProviders = useMemo(() => providersByTokens(filtered, since).slice(0, 5), [filtered, since]);
+  const tokenBuckets = useMemo(() => buildBuckets(filtered, granularity, since), [filtered, granularity, since]);
+  const costBuckets = useMemo(() => buildBuckets(filtered, granularity, since, Date.now(), "cost"), [filtered, granularity, since]);
+  const buckets = metric === "cost" ? costBuckets : tokenBuckets;
+  const bucketProviders = useMemo(() => providersByTokens(filtered, since, Date.now(), metric).slice(0, 5), [filtered, since, metric]);
 
   // Every figure below follows the selected period. "All time" leaves the
   // reports untouched, so it matches the CLI's TOTAL row exactly.
@@ -508,29 +520,55 @@ export function UsagePage() {
                 </p>
               ) : null}
 
-              {buckets.length > 0 ? (
+              {tokenBuckets.length > 0 || costBuckets.length > 0 ? (
                 <Card className="gap-3">
-                  <CardHeader className="flex-row items-center justify-between space-y-0">
+                  <CardHeader className="flex-row flex-wrap items-center justify-between gap-2 space-y-0">
                     <div className="space-y-1">
-                      <CardTitle className="text-base">Tokens over time</CardTitle>
-                      <CardDescription>Input plus output, stacked by provider.</CardDescription>
+                      <CardTitle className="text-base">{metric === "cost" ? "Est. cost over time" : "Tokens over time"}</CardTitle>
+                      <CardDescription>
+                        {metric === "cost"
+                          ? "Estimated USD from per-day totals, stacked by provider. Not real spend."
+                          : "Input plus output, stacked by provider."}
+                      </CardDescription>
                     </div>
-                    <div className="flex gap-1">
-                      {GRANULARITIES.map((g) => (
-                        <Button
-                          key={g.value}
-                          variant={granularity === g.value ? "secondary" : "ghost"}
-                          size="sm"
-                          className="h-8 text-xs"
-                          onClick={() => setGranularity(g.value)}
-                        >
-                          {g.label}
-                        </Button>
-                      ))}
+                    <div className="flex flex-wrap gap-3">
+                      <div className="flex gap-1" role="group" aria-label="Chart metric">
+                        {METRICS.map((m) => (
+                          <Button
+                            key={m.value}
+                            variant={metric === m.value ? "secondary" : "ghost"}
+                            size="sm"
+                            className="h-8 text-xs"
+                            aria-pressed={metric === m.value}
+                            onClick={() => setMetric(m.value)}
+                          >
+                            {m.label}
+                          </Button>
+                        ))}
+                      </div>
+                      <div className="flex gap-1" role="group" aria-label="Chart granularity">
+                        {GRANULARITIES.map((g) => (
+                          <Button
+                            key={g.value}
+                            variant={granularity === g.value ? "secondary" : "ghost"}
+                            size="sm"
+                            className="h-8 text-xs"
+                            onClick={() => setGranularity(g.value)}
+                          >
+                            {g.label}
+                          </Button>
+                        ))}
+                      </div>
                     </div>
                   </CardHeader>
                   <CardContent>
-                    <UsageChart buckets={buckets} providers={bucketProviders} />
+                    {buckets.length > 0 ? (
+                      <UsageChart buckets={buckets} providers={bucketProviders} metric={metric} />
+                    ) : (
+                      <p className="py-12 text-center text-sm text-muted-foreground">
+                        No per-day {metric === "cost" ? "cost" : "token"} figures for this period.
+                      </p>
+                    )}
                   </CardContent>
                 </Card>
               ) : null}

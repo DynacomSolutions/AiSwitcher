@@ -77,38 +77,56 @@ export function bucketKey(dateKey: string, granularity: Granularity): string {
   return formatDateMs(new Date(date.getFullYear(), date.getMonth(), date.getDate() - sinceMonday).getTime());
 }
 
-/** Providers with in-period tokens, biggest first. */
-export function providersByTokens(results: UsageResult[], since: SinceDays, nowMs: number = Date.now()): string[] {
+/** What the usage chart plots: tokens (input plus output) or estimated cost in USD. */
+export type ChartMetric = "tokens" | "cost";
+
+/** One series' per-day values for the metric. Tokens come from `dailyUsage`;
+ * cost is the estimated USD column of the exact per-day totals, the same
+ * figures the period cost card sums. */
+function dailySeries(result: UsageResult, metric: ChartMetric): [string, number][] {
+  if (metric === "tokens") return Object.entries(result.dailyUsage ?? {});
+  return Object.entries(result.dailyTotals ?? {}).map(([day, v]) => [day, v[5]]);
+}
+
+/** Providers with in-period tokens (or cost), biggest first. */
+export function providersByTokens(results: UsageResult[], since: SinceDays, nowMs: number = Date.now(), metric: ChartMetric = "tokens"): string[] {
   const totals = new Map<string, number>();
   for (const result of results) {
-    for (const [date, tokens] of Object.entries(result.dailyUsage ?? {})) {
-      if (!withinSince(date, since, nowMs)) continue;
-      totals.set(result.provider, (totals.get(result.provider) ?? 0) + tokens);
+    for (const [date, value] of dailySeries(result, metric)) {
+      if (!withinSince(date, since, nowMs) || !Number.isFinite(value)) continue;
+      totals.set(result.provider, (totals.get(result.provider) ?? 0) + value);
     }
   }
   return [...totals.entries()].sort((a, b) => b[1] - a[1]).map(([provider]) => provider);
 }
 
-/** Per-bucket token totals (input plus output) stacked by the five biggest
- * providers, the rest in "other". Buckets are padded with zeros between the
- * first and last active bucket, and a partial first or last week or month is
- * included in full for the days inside the period. */
-export function buildBuckets(results: UsageResult[], granularity: Granularity, since: SinceDays, nowMs: number = Date.now()): Bucket[] {
+/** Per-bucket totals of the metric (tokens by default, or estimated cost)
+ * stacked by the five biggest providers, the rest in "other". Buckets are
+ * padded with zeros between the first and last active bucket, and a partial
+ * first or last week or month is included in full for the days inside the
+ * period. */
+export function buildBuckets(
+  results: UsageResult[],
+  granularity: Granularity,
+  since: SinceDays,
+  nowMs: number = Date.now(),
+  metric: ChartMetric = "tokens",
+): Bucket[] {
   const perProvider = new Map<string, Map<string, number>>();
   const totals = new Map<string, number>();
   for (const result of results) {
-    for (const [date, tokens] of Object.entries(result.dailyUsage ?? {})) {
-      if (!withinSince(date, since, nowMs)) continue;
+    for (const [date, value] of dailySeries(result, metric)) {
+      if (!withinSince(date, since, nowMs) || !Number.isFinite(value)) continue;
       const key = bucketKey(date, granularity);
       let series = perProvider.get(result.provider);
       if (!series) perProvider.set(result.provider, (series = new Map()));
-      series.set(key, (series.get(key) ?? 0) + tokens);
-      totals.set(key, (totals.get(key) ?? 0) + tokens);
+      series.set(key, (series.get(key) ?? 0) + value);
+      totals.set(key, (totals.get(key) ?? 0) + value);
     }
   }
   if (totals.size === 0) return [];
   const keys = [...totals.keys()].sort();
-  const top = new Set(providersByTokens(results, since, nowMs).slice(0, 5));
+  const top = new Set(providersByTokens(results, since, nowMs, metric).slice(0, 5));
 
   const dense: string[] = [];
   const cursor = parseDay(keys[0]!);
