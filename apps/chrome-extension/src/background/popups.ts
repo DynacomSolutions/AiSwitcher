@@ -24,7 +24,7 @@ export class PopupGuard {
   constructor(private readonly api: ChromeApi, private readonly tabs: TabManager, private readonly now: () => number = Date.now, private readonly wait = sleep) {
     api.tabs.onActivated((tabId, windowId) => this.activated(tabId, windowId));
     api.tabs.onCreated(tab => { void this.created(tab).catch(() => {}); });
-    api.debugger.onEvent((tabId, method) => { if (method === "Page.windowOpen") this.windowOpen(tabId); });
+    api.debugger.onEvent((tabId, method, _params, sessionId) => { if (method === "Page.windowOpen" && sessionId === undefined) this.windowOpen(tabId); });
   }
 
   /** Learns the active tab of every window (worker start). */

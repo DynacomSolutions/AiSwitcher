@@ -38,9 +38,18 @@ Swap pools: mint a token for each pool member (`ais browser agent-token <member>
 
 ## Tools
 
-`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
+`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
 
-File upload is deliberately unsupported: it would let an agent read arbitrary local files on the Mac running Chrome (other identities' tokens, `~/.secrets`), which breaks identity isolation.
+### File upload
+
+`upload_file` puts files on a page's file input. The agent gives `paths`: files on the machine the agent runs on, which is often not the machine that runs Chrome. The `ais-browser` MCP server reads them there, with the rights the agent session already has, and sends only their content (`files`: name, MIME type from the file extension, base64 data) through the gateway. The target is a `ref` or a `coordinate`:
+
+- A ref to the file input itself: the files are set on it directly.
+- Anything else (the button or drop area that opens the file dialog, also inside an iframe): the extension clicks it with file chooser interception on (`Page.setInterceptFileChooserDialog`), so no dialog opens in the owner's window, and sets the files on the input that asked for them. Interception is on for that call only; the owner's own file dialogs open as usual. A cross-origin iframe is its own debugger target, so the first upload in a tab attaches to the tab's iframes (`Target.setAutoAttach`, iframes only) to catch a chooser opened inside one.
+
+Isolation: no tool reads a file from the disk of the machine that runs Chrome, so an agent cannot reach other identities' tokens or `~/.secrets` there. The gateway and the extension accept file content only: the wire schema has no path field, a name with a folder in it is refused, and the gateway answers 400 before any browser sees the call. The extension builds the `File` objects in the page from the content (`DataTransfer`) and never calls `DOM.setFileInputFiles`, the debugger command that takes host paths. Do not add a tool or argument that takes a path on the Chrome host.
+
+Limits: at most 10 files and 10 MiB in total per call (checked by the MCP server, the gateway and the extension). The gateway allows an upload 120 s to reach the extension. The page's `input` and `change` events come from script (`isTrusted` is false). A page that asks for files without a file input (`showOpenFilePicker`) or takes them by drag and drop only cannot be filled.
 
 ## Pause, Stop, revoke
 

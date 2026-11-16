@@ -42,8 +42,10 @@ export interface ChromeApi {
   debugger: {
     attach(tabId: number): Promise<void>;
     detach(tabId: number): Promise<void>;
-    send(tabId: number, method: string, params?: Record<string, unknown>): Promise<unknown>;
-    onEvent(listener: (tabId: number, method: string, params: Record<string, unknown>) => void): void;
+    /** `sessionId` addresses a child session of the tab (a cross-origin iframe attached through Target.setAutoAttach, flat mode). */
+    send(tabId: number, method: string, params?: Record<string, unknown>, sessionId?: string): Promise<unknown>;
+    /** `sessionId` is set when the event comes from a child session of the tab. */
+    onEvent(listener: (tabId: number, method: string, params: Record<string, unknown>, sessionId?: string) => void): void;
     onDetach(listener: (tabId: number, reason: string) => void): void;
   };
 }
@@ -88,11 +90,12 @@ export function realChromeApi(): ChromeApi {
     debugger: {
       attach: tabId => chrome.debugger.attach({ tabId }, "1.3"),
       detach: tabId => chrome.debugger.detach({ tabId }),
-      send: (tabId, method, params) => chrome.debugger.sendCommand({ tabId }, method, params),
+      send: (tabId, method, params, sessionId) => chrome.debugger.sendCommand(sessionId === undefined ? { tabId } : { tabId, sessionId }, method, params),
       onEvent: listener => chrome.debugger.onEvent.addListener((source, method, params) => {
-        if (source.tabId !== undefined) listener(source.tabId, method, (params ?? {}) as Record<string, unknown>);
+        if (source.tabId !== undefined) listener(source.tabId, method, (params ?? {}) as Record<string, unknown>, source.sessionId);
       }),
-      onDetach: listener => chrome.debugger.onDetach.addListener((source, reason) => { if (source.tabId !== undefined) listener(source.tabId, reason); }),
+      // A child session (an iframe) going away is not the tab's debugger detaching.
+      onDetach: listener => chrome.debugger.onDetach.addListener((source, reason) => { if (source.tabId !== undefined && (source as { sessionId?: string }).sessionId === undefined) listener(source.tabId, reason); }),
     },
   };
 }

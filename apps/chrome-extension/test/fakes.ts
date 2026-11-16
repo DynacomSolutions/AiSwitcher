@@ -9,12 +9,12 @@ export class FakeChrome implements ChromeApi {
   nextTab = 100;
   nextGroup = 1;
   groups = new Map<number, { title: string; color: string }>();
-  cdpLog: Array<{ tabId: number; method: string; params?: Record<string, unknown> }> = [];
+  cdpLog: Array<{ tabId: number; method: string; params?: Record<string, unknown>; sessionId?: string }> = [];
   cdpResults: Record<string, unknown> = {};
   attachedTabs = new Set<number>();
   detachCalls: number[] = [];
   removedListeners: Array<(id: number) => void> = [];
-  eventListeners: Array<(tabId: number, method: string, params: Record<string, unknown>) => void> = [];
+  eventListeners: Array<(tabId: number, method: string, params: Record<string, unknown>, sessionId?: string) => void> = [];
   resizes: Array<[number, number, number]> = [];
   createdListeners: Array<(tab: TabInfo) => void> = [];
   activatedListeners: Array<(tabId: number, windowId: number) => void> = [];
@@ -32,8 +32,9 @@ export class FakeChrome implements ChromeApi {
     this.tabList.delete(id);
     for (const l of this.removedListeners) l(id);
   }
-  emit(tabId: number, method: string, params: Record<string, unknown>): void {
-    for (const l of this.eventListeners) l(tabId, method, params);
+  /** `sessionId`: the event comes from a child session (a cross-origin iframe). */
+  emit(tabId: number, method: string, params: Record<string, unknown>, sessionId?: string): void {
+    for (const l of this.eventListeners) l(tabId, method, params, sessionId);
   }
 
   storage = {
@@ -96,12 +97,12 @@ export class FakeChrome implements ChromeApi {
   debugger = {
     attach: async (id: number) => { this.attachedTabs.add(id); },
     detach: async (id: number) => { this.attachedTabs.delete(id); this.detachCalls.push(id); },
-    send: async (tabId: number, method: string, params?: Record<string, unknown>) => {
-      this.cdpLog.push({ tabId, method, ...(params ? { params } : {}) });
+    send: async (tabId: number, method: string, params?: Record<string, unknown>, sessionId?: string) => {
+      this.cdpLog.push({ tabId, method, ...(params ? { params } : {}), ...(sessionId ? { sessionId } : {}) });
       const r = this.cdpResults[method];
-      return typeof r === "function" ? (r as (p?: Record<string, unknown>) => unknown)(params) : (r ?? {});
+      return typeof r === "function" ? (r as (p?: Record<string, unknown>, s?: string) => unknown)(params, sessionId) : (r ?? {});
     },
-    onEvent: (l: (tabId: number, method: string, params: Record<string, unknown>) => void) => { this.eventListeners.push(l); },
+    onEvent: (l: (tabId: number, method: string, params: Record<string, unknown>, sessionId?: string) => void) => { this.eventListeners.push(l); },
     onDetach: (l: (tabId: number, reason: string) => void) => { this.detachListeners.push(l); },
   };
 }
