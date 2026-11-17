@@ -1,5 +1,5 @@
 import type { Identity } from "../../identities/types.ts";
-import { hasMemberCopy, memberDir, memberStoreEnabled } from "../../identities/gateway-members.ts";
+import { hasMemberCopy, memberDir, memberStoreEnabled, memberStoreRoot } from "../../identities/gateway-members.ts";
 import { classifyLogin } from "../../identities/gateway-routed.ts";
 import { codexAccountOf, codexAuthPath, parseCodexAuth, readCodexAuthText } from "../../identities/codex-auth.ts";
 import { readFileSync } from "node:fs";
@@ -502,11 +502,14 @@ export const CODEX_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 const STORE_USAGE_TIMEOUT_MS = 15_000;
 
 /**
- * True when this identity's usage must be read from the gateway member store: this is not a gateway process (that one
- * reads the store through the registry already), the store holds the login, and the folder holds no login of its own.
+ * True when this identity's usage must be read from the gateway member store with one GET: the store holds the login,
+ * and either this is a gateway process whose registry already points the member at its store folder (the cluster pod
+ * has no codex binary, and an app-server there would spend the store's single-use refresh token), or the identity's
+ * own folder holds no login.
  */
 function readsViaMemberStore(identity: Identity, root?: string): boolean {
-  if (memberStoreEnabled() || !hasMemberCopy("codex", identity.name, root)) return false;
+  if (!hasMemberCopy("codex", identity.name, root)) return false;
+  if (memberStoreEnabled()) return identity.configDir === memberDir("codex", identity.name, root ?? memberStoreRoot());
   let text: string | undefined;
   try {
     text = readFileSync(codexAuthPath(identity.configDir), "utf8");
