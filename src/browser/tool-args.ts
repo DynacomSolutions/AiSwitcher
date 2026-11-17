@@ -37,6 +37,7 @@ export interface ToolArgs {
   wait: { seconds: number };
   resize: TabArgs & { width: number; height: number };
   close_tab: TabArgs;
+  handle_dialog: TabArgs & { accept: boolean; promptText?: string };
 }
 
 export interface JsonSchema {
@@ -91,7 +92,11 @@ export const TOOL_SCHEMAS: Record<ExtensionTool, { description: string; inputSch
   get_network: { description: "Return network requests collected since the extension attached to the tab.", inputSchema: obj({ tabId, urlPattern: { type: "string", description: "Case-insensitive substring filter." }, clear: { type: "boolean" } }, ["tabId"]) },
   wait: { description: "Wait for a number of seconds (at most 120).", inputSchema: obj({ seconds: { type: "number", minimum: 0, maximum: 120 } }, ["seconds"]) },
   resize: { description: "Resize the browser window containing the tab.", inputSchema: obj({ tabId, width: { type: "number", minimum: 200, maximum: 10000 }, height: { type: "number", minimum: 200, maximum: 10000 } }, ["tabId", "width", "height"]) },
-  close_tab: { description: "Close a tab owned by this session.", inputSchema: obj({ tabId }, ["tabId"]) },
+  close_tab: { description: "Close a tab owned by this session. If the page asks \"Leave site?\" (a beforeunload dialog, the page has unsaved changes), the tab stays open and the call fails with dialog_open: see handle_dialog.", inputSchema: obj({ tabId }, ["tabId"]) },
+  handle_dialog: {
+    description: "Answer the JavaScript dialog (alert, confirm, prompt or beforeunload) open on a tab. While one is open, other calls on that tab fail with dialog_open, and tabs_context shows it. accept false dismisses it (Cancel; for beforeunload: stay on the page). accept true presses OK; for beforeunload it leaves the page or closes the tab and DISCARDS THE USER'S UNSAVED CHANGES: only accept a beforeunload dialog when the user asked you to discard them. Nothing is ever accepted automatically.",
+    inputSchema: obj({ tabId, accept: { type: "boolean", description: "true for OK (leave the page, for beforeunload), false for Cancel (stay)." }, promptText: { type: "string", description: "Text to enter in a prompt dialog before accepting." } }, ["tabId", "accept"]),
+  },
 };
 
 function check(schema: JsonSchema, value: unknown, path: string): string | undefined {

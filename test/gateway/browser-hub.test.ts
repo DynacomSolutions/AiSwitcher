@@ -244,6 +244,21 @@ describe("BrowserHub", () => {
     expect(metrics.render()).toContain('ais_gateway_browser_calls_total{tool="screenshot",outcome="tab_hidden"} 1');
   });
 
+  test("dialog_open passes the sanitiser and handle_dialog is a metrics tool", async () => {
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const hub = mk({ metrics });
+    const ws = new FakeWs();
+    await hello(hub, ws);
+    const p = hub.call("work", req("c1", "click"), 1000);
+    await hub.message(ws, JSON.stringify({ t: "result", result: { id: "c1", ok: false, error: "dialog_open", message: "A JavaScript alert dialog is open on tab 5" } }));
+    expect(await p).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(metrics.render()).toContain('ais_gateway_browser_calls_total{tool="click",outcome="dialog_open"} 1');
+    const q = hub.call("work", req("c2", "handle_dialog"), 1000);
+    await hub.message(ws, JSON.stringify({ t: "result", result: { id: "c2", ok: true, content: [{ type: "text", text: "Dismissed" }] } }));
+    expect(await q).toMatchObject({ ok: true });
+    expect(metrics.render()).toContain('ais_gateway_browser_calls_total{tool="handle_dialog",outcome="ok"} 1');
+  });
+
   test("messages during auth are ignored and a second hello cannot double-attach", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
