@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { loadLastGood, saveLastGood } from "../cli/limits/claude-limits.ts";
-import { CLAUDE_RESETS_USER_AGENT, CLAUDE_USAGE_BETA, usableAccessToken, type FetchUsageDeps } from "../identities/claude-usage-api.ts";
+import { clearSpentWindows, loadLastGood, saveLastGood } from "../cli/limits/claude-limits.ts";
+import { CLAUDE_RESETS_USER_AGENT, CLAUDE_USAGE_BETA, resetGrantKind, usableAccessToken, type FetchUsageDeps } from "../identities/claude-usage-api.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { Identity } from "../identities/types.ts";
@@ -114,8 +114,11 @@ export async function useClaudeReset(identityName: string, grantId: string, deps
  */
 async function recordSpend(identity: Identity, spent: UseResetResult, cacheDir: string): Promise<void> {
   try {
-    const last = await loadLastGood(identity, cacheDir);
-    if (!last) return;
+    const loaded = await loadLastGood(identity, cacheDir);
+    if (!loaded) return;
+    // The cleared windows show at 0% now: the next usage read may be refused (429 backoff) for minutes.
+    const spentGrant = loaded.manualReset?.grants?.find((g) => g.id === spent.grantId);
+    const last = { ...loaded, windows: clearSpentWindows(loaded.windows, spent.cleared, spentGrant?.kind ?? resetGrantKind(spent.grantId)) };
     const reset = last.manualReset;
     if (!reset?.grants) {
       await saveLastGood(identity, { ...last, status: "cached" }, cacheDir);

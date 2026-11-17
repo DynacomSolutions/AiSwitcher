@@ -7,7 +7,7 @@ import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByLabel } from "./bucket.ts";
-import type { LimitWindow, OverageInfo, FetchedLimitResult } from "./types.ts";
+import type { LimitWindow, OverageInfo, FetchedLimitResult, ResetGrantKind } from "./types.ts";
 
 const AUTH_STATUS_TIMEOUT_MS = 10_000;
 // Was 30s — bumped after real hangs at 30s turned out to just need more time
@@ -96,6 +96,30 @@ export function windowsFromUsageBody(body: unknown): LimitWindow[] {
   const five = rec.five_hour as Record<string, unknown> | null | undefined;
   const seven = rec.seven_day as Record<string, unknown> | null | undefined;
   return [...make("session", "session (5h)", five?.utilization, five?.resets_at), ...make("week", "week (all)", seven?.utilization, seven?.resets_at)];
+}
+
+/**
+ * The windows after a reset is spent: the cleared ones at 0% with no reset time (a new window starts on next use).
+ * `cleared` holds the reset response's limit kinds (`session`, `weekly_all`, `weekly_scoped`, or a model name);
+ * when it names nothing recognisable, the grant kind decides: a full reset clears every window, a Fable reset the
+ * Fable weekly window. Used so a spent reset shows at once, even while the usage read is rate-limited.
+ */
+export function clearSpentWindows(windows: LimitWindow[], cleared: string[], grantKind: ResetGrantKind | undefined): LimitWindow[] {
+  const kinds = cleared.map((c) => c.toLowerCase());
+  const matches = (w: LimitWindow): boolean =>
+    kinds.some((k) =>
+      (k.includes("session") || k.includes("five_hour")) ? w.category === "session"
+      : k === "weekly_all" || k === "seven_day" || k === "weekly" ? w.label === "week (all)"
+      : k.includes("scoped") ? w.model !== undefined
+      : w.model !== undefined && k.includes(w.model.toLowerCase()),
+    );
+  const clears = windows.some(matches) ? matches : grantKind === "full" ? () => true : grantKind === "fable" ? (w: LimitWindow) => /fable/i.test(w.model ?? w.label) : () => false;
+  if (!windows.some(clears)) return windows;
+  return windows.map((w) => {
+    if (!clears(w)) return w;
+    const { resetsAt: _r, resetsAtMs: _m, ...rest } = w;
+    return { ...rest, usedPercent: 0 };
+  });
 }
 
 /** Same semantics as overageFromUsageText, read from the body's `extra_usage` block. */
