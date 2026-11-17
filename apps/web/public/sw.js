@@ -2,6 +2,8 @@
 // It caches nothing. Every request goes to the network as usual, so the
 // console stays a live view and no API data or token is ever stored here.
 // Only a failed page navigation is answered, with a small offline page.
+// It also shows push notifications (reset-expiry reminders) and opens the
+// console when one is tapped.
 
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
@@ -19,5 +21,41 @@ self.addEventListener("fetch", (event) => {
     fetch(event.request).catch(
       () => new Response(OFFLINE_HTML, { status: 503, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } }),
     ),
+  );
+});
+
+// Push reminders from the console daemon (reset expiry). The payload is
+// { title, body, tag, url }; the server encrypts it for this browser only.
+self.addEventListener("push", (event) => {
+  let data = {};
+  try {
+    data = event.data ? event.data.json() : {};
+  } catch {
+    data = { body: event.data ? event.data.text() : "" };
+  }
+  const title = typeof data.title === "string" && data.title ? data.title : "AIS Console";
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body: typeof data.body === "string" ? data.body : "",
+      tag: typeof data.tag === "string" ? data.tag : undefined,
+      icon: "/icon-192.png",
+      badge: "/icon-192.png",
+      data: { url: typeof data.url === "string" && data.url.startsWith("/") ? data.url : "/" },
+    }),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = new URL(event.notification.data?.url ?? "/", self.location.origin).href;
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((windows) => {
+      for (const client of windows) {
+        if (new URL(client.url).origin === self.location.origin && "focus" in client) {
+          return client.navigate(url).then((c) => (c ?? client).focus());
+        }
+      }
+      return self.clients.openWindow(url);
+    }),
   );
 });

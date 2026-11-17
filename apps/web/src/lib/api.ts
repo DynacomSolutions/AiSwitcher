@@ -33,6 +33,7 @@ import type {
   GatewayRotateResult,
   UseResetResult,
   BrowsersResponse,
+  PushStatusResponse,
   PoolsUsageResponse,
   UsageResponse,
 } from "@/types/api";
@@ -177,6 +178,13 @@ export const api = {
 
   useClaudeReset: (identity: string, grantId: string) =>
     request<UseResetResult>(`/api/limits/claude/${encodeURIComponent(identity)}/resets/${encodeURIComponent(grantId)}`, { method: "POST" }),
+
+  getPush: () => request<PushStatusResponse>("/api/push"),
+  subscribePush: (subscription: PushSubscriptionJSON) =>
+    request<{ ok: true; subscriptions: number }>("/api/push/subscribe", { method: "POST", body: { subscription } }),
+  unsubscribePush: (endpoint: string) =>
+    request<{ ok: true; removed: boolean }>("/api/push/unsubscribe", { method: "POST", body: { endpoint } }),
+  testPush: () => request<{ ok: true; sent: number; removed: number; failed: number }>("/api/push/test", { method: "POST" }),
 
   getBrowsers: () => request<BrowsersResponse>("/api/browsers"),
 

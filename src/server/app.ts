@@ -30,6 +30,7 @@ import * as gatewayApps from "./gateway-apps.ts";
 import * as claudeResets from "./claude-resets.ts";
 import { poolsUsage, type PoolsUsageResponse } from "./pools-usage.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
+import type { ResetExpiryNotifier } from "./reset-expiry-push.ts";
 import { mountBrowserAuthorize, type BrowserAuthConfig } from "./browser-authorize.ts";
 import { loadBrowserBindings, revokeBrowserBinding, type BrowserBindingsView } from "./browser-bindings.ts";
 
@@ -101,6 +102,12 @@ export interface ConsoleAppDeps extends GuardDeps {
   browserRevoke?: (name: string) => Promise<{ ok: true }>;
   /** Online-probe cache file for the default localModels; tests inject a temp path. */
   onlineCachePath?: string;
+  /** Daemon-side reset-expiry push reminders; absent in bare-app tests. */
+  resetExpiryPush?: Pick<ResetExpiryNotifier, "status" | "tick">;
+  /** Web Push state dir (VAPID keys, subscriptions); tests inject a temp dir. */
+  pushDir?: string;
+  /** Test seam: the push service fetch for POST /api/push/test. */
+  pushFetch?: typeof fetch;
 }
 
 /** Refresh status with stale revoked pins dropped, so a re-login shows at once. */
@@ -288,6 +295,45 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     (deps.invalidateLimits ?? invalidateLimitsCache)();
     return c.json(result);
   });
+  /* ------------------------------ web push -------------------------------- */
+  // Loaded on first use: every ais command imports this module, and start-up reads count (sync budgets).
+  const pushModule = () => import("./web-push.ts");
+  // The PWA subscribes here for reset-expiry reminders (src/server/reset-expiry-push.ts).
+  // Endpoints are capability URLs: accepted, never listed back.
+  app.get("/api/push", async (c) => {
+    const webPush = await pushModule();
+    const { publicKey } = await webPush.loadVapid(deps.pushDir);
+    const subscriptions = (await webPush.loadSubscriptions(deps.pushDir)).length;
+    return c.json({ publicKey, subscriptions, resetExpiry: deps.resetExpiryPush?.status() ?? null });
+  });
+  app.post("/api/push/subscribe", async (c) => {
+    const body = (await c.req.json().catch(() => undefined)) as { subscription?: unknown } | undefined;
+    const webPush = await pushModule();
+    const sub = webPush.parseSubscription(body?.subscription);
+    if (!sub) throw new HttpError(400, "invalid push subscription");
+    const subscriptions = await webPush.addSubscription(sub, c.req.header("origin") ?? undefined, deps.pushDir);
+    return c.json({ ok: true, subscriptions });
+  });
+  app.post("/api/push/unsubscribe", async (c) => {
+    const body = (await c.req.json().catch(() => undefined)) as { endpoint?: unknown } | undefined;
+    if (typeof body?.endpoint !== "string") throw new HttpError(400, "endpoint required");
+    return c.json({ ok: true, removed: await (await pushModule()).removeSubscription(body.endpoint, deps.pushDir) });
+  });
+  // Sends a test notification to every subscribed browser.
+  app.post("/api/push/test", async (c) => {
+    const result = await (await pushModule()).sendToAll(
+      { title: "AIS Console", body: "Notifications are on. You will hear about resets 7 days, 3 days and 24 hours before they expire.", tag: "push-test", url: "/limits" },
+      { ...(deps.pushDir ? { dir: deps.pushDir } : {}), ...(deps.pushFetch ? { fetchImpl: deps.pushFetch } : {}) },
+    );
+    return c.json({ ok: true, ...result });
+  });
+  // Runs the reset-expiry check now (normally hourly); answers how many reminders went out.
+  app.post("/api/push/reset-expiry/check", async (c) => {
+    if (!deps.resetExpiryPush) throw new HttpError(503, "reset-expiry push not running");
+    const sent = await deps.resetExpiryPush.tick();
+    return c.json({ ok: true, sent, status: deps.resetExpiryPush.status() });
+  });
+
   // Pool membership and the gateway ledger by identity; the console page sums these with native usage and limits.
   app.get("/api/pools/usage", async (c) => c.json(await (deps.poolsUsage ?? (() => poolsUsage()))()));
   // Per-project usage from the native store, written by the host collector

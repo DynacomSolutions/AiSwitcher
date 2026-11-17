@@ -229,10 +229,16 @@ export function manualResetFromWire(wire: RateLimitResetCreditsWire | undefined)
           minute: "2-digit",
         })
       : undefined;
+  const creditExpiries = available.flatMap((c, i) =>
+    typeof c.expiresAt === "number" && Number.isFinite(c.expiresAt)
+      ? [{ id: c.id ?? `credit-${i}`, ...(c.title ? { label: c.title } : {}), endsAt: new Date(c.expiresAt * 1000).toISOString() }]
+      : [],
+  );
   return {
     availableCount: count,
     ...(first?.title ? { label: first.title } : {}),
     ...(expiresAt !== undefined ? { expiresAt } : {}),
+    ...(creditExpiries.length > 0 ? { creditExpiries } : {}),
   };
 }
 

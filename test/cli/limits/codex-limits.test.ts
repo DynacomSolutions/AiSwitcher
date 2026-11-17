@@ -102,6 +102,9 @@ describe("manualResetFromWire", () => {
         hour: "numeric",
         minute: "2-digit",
       }),
+      creditExpiries: [
+        { id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_001", label: "Full reset (Weekly + 5 hr)", endsAt: new Date(1702592000 * 1000).toISOString() },
+      ],
     });
   });
 

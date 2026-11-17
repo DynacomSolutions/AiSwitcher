@@ -78,3 +78,8 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 12
   static server marks only Vite's hashed `/assets/` as immutable; every other file (index.html, sw.js, the manifest,
   icons) is `no-cache` so installs pick up new releases. Static files sit outside the `/api` guard, so the browser can
   fetch the manifest and worker without the token.
+- Reset-expiry push (`src/server/reset-expiry-push.ts`, `src/server/web-push.ts`): the worker also handles `push` and
+  `notificationclick` (still no Cache API). Web Push is implemented with `node:crypto` only (RFC 8291 aes128gcm, RFC 8292
+  VAPID; a test pins the RFC 8291 Appendix A vector), no web-push dependency. The daemon checks hourly through the shared
+  limits scan, only while a subscription exists, and records each grant's sent stage (7d, 3d, 24h) only after a device
+  accepted it, so a push service outage retries. Pool rows are skipped. Contract in `docs/API.md` (Push notifications).

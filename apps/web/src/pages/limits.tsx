@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { ToolBadge } from "@/components/badges";
 import { ProviderLabel } from "@/components/provider-icon";
 import { PoolUsageCards } from "@/components/pool-usage-cards";
+import { ResetPushToggle } from "@/components/reset-push-toggle";
 import { GlobalUsageCards } from "@/components/usage-counter";
 import { PageTabRedirect, PageTabs, usePageTab, type PageTab } from "@/components/page-tabs";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
@@ -323,6 +324,8 @@ export function LimitsPage() {
 
       {active === "overview" ? (
         <>
+          <ResetPushToggle />
+
           <GlobalUsageCards title="Global usage" />
 
           <PoolUsageCards />
