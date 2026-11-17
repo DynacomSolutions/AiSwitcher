@@ -233,6 +233,27 @@ describe("codex usage of a routed member", () => {
     expect(await readFile(storeFile("codex", "a", "auth.json"), "utf8")).toBe(codexLogin("acct-a"));
   });
 
+  test("a gateway process reads a member's store copy with one GET too (the pod has no codex binary)", async () => {
+    await routedCodex();
+    const saved = process.env.AIS_GATEWAY_MEMBER_STORE;
+    process.env.AIS_GATEWAY_MEMBER_STORE = "1";
+    try {
+      const calls: string[] = [];
+      const fetchImpl = (async (url: string) => {
+        calls.push(url);
+        return new Response(JSON.stringify(whamBody), { status: 200 });
+      }) as unknown as typeof fetch;
+      // In a gateway process loadIdentitiesFile points the member at its store folder.
+      const r = await fetchCodexLimits({ name: "a", label: "a", configDir: join(members, "codex", "a") }, { fetchImpl, now: () => T0 * 1000 });
+      expect(r.status).toBe("live");
+      expect(r.windows.map((w) => w.usedPercent)).toEqual([42, 7]);
+      expect(calls).toHaveLength(1);
+    } finally {
+      if (saved === undefined) delete process.env.AIS_GATEWAY_MEMBER_STORE;
+      else process.env.AIS_GATEWAY_MEMBER_STORE = saved;
+    }
+  });
+
   test("a rejected token is reported, not repaired", async () => {
     await routedCodex();
     const fetchImpl = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
