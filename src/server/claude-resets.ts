@@ -107,17 +107,25 @@ export async function useClaudeReset(identityName: string, grantId: string, deps
   return out;
 }
 
-/** Updates the cached grant list so the Limits page shows the new count before the next read. Never fails the spend. */
+/**
+ * Updates the cached grant list so the Limits page shows the new count even if the next read is refused, and marks the
+ * read "cached" so it is no longer a fresh shared read: the next read goes to Anthropic for the cleared windows.
+ * Never fails the spend.
+ */
 async function recordSpend(identity: Identity, spent: UseResetResult, cacheDir: string): Promise<void> {
   try {
     const last = await loadLastGood(identity, cacheDir);
-    const reset = last?.manualReset;
-    if (!last || !reset?.grants) return;
+    if (!last) return;
+    const reset = last.manualReset;
+    if (!reset?.grants) {
+      await saveLastGood(identity, { ...last, status: "cached" }, cacheDir);
+      return;
+    }
     const grants = reset.grants.map((g) =>
       g.id !== spent.grantId ? g : { ...g, ...(spent.resetsLeft !== undefined ? { resetsLeft: spent.resetsLeft, usableNow: g.usableNow && spent.resetsLeft > 0 } : { usableNow: false }) },
     );
     const availableCount = grants.filter((g) => g.usableNow).reduce((n, g) => n + g.resetsLeft, 0);
-    await saveLastGood(identity, { ...last, manualReset: { ...reset, grants, availableCount, ...(spent.cooldownUntil ? { cooldownUntil: spent.cooldownUntil } : {}) } }, cacheDir);
+    await saveLastGood(identity, { ...last, status: "cached", manualReset: { ...reset, grants, availableCount, ...(spent.cooldownUntil ? { cooldownUntil: spent.cooldownUntil } : {}) } }, cacheDir);
   } catch {
     // Bookkeeping only.
   }
