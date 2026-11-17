@@ -17,8 +17,7 @@
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
 header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 10px; }
 .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -.01em; font-size: 15px; }
-.mark { width: 22px; height: 22px; border-radius: 7px; background: conic-gradient(from 210deg, var(--accent), #d9a441, var(--accent)); position: relative; }
-.mark::after { content: ""; position: absolute; inset: 6px; border-radius: 3px; background: var(--bg); }
+.mark { width: 22px; height: 22px; display: block; }
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--idle-bg); color: var(--muted); }
 .chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .chip.ok { background: var(--ok-bg); color: var(--ok); }

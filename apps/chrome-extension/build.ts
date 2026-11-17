@@ -26,4 +26,5 @@ const manifest = stampManifest(await Bun.file(join(root, "manifest.json")).json(
 await Bun.write(join(dist, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 await cp(join(root, "src/sidepanel/sidepanel.html"), join(dist, "sidepanel.html"));
 await cp(join(root, "src/sidepanel/sidepanel.css"), join(dist, "sidepanel.css"));
+await cp(join(root, "icons"), join(dist, "icons"), { recursive: true });
 console.log(`Built ${process.argv[2] ?? "apps/chrome-extension/dist"}`);
