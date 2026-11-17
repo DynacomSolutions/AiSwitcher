@@ -31,6 +31,13 @@ export class ToolError extends Error {
   constructor(readonly code: BrowserErrorCode, message: string) { super(message); }
 }
 
+/** The page did not answer the debugger's first commands: most often a dialog that opened before the attach, which Chrome never reports. */
+class PageUnresponsive extends ToolError {
+  constructor(tabId: number) {
+    super("timeout", `Tab ${tabId} does not respond. It probably shows a JavaScript dialog (alert, confirm, prompt or "Leave site?") that opened before AIS attached to it; AIS cannot see or answer that one. Ask the user to answer it in Chrome, then try again. Do not retry before that.`);
+  }
+}
+
 export function capText(text: string): string {
   return text.length > MAX_TEXT_CHARS ? `${text.slice(0, MAX_TEXT_CHARS)}\n[truncated]` : text;
 }
@@ -70,6 +77,27 @@ interface NetEntry { id: string; method: string; url: string; status?: number; e
 interface Waited { params: Record<string, unknown>; sessionId?: string }
 interface Waiter { methods: string[]; frames: boolean; resolve: (e: Waited) => void }
 
+/** A JavaScript dialog (alert, confirm, prompt, beforeunload) open on a tab, as CDP reported it. */
+export interface PendingDialog {
+  type: string;
+  message: string;
+  url: string;
+  defaultPrompt?: string;
+  /** The tool call that was running on the tab when it opened, if any. */
+  openedDuring?: string;
+  /** Set when a cross-origin iframe opened it: the dialog is answered on that session. */
+  sessionId?: string;
+}
+/** Calls that still work while a dialog is open: they only read what the extension already holds, or answer the dialog. */
+const DIALOG_SAFE = new Set<ExtensionTool>(["get_console", "get_network", "handle_dialog"]);
+const MAX_DIALOG_TEXT = 300;
+/** How long close_tab waits for Chrome to close the tab (or for the page's "Leave site?" dialog). */
+const CLOSE_WAIT_MS = 5000;
+const CLOSE_POLL_MS = 100;
+/** How long a fresh attach waits for the page to answer before the call fails with PageUnresponsive. */
+export const ATTACH_ANSWER_MS = 5000;
+const clip = (t: string): string => (t.length > MAX_DIALOG_TEXT ? `${t.slice(0, MAX_DIALOG_TEXT)}...` : t);
+
 export interface ExecutorDeps {
   api: ChromeApi;
   tabs: TabManager;
@@ -80,6 +108,8 @@ export interface ExecutorDeps {
   captureTimeoutMs?: number;
   hoverHoldMs?: number;
   fileChooserWaitMs?: number;
+  /** How long a fresh attach waits for the page to answer (tests shorten it). */
+  attachAnswerMs?: number;
 }
 
 export class Executor {
@@ -88,6 +118,8 @@ export class Executor {
   private readonly state: State;
   private readonly ui: Ui;
   private readonly attached = new Set<number>();
+  /** Per tab: the domain enables of an attach the page has not answered yet. */
+  private readonly enabling = new Map<number, Promise<void>>();
 
   /** Tabs the debugger is attached to right now. */
   attachedTabIds(): number[] { return [...this.attached]; }
@@ -102,6 +134,12 @@ export class Executor {
   /** Per tab: the sessions told to attach to their cross-origin iframes (undefined is the page), and the sessions of those iframes. Set up by the first upload. */
   private readonly autoAttached = new Map<number, Set<string | undefined>>();
   private readonly frameSessions = new Map<number, Set<string>>();
+  /** Per tab: the JavaScript dialog open right now, and the calls running on the tab that a new dialog must end. */
+  private readonly dialogs = new Map<number, PendingDialog>();
+  private readonly dialogWatchers = new Map<number, Set<{ tool: ExtensionTool; reject: (e: ToolError) => void }>>();
+
+  /** The dialog open on a tab, if the extension saw one open. */
+  pendingDialog(tabId: number): PendingDialog | undefined { return this.dialogs.get(tabId); }
 
   constructor(deps: ExecutorDeps) {
     this.api = deps.api;
@@ -116,6 +154,7 @@ export class Executor {
     this.captureTimeout = deps.captureTimeoutMs ?? CAPTURE_TIMEOUT_MS;
     this.hoverHold = deps.hoverHoldMs ?? HOVER_HOLD_MS;
     this.chooserWait = deps.fileChooserWaitMs ?? FILE_CHOOSER_WAIT_MS;
+    this.attachAnswer = deps.attachAnswerMs ?? ATTACH_ANSWER_MS;
     this.api.debugger.onEvent((tabId, method, params, sessionId) => this.onEvent(tabId, method, params, sessionId));
     this.api.debugger.onDetach((tabId, reason) => {
       this.dropTab(tabId);
@@ -132,6 +171,7 @@ export class Executor {
   private readonly captureTimeout: number;
   private readonly hoverHold: number;
   private readonly chooserWait: number;
+  private readonly attachAnswer: number;
   private readonly held = new Map<number, ReturnType<typeof setTimeout>>();
 
   async run(req: CallRequest): Promise<CallResult> {
@@ -197,11 +237,16 @@ export class Executor {
       case "tabs_context": {
         const { own, granted, other } = await this.tabs.list(session.id);
         const view = (t: TabInfo) => ({ tabId: t.id, url: t.url, title: t.title, active: t.active });
-        const grantedView = (t: TabInfo) => ({ ...view(t), scope: "granted", groupId: t.groupId });
+        const dialog = (t: TabInfo) => {
+          const d = this.dialogs.get(t.id);
+          return d ? { dialog: { type: d.type, message: d.message, url: d.url, ...(d.defaultPrompt !== undefined ? { defaultPrompt: d.defaultPrompt } : {}) } } : {};
+        };
+        const actionable = (t: TabInfo) => ({ ...view(t), ...dialog(t) });
+        const grantedView = (t: TabInfo) => ({ ...actionable(t), scope: "granted", groupId: t.groupId });
         const mineGroup = this.tabs.sessions.get(session.id)?.groupId;
         // `scope` and `grantedGroups` are additive: "own" tabs are in this session's own group, "granted" tabs sit in a group the user granted.
-        const ownView = (t: TabInfo) => (t.groupId !== -1 && t.groupId !== mineGroup && this.tabs.grantee(t.groupId) === session.id ? grantedView(t) : { ...view(t), scope: "own" });
-        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), note: "otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group." }));
+        const ownView = (t: TabInfo) => (t.groupId !== -1 && t.groupId !== mineGroup && this.tabs.grantee(t.groupId) === session.id ? grantedView(t) : { ...actionable(t), scope: "own" });
+        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), note: "otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
       }
       case "tabs_create": {
         this.throwIfAborted(sig);
@@ -227,7 +272,16 @@ export class Executor {
         if (owner !== undefined && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} belongs to another session.`);
         this.throwIfAborted(sig);
         await this.tabs.addToSession(session, tabId);
-        await this.markControlled(tabId, session);
+        // The owner's tab may already show a dialog, which blocks the page marker: attached first, so it is seen (or the page is found unresponsive) before the marker hangs.
+        try {
+          await this.watchDialogs(tabId, tool, async () => { await this.ensureAttached(sig, tabId); await this.markControlled(tabId, session); });
+        } catch (e) {
+          const d = this.dialogs.get(tabId);
+          if (e instanceof PageUnresponsive) return text(`Adopted tab ${tabId}: ${tab.title}. ${e.message}`);
+          if (!(e instanceof ToolError && e.code === "dialog_open" && d)) throw e;
+          void this.markControlled(tabId, session);
+          return text(`Adopted tab ${tabId}: ${tab.title}. ${this.dialogError(tabId, d).message}`);
+        }
         return text(`Adopted tab ${tabId}: ${tab.title}`);
       }
       case "wait": {
@@ -239,8 +293,24 @@ export class Executor {
     }
     const { tabId } = a("screenshot");
     const tab = await this.ownedTab(req, tabId);
-    this.throwIfAborted(sig);
-    if (tool !== "hover") await this.releaseHold(tabId);
+    const open = this.dialogs.get(tabId);
+    if (open && !DIALOG_SAFE.has(tool)) throw this.dialogError(tabId, open);
+    // A page blocked by a dialog answers neither CDP input nor script injection: a dialog that opens mid-call ends the call at once.
+    return this.watchDialogs(tabId, tool, async () => {
+      // Attached before anything touches the page: a page that does not answer (a dialog Chrome never reported) ends the call here.
+      await this.ensureAttached(sig, tabId);
+      if (open) void this.markControlled(tabId, session); else await this.markControlled(tabId, session);
+      this.throwIfAborted(sig);
+      if (tool !== "hover") await this.releaseHold(tabId);
+      return this.tabTool(tool, req, sig, tab);
+    });
+  }
+
+  private async tabTool(tool: ExtensionTool, req: CallRequest, sig: AbortSignal, tab: TabInfo): Promise<Content> {
+    const session = req.session;
+    const args = req.args as unknown;
+    const a = <T extends ExtensionTool>(_t: T): ToolArgs[T] => args as ToolArgs[T];
+    const tabId = tab.id;
     switch (tool) {
       case "navigate": return this.navigate(sig, tab, a("navigate").url);
       case "screenshot": return this.hidden(sig, tabId, () => this.screenshot(sig, tabId));
@@ -307,6 +377,7 @@ export class Executor {
         const v = r.result?.value;
         return text(v === undefined ? (r.result?.description ?? "undefined") : JSON.stringify(v));
       }
+      case "handle_dialog": return this.handleDialog(sig, tabId, a("handle_dialog"));
       case "get_console": {
         const s = a("get_console");
         const pattern = s.pattern?.toLowerCase();
@@ -330,8 +401,14 @@ export class Executor {
       case "close_tab": {
         // Only tabs this session opened or adopted: tabs that merely sit in a granted group are the user's.
         if (!this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} was not opened by this session, so it cannot be closed.`);
-        this.throwIfAborted(sig);
+        // Attached first, so a "Leave site?" (beforeunload) dialog that closing raises is seen and ends the call instead of hanging it.
+        await this.ensureAttached(sig, tabId);
         await this.api.tabs.remove(tabId);
+        // A page that asks "Leave site?" keeps its tab open: its dialog ends this call (dialog_open) while we wait. Cancel keeps the tab, and its ownership.
+        for (let waited = 0; await this.api.tabs.get(tabId); waited += CLOSE_POLL_MS) {
+          if (waited >= CLOSE_WAIT_MS) throw new ToolError("internal", `Tab ${tabId} is still open.`);
+          await this.sleepFn(CLOSE_POLL_MS, sig);
+        }
         this.tabs.forget(tabId);
         await this.detach(tabId);
         await this.unmark(tabId);
@@ -355,8 +432,71 @@ export class Executor {
       this.dropTab(tabId);
       throw new ToolError("tab_closed", `Tab ${tabId} was closed.`);
     }
-    await this.markControlled(tabId, req.session);
     return tab;
+  }
+
+  // ---- JavaScript dialogs ------------------------------------------------
+
+  private dialogError(tabId: number, d: PendingDialog): ToolError {
+    const during = d.openedDuring ? ` It opened during ${d.openedDuring}.` : "";
+    const prompt = d.defaultPrompt ? ` Default prompt text: "${clip(d.defaultPrompt)}".` : "";
+    const answer = d.type === "beforeunload"
+      ? `The page has unsaved changes and asks whether to leave. Answer with handle_dialog {tabId: ${tabId}, accept: false} to stay on the page; accept: true leaves the page (or closes the tab) and discards the user's unsaved changes, so only do that if the user asked for it.`
+      : `Answer it with handle_dialog {tabId: ${tabId}, accept: true|false${d.type === "prompt" ? ", promptText" : ""}}.`;
+    return new ToolError("dialog_open", `A JavaScript ${d.type} dialog is open on tab ${tabId} (${clip(d.url)}): "${clip(d.message)}".${during}${prompt} Calls on this tab fail until it is answered. ${answer}`);
+  }
+
+  /** Runs a call on a tab; a dialog that opens on that tab meanwhile fails the call at once with dialog_open. The call's own work is left to finish (or hang) on its own. */
+  private async watchDialogs<T>(tabId: number, tool: ExtensionTool, work: () => Promise<T>): Promise<T> {
+    let watcher: { tool: ExtensionTool; reject: (e: ToolError) => void } | undefined;
+    const opened = new Promise<never>((_, reject) => { watcher = { tool, reject }; });
+    opened.catch(() => {});
+    const set = this.dialogWatchers.get(tabId) ?? new Set();
+    set.add(watcher!);
+    this.dialogWatchers.set(tabId, set);
+    const running = work();
+    running.catch(() => {});
+    try {
+      return await Promise.race([running, opened]);
+    } finally {
+      set.delete(watcher!);
+      if (set.size === 0 && this.dialogWatchers.get(tabId) === set) this.dialogWatchers.delete(tabId);
+    }
+  }
+
+  private onDialogOpening(tabId: number, p: Record<string, unknown>, sessionId?: string): void {
+    const watchers = [...(this.dialogWatchers.get(tabId) ?? [])].filter(w => w.tool !== "handle_dialog");
+    const d: PendingDialog = {
+      type: typeof p.type === "string" ? p.type : "alert",
+      message: typeof p.message === "string" ? p.message : "",
+      url: typeof p.url === "string" ? p.url : "",
+      ...(typeof p.defaultPrompt === "string" && p.defaultPrompt !== "" ? { defaultPrompt: p.defaultPrompt } : {}),
+      ...(watchers[0] ? { openedDuring: watchers[0].tool } : {}),
+      ...(sessionId === undefined ? {} : { sessionId }),
+    };
+    this.dialogs.set(tabId, d);
+    for (const w of watchers) w.reject(this.dialogError(tabId, d));
+  }
+
+  /** Answers the open dialog. Never called on the agent's behalf: accepting a beforeunload dialog discards the user's unsaved changes. */
+  private async handleDialog(sig: AbortSignal, tabId: number, args: ToolArgs["handle_dialog"]): Promise<Content> {
+    const d = this.dialogs.get(tabId);
+    if (!d) throw new ToolError("bad_args", `No JavaScript dialog is open on tab ${tabId}.`);
+    const params = { accept: args.accept, ...(args.promptText !== undefined && args.accept ? { promptText: args.promptText } : {}) };
+    try {
+      await this.cdp(sig, tabId, "Page.handleJavaScriptDialog", params, d.sessionId);
+    } catch (e) {
+      if (e instanceof ToolError) throw e;
+      this.dialogs.delete(tabId);
+    this.enabling.delete(tabId);
+      throw new ToolError("bad_args", `No JavaScript dialog is open on tab ${tabId} any more (${(e as Error).message}).`);
+    }
+    if (this.dialogs.get(tabId) === d) this.dialogs.delete(tabId);
+    const what = `${args.accept ? "Accepted" : "Dismissed"} the ${d.type} dialog "${clip(d.message)}".`;
+    if (d.type !== "beforeunload") return text(what);
+    return text(args.accept
+      ? `${what} The page is leaving${d.openedDuring === "close_tab" ? " and the tab closes" : ""}; its unsaved changes are discarded.`
+      : `${what} The page stays open with its changes${d.openedDuring ? `; ${d.openedDuring} did not happen` : ""}.`);
   }
 
   private async markControlled(tabId: number, session: UiSession): Promise<void> {
@@ -423,7 +563,7 @@ export class Executor {
 
   private async ensureAttached(sig: AbortSignal, tabId: number): Promise<void> {
     this.throwIfAborted(sig);
-    if (this.attached.has(tabId)) return;
+    if (this.attached.has(tabId)) return this.awaitEnabled(tabId);
     try {
       await this.api.debugger.attach(tabId);
     } catch (e) {
@@ -437,9 +577,25 @@ export class Executor {
     }
     // A timeout or gateway abort keeps the attachment: a concurrent call may already rely on it.
     this.attached.add(tabId);
-    for (const d of ["Page", "Runtime", "Log", "Network"]) await this.api.debugger.send(tabId, `${d}.enable`);
-    // Agents work in the background and never activate a tab: focus emulation keeps a background tab rendering for CDP captures and input.
-    try { await this.api.debugger.send(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }); } catch { /* best effort */ }
+    const enabling = (async () => {
+      for (const d of ["Page", "Runtime", "Log", "Network"]) await this.api.debugger.send(tabId, `${d}.enable`);
+      // Agents work in the background and never activate a tab: focus emulation keeps a background tab rendering for CDP captures and input.
+      try { await this.api.debugger.send(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }); } catch { /* best effort */ }
+    })();
+    enabling.catch(() => {});
+    this.enabling.set(tabId, enabling);
+    void enabling.then(() => { if (this.enabling.get(tabId) === enabling) this.enabling.delete(tabId); }, () => {});
+    await this.awaitEnabled(tabId);
+  }
+
+  /** Waits for the attach's enables. A page blocked by a dialog Chrome never reported answers none of them: fail fast instead of at the call timeout. */
+  private async awaitEnabled(tabId: number): Promise<void> {
+    const enabling = this.enabling.get(tabId);
+    if (!enabling) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const slow = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new PageUnresponsive(tabId)), this.attachAnswer); });
+    slow.catch(() => {});
+    try { await Promise.race([enabling, slow]); } finally { clearTimeout(timer); }
   }
 
   /** `sessionId` sends the command to a cross-origin iframe of the tab instead of its top page. */
@@ -480,6 +636,7 @@ export class Executor {
     this.lastPoint.delete(tabId);
     this.autoAttached.delete(tabId);
     this.frameSessions.delete(tabId);
+    this.dialogs.delete(tabId);
   }
 
   private push<T>(map: Map<number, T[]>, tabId: number, item: T): void {
@@ -500,6 +657,8 @@ export class Executor {
       this.frameSessions.get(tabId)?.delete(p.sessionId);
       this.autoAttached.get(tabId)?.delete(p.sessionId);
     }
+    if (method === "Page.javascriptDialogOpening") this.onDialogOpening(tabId, p, sessionId);
+    else if (method === "Page.javascriptDialogClosed" && this.dialogs.get(tabId)?.sessionId === sessionId) this.dialogs.delete(tabId);
     // Console, network and navigation state describe the top page only.
     if (sessionId !== undefined) return;
     if (method === "Page.frameNavigated" && !(p.frame as { parentId?: string } | undefined)?.parentId) this.domReady.delete(tabId);

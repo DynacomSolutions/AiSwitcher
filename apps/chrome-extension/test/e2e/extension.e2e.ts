@@ -221,6 +221,13 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
             ? `<input type="file" id="frameInput" style="display:none"><button id="framePick" onclick="document.getElementById('frameInput').click()">Upload in frame</button>${reporter}`
             : u.pathname === "/second"
             ? `<h1>Second page</h1><p id="p">Landed.</p>`
+            : u.pathname === "/dialogs"
+            ? `<h1>Dialogs</h1>
+               <button id="alert" onclick="alert('Saved to drafts'); result.textContent='alert closed'">Alert</button>
+               <button id="prompt" onclick="result.textContent='prompt ' + prompt('Your name?', 'Ada')">Prompt</button>
+               <input id="draft" aria-label="Draft" oninput="window.onbeforeunload = e => { e.preventDefault(); e.returnValue = ''; }">
+               <p id="result">idle</p>
+               <script>if (location.search.includes("onload")) setTimeout(() => alert("Opened on load"), 0);</script>`
             : u.pathname === "/opener"
             ? `<h1>Opener</h1><a id="open" href="/second" target="_blank">Open in new tab</a>`
             : `<h1>Fixture</h1><p id="out">idle</p><button id="go" onclick="out.textContent='go clicked'">Go</button><button id="save" onclick="out.textContent='save clicked'">Save</button><button id="bottom" onclick="out.textContent='bottom clicked'" onmouseenter="window.enters=(window.enters||0)+1" onmouseleave="window.leaves=(window.leaves||0)+1">Bottom</button>`;
@@ -541,6 +548,88 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     expect(ctx.sessionTabs.map(t => t.tabId)).toContain(opened);
     for (const id of [opened, made.tabId]) expect((await call(agents.a!, "close_tab", { tabId: id })).ok).toBe(true);
   });
+
+  it("JavaScript dialogs end calls at once, show in tabs_context and are answered only by handle_dialog", async () => {
+    const a = agents.a!;
+    const url = `http://127.0.0.1:${site.port}/dialogs`;
+    const { tabId } = JSON.parse(textOf(await call(a, "tabs_create", { url }))) as { tabId: number };
+    const page = await pageSession(u => u === url);
+    const out = () => page.eval<string>(`document.getElementById("result").textContent`);
+    const tree = textOf(await call(a, "read_page", { tabId }));
+    const ref = (label: RegExp) => { const m = label.exec(tree)?.[1]; expect(m).toBeDefined(); return m!; };
+    const timed = async (tool: string, args: Record<string, unknown>) => { const t0 = Date.now(); const r = await call(a, tool, args); return { r, ms: Date.now() - t0 }; };
+    const tabOpen = (id: number) => sw.eval<boolean>(`chrome.tabs.get(${id}).then(() => true, () => false)`);
+    const dialogOf = async (id: number) => (JSON.parse(textOf(await call(a, "tabs_context"))) as { sessionTabs: Array<{ tabId: number; dialog?: { type: string; message: string } }> }).sessionTabs.find(t => t.tabId === id)?.dialog;
+
+    // An alert raised by a click: the click returns at once with the dialog, and every other call on the tab says so too.
+    let { r, ms } = await timed("click", { tabId, ref: ref(/button "Alert" \[(ref_\d+)\]/) });
+    expect(r).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(ms).toBeLessThan(10_000);
+    expect(r.ok ? "" : r.message).toContain(`alert dialog is open on tab ${tabId}`);
+    expect(r.ok ? "" : r.message).toContain("Saved to drafts");
+    expect(await dialogOf(tabId)).toMatchObject({ type: "alert", message: "Saved to drafts" });
+    ({ r, ms } = await timed("screenshot", { tabId }));
+    expect(r).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(ms).toBeLessThan(5_000);
+    expect(textOf(await call(a, "handle_dialog", { tabId, accept: true }))).toContain('Accepted the alert dialog "Saved to drafts"');
+    await until("alert answered", async () => (await out()) === "alert closed");
+    expect(await dialogOf(tabId)).toBeUndefined();
+    expect(await call(a, "handle_dialog", { tabId, accept: true })).toMatchObject({ ok: false, error: "bad_args" });
+
+    // A prompt, answered with text.
+    ({ r } = await timed("click", { tabId, ref: ref(/button "Prompt" \[(ref_\d+)\]/) }));
+    expect(r.ok ? "" : r.message).toContain('Default prompt text: "Ada"');
+    expect(await dialogOf(tabId)).toMatchObject({ type: "prompt", message: "Your name?", defaultPrompt: "Ada" });
+    expect((await call(a, "handle_dialog", { tabId, accept: true, promptText: "Grace" })).ok).toBe(true);
+    await until("prompt answered", async () => (await out()) === "prompt Grace");
+
+    // A dialog from the javascript tool.
+    ({ r, ms } = await timed("javascript", { tabId, code: "confirm('Really?')" }));
+    expect(r).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(ms).toBeLessThan(10_000);
+    expect(r.ok ? "" : r.message).toContain("confirm dialog");
+    expect((await call(a, "handle_dialog", { tabId, accept: false })).ok).toBe(true);
+
+    // Unsaved changes: close_tab and navigate get "Leave site?" back, and the tab stays until the agent accepts.
+    expect((await call(a, "type", { tabId, ref: ref(/textbox "Draft" \[(ref_\d+)\]/), text: "unsent words" })).ok).toBe(true);
+    ({ r, ms } = await timed("close_tab", { tabId }));
+    expect(r).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(ms).toBeLessThan(10_000);
+    expect(r.ok ? "" : r.message).toContain("beforeunload dialog");
+    expect(r.ok ? "" : r.message).toContain("discards the user's unsaved changes");
+    expect(await dialogOf(tabId)).toMatchObject({ type: "beforeunload" });
+    expect(textOf(await call(a, "handle_dialog", { tabId, accept: false }))).toContain("close_tab did not happen");
+    await sleep(500);
+    expect(await tabOpen(tabId)).toBe(true);
+    expect(await page.eval<string>(`document.getElementById("draft").value`)).toBe("unsent words");
+    ({ r, ms } = await timed("navigate", { tabId, url: `http://127.0.0.1:${site.port}/second` }));
+    expect(r).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(ms).toBeLessThan(10_000);
+    expect((await call(a, "handle_dialog", { tabId, accept: false })).ok).toBe(true);
+    expect(await page.eval<string>(`location.pathname`)).toBe("/dialogs");
+    expect((await call(a, "close_tab", { tabId })).ok).toBe(false);
+    expect(textOf(await call(a, "handle_dialog", { tabId, accept: true }))).toContain("the tab closes");
+    await until("tab closed after accept", async () => !(await tabOpen(tabId)));
+    expect((JSON.parse(textOf(await call(a, "tabs_context"))) as { sessionTabs: Array<{ tabId: number }> }).sessionTabs.map(t => t.tabId)).not.toContain(tabId);
+
+    // A dialog that opened before the extension attached: Chrome never reports it (and suppresses dialogs in a background tab
+    // no debugger watches), so it happens in the owner's foreground tab. Calls fail fast and name the likely dialog.
+    await sw.eval(`chrome.tabs.create({ url: ${JSON.stringify(`${url}?onload`)}, active: true })`);
+    const early = await until("owner's tab", async () => (await sw.eval<number[]>(`chrome.tabs.query({}).then(ts => ts.filter(t => (t.url || t.pendingUrl || "").endsWith("?onload")).map(t => t.id))`))[0]);
+    await sleep(1000);
+    ({ r, ms } = await timed("adopt_tab", { tabId: early }));
+    expect(textOf(r)).toContain(`Adopted tab ${early}`);
+    expect(textOf(r)).toContain("opened before AIS attached");
+    expect(ms).toBeLessThan(10_000);
+    for (const [tool, args] of [["screenshot", {}], ["handle_dialog", { accept: false }]] as const) {
+      ({ r, ms } = await timed(tool, { tabId: early, ...args }));
+      expect(r).toMatchObject({ ok: false, error: "timeout" });
+      expect(r.ok ? "" : r.message).toContain("Ask the user to answer it in Chrome");
+      expect(ms).toBeLessThan(10_000);
+    }
+    await sw.eval(`chrome.tabs.remove(${early})`); // the owner closes it
+    await until("owner's tab closed", async () => !(await tabOpen(early)));
+  }, 120_000);
 
   async function panel(): Promise<Session> {
     const s = await extensionPage("sidepanel.html");

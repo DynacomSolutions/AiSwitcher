@@ -210,7 +210,8 @@ describe("args and tools", () => {
   });
 
   test("every tool except list_browsers has a schema", () => {
-    expect(Object.keys(TOOL_SCHEMAS)).toHaveLength(20);
+    expect(Object.keys(TOOL_SCHEMAS)).toHaveLength(21);
+    expect(Object.keys(TOOL_SCHEMAS)).toContain("handle_dialog");
     expect(Object.keys(TOOL_SCHEMAS)).toContain("upload_file");
     expect(validateToolArgs("click", { tabId: 1, coordinate: [1, 2] })).toBeUndefined();
     expect(validateToolArgs("click", { tabId: 1, coordinate: [1] })).toBeDefined();
@@ -739,5 +740,111 @@ describe("upload_file", () => {
     expect(await executor.run(call("upload_file", { tabId, files: [file] }))).toMatchObject({ ok: false, error: "bad_args" });
     expect(await executor.run(call("upload_file", { tabId, ref: "ref_1", files: [file] }, { id: "s2", identity: "dyn", label: "x" }))).toMatchObject({ ok: false, error: "forbidden_tab" });
     expect(methods(api)).not.toContain("Runtime.callFunctionOn");
+  });
+});
+
+describe("JavaScript dialogs", () => {
+  const never = () => new Promise<never>(() => {});
+  /** The page raises a dialog while handling the command, and then answers nothing until the dialog is answered. */
+  const raises = (api: FakeChrome, tabId: number, params: Record<string, unknown>) => () => { api.emit(tabId, "Page.javascriptDialogOpening", params); return never(); };
+  const answers = (api: FakeChrome) => api.cdpLog.filter(l => l.method === "Page.handleJavaScriptDialog");
+  const errorOf = (r: Awaited<ReturnType<Executor["run"]>>) => (r.ok ? "" : r.message);
+
+  test("a dialog raised during a call ends it at once with dialog_open; tabs_context shows it; other calls fail until handle_dialog answers", async () => {
+    const { api, tabs, executor } = setup(undefined, { defaultTimeoutMs: 5000 });
+    const tab = await tabs.create(session);
+    api.cdpResults["Runtime.evaluate"] = raises(api, tab.id, { type: "confirm", message: "Delete the draft?", url: "https://example.test/mail" });
+    const t0 = Date.now();
+    const r = await executor.run(call("javascript", { tabId: tab.id, code: "confirm('Delete the draft?')" }));
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(r).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(errorOf(r)).toContain(`A JavaScript confirm dialog is open on tab ${tab.id} (https://example.test/mail): "Delete the draft?". It opened during javascript.`);
+    expect(errorOf(r)).toContain(`handle_dialog {tabId: ${tab.id}, accept: true|false}`);
+    const ctx = JSON.parse(textOf(await executor.run(call("tabs_context"))));
+    expect(ctx.sessionTabs[0].dialog).toEqual({ type: "confirm", message: "Delete the draft?", url: "https://example.test/mail" });
+    const sent = api.cdpLog.length;
+    expect(await executor.run(call("screenshot", { tabId: tab.id }))).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(await executor.run(call("navigate", { tabId: tab.id, url: "https://example.test/other" }))).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(api.cdpLog.length).toBe(sent); // nothing was sent to the blocked page
+    expect((await executor.run(call("get_console", { tabId: tab.id }))).ok).toBe(true);
+    expect(answers(api)).toEqual([]); // never answered on the agent's behalf
+    const done = await executor.run(call("handle_dialog", { tabId: tab.id, accept: false }));
+    expect(textOf(done)).toBe('Dismissed the confirm dialog "Delete the draft?".');
+    expect(answers(api)).toEqual([{ tabId: tab.id, method: "Page.handleJavaScriptDialog", params: { accept: false } }]);
+    expect(JSON.parse(textOf(await executor.run(call("tabs_context")))).sessionTabs[0].dialog).toBeUndefined();
+    expect(await executor.run(call("handle_dialog", { tabId: tab.id, accept: true }))).toMatchObject({ ok: false, error: "bad_args" });
+  });
+
+  test("a prompt is answered with promptText; the text is only sent when accepting", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    await executor.run(call("javascript", { tabId: tab.id, code: "1" })); // attached
+    api.emit(tab.id, "Page.javascriptDialogOpening", { type: "prompt", message: "Your name?", url: "https://example.test/", defaultPrompt: "Ada" });
+    expect(errorOf(await executor.run(call("read_page", { tabId: tab.id })))).toContain('Default prompt text: "Ada"');
+    expect((await executor.run(call("handle_dialog", { tabId: tab.id, accept: true, promptText: "Grace" }))).ok).toBe(true);
+    api.emit(tab.id, "Page.javascriptDialogOpening", { type: "prompt", message: "Again?", url: "https://example.test/" });
+    expect((await executor.run(call("handle_dialog", { tabId: tab.id, accept: false, promptText: "ignored" }))).ok).toBe(true);
+    expect(answers(api).map(a => a.params)).toEqual([{ accept: true, promptText: "Grace" }, { accept: false }]);
+  });
+
+  test("close_tab on a page with unsaved changes: the beforeunload dialog ends the call, the tab stays owned, only an explicit accept closes it", async () => {
+    const { api, tabs, executor } = setup(undefined, { defaultTimeoutMs: 5000 });
+    const tab = await tabs.create(session);
+    const remove = api.tabs.remove;
+    api.tabs.remove = async () => { api.emit(tab.id, "Page.javascriptDialogOpening", { type: "beforeunload", message: "", url: "https://mail.example.test/" }); return never(); };
+    const r = await executor.run(call("close_tab", { tabId: tab.id }));
+    expect(r).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(errorOf(r)).toContain("It opened during close_tab.");
+    expect(errorOf(r)).toContain(`handle_dialog {tabId: ${tab.id}, accept: false} to stay on the page`);
+    expect(errorOf(r)).toContain("discards the user's unsaved changes, so only do that if the user asked for it");
+    expect(api.tabList.has(tab.id)).toBe(true);
+    expect(tabs.owns("s1", tab.id, "dyn")).toBe(true);
+    expect(answers(api)).toEqual([]);
+    // Cancel: the page stays, with its changes.
+    expect(textOf(await executor.run(call("handle_dialog", { tabId: tab.id, accept: false })))).toContain("The page stays open with its changes; close_tab did not happen.");
+    expect(tabs.owns("s1", tab.id, "dyn")).toBe(true);
+    // Again, and this time the agent accepts: Chrome closes the tab.
+    expect(await executor.run(call("close_tab", { tabId: tab.id }))).toMatchObject({ ok: false, error: "dialog_open" });
+    api.cdpResults["Page.handleJavaScriptDialog"] = (p?: Record<string, unknown>) => { if (p?.accept) void remove(tab.id); return {}; };
+    expect(textOf(await executor.run(call("handle_dialog", { tabId: tab.id, accept: true })))).toContain("and the tab closes; its unsaved changes are discarded.");
+    expect(api.tabList.has(tab.id)).toBe(false);
+    expect(tabs.owns("s1", tab.id, "dyn")).toBe(false);
+  });
+
+  test("a dialog the user answers in Chrome is forgotten", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    await executor.run(call("javascript", { tabId: tab.id, code: "1" }));
+    api.emit(tab.id, "Page.javascriptDialogOpening", { type: "alert", message: "Hi", url: "https://example.test/" });
+    expect(executor.pendingDialog(tab.id)).toMatchObject({ type: "alert", message: "Hi" });
+    api.emit(tab.id, "Page.javascriptDialogClosed", { result: true, userInput: "" });
+    expect(executor.pendingDialog(tab.id)).toBeUndefined();
+    expect((await executor.run(call("javascript", { tabId: tab.id, code: "1" }))).ok).toBe(true);
+  });
+
+  test("a page that does not answer the attach (a dialog opened before it) fails fast; adopt_tab still adopts and says so", async () => {
+    const { api, tabs, executor } = setup(undefined, { defaultTimeoutMs: 5000, attachAnswerMs: 50 });
+    api.cdpResults["Page.enable"] = never;
+    api.addTab(7, "https://mail.example.test/");
+    const adopted = await executor.run(call("adopt_tab", { tabId: 7 }));
+    expect(textOf(adopted)).toContain("Adopted tab 7");
+    expect(textOf(adopted)).toContain("opened before AIS attached to it; AIS cannot see or answer that one. Ask the user to answer it in Chrome");
+    expect(tabs.owns("s1", 7, "dyn")).toBe(true);
+    for (const [tool, args] of [["screenshot", {}], ["close_tab", {}], ["handle_dialog", { accept: false }]] as const) {
+      const t0 = Date.now();
+      const r = await executor.run(call(tool, { tabId: 7, ...args }));
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expect(r).toMatchObject({ ok: false, error: "timeout" });
+      expect(errorOf(r)).toContain("Tab 7 does not respond.");
+    }
+    expect(api.tabList.has(7)).toBe(true);
+    expect(answers(api)).toEqual([]);
+  });
+
+  test("handle_dialog says beforeunload accept discards changes in its description; nothing accepts automatically", () => {
+    expect(TOOL_SCHEMAS.handle_dialog.description).toContain("DISCARDS THE USER'S UNSAVED CHANGES");
+    expect(TOOL_SCHEMAS.handle_dialog.description).toContain("Nothing is ever accepted automatically.");
+    expect(validateToolArgs("handle_dialog", { tabId: 1 })).toBeDefined();
+    expect(validateToolArgs("handle_dialog", { tabId: 1, accept: true, promptText: "x" })).toBeUndefined();
   });
 });

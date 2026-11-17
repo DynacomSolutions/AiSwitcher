@@ -38,7 +38,17 @@ Swap pools: mint a token for each pool member (`ais browser agent-token <member>
 
 ## Tools
 
-`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
+`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
+
+### JavaScript dialogs
+
+A page blocked by a JavaScript dialog (alert, confirm, prompt, or beforeunload "Leave site?") answers neither input nor script, so a call on it used to hang until the 30 s timeout. The extension watches `Page.javascriptDialogOpening` / `Page.javascriptDialogClosed` on every tab it is attached to and keeps the open dialog per tab (type, message, url, default prompt text).
+
+- A dialog that opens while a call runs on the tab (a click, `javascript`, `navigate`, `close_tab` on a page with unsaved changes) ends that call at once with `dialog_open`, naming the dialog type and message. The call's own work is left to finish in the background once the dialog is answered.
+- While a dialog is open every call on the tab fails with `dialog_open` without touching the page, except `get_console`, `get_network` and `handle_dialog`. `tabs_context` shows it as `dialog` on the tab.
+- `handle_dialog {tabId, accept, promptText?}` answers it (`Page.handleJavaScriptDialog`). Nothing ever answers a dialog on the agent's behalf. Accepting a beforeunload dialog leaves the page (or lets `close_tab` close the tab) and discards the user's unsaved changes, so agents must only do it when the user asked; the tool description and the error say so. Dismissing it keeps the page and its changes, and the tab stays owned.
+- `close_tab` and `navigate` never force-leave a page: they run the page's beforeunload as Chrome does. `close_tab` attaches first so a "Leave site?" dialog is seen, then waits up to 5 s for Chrome to close the tab.
+- Chrome never reports a dialog that opened before the debugger attached, and then answers no command (`Page.enable` hangs). A fresh attach the page does not answer within 5 s fails with `timeout` and a message saying the page probably shows such a dialog that only the user can answer; `adopt_tab` still adopts the tab and says so. Chrome suppresses dialogs in a background tab no debugger watches, so this only happens in a foreground tab, typically one the user opened.
 
 ### File upload
 
@@ -56,7 +66,7 @@ Limits: at most 10 files and 10 MiB in total per call (checked by the MCP server
 - Pause (extension popup): calls fail with `paused_by_user` until resumed.
 - Stop: ends the agent's calls with `stopped_by_user`.
 - `ais browser revoke <name>` revokes the binding and drops its connection; the profile must pair again.
-- Error codes: `paused_by_user`, `stopped_by_user`, `no_browser`, `ambiguous_browser`, `forbidden_tab`, `tab_closed`, `tab_hidden`, `timeout`, `browser_disconnected`, `bad_args`, `internal`.
+- Error codes: `paused_by_user`, `stopped_by_user`, `no_browser`, `ambiguous_browser`, `forbidden_tab`, `tab_closed`, `tab_hidden`, `dialog_open`, `timeout`, `browser_disconnected`, `bad_args`, `internal`.
 
 ## Deploy requirements
 
