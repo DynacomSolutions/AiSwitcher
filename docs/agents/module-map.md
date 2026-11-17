@@ -169,6 +169,13 @@ src/
                             /web/state (hostPath mount + hostPID otherwise put the pod's
                             daemon pid in the same server.json the host daemon manages,
                             and each side's stop/start churn killed the other's daemon)
+    web-push.ts            Web Push with node:crypto only: VAPID key pair and browser
+                            subscriptions in the console state dir (0600), RFC 8291
+                            aes128gcm payload encryption, RFC 8292 VAPID JWT, sendToAll()
+                            (drops endpoints the push service reports gone)
+    reset-expiry-push.ts   ResetExpiryNotifier: hourly daemon check over the limits scan;
+                            pushes once per unspent Claude grant / Codex credit at 7 days,
+                            3 days and 24 hours before it ends (AIS_RESET_PUSH=0 opts out)
     expensive.ts           PollCache (TTL + in-flight dedupe) shared by the limits/usage
                             endpoints so BOTH frontends' live polling never hammers
                             upstream provider APIs; also maps query params onto the

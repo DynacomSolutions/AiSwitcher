@@ -13,7 +13,8 @@ import { LoginFlowManager } from "./login-flows.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
-import { stopScanWorkers, stopUsageSnapshotSampler, warmUsageCaches } from "./workers.ts";
+import { runScanIsolated, stopScanWorkers, stopUsageSnapshotSampler, warmUsageCaches } from "./workers.ts";
+import { ResetExpiryNotifier } from "./reset-expiry-push.ts";
 import { isAisLive, isLiveImageUser, noteLiveFeatureDisabled } from "../shared/live-mode.ts";
 import { ServerLifecycle, stopServerAfterDrain, trackResponseBody } from "./lifecycle.ts";
 
@@ -182,6 +183,14 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     claudeSwap.start();
   }
 
+  // Daemon-side push reminders for manual resets nearing expiry (7 days, 3 days,
+  // 24 hours). Idle until a browser subscribes; AIS_RESET_PUSH=0 opts out.
+  let resetExpiryPush: ResetExpiryNotifier | undefined;
+  if (process.env.AIS_RESET_PUSH !== "0") {
+    resetExpiryPush = new ResetExpiryNotifier({ scanLimits: () => runScanIsolated("limits", { maxAgeS: 45 }, 45_000) });
+    resetExpiryPush.start();
+  }
+
   const browserAuth = await browserAuthFromEnv();
   const token = newConsoleToken();
   const deps: ConsoleAppDeps = {
@@ -194,6 +203,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     ...(spendGuard ? { spendGuard } : {}),
     ...(herdrBridge ? { herdrBridge } : {}),
     ...(claudeSwap ? { claudeSwap } : {}),
+    ...(resetExpiryPush ? { resetExpiryPush } : {}),
     loginFlows,
     ...(browserAuth ? { browserAuth } : {}),
     ...(options.distDir ? { distDir: options.distDir } : {}),
@@ -280,6 +290,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
       spendGuard?.stop();
       herdrBridge?.stop();
       claudeSwap?.stop();
+      resetExpiryPush?.stop();
       loginFlows.stop();
       void stopServerAfterDrain(server, lifecycle).then(finishShutdownWhenDrained);
     };
@@ -302,7 +313,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     }
   }
 
-  return { port: server.port ?? port, token, stop: () => { stopUsageSnapshotSampler(); scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); claudeSwap?.stop(); loginFlows.stop(); server.stop(true); } };
+  return { port: server.port ?? port, token, stop: () => { stopUsageSnapshotSampler(); scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); claudeSwap?.stop(); resetExpiryPush?.stop(); loginFlows.stop(); server.stop(true); } };
 }
 
 /** Best-effort discovery of the built WebUI dist relative to wherever this

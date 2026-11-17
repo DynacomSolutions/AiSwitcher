@@ -859,3 +859,10 @@ export interface LocalModelsResponse {
   runner: string | null;
   models: Array<{ name: string; path: string; sizeBytes: number }>;
 }
+
+/** GET /api/push: the daemon's VAPID public key and reset-expiry reminder state. */
+export interface PushStatusResponse {
+  publicKey: string;
+  subscriptions: number;
+  resetExpiry: { running: boolean; lastCheckAt: string | null; lastError: string | null; lastSent: number } | null;
+}

@@ -392,6 +392,33 @@ updates the cached grant list. Swap pools and retired identities are refused
 (409); Anthropic refusals keep their status and reason. The console asks for
 confirmation first.
 
+Codex `manualReset` also carries `creditExpiries[]` (`{ id, label?, endsAt }`,
+ISO) for each available reset credit.
+
+### Push notifications
+
+The installed PWA subscribes for reset-expiry reminders. The daemon sends one
+Web Push (VAPID, aes128gcm) when an unspent Claude grant or Codex credit is 7
+days from its end, again at 3 days and at 24 hours; each stage is sent once per
+grant and recorded in `<state dir>/reset-expiry-push.json`. The check runs hourly
+through the shared limits scan, and only when a browser has subscribed. Swap
+pool rows are skipped (their members carry the grants). `AIS_RESET_PUSH=0`
+turns the reminders off; `AIS_PUSH_SUBJECT` sets the VAPID contact (default:
+the subscribing page's https origin); `AIS_PUSH_TIMEZONE` sets the zone for the
+deadline in the message (default `TZ`).
+
+- `GET /api/push` -> `{ publicKey, subscriptions, resetExpiry: { running, lastCheckAt, lastError, lastSent } | null }`.
+  Endpoints are capability URLs and are never returned.
+- `POST /api/push/subscribe` `{ subscription: PushSubscriptionJSON }` -> `{ ok, subscriptions }`.
+  https endpoints only; the request `Origin` is stored as the VAPID subject.
+- `POST /api/push/unsubscribe` `{ endpoint }` -> `{ ok, removed }`.
+- `POST /api/push/test` -> `{ ok, sent, removed, failed }`: a test notification to every subscription.
+  Endpoints the push service answers 404/410 for are removed.
+- `POST /api/push/reset-expiry/check` -> `{ ok, sent, status }`: runs the hourly check now (503 without the daemon).
+
+The VAPID key pair (`push-vapid.json`) and subscriptions (`push-subscriptions.json`)
+live in the console state dir, mode 0600.
+
 ### Gateway apps
 
 All gateway reads and writes go through the gateway admin API server-side

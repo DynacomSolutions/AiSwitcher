@@ -90,6 +90,8 @@ export interface ManualResetInfo {
   grantsCapturedAt?: string;
   /** True when `grants` were carried over from an earlier read because the latest one omitted them. */
   stale?: boolean;
+  /** Codex only: each available credit with its exact expiry (ISO), for the reset-expiry push. */
+  creditExpiries?: { id: string; label?: string; endsAt: string }[];
 }
 
 /** What one reset grant clears: every limit, only the Fable model's weekly limit, or something not recognised. */
