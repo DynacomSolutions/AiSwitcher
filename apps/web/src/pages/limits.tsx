@@ -32,7 +32,7 @@ import { Separator } from "@/components/ui/separator";
 import { qk, useLimitsQuery, usePoolsUsageQuery } from "@/hooks/queries";
 import { api } from "@/lib/api";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
-import type { LimitFetchStatus, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult } from "@/types/api";
+import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseResetResult } from "@/types/api";
 
 function StatusBadge({ status }: { status: LimitFetchStatus }) {
   switch (status) {
@@ -110,11 +110,24 @@ function grantState(grant: ResetGrant, cooldown: boolean): string {
   return grant.usableNow ? "usable now" : "not usable now";
 }
 
+/** The row with the spent grant applied, as the server records it, until the next read arrives. */
+function spendGrant(row: ToolLimitResult, spent: UseResetResult): ToolLimitResult {
+  const reset = row.manualReset;
+  if (row.toolName !== "claude" || row.identity.name !== spent.identity || !reset?.grants) return row;
+  const grants = reset.grants.map((g) =>
+    g.id !== spent.grantId ? g : { ...g, ...(spent.resetsLeft !== undefined ? { resetsLeft: spent.resetsLeft, usableNow: g.usableNow && spent.resetsLeft > 0 } : { usableNow: false }) },
+  );
+  const availableCount = grants.filter((g) => g.usableNow).reduce((n, g) => n + g.resetsLeft, 0);
+  return { ...row, manualReset: { ...reset, grants, availableCount, ...(spent.cooldownUntil ? { cooldownUntil: spent.cooldownUntil } : {}) } };
+}
+
 function UseResetDialog({ identity, grant, onClose }: { identity: string; grant: ResetGrant; onClose: () => void }) {
   const qc = useQueryClient();
   const mutation = useMutation({
     mutationFn: () => api.useClaudeReset(identity, grant.id),
     onSuccess: (r) => {
+      // Show the spent credit now; the refetch then brings the cleared windows from Anthropic.
+      qc.setQueryData<LimitsResponse>(qk.limits, (prev) => prev && { ...prev, results: prev.results.map((row) => spendGrant(row, r)) });
       void qc.invalidateQueries({ queryKey: qk.limits });
       const left = r.resetsLeft !== undefined ? `, ${r.resetsLeft} left` : "";
       toast.success(`Reset ${r.result}`, { description: `${identity}: ${grant.label ?? grant.id}${left}${r.cleared.length ? `; cleared ${r.cleared.join(", ")}` : ""}` });

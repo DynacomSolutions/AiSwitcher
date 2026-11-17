@@ -72,6 +72,11 @@ function cacheFor(kind: ScanKind): PollCache | undefined {
   }
 }
 
+/** Drops the daemon's cached limits so the next /api/limits read scans again (after a reset is spent). */
+export function invalidateLimitsCache(): void {
+  limitsCache.clear();
+}
+
 /** Cache-through runner shared by every cacheable scan kind: identical
  * results inside the TTL (failures are never cached; the next poll
  * retries). The payload's `cached` flag is the DAEMON's (the scan child is

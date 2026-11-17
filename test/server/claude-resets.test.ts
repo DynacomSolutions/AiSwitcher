@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadLastGood, saveLastGood } from "../../src/cli/limits/claude-limits.ts";
+import { fetchClaudeLimits, loadLastGood, saveLastGood } from "../../src/cli/limits/claude-limits.ts";
 import { createApp } from "../../src/server/app.ts";
 import { CLAUDE_PROFILE_URL, claudeResetUrl, useClaudeReset } from "../../src/server/claude-resets.ts";
 import { HttpError } from "../../src/server/types.ts";
@@ -49,6 +49,37 @@ describe("useClaudeReset", () => {
     expect(cached).toMatchObject({ availableCount: 0, cooldownUntil: "2026-11-13T00:00:00Z", grants: [{ id: GRANT, resetsLeft: 0, usableNow: false }] });
   });
 
+  test("after a spend the next limits read goes to Anthropic for the cleared windows and keeps the spent count", async () => {
+    const { identity, cacheDir, claudeRegistryPath } = setup();
+    await saveLastGood(identity, {
+      toolName: "claude",
+      identity,
+      windows: [{ label: "week (all)", category: "week", usedPercent: 100 }],
+      status: "live",
+      capturedAt: new Date().toISOString(),
+      manualReset: { availableCount: 2, grantsCapturedAt: new Date().toISOString(), grants: [{ id: GRANT, kind: "full", resetsLeft: 2, usableNow: true, paused: false }] },
+    }, cacheDir);
+    const fetchImpl = (async (url: unknown) =>
+      String(url) === CLAUDE_PROFILE_URL ? Response.json({ organization: { uuid: ORG } }) : Response.json({ result: "reset", grant_id: GRANT, resets_left: 1, cleared: ["weekly_all"] })) as unknown as typeof fetch;
+    await useClaudeReset("acct", GRANT, { resolveIdentity: async () => identity, fetchImpl, cacheDir, claudeRegistryPath });
+    expect((await loadLastGood(identity, cacheDir))?.status).toBe("cached");
+
+    let reads = 0;
+    const reconcile = async () => undefined as never;
+    // Anthropic leaves cedar_ember out once the account is clear of its limit: the spent count is carried from the cache.
+    const after = await fetchClaudeLimits(identity, { reconcile, cacheDir, fetchBody: async () => (reads++, { body: { seven_day: { utilization: 0, resets_at: "2026-11-20T00:00:00Z" } } }) });
+    expect(reads).toBe(1);
+    expect(after.status).toBe("live");
+    expect(after.windows.find((w) => w.category === "week")?.usedPercent).toBe(0);
+    expect(after.manualReset?.grants?.[0]).toMatchObject({ id: GRANT, resetsLeft: 1 });
+
+    // Anthropic refusing the read still shows the spent count, never the pre-spend one.
+    await useClaudeReset("acct", GRANT, { resolveIdentity: async () => identity, fetchImpl, cacheDir, claudeRegistryPath });
+    const refused = await fetchClaudeLimits(identity, { reconcile, cacheDir, fetchBody: async () => ({ error: "usage endpoint answered HTTP 429", status: 429 }) });
+    expect(refused.status).toBe("cached");
+    expect(refused.manualReset?.grants?.[0]).toMatchObject({ id: GRANT, resetsLeft: 1 });
+  });
+
   test("refusals are honest and never reach Anthropic for a bad grant id, pool or retired identity", async () => {
     const { identity, cacheDir, claudeRegistryPath } = setup();
     let hits = 0;
@@ -72,14 +103,25 @@ describe("useClaudeReset", () => {
 
   test("the route needs the console header and reaches the seam", async () => {
     const seen: string[] = [];
+    let invalidated = 0;
     const app = createApp({
       token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1", peerPort: 50000, peerUid: () => process.getuid?.(),
-      claudeUseReset: async (identity, grant) => (seen.push(`${identity}:${grant}`), { identity, grantId: grant, result: "reset", cleared: [] }),
+      claudeUseReset: async (identity, grant) => {
+        seen.push(`${identity}:${grant}`);
+        if (grant === "refused") throw new HttpError(409, "Anthropic refused the reset (HTTP 409)");
+        return { identity, grantId: grant, result: "reset", cleared: [] };
+      },
+      invalidateLimits: () => void invalidated++,
     });
     const path = `/api/limits/claude/acct/resets/${GRANT}`;
     expect((await app.request(path, { method: "POST", headers: { Host: "127.0.0.1:47129" } })).status).toBe(403);
     const ok = await app.request(path, { method: "POST", headers: { Host: "127.0.0.1:47129", "X-AIS-Console": "1" } });
     expect(ok.status).toBe(200);
     expect(seen).toEqual([`acct:${GRANT}`]);
+    // The page refetches limits next: the cached read must not answer it.
+    expect(invalidated).toBe(1);
+    const refused = await app.request("/api/limits/claude/acct/resets/refused", { method: "POST", headers: { Host: "127.0.0.1:47129", "X-AIS-Console": "1" } });
+    expect(refused.status).toBe(409);
+    expect(invalidated).toBe(1);
   });
 });

@@ -24,7 +24,7 @@ import { collectTargets } from "../cli/usage/run.ts";
 import { readUsageProjects } from "../cli/usage/projects.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
-import { runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
+import { invalidateLimitsCache, runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
 import * as gatewayApps from "./gateway-apps.ts";
 import * as claudeResets from "./claude-resets.ts";
@@ -87,6 +87,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   }>;
   /** Test seam for POST /api/limits/claude/:identity/resets/:grant; defaults to Anthropic's reset endpoint. */
   claudeUseReset?: (identity: string, grantId: string) => Promise<claudeResets.UseResetResult>;
+  /** Test seam: drops the cached /api/limits reads after a spent reset; defaults to the scan daemon's cache. */
+  invalidateLimits?: () => void;
   /** Test seam for GET /api/usage/projects; defaults to reading the collector's projects.json. */
   usageProjects?: () => ReturnType<typeof readUsageProjects>;
   /** Test seam for GET /api/pools/usage. */
@@ -280,9 +282,12 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     c.json(await (deps.gatewayApps?.revoke ?? ((n) => gatewayApps.revokeGatewayApp(n)))(decodeSegment(c.req.param("name")))),
   );
   // Spends one Claude reset grant (cedar_ember) for an identity with its own login.
-  app.post("/api/limits/claude/:identity/resets/:grant", async (c) =>
-    c.json(await (deps.claudeUseReset ?? ((i, g) => claudeResets.useClaudeReset(i, g)))(decodeSegment(c.req.param("identity")), decodeSegment(c.req.param("grant")))),
-  );
+  // The page refetches limits right after: drop the daemon's cached read so it shows the spent credit and cleared windows.
+  app.post("/api/limits/claude/:identity/resets/:grant", async (c) => {
+    const result = await (deps.claudeUseReset ?? ((i, g) => claudeResets.useClaudeReset(i, g)))(decodeSegment(c.req.param("identity")), decodeSegment(c.req.param("grant")));
+    (deps.invalidateLimits ?? invalidateLimitsCache)();
+    return c.json(result);
+  });
   // Pool membership and the gateway ledger by identity; the console page sums these with native usage and limits.
   app.get("/api/pools/usage", async (c) => c.json(await (deps.poolsUsage ?? (() => poolsUsage()))()));
   // Per-project usage from the native store, written by the host collector
