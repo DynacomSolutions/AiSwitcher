@@ -65,6 +65,16 @@ describe("apps/web PWA files", () => {
     expect(readFileSync(join(web, "index.html"), "utf8")).toContain('<link rel="manifest" href="/manifest.webmanifest" />');
   });
 
+  test("the notification badge exists and is a transparent silhouette (Android draws only its alpha)", () => {
+    const sw = readFileSync(join(web, "public", "sw.js"), "utf8");
+    const badge = /badge: "\/([^"]+)"/.exec(sw)?.[1];
+    expect(badge).toBeDefined();
+    const png = readFileSync(join(web, "public", badge!));
+    // PNG IHDR colour type 6 = RGBA; the opaque app icon would render as a solid circle.
+    expect(png.readUInt8(25)).toBe(6);
+    expect(badge).not.toBe("icon-192.png");
+  });
+
   test("service worker never caches or touches API requests", () => {
     const sw = readFileSync(join(web, "public", "sw.js"), "utf8");
     expect(sw).not.toMatch(/caches\.|cache\.put/);
