@@ -488,7 +488,6 @@ export class Executor {
     } catch (e) {
       if (e instanceof ToolError) throw e;
       this.dialogs.delete(tabId);
-    this.enabling.delete(tabId);
       throw new ToolError("bad_args", `No JavaScript dialog is open on tab ${tabId} any more (${(e as Error).message}).`);
     }
     if (this.dialogs.get(tabId) === d) this.dialogs.delete(tabId);
@@ -584,7 +583,8 @@ export class Executor {
     })();
     enabling.catch(() => {});
     this.enabling.set(tabId, enabling);
-    void enabling.then(() => { if (this.enabling.get(tabId) === enabling) this.enabling.delete(tabId); }, () => {});
+    const settled = () => { if (this.enabling.get(tabId) === enabling) this.enabling.delete(tabId); };
+    void enabling.then(settled, settled);
     await this.awaitEnabled(tabId);
   }
 
@@ -637,6 +637,7 @@ export class Executor {
     this.autoAttached.delete(tabId);
     this.frameSessions.delete(tabId);
     this.dialogs.delete(tabId);
+    this.enabling.delete(tabId);
   }
 
   private push<T>(map: Map<number, T[]>, tabId: number, item: T): void {
