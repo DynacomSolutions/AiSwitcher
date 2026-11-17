@@ -30,7 +30,6 @@ import * as gatewayApps from "./gateway-apps.ts";
 import * as claudeResets from "./claude-resets.ts";
 import { poolsUsage, type PoolsUsageResponse } from "./pools-usage.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
-import * as webPush from "./web-push.ts";
 import type { ResetExpiryNotifier } from "./reset-expiry-push.ts";
 import { mountBrowserAuthorize, type BrowserAuthConfig } from "./browser-authorize.ts";
 import { loadBrowserBindings, revokeBrowserBinding, type BrowserBindingsView } from "./browser-bindings.ts";
@@ -297,15 +296,19 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     return c.json(result);
   });
   /* ------------------------------ web push -------------------------------- */
+  // Loaded on first use: every ais command imports this module, and start-up reads count (sync budgets).
+  const pushModule = () => import("./web-push.ts");
   // The PWA subscribes here for reset-expiry reminders (src/server/reset-expiry-push.ts).
   // Endpoints are capability URLs: accepted, never listed back.
   app.get("/api/push", async (c) => {
+    const webPush = await pushModule();
     const { publicKey } = await webPush.loadVapid(deps.pushDir);
     const subscriptions = (await webPush.loadSubscriptions(deps.pushDir)).length;
     return c.json({ publicKey, subscriptions, resetExpiry: deps.resetExpiryPush?.status() ?? null });
   });
   app.post("/api/push/subscribe", async (c) => {
     const body = (await c.req.json().catch(() => undefined)) as { subscription?: unknown } | undefined;
+    const webPush = await pushModule();
     const sub = webPush.parseSubscription(body?.subscription);
     if (!sub) throw new HttpError(400, "invalid push subscription");
     const subscriptions = await webPush.addSubscription(sub, c.req.header("origin") ?? undefined, deps.pushDir);
@@ -314,11 +317,11 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   app.post("/api/push/unsubscribe", async (c) => {
     const body = (await c.req.json().catch(() => undefined)) as { endpoint?: unknown } | undefined;
     if (typeof body?.endpoint !== "string") throw new HttpError(400, "endpoint required");
-    return c.json({ ok: true, removed: await webPush.removeSubscription(body.endpoint, deps.pushDir) });
+    return c.json({ ok: true, removed: await (await pushModule()).removeSubscription(body.endpoint, deps.pushDir) });
   });
   // Sends a test notification to every subscribed browser.
   app.post("/api/push/test", async (c) => {
-    const result = await webPush.sendToAll(
+    const result = await (await pushModule()).sendToAll(
       { title: "AIS Console", body: "Notifications are on. You will hear about resets 7 days, 3 days and 24 hours before they expire.", tag: "push-test", url: "/limits" },
       { ...(deps.pushDir ? { dir: deps.pushDir } : {}), ...(deps.pushFetch ? { fetchImpl: deps.pushFetch } : {}) },
     );

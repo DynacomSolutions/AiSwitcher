@@ -14,7 +14,7 @@ import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } fr
 import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
 import { runScanIsolated, stopScanWorkers, stopUsageSnapshotSampler, warmUsageCaches } from "./workers.ts";
-import { ResetExpiryNotifier } from "./reset-expiry-push.ts";
+import type { ResetExpiryNotifier } from "./reset-expiry-push.ts";
 import { isAisLive, isLiveImageUser, noteLiveFeatureDisabled } from "../shared/live-mode.ts";
 import { ServerLifecycle, stopServerAfterDrain, trackResponseBody } from "./lifecycle.ts";
 
@@ -187,6 +187,8 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   // 24 hours). Idle until a browser subscribes; AIS_RESET_PUSH=0 opts out.
   let resetExpiryPush: ResetExpiryNotifier | undefined;
   if (process.env.AIS_RESET_PUSH !== "0") {
+    // Imported here, not at the top: every ais command loads this module.
+    const { ResetExpiryNotifier } = await import("./reset-expiry-push.ts");
     resetExpiryPush = new ResetExpiryNotifier({ scanLimits: () => runScanIsolated("limits", { maxAgeS: 45 }, 45_000) });
     resetExpiryPush.start();
   }
