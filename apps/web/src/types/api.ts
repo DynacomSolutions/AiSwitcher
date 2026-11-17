@@ -199,7 +199,10 @@ export interface LimitWindow {
   usedPercent: number;
   /** Already human-formatted by each adapter; render as-is. */
   resetsAt?: string;
+  resetsAtMs?: number;
   note?: string;
+  /** A weekly window scoped to one model, e.g. "Fable". */
+  model?: string;
 }
 
 export interface OverageInfo {

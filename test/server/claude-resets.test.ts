@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fetchClaudeLimits, loadLastGood, saveLastGood } from "../../src/cli/limits/claude-limits.ts";
+import { clearSpentWindows, fetchClaudeLimits, loadLastGood, saveLastGood } from "../../src/cli/limits/claude-limits.ts";
+import type { LimitWindow } from "../../src/cli/limits/types.ts";
 import { createApp } from "../../src/server/app.ts";
 import { CLAUDE_PROFILE_URL, claudeResetUrl, useClaudeReset } from "../../src/server/claude-resets.ts";
 import { HttpError } from "../../src/server/types.ts";
@@ -78,6 +79,46 @@ describe("useClaudeReset", () => {
     const refused = await fetchClaudeLimits(identity, { reconcile, cacheDir, fetchBody: async () => ({ error: "usage endpoint answered HTTP 429", status: 429 }) });
     expect(refused.status).toBe("cached");
     expect(refused.manualReset?.grants?.[0]).toMatchObject({ id: GRANT, resetsLeft: 1 });
+  });
+
+  test("a spend clears its windows at once, so a rate-limited read still shows the reset", async () => {
+    const { identity, cacheDir, claudeRegistryPath } = setup();
+    await saveLastGood(identity, {
+      toolName: "claude",
+      identity,
+      windows: [
+        { label: "session (5h)", category: "session", usedPercent: 40, resetsAt: "soon" },
+        { label: "week (all)", category: "week", usedPercent: 100, resetsAt: "Fri", resetsAtMs: 1 },
+        { label: "week (Fable)", category: "week", usedPercent: 70, model: "Fable" },
+      ],
+      status: "live",
+      capturedAt: new Date().toISOString(),
+      manualReset: { availableCount: 1, grantsCapturedAt: new Date().toISOString(), grants: [{ id: GRANT, kind: "full", resetsLeft: 1, usableNow: true, paused: false }] },
+    }, cacheDir);
+    const fetchImpl = (async (url: unknown) =>
+      String(url) === CLAUDE_PROFILE_URL ? Response.json({ organization: { uuid: ORG } }) : Response.json({ result: "reset", grant_id: GRANT, resets_left: 0, cleared: ["weekly_all"] })) as unknown as typeof fetch;
+    await useClaudeReset("acct", GRANT, { resolveIdentity: async () => identity, fetchImpl, cacheDir, claudeRegistryPath });
+    const refused = await fetchClaudeLimits(identity, { reconcile: async () => undefined as never, cacheDir, fetchBody: async () => ({ error: "usage endpoint answered HTTP 429", status: 429 }) });
+    expect(refused.status).toBe("cached");
+    expect(refused.windows.map((w) => [w.label, w.usedPercent, w.resetsAt])).toEqual([
+      ["session (5h)", 40, "soon"],
+      ["week (all)", 0, undefined],
+      ["week (Fable)", 70, undefined],
+    ]);
+  });
+
+  test("clearSpentWindows: named kinds first, else the grant kind", () => {
+    const w: LimitWindow[] = [
+      { label: "session (5h)", category: "session", usedPercent: 50 },
+      { label: "week (all)", category: "week", usedPercent: 90 },
+      { label: "week (Fable)", category: "week", usedPercent: 80, model: "Fable" },
+    ];
+    const pct = (x: LimitWindow[]) => x.map((v) => v.usedPercent);
+    expect(pct(clearSpentWindows(w, ["session", "weekly_all"], "fable"))).toEqual([0, 0, 80]);
+    expect(pct(clearSpentWindows(w, ["weekly_scoped"], "full"))).toEqual([50, 90, 0]);
+    expect(pct(clearSpentWindows(w, [], "full"))).toEqual([0, 0, 0]);
+    expect(pct(clearSpentWindows(w, ["something_new"], "fable"))).toEqual([50, 90, 0]);
+    expect(clearSpentWindows(w, [], "other")).toBe(w);
   });
 
   test("refusals are honest and never reach Anthropic for a bad grant id, pool or retired identity", async () => {

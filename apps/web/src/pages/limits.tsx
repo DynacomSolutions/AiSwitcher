@@ -111,10 +111,41 @@ function grantState(grant: ResetGrant, cooldown: boolean): string {
   return grant.usableNow ? "usable now" : "not usable now";
 }
 
+/** Mirrors clearSpentWindows in src/cli/limits/claude-limits.ts: the cleared windows at 0%, by `cleared` kind, else grant kind. */
+function clearSpentWindows(windows: LimitWindow[], cleared: string[], grantKind: ResetGrant["kind"] | undefined): LimitWindow[] {
+  const kinds = cleared.map((c) => c.toLowerCase());
+  const matches = (w: LimitWindow): boolean =>
+    kinds.some((k) =>
+      k.includes("session") || k.includes("five_hour")
+        ? w.category === "session"
+        : k === "weekly_all" || k === "seven_day" || k === "weekly"
+          ? w.label === "week (all)"
+          : k.includes("scoped")
+            ? w.model !== undefined
+            : w.model !== undefined && k.includes(w.model.toLowerCase()),
+    );
+  const clears = windows.some(matches)
+    ? matches
+    : grantKind === "full"
+      ? () => true
+      : grantKind === "fable"
+        ? (w: LimitWindow) => /fable/i.test(w.model ?? w.label)
+        : () => false;
+  if (!windows.some(clears)) return windows;
+  return windows.map((w) => {
+    if (!clears(w)) return w;
+    const { resetsAt: _r, resetsAtMs: _m, ...rest } = w;
+    return { ...rest, usedPercent: 0 };
+  });
+}
+
 /** The row with the spent grant applied, as the server records it, until the next read arrives. */
 function spendGrant(row: ToolLimitResult, spent: UseResetResult): ToolLimitResult {
+  if (row.toolName !== "claude" || row.identity.name !== spent.identity) return row;
+  const kind = row.manualReset?.grants?.find((g) => g.id === spent.grantId)?.kind;
+  row = { ...row, windows: clearSpentWindows(row.windows, spent.cleared, kind) };
   const reset = row.manualReset;
-  if (row.toolName !== "claude" || row.identity.name !== spent.identity || !reset?.grants) return row;
+  if (!reset?.grants) return row;
   const grants = reset.grants.map((g) =>
     g.id !== spent.grantId ? g : { ...g, ...(spent.resetsLeft !== undefined ? { resetsLeft: spent.resetsLeft, usableNow: g.usableNow && spent.resetsLeft > 0 } : { usableNow: false }) },
   );
