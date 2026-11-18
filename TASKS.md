@@ -208,7 +208,7 @@ ETA: 2026-11-15 23:00 ICT
 | 207 | Limits page: using a Claude reset shows the new count and cleared limits without a page refresh | done | claude | | | | The refetch after a reset was answered from the daemon's 45 s limits cache, and the spend rewrote the shared last-good read as still fresh, so the next read skipped Anthropic.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/558 (e7ae10b), released in v0.5.59. |
 | 210 | Limits page: a spent Claude reset clears its windows at once, even while Anthropic rate-limits the usage read | done | claude | limits-multi-reset-refresh | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/564 (d5ccbb9), released v0.5.61.<br>Owner report 2026-11-17: three resets, one updated; the others waited out a 429 backoff (Retry-After, up to 15 min) and kept the old windows. The spend now zeroes the cleared windows (reset response `cleared`, else the grant kind) in the cached read and on the page. |
 ## 6. Browser control extension
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-18 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -230,6 +230,7 @@ ETA: 2026-11-15 23:00 ICT
 | 203 | AIS Browser tools reach T3 per-account sessions: a preset config folder whose transcript link (`projects` / `sessions`) points into a registered identity's folder gets that identity's browser wiring | done | claude | | 6.194 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/549 (8611d95), released v0.5.56.<br>Owner request 2026-11-17 after 6.194: per-account T3 Claude/Codex providers use their own folders outside the registry, with no browser token, so they got no browser tools. |
 | 205 | AIS Browser extension uses the AIS icon (toolbar, chrome://extensions, side panel) | done | claude | | | | The manifest had no `icons`, so Chrome showed a placeholder. Icons are rendered from `apps/web/public/icon.svg`.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/555 (088b16e), released in v0.5.58. |
 | 207 | AIS Browser sees and answers JavaScript dialogs (alert, confirm, prompt, beforeunload) on agent tabs | done | claude | | | | Live report: close_tab on a page with unsaved changes hung on "Leave site?" until the 30 s timeout.<br>Extension tracks dialogs via CDP; calls on a tab with one fail at once with `dialog_open` (type, message); tabs_context shows it; new tool `handle_dialog {tabId, accept, promptText?}`. Never auto-accepts; beforeunload accept discards changes and the description says so.<br>A dialog opened before the attach (Chrome never reports it): calls fail in 5 s naming it, adopt_tab still adopts.<br>Real Chromium e2e: alert, prompt, confirm, beforeunload on close_tab and navigate, pre-attach.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/559 (8f94ed2) as row 6.206 (id taken by 5.206; renumbered), released v0.5.59. |
+| 215 | AIS Browser: `resize` emulates the viewport, never resizes the owner's window | in_progress | claude | browser-no-window-resize | | 2026-11-18 18:00 ICT | Owner report 2026-11-18: an agent resized the owner's Chrome window to test responsiveness.<br>`resize` called chrome.windows.update. Fix: CDP Emulation.setDeviceMetricsOverride on the tab only; no windows API in the extension. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-15 23:00 ICT
