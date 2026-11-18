@@ -9,8 +9,10 @@ import { DEFAULT_CONNECT_CA } from "./claude-proxy.ts";
 import { readSecretsKey } from "./secrets-file.ts";
 
 /**
- * `ais gateway t3-proxy [--proxy=<url>] [--ca=<path>] [--check] [--remove]`: routes api.anthropic.com for the T3 Code
+ * `ais gateway t3-proxy [--proxy=<url>] [--ca=<path>] [--check] [--remove]`: routes api.anthropic.com, the OpenCode usage
+ * call (opencode.ai /zen/go/v1/usage) and the Grok billing call (cli-chat-proxy.grok.com /v1/billing) of the T3 Code
  * server (only) through the gateway CONNECT proxy, so T3's account usage and reset credits come from the gateway.
+ * Every other host and path is untouched.
  * Never restarts T3: it must be restarted to apply.
  */
 export async function runT3ProxyCommand(args: string[], flags: ParsedArgs["flags"], deps: GatewayCliDeps, opts: T3Options = {}): Promise<void> {

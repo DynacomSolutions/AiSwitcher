@@ -352,9 +352,9 @@ describe("served from pool state", () => {
     expect(await (await call("cl", "/api/oauth/usage", { method: "GET" })).json()).toMatchObject({ five_hour: null, seven_day: null });
   });
 
-  test("these claude routes are not special for another provider", async () => {
-    await addApp("k", "kimi", "openai");
-    await call("k", "/api/oauth/usage", { method: "GET" });
+  test("these claude routes are not special for a provider without them", async () => {
+    await addApp("o", "opencode", "openai");
+    await call("o", "/api/oauth/usage", { method: "GET" });
     expect(seen).toHaveLength(1); // plain pass-through
   });
 
@@ -446,6 +446,62 @@ describe("served from pool state", () => {
     expect((await call("c", "/backend-api/wham/usage", { method: "GET" })).status).toBe(502);
     expect(seen).toHaveLength(0);
   });
+
+  const reading = (windows: NonNullable<PoolUsage["windows"]>): PoolUsage => ({ status: "live", maxUtilization: Math.max(...windows.map((w) => w.utilization)), capturedAt: "", windows });
+  const claudeShape = async (app: string): Promise<Record<string, unknown>> => (await call(app, "/api/oauth/usage", { method: "GET" })).json() as Promise<Record<string, unknown>>;
+  const mappings: Array<[string, GatewayProvider, NonNullable<PoolUsage["windows"]>, unknown, unknown]> = [
+    ["kimi session + week", "kimi", [{ label: "session", utilization: 12, resetsAt: "2026-11-02T11:00:00.000Z" }, { label: "week", utilization: 30, resetsAt: "2026-11-07T10:00:00.000Z" }], { utilization: 12, resets_at: "2026-11-02T11:00:00.000Z" }, { utilization: 30, resets_at: "2026-11-07T10:00:00.000Z" }],
+    ["kimi session + month (month fills seven_day)", "kimi", [{ label: "month", utilization: 55, resetsAt: "2026-11-20T00:00:00.000Z" }, { label: "session", utilization: 5 }], { utilization: 5, resets_at: null }, { utilization: 55, resets_at: "2026-11-20T00:00:00.000Z" }],
+    ["zai session + week", "zai", [{ label: "session", utilization: 7, resetsAt: "2026-11-02T14:00:00.000Z" }, { label: "week", utilization: 21 }, { label: "web tools", utilization: 99 }], { utilization: 7, resets_at: "2026-11-02T14:00:00.000Z" }, { utilization: 21, resets_at: null }],
+    ["kimi ~Nh and ~Nd labels", "kimi", [{ label: "~3d", utilization: 40 }, { label: "~2h", utilization: 10 }], { utilization: 10, resets_at: null }, { utilization: 40, resets_at: null }],
+    ["kimi week only", "kimi", [{ label: "week", utilization: 40 }], null, { utilization: 40, resets_at: null }],
+  ];
+  for (const [name, provider, windows, five, seven] of mappings) {
+    test(`${provider} Claude-style usage: ${name}, with no upstream call`, async () => {
+      await addApp("k", provider, "anthropic");
+      usage.a = reading(windows);
+      const res = await call("k", "/api/oauth/usage", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ five_hour: five, seven_day: seven, seven_day_opus: null, seven_day_sonnet: null, extra_usage: null });
+      expect(seen).toHaveLength(0);
+    });
+  }
+
+  test("a ~17d window is not taken for the week window", async () => {
+    await addApp("k", "kimi", "anthropic");
+    usage.a = reading([{ label: "~17d", utilization: 80 }, { label: "week", utilization: 20 }]);
+    expect(await claudeShape("k")).toMatchObject({ seven_day: { utilization: 20 } });
+  });
+
+  test("an openai-style kimi or zai app is denied Claude-style usage and profile, nothing goes upstream", async () => {
+    await addApp("ko", "kimi", "openai");
+    await addApp("zo", "zai", "openai");
+    for (const app of ["ko", "zo"]) for (const path of ["/api/oauth/usage", "/api/oauth/profile"]) expect((await call(app, path, { method: "GET" })).status).toBe(404);
+    expect(seen).toHaveLength(0);
+  });
+
+  test("kimi Claude-style usage with no readings is 502, never an invented 0%", async () => {
+    await addApp("k", "kimi", "anthropic");
+    expect((await call("k", "/api/oauth/usage", { method: "GET" })).status).toBe(502);
+    usage.a = reading([{ label: "mystery", utilization: 5 }]);
+    expect((await call("k", "/api/oauth/usage", { method: "GET" })).status).toBe(502);
+    expect(seen).toHaveLength(0);
+    expect(await claudeShape("k")).toMatchObject({ type: "error" });
+  });
+
+  for (const provider of ["kimi", "zai"] as const) {
+    test(`${provider} Claude-style profile is synthetic, stable and carries no member data`, async () => {
+      await addApp(`t3-${provider}`, provider, "anthropic");
+      const first = (await (await call(`t3-${provider}`, "/api/oauth/profile", { method: "GET" })).json()) as { account: Record<string, unknown>; organization: Record<string, unknown> };
+      const again = (await (await call(`t3-${provider}`, "/api/oauth/profile", { method: "GET" })).json()) as typeof first;
+      expect(again).toEqual(first);
+      expect(first.account).toMatchObject({ email: `t3-${provider}@gateway.invalid`, display_name: expect.stringContaining("(AIS gateway)") });
+      expect(first.account.uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(first.organization).toMatchObject({ organization_type: "claude_max", has_extra_usage_enabled: false, rate_limit_tier: expect.any(String) });
+      expect(first.organization.uuid).not.toBe(first.account.uuid);
+      expect(seen).toHaveLength(0);
+    });
+  }
 
   test("the bare /backend-api prefix names nothing: 404, never reaches the provider", async () => {
     await addApp("c", "codex", "openai");
@@ -565,8 +621,79 @@ describe("claude account paths", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(body); // the 429 is covered by the last good body
     expect(seen).toHaveLength(2);
-    // A plain read (no cedar_ember) has its own entry: with nothing good yet, the 429 passes through.
-    expect((await call("cl", "/api/oauth/usage", { method: "GET" })).status).toBe(429);
+    // A plain read (no cedar_ember) has its own entry: with nothing good yet and no poll data, it is a 503, never a 429
+    // (Claude Code remembers a 429 per bearer for about an hour).
+    const plain = await call("cl", "/api/oauth/usage", { method: "GET" });
+    expect(plain.status).toBe(503);
+    expect(await plain.json()).toMatchObject({ type: "error" });
+  });
+  describe("pinned claude app: usage from the gateway poll, profile that never fails", () => {
+    const poll = (over: Record<string, unknown> = {}) => ({
+      status: "live" as const,
+      maxUtilization: 41,
+      capturedAt: NOW.toISOString(),
+      windows: [
+        { label: "five-hour", utilization: 12, resetsAt: "2026-11-18T20:00:00Z" },
+        { label: "seven-day", utilization: 41, resetsAt: "2026-11-22T00:00:00Z" },
+      ],
+      ...over,
+    });
+    test("empty cache, upstream 429 and poll data: 200 with the poll body", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      usage.a = poll({ capturedAt: new Date(NOW.getTime() - 3_600_000).toISOString() }); // too old to skip Anthropic
+      reply = () => new Response("{}", { status: 429, headers: { "retry-after": "60" } });
+      const res = await call("cl", "/api/oauth/usage", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ five_hour: { utilization: 12, resets_at: "2026-11-18T20:00:00Z" }, seven_day: { utilization: 41, resets_at: "2026-11-22T00:00:00Z" }, seven_day_opus: null, seven_day_sonnet: null, extra_usage: null });
+      expect(seen).toHaveLength(1);
+    });
+    test("empty cache, upstream 429 or 500 and no poll data: 503, never 429", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      for (const status of [429, 500]) {
+        reply = () => new Response("{}", { status });
+        const res = await call("cl", "/api/oauth/usage", { method: "GET" });
+        expect(res.status).toBe(503);
+        expect(res.headers.get("retry-after")).toBeNull();
+      }
+    });
+    test("fresh poll data is served without calling Anthropic", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      usage.a = poll();
+      const res = await call("cl", "/api/oauth/usage", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { five_hour: { utilization: number } }).five_hour.utilization).toBe(12);
+      expect(seen).toHaveLength(0);
+    });
+    test("a read for reset grants still asks Anthropic, and falls back to the poll body on a 429", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      usage.a = poll();
+      reply = () => new Response("{}", { status: 429 });
+      const res = await call("cl", "/api/oauth/usage?cedar_ember=1", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(seen).toHaveLength(1);
+      expect(((await res.json()) as { seven_day: { utilization: number } }).seven_day.utilization).toBe(41);
+    });
+    test("profile is the member's own profile, forwarded with the member login", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      const body = { account: { uuid: "acct-a" }, organization: { uuid: "org-a", organization_type: "claude_pro", rate_limit_tier: "default_claude_ai" } };
+      reply = () => Response.json(body);
+      const res = await call("cl", "/api/oauth/profile", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(body);
+      expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+    });
+    for (const status of [401, 403, 429, 503]) {
+      test(`profile that Anthropic refuses with ${status} is a synthesised 200 profile`, async () => {
+        await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+        reply = () => new Response("{}", { status });
+        const res = await call("cl", "/api/oauth/profile", { method: "GET" });
+        expect(res.status).toBe(200);
+        const p = (await res.json()) as { organization: { organization_type: string; rate_limit_tier: string } };
+        expect(p.organization.organization_type).toBeString();
+        expect(p.organization.rate_limit_tier).toBeString();
+        expect(JSON.stringify(p)).not.toContain("tok-");
+      });
+    }
   });
   test("a pool app's usage with cedar_ember keeps the served windows and merges the chosen member's grants", async () => {
     await addApp("cl", "claude", "anthropic");
@@ -1007,6 +1134,8 @@ describe("account API of the other providers", () => {
     ["kimi", "openai", "/v1/usages", "api.kimi.com", "/coding/v1/usages"],
     ["zai", "anthropic", "/api/monitor/usage/quota/limit", "api.z.ai", "/api/monitor/usage/quota/limit"],
     ["opencode", "openai", "/usage", "opencode.ai", "/zen/go/v1/usage"],
+    ["grok", "openai", "/v1/billing", "cli-chat-proxy.grok.com", "/v1/billing"],
+    ["grok", "openai", "/billing", "cli-chat-proxy.grok.com", "/v1/billing"],
   ];
   for (const [provider, style, path, host, want] of others) {
     test(`${provider} ${path} is forwarded to ${host}${want} with the member's login, never the app token`, async () => {

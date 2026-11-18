@@ -1,25 +1,56 @@
 import { readFile, stat, writeFile, rename } from "node:fs/promises";
 import net from "node:net";
 import { join } from "node:path";
+import { X509Certificate } from "node:crypto";
+import { queryCarriesToken } from "./app.ts";
 import { collapseSlashes } from "./routes.ts";
+import type { ApiStyle, GatewayProvider } from "./types.ts";
 import { GATEWAY_TOKEN_PREFIX } from "../identities/claude-gateway-entry.ts";
 
 /**
- * The gateway's CONNECT proxy, for gateway-routed Claude Code (clients set HTTPS_PROXY and NODE_EXTRA_CA_CERTS).
+ * The gateway's CONNECT proxy, for gateway-routed clients (they set HTTPS_PROXY and NODE_EXTRA_CA_CERTS).
  *
- * Claude Code asks for its limits at a fixed host (`https://api.anthropic.com/api/oauth/usage`), never at
- * ANTHROPIC_BASE_URL, so with a gateway login it gets a refusal and shows no limits. This proxy:
+ * Some clients ask for their limits at a fixed host, never at their configurable base URL, so with a gateway login they
+ * get a refusal and show no limits. This proxy:
  * - tunnels every CONNECT untouched (plain TCP pipe, no TLS termination), except
- * - CONNECT to api.anthropic.com:443, whose TLS it terminates with the certificate the cluster issues for that name
- *   (cert-manager, mounted as `tls.crt`/`tls.key`/`ca.crt`; the proxy makes no certificates). On that connection
- *   every request that carries a gateway app token (`aisg_...`), whatever its method or path, is handed to the gateway's own
- *   route for that app (`/<app>/<path>`): the usage and profile answers, reset-credit view and redeem and the rest of Anthropic's
- *   account API are forwarded there with the login of the member the app maps to. A gateway token the gateway does not accept is
- *   answered 401 and never sent on. A request with any other bearer is forwarded to the real host unchanged (headers, body,
- *   compressed answer).
+ * - CONNECT to one of three hosts on port 443 (INTERCEPTED_HOSTS), whose TLS it terminates with the certificate the
+ *   cluster issues (cert-manager, mounted as `tls.crt`/`tls.key`/`ca.crt`; the proxy makes no certificates). A host is
+ *   only intercepted when the loaded certificate covers its name. Otherwise it stays a plain tunnel, so a certificate
+ *   that lags behind a rollout never breaks plain traffic.
+ *   - api.anthropic.com (Claude Code): every request that carries a gateway app token (`aisg_...`), whatever its method
+ *     or path, is handed to the gateway's own route for that claude app (`/<app>/<path>`): usage, profile, reset credits
+ *     and the rest of Anthropic's account API, with the login of the member the app maps to. A kimi or zai app token
+ *     (Claude Code on an Anthropic-style gateway app) may only `GET /api/oauth/usage` and `GET /api/oauth/profile`, which
+ *     the gateway answers itself; any other request gets a JSON 404 and is never forwarded.
+ *   - opencode.ai (opencode): only `GET /zen/go/v1/usage`, served as `/v1/usage` for an opencode app.
+ *   - cli-chat-proxy.grok.com (grok): only `GET /v1/billing` (query kept), served for a grok app.
+ *   On opencode.ai and cli-chat-proxy.grok.com a gateway token on any other method or path is answered 403 and never
+ *   sent on. A gateway token that is not valid for the host's provider is answered 401 and never sent on.
+ *   A request with any other bearer, or none, is forwarded to the real host unchanged (headers, body, compressed answer).
+ *   A request for a host that is not intercepted is answered 421.
  * No pool member login is read or sent by this file; the gateway route adds it.
  */
-export const INTERCEPTED_HOST = "api.anthropic.com";
+export interface InterceptedHost {
+  /** The providers whose app tokens are accepted on this host. */
+  providers: GatewayProvider[];
+  /** The gateway path to serve this request as, or undefined when a gateway token of that provider may not use it here. */
+  servePath(method: string, path: string, provider: GatewayProvider): string | undefined;
+}
+
+/**
+ * kimi and zai apps (Claude Code pointed at their Anthropic-style gateway apps) may only read limits and the account on
+ * api.anthropic.com. Everything else is refused, never sent to Anthropic and never to the kimi or zai upstream.
+ */
+const LIMITS_ONLY = new Set(["/api/oauth/usage", "/api/oauth/profile"]);
+
+export const INTERCEPTED_HOSTS: Readonly<Record<string, InterceptedHost>> = {
+  "api.anthropic.com": {
+    providers: ["claude", "kimi", "zai"],
+    servePath: (method, path, provider) => (provider === "claude" || (method === "GET" && LIMITS_ONLY.has(path)) ? path : undefined),
+  },
+  "opencode.ai": { providers: ["opencode"], servePath: (method, path) => (method === "GET" && path === "/zen/go/v1/usage" ? "/v1/usage" : undefined) },
+  "cli-chat-proxy.grok.com": { providers: ["grok"], servePath: (method, path) => (method === "GET" && path === "/v1/billing" ? "/v1/billing" : undefined) },
+};
 /** Why a plain HTTP request was refused: almost always a client with HTTPS_PROXY set and no NO_PROXY for its own (loopback) base URL. */
 export const NOT_CONNECT_BODY =
   "ais gateway CONNECT proxy: only CONNECT tunnels are accepted here, and this was a plain HTTP request. " +
@@ -38,13 +69,13 @@ export interface UsageProxyOptions {
   tlsDir: string;
   /** Where to copy `ca.crt` for clients (NODE_EXTRA_CA_CERTS), if anywhere. */
   publishCaTo?: string;
-  /** The app a gateway token belongs to (an active app whose token verifies), else undefined. */
-  appForToken(token: string): Promise<string | undefined>;
+  /** The app a gateway token belongs to (an active app of one of those providers whose token verifies), with its provider, else undefined. */
+  appForToken(token: string, providers: GatewayProvider[]): Promise<{ name: string; provider: GatewayProvider; style: ApiStyle } | undefined>;
   /** Answers a request for an app (the gateway's own handler; the request carries the same token, method and body). */
   serve(app: string, path: string, req: Request): Promise<Response>;
   fetch?: typeof fetch;
   /** Where intercepted requests that are not served go (tests point it elsewhere). */
-  passthroughOrigin?: string;
+  passthroughOrigin?: string | ((host: string) => string);
   /** Test hook: where a plain CONNECT goes instead of the requested host:port. */
   connectTarget?(host: string, port: number): { host: string; port: number };
   log?(line: string): void;
@@ -105,19 +136,36 @@ async function publish(ca: string | undefined, to: string | undefined): Promise<
 export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningUsageProxy> {
   const log = opts.log ?? ((line: string) => console.info(line));
   const doFetch = opts.fetch ?? fetch;
-  const origin = (opts.passthroughOrigin ?? `https://${INTERCEPTED_HOST}`).replace(/\/+$/, "");
+  const originFor = (host: string): string => {
+    const o = typeof opts.passthroughOrigin === "function" ? opts.passthroughOrigin(host) : (opts.passthroughOrigin ?? `https://${host}`);
+    return o.replace(/\/+$/, "");
+  };
+  const denied = (status: number, type: string, message: string): Response => Response.json({ type: "error", error: { type, message } }, { status });
 
   async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
+    const host = url.hostname.toLowerCase();
+    const target = Object.hasOwn(INTERCEPTED_HOSTS, host) ? INTERCEPTED_HOSTS[host] : undefined;
+    // Not one of ours: never forwarded.
+    if (!target) return new Response("misdirected request\n", { status: 421 });
     const path = collapseSlashes(url.pathname);
     const token = tokenOf(req.headers);
     if (token?.startsWith(GATEWAY_TOKEN_PREFIX)) {
-      const app = await opts.appForToken(token).catch(() => undefined);
       // A gateway token is never handed to the real host, known or not.
-      if (!app) return Response.json({ type: "error", error: { type: "authentication_error", message: "invalid AIS gateway token" } }, { status: 401 });
-      const res = await opts.serve(app, path, req).catch(() => Response.json({ type: "error", error: { type: "api_error", message: "gateway error" } }, { status: 502 }));
-      log(`gateway: connect-proxy ${req.method} ${path.split("/").slice(0, 3).join("/")} for app ${app}: ${res.status}`);
+      const app = await opts.appForToken(token, target.providers).catch(() => undefined);
+      if (!app) return denied(401, "authentication_error", "invalid AIS gateway token");
+      const servePath = (app.provider === "kimi" || app.provider === "zai") && app.style !== "anthropic" ? undefined : target.servePath(req.method, path, app.provider);
+      if (servePath === undefined) {
+        // On api.anthropic.com a kimi or zai app gets an Anthropic-shaped 404; the other hosts keep their 403.
+        return target.providers.length > 1 ? denied(404, "not_found_error", "not found") : denied(403, "permission_error", "this request is not available with an AIS gateway token");
+      }
+      const res = await opts.serve(app.name, servePath, req).catch(() => Response.json({ type: "error", error: { type: "api_error", message: "gateway error" } }, { status: 502 }));
+      log(`gateway: connect-proxy ${host} ${req.method} ${servePath.split("/").slice(0, 3).join("/")} for app ${app.name}: ${res.status}`);
       return res;
+    }
+    // A gateway token in a place tokenOf did not read (query, extra text, doubled header) is never sent upstream.
+    if (queryCarriesToken(url.search) || [...req.headers.values()].some((v) => v.toLowerCase().includes(GATEWAY_TOKEN_PREFIX))) {
+      return denied(401, "authentication_error", "invalid AIS gateway token");
     }
     const headers = hopClean(req.headers);
     headers.delete("host");
@@ -127,7 +175,7 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
       init.duplex = "half";
     }
     try {
-      const res = await doFetch(`${origin}${url.pathname}${url.search}`, init);
+      const res = await doFetch(`${originFor(host)}${url.pathname}${url.search}`, init);
       return new Response(res.body, { status: res.status, statusText: res.statusText, headers: hopClean(res.headers) });
     } catch {
       return new Response("bad gateway\n", { status: 502 });
@@ -140,6 +188,19 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
   let tls = await readTls(opts.tlsDir);
   await publish(tls.ca, opts.publishCaTo).catch((err: Error) => log(`gateway: connect-proxy could not publish ca.crt (${err.message})`));
   let tlsServer = startTls(tls);
+  /** The intercepted hosts the loaded certificate covers; the rest stay plain tunnels. */
+  const coveredHosts = (cert: string): Set<string> => {
+    let x: X509Certificate | undefined;
+    try {
+      x = new X509Certificate(cert);
+    } catch {
+      return new Set();
+    }
+    return new Set(Object.keys(INTERCEPTED_HOSTS).filter((h) => x!.checkHost(h) !== undefined));
+  };
+  let covered = coveredHosts(tls.cert);
+  const logCovered = (): void => log(`gateway: connect-proxy intercepts ${[...covered].join(", ") || "no host"} (certificate names)`);
+  logCovered();
   const recheck = setInterval(() => {
     void (async () => {
       const st = await stat(join(opts.tlsDir, "tls.crt")).catch(() => undefined);
@@ -148,9 +209,11 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
       const old = tlsServer;
       tlsServer = startTls(next);
       tls = next;
+      covered = coveredHosts(next.cert);
       void old.stop(false);
       await publish(next.ca, opts.publishCaTo).catch(() => undefined);
       log("gateway: connect-proxy loaded a renewed certificate");
+      logCovered();
     })().catch((err: Error) => log(`gateway: connect-proxy certificate reload failed (${err.message})`));
   }, opts.tlsRecheckMs ?? TLS_RECHECK_MS);
   recheck.unref?.();
@@ -183,7 +246,7 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
       const host = m[1]!.replace(/^\[|\]$/g, "").toLowerCase();
       const port = Number(m[2]);
       if (port < 1 || port > 65535) return fail("400 Bad Request");
-      const intercept = host === INTERCEPTED_HOST && port === 443;
+      const intercept = port === 443 && covered.has(host);
       const target = intercept ? { host: "127.0.0.1", port: tlsServer.port as number } : (opts.connectTarget?.(host, port) ?? { host, port });
       const upstream = net.connect(target.port, target.host);
       let open = false;

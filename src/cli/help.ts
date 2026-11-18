@@ -79,7 +79,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|t3-models|t3-acp|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -97,15 +97,23 @@ export const HELP: Record<string, HelpNode> = {
       ),
       "t3-proxy": sub(
         "ais gateway t3-proxy [--proxy=<url>] [--ca=<path>] [--check] [--remove]",
-        "Route api.anthropic.com for the T3 Code server only (not its children) through the gateway CONNECT proxy so T3's account usage and reset credits come from the gateway: installs ~/.ais/t3/anthropic-proxy.cjs and sets NODE_OPTIONS (--require), AIS_T3_ANTHROPIC_PROXY and NODE_EXTRA_CA_CERTS in ~/.t3/service.env (T3CODE_HOME honoured; never HTTPS_PROXY); --check only reports, --remove undoes it; restart T3 to apply (never done here)",
+        "Route api.anthropic.com (all paths), opencode.ai /zen/go/v1/usage and cli-chat-proxy.grok.com /v1/billing for the T3 Code server only (not its children) through the gateway CONNECT proxy so T3's account usage, reset credits, OpenCode Go usage and Grok billing come from the gateway (every other host is a plain tunnel): installs ~/.ais/t3/anthropic-proxy.cjs and sets NODE_OPTIONS (--require), AIS_T3_ANTHROPIC_PROXY and NODE_EXTRA_CA_CERTS in ~/.t3/service.env (T3CODE_HOME honoured; never HTTPS_PROXY); --check only reports, --remove undoes it; restart T3 to apply (never done here)",
       ),
       "t3-models": sub(
         "ais gateway t3-models [--check]",
         "Make the model lists of the T3 Code gateway folders (~/.t3/gateway/*: kimi-code config.toml [models.*] blocks of a type=kimi provider, opencode.json provider models) equal to the gateway's GET <base>/models now; every other key stays; the profile-sync daemon does this every 10 minutes; --check only reports",
       ),
+      "t3-usage": sub(
+        "ais gateway t3-usage [--check]",
+        "Give T3 Code's built-in OpenCode and Grok drivers a usage credential that is only the gateway app token: per T3 provider instance (settings.json providerInstances, T3CODE_HOME honoured, read only) writes <XDG_DATA_HOME>/opencode/auth.json (opencode-go entry) and adds opencode-go to disabled_providers in opencode.json, or writes <GROK_HOME>/auth.json (0600); reports Grok env that hides usage in T3; the profile-sync daemon does this every 10 minutes; --check writes nothing and fails when a file is out of date, failed or has a problem",
+      ),
       "t3-acp": sub(
         "ais gateway t3-acp [--check] [--remove]",
         "Start T3 Code's ACP registry agents (kimi-code, grok-build, glm-acp-agent) behind the AIS relay, so a failed turn shows its reason in the thread and not an empty, completed turn: writes one launcher per agent to ~/.ais/t3/acp/ and sets it as the executable override of each provider instance in T3 Code's settings.json (backup kept; an instance with its own override is left alone). Sessions started after it use the relay. --check writes nothing and fails when something is not in place, or when the registry has a newer agent version than the one installed; --remove undoes it",
+      ),
+      "t3-instance": sub(
+        "ais gateway t3-instance <instance-id> --driver=claude|grok --app=<gateway app> [--name=<name>] [--models=a,b,...] [--like=<claude instance id>] [--binary=<path>] [--check] [--remove]",
+        "Create or update one T3 Code provider instance whose folder (<T3 home>/gateway/<id>) holds only the gateway app token: writes the instance into T3's settings.json (backup kept, other instances untouched), and for claude the folder settings.json (gateway base URL, CONNECT proxy, CA, models; hooks copied from --like) and .credentials.json, for grok a launcher in ~/.ais/t3/grok/<id> that reads the token at start, plus the usage auth.json; says created, updated or current; --check writes nothing and fails on a difference; --remove drops the instance entry and leaves the folder",
       ),
       "codex-home": sub(
         "ais gateway codex-home <codex home dir>... [--check]",

@@ -2,6 +2,8 @@ import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/sto
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import { adapterFor as poolAdapterFor } from "../identities/pool/registry.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
+import { fetchZaiLimits } from "../cli/limits/zai-limits.ts";
+import { usageFromLimits } from "../identities/pool/grant-file-adapter.ts";
 import type { GatewayProvider } from "./types.ts";
 
 export const USAGE_TTL_MS = 45_000;
@@ -9,14 +11,20 @@ export const USAGE_TTL_MS = 45_000;
 /** `fresh`: read the source now, past any short-lived shared cache (claude's one-minute last-good file). */
 export type FetchUsage = (provider: GatewayProvider, identity: string, opts?: { fresh?: boolean }) => Promise<PoolUsage | undefined>;
 
-/** The agent reserve's utilisation figure, from the same adapters `ais swap` uses (claude, codex, kimi). Others have none. The poll never refreshes a token (`noRefresh`): rotating a grant is the proxy's job, where it is counted and alerted. */
+/** The zai reading with only the token windows (session, week). The monthly web tools count is not a token quota and must not make the pool refuse model traffic. */
+export function zaiTokenUsage(result: Parameters<typeof usageFromLimits>[0][number]): PoolUsage {
+  return usageFromLimits([{ ...result, windows: result.windows.filter((w) => w.category !== "other") }]);
+}
+
+/** The agent reserve's utilisation figure, from the same adapters `ais swap` uses (claude, codex, kimi) and, for zai, the same Z.ai quota read `ais limits` uses (zai has no swap pool adapter). Others have none. The poll never refreshes a token (`noRefresh`): rotating a grant is the proxy's job, where it is counted and alerted. */
 export const fetchPoolUsage: FetchUsage = async (provider, identity, opts) => {
-  if (provider !== "claude" && provider !== "codex" && provider !== "kimi") return undefined;
-  const adapter = poolAdapterFor(provider);
-  if (!adapter) return undefined;
+  if (provider !== "claude" && provider !== "codex" && provider !== "kimi" && provider !== "zai") return undefined;
+  const adapter = provider === "zai" ? undefined : poolAdapterFor(provider);
+  if (provider !== "zai" && !adapter) return undefined;
   const file = await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath);
   const found = findIdentityByNameOrAlias(file.identities, identity);
-  return found ? adapter.fetchUsage(found, { noRefresh: true, ...(opts?.fresh ? { fresh: true } : {}) }) : undefined;
+  if (provider === "zai") return found ? zaiTokenUsage(await fetchZaiLimits(found)) : undefined;
+  return found ? adapter!.fetchUsage(found, { noRefresh: true, ...(opts?.fresh ? { fresh: true } : {}) }) : undefined;
 };
 
 interface Entry {

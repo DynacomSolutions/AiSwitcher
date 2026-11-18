@@ -12,6 +12,7 @@ import { listLiveSessions, sessionRegistryDir, type IsRunning, type RegisteredSe
 import type { SyncRunOptions } from "./types.ts";
 import { createStoreSyncSupervisor, type StoreSyncSupervisor } from "./store-sync-supervisor.ts";
 import { createT3ModelsTicker, type T3ModelsTicker } from "./t3-models-ticker.ts";
+import { createT3UsageTicker, type T3UsageTicker } from "./t3-usage-ticker.ts";
 import { POLL_MS, scanTree, snapshotsDiffer, type Snapshot } from "./watch.ts";
 
 /**
@@ -277,6 +278,8 @@ export interface RunDaemonOptions {
   storeSync?: StoreSyncSupervisor | false;
   /** T3 gateway model-list sync (t3-models-ticker.ts). Default: one is created when no `deps` are given (production). */
   t3Models?: T3ModelsTicker | false;
+  /** T3 OpenCode and Grok usage credential sync (t3-usage-ticker.ts). Default: one is created when no `deps` are given. */
+  t3Usage?: T3UsageTicker | false;
 }
 
 /**
@@ -295,6 +298,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
   const daemon = createProfileSyncDaemon(options.deps);
   const storeSync = options.storeSync === false ? undefined : (options.storeSync ?? (options.deps ? undefined : createStoreSyncSupervisor()));
   const t3Models = options.t3Models === false ? undefined : (options.t3Models ?? (options.deps ? undefined : createT3ModelsTicker()));
+  const t3Usage = options.t3Usage === false ? undefined : (options.t3Usage ?? (options.deps ? undefined : createT3UsageTicker()));
   let stopped = false;
   let wake: (() => void) | undefined;
   const onSignal = () => {
@@ -323,6 +327,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
       try { await daemon.tick(); } catch { /* keep polling */ }
       try { await storeSync?.tick(); } catch { /* retried next poll */ }
       try { await t3Models?.tick(); } catch { /* retried next interval */ }
+      try { await t3Usage?.tick(); } catch { /* retried next interval */ }
       if (stopped) break;
       await new Promise<void>((resolve) => {
         wake = resolve;

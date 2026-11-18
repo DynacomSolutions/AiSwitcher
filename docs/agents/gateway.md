@@ -251,6 +251,14 @@ token to the real host.
 - On that host, any request with an `aisg_` bearer is handed to the route of the claude app the token belongs to, which
   forwards account requests with the member's login (see "Account API" above). An `aisg_` token the gateway does not accept
   gets 401 there and is never sent on. Requests with any other bearer are forwarded unchanged.
+- A kimi or zai app token (Claude Code on a `t3-claude-kimi-*` or `t3-claude-zai-*` app) gets only `GET /api/oauth/usage` and
+  `GET /api/oauth/profile` on that host, both answered by the gateway (no upstream call). Any other method or path is a
+  JSON 404 and is never sent to Anthropic or to the kimi or zai upstream. The usage answer is Claude's shape built from the
+  member's windows by length: `five_hour` is the shortest window of at most 6 h (kimi `session` or `~Nh`, zai `session`),
+  `seven_day` is the next window of at least 1 day (`week` first, else `month` or the longest `~Nd`; a month window shows
+  in the `seven_day` slot because Claude has no monthly slot). A missing window is null; no reading at all is 502 so the
+  client shows "unavailable". The profile is made up from the app name (stable uuids, "Kimi (AIS gateway)", `claude_max`).
+  The zai reading is the Z.ai quota `ais limits` uses, read with the member's key.
 - The proxy itself reads and sends no member login. A renewed certificate is picked up within 5 minutes.
 
 ### Claude usage proxy on a folder
