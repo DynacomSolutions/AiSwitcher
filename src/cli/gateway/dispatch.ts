@@ -39,12 +39,16 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     const { runT3ModelsCommand } = await import("./t3-models.ts");
     return runT3ModelsCommand(rest, flags, merged);
   }
+  if (sub === "t3-acp") {
+    const { runT3AcpCommand } = await import("./t3-acp.ts");
+    return runT3AcpCommand(rest, flags, merged);
+  }
   if (sub === "store") return runStoreCommand(rest, flags, merged);
   if (sub === "codex-home") {
     const { runCodexHomeCommand } = await import("./codex-home.ts");
     return runCodexHomeCommand(rest, flags, merged);
   }
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|t3-models|codex-home ...  (ais gateway --help)");
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|t3-models|t3-acp|codex-home ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");

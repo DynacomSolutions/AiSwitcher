@@ -133,6 +133,15 @@ src/
     global-memory.ts       owns `~/.ais/memory/GLOBAL.md` and projects it through each
                           tool's mandatory native memory channel without creating a
                           second writable store
+  acp/                 the relay between T3 Code and its ACP registry agents (`ais __acp_relay`):
+                          relay.ts holds the rules (a failed turn answered `end_turn` becomes a
+                          JSON-RPC error with its reason, a generic error message gets the detail
+                          from `data`, an empty turn gets a notice; every other line unchanged),
+                          kimi-turn.ts reads how a kimi-code turn ended from its session log,
+                          relay-process.ts runs the agent and passes both streams. Installed by
+                          `ais gateway t3-acp` (identities/t3-acp-relay.ts: launchers in
+                          ~/.ais/t3/acp and the executable override in T3 Code's settings.json).
+                          See gateway.md, "T3 Code ACP agents"
   sync/                SSH/rsync profile and usage-data synchronisation — machine-local
                           remote config, portable ~/ registries, staged additive exchange,
                           inter-process lock, and in-session/final reconciliation;

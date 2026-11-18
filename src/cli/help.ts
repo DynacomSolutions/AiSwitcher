@@ -79,7 +79,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|t3-models|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|t3-models|t3-acp|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -102,6 +102,10 @@ export const HELP: Record<string, HelpNode> = {
       "t3-models": sub(
         "ais gateway t3-models [--check]",
         "Make the model lists of the T3 Code gateway folders (~/.t3/gateway/*: kimi-code config.toml [models.*] blocks of a type=kimi provider, opencode.json provider models) equal to the gateway's GET <base>/models now; every other key stays; the profile-sync daemon does this every 10 minutes; --check only reports",
+      ),
+      "t3-acp": sub(
+        "ais gateway t3-acp [--check] [--remove]",
+        "Start T3 Code's ACP registry agents (kimi-code, grok-build, glm-acp-agent) behind the AIS relay, so a failed turn shows its reason in the thread and not an empty, completed turn: writes one launcher per agent to ~/.ais/t3/acp/ and sets it as the executable override of each provider instance in T3 Code's settings.json (backup kept; an instance with its own override is left alone). Sessions started after it use the relay. --check writes nothing and fails when something is not in place, or when the registry has a newer agent version than the one installed; --remove undoes it",
       ),
       "codex-home": sub(
         "ais gateway codex-home <codex home dir>... [--check]",

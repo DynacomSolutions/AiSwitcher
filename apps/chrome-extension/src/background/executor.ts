@@ -394,9 +394,11 @@ export class Executor {
       }
       case "resize": {
         this.throwIfAborted(sig);
-        await this.api.windows.resize(tab.windowId, a("resize").width, a("resize").height);
+        const { width: w, height: h } = a("resize");
+        // Responsive-mode emulation of this one tab only: the owner's browser window is never resized or moved.
+        await this.cdp(sig, tabId, "Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: 0, mobile: false });
         this.scales.delete(tabId);
-        return text(`Resized window to ${a("resize").width}x${a("resize").height}.`);
+        return text(`Emulated a ${w}x${h} viewport on tab ${tabId} (responsive mode). The browser window was not changed.`);
       }
       case "close_tab": {
         // Only tabs this session opened or adopted: tabs that merely sit in a granted group are the user's.
