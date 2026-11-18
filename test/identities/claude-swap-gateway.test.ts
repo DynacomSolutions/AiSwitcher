@@ -380,7 +380,13 @@ describe("the cluster gateway owns gateway-managed logins; nothing local touches
   });
 
   test("the role is set in code by the gateway server, not by the environment of the pod", async () => {
-    const m = await import("../../src/identities/gateway-managed.ts");
+    // Use a fresh copy of the module. An earlier test file in the same process may
+    // have started the gateway server, which sets the module-level owner flag.
+    // The query suffix gives a separate instance; a variable keeps tsc from resolving it.
+    const freshModule = "../../src/identities/gateway-managed.ts?role-test";
+    const m = (await import(freshModule)) as typeof import("../../src/identities/gateway-managed.ts");
+    const savedOwner = process.env.AIS_GATEWAY_OWNER;
+    const savedHost = process.env.KUBERNETES_SERVICE_HOST;
     delete process.env.AIS_GATEWAY_OWNER;
     process.env.KUBERNETES_SERVICE_HOST = "kubernetes.default.svc";
     try {
@@ -388,7 +394,8 @@ describe("the cluster gateway owns gateway-managed logins; nothing local touches
       m.markGatewayOwnerProcess();
       expect(m.isGatewayOwnerProcess()).toBe(true);
     } finally {
-      delete process.env.KUBERNETES_SERVICE_HOST;
+      if (savedHost === undefined) delete process.env.KUBERNETES_SERVICE_HOST; else process.env.KUBERNETES_SERVICE_HOST = savedHost;
+      if (savedOwner === undefined) delete process.env.AIS_GATEWAY_OWNER; else process.env.AIS_GATEWAY_OWNER = savedOwner;
     }
   });
 
