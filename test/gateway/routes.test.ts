@@ -621,8 +621,79 @@ describe("claude account paths", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(body); // the 429 is covered by the last good body
     expect(seen).toHaveLength(2);
-    // A plain read (no cedar_ember) has its own entry: with nothing good yet, the 429 passes through.
-    expect((await call("cl", "/api/oauth/usage", { method: "GET" })).status).toBe(429);
+    // A plain read (no cedar_ember) has its own entry: with nothing good yet and no poll data, it is a 503, never a 429
+    // (Claude Code remembers a 429 per bearer for about an hour).
+    const plain = await call("cl", "/api/oauth/usage", { method: "GET" });
+    expect(plain.status).toBe(503);
+    expect(await plain.json()).toMatchObject({ type: "error" });
+  });
+  describe("pinned claude app: usage from the gateway poll, profile that never fails", () => {
+    const poll = (over: Record<string, unknown> = {}) => ({
+      status: "live" as const,
+      maxUtilization: 41,
+      capturedAt: NOW.toISOString(),
+      windows: [
+        { label: "five-hour", utilization: 12, resetsAt: "2026-11-18T20:00:00Z" },
+        { label: "seven-day", utilization: 41, resetsAt: "2026-11-22T00:00:00Z" },
+      ],
+      ...over,
+    });
+    test("empty cache, upstream 429 and poll data: 200 with the poll body", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      usage.a = poll({ capturedAt: new Date(NOW.getTime() - 3_600_000).toISOString() }); // too old to skip Anthropic
+      reply = () => new Response("{}", { status: 429, headers: { "retry-after": "60" } });
+      const res = await call("cl", "/api/oauth/usage", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ five_hour: { utilization: 12, resets_at: "2026-11-18T20:00:00Z" }, seven_day: { utilization: 41, resets_at: "2026-11-22T00:00:00Z" }, seven_day_opus: null, seven_day_sonnet: null, extra_usage: null });
+      expect(seen).toHaveLength(1);
+    });
+    test("empty cache, upstream 429 or 500 and no poll data: 503, never 429", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      for (const status of [429, 500]) {
+        reply = () => new Response("{}", { status });
+        const res = await call("cl", "/api/oauth/usage", { method: "GET" });
+        expect(res.status).toBe(503);
+        expect(res.headers.get("retry-after")).toBeNull();
+      }
+    });
+    test("fresh poll data is served without calling Anthropic", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      usage.a = poll();
+      const res = await call("cl", "/api/oauth/usage", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { five_hour: { utilization: number } }).five_hour.utilization).toBe(12);
+      expect(seen).toHaveLength(0);
+    });
+    test("a read for reset grants still asks Anthropic, and falls back to the poll body on a 429", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      usage.a = poll();
+      reply = () => new Response("{}", { status: 429 });
+      const res = await call("cl", "/api/oauth/usage?cedar_ember=1", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(seen).toHaveLength(1);
+      expect(((await res.json()) as { seven_day: { utilization: number } }).seven_day.utilization).toBe(41);
+    });
+    test("profile is the member's own profile, forwarded with the member login", async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      const body = { account: { uuid: "acct-a" }, organization: { uuid: "org-a", organization_type: "claude_pro", rate_limit_tier: "default_claude_ai" } };
+      reply = () => Response.json(body);
+      const res = await call("cl", "/api/oauth/profile", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(body);
+      expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+    });
+    for (const status of [401, 403, 429, 503]) {
+      test(`profile that Anthropic refuses with ${status} is a synthesised 200 profile`, async () => {
+        await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+        reply = () => new Response("{}", { status });
+        const res = await call("cl", "/api/oauth/profile", { method: "GET" });
+        expect(res.status).toBe(200);
+        const p = (await res.json()) as { organization: { organization_type: string; rate_limit_tier: string } };
+        expect(p.organization.organization_type).toBeString();
+        expect(p.organization.rate_limit_tier).toBeString();
+        expect(JSON.stringify(p)).not.toContain("tok-");
+      });
+    }
   });
   test("a pool app's usage with cedar_ember keeps the served windows and merges the chosen member's grants", async () => {
     await addApp("cl", "claude", "anthropic");

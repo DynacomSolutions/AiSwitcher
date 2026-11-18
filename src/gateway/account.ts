@@ -2,7 +2,7 @@ import type { GatewayDeps } from "./app.ts";
 import { upstreamHeaders } from "./app.ts";
 import { providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
-import { availableCount, claudeUsageBody, normalisePath, orgSegmentIndex, type AccountOp } from "./routes.ts";
+import { availableCount, claudeUsageBody, claudeUsageBodyOf, normalisePath, orgSegmentIndex, syntheticClaudeProfile, type AccountOp } from "./routes.ts";
 import { allowedMembers, utilisationOf } from "./select.ts";
 import type { ApiStyle, GatewayApp } from "./types.ts";
 
@@ -38,6 +38,8 @@ export function newAccountState(): AccountState {
 export const PIN_USAGE_FRESH_MS = 30_000;
 /** How long a last good usage body may stand in for Anthropic's 429 (its usage API rate-limits per account). */
 export const PIN_USAGE_STALE_MAX_MS = 6 * 3_600_000;
+/** The gateway's own usage poll of a member counts as fresh for a plain pinned read for this long. */
+export const PIN_POLL_FRESH_MS = 5 * 60_000;
 
 export interface AccountRequest {
   app: GatewayApp;
@@ -283,27 +285,69 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
     url = `${new URL(url).origin}${out.join("/")}`;
   }
   if (r.op === "claude-usage") return pinnedUsage(r, member, url, cls);
+  if (r.op === "forward" && r.method === "GET" && r.app.target.kind === "pin" && normalisePath(new URL(url).pathname)?.norm === "/api/oauth/profile") return pinnedProfile(r, member, url, cls);
   const res = await callAs(r, member, { method: r.method, url: url + r.search, ...(r.body ? { body: r.body } : {}) });
   return { res: relay(res), identity: member, cls };
 }
 
 /**
+ * Pinned profile read. The member's own profile is forwarded. When Anthropic refuses it (401, 403, 429, 5xx) or cannot be
+ * reached, the client gets a profile made up from the app name instead of the error: Claude Code treats a failed profile
+ * read as "no subscription known" and then hides limits. Other answers (404 and so on) pass through.
+ */
+async function pinnedProfile(r: AccountRequest, member: string, url: string, cls: string): Promise<AccountResult> {
+  let res: Response | undefined;
+  try {
+    res = await callAs(r, member, { method: r.method, url: url + r.search });
+  } catch (err) {
+    if (r.signal.aborted) throw err;
+  }
+  if (res && !(res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500)) return { res: relay(res), identity: member, cls };
+  if (res) await discard(res);
+  return { res: syntheticClaudeProfile(r.app, "Claude"), identity: member, cls };
+}
+
+/** The member's gateway poll reading when it has the Claude windows, with its age; else undefined. */
+async function pollReading(r: AccountRequest, member: string, nowMs: number): Promise<{ body: Record<string, unknown>; ageMs: number; stale: boolean } | undefined> {
+  try {
+    const u = await r.deps.usageFor(r.app.provider, member);
+    if (!u || !u.windows?.some((w) => w.label === "five-hour" || w.label === "seven-day")) return undefined;
+    const at = Date.parse(u.capturedAt);
+    return { body: claudeUsageBodyOf(u), ageMs: Number.isFinite(at) ? Math.max(0, nowMs - at) : Infinity, stale: u.stale === true || u.status !== "live" };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Pinned usage read. Anthropic's usage API answers 429 per account when it is read often (the gateway's own usage poll
  * shares the token), and a client then shows no limits and no reset credits. Reads are shared for a short while, and a
- * last good body stands in for a 429 or an error, so the client keeps its limits and resets.
+ * last good body or the gateway poll reading stands in for a 429 or an error, so the client keeps its limits and resets.
  */
 async function pinnedUsage(r: AccountRequest, member: string, url: string, cls: string): Promise<AccountResult> {
-  const key = `${r.app.provider}/${member}?${wantsResets(r.search) ? "resets" : "plain"}`;
+  const resets = wantsResets(r.search);
+  const key = `${r.app.provider}/${member}?${resets ? "resets" : "plain"}`;
   const nowMs = r.deps.now().getTime();
   const hit = r.state.usage.get(key);
   const cached = (): AccountResult => ({ res: new Response(hit!.body, { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" } }), identity: member, cls });
   if (hit && nowMs - hit.at < PIN_USAGE_FRESH_MS) return cached();
+  // The gateway's own poll (every replica has it) answers a plain read while it is fresh. A read for reset grants needs Anthropic: the poll has none.
+  const poll = await pollReading(r, member, nowMs);
+  const fromPoll = (): AccountResult => ({ res: new Response(JSON.stringify(poll!.body), { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" } }), identity: member, cls });
+  if (!resets && poll && !poll.stale && poll.ageMs < PIN_POLL_FRESH_MS) return fromPoll();
+  /** Last good body or poll reading for an Anthropic failure; undefined when there is neither. */
+  const fallback = (): AccountResult | undefined => {
+    if (hit && nowMs - hit.at < PIN_USAGE_STALE_MAX_MS) return cached();
+    if (poll && poll.ageMs < PIN_USAGE_STALE_MAX_MS) return fromPoll();
+    return undefined;
+  };
   let res: Response;
   try {
     res = await callAs(r, member, { method: r.method, url: url + r.search });
   } catch (err) {
     if (r.signal.aborted) throw err;
-    if (hit && nowMs - hit.at < PIN_USAGE_STALE_MAX_MS) return cached();
+    const covered = fallback();
+    if (covered) return covered;
     throw err;
   }
   if (res.ok) {
@@ -311,9 +355,12 @@ async function pinnedUsage(r: AccountRequest, member: string, url: string, cls: 
     r.state.usage.set(key, { body, at: nowMs });
     return { res: new Response(body, { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json", "cache-control": "no-store" } }), identity: member, cls };
   }
-  if (hit && nowMs - hit.at < PIN_USAGE_STALE_MAX_MS && (res.status === 429 || res.status >= 500)) {
+  if (res.status === 429 || res.status >= 500) {
     await discard(res);
-    return cached();
+    const covered = fallback();
+    if (covered) return covered;
+    // Claude Code remembers a 429 (and 401, 403) per bearer for about an hour, but not a 5xx: never relay Anthropic's 429.
+    return { res: json({ type: "error", error: { type: "api_error", message: "usage is temporarily unavailable" } }, 503), identity: member, cls };
   }
   return { res: relay(res), identity: member, cls };
 }

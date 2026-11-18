@@ -326,7 +326,11 @@ export async function leastUsed(ctx: ServeContext): Promise<PoolUsage | undefine
 
 /** The two windows of the member the pool would route to (lowest utilisation), in the shape of Anthropic's usage endpoint. */
 export async function claudeUsageBody(ctx: ServeContext): Promise<Record<string, unknown>> {
-  const best = await leastUsed(ctx);
+  return claudeUsageBodyOf(await leastUsed(ctx));
+}
+
+/** The same body for one reading (a pinned member's own poll data). */
+export function claudeUsageBodyOf(best: PoolUsage | undefined): Record<string, unknown> {
   const win = (label: string): { utilization: number; resets_at: string | null } | null => {
     const w = best?.windows?.find((x) => x.label === label);
     return w ? { utilization: w.utilization, resets_at: w.resetsAt ?? null } : null;
@@ -414,7 +418,14 @@ function stableUuid(seed: string): string {
 
 /** A made-up Claude profile for a kimi or zai app: stable ids from the app name, no personal data and no member login. */
 function claudeStyleProfile(app: GatewayApp): Response {
-  const label = app.provider === "zai" ? "Z.ai" : "Kimi";
+  return syntheticClaudeProfile(app, app.provider === "zai" ? "Z.ai" : "Kimi");
+}
+
+/**
+ * A made-up Claude profile built from the app name alone. Used for kimi and zai apps, and for a pinned claude app when the
+ * member's real profile cannot be read. The member's plan is not known to the gateway, so it is shown as Max.
+ */
+export function syntheticClaudeProfile(app: GatewayApp, label: string): Response {
   return json({
     account: {
       uuid: stableUuid(`account:${app.name}`),
