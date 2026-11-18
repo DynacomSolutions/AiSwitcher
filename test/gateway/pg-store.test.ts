@@ -2,7 +2,9 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
 import { isDataError } from "../../src/gateway/ledger-buffer.ts";
 import { migrate, PgGatewayStore } from "../../src/gateway/pg-store.ts";
+import { CachedGatewayStore } from "../../src/gateway/cache-store.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
+import { generateToken, verifyToken } from "../../src/gateway/tokens.ts";
 import { browserStoreContract } from "./browser-store-contract.ts";
 import { storeContract } from "./store-contract.ts";
 
@@ -136,6 +138,60 @@ if (!url && process.env.CI && !optOut) {
   describe("PgGatewayStore contract", () => {
     storeContract(async () => {
       return fresh();
+    });
+  });
+
+  describe("PgGatewayStore app change notices", () => {
+    const app = { name: "web", owner: "o", namespace: "ns", provider: "claude" as const, style: "anthropic" as const, target: { kind: "pin" as const, identity: "id1" }, state: "active" as const, createdAt: "2026-11-01T00:00:00.000Z" };
+
+    test("a write on one connection reaches a listener on another", async () => {
+      const writer = await fresh();
+      const listener = new PgGatewayStore(url);
+      stores.push(listener);
+      const seen: string[] = [];
+      const unlisten = await listener.listenAppChanges?.((n) => seen.push(n));
+      await writer.putApp(app);
+      await writer.addToken({ app: "web", prefix: "p1", hash: "h1", createdAt: app.createdAt });
+      await writer.expireTokens("web", "2099-01-01T00:00:00.000Z");
+      await writer.revokeApp("web");
+      const end = Date.now() + 3000;
+      while (seen.length < 4 && Date.now() < end) await Bun.sleep(10);
+      await unlisten?.();
+      expect(seen).toEqual(["web", "web", "web", "web"]);
+    });
+
+    test("a ping notice reaches a listener and never names an app", async () => {
+      const writer = await fresh();
+      const listener = new PgGatewayStore(url);
+      stores.push(listener);
+      const seen: string[] = [];
+      const unlisten = await listener.listenAppChanges?.((n) => seen.push(n));
+      await writer.pingAppChanges("!ping:abc");
+      const end = Date.now() + 3000;
+      while (seen.length < 1 && Date.now() < end) await Bun.sleep(10);
+      await unlisten?.();
+      expect(seen).toEqual(["!ping:abc"]);
+    });
+
+    test("a revoke through one store makes a cache over another store reject the old token", async () => {
+      const writer = await fresh();
+      const other = new PgGatewayStore(url);
+      stores.push(other);
+      const cache = new CachedGatewayStore(other);
+      await writer.putApp(app);
+      const t = generateToken();
+      await writer.addToken({ app: "web", prefix: t.prefix, hash: t.hash, createdAt: app.createdAt });
+      await cache.warm();
+      await cache.startListening();
+      try {
+        expect(await verifyToken(cache, "web", t.token, new Date("2026-11-02T00:00:00.000Z"))).toBe(true);
+        await writer.revokeApp("web");
+        const end = Date.now() + 3000;
+        while ((await cache.getApp("web"))?.state !== "revoked" && Date.now() < end) await Bun.sleep(10);
+        expect(await verifyToken(cache, "web", t.token, new Date("2026-11-02T00:00:00.000Z"))).toBe(false);
+      } finally {
+        cache.stop();
+      }
     });
   });
 

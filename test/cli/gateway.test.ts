@@ -122,6 +122,13 @@ describe("ais gateway app add", () => {
     await expect(run(ADD)).rejects.toThrow(/already exists/);
   });
 
+  test("add on a revoked app says it is revoked, asks for a new name and mints nothing", async () => {
+    respond = () => Response.json({ name: "billing", state: "revoked" });
+    await expect(run(ADD)).rejects.toThrow(/revoked.*stays revoked.*Register a new name/);
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+    expect(kube).toHaveLength(0);
+  });
+
   test("no proxy url errors before any token is minted", async () => {
     writeFileSync(secrets, "AIS_GATEWAY_ADMIN_URL=http://admin.test\nAIS_GATEWAY_ADMIN_TOKEN=adm-1\n", { mode: 0o600 });
     delete process.env.AIS_GATEWAY_PROXY_URL;
@@ -168,10 +175,18 @@ describe("other commands", () => {
     expect(out.join("\n")).toContain(TOKEN);
   });
 
-  test("revoke posts to the admin API", async () => {
+  test("revoke posts to the admin API and says every token stopped", async () => {
     respond = () => Response.json({ app: "billing", state: "revoked" });
     await run("gateway app revoke billing");
     expect(calls[0]).toMatchObject({ method: "POST", url: "http://admin.test/apps/billing/revoke" });
+    expect(out).toEqual(["revoked billing: every token stopped working now; the name cannot be used again"]);
+  });
+
+  test("rotate on a revoked app is refused before any token is minted", async () => {
+    respond = () => Response.json({ name: "billing", namespace: "shop", state: "revoked" });
+    await expect(run("gateway app rotate billing")).rejects.toThrow(/revoked.*Register a new name/);
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
+    expect(kube).toHaveLength(0);
   });
 
   test("update merges flags over the current app", async () => {

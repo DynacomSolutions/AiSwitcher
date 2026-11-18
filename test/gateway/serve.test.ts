@@ -251,6 +251,28 @@ describe("serve lifecycle", () => {
     expect(text).toContain('ais_gateway_credential_unreadable_total{app="broken",provider="claude",identity="missing"} 1');
   });
 
+  test("a revoke on one replica stops the old token on the other at once, and the name cannot be reused", async () => {
+    const token = await seed();
+    const a = await boot();
+    const b = await boot();
+    for (const g of [a, b]) await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const call = (g: { port: number }) => fetch(`${base(g)}/web/v1/messages`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
+    expect((await call(a)).status).toBe(200);
+    expect((await call(b)).status).toBe(200);
+    const admin = (g: { adminPort: number }, path: string, init: RequestInit = {}) =>
+      fetch(`http://127.0.0.1:${g.adminPort}${path}`, { ...init, headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" } });
+    expect((await admin(a, "/apps/web/revoke", { method: "POST" })).status).toBe(200);
+    // The refresh timer is an hour long here, so only the change notice can update B.
+    await waitFor(async () => (await call(b)).status === 401);
+    expect((await call(a)).status).toBe(401);
+    const put = await admin(b, "/apps/web", { method: "PUT", body: JSON.stringify({ owner: "o", namespace: "ns", provider: "claude", style: "anthropic", target: { kind: "pin", identity: "id1" } }) });
+    expect(put.status).toBe(409);
+    expect((await admin(b, "/apps/web/tokens", { method: "POST", body: "{}" })).status).toBe(409);
+    expect((await call(a)).status).toBe(401);
+    expect((await call(b)).status).toBe(401);
+    expect((await store.getApp("web"))?.state).toBe("revoked");
+  });
+
   test("admin token shorter than 32 characters fails startup without printing it", async () => {
     const short = "short-token-value";
     const err = await startGateway({ port: 0, adminPort: 0, databaseUrl: "postgres://unused", adminToken: short }, hooks()).then(() => undefined, (e: Error) => e);

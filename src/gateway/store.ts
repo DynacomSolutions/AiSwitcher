@@ -2,14 +2,34 @@ import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browse
 import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 
+/** The message for any attempt to reuse or extend a revoked app. */
+export function revokedMessage(name: string): string {
+  return `app "${name}" is revoked; a revoked app stays revoked and its tokens never work again. Register a new name.`;
+}
+
+/** Thrown by a store when a write would revive or extend a revoked (or missing) app. A revoked app is final. */
+export class AppRevokedError extends Error {
+  constructor(readonly app: string) {
+    super(revokedMessage(app));
+    this.name = "AppRevokedError";
+  }
+}
+
 export interface GatewayStore {
   getApp(name: string): Promise<GatewayApp | undefined>;
   listApps(): Promise<GatewayApp[]>;
+  /** Creates or updates an app. Throws AppRevokedError when the stored app is revoked (a revoked app is never changed). */
   putApp(app: GatewayApp): Promise<void>;
+  /** Adds a token only to an existing active app; throws AppRevokedError otherwise. */
   addToken(rec: TokenRecord): Promise<void>;
   tokensFor(app: string): Promise<TokenRecord[]>;
   expireTokens(app: string, at: string): Promise<void>;
+  /** Marks the app revoked and stops every token of it now (expiresAt set to the revoke time). */
   revokeApp(name: string): Promise<void>;
+  /** Calls `onApp` with the app name whenever any replica changes an app or its tokens. Returns an unlisten function. Optional: a store without it relies on the periodic refresh. */
+  listenAppChanges?(onApp: (name: string) => void): Promise<() => Promise<void>>;
+  /** Sends a control notice on the app-change channel (payload starts with "!", so no app name can equal it). A cache uses it to check that its subscription is alive. */
+  pingAppChanges?(payload: string): Promise<void>;
   appendUsage(rows: UsageRow[]): Promise<void>;
   usageSince(app: string, since: Date): Promise<number>;
   /** usageSince for every app at once (one ledger scan), keyed by app; apps with no rows are absent. */
@@ -62,12 +82,44 @@ export class MemoryGatewayStore implements GatewayStore {
     return [...this.apps.values()].map((a) => ({ ...a }));
   }
 
+  private appListeners = new Set<(name: string) => void>();
+
+  private changed(name: string): void {
+    for (const l of [...this.appListeners]) {
+      try {
+        l(name);
+      } catch {
+        // a failing listener must not fail the write
+      }
+    }
+  }
+
+  async listenAppChanges(onApp: (name: string) => void): Promise<() => Promise<void>> {
+    this.appListeners.add(onApp);
+    return async () => {
+      this.appListeners.delete(onApp);
+    };
+  }
+
+  async pingAppChanges(payload: string): Promise<void> {
+    this.changed(payload);
+  }
+
+  /** Drops every listener without telling it, as a lost database connection would (for tests). */
+  dropListeners(): void {
+    this.appListeners.clear();
+  }
+
   async putApp(app: GatewayApp): Promise<void> {
+    if (this.apps.get(app.name)?.state === "revoked") throw new AppRevokedError(app.name);
     this.apps.set(app.name, { ...app });
+    this.changed(app.name);
   }
 
   async addToken(rec: TokenRecord): Promise<void> {
+    if (this.apps.get(rec.app)?.state !== "active") throw new AppRevokedError(rec.app);
     this.tokens.push({ ...rec });
+    this.changed(rec.app);
   }
 
   async tokensFor(app: string): Promise<TokenRecord[]> {
@@ -79,11 +131,18 @@ export class MemoryGatewayStore implements GatewayStore {
     for (const t of this.tokens) {
       if (t.app === app && t.expiresAt === undefined) t.expiresAt = at;
     }
+    this.changed(app);
   }
 
   async revokeApp(name: string): Promise<void> {
     const app = this.apps.get(name);
-    if (app) app.state = "revoked";
+    if (!app) return;
+    app.state = "revoked";
+    const at = new Date().toISOString();
+    for (const t of this.tokens) {
+      if (t.app === name && (t.expiresAt === undefined || Date.parse(t.expiresAt) > Date.parse(at))) t.expiresAt = at;
+    }
+    this.changed(name);
   }
 
   async appendUsage(rows: UsageRow[]): Promise<void> {

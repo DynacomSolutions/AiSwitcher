@@ -409,6 +409,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const ledger = new LedgerBuffer(store, hooks.ledger ?? { max: 50_000, flushMs: 2_000 });
   const metrics = new PrometheusMetrics({ ledgerDepth: () => ledger.depth, ledgerDropped: () => ledger.dropped });
   metrics.publicHostsConfigured(publicHosts.length);
+  metrics.appNoticesUp = () => (store.listening ? 1 : 0);
   if (publicHosts.length === 0) console.warn("gateway: AIS_GATEWAY_PUBLIC_HOSTS is empty, so /metrics, /healthz, /readyz and /browser/pair answer on every host, including a public tunnel; set it to the public host names");
   const alerter = createAlerter(hooks.notify ?? stderrNotifier);
   const failedTokens = new Map<string, string>();
@@ -512,7 +513,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     }
     return undefined;
   };
-  const admin = createAdminApp({ store, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, browserPoolMembers, browserIdentityExists, browserHub: browser, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
+  const admin = createAdminApp({ store, readStore: inner, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, browserPoolMembers, browserIdentityExists, browserHub: browser, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
 
   let warmed = false;
   let draining = false;
@@ -632,6 +633,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         warmed = true;
         pruneJournal();
         store.startRefresh(hooks.refreshIntervalMs ?? 15_000);
+        // Other replicas' changes (a revoke above all) arrive at once; the timed refresh stays as the fallback.
+        await store.startListening().catch((err) => console.warn(`gateway: app change notices unavailable (${describe(err)}); the ${(hooks.refreshIntervalMs ?? 15_000) / 1000} s refresh still applies`));
         console.info("gateway: warm, ready for traffic");
         void probeIdentities().catch(() => undefined);
         if (aliList && selfTestEnabled) void aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).then((p) => void (aliSetupOk = p.length === 0), () => undefined);

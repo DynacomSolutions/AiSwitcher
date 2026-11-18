@@ -197,6 +197,19 @@ function mintedToken(json: Record<string, unknown>): string {
   return json.token;
 }
 
+/** The app is revoked, so add or rotate is refused. Carries the CliUsageError name so callers handle it like any usage error. */
+export class RevokedAppError extends CliUsageError {
+  constructor(message: string) {
+    super(message);
+    this.name = "CliUsageError";
+  }
+}
+
+/** A revoked app is final: its name and tokens never come back, so add and rotate refuse it. */
+function revokedMessage(name: string, action: "add" | "rotate"): string {
+  return `App "${name}" is revoked; a revoked app stays revoked and its tokens never work again, so it cannot be ${action === "add" ? "added again" : "rotated"}. Register a new name: ais gateway app add <new-name> ...`;
+}
+
 function appName(positionals: string[]): string {
   const name = positionals[0];
   if (!name) throw new CliUsageError("App name required, e.g. ais gateway app add <name> ...");
@@ -210,6 +223,7 @@ function appName(positionals: string[]): string {
  */
 export async function rotateApp(admin: Admin, deps: GatewayCliDeps, flags: Flags, name: string): Promise<{ token: string; url: string; previousTokensExpireAt: string }> {
   const { json: cur } = await admin.call("GET", `/apps/${name}`);
+  if (cur.state === "revoked") throw new RevokedAppError(revokedMessage(name, "rotate"));
   const url = await proxyUrl(deps, flags, name);
   const minted = await admin.call("POST", `/apps/${name}/tokens`, {});
   const token = mintedToken(minted.json);
@@ -246,6 +260,7 @@ export async function runAppCommand(action: string | undefined, positionals: str
       await rejectPoolPin(deps, body.provider, body.target, true);
       const url = await proxyUrl(deps, flags, name);
       const existing = await admin.call("GET", `/apps/${name}`, undefined, [404]);
+      if (existing.status !== 404 && existing.json.state === "revoked") throw new RevokedAppError(revokedMessage(name, "add"));
       if (existing.status !== 404) throw new CliUsageError(`App "${name}" already exists; use: ais gateway app update ${name} to change settings, or ais gateway app rotate ${name} for a new token`);
       await admin.call("PUT", `/apps/${name}`, body);
       const minted = await admin.call("POST", `/apps/${name}/tokens`, {});
@@ -289,7 +304,7 @@ export async function runAppCommand(action: string | undefined, positionals: str
     case "revoke": {
       const name = appName(positionals);
       await admin.call("POST", `/apps/${name}/revoke`);
-      deps.out(`revoked ${name}`);
+      deps.out(`revoked ${name}: every token stopped working now; the name cannot be used again`);
       return;
     }
     default:

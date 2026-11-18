@@ -43,6 +43,8 @@ describe("MemoryGatewayStore", () => {
 
   test("expireTokens only touches the given app and unexpired tokens", async () => {
     const s = new MemoryGatewayStore();
+    await s.putApp(base);
+    await s.putApp({ ...base, name: "b" });
     await s.addToken({ app: "a", prefix: "p1", hash: "h1", createdAt: "t" });
     await s.addToken({ app: "b", prefix: "p2", hash: "h2", createdAt: "t" });
     await s.expireTokens("a", "2026-11-02T00:00:00.000Z");

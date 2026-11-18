@@ -75,7 +75,7 @@ The admin API owns validation; its reason is shown when a value is refused.
 
 `update` merges your flags over the current app. It cannot clear a field (such as
 `--models` or a cap), and it does not move the Secret to another namespace. To do
-either, `revoke` the app and `add` it again.
+either, `add` a new app under a new name and `revoke` the old one. A revoked name cannot be reused.
 
 ## Out of capacity
 
@@ -96,13 +96,29 @@ a provider passes the last upstream 429 through.
 Claude Code in API-key mode (the gateway token via `apiKeyHelper`) retries a 429 only when `retry-after` is
 60 s or less; a longer wait ends the request with `Request rejected (429)`.
 
-## Rotate and revoke
+## Add, update, rotate and revoke
 
-`rotate` mints a new token and rewrites the Secret and `~/.secrets`. Earlier tokens
-keep working for an overlap window (24 hours by default) so pods can restart onto
-the new Secret. `revoke` is immediate and final for the app. If `kubectl` fails
-during `add` or `rotate`, the token is still saved to `~/.secrets`; fix access and
+What each command does to tokens:
+
+- `add` creates a new app and its first token. It is refused for any name that already exists, a revoked
+  app included.
+- `update` changes settings only. No token changes.
+- `rotate` mints a new token and rewrites the Secret and `~/.secrets`. Earlier tokens keep working for an
+  overlap window (24 hours by default) so pods can restart onto the new Secret. The admin API takes
+  `overlapHours` (0 up to 720) in the body of `POST /apps/<name>/tokens`. With `0` the earlier tokens stop at
+  once. `rotate` is refused on a revoked app.
+- `revoke` is final. Every token of the app stops working at once, on every replica, and the name can never
+  be used again. `add`, `update` (PUT) and `rotate` on a revoked name answer `409` with: `app "<name>" is
+  revoked; a revoked app stays revoked and its tokens never work again. Register a new name.`
+
+If `kubectl` fails during `add` or `rotate`, the token is still saved to `~/.secrets`; fix access and
 run `rotate`.
+
+Why a revoke holds on every replica: the admin API reads apps and tokens from the database, never from the
+replica's own cache, so a replica that has not yet seen a revoke still refuses to change or revive the app.
+The database also refuses to update a revoked app or to add a token to it. A revoke sets every token's expiry
+to now in the same transaction. Each change sends a PostgreSQL `NOTIFY` on `gateway_apps_changed` with the
+app name, and every replica re-reads that app at once. The 15 s full refresh stays as the fallback.
 
 ## What the app sets
 
