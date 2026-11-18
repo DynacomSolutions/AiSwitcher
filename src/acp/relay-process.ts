@@ -29,6 +29,10 @@ export class LineSplitter {
     return out;
   }
   /** What is left after the last newline. */
+  /** Whether part of a line is waiting for its newline. */
+  midLine(): boolean {
+    return this.pending.length > 0;
+  }
   rest(): Buffer {
     const rest = Buffer.concat(this.pending);
     this.pending = [];
@@ -57,8 +61,20 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
   const stdin: NodeJS.ReadableStream = opts.stdin ?? process.stdin;
   const stdout: NodeJS.WritableStream = opts.stdout ?? process.stdout;
   const log = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log });
   const child = spawn(opts.command, opts.args, { stdio: ["pipe", "pipe", "inherit"], env: opts.env ?? process.env });
+  // The relay's own lines to the agent go between the client's lines, never inside one.
+  const fromClient = new LineSplitter();
+  let held: string[] = [];
+  const flushHeld = () => {
+    if (held.length === 0 || fromClient.midLine() || !child.stdin.writable) return;
+    child.stdin.write(held.map((l) => `${l}\n`).join(""));
+    held = [];
+  };
+  const toAgent = (line: string) => {
+    held.push(line);
+    flushHeld();
+  };
+  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log, toAgent });
 
   return new Promise<number>((resolve) => {
     let done = false;
@@ -76,7 +92,6 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     };
 
     // Client to agent.
-    const fromClient = new LineSplitter();
     stdin.on("data", (chunk: Buffer | string) => {
       const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
       for (const line of fromClient.push(bytes)) {
@@ -87,6 +102,7 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
         }
       }
       if (child.stdin.writable) child.stdin.write(bytes);
+      flushHeld();
     });
     stdin.on("end", () => child.stdin.end());
     child.stdin.on("error", () => {}); // the agent closed its stdin: nothing more to send

@@ -342,6 +342,22 @@ shows a turn as failed, with a message, only when the agent answers `session/pro
   `[No reply: the agent ended this turn without any output and gave no reason.]` A turn the agent's records say ended
   well never gets the notice.
 
+Turns the agent starts by itself (measured 18 Nov 2026, kimi-code 2.5.2: a finished background task wakes the agent with
+no `session/prompt`). T3 Code has no run for such a turn. It shows none of its output, and it answers the turn's
+`session/request_permission` by selecting the agent's reject option, so the agent tells the model "the user rejected the
+approval request" although nobody was asked. The relay:
+
+- never sends the client a permission request of a session with no open prompt. It answers it itself: with the same
+  option kind the client chose for this session's last request, when the client chose an allow option within 250 ms
+  (`AUTO_ANSWER_MS`: no person answers that fast, so the thread's mode approves by itself, as in full access); else
+  `cancelled`, which the agent reports as a cancelled request, never as a rejection by the user. The relay's answer goes
+  to the agent between the client's lines, never inside one.
+- notes output a session sends while none of its prompts is open. Until a prompt of that session has output again, an
+  empty answer gets `[No reply: the agent is busy with a turn it started by itself ...]` and not the plain empty notice.
+
+The cause is removed at the source too: the cluster's Kimi `config.toml` files turn off its background tools (see
+DynacomSolutions/.cluster `agent-runtime/README.md`).
+
 Every other line passes unchanged, byte for byte, in both directions. Reasons are cut to 500 characters and
 credential-shaped text is removed (`redactText`).
 

@@ -42,6 +42,10 @@ process.stdin.on("data", (d) => {
       else if (text === "empty") send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } });
       else if (text === "rpc") send({ jsonrpc: "2.0", id: m.id, error: { code: -32603, message: "Internal error", data: { details: "API error (status 500): upstream down" } } });
       else if (text === "exit") process.exit(7);
+      else if (text === "wake") { send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } }); setTimeout(() => send({ jsonrpc: "2.0", id: "perm-1", method: "session/request_permission", params: { sessionId: "session_fake", options: [{ optionId: "approve", name: "Approve once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }], toolCall: { toolCallId: "t1", title: "Bash" } } }), 50); }
+    } else if (m.id === "perm-1") {
+      fs.writeFileSync(process.env.FAKE_SEEN + ".perm", JSON.stringify(m));
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "session_fake", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "permission answered" } } } });
     }
   }
 });
@@ -181,4 +185,23 @@ test("adapterFor: kimi-code reads its session log, other agents have no adapter"
   expect(adapterFor("kimi-code", { KIMI_CODE_HOME: join(root, "h") })?.turnOutcome).toBeDefined();
   expect(adapterFor("grok-build", {})).toBeUndefined();
   expect(adapterFor("glm-acp-agent", {})).toBeUndefined();
+});
+
+test("regression: a permission request from a turn the agent started itself is answered cancelled, never sent to the client", async () => {
+  const t = await start("wake");
+  t.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
+  t.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/x", mcpServers: [] } });
+  await t.next(2);
+  t.prompt(3, "wake"); // the turn ends; 50 ms later the agent asks permission with no prompt open
+  const [notice, end] = await t.next(2);
+  expect(end!.id).toBe(3);
+  expect(notice!.method).toBe("session/update");
+  const [after] = await t.next(1); // the agent got its answer and went on; the client never saw the request
+  expect(after!.params.update.content.text).toBe("permission answered");
+  expect(t.lines.some((l) => l.includes("session/request_permission"))).toBe(false);
+  const { readFile } = await import("node:fs/promises");
+  expect(JSON.parse(await readFile(`${t.seen}.perm`, "utf8")).result).toEqual({ outcome: { outcome: "cancelled" } });
+  expect(t.notes).toContain("acp-relay: permission asked with no prompt open, nobody can answer: cancelled");
+  t.stdin.end();
+  expect(await t.exit).toBe(0);
 });

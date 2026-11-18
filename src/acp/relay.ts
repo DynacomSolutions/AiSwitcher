@@ -12,7 +12,16 @@
  * - an answer `end_turn` for a turn the agent's own records say failed becomes a JSON-RPC error with the reason;
  * - an error whose message is generic gets the detail from its `data`;
  * - an `end_turn` after a turn with no output at all, when nothing is known about how the turn ended, is kept, preceded
- *   by a notice the user can see. A turn the agent's records say ended well is never given a notice.
+ *   by a notice the user can see. A turn the agent's records say ended well is never given a notice. When the agent sent
+ *   output while no prompt of the session was open (a turn it started itself), the notice says the agent is busy.
+ *
+ * Permission requests while no prompt of the session is open (measured 18 Nov 2026, kimi-code 2.5.2): an agent can
+ * start a turn by itself (a finished background task wakes it). T3 Code has no run for that turn and answers its
+ * `session/request_permission` by selecting the agent's reject option, so the agent tells the model "the user rejected
+ * the approval request" although nobody was asked. Such a request never goes to the client. The relay answers it:
+ * - with the client's own answer inside runs, when the client answered this session's last permission request with an
+ *   allow option within `AUTO_ANSWER_MS` (no person answers that fast: the thread's mode approves by itself);
+ * - otherwise `cancelled`, which agents report as a cancelled request, never as a user's rejection.
  *
  * Every other line passes unchanged, byte for byte. A line this code cannot read passes unchanged too.
  */
@@ -47,12 +56,20 @@ export interface RelayOptions {
   adapter?: RelayAdapter;
   /** One line per changed answer, for the agent's stderr log. Never carries prompt or reply text. */
   log?: (line: string) => void;
+  /** Sends a line to the agent (the relay's own answer to a request the client does not get). */
+  toAgent?: (line: string) => void;
+  /** The clock, for the time the client took to answer a permission request. */
+  now?: () => number;
 }
 
 /** JSON-RPC "internal error": the code agents use for a failed provider call. */
 export const TURN_FAILED_CODE = -32603;
 export const ERROR_SOURCE = "ais-acp-relay";
 export const EMPTY_TURN_NOTICE = "[No reply: the agent ended this turn without any output and gave no reason.]";
+export const BUSY_TURN_NOTICE =
+  "[No reply: the agent is busy with a turn it started by itself (for example when background work ended). That turn's output does not reach this thread. Wait until it is done, then send the message again.]";
+/** A permission answer quicker than this came from the client's mode, not from a person. */
+export const AUTO_ANSWER_MS = 250;
 const MESSAGE_MAX = 500;
 
 /** Session updates that are output of the turn (text, thinking, tools, a plan). */
@@ -103,18 +120,52 @@ export function failureMessage(f: TurnFailure): string {
 
 const idKey = (id: unknown): string | undefined => (typeof id === "number" || typeof id === "string" ? `${typeof id}:${id}` : undefined);
 
+interface PermissionAsked {
+  sessionId: string;
+  /** Option id -> kind (`allow_once`, `allow_always`, `reject_once`, ...). */
+  kinds: Map<string, string>;
+  at: number;
+}
+
+/** The options of a `session/request_permission` request, id -> kind. */
+function optionKinds(params: Json | undefined): Map<string, string> {
+  const kinds = new Map<string, string>();
+  const options = Array.isArray(params?.options) ? params.options : [];
+  for (const o of options) {
+    const id = str(obj(o)?.optionId);
+    if (id !== undefined) kinds.set(id, str(obj(o)?.kind) ?? "");
+  }
+  return kinds;
+}
+
 export class AcpRelay {
   private readonly prompts = new Map<string, Prompt>();
   /** Output updates seen per session. A prompt had output when the count grew after it was sent. */
   private readonly output = new Map<string, number>();
+  /** Permission requests the client got and has not answered, by request id. */
+  private readonly asked = new Map<string, PermissionAsked>();
+  /** Per session: the option kind the client chose at once for its last permission request, or null when it did not. */
+  private readonly autoAnswer = new Map<string, string | null>();
+  /** Sessions that sent output while none of their prompts was open, and have not had a prompt with output since. */
+  private readonly busyAlone = new Set<string>();
 
   constructor(private readonly opts: RelayOptions = {}) {}
 
+  private now(): number {
+    return this.opts.now?.() ?? Date.now();
+  }
+
+  private promptOpen(sessionId: string): boolean {
+    for (const p of this.prompts.values()) if (p.sessionId === sessionId) return true;
+    return false;
+  }
+
   /**
    * A line the client sends to the agent, seen before the agent gets it. It is never changed; a `session/prompt`
-   * request is remembered.
+   * request is remembered, and the client's answer to a permission request is noted.
    */
   fromClient(line: string): void {
+    if (this.asked.size > 0 && line.includes('"outcome"')) this.notePermissionAnswer(line);
     if (!line.includes('"session/prompt"')) return;
     let msg: Json | undefined;
     try {
@@ -137,7 +188,7 @@ export class AcpRelay {
 
   /** A line the agent sent. Returns the lines the client gets: the same line, or the changed answer to a prompt. */
   async fromAgent(line: string): Promise<string[]> {
-    if (this.prompts.size === 0) return [line];
+    if (this.prompts.size === 0 && !line.includes('"session/')) return [line];
     let msg: Json | undefined;
     try {
       msg = obj(JSON.parse(line));
@@ -149,16 +200,24 @@ export class AcpRelay {
       const params = obj(msg.params);
       const kind = obj(params?.update)?.sessionUpdate;
       const sessionId = str(params?.sessionId);
-      if (sessionId !== undefined && typeof kind === "string" && OUTPUT_UPDATES.has(kind)) this.output.set(sessionId, (this.output.get(sessionId) ?? 0) + 1);
+      if (sessionId !== undefined && typeof kind === "string" && OUTPUT_UPDATES.has(kind)) {
+        if (this.promptOpen(sessionId)) this.output.set(sessionId, (this.output.get(sessionId) ?? 0) + 1);
+        else if (!this.busyAlone.has(sessionId)) {
+          this.busyAlone.add(sessionId);
+          this.opts.log?.("acp-relay: the agent sent output with no prompt open (a turn it started itself)");
+        }
+      }
       return [line];
     }
+    if (msg.method === "session/request_permission") return this.permissionRequest(msg, line);
     if (msg.method !== undefined) return [line];
     const key = idKey(msg.id);
     const prompt = key !== undefined ? this.prompts.get(key) : undefined;
     if (key === undefined || !prompt) return [line];
     this.prompts.delete(key);
     const hadOutput = (this.output.get(prompt.sessionId) ?? 0) > prompt.outputAtStart;
-    if (![...this.prompts.values()].some((p) => p.sessionId === prompt.sessionId)) this.output.delete(prompt.sessionId);
+    if (!this.promptOpen(prompt.sessionId)) this.output.delete(prompt.sessionId);
+    if (hadOutput) this.busyAlone.delete(prompt.sessionId);
 
     if (msg.error !== undefined) {
       const described = describeError(msg.error);
@@ -182,10 +241,55 @@ export class AcpRelay {
       return [JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: TURN_FAILED_CODE, message: failureMessage(failure), data } })];
     }
     if (!hadOutput) {
-      this.opts.log?.("acp-relay: empty turn, notice added");
-      const notice = { jsonrpc: "2.0", method: "session/update", params: { sessionId: prompt.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: EMPTY_TURN_NOTICE } } } };
+      const busy = this.busyAlone.has(prompt.sessionId);
+      this.opts.log?.(busy ? "acp-relay: empty turn while the agent is busy on its own, notice added" : "acp-relay: empty turn, notice added");
+      const text = busy ? BUSY_TURN_NOTICE : EMPTY_TURN_NOTICE;
+      const notice = { jsonrpc: "2.0", method: "session/update", params: { sessionId: prompt.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } };
       return [JSON.stringify(notice), line];
     }
     return [line];
+  }
+
+  /** A permission request from the agent: to the client inside a prompt, answered here outside one. */
+  private permissionRequest(msg: Json, line: string): string[] {
+    const params = obj(msg.params);
+    const sessionId = str(params?.sessionId);
+    const key = idKey(msg.id);
+    if (sessionId === undefined || key === undefined) return [line];
+    const kinds = optionKinds(params);
+    if (this.promptOpen(sessionId) || !this.opts.toAgent) {
+      this.asked.set(key, { sessionId, kinds, at: this.now() });
+      return [line];
+    }
+    const want = this.autoAnswer.get(sessionId);
+    const optionId = want ? [...kinds].find(([, k]) => k === want)?.[0] ?? [...kinds].find(([, k]) => k.startsWith("allow"))?.[0] : undefined;
+    const outcome = optionId !== undefined ? { outcome: "selected", optionId } : { outcome: "cancelled" };
+    this.opts.log?.(
+      optionId !== undefined
+        ? `acp-relay: permission asked with no prompt open, approved as the client approves this session (${want})`
+        : "acp-relay: permission asked with no prompt open, nobody can answer: cancelled",
+    );
+    this.opts.toAgent(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { outcome } }));
+    return [];
+  }
+
+  /** The client's answer to a permission request: notes whether this session's mode approves by itself. */
+  private notePermissionAnswer(line: string): void {
+    let msg: Json | undefined;
+    try {
+      msg = obj(JSON.parse(line));
+    } catch {
+      return;
+    }
+    if (!msg || msg.method !== undefined) return;
+    const key = idKey(msg.id);
+    const asked = key !== undefined ? this.asked.get(key) : undefined;
+    if (key === undefined || !asked) return;
+    this.asked.delete(key);
+    const outcome = obj(obj(msg.result)?.outcome);
+    const optionId = str(outcome?.optionId);
+    const kind = outcome?.outcome === "selected" && optionId !== undefined ? asked.kinds.get(optionId) : undefined;
+    const quick = this.now() - asked.at <= AUTO_ANSWER_MS;
+    this.autoAnswer.set(asked.sessionId, kind !== undefined && kind.startsWith("allow") && quick ? kind : null);
   }
 }
