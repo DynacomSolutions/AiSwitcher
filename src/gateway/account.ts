@@ -14,6 +14,9 @@ import type { ApiStyle, GatewayApp } from "./types.ts";
  * claude reset grant id; a codex account with an unspent reset credit), else the member the pool would route to now (lowest
  * utilisation; a member with no figure after those with one). The reserve is not applied: an account call is exactly what a user
  * makes when the account is full (spending a reset credit).
+ *
+ * Exception: a pool app's `GET /api/oauth/profile` is answered by the gateway itself (a profile made up from the app name, no
+ * upstream call, no member login), so a pool never shows a member's real email and T3 Code lists each pool as its own row.
  */
 
 /** Largest account request body held in memory; account calls carry a few hundred bytes. */
@@ -254,6 +257,12 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
       if (r.signal.aborted) throw new DOMException("aborted", "AbortError");
     }
     return { res: json(served), identity: member, cls };
+  }
+
+  // Pool: the profile is made up per app, with no upstream call and no member login. A member's real email would make T3 Code
+  // merge the usage rows of several pools into one.
+  if (r.method === "GET" && r.app.target.kind !== "pin" && r.app.provider === "claude" && r.op === "forward" && normalisePath(new URL(url).pathname)?.norm === "/api/oauth/profile") {
+    return { res: syntheticClaudeProfile(r.app, "Claude"), cls };
   }
 
   let orgAt = -1;
