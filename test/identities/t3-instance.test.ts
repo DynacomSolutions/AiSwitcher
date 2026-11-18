@@ -52,7 +52,7 @@ test("claude create writes instance, folder files and keeps others", async () =>
   const folder = join(home, ".t3", "gateway", "c1");
   expect(after.providerInstances.c1).toEqual({ driver: "claudeAgent", displayName: "C One", enabled: true, config: { binaryPath: "/bin/cl", homePath: folder, customModels: ["m1", "m2", "m3"] } });
   const fs = JSON.parse(await readFile(join(folder, "settings.json"), "utf8"));
-  expect(fs.env).toMatchObject({ ANTHROPIC_BASE_URL: "https://gw.example/gateway/agents-claude", HTTPS_PROXY: "http://proxy.example:3128", NODE_EXTRA_CA_CERTS: "/ca.pem", NO_PROXY: "127.0.0.1,localhost,::1", ANTHROPIC_MODEL: "m1", ANTHROPIC_DEFAULT_HAIKU_MODEL: "m3", CLAUDE_CODE_SUBAGENT_MODEL: "m1" });
+  expect(fs.env).toMatchObject({ ANTHROPIC_BASE_URL: "https://gw.example/gateway/agents-claude", HTTPS_PROXY: "http://proxy.example:3128", NODE_EXTRA_CA_CERTS: "/ca.pem", NO_PROXY: "127.0.0.1,localhost,::1,opencode.ai,cli-chat-proxy.grok.com", ANTHROPIC_MODEL: "m1", ANTHROPIC_DEFAULT_HAIKU_MODEL: "m3", CLAUDE_CODE_SUBAGENT_MODEL: "m1" });
   expect(fs.hooks).toEqual({ Stop: [1] });
   expect(fs.other).toBeUndefined();
   const cred = JSON.parse(await readFile(join(folder, ".credentials.json"), "utf8"));

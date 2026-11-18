@@ -18,6 +18,15 @@ import { writeFileAtomic } from "./pool/fs.ts";
 export const LOOPBACK_NO_PROXY = ["127.0.0.1", "localhost", "::1"] as const;
 
 const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] as const;
+/**
+ * Hosts that other tools use and that the gateway proxy also intercepts. Claude Code never calls them, so a tool
+ * started from a Claude session (for example grok) must go direct. The doctor does not require these.
+ */
+export const DIRECT_NO_PROXY = ["opencode.ai", "cli-chat-proxy.grok.com"] as const;
+
+/** Every name the written NO_PROXY must hold: loopback first, then the direct hosts. */
+export const GATEWAY_NO_PROXY = [...LOOPBACK_NO_PROXY, ...DIRECT_NO_PROXY] as const;
+
 const NO_PROXY_KEYS = ["NO_PROXY", "no_proxy"] as const;
 
 type Env = Record<string, unknown>;
@@ -65,11 +74,11 @@ export function usageProxyProblem(env: Env | undefined): string | undefined {
   return `${proxyKey} is set but NO_PROXY does not cover the loopback ANTHROPIC_BASE_URL host ${host}: every model call goes to the proxy and fails (405 from the gateway CONNECT proxy). Set NO_PROXY=${LOOPBACK_NO_PROXY.join(",")}.`;
 }
 
-/** NO_PROXY with every loopback name added, keeping the existing entries and their order. */
+/** NO_PROXY with every loopback name and direct host added, keeping the existing entries and their order. */
 export function withLoopbackNoProxy(current: unknown): string {
   const have = (str(current) ?? "").split(",").map((e) => e.trim()).filter((e) => e !== "");
   const lower = new Set(have.map((e) => e.toLowerCase()));
-  return [...have, ...LOOPBACK_NO_PROXY.filter((e) => !lower.has(e))].join(",");
+  return [...have, ...GATEWAY_NO_PROXY.filter((e) => !lower.has(e))].join(",");
 }
 
 export interface UsageProxyOptions {
