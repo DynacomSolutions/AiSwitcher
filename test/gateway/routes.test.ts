@@ -3,7 +3,7 @@ import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { createGatewayApp, type GatewayDeps } from "../../src/gateway/app.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { noopMetrics, type GatewayMetrics } from "../../src/gateway/metrics.ts";
-import { routeFor } from "../../src/gateway/routes.ts";
+import { claudeUsageBodyOf, routeFor } from "../../src/gateway/routes.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { generateToken } from "../../src/gateway/tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider } from "../../src/gateway/types.ts";
@@ -345,6 +345,19 @@ describe("served from pool state", () => {
     expect(await res.json()).toMatchObject({ five_hour: { utilization: 30, resets_at: "2026-11-02T13:00:00.000Z" }, seven_day: { utilization: 10, resets_at: "2026-11-05T00:00:00.000Z" } });
     expect(seen).toHaveLength(0);
     expect(requests.at(-1)).toMatchObject({ provider: "claude", status: "ok", httpStatus: 200 });
+  });
+
+  test("claude usage carries a model-scoped window as a limits[] weekly_scoped entry, and none without one", async () => {
+    const base = [{ label: "five-hour", utilization: 30, resetsAt: "2026-11-02T13:00:00.000Z" }, { label: "seven-day", utilization: 10, resetsAt: "2026-11-05T00:00:00.000Z" }];
+    const withFable = claudeUsageBodyOf({ status: "live", maxUtilization: 30, capturedAt: "", windows: [...base, { label: "seven-day (Fable)", model: "Fable", utilization: 75, resetsAt: "2026-11-05T01:00:00.000Z" }] });
+    expect(withFable).toMatchObject({ five_hour: { utilization: 30 }, seven_day: { utilization: 10 } });
+    expect(withFable.limits).toEqual([
+      { kind: "session", group: "session", percent: 30, resets_at: "2026-11-02T13:00:00.000Z", scope: null },
+      { kind: "weekly_all", group: "weekly", percent: 10, resets_at: "2026-11-05T00:00:00.000Z", scope: null },
+      { kind: "weekly_scoped", group: "weekly", percent: 75, resets_at: "2026-11-05T01:00:00.000Z", scope: { model: { id: null, display_name: "Fable" }, surface: null } },
+    ]);
+    const without = claudeUsageBodyOf({ status: "live", maxUtilization: 30, capturedAt: "", windows: base });
+    expect(without).not.toHaveProperty("limits");
   });
 
   test("claude usage with no figures answers null windows", async () => {
