@@ -137,6 +137,9 @@ export async function sendSessionEnd(ctx: ShimContext): Promise<void> {
   await Promise.race([callTool(ctx, SESSION_END_TOOL, {}, undefined, SESSION_END_TIMEOUT_MS, true).then(() => {}, () => {}), deadline]);
 }
 
+/** Server instructions sent in the initialize reply. Keep in step with docs/agents/browser.md, "When to close a tab". */
+export const BROWSER_INSTRUCTIONS = "Tabs open in the user's own Chrome window, in this session's tab group. Do not call close_tab on a tab while a step in it waits for the user: a sign-in, 2FA, \"Verify that it's you\", a CAPTCHA, a consent or payment page, a manual review, or a question to the user about that page. Leave the tab open on the page the user must use. Before you ask the user to act, make sure the tab shows that page, and give the browser profile (profileLabel from list_browsers) and the tab title in the question. If you closed the tab by mistake, open it again on the correct page before you ask. Close a tab only when the work in it is finished and verified, and neither you nor the user needs it again. A move to a different step is not the end of the work in the tab. At the true end of the task, close the tabs this session opened.";
+
 /** Handles one JSON-RPC message; undefined for notifications. */
 export async function handleRpc(msg: RpcMessage, ctx: ShimContext): Promise<object | undefined> {
   const reply = (result: unknown) => ({ jsonrpc: "2.0", id: msg.id ?? null, result });
@@ -149,7 +152,7 @@ export async function handleRpc(msg: RpcMessage, ctx: ShimContext): Promise<obje
   if (msg.id === undefined || msg.id === null) return undefined;
   switch (msg.method) {
     case "initialize":
-      return reply({ protocolVersion: SUPPORTED_VERSIONS.includes(String(msg.params?.protocolVersion)) ? msg.params?.protocolVersion : LATEST_VERSION, capabilities: { tools: {} }, serverInfo: { name: "ais-browser", version: "1" } });
+      return reply({ protocolVersion: SUPPORTED_VERSIONS.includes(String(msg.params?.protocolVersion)) ? msg.params?.protocolVersion : LATEST_VERSION, capabilities: { tools: {} }, serverInfo: { name: "ais-browser", version: "1" }, instructions: BROWSER_INSTRUCTIONS });
     case "ping":
       return reply({});
     case "tools/list":
