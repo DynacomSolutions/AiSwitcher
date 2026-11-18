@@ -300,3 +300,61 @@ describe("pi driver", () => {
     expect((await applyT3Instance(piOpts({ remove: true }))).status).toBe("absent");
   });
 });
+
+describe("claude stale oauthAccount", () => {
+  const folderOf = () => join(home, ".t3", "gateway", "c1");
+  const okFetch = (uuid: string) => async () => ({ ok: true, status: 200, json: async () => ({ account: { uuid } }) });
+  const seed = async (json: object) => {
+    await applyT3Instance(opts({}));
+    await writeFile(join(folderOf(), ".claude.json"), `${JSON.stringify(json, null, 2)}\n`, { mode: 0o600 });
+  };
+  const read = async () => readFile(join(folderOf(), ".claude.json"), "utf8");
+
+  test("stale account is removed, other keys kept", async () => {
+    await seed({ hasCompletedOnboarding: true, mine: 1, oauthAccount: { accountUuid: "old", emailAddress: "old@example.invalid" } });
+    let seen: { url: string; headers: Record<string, string> } | undefined;
+    const r = await applyT3Instance(opts({ fetch: async (url, init) => { seen = { url, headers: init.headers }; return okFetch("gw")(); } }));
+    expect(r.status).toBe("updated");
+    expect(r.changes).toEqual(["account"]);
+    expect(seen?.url).toBe("https://gw.example/gateway/agents-claude/api/oauth/profile");
+    expect(seen?.headers).toEqual({ Authorization: `Bearer ${TOKEN}`, "anthropic-beta": "oauth-2025-04-20" });
+    expect(await read()).toBe(`${JSON.stringify({ hasCompletedOnboarding: true, mine: 1 }, null, 2)}\n`);
+    expect(await mode(join(folderOf(), ".claude.json"))).toBe(0o600);
+  });
+
+  test("matching account is untouched and current", async () => {
+    await seed({ oauthAccount: { accountUuid: "gw" } });
+    const before = await read();
+    const r = await applyT3Instance(opts({ fetch: okFetch("gw") }));
+    expect(r.status).toBe("current");
+    expect(await read()).toBe(before);
+  });
+
+  test("no oauthAccount is untouched and current", async () => {
+    await seed({ mine: 1 });
+    const before = await read();
+    const r = await applyT3Instance(opts({ fetch: okFetch("gw") }));
+    expect(r.status).toBe("current");
+    expect(await read()).toBe(before);
+  });
+
+  test("fetch failure leaves the file and warns", async () => {
+    await seed({ oauthAccount: { accountUuid: "old" } });
+    const before = await read();
+    for (const f of [async () => { throw new Error("boom"); }, async () => ({ ok: false, status: 500, json: async () => ({}) }), async () => ({ ok: true, status: 200, json: async () => { throw new Error("bad json"); } })]) {
+      const r = await applyT3Instance(opts({ fetch: f }));
+      expect(r.status).toBe("current");
+      expect(r.warnings?.length).toBe(1);
+      expect(await read()).toBe(before);
+    }
+  });
+
+  test("--check reports mismatch and writes nothing", async () => {
+    await seed({ oauthAccount: { accountUuid: "old" } });
+    const before = await read();
+    const r = await applyT3Instance(opts({ check: true, fetch: okFetch("gw") }));
+    expect(r.status).toBe("updated");
+    expect(r.changes).toEqual(["account"]);
+    expect(await read()).toBe(before);
+  });
+});

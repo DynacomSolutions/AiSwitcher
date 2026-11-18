@@ -36,6 +36,8 @@ export interface T3InstanceOptions {
   env?: Record<string, string | undefined>;
   secretsPath?: string;
   now?: () => number;
+  /** Fetch used for the gateway profile lookup (claude only). Injectable for tests. */
+  fetch?: (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
   check?: boolean;
   remove?: boolean;
 }
@@ -47,6 +49,8 @@ export interface T3InstanceResult {
   backup?: string;
   folder: string;
   usage?: UsageResult[];
+  /** Non-fatal problems, for example a failed gateway profile lookup. */
+  warnings?: string[];
 }
 
 type Json = Record<string, unknown>;
@@ -185,6 +189,26 @@ async function writeSettings(path: string, before: string | undefined, settings:
   await writeFileAtomic(path, `${JSON.stringify(settings, null, indent)}${newline ? "\n" : ""}`);
   await chmod(path, mode);
   return backup;
+}
+
+/** The gateway profile account uuid, or a reason string when it cannot be read. */
+async function fetchProfileUuid(opts: T3InstanceOptions, token: string): Promise<{ uuid: string } | { error: string }> {
+  const doFetch = opts.fetch ?? ((url, init) => fetch(url, init));
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 10_000);
+  try {
+    const res = await doFetch(`${opts.gatewayUrl.replace(/\/+$/, "")}/api/oauth/profile`, {
+      headers: { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
+      signal: ctl.signal,
+    });
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    const uuid = obj(obj(await res.json())?.account)?.uuid;
+    return typeof uuid === "string" && uuid !== "" ? { uuid } : { error: "no account uuid in the response" };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Creates, updates, checks or removes one T3 provider instance. */
@@ -338,6 +362,28 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     plans.push({ path: launcher, content: grokLauncherSource({ ...(opts.binary ? { binary: opts.binary } : {}), t3Home, fallback: join(home, ".local", "bin", "grok") }), mode: 0o755, label: "launcher" });
   }
 
+  const warnings: string[] = [];
+  if (opts.driver === "claude") {
+    // A folder that held an old login keeps a cached oauthAccount of that account; drop it when it is not the gateway account.
+    const cjPath = join(folder, ".claude.json");
+    const cjText = await readText(cjPath);
+    let cj: Json | undefined;
+    try {
+      cj = cjText === undefined ? undefined : obj(JSON.parse(cjText));
+    } catch {
+      cj = undefined;
+    }
+    if (cjText !== undefined && cj && "oauthAccount" in cj) {
+      const profile = await fetchProfileUuid(opts, token);
+      if ("error" in profile) warnings.push(`could not read the gateway profile (${profile.error}); ${cjPath} left unchanged`);
+      else if (obj(cj.oauthAccount)?.accountUuid !== profile.uuid) {
+        delete cj.oauthAccount;
+        const indent = /^\{\r?\n([ \t]+)"/.exec(cjText)?.[1] ?? (cjText.includes("\n") ? 2 : 0);
+        plans.push({ path: cjPath, content: `${JSON.stringify(cj, null, indent)}${cjText.endsWith("\n") ? "\n" : ""}`, mode: 0o600, label: "account" });
+      }
+    }
+  }
+
   const changes: string[] = [];
   const toWrite: Plan[] = [];
   for (const p of plans) {
@@ -374,5 +420,5 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     for (const r of usage) if (r.status === "updated") changes.push(`usage credential ${r.file}`);
   }
   const status = changes.length === 0 ? "current" : existing ? "updated" : "created";
-  return { status, changes, ...(backup ? { backup } : {}), folder, ...(usage ? { usage } : {}) };
+  return { status, changes, ...(backup ? { backup } : {}), folder, ...(usage ? { usage } : {}), ...(warnings.length > 0 ? { warnings } : {}) };
 }
