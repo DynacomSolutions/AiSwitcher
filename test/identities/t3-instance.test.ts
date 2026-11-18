@@ -171,3 +171,40 @@ describe("grok launcher binary resolution", () => {
     await rm(t3, { recursive: true, force: true });
   });
 });
+
+describe("grok launcher models rewrite", () => {
+  const runFake = async (args: string[], body: string): Promise<{ out: string; code: number }> => {
+    const dir = await mkdtemp(join(tmpdir(), "grok-launcher-"));
+    try {
+      await mkdir(join(dir, "gh"), { recursive: true });
+      await writeFile(join(dir, "gh", "token"), "tok\n");
+      const fake = join(dir, "fakegrok");
+      await writeFile(fake, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+      const l = join(dir, "launch");
+      await writeFile(l, grokLauncherSource({ binary: fake, t3Home: dir, fallback: "/fb/grok" }));
+      const p = Bun.spawn(["sh", l, ...args], { env: { PATH: process.env.PATH ?? "", GROK_HOME: join(dir, "gh") }, stdout: "pipe", stderr: "pipe" });
+      const out = await new Response(p.stdout).text();
+      return { out, code: await p.exited };
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  };
+  test("models: XAI line becomes logged in, list kept, exit 0", async () => {
+    const r = await runFake(["models"], 'echo "You are using XAI_API_KEY."; echo "grok-4"; echo "grok-3" >&2; exit 0');
+    expect(r.out).toContain("You are logged in (AIS gateway token).");
+    expect(r.out).toContain("grok-4");
+    expect(r.out).toContain("grok-3");
+    expect(r.out).not.toContain("XAI_API_KEY");
+    expect(r.code).toBe(0);
+  });
+  test("models: exit code is kept", async () => {
+    const r = await runFake(["models"], 'echo "boom"; exit 3');
+    expect(r.out).toContain("boom");
+    expect(r.code).toBe(3);
+  });
+  test("other subcommands pass through unchanged", async () => {
+    const r = await runFake(["acp"], 'echo "You are using XAI_API_KEY."; echo "args: $*"; exit 0');
+    expect(r.out).toBe("You are using XAI_API_KEY.\nargs: acp\n");
+    expect(r.code).toBe(0);
+  });
+});
