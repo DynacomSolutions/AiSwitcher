@@ -6,7 +6,13 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 48
   repository.** `~/.ais/memory/GLOBAL.md` is the sole writable authority and
   is deliberately outside every SSH profile-sync root and git-managed backup
   group. `run-wrapper.ts` projects it at launch through the mandatory
-  `ToolConfig.globalMemoryProjection`: Claude append-system-prompt file,
+  `ToolConfig.globalMemoryProjection`: Claude append-system-prompt file
+  (SDK host launches, `--input-format stream-json`, get a linked `CLAUDE.md`
+  folder (`~/.ais/claude-memory-projection`, outside `memory`, which may be a
+  link into a read-only checkout) via `--add-dir` instead, because the host's own
+  `appendSystemPrompt` replaces the file; that folder holds only the link and
+  is kept read-only, and any problem with it prints one warning and falls back
+  to the file flag, never stopping the launch),
   Codex developer instructions, Grok rules, Kimi global AGENTS discovery, Pi
   append-system-prompt file, OpenCode runtime config content, or Crush global
   context paths. Any vendor file or config entry created for compatibility is

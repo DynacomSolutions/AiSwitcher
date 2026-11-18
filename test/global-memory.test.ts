@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
-import { chmod, mkdtemp, readFile, readlink, rm, writeFile, mkdir } from "node:fs/promises";
+import { chmod, lstat, readdir, stat, mkdtemp, readFile, readlink, rm, symlink, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -15,6 +15,7 @@ import {
 import {
   appendGlobalMemory,
   ensureGlobalMemoryFile,
+  isSdkHostLaunch,
   piBypassesMemoryProjection,
   projectGlobalMemoryForLaunch,
   readGlobalMemory,
@@ -29,7 +30,13 @@ async function home(): Promise<string> {
 }
 
 afterEach(async () => {
-  await Promise.all(homes.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await Promise.all(
+    homes.splice(0).map(async (path) => {
+      // The projection folder is deliberately read-only.
+      await chmod(join(path, ".ais", "claude-memory-projection"), 0o700).catch(() => undefined);
+      await rm(path, { recursive: true, force: true });
+    }),
+  );
 });
 
 describe("AIS global memory", () => {
@@ -121,6 +128,167 @@ describe("AIS global memory", () => {
     expect(config.providers.zai.api_key).toBe("test");
     expect(config.options.debug).toBe(true);
     expect(config.options.global_context_paths).toEqual([projection.memoryPath]);
+  });
+});
+
+describe("Claude launches started by an SDK host", () => {
+  const sdkArgv = ["--output-format", "stream-json", "--input-format", "stream-json", "--verbose"];
+  const claudeDir = (root: string) => join(root, ".ais", "claude-memory-projection");
+
+  async function quietly<T>(run: () => Promise<T>): Promise<{ result: T; warnings: string[] }> {
+    const warnings: string[] = [];
+    const spy = spyOn(console, "error").mockImplementation((line: unknown) => {
+      warnings.push(String(line));
+    });
+    try {
+      return { result: await run(), warnings };
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  function expectFallback(projection: { argv: string[]; env: Record<string, string> }, memory: string) {
+    expect(projection.argv).toEqual(["--append-system-prompt-file", memory, ...sdkArgv]);
+    expect(projection.env).toEqual({});
+  }
+
+  test("detects both spellings of the input format flag", () => {
+    expect(isSdkHostLaunch(sdkArgv)).toBe(true);
+    expect(isSdkHostLaunch(["--input-format=stream-json"])).toBe(true);
+    expect(isSdkHostLaunch(["--input-format", "text"])).toBe(false);
+    expect(isSdkHostLaunch(["--output-format", "stream-json"])).toBe(false);
+    expect(isSdkHostLaunch(["-p", "stream-json"])).toBe(false);
+  });
+
+  test("links a CLAUDE.md folder instead of the append file and locks it", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const dir = claudeDir(root);
+    for (const argv of [sdkArgv, ["--input-format=stream-json", "--verbose"]]) {
+      const projection = await projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", argv, {}, root);
+      expect(projection.argv).toEqual([`--add-dir=${dir}`, ...argv]);
+      expect(projection.argv).not.toContain("--append-system-prompt-file");
+      expect(projection.env).toEqual({ CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: "1" });
+      expect(await readlink(join(dir, "CLAUDE.md"))).toBe(memory);
+      expect((await stat(dir)).mode & 0o777).toBe(0o500);
+    }
+    expect(await readdir(dir)).toEqual(["CLAUDE.md"]);
+  });
+
+  test("a launch that finds the folder correct changes nothing", async () => {
+    const root = await home();
+    await projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root);
+    const dir = claudeDir(root);
+    const before = await stat(dir);
+    const spy = spyOn(fsPromises, "chmod");
+    try {
+      await projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+    expect((await stat(dir)).ctimeMs).toBe(before.ctimeMs);
+  });
+
+  test("8 parallel launches on a fresh home all succeed with one correct link", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const dir = claudeDir(root);
+    const { result, warnings } = await quietly(() =>
+      Promise.all(
+        Array.from({ length: 8 }, () => projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root)),
+      ),
+    );
+    for (const projection of result) expect(projection.argv[0]).toBe(`--add-dir=${dir}`);
+    expect(warnings).toEqual([]);
+    expect(await readdir(dir)).toEqual(["CLAUDE.md"]);
+    expect(await readlink(join(dir, "CLAUDE.md"))).toBe(memory);
+    expect((await readdir(join(root, ".ais"))).filter((name) => name.includes(".tmp-"))).toEqual([]);
+  });
+
+  test("repairs a stale link, also in parallel", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const dir = claudeDir(root);
+    await mkdir(dir, { recursive: true });
+    await symlink(join(root, "moved.md"), join(dir, "CLAUDE.md"));
+    await chmod(dir, 0o500);
+    const { result, warnings } = await quietly(() =>
+      Promise.all(
+        Array.from({ length: 8 }, () => projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root)),
+      ),
+    );
+    for (const projection of result) expect(projection.argv[0]).toBe(`--add-dir=${dir}`);
+    expect(warnings).toEqual([]);
+    expect(await readlink(join(dir, "CLAUDE.md"))).toBe(memory);
+    expect((await stat(dir)).mode & 0o777).toBe(0o500);
+  });
+
+  test("a read-only ais home falls back to the file flag with a warning", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const ais = join(root, ".ais");
+    await chmod(ais, 0o500);
+    try {
+      const { result, warnings } = await quietly(() =>
+        projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root),
+      );
+      expectFallback(result, memory);
+      expect(warnings).toHaveLength(1);
+    } finally {
+      await chmod(ais, 0o700);
+    }
+  });
+
+  test("a regular file at the link path falls back and is left untouched", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const dir = claudeDir(root);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "CLAUDE.md"), "mine");
+    const { result, warnings } = await quietly(() =>
+      projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root),
+    );
+    expectFallback(result, memory);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("is not an AIS-managed link");
+    expect((await lstat(join(dir, "CLAUDE.md"))).isFile()).toBe(true);
+    expect(await readFile(join(dir, "CLAUDE.md"), "utf8")).toBe("mine");
+  });
+
+  test("an extra entry in the folder falls back and the warning names the folder", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const dir = claudeDir(root);
+    await mkdir(join(dir, ".claude"), { recursive: true });
+    const { result, warnings } = await quietly(() =>
+      projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root),
+    );
+    expectFallback(result, memory);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(dir);
+  });
+
+  test("creates nothing inside a memory folder that is a link elsewhere", async () => {
+    const root = await home();
+    const target = join(root, "checkout", "memory");
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, "GLOBAL.md"), "# linked memory\n");
+    await mkdir(join(root, ".ais"), { recursive: true });
+    await symlink(target, join(root, ".ais", "memory"));
+    const before = await readdir(target, { recursive: true });
+    const projection = await projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root);
+    expect(await readdir(target, { recursive: true })).toEqual(before);
+    expect(projection.argv[0]).toBe(`--add-dir=${join(root, ".ais", "claude-memory-projection")}`);
+  });
+
+  test("normal launches keep the append file and create no folder", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const projection = await projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", ["-p", "hi"], {}, root);
+    expect(projection.argv).toEqual(["--append-system-prompt-file", memory, "-p", "hi"]);
+    expect(projection.env).toEqual({});
+    await expect(lstat(join(root, ".ais", "claude-memory-projection"))).rejects.toThrow();
   });
 });
 
