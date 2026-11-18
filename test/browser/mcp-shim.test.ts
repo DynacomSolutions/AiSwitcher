@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { BROWSER_TOOLS } from "../../src/browser/protocol.ts";
-import { handleRpc, STOPPED_BY_USER_NOTE, type ShimContext } from "../../src/browser/mcp-shim.ts";
+import { BROWSER_INSTRUCTIONS, handleRpc, STOPPED_BY_USER_NOTE, type ShimContext } from "../../src/browser/mcp-shim.ts";
 import { MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, validateToolArgs } from "../../src/browser/tool-args.ts";
 
 let seen: { auth: string | null; body: any }[] = [];
@@ -27,6 +27,8 @@ const call = (name: string, args: object = {}) => handleRpc({ id: 1, method: "to
 test("initialize and notification", async () => {
   const r: any = await handleRpc({ id: 1, method: "initialize" }, ctx());
   expect(r.result.serverInfo.name).toBe("ais-browser");
+  expect(r.result.instructions).toBe(BROWSER_INSTRUCTIONS);
+  expect(r.result.instructions).toContain("close_tab");
   expect(await handleRpc({ method: "notifications/initialized" }, ctx())).toBeUndefined();
 });
 
@@ -40,6 +42,13 @@ test("tools/list returns every tool; browser prop on all but list_browsers", asy
   for (const t of r.result.tools) {
     expect(t.inputSchema.properties.browser !== undefined).toBe(t.name !== "list_browsers");
   }
+});
+
+test("tools/list tells the agent not to close a tab while the user must act in it", async () => {
+  const r: any = await handleRpc({ id: 2, method: "tools/list" }, ctx());
+  const desc = (n: string) => r.result.tools.find((t: any) => t.name === n).description as string;
+  expect(desc("close_tab")).toContain("never while a step in it waits for the user");
+  expect(desc("tabs_create")).toContain("close_tab");
 });
 
 test("tools/call posts to the gateway and maps image content", async () => {

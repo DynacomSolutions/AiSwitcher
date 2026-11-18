@@ -40,6 +40,21 @@ Swap pools: mint a token for each pool member (`ais browser agent-token <member>
 
 `list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
 
+### When to close a tab
+
+Close a tab only when the work in it is fully finished. A tab that waits for the owner stays open.
+
+- Do not call `close_tab` on a tab while a step in it waits for the owner. Examples: a sign-in, a 2FA code, "Verify that it's you", a CAPTCHA, a consent or payment page, a manual review, or a question to the owner about that page. Leave the tab open on the page the owner must use.
+- Before you ask the owner, make sure that the tab shows the page the owner needs (`tabs_context` or `screenshot`). In the question, give the browser profile (`profileLabel` from `list_browsers`) and the tab title, so that the owner can find the tab.
+- Keep the session alive while you wait. When the agent session ends, the extension closes the tabs the session created.
+- Close a tab only when the work in it is finished and verified, and neither the owner nor the agent needs it again. A move to a different step is not the end of the work in the tab.
+- If you closed a tab by mistake, open it again on the correct page (`tabs_create` with the URL) before you ask the owner to act.
+- At the true end of the task, close the tabs the session opened.
+
+Agents get this rule in three places: the `ais-browser` MCP server instructions (`BROWSER_INSTRUCTIONS` in `src/browser/mcp-shim.ts`), the `close_tab` and `tabs_create` descriptions (`src/browser/tool-args.ts`) and this section. Keep the three in step.
+
+Reason (owner report, 18 Nov 2026): an agent closed its tab at a "Verify that it's you" page, did other work, then asked the owner to sign in "in that tab". The tab was gone.
+
 ### JavaScript dialogs
 
 A page blocked by a JavaScript dialog (alert, confirm, prompt, or beforeunload "Leave site?") answers neither input nor script, so a call on it used to hang until the 30 s timeout. The extension watches `Page.javascriptDialogOpening` / `Page.javascriptDialogClosed` on every tab it is attached to and keeps the open dialog per tab (type, message, url, default prompt text).
