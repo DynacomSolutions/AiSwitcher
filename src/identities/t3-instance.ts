@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { appTokenKey, readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { GATEWAY_ENTRY_SCOPES_WITH_USAGE_PROXY, GATEWAY_TOKEN_PREFIX, gatewayEntryText } from "./claude-gateway-entry.ts";
+import { withLoopbackNoProxy } from "./claude-usage-proxy.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
 import { t3Paths } from "./t3-anthropic-proxy.ts";
 import { syncT3UsageCredentials, type UsageResult } from "./t3-usage-credentials.ts";
@@ -228,7 +229,8 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     env.ANTHROPIC_BASE_URL = opts.gatewayUrl;
     env.HTTPS_PROXY = opts.proxyUrl;
     if (opts.caPath) env.NODE_EXTRA_CA_CERTS = opts.caPath;
-    env.NO_PROXY = "127.0.0.1,localhost,::1";
+    env.NO_PROXY = withLoopbackNoProxy(env.NO_PROXY ?? env.no_proxy);
+    delete env.no_proxy;
     if (models.length > 0) {
       const first = models[0]!;
       Object.assign(env, {

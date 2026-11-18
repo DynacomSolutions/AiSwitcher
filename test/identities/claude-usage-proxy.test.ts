@@ -46,14 +46,23 @@ describe("withUsageProxy", () => {
   test("never sets HTTPS_PROXY without a loopback NO_PROXY, and keeps other keys", () => {
     const out = withUsageProxy({ model: "x", env: { ANTHROPIC_BASE_URL: LOCAL, KEEP: "1" } }, { proxyUrl: PROXY, caPath: "/ca.pem" });
     expect(out.model).toBe("x");
-    expect(out.env).toEqual({ ANTHROPIC_BASE_URL: LOCAL, KEEP: "1", HTTPS_PROXY: PROXY, NODE_EXTRA_CA_CERTS: "/ca.pem", NO_PROXY: "127.0.0.1,localhost,::1" });
+    expect(out.env).toEqual({ ANTHROPIC_BASE_URL: LOCAL, KEEP: "1", HTTPS_PROXY: PROXY, NODE_EXTRA_CA_CERTS: "/ca.pem", NO_PROXY: "127.0.0.1,localhost,::1,opencode.ai,cli-chat-proxy.grok.com" });
     expect(usageProxyProblem(out.env as Record<string, unknown>)).toBeUndefined();
   });
   test("an existing NO_PROXY keeps its entries and gains the loopback ones once", () => {
-    expect(withLoopbackNoProxy("internal.example.test,LOCALHOST")).toBe("internal.example.test,LOCALHOST,127.0.0.1,::1");
+    expect(withLoopbackNoProxy("internal.example.test,LOCALHOST")).toBe("internal.example.test,LOCALHOST,127.0.0.1,::1,opencode.ai,cli-chat-proxy.grok.com");
     const out = withUsageProxy({ env: { no_proxy: "internal.example.test" } }, { proxyUrl: PROXY, caPath: "/ca.pem" });
-    expect((out.env as Record<string, unknown>).NO_PROXY).toBe("internal.example.test,127.0.0.1,localhost,::1");
+    expect((out.env as Record<string, unknown>).NO_PROXY).toBe("internal.example.test,127.0.0.1,localhost,::1,opencode.ai,cli-chat-proxy.grok.com");
     expect((out.env as Record<string, unknown>).no_proxy).toBeUndefined();
+  });
+  test("the merge adds the two direct hosts, keeps other entries and is idempotent", () => {
+    const once = withLoopbackNoProxy("corp.example.test,OPENCODE.AI");
+    expect(once).toBe("corp.example.test,OPENCODE.AI,127.0.0.1,localhost,::1,cli-chat-proxy.grok.com");
+    expect(withLoopbackNoProxy(once)).toBe(once);
+    expect(withLoopbackNoProxy(undefined)).toBe("127.0.0.1,localhost,::1,opencode.ai,cli-chat-proxy.grok.com");
+  });
+  test("the doctor still only needs loopback, not the new hosts", () => {
+    expect(usageProxyProblem({ ANTHROPIC_BASE_URL: LOCAL, HTTPS_PROXY: PROXY, NO_PROXY: "127.0.0.1,localhost,::1" })).toBeUndefined();
   });
   test("refuses a bad proxy URL or a missing CA", () => {
     expect(() => withUsageProxy({}, { proxyUrl: "proxy:1", caPath: "/ca.pem" })).toThrow();
@@ -68,7 +77,7 @@ describe("folders", () => {
     expect(await folderUsageProxyProblem(dir)).toBeDefined();
     await configureUsageProxy(dir, { proxyUrl: PROXY, caPath: "/ca.pem" });
     expect(await folderUsageProxyProblem(dir)).toBeUndefined();
-    expect(JSON.parse(await readFile(join(dir, "settings.json"), "utf8")).env.NO_PROXY).toBe("127.0.0.1,localhost,::1");
+    expect(JSON.parse(await readFile(join(dir, "settings.json"), "utf8")).env.NO_PROXY).toBe("127.0.0.1,localhost,::1,opencode.ai,cli-chat-proxy.grok.com");
     expect((await stat(join(dir, "settings.json"))).mode & 0o777).toBe(0o600);
   });
   test("turning the proxy on adds user:profile to a gateway entry, and never touches a real login", async () => {
