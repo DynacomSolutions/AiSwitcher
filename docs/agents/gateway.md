@@ -311,6 +311,44 @@ Files keep their mode. The host profile-sync daemon (`ais __profile_sync_daemon`
 0.1.7 reads an ACP picker from the live config of the instance's latest session, so a new model shows after a new session
 of that instance starts.
 
+### T3 Code ACP agents: a failed turn shows its error (`src/acp/`)
+
+T3 Code runs Kimi, Grok and Z.ai through ACP agents from its registry (`kimi-code`, `grok-build`, `glm-acp-agent`). It
+shows a turn as failed, with a message, only when the agent answers `session/prompt` with a JSON-RPC error. Measured on
+18 Nov 2026 with each real agent against a stub provider:
+
+| Agent | Provider 400, 429 or 5xx | What the thread showed |
+|---|---|---|
+| kimi-code 2.5.2 | answers `stopReason: "end_turn"`, no text; the reason is only in its session log | an empty, completed turn |
+| grok-build 1.0.79 | JSON-RPC error `Internal error`, reason in `data.message` | "Internal error" |
+| glm-acp-agent 1.17.0 | JSON-RPC error `Internal error`, reason in `data.details` | "Internal error" |
+
+`ais gateway t3-acp` puts the AIS relay between T3 Code and these agents. It changes only the end of a prompt:
+
+- `end_turn` for a turn the agent's own records say failed becomes a JSON-RPC error: `Turn failed: <reason> (HTTP <status>,
+  <agent code>)`. For kimi-code the record is the last `turn.ended` line of the session's `wire.jsonl`.
+- An error with a generic message (`Internal error`) gets the detail from its `data` as the message.
+- `end_turn` after a turn with no output and no known failure is kept, with a notice before it: `[No reply: the agent
+  ended this turn without any output and gave no reason.]`
+
+Every other line passes unchanged, byte for byte, in both directions. Reasons are cut to 500 characters and
+credential-shaped text is removed (`redactText`).
+
+How it is installed: one launcher per agent in `~/.ais/t3/acp/<agentId>`, set as the "Executable override"
+(`config.commandPath`) of each `acpRegistry` provider instance of that agent in `<t3Home>/userdata/settings.json`. T3 Code
+starts the launcher with the registry's arguments and the instance's environment; the launcher starts
+`ais __acp_relay <agentId> <args>`, which runs the executable T3 Code itself installed (newest record in
+`<t3Home>/caches/acp-registry/package-installs`). Without `ais` the launcher starts the agent directly. T3 Code reads its
+settings file again by itself; sessions started after the change use the relay, a running agent keeps going as it is. A
+backup of the settings goes to `<t3Home>/backups`. An instance with its own override, or of another agent, is not changed.
+T3 Code itself is not changed.
+
+- `ais gateway t3-acp --check` writes nothing and fails when an instance lacks the relay, a launcher is missing or out of
+  date, `ais` is missing, or the registry has a newer agent version than the one installed.
+- While the override is set, T3 Code does not install a newer agent version. To update: `ais gateway t3-acp --remove`,
+  start the agent once in T3 Code, then `ais gateway t3-acp`.
+- `ais gateway t3-acp --remove` takes the override out and deletes the launchers.
+
 ### Codex usage limits on a folder
 
 `ais gateway codex-home <dir>...` sets up Codex folders (CODEX_HOME, for example T3 Code's) that run through the gateway
