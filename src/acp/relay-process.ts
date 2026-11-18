@@ -2,8 +2,10 @@
  * Runs an ACP agent behind the relay (relay.ts): this process takes the agent's place for the client, starts the real
  * agent and passes both directions line by line (ACP is newline-delimited JSON-RPC on stdin and stdout).
  *
- * - Client to agent: every byte is passed at once and unchanged; complete lines are also shown to the relay.
- * - Agent to client: one line at a time, in order. An unchanged line keeps its bytes.
+ * - Client to agent: every byte is passed at once and unchanged. A complete line is shown to the relay just before its
+ *   last bytes are passed, so the relay can note where the agent's records stand before the agent sees the prompt.
+ * - Agent to client: one line at a time, in order. An unchanged line keeps its bytes. Each write is waited for, so
+ *   nothing is still pending when this process ends (Bun drops pending stdout at `process.exit`).
  * - stderr is the agent's own. Signals go to the agent; this process ends with the agent's exit code.
  */
 import { spawn } from "node:child_process";
@@ -77,7 +79,6 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     const fromClient = new LineSplitter();
     stdin.on("data", (chunk: Buffer | string) => {
       const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-      if (child.stdin.writable) child.stdin.write(bytes);
       for (const line of fromClient.push(bytes)) {
         try {
           relay.fromClient(line.toString("utf8"));
@@ -85,6 +86,7 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
           // Tracking a prompt must never stop it from being sent.
         }
       }
+      if (child.stdin.writable) child.stdin.write(bytes);
     });
     stdin.on("end", () => child.stdin.end());
     child.stdin.on("error", () => {}); // the agent closed its stdin: nothing more to send
@@ -92,10 +94,14 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     // Agent to client, in order.
     const fromAgent = new LineSplitter();
     let chain: Promise<void> = Promise.resolve();
-    const write = (bytes: Buffer | string): void => {
-      stdout.write(bytes);
-      stdout.write("\n");
-    };
+    let clientGone = false;
+    /** Resolves when the bytes are written (or the client is gone). */
+    const write = (bytes: Buffer): Promise<void> =>
+      new Promise<void>((done) => {
+        if (clientGone) return done();
+        stdout.write(bytes, () => done());
+      });
+    const NEWLINE = Buffer.from("\n");
     const pass = (line: Buffer): void => {
       chain = chain.then(async () => {
         let out: string[] | undefined;
@@ -105,14 +111,17 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
         } catch {
           out = undefined;
         }
-        if (!out || (out.length === 1 && out[0] === text)) write(line);
-        else for (const o of out) write(o);
+        if (!out || (out.length === 1 && out[0] === text)) await write(Buffer.concat([line, NEWLINE]));
+        else await write(Buffer.from(out.map((o) => `${o}\n`).join(""), "utf8"));
       });
     };
     child.stdout.on("data", (chunk: Buffer) => {
       for (const line of fromAgent.push(chunk)) pass(line);
     });
-    stdout.on("error", () => child.kill("SIGTERM")); // the client is gone
+    stdout.on("error", () => {
+      clientGone = true; // nothing more can be written
+      child.kill("SIGTERM");
+    });
 
     child.on("error", (err) => {
       log(`acp-relay: cannot start ${opts.command}: ${err.message}`);
@@ -120,10 +129,9 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     });
     child.on("close", (code, signal) => {
       const rest = fromAgent.rest();
-      void chain.then(() => {
-        if (rest.length > 0) stdout.write(rest);
-        finish(code ?? (signal ? 128 + (signalNumber(signal) ?? 15) : 1));
-      });
+      void chain
+        .then(() => (rest.length > 0 ? write(rest) : undefined))
+        .then(() => finish(code ?? (signal ? 128 + (signalNumber(signal) ?? 15) : 1)));
     });
   });
 }

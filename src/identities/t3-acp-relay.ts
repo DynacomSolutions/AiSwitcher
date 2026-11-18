@@ -8,15 +8,18 @@
  * (`~/.ais/t3/acp/<agentId>`) and sets it as `commandPath` on every instance of that agent in
  * `<t3Home>/userdata/settings.json`. T3 Code watches that file and takes the change for sessions started after it.
  *
- * The launcher starts `ais __acp_relay <agentId> <args>`, which finds the agent's executable in T3 Code's own install
- * record (`<t3Home>/caches/acp-registry/package-installs/<agentId>-*.json`) at each start. When `ais` is missing the
- * launcher starts the executable known at install time, so the agent always runs.
+ * The launcher starts `ais __acp_relay <agentId> --fallback=<executable> <args>`, which finds the agent's executable in
+ * T3 Code's own install record (`<t3Home>/caches/acp-registry/package-installs/<agentId>-*.json`) at each start, and uses
+ * the executable known at install time when there is no record. When `ais` is missing, or is a version without the relay
+ * (the launcher asks it: `ais __acp_relay --supported`), the launcher starts that executable directly, so the agent
+ * always runs.
  *
  * Only instances whose `commandPath` is empty or already this launcher are changed. T3 Code itself is never changed.
  * While the override is set T3 Code does not install a newer version of the agent; `--check` says when the registry
  * has one.
  */
-import { randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -32,6 +35,8 @@ export interface AcpRelayOptions {
   env?: Record<string, string | undefined>;
   /** The `ais` executable the launchers start. Default: `<home>/.local/bin/ais`. */
   aisPath?: string;
+  /** Whether the `ais` at a path has the relay. Default: asks it (`ais __acp_relay --supported`). */
+  aisHasRelay?: (aisPath: string) => boolean;
   now?: () => number;
 }
 
@@ -47,12 +52,14 @@ export interface AcpRelayPaths {
 export function acpRelayPaths(opts: AcpRelayOptions = {}): AcpRelayPaths {
   const home = opts.home ?? homedir();
   const t3 = t3Paths({ home, ...(opts.env ? { env: opts.env } : {}) });
+  // Launchers hold paths of one T3 Code folder, so a second folder (T3CODE_HOME) gets its own directory.
+  const own = t3.t3Home === join(home, ".t3") ? "acp" : `acp-${createHash("sha256").update(t3.t3Home).digest("hex").slice(0, 8)}`;
   return {
     settings: join(t3.t3Home, "userdata", "settings.json"),
     installs: join(t3.t3Home, "caches", "acp-registry", "package-installs"),
     registry: join(t3.t3Home, "caches", "acp-registry", "registry.json"),
     backupsDir: t3.backupsDir,
-    launchers: join(home, ".ais", "t3", "acp"),
+    launchers: join(home, ".ais", "t3", own),
     ais: opts.aisPath ?? join(home, ".local", "bin", "ais"),
   };
 }
@@ -68,10 +75,7 @@ export interface AgentInstall {
   binDirectory?: string;
 }
 
-/** Orders dotted versions by their numbers (`2.10.0` after `2.9.1`); text that is not a number compares as text. */
-export function compareVersions(a: string, b: string): number {
-  const pa = a.split(/[.+-]/);
-  const pb = b.split(/[.+-]/);
+function compareParts(pa: string[], pb: string[]): number {
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
     const x = pa[i] ?? "0";
     const y = pb[i] ?? "0";
@@ -81,6 +85,23 @@ export function compareVersions(a: string, b: string): number {
     if (c !== 0) return c;
   }
   return 0;
+}
+
+/**
+ * Orders versions as semver does: the dotted numbers first (`2.10.0` after `2.9.1`), then a release after its
+ * pre-releases (`1.0.0` after `1.0.0-beta`). Build text after `+` is ignored.
+ */
+export function compareVersions(a: string, b: string): number {
+  const split = (v: string): [string[], string[] | undefined] => {
+    const [core = "", ...pre] = (v.split("+")[0] as string).split("-");
+    return [core.split("."), pre.length > 0 ? pre.join("-").split(".") : undefined];
+  };
+  const [ca, prea] = split(a);
+  const [cb, preb] = split(b);
+  const core = compareParts(ca, cb);
+  if (core !== 0) return core;
+  if (!prea || !preb) return prea ? -1 : preb ? 1 : 0;
+  return compareParts(prea, preb);
 }
 
 /** The newest install of `agentId` T3 Code recorded whose executable is still there. */
@@ -127,16 +148,27 @@ async function registryVersion(agentId: string, paths: AcpRelayPaths): Promise<s
   return undefined;
 }
 
+/** True when the `ais` at `aisPath` answers `__acp_relay --supported` with exit 0, as the launcher asks at each start. */
+export function aisHasRelay(aisPath: string): boolean {
+  try {
+    return spawnSync(aisPath, ["__acp_relay", "--supported"], { stdio: "ignore", timeout: 15_000 }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
 const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
 export function launcherSource(agentId: string, aisPath: string, fallbackExecutable: string): string {
   return [
     "#!/bin/sh",
     `# Written by \`ais gateway t3-acp\`; do not edit. Starts the ACP agent ${agentId} behind the AIS relay, which reports`,
-    "# a failed turn to T3 Code as an error with its reason. Without ais the agent starts directly.",
+    "# a failed turn to T3 Code as an error with its reason. Without ais, or with an ais that has no relay, the agent",
+    "# starts directly.",
     `AIS=${shQuote(aisPath)}`,
-    `if [ -x "$AIS" ]; then exec "$AIS" __acp_relay ${agentId} "$@"; fi`,
-    `exec ${shQuote(fallbackExecutable)} "$@"`,
+    `AGENT=${shQuote(fallbackExecutable)}`,
+    `if [ -x "$AIS" ] && "$AIS" __acp_relay --supported >/dev/null 2>&1; then exec "$AIS" __acp_relay ${agentId} "--fallback=$AGENT" "$@"; fi`,
+    `exec "$AGENT" "$@"`,
     "",
   ].join("\n");
 }
@@ -183,10 +215,38 @@ async function readSettings(paths: AcpRelayPaths): Promise<{ text: string; setti
   return { text, settings };
 }
 
+/** Thrown when T3 Code wrote its settings while this command worked on them; the command then starts again. */
+class SettingsChanged extends Error {}
+
+async function retryOnChange<T>(run: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await run();
+    } catch (err) {
+      if (!(err instanceof SettingsChanged) || attempt >= 5) throw err;
+    }
+  }
+}
+
 async function writeSettings(paths: AcpRelayPaths, before: string, settings: Json, now: number): Promise<string> {
   await mkdir(paths.backupsDir, { recursive: true });
-  const saved = join(paths.backupsDir, `settings.json.pre-acp-relay.${Math.floor(now / 1000)}`);
-  await writeFile(saved, before, { mode: 0o600 });
+  // A backup is never written over: a second one in the same second gets a suffix.
+  const stem = join(paths.backupsDir, `settings.json.pre-acp-relay.${Math.floor(now / 1000)}`);
+  let saved = stem;
+  for (let n = 1; ; n++) {
+    try {
+      await writeFile(saved, before, { mode: 0o600, flag: "wx" });
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST" || n > 100) throw err;
+      saved = `${stem}.${n}`;
+    }
+  }
+  // T3 Code writes this file too. When it changed since it was read, nothing is written and the caller starts again.
+  if ((await readFile(paths.settings, "utf8")) !== before) {
+    await rm(saved, { force: true });
+    throw new SettingsChanged(`${paths.settings} changed while it was being updated`);
+  }
   let mode = 0o600;
   try {
     mode = (await stat(paths.settings)).mode & 0o777;
@@ -211,7 +271,11 @@ export interface AcpRelayResult {
 }
 
 /** Writes the launchers and sets them as the executable of every relay-agent instance. Idempotent. */
-export async function installAcpRelay(opts: AcpRelayOptions = {}): Promise<AcpRelayResult> {
+export function installAcpRelay(opts: AcpRelayOptions = {}): Promise<AcpRelayResult> {
+  return retryOnChange(() => installOnce(opts));
+}
+
+async function installOnce(opts: AcpRelayOptions): Promise<AcpRelayResult> {
   const paths = acpRelayPaths(opts);
   const read = await readSettings(paths);
   if (!read) return { instances: [], changed: false };
@@ -248,7 +312,11 @@ export async function installAcpRelay(opts: AcpRelayOptions = {}): Promise<AcpRe
 }
 
 /** Takes the launchers out of T3 Code's settings and deletes them. */
-export async function removeAcpRelay(opts: AcpRelayOptions = {}): Promise<AcpRelayResult> {
+export function removeAcpRelay(opts: AcpRelayOptions = {}): Promise<AcpRelayResult> {
+  return retryOnChange(() => removeOnce(opts));
+}
+
+async function removeOnce(opts: AcpRelayOptions): Promise<AcpRelayResult> {
   const paths = acpRelayPaths(opts);
   const read = await readSettings(paths);
   const results: InstanceResult[] = [];
@@ -288,11 +356,12 @@ export async function checkAcpRelay(opts: AcpRelayOptions = {}): Promise<string[
     }
     const source = await readFile(launcher, "utf8").catch(() => undefined);
     if (source !== launcherSource(inst.agentId, paths.ais, install.executable)) problems.push(`${inst.agentId}: the launcher ${launcher} is missing or out of date`);
+    let aisThere = false;
     try {
-      if (!(await stat(paths.ais)).isFile()) throw new Error("not a file");
-    } catch {
-      problems.push(`${inst.agentId}: ${paths.ais} is missing, so the agent starts without the relay`);
-    }
+      aisThere = (await stat(paths.ais)).isFile();
+    } catch {}
+    if (!aisThere) problems.push(`${inst.agentId}: ${paths.ais} is missing, so the agent starts without the relay`);
+    else if (!(opts.aisHasRelay ?? aisHasRelay)(paths.ais)) problems.push(`${inst.agentId}: ${paths.ais} is a version without the relay, so the agent starts without it (ais update)`);
     const latest = await registryVersion(inst.agentId, paths);
     if (latest && compareVersions(latest, install.version) > 0) {
       problems.push(`${inst.agentId}: version ${install.version} is installed and the registry has ${latest}; T3 Code does not update an agent with an executable override (ais gateway t3-acp --remove, start the agent once in T3 Code, then ais gateway t3-acp)`);

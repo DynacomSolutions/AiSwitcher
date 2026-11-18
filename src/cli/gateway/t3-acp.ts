@@ -47,16 +47,21 @@ export async function runT3AcpCommand(args: string[], flags: ParsedArgs["flags"]
 }
 
 /**
- * `ais __acp_relay <agentId> [agent arguments]`: what a launcher starts. Takes the agent's place on stdin and stdout
- * and runs the agent T3 Code installed behind the relay. Prints nothing to stdout itself.
+ * `ais __acp_relay <agentId> [--fallback=<executable>] [agent arguments]`: what a launcher starts. Takes the agent's
+ * place on stdin and stdout and runs the agent T3 Code installed behind the relay; with no install record it runs the
+ * fallback executable. Prints nothing to stdout itself. `ais __acp_relay --supported` only exits 0: a launcher asks it
+ * before it hands the agent over, because an ais without the relay fails on this command.
  */
-export async function runAcpRelayProcess(argv: string[]): Promise<number> {
-  const [agentId, ...agentArgs] = argv;
+export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions = {}): Promise<number> {
+  const [agentId, ...rest] = argv;
+  if (agentId === "--supported") return 0;
   if (!agentId) {
     process.stderr.write("ais __acp_relay: an agent id is required\n");
     return 2;
   }
-  const install = await resolveAgentInstall(agentId);
+  const fallback = rest[0]?.startsWith("--fallback=") ? rest[0].slice("--fallback=".length) : undefined;
+  const agentArgs = fallback !== undefined ? rest.slice(1) : rest;
+  const install = (await resolveAgentInstall(agentId, opts)) ?? (fallback ? { agentId, version: "0", executable: fallback } : undefined);
   if (!install) {
     process.stderr.write(`ais __acp_relay: T3 Code has no install of ${agentId}\n`);
     return 127;

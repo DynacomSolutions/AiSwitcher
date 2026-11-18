@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AcpRelay, describeError, EMPTY_TURN_NOTICE, ERROR_SOURCE, failureMessage, TURN_FAILED_CODE, type TurnFailure } from "../../src/acp/relay.ts";
+import { AcpRelay, describeError, EMPTY_TURN_NOTICE, ERROR_SOURCE, failureMessage, TURN_FAILED_CODE, type TurnFailure, type TurnOutcome } from "../../src/acp/relay.ts";
 import { LineSplitter } from "../../src/acp/relay-process.ts";
 
 const prompt = (id: number | string, sessionId = "s1") => JSON.stringify({ jsonrpc: "2.0", id, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: "SYNTHETIC_FIXTURE prompt" }] } });
@@ -7,15 +7,16 @@ const update = (kind: string, sessionId = "s1") => JSON.stringify({ jsonrpc: "2.
 const endTurn = (id: number | string, stopReason = "end_turn") => JSON.stringify({ jsonrpc: "2.0", id, result: { stopReason } });
 const failed: TurnFailure = { message: "Invalid request Error", code: "provider.api_error", status: 400, retryable: false };
 
-function relay(failure?: TurnFailure | (() => Promise<TurnFailure | undefined>)) {
-  const asked: Array<[string, number]> = [];
+function relay(failure?: TurnOutcome | (() => Promise<TurnOutcome>)) {
+  const asked: Array<[string, unknown]> = [];
   const logs: string[] = [];
+  let marks = 0;
   const r = new AcpRelay({
-    now: () => 1000,
     log: (l) => logs.push(l),
     adapter: {
-      turnFailure: async (sessionId, startedAtMs) => {
-        asked.push([sessionId, startedAtMs]);
+      promptStarting: (sessionId: string) => `${sessionId}#${++marks}`,
+      turnOutcome: async (sessionId: string, mark: unknown) => {
+        asked.push([sessionId, mark]);
         return typeof failure === "function" ? failure() : failure;
       },
     },
@@ -34,7 +35,7 @@ describe("a turn the agent says ended normally", () => {
       id: 7,
       error: { code: TURN_FAILED_CODE, message: "Turn failed: Invalid request Error (HTTP 400, provider.api_error)", data: { source: ERROR_SOURCE, code: "provider.api_error", status: 400, retryable: false } },
     });
-    expect(asked).toEqual([["s1", 1000]]);
+    expect(asked).toEqual([["s1", "s1#1"]]); // the mark taken before the prompt went to the agent
     expect(logs).toEqual(["acp-relay: failed turn reported as an error (provider.api_error, HTTP 400)"]);
   });
 
@@ -55,7 +56,17 @@ describe("a turn the agent says ended normally", () => {
     expect(logs).toEqual([]);
   });
 
-  test("a turn with no output and no known failure gets a notice before its answer", async () => {
+  test("a turn the agent's records say ended well never gets a notice, with or without output", async () => {
+    const { r, logs } = relay("ok");
+    r.fromClient(prompt(1));
+    expect(await r.fromAgent(endTurn(1))).toEqual([endTurn(1)]); // for example a command that prints nothing
+    r.fromClient(prompt(2));
+    await r.fromAgent(update("agent_message_chunk"));
+    expect(await r.fromAgent(endTurn(2))).toEqual([endTurn(2)]);
+    expect(logs).toEqual([]);
+  });
+
+  test("a turn with no output, when nothing is known about its end, gets a notice before its answer", async () => {
     const { r } = relay(undefined);
     r.fromClient(prompt("p-1", "s9"));
     await r.fromAgent(update("usage_update", "s9")); // not output
@@ -82,6 +93,16 @@ describe("a turn the agent says ended normally", () => {
     r.fromClient(prompt(1));
     await r.fromAgent(update("agent_message_chunk"));
     expect(await r.fromAgent(endTurn(1))).toEqual([endTurn(1)]);
+    const broken = new AcpRelay({
+      adapter: {
+        promptStarting: () => {
+          throw new Error("no log");
+        },
+        turnOutcome: async (_s: string, mark: unknown) => (mark === undefined ? failed : "ok"),
+      },
+    });
+    broken.fromClient(prompt(2));
+    expect(JSON.parse((await broken.fromAgent(endTurn(2)))[0]!).error.code).toBe(TURN_FAILED_CODE);
   });
 
   test("other stop reasons pass unchanged and the adapter is not asked", async () => {
@@ -160,13 +181,25 @@ describe("everything else", () => {
     expect(JSON.parse((await r.fromAgent(endTurn("1")))[0]!).error).toBeDefined();
   });
 
-  test("output is counted for the prompt in flight of its own session", async () => {
+  test("output is counted per session", async () => {
     const { r } = relay(undefined);
     r.fromClient(prompt(1, "a"));
     r.fromClient(prompt(2, "b"));
     await r.fromAgent(update("agent_message_chunk", "b"));
     expect((await r.fromAgent(endTurn(1))).length).toBe(2); // session a had no output
     expect(await r.fromAgent(endTurn(2))).toEqual([endTurn(2)]);
+  });
+
+  test("two prompts in flight in one session: output after the first counts for it", async () => {
+    const { r } = relay(undefined);
+    r.fromClient(prompt(1));
+    r.fromClient(prompt(2)); // a queued message, before the first had any output
+    await r.fromAgent(update("agent_message_chunk"));
+    expect(await r.fromAgent(endTurn(1))).toEqual([endTurn(1)]);
+    expect(await r.fromAgent(endTurn(2))).toEqual([endTurn(2)]);
+    // output of an earlier turn does not count for a later one
+    r.fromClient(prompt(3));
+    expect((await r.fromAgent(endTurn(3))).length).toBe(2);
   });
 
   test("a client line that is not a prompt is ignored", () => {

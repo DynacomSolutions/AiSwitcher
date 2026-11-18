@@ -3,8 +3,8 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayCliDeps } from "../../src/cli/gateway/apps.ts";
-import { runT3AcpCommand } from "../../src/cli/gateway/t3-acp.ts";
-import { acpRelayPaths, checkAcpRelay, compareVersions, installAcpRelay, launcherSource, removeAcpRelay, resolveAgentInstall } from "../../src/identities/t3-acp-relay.ts";
+import { runAcpRelayProcess, runT3AcpCommand } from "../../src/cli/gateway/t3-acp.ts";
+import { acpRelayPaths, aisHasRelay, checkAcpRelay, compareVersions, installAcpRelay, launcherSource, removeAcpRelay, resolveAgentInstall } from "../../src/identities/t3-acp-relay.ts";
 
 const root = await mkdtemp(join(tmpdir(), "ais-t3acp-"));
 afterAll(() => rm(root, { recursive: true, force: true }));
@@ -84,8 +84,9 @@ test("sets the launcher on every instance of a relay agent, and nothing else", a
   // the launcher: executable, starts ais with the agent id, falls back to the agent itself
   const launcher = await readFile(h.launcher("kimi-code"), "utf8");
   expect(launcher).toBe(launcherSource("kimi-code", join(h.home, ".local", "bin", "ais"), kimi));
-  expect(launcher).toContain(`exec "$AIS" __acp_relay kimi-code "$@"`);
-  expect(launcher).toContain(`exec '${kimi}' "$@"`);
+  expect(launcher).toContain(`AGENT='${kimi}'`);
+  expect(launcher).toContain(`if [ -x "$AIS" ] && "$AIS" __acp_relay --supported >/dev/null 2>&1; then exec "$AIS" __acp_relay kimi-code "--fallback=$AGENT" "$@"; fi`);
+  expect(launcher).toContain(`exec "$AGENT" "$@"`);
   expect((await stat(h.launcher("kimi-code"))).mode & 0o777).toBe(0o755);
 
   // the settings as they were are kept
@@ -124,6 +125,10 @@ test("the newest install whose executable exists is used", async () => {
   expect(compareVersions("2.10.0", "2.9.1")).toBeGreaterThan(0);
   expect(compareVersions("1.0", "1.0.0")).toBe(0);
   expect(compareVersions("1.0.0-beta", "1.0.0-alpha")).toBeGreaterThan(0);
+  expect(compareVersions("1.0.0", "1.0.0-beta")).toBeGreaterThan(0); // a release is newer than its pre-release
+  expect(compareVersions("1.0.0-rc.2", "1.0.0-rc.10")).toBeLessThan(0);
+  expect(compareVersions("1.0.1-beta", "1.0.0")).toBeGreaterThan(0);
+  expect(compareVersions("1.0.0+build5", "1.0.0")).toBe(0);
 });
 
 test("--check names what is not in place", async () => {
@@ -136,6 +141,14 @@ test("--check names what is not in place", async () => {
   await mkdir(join(h.home, ".local", "bin"), { recursive: true });
   await writeFile(join(h.home, ".local", "bin", "ais"), "#!/bin/sh\n", { mode: 0o755 });
   expect(await checkAcpRelay(h.opts)).toEqual([]);
+
+  // an ais from before the relay: the launcher would start the agent without it
+  await writeFile(join(h.home, ".local", "bin", "ais"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  expect(aisHasRelay(join(h.home, ".local", "bin", "ais"))).toBe(false);
+  expect(await checkAcpRelay(h.opts)).toEqual([`kimi-code: ${join(h.home, ".local", "bin", "ais")} is a version without the relay, so the agent starts without it (ais update)`]);
+  await writeFile(join(h.home, ".local", "bin", "ais"), "#!/bin/sh\n", { mode: 0o755 });
+  expect(aisHasRelay(join(h.home, ".local", "bin", "ais"))).toBe(true);
+  expect(aisHasRelay(join(h.home, "no-such-ais"))).toBe(false);
 
   // a launcher someone changed
   await writeFile(h.launcher("kimi-code"), "#!/bin/sh\nexit 1\n");
@@ -161,6 +174,35 @@ test("--remove takes the launchers out again and leaves other overrides", async 
   expect(after.providerInstances.mine.config.commandPath).toBe("/opt/my-grok");
   expect(await stat(join(h.home, ".ais", "t3", "acp")).catch(() => undefined)).toBeUndefined();
   expect((await removeAcpRelay(h.opts)).changed).toBe(false);
+  // two backups in the same second: the first (the settings before the relay) is never written over
+  const backups = (await readdir(join(h.home, ".t3", "backups"))).sort();
+  expect(backups).toEqual(["settings.json.pre-acp-relay.1795000000", "settings.json.pre-acp-relay.1795000000.1"]);
+  expect(JSON.parse(await readFile(join(h.home, ".t3", "backups", backups[0]!), "utf8")).providerInstances.k.config.commandPath).toBeUndefined();
+  expect(JSON.parse(await readFile(join(h.home, ".t3", "backups", backups[1]!), "utf8")).providerInstances.k.config.commandPath).toBe(h.launcher("kimi-code"));
+});
+
+test("a settings file T3 Code wrote in the meantime is not written over: the command starts again", async () => {
+  const h = await host({ k: instance("kimi-code") });
+  await h.install("kimi-code", "2.5.2");
+  let calls = 0;
+  const r = await installAcpRelay({
+    ...h.opts,
+    now: () => {
+      // T3 Code saves a setting between the read and the write of the first try
+      if (++calls === 1) {
+        const cur = JSON.parse(require("node:fs").readFileSync(h.settings, "utf8"));
+        cur.theme = "light";
+        require("node:fs").writeFileSync(h.settings, `${JSON.stringify(cur, null, 2)}\n`);
+      }
+      return 1_795_000_000_000;
+    },
+  });
+  expect(calls).toBe(2);
+  expect(r.changed).toBe(true);
+  const after = await h.read();
+  expect(after.theme).toBe("light");
+  expect(after.providerInstances.k.config.commandPath).toBe(h.launcher("kimi-code"));
+  expect(await readdir(join(h.home, ".t3", "backups"))).toEqual(["settings.json.pre-acp-relay.1795000000"]);
 });
 
 test("no T3 Code settings file: nothing is written", async () => {
@@ -176,7 +218,10 @@ test("T3CODE_HOME moves T3 Code's folder", async () => {
   const paths = acpRelayPaths({ home: h.home, env: { T3CODE_HOME: "/data/t3" } });
   expect(paths.settings).toBe("/data/t3/userdata/settings.json");
   expect(paths.installs).toBe("/data/t3/caches/acp-registry/package-installs");
-  expect(paths.launchers).toBe(join(h.home, ".ais", "t3", "acp"));
+  // a second T3 Code folder has its own launchers, so --remove for one never breaks the other
+  expect(paths.launchers).toMatch(new RegExp(`^${join(h.home, ".ais", "t3", "acp-")}[0-9a-f]{8}$`));
+  expect(acpRelayPaths({ home: h.home, env: {} }).launchers).toBe(join(h.home, ".ais", "t3", "acp"));
+  expect(acpRelayPaths({ home: h.home, env: { T3CODE_HOME: join(h.home, ".t3") } }).launchers).toBe(join(h.home, ".ais", "t3", "acp"));
 });
 
 test("the command reports each instance, and --check fails when something is missing", async () => {
@@ -210,5 +255,23 @@ test("a launcher runs the agent directly when ais is missing, with its arguments
   await mkdir(join(h.home, ".local", "bin"), { recursive: true });
   await writeFile(join(h.home, ".local", "bin", "ais"), '#!/bin/sh\nprintf "ais:%s|" "$@"\n', { mode: 0o755 });
   const viaAis = Bun.spawnSync([h.launcher("kimi-code"), "acp", "two words"]);
-  expect(viaAis.stdout.toString()).toBe("ais:__acp_relay|ais:kimi-code|ais:acp|ais:two words|");
+  expect(viaAis.stdout.toString()).toBe(`ais:__acp_relay|ais:kimi-code|ais:--fallback=${exe}|ais:acp|ais:two words|`);
+  // an ais from before the relay fails on the command: the agent still starts, directly
+  await writeFile(join(h.home, ".local", "bin", "ais"), '#!/bin/sh\necho "unknown command" >&2\nexit 1\n', { mode: 0o755 });
+  const oldAis = Bun.spawnSync([h.launcher("kimi-code"), "acp", "two words"]);
+  expect(oldAis.stdout.toString()).toBe("acp|two words|");
+  expect(oldAis.stderr.toString()).toBe("");
+});
+
+test("the relay command: --supported, and no agent to run", async () => {
+  expect(await runAcpRelayProcess(["--supported"])).toBe(0);
+  const h = await host({});
+  const err = process.stderr.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  try {
+    expect(await runAcpRelayProcess(["kimi-code", "acp"], h.opts)).toBe(127);
+    expect(await runAcpRelayProcess([], h.opts)).toBe(2);
+  } finally {
+    process.stderr.write = err;
+  }
 });

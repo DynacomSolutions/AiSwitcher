@@ -11,7 +11,8 @@
  * A JSON-RPC error on `session/prompt` is what the client shows as a failed turn, so:
  * - an answer `end_turn` for a turn the agent's own records say failed becomes a JSON-RPC error with the reason;
  * - an error whose message is generic gets the detail from its `data`;
- * - an `end_turn` after a turn with no output at all, and no known failure, is kept, preceded by a notice the user can see.
+ * - an `end_turn` after a turn with no output at all, when nothing is known about how the turn ended, is kept, preceded
+ *   by a notice the user can see. A turn the agent's records say ended well is never given a notice.
  *
  * Every other line passes unchanged, byte for byte. A line this code cannot read passes unchanged too.
  */
@@ -27,15 +28,23 @@ export interface TurnFailure {
   retryable?: boolean;
 }
 
+/** How a turn ended by the agent's own records: its failure, "ok" (ended without one), or undefined when nothing is known. */
+export type TurnOutcome = TurnFailure | "ok" | undefined;
+
 /** What the relay knows about one agent beyond the protocol. */
 export interface RelayAdapter {
-  /** The failure of the turn that started at `startedAtMs` in `sessionId`, when the agent recorded one. */
-  turnFailure?(sessionId: string, startedAtMs: number): Promise<TurnFailure | undefined>;
+  /**
+   * Called for a prompt before it is passed to the agent. What it returns (a place in the agent's records) is given back
+   * to `turnOutcome`, so the end of this turn is told apart from the end of an earlier one. Must be quick: it runs in
+   * the path of the prompt.
+   */
+  promptStarting?(sessionId: string): unknown;
+  /** The outcome of the turn in `sessionId` whose prompt gave `mark`. */
+  turnOutcome?(sessionId: string, mark: unknown): Promise<TurnOutcome>;
 }
 
 export interface RelayOptions {
   adapter?: RelayAdapter;
-  now?: () => number;
   /** One line per changed answer, for the agent's stderr log. Never carries prompt or reply text. */
   log?: (line: string) => void;
 }
@@ -56,8 +65,10 @@ const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim
 
 interface Prompt {
   sessionId: string;
-  startedAtMs: number;
-  output: number;
+  /** What the adapter returned before the prompt went to the agent. */
+  mark: unknown;
+  /** The session's output count when the prompt was sent. */
+  outputAtStart: number;
 }
 
 /** The detail an agent put in a JSON-RPC error's `data`: a string, or an object's message, details, detail or error text. */
@@ -94,15 +105,15 @@ const idKey = (id: unknown): string | undefined => (typeof id === "number" || ty
 
 export class AcpRelay {
   private readonly prompts = new Map<string, Prompt>();
-  /** The prompt in flight for each session. */
-  private readonly active = new Map<string, string>();
-  private readonly now: () => number;
+  /** Output updates seen per session. A prompt had output when the count grew after it was sent. */
+  private readonly output = new Map<string, number>();
 
-  constructor(private readonly opts: RelayOptions = {}) {
-    this.now = opts.now ?? Date.now;
-  }
+  constructor(private readonly opts: RelayOptions = {}) {}
 
-  /** A line the client sent to the agent. It is never changed; a `session/prompt` request is remembered. */
+  /**
+   * A line the client sends to the agent, seen before the agent gets it. It is never changed; a `session/prompt`
+   * request is remembered.
+   */
   fromClient(line: string): void {
     if (!line.includes('"session/prompt"')) return;
     let msg: Json | undefined;
@@ -115,8 +126,13 @@ export class AcpRelay {
     const key = idKey(msg.id);
     const sessionId = str(obj(msg.params)?.sessionId);
     if (key === undefined || sessionId === undefined) return;
-    this.prompts.set(key, { sessionId, startedAtMs: this.now(), output: 0 });
-    this.active.set(sessionId, key);
+    let mark: unknown;
+    try {
+      mark = this.opts.adapter?.promptStarting?.(sessionId);
+    } catch {
+      mark = undefined;
+    }
+    this.prompts.set(key, { sessionId, mark, outputAtStart: this.output.get(sessionId) ?? 0 });
   }
 
   /** A line the agent sent. Returns the lines the client gets: the same line, or the changed answer to a prompt. */
@@ -132,9 +148,8 @@ export class AcpRelay {
     if (msg.method === "session/update") {
       const params = obj(msg.params);
       const kind = obj(params?.update)?.sessionUpdate;
-      const key = this.active.get(str(params?.sessionId) ?? "");
-      const prompt = key !== undefined ? this.prompts.get(key) : undefined;
-      if (prompt && typeof kind === "string" && OUTPUT_UPDATES.has(kind)) prompt.output++;
+      const sessionId = str(params?.sessionId);
+      if (sessionId !== undefined && typeof kind === "string" && OUTPUT_UPDATES.has(kind)) this.output.set(sessionId, (this.output.get(sessionId) ?? 0) + 1);
       return [line];
     }
     if (msg.method !== undefined) return [line];
@@ -142,7 +157,8 @@ export class AcpRelay {
     const prompt = key !== undefined ? this.prompts.get(key) : undefined;
     if (key === undefined || !prompt) return [line];
     this.prompts.delete(key);
-    if (this.active.get(prompt.sessionId) === key) this.active.delete(prompt.sessionId);
+    const hadOutput = (this.output.get(prompt.sessionId) ?? 0) > prompt.outputAtStart;
+    if (![...this.prompts.values()].some((p) => p.sessionId === prompt.sessionId)) this.output.delete(prompt.sessionId);
 
     if (msg.error !== undefined) {
       const described = describeError(msg.error);
@@ -152,18 +168,20 @@ export class AcpRelay {
     }
     if (obj(msg.result)?.stopReason !== "end_turn") return [line];
 
-    let failure: TurnFailure | undefined;
+    let outcome: TurnOutcome;
     try {
-      failure = await this.opts.adapter?.turnFailure?.(prompt.sessionId, prompt.startedAtMs);
+      outcome = await this.opts.adapter?.turnOutcome?.(prompt.sessionId, prompt.mark);
     } catch {
-      failure = undefined;
+      outcome = undefined;
     }
+    if (outcome === "ok") return [line];
+    const failure = outcome;
     if (failure) {
       this.opts.log?.(`acp-relay: failed turn reported as an error (${failure.code ?? "no code"}${failure.status !== undefined ? `, HTTP ${failure.status}` : ""})`);
       const data = { source: ERROR_SOURCE, ...(failure.code !== undefined ? { code: failure.code } : {}), ...(failure.status !== undefined ? { status: failure.status } : {}), ...(failure.retryable !== undefined ? { retryable: failure.retryable } : {}) };
       return [JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: TURN_FAILED_CODE, message: failureMessage(failure), data } })];
     }
-    if (prompt.output === 0) {
+    if (!hadOutput) {
       this.opts.log?.("acp-relay: empty turn, notice added");
       const notice = { jsonrpc: "2.0", method: "session/update", params: { sessionId: prompt.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: EMPTY_TURN_NOTICE } } } };
       return [JSON.stringify(notice), line];

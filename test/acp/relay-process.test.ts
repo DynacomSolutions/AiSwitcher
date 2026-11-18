@@ -24,7 +24,7 @@ const path = require("node:path");
 const log = process.env.FAKE_WIRE_LOG;
 fs.writeFileSync(process.env.FAKE_SEEN, JSON.stringify({ args: process.argv.slice(2), marker: process.env.FAKE_MARKER }));
 const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
-const ended = (reason, error) => fs.appendFileSync(log, JSON.stringify({ type: "turn.ended", time: Date.now(), reason, ...(error ? { error } : {}) }) + "\\n");
+const ended = (reason, error) => fs.appendFileSync(log, JSON.stringify({ type: "turn.ended", time: 1, reason, ...(error ? { error } : {}) }) + "\\n");
 let buf = "";
 process.stdin.on("data", (d) => {
   buf += d;
@@ -140,6 +140,30 @@ test("a client talks to the agent through the relay: failed, good, empty and err
   ]);
 }, 30_000);
 
+test("output the client has not read yet is not lost when the agent exits", async () => {
+  // An agent that prints 4 MiB in 64 lines and exits at once; the client starts to read 500 ms later.
+  const dir = join(root, "flush");
+  await mkdir(dir, { recursive: true });
+  const script = join(dir, "big.cjs");
+  await writeFile(script, 'const line = JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { x: "a".repeat(65536 - 60) } }) + "\\n"; for (let i = 0; i < 64; i++) process.stdout.write(line); process.stdout.write("tail-without-newline");');
+  const stdout = new PassThrough({ highWaterMark: 1024 });
+  stdout.pause();
+  let bytes = 0;
+  let last = "";
+  setTimeout(() => {
+    stdout.on("data", (d: Buffer) => {
+      bytes += d.length;
+      last = (last + d.toString("utf8")).slice(-20);
+    });
+    stdout.resume();
+  }, 500);
+  const code = await runAcpRelay({ command: process.execPath, args: [script], stdin: new PassThrough(), stdout, log: () => {} });
+  expect(code).toBe(0);
+  const one = JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { x: "a".repeat(65536 - 60) } }).length + 1;
+  expect(bytes).toBe(64 * one + "tail-without-newline".length);
+  expect(last).toBe("tail-without-newline");
+}, 30_000);
+
 test("the relay ends with the agent's exit code", async () => {
   const a = await start("exit");
   a.prompt(1, "exit");
@@ -154,7 +178,7 @@ test("an agent that cannot start gives 127 and a note", async () => {
 }, 30_000);
 
 test("adapterFor: kimi-code reads its session log, other agents have no adapter", () => {
-  expect(adapterFor("kimi-code", { KIMI_CODE_HOME: join(root, "h") })?.turnFailure).toBeDefined();
+  expect(adapterFor("kimi-code", { KIMI_CODE_HOME: join(root, "h") })?.turnOutcome).toBeDefined();
   expect(adapterFor("grok-build", {})).toBeUndefined();
   expect(adapterFor("glm-acp-agent", {})).toBeUndefined();
 });
