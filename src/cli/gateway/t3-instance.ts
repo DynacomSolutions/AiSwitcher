@@ -1,0 +1,73 @@
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+import { expandPath } from "../../identities/match.ts";
+import { proxyFromT3Folders } from "../../identities/t3-anthropic-proxy.ts";
+import { applyT3Instance, type InstanceDriver, type T3InstanceOptions } from "../../identities/t3-instance.ts";
+import { isUsageTrouble, describeUsageResult } from "../../identities/t3-usage-credentials.ts";
+import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
+import { CliUsageError } from "../errors.ts";
+import type { GatewayCliDeps } from "./apps.ts";
+import { DEFAULT_CONNECT_CA } from "./claude-proxy.ts";
+import { readSecretsKey } from "./secrets-file.ts";
+
+const USAGE = "Usage: ais gateway t3-instance <instance-id> --driver=claude|grok --app=<gateway app> [--name=<name>] [--models=a,b] [--like=<claude instance id>] [--binary=<path>] [--check] [--remove]";
+
+/**
+ * `ais gateway t3-instance`: creates or updates one T3 Code provider instance whose folder holds only the gateway app
+ * token (src/identities/t3-instance.ts). T3 watches its settings file, so nothing is restarted here.
+ */
+export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["flags"], deps: GatewayCliDeps, opts: Pick<T3InstanceOptions, "home" | "env"> = {}): Promise<void> {
+  const id = args[0];
+  if (!id || args.length > 1) throw new CliUsageError(USAGE);
+  const check = boolFlag(flags, "check");
+  const remove = boolFlag(flags, "remove");
+  if (check && remove) throw new CliUsageError("--check and --remove cannot be combined");
+  const driver = stringFlag(flags, "driver");
+  const app = stringFlag(flags, "app");
+  if (driver !== "claude" && driver !== "grok") throw new CliUsageError(`--driver=claude|grok is required. ${USAGE}`);
+  if (!app && !remove) throw new CliUsageError(`--app=<gateway app> is required. ${USAGE}`);
+  const models = stringFlag(flags, "models")?.split(",").map((m) => m.trim()).filter(Boolean);
+  const base: T3InstanceOptions = {
+    id,
+    driver: driver as InstanceDriver,
+    app: app ?? "",
+    gatewayUrl: "",
+    ...opts,
+    ...(deps.secretsPath ? { secretsPath: deps.secretsPath } : {}),
+    check,
+    remove,
+  };
+  for (const k of ["name", "like", "binary"] as const) {
+    const v = stringFlag(flags, k);
+    if (v) base[k] = v;
+  }
+  if (models && models.length > 0) base.models = models;
+  if (!remove) {
+    const root = (await readSecretsKey("AIS_GATEWAY_PROXY_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_PROXY_URL;
+    if (!root) throw new CliUsageError("Proxy base URL unknown: set AIS_GATEWAY_PROXY_URL in ~/.secrets");
+    base.gatewayUrl = `${root.replace(/\/+$/, "")}/${app}`;
+    if (driver === "claude") {
+      const proxyUrl =
+        stringFlag(flags, "proxy") ??
+        (await readSecretsKey("AIS_GATEWAY_CONNECT_PROXY_URL", deps.secretsPath)) ??
+        process.env.AIS_GATEWAY_CONNECT_PROXY_URL ??
+        (await proxyFromT3Folders({ home: homedir(), ...opts }));
+      if (!proxyUrl) throw new CliUsageError("Proxy URL unknown: pass --proxy=http://<host>:<port> or set AIS_GATEWAY_CONNECT_PROXY_URL in ~/.secrets");
+      base.proxyUrl = proxyUrl;
+      base.caPath = resolve(expandPath(DEFAULT_CONNECT_CA()));
+    }
+  }
+  const r = await applyT3Instance(base);
+  const detail = r.changes.length > 0 ? `${check ? " (differs" : " (changed"}: ${r.changes.join(", ")})` : "";
+  const status = check && r.status !== "current" && r.status !== "absent" ? `would be ${r.status}` : r.status;
+  deps.out(`t3-instance: ${id} ${status}${detail}`);
+  if (r.backup) deps.out(`t3-instance: settings backup ${r.backup}`);
+  if (remove && r.status === "removed") deps.out(`t3-instance: the folder ${r.folder} was left in place`);
+  let trouble = false;
+  for (const u of r.usage ?? []) {
+    deps.out(`t3-instance: ${describeUsageResult(u, check)}`);
+    if (isUsageTrouble(u, false)) trouble = true;
+  }
+  if (check && r.status !== "current" && r.status !== "absent") throw new Error(`t3-instance ${id} differs`);
+  if (trouble) throw new Error(`t3-instance ${id}: usage credential problem`);
+}
