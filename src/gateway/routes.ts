@@ -335,7 +335,21 @@ export function claudeUsageBodyOf(best: PoolUsage | undefined): Record<string, u
     const w = best?.windows?.find((x) => x.label === label);
     return w ? { utilization: w.utilization, resets_at: w.resetsAt ?? null } : null;
   };
-  return { five_hour: win("five-hour"), seven_day: win("seven-day"), seven_day_opus: null, seven_day_sonnet: null, extra_usage: null };
+  const body: Record<string, unknown> = { five_hour: win("five-hour"), seven_day: win("seven-day"), seven_day_opus: null, seven_day_sonnet: null, extra_usage: null };
+  // Model-scoped weekly windows (a Fable weekly) travel as upstream's `limits[]` entries: kind weekly_scoped, percent, resets_at,
+  // scope.model.display_name. Upstream lists the session and weekly_all windows there too, so they are repeated.
+  const scoped = (best?.windows ?? []).filter((w) => w.model !== undefined && Number.isFinite(w.utilization));
+  if (scoped.length > 0) {
+    const entry = (kind: string, group: string, w: { utilization: number; resetsAt?: string | undefined }, scope: unknown) => ({ kind, group, percent: w.utilization, resets_at: w.resetsAt ?? null, scope });
+    const five = best?.windows?.find((x) => x.label === "five-hour");
+    const seven = best?.windows?.find((x) => x.label === "seven-day");
+    body.limits = [
+      ...(five ? [entry("session", "session", five, null)] : []),
+      ...(seven ? [entry("weekly_all", "weekly", seven, null)] : []),
+      ...scoped.map((w) => entry("weekly_scoped", "weekly", w, { model: { id: null, display_name: w.model }, surface: null })),
+    ];
+  }
+  return body;
 }
 
 /**
