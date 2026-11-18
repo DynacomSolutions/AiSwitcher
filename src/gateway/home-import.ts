@@ -2,7 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { readOpencodeAuth, readOpencodeV2Credentials } from "../cli/limits/opencode-limits.ts";
+import { readOpencodeV2Credentials } from "../cli/limits/opencode-limits.ts";
 import { heartbeatPath } from "../identities/gateway-heartbeat.ts";
 import { enableMemberStore, hasMemberCopy, isMemberStoreTool, memberDir } from "../identities/gateway-members.ts";
 import { REVOKED_MARKER_FILE } from "../identities/gateway-revoked.ts";
@@ -50,6 +50,18 @@ export interface ImportReport {
 
 const exists = async (p: string): Promise<boolean> => stat(p).then((s) => s.isFile(), () => false);
 
+/**
+ * Content of the derived Go key file for an OpenCode identity folder, or undefined when its SQLite database holds no
+ * usable Go credential. The database is not mirrored, so its credential travels in this file. OpenCode v2 writes logins
+ * only to the database and never updates auth.json again, so the file is made even when auth.json still holds a key
+ * (a Console sign-in leaves the old, possibly expired, auth.json key in place).
+ */
+export async function opencodeDerivedKeyFile(configDir: string): Promise<Buffer | undefined> {
+  const v2 = (await readOpencodeV2Credentials(configDir).catch(() => undefined))?.find((c) => c.provider === "opencode-go")?.entry.key;
+  if (typeof v2 !== "string" || !v2.trim()) return undefined;
+  return Buffer.from(`${JSON.stringify({ "opencode-go": { type: "api", key: v2 } })}\n`);
+}
+
 /** Every file the gateway needs, from the registries under the current HOME (member-store view, as the gateway sees it). */
 export async function collectImportEntries(home: string = homedir()): Promise<ImportEntry[]> {
   enableMemberStore();
@@ -90,12 +102,8 @@ export async function collectImportEntries(home: string = homedir()): Promise<Im
       } else if (tool === "opencode") {
         const p = join(id.configDir, "data", "opencode", "auth.json");
         if (await exists(p)) add({ abs: p, account, kind: "hostfile" });
-        // The SQLite database is not mirrored: when only it holds the key, a small derived file carries it.
-        const legacy = (await readOpencodeAuth(id.configDir).catch(() => undefined))?.["opencode-go"]?.key;
-        if (!legacy) {
-          const v2 = (await readOpencodeV2Credentials(id.configDir).catch(() => undefined))?.find((c) => c.provider === "opencode-go")?.entry.key;
-          if (typeof v2 === "string" && v2.trim()) add({ abs: join(id.configDir, OPENCODE_GATEWAY_KEY_FILE), account, kind: "derived", content: Buffer.from(`${JSON.stringify({ "opencode-go": { type: "api", key: v2 } })}\n`) });
-        }
+        const derived = await opencodeDerivedKeyFile(id.configDir);
+        if (derived) add({ abs: join(id.configDir, OPENCODE_GATEWAY_KEY_FILE), account, kind: "derived", content: derived });
       }
     }
   }
