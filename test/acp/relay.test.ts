@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AcpRelay, describeError, EMPTY_TURN_NOTICE, ERROR_SOURCE, failureMessage, TURN_FAILED_CODE, type TurnFailure, type TurnOutcome } from "../../src/acp/relay.ts";
+import { AcpRelay, AUTO_ANSWER_MS, BUSY_TURN_NOTICE, describeError, EMPTY_TURN_NOTICE, ERROR_SOURCE, failureMessage, TURN_FAILED_CODE, type TurnFailure, type TurnOutcome } from "../../src/acp/relay.ts";
 import { LineSplitter } from "../../src/acp/relay-process.ts";
 
 const prompt = (id: number | string, sessionId = "s1") => JSON.stringify({ jsonrpc: "2.0", id, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: "SYNTHETIC_FIXTURE prompt" }] } });
@@ -221,5 +221,118 @@ describe("LineSplitter", () => {
     expect(text(s.push(euro.subarray(2)))).toEqual(['{"b":2€}', ""]);
     expect(s.rest().toString()).toBe("last");
     expect(s.rest().length).toBe(0);
+  });
+});
+
+const OPTIONS = [
+  { optionId: "approve", name: "Approve once", kind: "allow_once" },
+  { optionId: "approve_for_session", name: "Approve for this session", kind: "allow_always" },
+  { optionId: "reject", name: "Reject", kind: "reject_once" },
+];
+const askPermission = (id: number | string, sessionId = "s1") =>
+  JSON.stringify({ jsonrpc: "2.0", id, method: "session/request_permission", params: { sessionId, options: OPTIONS, toolCall: { toolCallId: `t${id}`, title: "mcp__t3-code__delegate_task" } } });
+const answer = (id: number | string, optionId?: string) =>
+  JSON.stringify({ jsonrpc: "2.0", id, result: { outcome: optionId === undefined ? { outcome: "cancelled" } : { outcome: "selected", optionId } } });
+
+function permissionRelay() {
+  const toAgent: string[] = [];
+  const logs: string[] = [];
+  let clock = 1_000;
+  const r = new AcpRelay({ log: (l) => logs.push(l), toAgent: (l) => toAgent.push(l), now: () => clock });
+  return { r, toAgent, logs, tick: (ms: number) => (clock += ms) };
+}
+
+describe("permission requests (fake rejections, 18 Nov 2026)", () => {
+  test("regression: a turn the agent started itself asks permission; the client never gets it and it is never a rejection", async () => {
+    const { r, toAgent, logs } = permissionRelay();
+    // A finished background task woke the agent: no prompt is open. T3 Code would select the reject option.
+    expect(await r.fromAgent(askPermission(40))).toEqual([]);
+    expect(toAgent.map((l) => JSON.parse(l))).toEqual([{ jsonrpc: "2.0", id: 40, result: { outcome: { outcome: "cancelled" } } }]);
+    expect(JSON.stringify(toAgent)).not.toContain("reject");
+    expect(logs).toEqual(["acp-relay: permission asked with no prompt open, nobody can answer: cancelled"]);
+  });
+
+  test("a session whose client approves at once (full access) is approved the same way with no prompt open", async () => {
+    const { r, toAgent, tick } = permissionRelay();
+    r.fromClient(prompt(1));
+    expect(await r.fromAgent(askPermission(10))).toEqual([askPermission(10)]); // inside a run: to the client
+    tick(12);
+    r.fromClient(answer(10, "approve"));
+    await r.fromAgent(update("agent_message_chunk"));
+    await r.fromAgent(endTurn(1));
+    expect(await r.fromAgent(askPermission(11))).toEqual([]);
+    expect(JSON.parse(toAgent[0]!)).toEqual({ jsonrpc: "2.0", id: 11, result: { outcome: { outcome: "selected", optionId: "approve" } } });
+  });
+
+  test("the same kind is chosen: a client that approves for the session at once gets that option", async () => {
+    const { r, toAgent } = permissionRelay();
+    r.fromClient(prompt(1));
+    await r.fromAgent(askPermission(10));
+    r.fromClient(answer(10, "approve_for_session"));
+    await r.fromAgent(endTurn(1));
+    await r.fromAgent(askPermission(11));
+    expect(JSON.parse(toAgent[0]!).result.outcome.optionId).toBe("approve_for_session");
+  });
+
+  test("an approval a person gave (slower than AUTO_ANSWER_MS) is never repeated without them", async () => {
+    const { r, toAgent, tick } = permissionRelay();
+    r.fromClient(prompt(1));
+    await r.fromAgent(askPermission(10));
+    tick(AUTO_ANSWER_MS + 1);
+    r.fromClient(answer(10, "approve"));
+    await r.fromAgent(endTurn(1));
+    await r.fromAgent(askPermission(11));
+    expect(JSON.parse(toAgent[0]!).result.outcome).toEqual({ outcome: "cancelled" });
+  });
+
+  test("a client that rejected or cancelled the last request is not taken as approving", async () => {
+    for (const last of ["reject", undefined]) {
+      const { r, toAgent } = permissionRelay();
+      r.fromClient(prompt(1));
+      await r.fromAgent(askPermission(10));
+      r.fromClient(answer(10, "approve"));
+      await r.fromAgent(askPermission(12));
+      r.fromClient(answer(12, last));
+      await r.fromAgent(endTurn(1));
+      await r.fromAgent(askPermission(11));
+      expect(JSON.parse(toAgent[0]!).result.outcome).toEqual({ outcome: "cancelled" });
+    }
+  });
+
+  test("auto-approval is per session", async () => {
+    const { r, toAgent } = permissionRelay();
+    r.fromClient(prompt(1, "a"));
+    await r.fromAgent(askPermission(10, "a"));
+    r.fromClient(answer(10, "approve"));
+    await r.fromAgent(endTurn(1));
+    await r.fromAgent(askPermission(11, "b"));
+    expect(JSON.parse(toAgent[0]!).result.outcome).toEqual({ outcome: "cancelled" });
+  });
+
+  test("without a way to answer the agent, the request goes to the client as before", async () => {
+    const r = new AcpRelay({});
+    expect(await r.fromAgent(askPermission(5))).toEqual([askPermission(5)]);
+  });
+});
+
+describe("a turn the agent started itself", () => {
+  test("output with no prompt open makes the next empty answer say the agent is busy", async () => {
+    const { r, logs } = permissionRelay();
+    expect(await r.fromAgent(update("tool_call"))).toEqual([update("tool_call")]); // passed unchanged
+    r.fromClient(prompt(1));
+    const out = await r.fromAgent(endTurn(1)); // the agent queued the message and answered at once
+    expect(JSON.parse(out[0]!).params.update.content.text).toBe(BUSY_TURN_NOTICE);
+    expect(out[1]).toBe(endTurn(1));
+    expect(logs).toContain("acp-relay: empty turn while the agent is busy on its own, notice added");
+  });
+
+  test("a prompt with output ends the busy state", async () => {
+    const { r } = permissionRelay();
+    await r.fromAgent(update("tool_call"));
+    r.fromClient(prompt(1));
+    await r.fromAgent(update("agent_message_chunk"));
+    expect(await r.fromAgent(endTurn(1))).toEqual([endTurn(1)]);
+    r.fromClient(prompt(2));
+    expect(JSON.parse((await r.fromAgent(endTurn(2)))[0]!).params.update.content.text).toBe(EMPTY_TURN_NOTICE);
   });
 });
