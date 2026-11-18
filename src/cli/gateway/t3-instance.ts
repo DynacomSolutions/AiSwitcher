@@ -77,6 +77,7 @@ export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["fl
   const detail = r.changes.length > 0 ? `${check ? " (differs" : " (changed"}: ${r.changes.join(", ")})` : "";
   const status = check && r.status !== "current" && r.status !== "absent" ? `would be ${r.status}` : r.status;
   deps.out(`t3-instance: ${id} ${status}${detail}`);
+  for (const w of r.warnings ?? []) deps.out(`t3-instance: warning: ${w}`);
   if (r.backup) deps.out(`t3-instance: settings backup ${r.backup}`);
   if (remove && r.status === "removed") deps.out(`t3-instance: the folder ${r.folder} was left in place`);
   let trouble = false;
