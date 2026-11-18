@@ -13,7 +13,7 @@ import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadReque
 import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
-import { nativeLimitResponse } from "./native-limit.ts";
+import { nativeLimitResponse, type LimitCandidate } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
@@ -736,6 +736,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     exhausted.set(exKey(name), deps.now().getTime() + (long ? CREDENTIAL_HOLD_MS : BURST_HOLD_DEFAULT_MS));
     holds.set(exKey(name), { kind: "cred", long, message, sig: await credentialSignature(deps, app.provider, name) });
   };
+  /** Resets that members' own proven-exhaustion 429s reported during this request (they count even when a reading is stale). */
+  const limitResets: LimitCandidate[] = [];
+  const noteLimitReset = (headers: Headers): void => {
+    const reset = Number(headers.get("anthropic-ratelimit-unified-reset"));
+    if (!Number.isFinite(reset) || reset <= 0) return;
+    const claim = headers.get("anthropic-ratelimit-unified-representative-claim") ?? "";
+    limitResets.push({ resetAtSec: reset, claim: claim.startsWith("five_hour") ? "short" : "long" });
+  };
   /** Hold a member after a quota-type answer: until reset when exhaustion is proven (or 402/403), else briefly. */
   const holdQuota = (name: string, res: Response): void => {
     const nowMs = deps.now().getTime();
@@ -750,6 +758,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         void refreshFromSource(name);
       }
     } else if (res.status === 402 || res.status === 403 || (res.status === 429 && provesSubscriptionExhaustion(res.headers))) {
+      if (res.status === 429) noteLimitReset(res.headers);
       holds.delete(exKey(name));
       bridgeUntilReading(name, exKey(name), exhaustedUntil(res.headers, nowMs));
     } else if (res.status === 429) {
@@ -828,31 +837,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     await (deps.sleep ?? defaultSleep)(Math.min(Math.max(soonest - now, SHORT_HOLD_MIN_SLEEP_MS), left), req.signal);
     return !req.signal.aborted;
   };
-  let picked = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined, model);
-  while ("reject" in picked && picked.reject === "no-headroom" && (await waitForShortHold())) picked = await pickIdentity(app, deps, await exhaustedNames(), model);
-  if ("reject" in picked && picked.reject === "no-headroom" && app.target.kind === "pool") {
-    // Nobody has headroom and a quota hold stands in the way. The hold only ends early on a live usage reading, and the
-    // usage endpoint itself answers 429 for full accounts, so a reset spent out of band (or an early provider reset) would
-    // otherwise wait out the whole week. At most once per interval and member, this request goes to the held member:
-    // the provider's own answer is the ground truth (a 200 ends the hold; a refusal renews it and passes through).
-    const held = await exhaustedNames();
-    const probe = claimProbe(held);
-    if (probe !== undefined) {
-      const p = await pickIdentity(app, deps, new Set([...held].filter((n) => n !== probe)), model);
-      if ("identity" in p) {
-        log(JSON.stringify({ event: "quota_probe", app: app.name, provider: app.provider, identity: p.identity, ...(model !== undefined ? { model } : {}) }));
-        picked = p;
-      }
-    }
-  }
-  const pick = picked;
-  if ("reject" in pick) {
-    deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
-    const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
-    const reason = pick.reject === "no-headroom" && app.target.kind === "pool" && (await exhaustedNames()).size > 0 ? "no-headroom:exhausted" : pick.reject;
-    // Out of capacity (or at the reserve): answer in the provider's own limit shape so its CLI shows its built-in limit handling.
+  /**
+   * The answer for a pool that is out of capacity. When a member would be free without the short holds, the answer is
+   * about the hold, not about usage. Else the provider's native limit answer, whose reset is the earliest across the pool
+   * (readings plus the members' own 429 resets). Undefined when the provider has no native shape.
+   */
+  const outOfCapacity = async (rejectKind: "no-headroom" | "reserve" | "no-identities", reason: string): Promise<Response | undefined> => {
     // When a member would be free without the short holds, the answer is about the hold, not about usage.
-    if (pick.reject === "no-headroom" && app.target.kind === "pool") {
+    if (rejectKind === "no-headroom" && app.target.kind === "pool") {
       // Only the short holds are ignored: members out for proven quota exhaustion stay excluded.
       const quotaOut = new Set([...(await exhaustedNames())].filter((n) => !holds.has(exKey(n))));
       let free = await pickIdentity(app, deps, quotaOut, model);
@@ -878,13 +870,40 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         return providerError(style, 502, h.message ?? "upstream credential unavailable");
       }
     }
-    if (pick.reject !== "no-identities") {
-      const native = nativeLimitResponse(app.provider, await memberUsages(app, deps, model), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, deps.now());
+    if (rejectKind !== "no-identities") {
+      const native = nativeLimitResponse(app.provider, await memberUsages(app, deps, model), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, deps.now(), limitResets);
       if (native) {
         record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
         return native;
       }
     }
+    return undefined;
+  };
+  let picked = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined, model);
+  while ("reject" in picked && picked.reject === "no-headroom" && (await waitForShortHold())) picked = await pickIdentity(app, deps, await exhaustedNames(), model);
+  if ("reject" in picked && picked.reject === "no-headroom" && app.target.kind === "pool") {
+    // Nobody has headroom and a quota hold stands in the way. The hold only ends early on a live usage reading, and the
+    // usage endpoint itself answers 429 for full accounts, so a reset spent out of band (or an early provider reset) would
+    // otherwise wait out the whole week. At most once per interval and member, this request goes to the held member:
+    // the provider's own answer is the ground truth (a 200 ends the hold; a refusal renews it and passes through).
+    const held = await exhaustedNames();
+    const probe = claimProbe(held);
+    if (probe !== undefined) {
+      const p = await pickIdentity(app, deps, new Set([...held].filter((n) => n !== probe)), model);
+      if ("identity" in p) {
+        log(JSON.stringify({ event: "quota_probe", app: app.name, provider: app.provider, identity: p.identity, ...(model !== undefined ? { model } : {}) }));
+        picked = p;
+      }
+    }
+  }
+  const pick = picked;
+  if ("reject" in pick) {
+    deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
+    const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
+    const reason = pick.reject === "no-headroom" && app.target.kind === "pool" && (await exhaustedNames()).size > 0 ? "no-headroom:exhausted" : pick.reject;
+    // Out of capacity (or at the reserve): answer in the provider's own limit shape so its CLI shows its built-in limit handling.
+    const out = await outOfCapacity(pick.reject, reason);
+    if (out) return out;
     return reject(429, why, identityForRow, model, reason);
   }
 
@@ -1035,7 +1054,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried]), model);
         if (!("identity" in next)) {
           // Everyone left is only briefly held: wait for the first to free, then try the pool again from the top.
-          if (quota && cur && !provesSubscriptionExhaustion(cur.headers) && (await waitForShortHold())) {
+          if (quota && cur && (await waitForShortHold())) {
             tried.clear();
             name = "";
             continue;
@@ -1069,6 +1088,15 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         if (quota) holdQuota(name, cur);
       }
       if (!cur) throw credErr;
+      if (quota) {
+        // No member is left: the client gets the pool's own out-of-capacity answer, not the last member's 429.
+        const out = await outOfCapacity("no-headroom", "no-headroom:exhausted");
+        if (out) {
+          await discard(cur);
+          req.signal.removeEventListener("abort", onAbort);
+          return out;
+        }
+      }
     }
     if (!cur) throw credErr;
     up = cur;

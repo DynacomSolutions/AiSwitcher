@@ -87,8 +87,11 @@ in the provider's own limit shape, so the CLI shows its built-in limit message a
 - codex: `429` with `error.type` `usage_limit_reached`, `resets_at` and `resets_in_seconds`, plus `x-codex-primary-*`
   and `x-codex-secondary-*` headers.
 
-The reset is the earliest member recovery time from AIS usage data (300 s when no member reports one). A real
-upstream 429 from a member is passed through unchanged. Other providers keep the generic gateway error.
+A pool fails over to the next member on a member's 429. It waits out short (burst) holds while a member would be
+free. Only when no member is left does it answer in the native shape. Its reset is the earliest across the pool: the
+AIS usage readings plus the resets in the members' own 429 answers during the request (300 s when none is known).
+A pinned app passes a real 429 through unchanged. Other providers keep the generic gateway error, and a pool of such
+a provider passes the last upstream 429 through.
 
 Claude Code in API-key mode (the gateway token via `apiKeyHelper`) retries a 429 only when `retry-after` is
 60 s or less; a longer wait ends the request with `Request rejected (429)`.
