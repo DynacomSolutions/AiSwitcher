@@ -9,6 +9,7 @@ import { checkCaps, dayStartIct } from "./caps.ts";
 import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
 import { providerError } from "./errors.ts";
 import type { LedgerBuffer } from "./ledger-buffer.ts";
+import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadRequest, KnownBadFiles, MAX_FILE_CHECKS, MEDIA_REMOVED_HEADER, mediaAware, mentionedFileIds, rejectedUpload, withoutFiles, type FileVerdict } from "./media-recovery.ts";
 import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
@@ -22,6 +23,7 @@ import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity, usageForModel, uti
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, UsageRow } from "./types.ts";
+import { ErrorPeek, failureName, redactText, summariseUpstreamError, type UpstreamErrorSummary } from "./upstream-error.ts";
 import { estimateCostWarn, UsageTap } from "./usage.ts";
 import type { UsageCounts } from "./usage.ts";
 
@@ -38,7 +40,10 @@ export interface GatewayDeps {
   fetch: typeof fetch;
   now(): Date;
   metrics: GatewayMetrics;
-  /** One JSON line per request (app, provider, identity, status, tap status). Never carries tokens, bodies or query strings. Defaults to console.info. */
+  /**
+   * One JSON line per request (app, provider, identity, status, tap status). Never carries tokens, bodies or query strings. An
+   * upstream error adds the provider's own error type, code and message, cut short and redacted (upstream-error.ts). Defaults to console.info.
+   */
   log?: (line: string) => void;
   /** Member accounts of a swap pool, or undefined for an unknown pool. */
   browserPoolMembers?(pool: string): Promise<string[] | undefined>;
@@ -74,8 +79,10 @@ export function bodyBudgetFromEnv(env: Record<string, string | undefined> = proc
  * limit (32 MB), so every request the provider accepts can fail over to another member; long agent threads with screenshots run past 8 MiB.
  */
 export const REPLAY_LIMIT_BYTES = 32 * 1024 * 1024;
-/** Quota errors (403) are only inspected up to this size. */
+/** Quota errors (403) are only inspected up to this size; the same bound holds for the error summary in the request log. */
 export const ERROR_PEEK_BYTES = 64 * 1024;
+/** Longest all file lookups for one refused request may take together (media-recovery.ts). */
+const FILE_CHECK_BUDGET_MS = 15_000;
 
 /** Headers a front proxy adds that identify the client or the path to it. */
 const PROXY_METADATA = new Set(["cdn-loop", "forwarded", "x-real-ip", "x-request-id", "x-client-ip", "true-client-ip"]);
@@ -434,8 +441,9 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const holds = new Map<string, Hold>();
   /** Quota holds (proven exhaustion, model-scoped): the time from which one request may probe the member again, by hold key. */
   const probes = new Map<string, number>();
+  const knownBad = new KnownBadFiles();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -445,7 +453,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -492,7 +500,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   };
   const identityForRow = app.target.kind === "pin" ? await canon(app.target.identity) : "-";
   let recorded = false;
-  const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string, reason?: string): void => {
+  const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string, reason?: string, upstream?: UpstreamErrorSummary): void => {
     if (recorded) return;
     recorded = true;
     const latencyMs = Math.round(performance.now() - started);
@@ -517,7 +525,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     try {
       deps.ledger.push(row);
       deps.metrics.request({ app: app.name, provider: app.provider, identity, status, httpStatus, latencyMs, ...(counts ? { tokens: c } : {}) });
-      log(JSON.stringify({ event: "request", app: app.name, provider: app.provider, identity, status, http: httpStatus, ...(tap ? { tap } : {}), ...(reason ? { reason } : {}) }));
+      log(JSON.stringify({ event: "request", app: app.name, provider: app.provider, identity, status, http: httpStatus, ...(tap ? { tap } : {}), ...(reason ? { reason } : {}), ...(upstream ? { upstream } : {}) }));
     } catch {
       // Observation must never affect the response.
     }
@@ -635,8 +643,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (poolList) {
       const listed = await poolModels({ app, deps, style, url: poolList.url + url.search, incoming: req.headers, signal: ctrl.signal, single: poolList.models === "one" });
       req.signal.removeEventListener("abort", onAbort);
-      record(identityForRow, listed.status >= 400 ? "upstream_error" : "ok", listed.status, undefined, false);
-      return listed;
+      if (listed.status < 400) {
+        record(identityForRow, "ok", listed.status, undefined, false);
+        return listed;
+      }
+      const refused = await peek(listed, ERROR_PEEK_BYTES);
+      record(identityForRow, "upstream_error", listed.status, undefined, false, undefined, undefined, undefined, summariseUpstreamError(refused.bytes));
+      return refused.res;
     }
     if (route?.kind !== "serve") throw new Error("unreachable: not a served route");
     const served = await serveRoute(route.name, { app, style, deps, signal: ctrl.signal, cache: resetCredits });
@@ -877,6 +890,19 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   const upstreamUrl = (route?.kind === "upstream" ? route.url : adapter.upstreamBase(style) + rest) + url.search;
   const replayable = body.kind !== "stream";
+  /** A chat request of a provider whose file references the gateway can check (media-recovery.ts). */
+  const mediaChat = !side && route === undefined && mediaAware(app.provider) && isChatRequest(req.method, rest);
+  /** Media parts replaced by a text note in the request the answer belongs to. */
+  let mediaRemoved = 0;
+  if (mediaChat && body.kind === "buffered" && knownBad.size > 0) {
+    // Files this replica already found failed or gone: a later turn of the same conversation is repaired before the first send.
+    // The body is only parsed when its bytes mention one of them.
+    const fixed = withoutFiles(body.bytes, knownBad.among(app.provider, mentionedFileIds(body.bytes), nowMs));
+    if (fixed) {
+      body = { kind: "buffered", bytes: fixed.bytes };
+      mediaRemoved = fixed.removed;
+    }
+  }
 
   const send = (cred: ProviderCredential): Promise<Response> => {
     // A client that is already gone gets no upstream call.
@@ -941,6 +967,37 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   /** The pool member (as named in the pool) whose answer the client gets. */
   let servedBy = pick.identity;
   let up: Response;
+  /**
+   * A chat request the provider refused: each file it names is looked up with the member's login; the parts whose file is
+   * failed or gone become a text note and the request is sent once more. Returns `refused` when nothing can be repaired.
+   */
+  const repairMedia = async (refused: Response): Promise<Response> => {
+    const base = filesBase(app.provider);
+    if (body.kind !== "buffered" || base === undefined) return refused;
+    const ids = fileIds(body.bytes);
+    if (ids.length === 0 || ids.length > MAX_FILE_CHECKS) return refused;
+    const cred = await deps.creds.get(app.provider, servedBy);
+    const signal = AbortSignal.any([ctrl.signal, AbortSignal.timeout(FILE_CHECK_BUDGET_MS)]);
+    // A file belongs to the account that uploaded it: for a pool, "not found" may only mean another member holds it.
+    const goneIsBad = app.target.kind === "pin";
+    const lookup = async (id: string): Promise<FileVerdict> => {
+      const headers = upstreamHeaders(adapter, cred, req.headers);
+      headers.delete("content-type");
+      const res = await deps.fetch(`${base}/${encodeURIComponent(id)}`, { method: "GET", headers, signal, redirect: "manual" });
+      const p = await peek(res, ERROR_PEEK_BYTES);
+      if (!p.whole) await discard(p.res);
+      return p.whole ? fileVerdict(res.status, p.bytes, goneIsBad) : "unknown";
+    };
+    const bad = await badFiles(ids, lookup);
+    for (const id of bad) knownBad.add(app.provider, id, deps.now().getTime());
+    const fixed = withoutFiles(body.bytes, bad);
+    if (!fixed) return refused;
+    body = { kind: "buffered", bytes: fixed.bytes };
+    const again = await attempt(servedBy);
+    await discard(refused);
+    mediaRemoved += fixed.removed;
+    return again;
+  };
   try {
     const poolReplay = app.target.kind === "pool" && replayable;
     let first: Response | undefined;
@@ -1015,6 +1072,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     if (!cur) throw credErr;
     up = cur;
+    if (mediaChat && (up.status === 400 || (up.status === 404 && app.target.kind === "pin"))) {
+      try {
+        up = await repairMedia(up);
+      } catch {
+        // The repair could not run (lookup or resend failed): the provider's refusal stands.
+      }
+    }
     if (app.target.kind === "pool" && !side && up.status < 400) releaseHolds(servedBy);
   } catch (err) {
     req.signal.removeEventListener("abort", onAbort);
@@ -1028,8 +1092,32 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     // Never echo the error: it may carry paths or provider text.
     const credential = err instanceof RefreshCooldownError || err instanceof NotRefreshableError || (err as { name?: string } | null)?.name === "SwapLockError";
-    record(identity, credential ? "credential_error" : "upstream_error", 502, undefined, false, undefined, model);
+    record(identity, credential ? "credential_error" : "upstream_error", 502, undefined, false, undefined, model, credential ? undefined : failureName(err));
     return providerError(style, 502, credential ? "upstream credential unavailable" : "upstream request failed");
+  }
+
+  if (!side && route === undefined && mediaAware(app.provider) && isUploadRequest(req.method, rest) && up.status >= 200 && up.status < 300) {
+    // An upload the provider stored but marked as failed is useless: every request naming it is refused. Answered as an
+    // error, so the client keeps no id for it and falls back to sending the file inline.
+    const p = await peek(up, ERROR_PEEK_BYTES);
+    up = p.res;
+    const rejected = p.whole ? rejectedUpload(p.bytes) : undefined;
+    if (rejected) {
+      await discard(up);
+      req.signal.removeEventListener("abort", onAbort);
+      if (rejected.id) knownBad.add(app.provider, rejected.id, deps.now().getTime());
+      const details = redactText(rejected.details, 200);
+      record(identity, "upstream_error", 422, undefined, false, undefined, model, "upload_rejected", { type: "file_status_error", message: details });
+      return providerError("openai", 422, `upload rejected by provider: ${details}`);
+    }
+  }
+  if (mediaRemoved > 0) {
+    try {
+      deps.metrics.mediaRemoved?.(app.name, mediaRemoved);
+      log(JSON.stringify({ event: "media_removed", app: app.name, provider: app.provider, identity, ...(model !== undefined ? { model } : {}), parts: mediaRemoved, http: up.status }));
+    } catch {
+      // Observation must never affect the response.
+    }
   }
 
   // The upstream has answered: no replay is possible or needed any more, so the request bytes can go.
@@ -1037,6 +1125,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   releaseBody?.();
   const headers = new Headers(up.headers);
   headers.delete(SUBSCRIPTION_EXHAUSTED_HEADER);
+  if (mediaRemoved > 0) headers.set(MEDIA_REMOVED_HEADER, String(mediaRemoved));
   stripHopByHop(headers);
   if (headers.has("content-encoding")) {
     headers.delete("content-encoding");
@@ -1046,10 +1135,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const tap = new UsageTap(adapter.usageStyle(style), contentType);
   const httpStatus = up.status;
   const okStatus = httpStatus >= 400 ? "upstream_error" : "ok";
+  /** The provider's own words for a refusal, for the request log: the first bytes of the error body as it streams to the client. */
+  const errorPeek = httpStatus >= 400 ? new ErrorPeek(ERROR_PEEK_BYTES) : undefined;
   const finish = (status: string): void => {
     req.signal.removeEventListener("abort", onAbort);
     const counts = tap.result();
-    record(identity, status, httpStatus, counts, tap.isSse(), tap.status(), model);
+    record(identity, status, httpStatus, counts, tap.isSse(), tap.status(), model, mediaRemoved > 0 ? "media_removed" : undefined, errorPeek?.summary());
   };
 
   if (!up.body) {
@@ -1067,6 +1158,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
           return;
         }
         tap.write(r.value);
+        errorPeek?.write(r.value);
         c.enqueue(r.value);
       } catch {
         finish(ctrl.signal.aborted ? "client_aborted" : "stream_error");

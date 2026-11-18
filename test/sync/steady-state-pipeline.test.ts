@@ -221,7 +221,9 @@ test.skipIf(process.platform !== "linux" || !rsync)("conflict-prone trees conver
   const localEntry = steady.entries.find((e) => e.argv === "sync now")!;
   const remoteAis = steady.entries.filter((e) => e.argv.startsWith("sync ") && e.argv !== "sync now");
   // The fake ssh runs the remote tail-plan and merge as children, so their start-up (about 5 MB each) lands here too.
-  expect(bytes(localEntry)).toBeLessThan(50_000_000);
+  // Every ais process reads its own source at start, so this baseline grows with the code base (49.96 MB on 18 Nov 2026).
+  // The budget leaves room for that and still sits far below the ~90 MB a re-staged history would cost.
+  expect(bytes(localEntry)).toBeLessThan(60_000_000);
   expect(localEntry.write_bytes).toBeLessThan(1_000_000);
   expect(remoteAis.length).toBeGreaterThan(0);
   for (const e of remoteAis) {

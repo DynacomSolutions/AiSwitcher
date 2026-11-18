@@ -21,6 +21,8 @@ export interface GatewayMetrics {
   browserCall(tool: string, outcome: string, seconds: number): void;
   /** A browser pairing completed (token delivered). */
   browserPairing(): void;
+  /** Media parts replaced by a text note because the provider refused the file they name (media-recovery.ts). */
+  mediaRemoved?(app: string, parts: number): void;
   /** Requests currently queued for request-body budget. */
   bodyBudgetWaiting?(n: number): void;
   /** Seconds a request waited for body budget (0 when it did not have to wait). */
@@ -77,6 +79,7 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly rejections = new Counter("ais_gateway_rejections_total", "Requests rejected before reaching a provider.");
   private readonly failovers = new Counter("ais_gateway_failovers_total", "Requests retried on another pool member.");
   private readonly failOpens = new Counter("ais_gateway_fail_open_total", "Safety checks skipped so the request could proceed.");
+  private readonly mediaRemovals = new Counter("ais_gateway_media_removed_total", "Media parts replaced by a text note because the provider refused the file they name.");
   private readonly unreadable = new Counter("ais_gateway_credential_unreadable_total", "Credential reads that failed at warm-up, per app identity.");
   private readonly browserCalls = new Counter("ais_gateway_browser_calls_total", "Browser tool calls by tool and outcome.");
   private readonly browserPairings = new Counter("ais_gateway_browser_pairings_total", "Browser pairings completed.");
@@ -127,6 +130,9 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   failOpen(app: string, reason: "cap_check_failed" | "side_count_failed"): void {
     this.failOpens.inc({ app, reason });
+  }
+  mediaRemoved(app: string, parts: number): void {
+    this.mediaRemovals.inc({ app }, parts);
   }
 
   browserCall(tool: string, outcome: string, seconds: number): void {
@@ -191,7 +197,7 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.rejections, this.failovers, this.failOpens, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
     out.push(`ais_gateway_upstream_seconds_bucket{le="+Inf"} ${this.durationCount}`, `ais_gateway_upstream_seconds_sum ${this.durationSum}`, `ais_gateway_upstream_seconds_count ${this.durationCount}`);

@@ -1679,3 +1679,65 @@ describe("native limit answers", () => {
     for (const [k, v] of Object.entries(realHeaders)) expect(res.headers.get(k)).toBe(v);
   });
 });
+
+describe("upstream errors in the request log", () => {
+  const requestLog = (): Record<string, unknown> => logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return {}; } }).filter((l) => l.event === "request").at(-1) ?? {};
+
+  test("a refused request logs the provider's error type and message, and the body still passes byte for byte", async () => {
+    const t = await addApp(baseApp({}));
+    const body = '{"type":"error","error":{"type":"invalid_request_error","message":"messages.3.content.1.image: Could not process image SYNTHETIC_FIXTURE"},"request_id":"req_SYNTHETIC_FIXTURE"}';
+    handler = () => new Response(body, { status: 400, headers: { "content-type": "application/json" } });
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe(body);
+    expect(requestLog()).toMatchObject({ app: "pin", provider: "claude", status: "upstream_error", http: 400, upstream: { type: "invalid_request_error", message: "messages.3.content.1.image: Could not process image SYNTHETIC_FIXTURE" } });
+  });
+
+  test("every provider's error shape is summarised, with credentials removed and the message cut", async () => {
+    const cases: Array<[Partial<GatewayApp>, string, number, string, Record<string, string>]> = [
+      [{ name: "cx", provider: "codex", style: "openai" }, "/cx/backend-api/codex/responses", 400, '{"detail":"Stream must be set to true"}', { message: "Stream must be set to true" }],
+      [{ name: "oc", provider: "opencode", style: "openai" }, "/oc/chat/completions", 401, '{"type":"error","error":{"type":"AuthError","message":"Invalid API key sk-SYNTHETIC_FIXTURE_0123456789abcdef"}}', { type: "AuthError", message: "Invalid API key [redacted]" }],
+      [{ name: "gk", provider: "grok", style: "openai" }, "/gk/chat/completions", 404, "<html><body>Not Found</body></html>", { message: "Not Found" }],
+      [{ name: "za", provider: "zai", style: "openai" }, "/za/chat/completions", 500, JSON.stringify({ error: { code: "1234", message: "word ".repeat(200) } }), { code: "1234", message: `${"word ".repeat(200).slice(0, 299)}…` }],
+    ];
+    for (const [over, path, status, body, want] of cases) {
+      const t = await addApp(baseApp(over));
+      handler = () => new Response(body, { status });
+      const res = await call(path, t, { method: "POST", body: "{}" });
+      expect(res.status).toBe(status);
+      expect(requestLog()).toMatchObject({ provider: over.provider, status: "upstream_error", http: status });
+      expect(requestLog().upstream).toEqual(want);
+    }
+  });
+
+  test("an error with no body, and a success, log no error summary", async () => {
+    const t = await addApp(baseApp({}));
+    handler = () => new Response(null, { status: 503 });
+    await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(requestLog()).toMatchObject({ status: "upstream_error", http: 503 });
+    expect(requestLog().upstream).toBeUndefined();
+    handler = () => new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(requestLog().upstream).toBeUndefined();
+  });
+
+  test("a failed pool model list logs the provider's error", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    handler = () => new Response('{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired"}}', { status: 401, headers: { "content-type": "application/json" } });
+    const res = await call("/pool/v1/models", t, { method: "GET" });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ error: { type: "authentication_error" } });
+    expect(requestLog()).toMatchObject({ status: "upstream_error", http: 401, upstream: { type: "authentication_error", message: "OAuth token has expired" } });
+  });
+
+  test("an upstream call that fails outright logs the failure's name, never its message", async () => {
+    const t = await addApp(baseApp({}));
+    deps.fetch = (async () => {
+      throw Object.assign(new Error("connect to 192.0.2.1 SYNTHETIC_FIXTURE failed"), { code: "ECONNREFUSED" });
+    }) as unknown as typeof fetch;
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(502);
+    expect(requestLog()).toMatchObject({ status: "upstream_error", http: 502, reason: "ECONNREFUSED" });
+    expect(logs.join("\n")).not.toContain("192.0.2.1");
+  });
+});
