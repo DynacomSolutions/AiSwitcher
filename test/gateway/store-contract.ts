@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { GatewayStore } from "../../src/gateway/store.ts";
+import { AppRevokedError, type GatewayStore } from "../../src/gateway/store.ts";
 import type { GatewayApp, UsageRow } from "../../src/gateway/types.ts";
 
 const base: GatewayApp = {
@@ -73,6 +73,44 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     await s.expireTokens("a", "2026-11-02T00:00:00.000Z");
     await s.expireTokens("a", "2026-12-01T00:00:00.000Z");
     expect((await s.tokensFor("a"))[0]?.expiresAt).toBe("2026-11-02T00:00:00.000Z");
+    expect((await s.tokensFor("b"))[0]?.expiresAt).toBeUndefined();
+  });
+
+  test("a revoked app is final: putApp and addToken throw and change nothing", async () => {
+    const s = await makeStore();
+    await s.putApp(base);
+    await s.addToken({ app: "a", prefix: "p1", hash: "h1", createdAt: "2026-11-01T00:00:00.000Z" });
+    await s.revokeApp("a");
+    await expect(s.putApp({ ...base, owner: "o2", state: "active" })).rejects.toBeInstanceOf(AppRevokedError);
+    expect((await s.getApp("a"))?.state).toBe("revoked");
+    expect((await s.getApp("a"))?.owner).toBe("o");
+    await expect(s.addToken({ app: "a", prefix: "p2", hash: "h2", createdAt: "2026-11-01T00:00:00.000Z" })).rejects.toBeInstanceOf(AppRevokedError);
+    expect((await s.tokensFor("a")).map((t) => t.prefix)).toEqual(["p1"]);
+  });
+
+  test("addToken for an app that does not exist throws", async () => {
+    const s = await makeStore();
+    await expect(s.addToken({ app: "ghost", prefix: "p1", hash: "h1", createdAt: "2026-11-01T00:00:00.000Z" })).rejects.toBeInstanceOf(AppRevokedError);
+    expect(await s.tokensFor("ghost")).toEqual([]);
+  });
+
+  test("revokeApp stops every token of that app now and leaves other apps alone", async () => {
+    const s = await makeStore();
+    await s.putApp(base);
+    await s.putApp({ ...base, name: "b" });
+    await s.addToken({ app: "a", prefix: "p1", hash: "h1", createdAt: "2026-11-01T00:00:00.000Z" });
+    await s.addToken({ app: "a", prefix: "p2", hash: "h2", createdAt: "2026-11-01T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z" });
+    await s.addToken({ app: "a", prefix: "p3", hash: "h3", createdAt: "2026-11-01T00:00:00.000Z", expiresAt: "2026-11-02T00:00:00.000Z" });
+    await s.addToken({ app: "b", prefix: "p4", hash: "h4", createdAt: "2026-11-01T00:00:00.000Z" });
+    const before = Date.now();
+    await s.revokeApp("a");
+    const toks = await s.tokensFor("a");
+    for (const t of toks.filter((x) => x.prefix !== "p3")) {
+      expect(Date.parse(t.expiresAt!)).toBeGreaterThanOrEqual(before - 5000);
+      expect(Date.parse(t.expiresAt!)).toBeLessThanOrEqual(Date.now() + 5000);
+    }
+    // A token that had already expired keeps its earlier expiry.
+    expect(toks.find((t) => t.prefix === "p3")?.expiresAt).toBe("2026-11-02T00:00:00.000Z");
     expect((await s.tokensFor("b"))[0]?.expiresAt).toBeUndefined();
   });
 

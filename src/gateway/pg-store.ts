@@ -2,7 +2,7 @@ import { SQL, type TransactionSQL } from "bun";
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import { bumpSideCountOn, type SqlTag } from "./side-count.ts";
 import { errorTag } from "./ledger-buffer.ts";
-import type { GatewayStore } from "./store.ts";
+import { AppRevokedError, type GatewayStore } from "./store.ts";
 import type { GatewayApp, GatewayProvider, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
@@ -101,6 +101,9 @@ function toBinding(r: Row): BrowserBinding {
   return b;
 }
 
+/** NOTIFY channel carrying the name of an app that changed, so other replicas re-read it at once. */
+const APPS_CHANNEL = "gateway_apps_changed";
+
 export class PgGatewayStore implements GatewayStore {
   private readonly sql: SQL;
 
@@ -122,9 +125,24 @@ export class PgGatewayStore implements GatewayStore {
     return rows.map(toApp);
   }
 
+  /** Tells the other replicas an app changed. Best effort: the periodic refresh is the fallback. */
+  private async notifyApp(name: string): Promise<void> {
+    await this.sql`SELECT pg_notify(${APPS_CHANNEL}, ${name})`.catch(() => undefined);
+  }
+
+  /** Calls `onApp` for every app-change NOTIFY. Resolves once listening; returns an unlisten function. */
+  async listenAppChanges(onApp: (name: string) => void): Promise<() => Promise<void>> {
+    // biome-ignore lint/suspicious/noExplicitAny: Bun's SQL listen is not in the published types yet
+    const handle: any = await (this.sql as any).listen(APPS_CHANNEL, (payload: string) => onApp(payload));
+    return async () => {
+      await Promise.resolve(handle?.unlisten?.()).catch(() => undefined);
+    };
+  }
+
   async putApp(a: GatewayApp): Promise<void> {
     const models = a.models === undefined ? null : JSON.stringify(a.models);
-    await this.sql`
+    // The WHERE keeps a revoked row untouched: a revoked app is final, whatever a stale replica sends.
+    const rows = await this.sql`
       INSERT INTO gateway_apps
         (name, owner, namespace, provider, style, target, models, daily_tokens, reserve_percent, state, created_at, last_used_at)
       VALUES
@@ -135,13 +153,22 @@ export class PgGatewayStore implements GatewayStore {
         owner = EXCLUDED.owner, namespace = EXCLUDED.namespace, provider = EXCLUDED.provider,
         style = EXCLUDED.style, target = EXCLUDED.target, models = EXCLUDED.models,
         daily_tokens = EXCLUDED.daily_tokens, reserve_percent = EXCLUDED.reserve_percent,
-        state = EXCLUDED.state, created_at = EXCLUDED.created_at, last_used_at = EXCLUDED.last_used_at`;
+        state = EXCLUDED.state, created_at = EXCLUDED.created_at, last_used_at = EXCLUDED.last_used_at
+      WHERE gateway_apps.state <> 'revoked'
+      RETURNING name`;
+    if (rows.length === 0) throw new AppRevokedError(a.name);
+    await this.notifyApp(a.name);
   }
 
   async addToken(t: TokenRecord): Promise<void> {
-    await this.sql`
+    // FOR SHARE blocks a concurrent revoke until this insert commits, so the revoke then expires the new token too.
+    const rows = await this.sql`
       INSERT INTO gateway_tokens (app, prefix, hash, created_at, expires_at)
-      VALUES (${t.app}, ${t.prefix}, ${t.hash}, ${t.createdAt}::timestamptz, ${t.expiresAt ?? null}::timestamptz)`;
+      SELECT name, ${t.prefix}::text, ${t.hash}::text, ${t.createdAt}::timestamptz, ${t.expiresAt ?? null}::timestamptz
+      FROM gateway_apps WHERE name = ${t.app} AND state = 'active' FOR SHARE OF gateway_apps
+      RETURNING id`;
+    if (rows.length === 0) throw new AppRevokedError(t.app);
+    await this.notifyApp(t.app);
   }
 
   async tokensFor(app: string): Promise<TokenRecord[]> {
@@ -158,10 +185,17 @@ export class PgGatewayStore implements GatewayStore {
     await this.sql`
       UPDATE gateway_tokens SET expires_at = ${at}::timestamptz
       WHERE app = ${app} AND expires_at IS NULL`;
+    await this.notifyApp(app);
   }
 
   async revokeApp(name: string): Promise<void> {
-    await this.sql`UPDATE gateway_apps SET state = 'revoked' WHERE name = ${name}`;
+    await this.sql.begin(async (tx) => {
+      await tx`UPDATE gateway_apps SET state = 'revoked' WHERE name = ${name}`;
+      await tx`
+        UPDATE gateway_tokens SET expires_at = now()
+        WHERE app = ${name} AND (expires_at IS NULL OR expires_at > now())`;
+    });
+    await this.notifyApp(name);
   }
 
   async appendUsage(rows: UsageRow[]): Promise<void> {

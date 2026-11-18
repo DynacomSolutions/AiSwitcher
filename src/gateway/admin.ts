@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
-import type { GatewayStore } from "./store.ts";
+import { AppRevokedError, revokedMessage, type GatewayStore } from "./store.ts";
 import { registerBrowserAdmin } from "./browser/admin.ts";
 import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
@@ -22,7 +22,10 @@ const FIXED_STYLE: Partial<Record<GatewayProvider, ApiStyle>> = { claude: "anthr
 export type IdentityState = "ok" | "missing" | "retired" | "pool";
 
 export interface AdminDeps {
+  /** Writes go here (the replica's cached store, so its own cache updates at once). */
   store: GatewayStore;
+  /** Reads behind every decision or answer. Defaults to `store`; the gateway passes the uncached database store, so a stale replica cache never decides. */
+  readStore?: GatewayStore;
   adminToken: string;
   now(): Date;
   overlapMs?: number;
@@ -105,6 +108,7 @@ async function jsonBody(req: Request): Promise<unknown> {
 
 export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
+  const read = deps.readStore ?? store;
   const hono = new Hono();
   const err = (status: 400 | 401 | 404 | 409 | 500 | 503, message: string): Response => Response.json({ error: message }, { status });
 
@@ -116,13 +120,13 @@ export function createAdminApp(deps: AdminDeps): Hono {
   registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserHub ? { hub: deps.browserHub } : {}), ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
 
   hono.get("/apps", async (c) => {
-    const apps = await store.listApps();
-    return c.json({ apps: await Promise.all(apps.map((a) => appView(store, a))) });
+    const apps = await read.listApps();
+    return c.json({ apps: await Promise.all(apps.map((a) => appView(read, a))) });
   });
 
   hono.get("/apps/:name", async (c) => {
-    const app = await store.getApp(c.req.param("name"));
-    return app ? c.json(await appView(store, app)) : err(404, "no such app");
+    const app = await read.getApp(c.req.param("name"));
+    return app ? c.json(await appView(read, app)) : err(404, "no such app");
   });
 
   hono.put("/apps/:name", async (c) => {
@@ -136,6 +140,9 @@ export function createAdminApp(deps: AdminDeps): Hono {
     }
     const parsed = parseAppBody(raw);
     if (typeof parsed === "string") return err(400, parsed);
+    // A fresh read from the database: a revoked app is final and never changed or reused.
+    const existing = await read.getApp(name);
+    if (existing?.state === "revoked") return err(409, revokedMessage(name));
     try {
     for (const identity of parsed.target.kind === "pin" ? [parsed.target.identity] : (parsed.target.identities ?? [])) {
       const state = (await deps.identityState?.(parsed.provider, identity)) ?? "ok";
@@ -147,23 +154,27 @@ export function createAdminApp(deps: AdminDeps): Hono {
     } catch {
       return err(500, "identity registry unreadable");
     }
-    const existing = await store.getApp(name);
     const app: GatewayApp = {
       ...parsed,
       name,
-      state: existing?.state ?? "active",
+      state: "active",
       createdAt: existing?.createdAt ?? deps.now().toISOString(),
       ...(existing?.lastUsedAt !== undefined ? { lastUsedAt: existing.lastUsedAt } : {}),
     };
-    await store.putApp(app);
-    return c.json(await appView(store, app), existing ? 200 : 201);
+    try {
+      await store.putApp(app);
+    } catch (e) {
+      if (e instanceof AppRevokedError) return err(409, e.message);
+      throw e;
+    }
+    return c.json(await appView(read, app), existing ? 200 : 201);
   });
 
   hono.post("/apps/:name/tokens", async (c) => {
     const name = c.req.param("name");
-    const app = await store.getApp(name);
+    const app = await read.getApp(name);
     if (!app) return err(404, "no such app");
-    if (app.state !== "active") return err(409, "app is revoked");
+    if (app.state !== "active") return err(409, revokedMessage(name));
     let raw: unknown;
     try {
       raw = await jsonBody(c.req.raw);
@@ -179,16 +190,23 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const now = deps.now();
     // Older tokens first (the store expires every token without an expiry), then the new one.
     const previousExpiresAt = new Date(now.getTime() + overlapMs).toISOString();
+    // Safe in any order against a racing revoke: a revoke gives every token an expiry, and this only sets one where none exists.
+    // The store refuses the new token for a revoked app.
     await store.expireTokens(name, previousExpiresAt);
     const t = generateToken();
-    await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: now.toISOString() });
+    try {
+      await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: now.toISOString() });
+    } catch (e) {
+      if (e instanceof AppRevokedError) return err(409, e.message);
+      throw e;
+    }
     // The only time the token is ever returned.
     return c.json({ app: name, token: t.token, prefix: t.prefix, previousTokensExpireAt: previousExpiresAt }, 201);
   });
 
   hono.post("/apps/:name/revoke", async (c) => {
     const name = c.req.param("name");
-    if (!(await store.getApp(name))) return err(404, "no such app");
+    if (!(await read.getApp(name))) return err(404, "no such app");
     await store.revokeApp(name);
     return c.json({ app: name, state: "revoked" });
   });
@@ -200,7 +218,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const providerFilter = c.req.query("provider");
     if (providerFilter !== undefined && !PROVIDERS.includes(providerFilter as GatewayProvider)) return err(400, "unknown provider");
     const since = new Date(deps.now().getTime() - days * 86400_000);
-    const apps = (await store.listApps()).filter((a) => (appFilter === undefined || a.name === appFilter) && (providerFilter === undefined || a.provider === providerFilter));
+    const apps = (await read.listApps()).filter((a) => (appFilter === undefined || a.name === appFilter) && (providerFilter === undefined || a.provider === providerFilter));
     // One grouped ledger read for every app (was one SUM per app in parallel, which took seconds with ~60 apps).
     const totals = await store.usageTotalsSince(since);
     const usage = apps.map((a) => ({ app: a.name, provider: a.provider, days, tokens: totals.get(a.name) ?? 0 }));

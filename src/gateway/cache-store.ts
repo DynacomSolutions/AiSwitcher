@@ -1,5 +1,5 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
-import type { GatewayStore } from "./store.ts";
+import { AppRevokedError, type GatewayStore } from "./store.ts";
 import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
 
 /**
@@ -8,6 +8,8 @@ import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./type
  * store first and then into the cache, so a revoke or rotation made through
  * this instance is seen by the next request. A timer re-reads the store to
  * pick up changes made by other instances; a failed re-read keeps the cache.
+ * When the store can notify (PostgreSQL LISTEN), a change made by any instance
+ * re-reads that one app at once, so a revoke reaches every replica in moments.
  */
 export class CachedGatewayStore implements GatewayStore {
   private apps = new Map<string, GatewayApp>();
@@ -15,6 +17,8 @@ export class CachedGatewayStore implements GatewayStore {
   private version = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
   private loaded = false;
+  private unlisten: (() => Promise<void>) | undefined;
+  private stopped = false;
 
   constructor(private readonly inner: GatewayStore) {}
 
@@ -26,7 +30,14 @@ export class CachedGatewayStore implements GatewayStore {
     for (const a of apps) tokens.set(a.name, await this.inner.tokensFor(a.name));
     // A write made while we were reading is newer than this snapshot: keep it.
     if (this.version !== seen && this.loaded) return;
-    this.apps = new Map(apps.map((a) => [a.name, a]));
+    // A revoked app is final in the cache too: a snapshot that says active (an older read) never undoes it.
+    const nextApps = new Map(apps.map((a) => [a.name, a]));
+    for (const [name, cached] of this.apps) {
+      if (cached.state !== "revoked") continue;
+      nextApps.set(name, cached);
+      tokens.set(name, this.tokens.get(name) ?? []);
+    }
+    this.apps = nextApps;
     this.tokens = tokens;
     this.loaded = true;
   }
@@ -37,9 +48,52 @@ export class CachedGatewayStore implements GatewayStore {
     this.timer.unref?.();
   }
 
+  /**
+   * Subscribes to app-change notices from the store, if it offers them. Throws when the subscription fails
+   * (the caller may log it: the timed refresh still keeps the cache current).
+   */
+  async startListening(): Promise<void> {
+    if (this.unlisten || this.stopped || !this.inner.listenAppChanges) return;
+    const unlisten = await this.inner.listenAppChanges((name) => void this.refreshApp(name).catch(() => undefined));
+    if (this.stopped) {
+      await unlisten().catch(() => undefined);
+      return;
+    }
+    this.unlisten = unlisten;
+  }
+
+  /** Re-reads one app and its tokens from the store and replaces the cache entry (drops it when the app is gone). */
+  async refreshApp(name: string): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const seen = this.version;
+      const app = await this.inner.getApp(name);
+      const tokens = app ? await this.inner.tokensFor(name) : [];
+      // A local write made while we were reading may be newer than this read: read again.
+      if (this.version !== seen) continue;
+      if (this.apps.get(name)?.state === "revoked") {
+        // Final: keep the cached revoked entry and its expiries, whatever this read says.
+        return;
+      }
+      if (app) {
+        this.apps.set(name, app);
+        this.tokens.set(name, tokens);
+      } else {
+        this.apps.delete(name);
+        this.tokens.delete(name);
+      }
+      // Tell a warm() that is mid-read to drop its older snapshot.
+      this.version++;
+      return;
+    }
+  }
+
   stop(): void {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    const unlisten = this.unlisten;
+    this.unlisten = undefined;
+    if (unlisten) void unlisten().catch(() => undefined);
   }
 
   async getApp(name: string): Promise<GatewayApp | undefined> {
@@ -56,14 +110,27 @@ export class CachedGatewayStore implements GatewayStore {
   }
 
   async putApp(app: GatewayApp): Promise<void> {
-    await this.inner.putApp(app);
+    if (this.apps.get(app.name)?.state === "revoked") throw new AppRevokedError(app.name);
+    try {
+      await this.inner.putApp(app);
+    } catch (e) {
+      // This replica did not know the app was revoked: learn it now.
+      if (e instanceof AppRevokedError) await this.refreshApp(app.name).catch(() => undefined);
+      throw e;
+    }
     this.version++;
     this.apps.set(app.name, { ...app });
     if (!this.tokens.has(app.name)) this.tokens.set(app.name, []);
   }
 
   async addToken(rec: TokenRecord): Promise<void> {
-    await this.inner.addToken(rec);
+    if (this.apps.get(rec.app)?.state === "revoked") throw new AppRevokedError(rec.app);
+    try {
+      await this.inner.addToken(rec);
+    } catch (e) {
+      if (e instanceof AppRevokedError) await this.refreshApp(rec.app).catch(() => undefined);
+      throw e;
+    }
     this.version++;
     this.tokens.set(rec.app, [...(this.tokens.get(rec.app) ?? []), { ...rec }]);
   }
@@ -82,6 +149,12 @@ export class CachedGatewayStore implements GatewayStore {
     this.version++;
     const a = this.apps.get(name);
     if (a) this.apps.set(name, { ...a, state: "revoked" });
+    // Every token stops now, as in the store.
+    const at = new Date().toISOString();
+    this.tokens.set(
+      name,
+      (this.tokens.get(name) ?? []).map((t) => (t.expiresAt === undefined || Date.parse(t.expiresAt) > Date.parse(at) ? { ...t, expiresAt: at } : t)),
+    );
   }
 
   appendUsage(rows: UsageRow[]): Promise<void> {

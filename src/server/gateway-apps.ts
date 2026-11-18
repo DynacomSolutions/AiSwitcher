@@ -1,5 +1,5 @@
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import { Admin, RotateDeliveryError, rotateApp, type GatewayCliDeps } from "../cli/gateway/apps.ts";
+import { Admin, RevokedAppError, RotateDeliveryError, rotateApp, type GatewayCliDeps } from "../cli/gateway/apps.ts";
 import { runKubectl } from "../cli/gateway/kube-secret.ts";
 import { DEFAULT_RESERVE_PERCENT } from "../gateway/select.ts";
 import { mapGatewayUsage } from "../gateway/usage-view.ts";
@@ -261,6 +261,7 @@ export async function rotateGatewayApp(name: string, deps: GatewayAppsDeps = {})
       return { app: name, ...m, messages: clean(m.token), deliveryError: e.message };
     }
     // CliUsageError (no proxy URL) or an admin failure: nothing was minted, or the admin refused.
+    if (e instanceof RevokedAppError) throw new HttpError(409, e.message);
     if (e instanceof Error && e.name === "CliUsageError") throw new HttpError(503, e.message);
     throw adminError(e);
   }
