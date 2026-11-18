@@ -10,11 +10,11 @@ import { t3Paths } from "./t3-anthropic-proxy.ts";
 import { syncT3UsageCredentials, type UsageResult } from "./t3-usage-credentials.ts";
 
 /**
- * Creates or updates one T3 Code provider instance (claude or grok) whose folder holds only the gateway app token,
+ * Creates or updates one T3 Code provider instance (claude, grok or opencode) whose folder holds only the gateway app token,
  * never a provider key. T3 watches settings.json and applies the change by itself.
  */
 
-export type InstanceDriver = "claude" | "grok";
+export type InstanceDriver = "claude" | "grok" | "opencode";
 
 export interface T3InstanceOptions {
   id: string;
@@ -250,6 +250,36 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     plans.push({ path: join(folder, "settings.json"), content: `${JSON.stringify(own, null, 2)}\n`, mode: 0o600, label: "settings.json (folder)" });
     plans.push({ path: join(folder, ".credentials.json"), content: gatewayEntryText(token, GATEWAY_ENTRY_SCOPES_WITH_USAGE_PROXY), mode: 0o600, label: ".credentials.json" });
     plans.push({ path: join(folder, ".claude.json"), content: `${JSON.stringify({ hasCompletedOnboarding: true })}\n`, mode: 0o600, label: ".claude.json", onlyIfMissing: true });
+  } else if (opts.driver === "opencode") {
+    let likeBinary: string | undefined;
+    if (opts.like) {
+      const like = obj(instances[opts.like]);
+      if (!like || like.driver !== "opencode") throw new Error(`--like ${opts.like} is not an opencode instance in settings.json`);
+      const b = obj(like.config)?.binaryPath;
+      if (typeof b === "string" && b !== "") likeBinary = b;
+    }
+    const config: Json = { ...obj(existing?.config), binaryPath: opts.binary ?? likeBinary ?? (typeof obj(existing?.config)?.binaryPath === "string" ? (obj(existing?.config)!.binaryPath as string) : join(home, ".local", "bin", "opencode")) };
+    entry = {
+      ...existing,
+      driver: "opencode",
+      displayName,
+      enabled: true,
+      environment: [
+        { name: "OPENCODE_CONFIG_DIR", value: folder, sensitive: false },
+        { name: "XDG_DATA_HOME", value: folder, sensitive: false },
+      ],
+      config,
+    };
+    // The folder opencode.json points at the gateway. The usage writer adds disabled_providers and auth.json afterwards,
+    // so existing keys (disabled_providers included) are kept and only ours are set.
+    const own = (await readJsonObject(join(folder, "opencode.json"))) ?? { $schema: "https://opencode.ai/config.json", permission: { "*": "allow", external_directory: "allow" } };
+    const providers = obj(own.provider) ?? {};
+    const gw = obj(providers.gateway) ?? {};
+    const options: Json = { ...obj(gw.options), baseURL: opts.gatewayUrl, apiKey: "{file:token}", headers: { "x-opencode-session": opts.id } };
+    const gwOut: Json = { npm: "@ai-sdk/openai-compatible", name: "OpenCode Go (gateway)", ...gw, options };
+    if (models.length > 0) gwOut.models = Object.fromEntries(models.map((m) => [m, { name: m }]));
+    own.provider = { ...providers, gateway: gwOut };
+    plans.push({ path: join(folder, "opencode.json"), content: `${JSON.stringify(own, null, 2)}\n`, mode: 0o600, label: "opencode.json" });
   } else {
     const launcher = grokLauncherPath(opts.id, { home, ...(opts.env ? { env: opts.env } : {}) });
     const config: Json = { ...obj(existing?.config), binaryPath: launcher };
@@ -298,7 +328,10 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
   }
 
   let usage: UsageResult[] | undefined;
-  if (opts.driver === "grok") {
+  // opencode: the usage writer reads the instance from settings.json and the folder opencode.json, so a check with
+  // either still to be written has nothing to read yet; the changes list already reports it.
+  const usageReady = opts.driver === "grok" || (opts.driver === "opencode" && (!check || (toWrite.length === 0 && !entryChanged)));
+  if (usageReady) {
     usage = (await syncT3UsageCredentials({ home, ...(opts.env ? { env: opts.env } : {}), ...(opts.secretsPath ? { secretsPath: opts.secretsPath } : {}), check })).filter((r) => r.id === opts.id);
     for (const r of usage) if (r.status === "updated") changes.push(`usage credential ${r.file}`);
   }

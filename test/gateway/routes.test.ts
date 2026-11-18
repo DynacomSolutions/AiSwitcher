@@ -579,14 +579,23 @@ describe("claude account paths", () => {
       expect(await res.text()).not.toContain("tok-");
     });
   }
-  test("a pool app's profile is the one of the member the pool uses now, unchanged", async () => {
+  test("a pool app's profile is made up per app: no upstream call, no member email", async () => {
     await addApp("cl", "claude", "anthropic");
+    await addApp("cl2", "claude", "anthropic");
     usage.a = { status: "live", maxUtilization: 80, capturedAt: "" };
     usage.b = { status: "live", maxUtilization: 10, capturedAt: "" };
     reply = () => Response.json({ account: { uuid: "acct-b", email: "b@example.com" }, organization: { uuid: "org-b" } });
     const res = await call("cl", "/api/oauth/profile", { method: "GET" });
-    expect(await res.json()).toEqual({ account: { uuid: "acct-b", email: "b@example.com" }, organization: { uuid: "org-b" } });
-    expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-b");
+    expect(res.status).toBe(200);
+    const p = (await res.json()) as { account: { uuid: string; email: string }; organization: { uuid: string } };
+    expect(seen).toHaveLength(0);
+    expect(JSON.stringify(p)).not.toContain("b@example.com");
+    expect(p.account.email).toBe("cl@gateway.invalid");
+    const other = (await (await call("cl2", "/api/oauth/profile", { method: "GET" })).json()) as typeof p;
+    expect(other.account.email).not.toBe(p.account.email);
+    expect(other.account.uuid).not.toBe(p.account.uuid);
+    expect(other.organization.uuid).not.toBe(p.organization.uuid);
+    expect(seen).toHaveLength(0);
   });
   test("a pinned app's usage with cedar_ember is the member's own body", async () => {
     await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });

@@ -53,6 +53,7 @@ export type Route =
  * to the provider with the REAL login of the member the app maps to (pin: that identity; pool: the member owning the resource,
  * else the one the pool would route to now), see account.ts. The member's token never reaches the client. Counted as a side call.
  * - `forward`: as is, to `url` (plus the query string).
+ * - `forward` of `GET /api/oauth/profile` on a claude pool app is not forwarded: the gateway answers with a profile made up from the app name (no upstream call, no member login), so each pool is its own account in a client such as T3 Code.
  * - `claude-usage`: pin forwards; pool serves the windows and merges the chosen member's `cedar_ember` when asked for.
  * - `claude-org`: `/api/organizations/<org>/...`; the org is rewritten to the member's, and a reset redeem goes to the member owning the grant.
  * - `codex-consume`: spending a codex reset credit, sent to a member that has one.
