@@ -73,6 +73,14 @@ export function aisGlobalMemoryPath(home: string = homedir()): string {
   return join(aisHome(home), "memory", "GLOBAL.md");
 }
 
+/** Launcher-owned folder for SDK host Claude launches. Its `CLAUDE.md` is a
+ * link to the global memory file; see `projectGlobalMemoryForLaunch`. It is a
+ * sibling of `memory`, never inside it, because the memory folder can be a
+ * link into a read-only checkout. */
+export function aisClaudeProjectionDir(home: string = homedir()): string {
+  return join(aisHome(home), "claude-memory-projection");
+}
+
 /** Explicit corrections for sessions whose immutable transcript metadata was
  * created from the wrong working directory. Kept outside the transcript so a
  * live writer never has its open rollout file replaced underneath it. */

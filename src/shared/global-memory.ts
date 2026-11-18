@@ -14,7 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import type { ToolConfig } from "../identities/types.ts";
-import { aisGlobalMemoryPath } from "./ais-home.ts";
+import { aisClaudeProjectionDir, aisGlobalMemoryPath } from "./ais-home.ts";
 
 export const INITIAL_MEMORY = `# AIS global memory
 
@@ -144,6 +144,40 @@ async function ensureGrokProjection(configDir: string, memoryPath: string): Prom
   await symlink(memoryPath, projection);
 }
 
+/** True when a host drives Claude over the Agent SDK control protocol
+ * (`--input-format stream-json`). Such a host sends its own
+ * `appendSystemPrompt` in `initialize`, and Claude Code then drops the text of
+ * `--append-system-prompt-file`. */
+export function isSdkHostLaunch(argv: readonly string[]): boolean {
+  return argv.some(
+    (arg, index) =>
+      arg === "--input-format=stream-json" || (arg === "--input-format" && argv[index + 1] === "stream-json"),
+  );
+}
+
+/** `<aisHome>/claude-memory-projection/CLAUDE.md` links to the memory file.
+ * Claude Code loads it as an additional-directory CLAUDE.md, a channel that
+ * the host's `appendSystemPrompt` does not replace (verified with a live probe). */
+async function ensureClaudeProjection(memoryPath: string, home: string): Promise<string> {
+  const dir = aisClaudeProjectionDir(home);
+  const projection = join(dir, "CLAUDE.md");
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  try {
+    const stat = await lstat(projection);
+    if (stat.isSymbolicLink() && (await readlink(projection)) === memoryPath) return dir;
+    if (!stat.isSymbolicLink()) {
+      throw new Error(
+        `Cannot project AIS global memory into Claude: ${projection} already exists and is not an AIS-managed link`,
+      );
+    }
+    await unlink(projection); // stale AIS link (memory path moved)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await symlink(memoryPath, projection);
+  return dir;
+}
+
 async function ensureCrushProjection(configDir: string, memoryPath: string): Promise<void> {
   const configPath = join(configDir, "crush.json");
   let config: Record<string, unknown> = {};
@@ -200,7 +234,11 @@ export function piBypassesMemoryProjection(argv: readonly string[]): boolean {
 }
 
 /** Project the one AIS-owned memory file through each tool's supported
- * native instruction channel. No adapter creates another writable store. */
+ * native instruction channel. No adapter creates another writable store.
+ * Claude normally gets `--append-system-prompt-file`. An SDK host launch
+ * (see `isSdkHostLaunch`) gets a linked `CLAUDE.md` folder through `--add-dir`
+ * plus `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`, because the host's
+ * own append would replace the file flag. */
 export async function projectGlobalMemoryForLaunch(
   cfg: ToolConfig,
   configDir: string,
@@ -213,6 +251,14 @@ export async function projectGlobalMemoryForLaunch(
 
   switch (cfg.globalMemoryProjection) {
     case "claude-append-file":
+      if (isSdkHostLaunch(argv)) {
+        const dir = await ensureClaudeProjection(memoryPath, home);
+        return {
+          argv: ["--add-dir", dir, ...argv],
+          env: { CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: "1" },
+          memoryPath,
+        };
+      }
       return { argv: ["--append-system-prompt-file", memoryPath, ...argv], env: {}, memoryPath };
     case "codex-developer-instructions":
       return { argv: ["-c", `developer_instructions=${JSON.stringify(content)}`, ...argv], env: {}, memoryPath };

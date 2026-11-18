@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
-import { chmod, mkdtemp, readFile, readlink, rm, writeFile, mkdir } from "node:fs/promises";
+import { chmod, lstat, readdir, mkdtemp, readFile, readlink, rm, symlink, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -15,6 +15,7 @@ import {
 import {
   appendGlobalMemory,
   ensureGlobalMemoryFile,
+  isSdkHostLaunch,
   piBypassesMemoryProjection,
   projectGlobalMemoryForLaunch,
   readGlobalMemory,
@@ -121,6 +122,74 @@ describe("AIS global memory", () => {
     expect(config.providers.zai.api_key).toBe("test");
     expect(config.options.debug).toBe(true);
     expect(config.options.global_context_paths).toEqual([projection.memoryPath]);
+  });
+});
+
+describe("Claude launches started by an SDK host", () => {
+  const sdkArgv = ["--output-format", "stream-json", "--input-format", "stream-json", "--verbose"];
+
+  test("detects both spellings of the input format flag", () => {
+    expect(isSdkHostLaunch(sdkArgv)).toBe(true);
+    expect(isSdkHostLaunch(["--input-format=stream-json"])).toBe(true);
+    expect(isSdkHostLaunch(["--input-format", "text"])).toBe(false);
+    expect(isSdkHostLaunch(["--output-format", "stream-json"])).toBe(false);
+    expect(isSdkHostLaunch(["-p", "stream-json"])).toBe(false);
+  });
+
+  test("links a CLAUDE.md folder instead of the append file", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const dir = join(root, ".ais", "claude-memory-projection");
+    for (const argv of [sdkArgv, ["--input-format=stream-json", "--verbose"]]) {
+      const projection = await projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", argv, {}, root);
+      expect(projection.argv).toEqual(["--add-dir", dir, ...argv]);
+      expect(projection.argv).not.toContain("--append-system-prompt-file");
+      expect(projection.env).toEqual({ CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: "1" });
+      expect(await readlink(join(dir, "CLAUDE.md"))).toBe(memory);
+    }
+  });
+
+  test("repairs a stale link", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const dir = join(root, ".ais", "claude-memory-projection");
+    await mkdir(dir, { recursive: true });
+    await symlink(join(root, "moved.md"), join(dir, "CLAUDE.md"));
+    await projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root);
+    expect(await readlink(join(dir, "CLAUDE.md"))).toBe(memory);
+  });
+
+  test("refuses a regular file at the link path", async () => {
+    const root = await home();
+    const dir = join(root, ".ais", "claude-memory-projection");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "CLAUDE.md"), "mine");
+    await expect(projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root)).rejects.toThrow(
+      /already exists and is not an AIS-managed link/,
+    );
+    expect((await lstat(join(dir, "CLAUDE.md"))).isFile()).toBe(true);
+  });
+
+  test("creates nothing inside a memory folder that is a link elsewhere", async () => {
+    const root = await home();
+    const target = join(root, "checkout", "memory");
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, "GLOBAL.md"), "# linked memory\n");
+    await mkdir(join(root, ".ais"), { recursive: true });
+    await symlink(target, join(root, ".ais", "memory"));
+    const before = await readdir(target, { recursive: true });
+    const projection = await projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", sdkArgv, {}, root);
+    expect(await readdir(target, { recursive: true })).toEqual(before);
+    expect(projection.argv.slice(0, 2)).toEqual(["--add-dir", join(root, ".ais", "claude-memory-projection")]);
+  });
+
+  test("normal launches keep the append file and create no folder", async () => {
+    const root = await home();
+    const memory = await ensureGlobalMemoryFile(root);
+    const projection = await projectGlobalMemoryForLaunch(CLAUDE_CONFIG, "/identity", ["-p", "hi"], {}, root);
+    expect(projection.argv).toEqual(["--append-system-prompt-file", memory, "-p", "hi"]);
+    expect(projection.env).toEqual({});
+    await expect(lstat(join(root, ".ais", "claude-memory-projection"))).rejects.toThrow();
   });
 });
 
