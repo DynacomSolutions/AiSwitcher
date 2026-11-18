@@ -32,7 +32,7 @@ import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
 import { createUsageSource, fetchPoolUsage, type FetchUsage } from "./usage-source.ts";
-import type { GatewayProvider } from "./types.ts";
+import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
 import { enableMemberStore, memberStoreEnabled, setLocalWriteHook } from "../identities/gateway-members.ts";
@@ -504,11 +504,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     now,
     metrics: recoverOnSuccess(metrics, alerter),
   });
-  /** The active claude app a gateway token belongs to, for the CONNECT proxy. */
-  const appForToken = async (token: string): Promise<string | undefined> => {
+  /** The active app of one of the given providers that a gateway token belongs to, for the CONNECT proxy. */
+  const appForToken = async (token: string, providers: GatewayProvider[]): Promise<{ name: string; provider: GatewayProvider; style: ApiStyle } | undefined> => {
     if (!warmed || !parseToken(token)) return undefined;
     for (const app of await store.listApps()) {
-      if (app.state === "active" && app.provider === "claude" && (await verifyToken(store, app.name, token, now()))) return app.name;
+      if (app.state === "active" && providers.includes(app.provider) && (await verifyToken(store, app.name, token, now()))) return { name: app.name, provider: app.provider, style: app.style };
     }
     return undefined;
   };

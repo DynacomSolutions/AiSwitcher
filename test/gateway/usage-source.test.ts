@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { pickIdentity } from "../../src/gateway/select.ts";
-import { createUsageSource } from "../../src/gateway/usage-source.ts";
+import { createUsageSource, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
 import type { GatewayApp } from "../../src/gateway/types.ts";
 
 const live = (u: number): PoolUsage => ({ status: "live", maxUtilization: u, capturedAt: "2026-11-02T00:00:00.000Z" });
@@ -9,6 +9,19 @@ const app: GatewayApp = {
   name: "a", owner: "o", namespace: "n", provider: "claude", style: "anthropic",
   target: { kind: "pin", identity: "id1" }, reservePercent: 80, state: "active", createdAt: "2026-11-01T00:00:00.000Z",
 };
+
+describe("zai token usage", () => {
+  test("the web tools window does not count, so pickIdentity does not refuse", async () => {
+    const u = zaiTokenUsage({ tool: "zai", status: "ok", windows: [
+      { label: "session", category: "session", usedPercent: 10 },
+      { label: "week", category: "week", usedPercent: 10 },
+      { label: "web tools", category: "other", usedPercent: 100 },
+    ] } as never);
+    expect(u.maxUtilization).toBe(10);
+    const zapp: GatewayApp = { ...app, provider: "zai" };
+    expect(await pickIdentity(zapp, { usageFor: async () => u, poolMembers: async () => ["id1"] })).toEqual({ identity: "id1" });
+  });
+});
 
 describe("usage source", () => {
   test("reserve rejects once the cache holds usage above the threshold", async () => {

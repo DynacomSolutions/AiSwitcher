@@ -59,7 +59,7 @@ export type Route =
  */
 export type AccountOp = "forward" | "claude-usage" | "claude-org" | "codex-consume";
 
-export type ServedName = "codex-usage" | "codex-reset-credits" | "codex-accounts-check" | "ali-models";
+export type ServedName = "codex-usage" | "codex-reset-credits" | "codex-accounts-check" | "ali-models" | "claude-style-usage" | "claude-style-profile";
 
 /** Served names a pinned app gets forwarded to the provider instead (the real body of its one identity). */
 export const PIN_FORWARD: Partial<Record<ServedName, string>> = {
@@ -211,9 +211,17 @@ function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, pat
     if (provider === "kimi" && /^(?:\/v1)?\/usages$/.test(path)) return { kind: "account", op: "forward", url: `${KIMI_V1}/usages` };
     if (provider === "zai" && /^\/api\/monitor\/.+/.test(path)) return { kind: "account", op: "forward", url: `https://api.z.ai${orig}` };
     if (provider === "opencode" && /^(?:\/v1)?\/usage$/.test(path)) return { kind: "account", op: "forward", url: "https://opencode.ai/zen/go/v1/usage" };
+    if (provider === "grok" && /^(?:\/v1)?\/billing$/.test(path)) return { kind: "account", op: "forward", url: "https://cli-chat-proxy.grok.com/v1/billing" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits$/.test(path)) return { kind: "serve", name: "codex-reset-credits" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)?\/accounts\/check(?:\/[^/]+)?$/.test(path)) return { kind: "serve", name: "codex-accounts-check" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)\/usage$/.test(path)) return { kind: "serve", name: "codex-usage" };
+  }
+  // Claude Code on a kimi or zai app (Anthropic-style) reads its limits and account the Claude way; the gateway answers both
+  // itself from the pool readings. Served routes count against the side limit like claude-usage does.
+  if ((provider === "kimi" || provider === "zai") && m === "GET" && (path === "/api/oauth/usage" || path === "/api/oauth/profile")) {
+    // Only an Anthropic-style app gets these. An openai-style app must never fall through to the upstream.
+    if (style !== "anthropic") return { kind: "deny", status: 404 };
+    return { kind: "serve", name: path === "/api/oauth/usage" ? "claude-style-usage" : "claude-style-profile" };
   }
   if (provider === "claude") {
     if (m === "GET" && path === "/api/oauth/usage") return { kind: "account", op: "claude-usage", url: "https://api.anthropic.com/api/oauth/usage" };
@@ -264,6 +272,10 @@ export async function serveRoute(name: ServedName, ctx: ServeContext): Promise<R
         first_id: ALI_MODELS[0]?.id ?? null,
         last_id: ALI_MODELS[ALI_MODELS.length - 1]?.id ?? null,
       });
+    case "claude-style-usage":
+      return claudeStyleUsage(ctx);
+    case "claude-style-profile":
+      return claudeStyleProfile(ctx.app);
     case "codex-usage":
       return codexUsage(ctx);
     case "codex-reset-credits":
@@ -362,6 +374,66 @@ async function codexUsage(ctx: ServeContext): Promise<Response> {
   return json({
     plan_type: "pro",
     rate_limit: { allowed: !full, limit_reached: full, primary_window: windows[0] ?? null, secondary_window: windows[1] ?? null },
+  });
+}
+
+/**
+ * Claude's usage shape for a kimi or zai app, from the member the pool would route to. The two Claude slots are filled from
+ * the member's windows by length (codexWindowSeconds):
+ * - five_hour: the shortest window of at most 6 h (kimi "session" or "~Nh", zai "session" = 5 h).
+ * - seven_day: the next window of at least 1 day: "week" first, else "month" or the longest "~Nd" window. A month window
+ *   shows in the seven_day slot because Claude has no monthly slot.
+ * A missing window is null. No reading at all: 502, so the client shows "unavailable", never an invented 0%.
+ */
+export function claudeStyleWindows(best: PoolUsage | undefined): { five_hour: { utilization: number; resets_at: string | null } | null; seven_day: { utilization: number; resets_at: string | null } | null } | undefined {
+  type W = NonNullable<PoolUsage["windows"]>[number];
+  const known = (best?.windows ?? [])
+    .filter((w) => !w.model && Number.isFinite(w.utilization))
+    .map((w) => ({ w, seconds: codexWindowSeconds(w.label) }))
+    .filter((x): x is { w: W; seconds: number } => x.seconds !== undefined);
+  if (known.length === 0) return undefined;
+  const shape = (w: W | undefined) => (w ? { utilization: w.utilization, resets_at: w.resetsAt ?? null } : null);
+  const short = known.filter((x) => x.seconds <= 6 * 3_600).sort((a, b) => a.seconds - b.seconds)[0];
+  const long = known.filter((x) => x.seconds >= 86_400);
+  const week = long.find((x) => /^(?:week|seven.*|7d)$/.test(x.w.label.toLowerCase().trim()) || x.seconds === 7 * 86_400);
+  const longest = [...long].sort((a, b) => b.seconds - a.seconds)[0];
+  return { five_hour: shape(short?.w), seven_day: shape((week ?? longest)?.w) };
+}
+
+async function claudeStyleUsage(ctx: ServeContext): Promise<Response> {
+  const mapped = claudeStyleWindows(await leastUsed(ctx));
+  if (!mapped) return providerError(ctx.style, 502, "usage unavailable");
+  return json({ ...mapped, seven_day_opus: null, seven_day_sonnet: null, extra_usage: null });
+}
+
+/** A stable uuid-shaped id from a string (not a real identifier of anyone). */
+function stableUuid(seed: string): string {
+  const h = new Bun.CryptoHasher("sha256").update(`ais-gateway:${seed}`).digest("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/** A made-up Claude profile for a kimi or zai app: stable ids from the app name, no personal data and no member login. */
+function claudeStyleProfile(app: GatewayApp): Response {
+  const label = app.provider === "zai" ? "Z.ai" : "Kimi";
+  return json({
+    account: {
+      uuid: stableUuid(`account:${app.name}`),
+      full_name: `${label} (AIS gateway)`,
+      display_name: `${label} (AIS gateway)`,
+      email: `${app.name}@gateway.invalid`,
+      has_claude_max: true,
+      has_claude_pro: false,
+      created_at: "2025-01-01T00:00:00Z",
+    },
+    organization: {
+      uuid: stableUuid(`organization:${app.name}`),
+      name: `${label} (AIS gateway)`,
+      organization_type: "claude_max",
+      billing_type: "stripe_subscription",
+      rate_limit_tier: "default_claude_max_5x",
+      has_extra_usage_enabled: false,
+      subscription_status: "active",
+    },
   });
 }
 

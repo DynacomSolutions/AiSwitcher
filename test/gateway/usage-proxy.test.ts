@@ -11,17 +11,18 @@ const OTHER_BEARER = ["Bearer", "not-an-app-token"].join(" ");
 
 let dir: string;
 let tlsDir: string;
+let narrowTlsDir: string;
 const ca = { certPem: "" };
 
 /** A CA and an api.anthropic.com leaf, as the cluster's cert-manager secret would hold them (tls.crt, tls.key, ca.crt). */
-function makeTls(out: string): void {
+function makeTls(out: string, sans = "DNS:api.anthropic.com,DNS:opencode.ai,DNS:cli-chat-proxy.grok.com"): void {
   const run = (...args: string[]): void => {
     const r = Bun.spawnSync(["openssl", ...args], { cwd: out, stderr: "pipe" });
     if (r.exitCode !== 0) throw new Error(`openssl ${args[0]}: ${r.stderr.toString()}`);
   };
   run("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca.key", "-out", "ca.crt", "-days", "2", "-subj", "/CN=test ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign");
   run("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "tls.key", "-out", "leaf.csr", "-subj", "/CN=api.anthropic.com");
-  Bun.spawnSync(["sh", "-c", "printf 'subjectAltName=DNS:api.anthropic.com\\n' > ext"], { cwd: out });
+  Bun.spawnSync(["sh", "-c", `printf 'subjectAltName=${sans}\\n' > ext`], { cwd: out });
   run("x509", "-req", "-in", "leaf.csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-CAcreateserial", "-days", "2", "-extfile", "ext", "-out", "tls.crt");
 }
 
@@ -30,6 +31,9 @@ beforeAll(async () => {
   tlsDir = join(dir, "tls");
   await mkdir(tlsDir);
   makeTls(tlsDir);
+  narrowTlsDir = join(dir, "tls-narrow");
+  await mkdir(narrowTlsDir);
+  makeTls(narrowTlsDir, "DNS:api.anthropic.com");
   ca.certPem = await readFile(join(tlsDir, "ca.crt"), "utf8");
 });
 
@@ -59,7 +63,7 @@ async function proxy(calls: Call[], extra: Partial<Parameters<typeof startUsageP
     port: 0,
     host: "127.0.0.1",
     tlsDir,
-    appForToken: async (t) => (t === APP_TOKEN ? "t3-claude-x" : undefined),
+    appForToken: async (t, providers) => (t === APP_TOKEN ? { name: `t3-${providers[0]}-x`, provider: providers[0]!, style: "anthropic" } : undefined),
     serve: async (app, path, req) => {
       calls.push({ url: `gateway:${app}${path}${new URL(req.url).search}`, method: req.method, headers: req.headers, body: "" });
       return Response.json({ seven_day: { utilization: 62 } });
@@ -91,15 +95,16 @@ function connect(port: number, target: string): Promise<{ socket: net.Socket; st
 }
 
 /** One HTTP/1.1 request over TLS through the tunnel, trusting only the AIS CA. */
-async function viaProxy(port: number, req: { method?: string; path: string; headers?: Record<string, string>; body?: string }): Promise<{ status: number; body: string }> {
-  const { socket } = await connect(port, "api.anthropic.com:443");
-  const secure = tls.connect({ socket, servername: "api.anthropic.com", ca: ca.certPem });
+async function viaProxy(port: number, req: { ca?: string; host?: string; method?: string; path: string; headers?: Record<string, string>; body?: string }): Promise<{ status: number; body: string }> {
+  const host = req.host ?? "api.anthropic.com";
+  const { socket } = await connect(port, `${host}:443`);
+  const secure = tls.connect({ socket, servername: host, ca: req.ca ?? ca.certPem });
   await new Promise<void>((resolve, reject) => {
     secure.once("secureConnect", resolve);
     secure.once("error", reject);
   });
   const body = req.body ?? "";
-  const headers = { host: "api.anthropic.com", connection: "close", "content-length": String(Buffer.byteLength(body)), ...req.headers };
+  const headers = { host, connection: "close", "content-length": String(Buffer.byteLength(body)), ...req.headers };
   secure.write(`${req.method ?? "GET"} ${req.path} HTTP/1.1\r\n${Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n${body}`);
   const raw = await new Promise<string>((resolve) => {
     let out = "";
@@ -244,6 +249,148 @@ describe("usage proxy", () => {
     expect(first).toContain("NO_PROXY=127.0.0.1,localhost,::1");
     // The proxy closes its side even when the client keeps the connection open.
     await new Promise<void>((r) => socket.once("close", () => r()));
+  });
+});
+
+describe("usage proxy: opencode and grok hosts", () => {
+  test("serves GET /zen/go/v1/usage on opencode.ai for an opencode app token", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls);
+    const res = await viaProxy(p.port, { host: "opencode.ai", path: "/zen/go/v1/usage", headers: { authorization: `Bearer ${APP_TOKEN}` } });
+    expect(res.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("gateway:t3-opencode-x/v1/usage");
+  });
+
+  test("serves GET /v1/billing with its query on cli-chat-proxy.grok.com for a grok app token", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls);
+    const res = await viaProxy(p.port, { host: "cli-chat-proxy.grok.com", path: "/v1/billing?format=credits", headers: { authorization: `Bearer ${APP_TOKEN}` } });
+    expect(res.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("gateway:t3-grok-x/v1/billing?format=credits");
+  });
+
+  test("a gateway token on any other opencode.ai or grok path or method is 403 and never sent on", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls);
+    for (const [host, method, path] of [
+      ["opencode.ai", "GET", "/zen/go/v1/chat/completions"],
+      ["opencode.ai", "POST", "/zen/go/v1/usage"],
+      ["cli-chat-proxy.grok.com", "POST", "/v1/billing"],
+      ["cli-chat-proxy.grok.com", "GET", "/v1/responses"],
+    ] as const) {
+      const res = await viaProxy(p.port, { host, method, path, headers: { authorization: `Bearer ${APP_TOKEN}` } });
+      expect(res.status).toBe(403);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  for (const provider of ["kimi", "zai"] as const) {
+    test(`a ${provider} app token on api.anthropic.com: usage and profile are served, every other request is 404 and never sent on`, async () => {
+      const calls: Call[] = [];
+      const p = await proxy(calls, { appForToken: async (t) => (t === APP_TOKEN ? { name: `t3-${provider}`, provider, style: "anthropic" as const } : undefined) });
+      const auth = { authorization: `Bearer ${APP_TOKEN}` };
+      for (const path of ["/api/oauth/usage", "/api/oauth/profile"]) {
+        const res = await viaProxy(p.port, { path, headers: auth });
+        expect(res.status).toBe(200);
+      }
+      expect(calls.map((c) => c.url)).toEqual([`gateway:t3-${provider}/api/oauth/usage`, `gateway:t3-${provider}/api/oauth/profile`]);
+      calls.length = 0;
+      for (const [method, path] of [["POST", "/v1/messages"], ["POST", "/api/event_logging/batch"], ["GET", "/api/oauth/account"], ["POST", "/api/oauth/usage"], ["GET", "/api/oauth/usage/x"], ["GET", "/v1/models"]] as const) {
+        const res = await viaProxy(p.port, { method, path, headers: auth, body: method === "POST" ? "{}" : undefined });
+        expect(res.status).toBe(404);
+        expect(JSON.parse(res.body)).toMatchObject({ type: "error", error: { type: "not_found_error" } });
+      }
+      expect(calls).toHaveLength(0);
+    });
+  }
+
+  for (const provider of ["kimi", "zai"] as const) {
+    test(`an openai-style ${provider} app on api.anthropic.com gets 404 for usage and profile, never sent on`, async () => {
+      const calls: Call[] = [];
+      const p = await proxy(calls, { appForToken: async (t) => (t === APP_TOKEN ? { name: `t3-${provider}`, provider, style: "openai" as const } : undefined) });
+      for (const path of ["/api/oauth/usage", "/api/oauth/profile"]) {
+        const res = await viaProxy(p.port, { path, headers: { authorization: `Bearer ${APP_TOKEN}` } });
+        expect(res.status).toBe(404);
+      }
+      expect(calls).toHaveLength(0);
+    });
+  }
+
+  test("a gateway token in a place the proxy does not read is 401 and never sent on", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls);
+    const cases: Array<{ path: string; headers: Record<string, string> }> = [
+      { path: `/v1/messages?key=${APP_TOKEN}`, headers: {} },
+      { path: "/v1/messages", headers: { authorization: `Bearer ${APP_TOKEN} extra` } },
+      { path: "/v1/messages", headers: { authorization: `Bearer ${APP_TOKEN}, Bearer ${APP_TOKEN}` } },
+      { path: "/v1/messages", headers: { "x-custom": `see ${APP_TOKEN}` } },
+    ];
+    for (const c of cases) {
+      const res = await viaProxy(p.port, { method: "GET", ...c });
+      expect(res.status).toBe(401);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a claude app token on api.anthropic.com is still served for every method and path", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls, { appForToken: async (t) => (t === APP_TOKEN ? { name: "t3-claude-x", provider: "claude", style: "anthropic" } : undefined) });
+    await viaProxy(p.port, { method: "POST", path: "/api/event_logging/batch", headers: { authorization: `Bearer ${APP_TOKEN}` }, body: "{}" });
+    expect(calls.map((c) => c.url)).toEqual(["gateway:t3-claude-x/api/event_logging/batch"]);
+  });
+
+  test("a token that is not valid for the host's provider is 401 and never sent on", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls, { appForToken: async (t, providers) => (t === APP_TOKEN && providers.includes("claude") ? { name: "t3-claude-x", provider: "claude", style: "anthropic" } : undefined) });
+    for (const [host, path] of [["opencode.ai", "/zen/go/v1/usage"], ["cli-chat-proxy.grok.com", "/v1/billing"]] as const) {
+      const res = await viaProxy(p.port, { host, path, headers: { authorization: `Bearer ${APP_TOKEN}` } });
+      expect(res.status).toBe(401);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a request without a gateway token goes to that host's origin unchanged", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls, { passthroughOrigin: (host) => `https://${host}.origin.invalid` });
+    const res = await viaProxy(p.port, { host: "opencode.ai", method: "POST", path: "/zen/go/v1/chat/completions", headers: { authorization: OTHER_BEARER }, body: '{"a":1}' });
+    expect(res.status).toBe(401);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("https://opencode.ai.origin.invalid/zen/go/v1/chat/completions");
+    expect(calls[0]!.headers.get("authorization")).toBe(OTHER_BEARER);
+    expect(calls[0]!.body).toBe('{"a":1}');
+    const g = await viaProxy(p.port, { host: "cli-chat-proxy.grok.com", path: "/v1/billing" });
+    expect(g.status).toBe(401);
+    expect(calls[1]!.url).toBe("https://cli-chat-proxy.grok.com.origin.invalid/v1/billing");
+  });
+
+  test("a Host that is not intercepted is 421 and not forwarded", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls);
+    const { socket } = await connect(p.port, "api.anthropic.com:443");
+    const secure = tls.connect({ socket, servername: "api.anthropic.com", ca: ca.certPem });
+    await new Promise<void>((resolve, reject) => (secure.once("secureConnect", resolve), secure.once("error", reject)));
+    secure.write("GET / HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n");
+    const raw = await new Promise<string>((resolve) => {
+      let out = "";
+      secure.on("data", (d: Buffer) => (out += d.toString()));
+      secure.on("close", () => resolve(out));
+    });
+    expect(raw.startsWith("HTTP/1.1 421")).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a certificate without the opencode.ai name leaves CONNECT opencode.ai:443 a plain tunnel", async () => {
+    const targets: string[] = [];
+    const p = await proxy([], { tlsDir: narrowTlsDir, connectTarget: (host, port) => (targets.push(`${host}:${port}`), { host: "127.0.0.1", port: 1 }) });
+    const { status } = await connect(p.port, "opencode.ai:443");
+    expect(status).toBe("HTTP/1.1 502 Bad Gateway");
+    expect(targets).toEqual(["opencode.ai:443"]);
+    // api.anthropic.com is still intercepted with that certificate.
+    const res = await viaProxy(p.port, { ca: await readFile(join(narrowTlsDir, "ca.crt"), "utf8"), path: "/api/oauth/usage", headers: { authorization: `Bearer ${APP_TOKEN}` } });
+    expect(res.status).toBe(200);
+    expect(targets).toEqual(["opencode.ai:443"]);
   });
 });
 

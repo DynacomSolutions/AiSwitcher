@@ -352,9 +352,9 @@ describe("served from pool state", () => {
     expect(await (await call("cl", "/api/oauth/usage", { method: "GET" })).json()).toMatchObject({ five_hour: null, seven_day: null });
   });
 
-  test("these claude routes are not special for another provider", async () => {
-    await addApp("k", "kimi", "openai");
-    await call("k", "/api/oauth/usage", { method: "GET" });
+  test("these claude routes are not special for a provider without them", async () => {
+    await addApp("o", "opencode", "openai");
+    await call("o", "/api/oauth/usage", { method: "GET" });
     expect(seen).toHaveLength(1); // plain pass-through
   });
 
@@ -446,6 +446,62 @@ describe("served from pool state", () => {
     expect((await call("c", "/backend-api/wham/usage", { method: "GET" })).status).toBe(502);
     expect(seen).toHaveLength(0);
   });
+
+  const reading = (windows: NonNullable<PoolUsage["windows"]>): PoolUsage => ({ status: "live", maxUtilization: Math.max(...windows.map((w) => w.utilization)), capturedAt: "", windows });
+  const claudeShape = async (app: string): Promise<Record<string, unknown>> => (await call(app, "/api/oauth/usage", { method: "GET" })).json() as Promise<Record<string, unknown>>;
+  const mappings: Array<[string, GatewayProvider, NonNullable<PoolUsage["windows"]>, unknown, unknown]> = [
+    ["kimi session + week", "kimi", [{ label: "session", utilization: 12, resetsAt: "2026-11-02T11:00:00.000Z" }, { label: "week", utilization: 30, resetsAt: "2026-11-07T10:00:00.000Z" }], { utilization: 12, resets_at: "2026-11-02T11:00:00.000Z" }, { utilization: 30, resets_at: "2026-11-07T10:00:00.000Z" }],
+    ["kimi session + month (month fills seven_day)", "kimi", [{ label: "month", utilization: 55, resetsAt: "2026-11-20T00:00:00.000Z" }, { label: "session", utilization: 5 }], { utilization: 5, resets_at: null }, { utilization: 55, resets_at: "2026-11-20T00:00:00.000Z" }],
+    ["zai session + week", "zai", [{ label: "session", utilization: 7, resetsAt: "2026-11-02T14:00:00.000Z" }, { label: "week", utilization: 21 }, { label: "web tools", utilization: 99 }], { utilization: 7, resets_at: "2026-11-02T14:00:00.000Z" }, { utilization: 21, resets_at: null }],
+    ["kimi ~Nh and ~Nd labels", "kimi", [{ label: "~3d", utilization: 40 }, { label: "~2h", utilization: 10 }], { utilization: 10, resets_at: null }, { utilization: 40, resets_at: null }],
+    ["kimi week only", "kimi", [{ label: "week", utilization: 40 }], null, { utilization: 40, resets_at: null }],
+  ];
+  for (const [name, provider, windows, five, seven] of mappings) {
+    test(`${provider} Claude-style usage: ${name}, with no upstream call`, async () => {
+      await addApp("k", provider, "anthropic");
+      usage.a = reading(windows);
+      const res = await call("k", "/api/oauth/usage", { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ five_hour: five, seven_day: seven, seven_day_opus: null, seven_day_sonnet: null, extra_usage: null });
+      expect(seen).toHaveLength(0);
+    });
+  }
+
+  test("a ~17d window is not taken for the week window", async () => {
+    await addApp("k", "kimi", "anthropic");
+    usage.a = reading([{ label: "~17d", utilization: 80 }, { label: "week", utilization: 20 }]);
+    expect(await claudeShape("k")).toMatchObject({ seven_day: { utilization: 20 } });
+  });
+
+  test("an openai-style kimi or zai app is denied Claude-style usage and profile, nothing goes upstream", async () => {
+    await addApp("ko", "kimi", "openai");
+    await addApp("zo", "zai", "openai");
+    for (const app of ["ko", "zo"]) for (const path of ["/api/oauth/usage", "/api/oauth/profile"]) expect((await call(app, path, { method: "GET" })).status).toBe(404);
+    expect(seen).toHaveLength(0);
+  });
+
+  test("kimi Claude-style usage with no readings is 502, never an invented 0%", async () => {
+    await addApp("k", "kimi", "anthropic");
+    expect((await call("k", "/api/oauth/usage", { method: "GET" })).status).toBe(502);
+    usage.a = reading([{ label: "mystery", utilization: 5 }]);
+    expect((await call("k", "/api/oauth/usage", { method: "GET" })).status).toBe(502);
+    expect(seen).toHaveLength(0);
+    expect(await claudeShape("k")).toMatchObject({ type: "error" });
+  });
+
+  for (const provider of ["kimi", "zai"] as const) {
+    test(`${provider} Claude-style profile is synthetic, stable and carries no member data`, async () => {
+      await addApp(`t3-${provider}`, provider, "anthropic");
+      const first = (await (await call(`t3-${provider}`, "/api/oauth/profile", { method: "GET" })).json()) as { account: Record<string, unknown>; organization: Record<string, unknown> };
+      const again = (await (await call(`t3-${provider}`, "/api/oauth/profile", { method: "GET" })).json()) as typeof first;
+      expect(again).toEqual(first);
+      expect(first.account).toMatchObject({ email: `t3-${provider}@gateway.invalid`, display_name: expect.stringContaining("(AIS gateway)") });
+      expect(first.account.uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(first.organization).toMatchObject({ organization_type: "claude_max", has_extra_usage_enabled: false, rate_limit_tier: expect.any(String) });
+      expect(first.organization.uuid).not.toBe(first.account.uuid);
+      expect(seen).toHaveLength(0);
+    });
+  }
 
   test("the bare /backend-api prefix names nothing: 404, never reaches the provider", async () => {
     await addApp("c", "codex", "openai");
@@ -1007,6 +1063,8 @@ describe("account API of the other providers", () => {
     ["kimi", "openai", "/v1/usages", "api.kimi.com", "/coding/v1/usages"],
     ["zai", "anthropic", "/api/monitor/usage/quota/limit", "api.z.ai", "/api/monitor/usage/quota/limit"],
     ["opencode", "openai", "/usage", "opencode.ai", "/zen/go/v1/usage"],
+    ["grok", "openai", "/v1/billing", "cli-chat-proxy.grok.com", "/v1/billing"],
+    ["grok", "openai", "/billing", "cli-chat-proxy.grok.com", "/v1/billing"],
   ];
   for (const [provider, style, path, host, want] of others) {
     test(`${provider} ${path} is forwarded to ${host}${want} with the member's login, never the app token`, async () => {
