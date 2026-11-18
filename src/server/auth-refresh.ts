@@ -17,6 +17,7 @@ import type { Identity } from "../identities/types.ts";
 import { consoleWebDir } from "./state.ts";
 import { createOwnershipCheck } from "../gateway/home-store.ts";
 import { GATEWAY_REFRESH_TOOLS } from "../identities/gateway-managed.ts";
+import { OPENCODE_CONSOLE_EXPIRY_WINDOW_HOURS, opencodeConsoleFingerprint, refreshOpencodeConsoleGrant } from "../identities/opencode-console-refresh.ts";
 
 async function listIdentitiesFromRegistry(tool: string): Promise<Identity[]> {
   const cfg = TOOL_CONFIGS[tool as keyof typeof TOOL_CONFIGS];
@@ -28,7 +29,8 @@ async function listIdentitiesFromRegistry(tool: string): Promise<Identity[]> {
 /** Daemon-side credential renewal. Two kinds of refresher live here:
  * - ali: the Alibaba console-cookie harvest (browser session — the same
  *   code the host systemd timers run, hardened 2026-09-10).
- * - the OAuth refreshers (codex/claude/grok/kimi): proactive access-token
+ * - the OAuth refreshers (codex/claude/grok/kimi, and opencode's Console
+ *   login in opencode-console-refresh.ts): proactive access-token
  *   renewal at each provider's token endpoint, written through to every
  *   store of the account per the one-credential law
  *   (src/identities/oauth-refresh.ts). These run on a cadence — inside the
@@ -101,6 +103,16 @@ const REFRESHERS: Record<string, Refresher> = {
   claude: oauthRefresherFor("claude"),
   grok: oauthRefresherFor("grok"),
   kimi: oauthRefresherFor("kimi"),
+  // The OpenCode Console login (Go plan): OpenCode renews it only when used, so a host that does not run OpenCode would let
+  // the 30-day grant lapse and the gateway fail. Renewed here and written back to opencode.db; the store import carries it on.
+  opencode: async (identity, context) => {
+    const result = await refreshOpencodeConsoleGrant(identity.name, identity.configDir, {
+      force: context.force,
+      expiryWindowHours: Math.max(context.expiryWindowHours, OPENCODE_CONSOLE_EXPIRY_WINDOW_HOURS),
+      ...(context.revokedFingerprint ? { revokedFingerprint: context.revokedFingerprint } : {}),
+    });
+    return result.outcome === "refreshed" ? result.detail : { skipped: true, detail: result.detail };
+  },
 };
 
 const OAUTH_TOOLS: ReadonlySet<string> = new Set(["codex", "claude", "grok", "kimi"]);
@@ -108,6 +120,7 @@ const OAUTH_TOOLS: ReadonlySet<string> = new Set(["codex", "claude", "grok", "ki
 /** Fingerprint of the grant currently on disk for an identity (never a
  * token), or undefined when the tool has no OAuth grant or none is stored. */
 async function currentGrantFingerprint(tool: string, identity: Identity): Promise<string | undefined> {
+  if (tool === "opencode") return opencodeConsoleFingerprint(identity.configDir);
   if (!OAUTH_TOOLS.has(tool)) return undefined;
   try {
     // A store that exists but cannot be read may hide the newer grant, so a

@@ -1,6 +1,7 @@
 import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
-import { ALI_CONFIG } from "../../identities/tool-configs.ts";
+import { ALI_CONFIG, OPENCODE_CONFIG } from "../../identities/tool-configs.ts";
+import { refreshOpencodeConsoleGrant } from "../../identities/opencode-console-refresh.ts";
 import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { expandPath } from "../../identities/match.ts";
@@ -34,7 +35,7 @@ function assertNotRetired(tool: string, identity: Identity): void {
 
 async function resolveAliIdentity(positionals: string[], flags: ParsedArgs["flags"]) {
   if (stringFlag(flags, "tool") !== undefined && stringFlag(flags, "tool") !== "ali") {
-    throw new CliUsageError('auth login/enable/ports support only --tool=ali (auth refresh also accepts codex|claude|grok|kimi)');
+    throw new CliUsageError('auth login/enable/ports support only --tool=ali (auth refresh also accepts codex|claude|grok|kimi|opencode)');
   }
   const file = await loadIdentitiesFile(ALI_CONFIG.identitiesJsonPath);
   const flaggedKey = stringFlag(flags, "identity");
@@ -110,9 +111,13 @@ async function runAuthRefresh(rest: string[], flags: ParsedArgs["flags"]): Promi
     }
     return;
   }
+  if (tool === "opencode") {
+    await runOpencodeConsoleRefresh(rest, flags);
+    return;
+  }
   if (!(OAUTH_REFRESH_TOOLS as readonly string[]).includes(tool)) {
     throw new CliUsageError(
-      `auth refresh supports --tool=ali|${OAUTH_REFRESH_TOOLS.join("|")} (got "${tool}")`,
+      `auth refresh supports --tool=ali|${OAUTH_REFRESH_TOOLS.join("|")}|opencode (got "${tool}")`,
     );
   }
   const cfg = TOOL_CONFIGS[tool as keyof typeof TOOL_CONFIGS];
@@ -138,6 +143,24 @@ async function runAuthRefresh(rest: string[], flags: ParsedArgs["flags"]): Promi
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`${tool} refresh failed for ${identity.name}: ${message}`);
+    process.exitCode = 1;
+  }
+}
+
+/** `ais auth refresh <identity> --tool=opencode`: renews the OpenCode Console login now (opencode-console-refresh.ts). */
+async function runOpencodeConsoleRefresh(rest: string[], flags: ParsedArgs["flags"]): Promise<void> {
+  const file = await loadIdentitiesFile(OPENCODE_CONFIG.identitiesJsonPath);
+  const key = rest[0] ?? stringFlag(flags, "identity");
+  if (rest.length > 1) throw new CliUsageError("auth accepts at most one identity");
+  if (!key) throw new CliUsageError("Specify the identity (for example: ais auth refresh <identity> --tool=opencode).");
+  const identity = findIdentityByNameOrAlias(file.identities, key);
+  if (!identity) throw new CliUsageError(`No opencode identity named "${key}".`);
+  assertNotRetired("opencode", identity);
+  try {
+    const result = await refreshOpencodeConsoleGrant(identity.name, expandPath(identity.configDir), { force: true });
+    if (!boolFlag(flags, "quiet")) console.log(`opencode/${identity.name}: ${result.detail}`);
+  } catch (err) {
+    console.error(`opencode refresh failed for ${identity.name}: ${err instanceof Error ? err.message : String(err)}`);
     process.exitCode = 1;
   }
 }

@@ -74,7 +74,7 @@ export const HELP: Record<string, HelpNode> = {
     subs: {
       login: sub("ais auth login <identity> --tool=ali", "Interactive SSH auth browser"),
       enable: sub("ais auth enable <identity> --tool=ali", "Renew the ali cookie every 10 minutes"),
-      refresh: sub("ais auth refresh <identity> --tool=ali|codex|claude|grok|kimi", "Renew credentials without re-login"),
+      refresh: sub("ais auth refresh <identity> --tool=ali|codex|claude|grok|kimi|opencode", "Renew credentials without re-login"),
       import: sub("ais auth import <pi-id> --tool=pi --claude=<id> [--codex= --grok= --kimi= --zai= --ali= --opencode-go]", "Merge provider credentials into a Pi identity"),
     },
   },
