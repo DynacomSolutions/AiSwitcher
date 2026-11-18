@@ -10,11 +10,11 @@ import { t3Paths } from "./t3-anthropic-proxy.ts";
 import { syncT3UsageCredentials, type UsageResult } from "./t3-usage-credentials.ts";
 
 /**
- * Creates or updates one T3 Code provider instance (claude, grok or opencode) whose folder holds only the gateway app token,
+ * Creates or updates one T3 Code provider instance (claude, grok, opencode or pi) whose folder holds only the gateway app token,
  * never a provider key. T3 watches settings.json and applies the change by itself.
  */
 
-export type InstanceDriver = "claude" | "grok" | "opencode";
+export type InstanceDriver = "claude" | "grok" | "opencode" | "pi";
 
 export interface T3InstanceOptions {
   id: string;
@@ -24,6 +24,8 @@ export interface T3InstanceOptions {
   gatewayUrl: string;
   name?: string;
   models?: string[];
+  /** Upstream provider slug of the app (pi only). Falls back to the app name. */
+  provider?: string;
   like?: string;
   binary?: string;
   /** CONNECT proxy URL (claude only). */
@@ -258,6 +260,34 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     plans.push({ path: join(folder, "settings.json"), content: `${JSON.stringify(own, null, 2)}\n`, mode: 0o600, label: "settings.json (folder)" });
     plans.push({ path: join(folder, ".credentials.json"), content: gatewayEntryText(token, GATEWAY_ENTRY_SCOPES_WITH_USAGE_PROXY), mode: 0o600, label: ".credentials.json" });
     plans.push({ path: join(folder, ".claude.json"), content: `${JSON.stringify({ hasCompletedOnboarding: true })}\n`, mode: 0o600, label: ".claude.json", onlyIfMissing: true });
+  } else if (opts.driver === "pi") {
+    if (models.length === 0) throw new Error("--models=a,b is required for the pi driver");
+    const binaryPath = opts.binary ?? join(home, ".local", "bin", "pi");
+    const config: Json = { ...obj(existing?.config), binaryPath, customModels: models };
+    entry = {
+      ...existing,
+      driver: "pi",
+      displayName,
+      enabled: true,
+      environment: [{ name: "PI_CODING_AGENT_DIR", value: folder, sensitive: false }],
+      config,
+    };
+    const provider = opts.provider ?? opts.app;
+    const own = (await readJsonObject(join(folder, "models.json"))) ?? {};
+    const providers = { ...obj(own.providers) };
+    // The key is read from the token file at run time ("!" runs a shell command), so models.json holds no token.
+    providers[provider] = {
+      baseUrl: opts.gatewayUrl,
+      api: "anthropic-messages",
+      apiKey: `!cat ${shQuote(join(folder, "token"))}`,
+      models: models.map((id) => ({ id, name: id, contextWindow: 262144, maxTokens: 32768, input: ["text"], reasoning: false, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })),
+    };
+    own.providers = providers;
+    plans.push({ path: join(folder, "models.json"), content: `${JSON.stringify(own, null, 2)}\n`, mode: 0o600, label: "models.json" });
+    const piSettings = (await readJsonObject(join(folder, "settings.json"))) ?? {};
+    piSettings.defaultProvider = provider;
+    piSettings.defaultModel = models[0]!;
+    plans.push({ path: join(folder, "settings.json"), content: `${JSON.stringify(piSettings, null, 2)}\n`, mode: 0o600, label: "settings.json (folder)" });
   } else if (opts.driver === "opencode") {
     let likeBinary: string | undefined;
     if (opts.like) {
