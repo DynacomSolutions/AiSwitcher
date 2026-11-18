@@ -79,14 +79,24 @@ function memberRecovery(usage: PoolUsage | undefined, reservePercent: number): {
   return { resetAtSec: last.resetsAtSec as number, claim: last.slot, windows };
 }
 
-/** The earliest reset across the members, from their usage readings. Resets already in the past are ignored (stale figures). */
-export function summariseLimit(usages: Array<PoolUsage | undefined>, reservePercent: number, now: Date): LimitInfo {
+/** A reset a member's own 429 reported during the request: it counts even when the member's usage reading is stale or missing. */
+export interface LimitCandidate {
+  resetAtSec: number;
+  claim: LimitSlot;
+}
+
+/** The earliest reset across the members, from their usage readings and their own 429 answers. Resets already in the past are ignored (stale figures). */
+export function summariseLimit(usages: Array<PoolUsage | undefined>, reservePercent: number, now: Date, extra: LimitCandidate[] = []): LimitInfo {
   const nowSec = Math.floor(now.getTime() / 1000);
   let best: { resetAtSec: number; claim: LimitSlot; windows: LimitWindow[] } | undefined;
   for (const u of usages) {
     const r = memberRecovery(u, reservePercent);
     if (!r || r.resetAtSec <= nowSec) continue;
     if (!best || r.resetAtSec < best.resetAtSec) best = r;
+  }
+  for (const c of extra) {
+    if (c.resetAtSec <= nowSec) continue;
+    if (!best || c.resetAtSec < best.resetAtSec) best = { resetAtSec: c.resetAtSec, claim: c.claim, windows: [] };
   }
   if (best) return { ...best, guessed: false };
   return { resetAtSec: nowSec + FALLBACK_RESET_SECONDS, guessed: true, claim: "short", windows: [] };
@@ -157,8 +167,8 @@ export function codexLimitResponse(info: LimitInfo, now: Date): Response {
 }
 
 /** The native limit answer for `provider`, or undefined when the provider has no native shape to copy (callers keep their generic error). */
-export function nativeLimitResponse(provider: GatewayProvider, usages: Array<PoolUsage | undefined>, reservePercent: number, now: Date): Response | undefined {
+export function nativeLimitResponse(provider: GatewayProvider, usages: Array<PoolUsage | undefined>, reservePercent: number, now: Date, extra: LimitCandidate[] = []): Response | undefined {
   if (provider !== "claude" && provider !== "codex") return undefined;
-  const info = summariseLimit(usages, reservePercent, now);
+  const info = summariseLimit(usages, reservePercent, now, extra);
   return provider === "claude" ? anthropicLimitResponse(info, now) : codexLimitResponse(info, now);
 }

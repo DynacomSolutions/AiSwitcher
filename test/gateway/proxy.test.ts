@@ -900,6 +900,85 @@ describe("failover and refresh", () => {
     expect(clock.ms).toBe(start);
   });
 
+  const rejected = (reset: number, claim = "seven_day"): Response =>
+    new Response('{"type":"error","error":{"type":"rate_limit_error","message":"weekly"}}', { status: 429, headers: { "content-type": "application/json", "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(reset), "anthropic-ratelimit-unified-representative-claim": claim } });
+  const ok = (): Response => new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+  const staleFull = (): PoolUsage => ({ status: "live", stale: true, maxUtilization: 100, capturedAt: NOW.toISOString() } as PoolUsage);
+  const poolOf = async (names: string[]) => {
+    deps.poolMembers = async () => names;
+    const clock = { ms: NOW.getTime() };
+    deps.now = () => new Date(clock.ms);
+    deps.sleep = async (ms) => { clock.ms += ms; };
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" }, reservePercent: 100 }));
+    const call = async () => { const r = await gw.request("http://gw.test/pool/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status, headers: r.headers }); };
+    return { clock, call, who: () => seen.map((x) => x.headers.get("authorization")) };
+  };
+
+  // Incident 19 Nov 2026: a burst 429 from the only member with headroom, then full members answered weekly 429s,
+  // and the last full member's answer reached the client although the first member freed within seconds.
+  test("a burst-held member with headroom is waited for after full members answered weekly 429s", async () => {
+    const { clock, call } = await poolOf(["h", "full1", "full2"]);
+    usage.h = live(29);
+    usage.full1 = staleFull();
+    usage.full2 = undefined;
+    const start = clock.ms;
+    const reset = Math.floor((clock.ms + 3 * 86_400_000) / 1000);
+    let headCalls = 0;
+    handler = (_req, s) => {
+      const a = s.headers.get("authorization");
+      if (a === "Bearer tok-h") return headCalls++ === 0 ? new Response("{}", { status: 429, headers: { "retry-after": "5" } }) : ok();
+      return rejected(reset);
+    };
+    const res = await call();
+    expect(res.status).toBe(200);
+    expect(clock.ms - start).toBeGreaterThanOrEqual(5_000);
+    expect(clock.ms - start).toBeLessThan(10_000);
+  });
+
+  test("a burst member that keeps refusing gives the short retry 429, never a full member's weekly answer", async () => {
+    const { call } = await poolOf(["h", "full1"]);
+    usage.h = live(29);
+    usage.full1 = staleFull();
+    const reset = Math.floor((NOW.getTime() + 3 * 86_400_000) / 1000);
+    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-h" ? new Response("{}", { status: 429, headers: { "retry-after": "60" } }) : rejected(reset));
+    const res = await call();
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(60);
+    expect(res.headers.get("anthropic-ratelimit-unified-status")).not.toBe("rejected");
+    expect(await res.text()).not.toContain("weekly");
+  });
+
+  test("all members exhausted: the native answer carries the earliest reset, from a never-tried member's live reading", async () => {
+    const { clock, call } = await poolOf(["a", "b"]);
+    const start = clock.ms;
+    const early = Math.floor((clock.ms + 3_600_000) / 1000);
+    const late = Math.floor((clock.ms + 5 * 86_400_000) / 1000);
+    usage.a = staleFull();
+    usage.b = { status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "session", utilization: 100, resetsAt: new Date(early * 1000).toISOString() }] };
+    handler = () => rejected(late);
+    const res = await call();
+    expect(res.status).toBe(429);
+    expect(clock.ms).toBe(start);
+    expect(res.headers.get("anthropic-ratelimit-unified-status")).toBe("rejected");
+    expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe(String(early));
+    expect(res.headers.get("anthropic-ratelimit-unified-representative-claim")).toBe("five_hour");
+  });
+
+  test("all members exhausted: the native answer carries the earliest reset, from a tried stale member's 429", async () => {
+    const { clock, call } = await poolOf(["a", "b"]);
+    const early = Math.floor((clock.ms + 2 * 86_400_000) / 1000);
+    const late = Math.floor((clock.ms + 5 * 86_400_000) / 1000);
+    usage.a = staleFull();
+    usage.b = staleFull();
+    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? rejected(late) : rejected(early));
+    const res = await call();
+    expect(res.status).toBe(429);
+    expect(seen.length).toBe(2);
+    expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe(String(early));
+    expect(res.headers.get("anthropic-ratelimit-unified-representative-claim")).toBe("seven_day");
+  });
+
   test("single-member pool: burst 429 reaches the client once and recovers within the hold window", async () => {
     const { clock, call } = await burstSetup("single");
     usage.b = live(100);
@@ -1402,7 +1481,9 @@ describe("fix round 1", () => {
     expect(seen.length).toBe(1);
   });
 
-  test("a failover target that cannot be tried returns the original 429", async () => {
+  // Changed: a pool no longer passes the last member's 429 through. A burst 429 with the only other member unusable
+  // now ends in the gateway's own short retry answer.
+  test("a failover target that cannot be tried ends in the short retry 429", async () => {
     const t = await poolApp();
     const get = deps.creds.get.bind(deps.creds);
     deps.creds = {
@@ -1417,10 +1498,11 @@ describe("fix round 1", () => {
     handler = () => new Response('{"orig":"429"}', { status: 429, headers: { "content-type": "application/json" } });
     const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    expect(await res.text()).toBe('{"orig":"429"}');
+    expect(await res.text()).not.toContain("orig");
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(60);
     const r = await rows();
     expect(r.length).toBe(1);
-    expect(r[0]).toMatchObject({ identity: "a", httpStatus: 429 });
+    expect(r[0]).toMatchObject({ httpStatus: 429, status: "rejected" });
   });
 
   test("an over-limit body 401 refreshes the credential but is not retried", async () => {
@@ -1658,23 +1740,48 @@ describe("native limit answers", () => {
     expect(JSON.stringify(await res.json())).toContain("no pool member has headroom");
   });
 
-  test("a real upstream 429 from the last member passes through byte for byte", async () => {
+  const realBody = '{"type":"error","error":{"type":"rate_limit_error","message":"Number 3 SYNTHETIC_FIXTURE"},"request_id":"req_SYNTHETIC_FIXTURE"}';
+  const realHeaders = {
+    "content-type": "application/json",
+    "retry-after": "1234",
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-reset": "1793622600",
+    "anthropic-ratelimit-unified-representative-claim": "five_hour",
+    "anthropic-ratelimit-unified-5h-utilization": "1.0",
+  };
+
+  test("a real upstream 429 passes through byte for byte for a pinned app", async () => {
+    const t = await addApp(baseApp({}));
+    handler = () => new Response(realBody, { status: 429, headers: realHeaders });
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(seen.length).toBe(1);
+    expect(await res.text()).toBe(realBody);
+    for (const [k, v] of Object.entries(realHeaders)) expect(res.headers.get(k)).toBe(v);
+  });
+
+  // Changed: a pool used to pass the last member's 429 through. It now answers natively with the pool's earliest reset.
+  test("a pool whose members all answer a real 429 gives the native answer, not the last member's", async () => {
     const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
     usage.a = live(10);
     usage.b = live(20);
-    const realBody = '{"type":"error","error":{"type":"rate_limit_error","message":"Number 3 SYNTHETIC_FIXTURE"},"request_id":"req_SYNTHETIC_FIXTURE"}';
-    const realHeaders = {
-      "content-type": "application/json",
-      "retry-after": "1234",
-      "anthropic-ratelimit-unified-status": "rejected",
-      "anthropic-ratelimit-unified-reset": "1793622600",
-      "anthropic-ratelimit-unified-representative-claim": "five_hour",
-      "anthropic-ratelimit-unified-5h-utilization": "1.0",
-    };
     handler = () => new Response(realBody, { status: 429, headers: realHeaders });
     const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
     expect(seen.length).toBe(2); // both members tried
+    expect(await res.text()).not.toContain("SYNTHETIC_FIXTURE");
+    expect(res.headers.get("anthropic-ratelimit-unified-status")).toBe("rejected");
+    expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe("1793622600");
+  });
+
+  test("a pool of a provider with no native shape passes the last upstream 429 through byte for byte", async () => {
+    const t = await addApp(baseApp({ name: "k", provider: "kimi", target: { kind: "pool" } }));
+    usage.a = live(10);
+    usage.b = live(20);
+    handler = () => new Response(realBody, { status: 429, headers: realHeaders });
+    const res = await call("/k/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(seen.length).toBe(2);
     expect(await res.text()).toBe(realBody);
     for (const [k, v] of Object.entries(realHeaders)) expect(res.headers.get(k)).toBe(v);
   });
