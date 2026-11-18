@@ -8,8 +8,10 @@ import { bearer, BASE_STRIP_HEADERS, unsupportedStyle, type ProviderAdapter } fr
  *   Go upstream, so that style throws.
  * - credential: the `opencode-go` key. v2 opencode writes only
  *   <configDir>/data/opencode/opencode.db (credential table); auth.json can be
- *   stale (opencode-limits.ts header). The cache prefers the db and falls back
- *   to auth.json. A static key, so there is nothing to refresh.
+ *   stale (opencode-limits.ts header). The cache prefers the db, then the
+ *   key the store import derived from the db (replicas have no db), then
+ *   auth.json. The gateway never refreshes it: a Console login's OAuth access
+ *   token is renewed by OpenCode on the host, and the import carries the new one.
  */
 export const opencodeAdapter: ProviderAdapter = {
   provider: "opencode",
