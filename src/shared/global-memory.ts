@@ -6,6 +6,7 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   readlink,
   rename,
   stat,
@@ -157,24 +158,51 @@ export function isSdkHostLaunch(argv: readonly string[]): boolean {
 
 /** `<aisHome>/claude-memory-projection/CLAUDE.md` links to the memory file.
  * Claude Code loads it as an additional-directory CLAUDE.md, a channel that
- * the host's `appendSystemPrompt` does not replace (verified with a live probe). */
+ * the host's `appendSystemPrompt` does not replace (verified with a live probe).
+ * The folder becomes a working directory of the session, so it holds nothing
+ * but that link and is read-only (0o500) except while a link is made or
+ * repaired. The link is made under a temporary name beside the folder and
+ * renamed into place, so parallel launches never see a missing or half-made
+ * link. Throws on anything unexpected; the caller falls back. */
 async function ensureClaudeProjection(memoryPath: string, home: string): Promise<string> {
   const dir = aisClaudeProjectionDir(home);
   const projection = join(dir, "CLAUDE.md");
   await mkdir(dir, { recursive: true, mode: 0o700 });
-  try {
-    const stat = await lstat(projection);
-    if (stat.isSymbolicLink() && (await readlink(projection)) === memoryPath) return dir;
-    if (!stat.isSymbolicLink()) {
-      throw new Error(
-        `Cannot project AIS global memory into Claude: ${projection} already exists and is not an AIS-managed link`,
-      );
-    }
-    await unlink(projection); // stale AIS link (memory path moved)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+
+  const extra = (await readdir(dir)).filter((name) => name !== "CLAUDE.md");
+  if (extra.length > 0) {
+    throw new Error(`${dir} holds unexpected entries (${extra.join(", ")})`);
   }
-  await symlink(memoryPath, projection);
+
+  const linkIsCorrect = async (): Promise<boolean> => {
+    try {
+      const stat = await lstat(projection);
+      if (!stat.isSymbolicLink()) throw new Error(`${projection} already exists and is not an AIS-managed link`);
+      return (await readlink(projection)) === memoryPath;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
+  const modeOf = async (): Promise<number> => (await stat(dir)).mode & 0o777;
+
+  if (await linkIsCorrect()) {
+    if ((await modeOf()) !== 0o500) await chmod(dir, 0o500);
+    return dir;
+  }
+
+  const temporary = join(dirname(dir), `.claude-memory-projection.tmp-${process.pid}-${crypto.randomUUID()}`);
+  try {
+    await chmod(dir, 0o700);
+    await symlink(memoryPath, temporary);
+    await rename(temporary, projection); // atomic; replaces a stale link
+  } catch (error) {
+    // A parallel launch may have finished first and locked the folder.
+    if (!(await linkIsCorrect().catch(() => false))) throw error;
+  } finally {
+    if (await exists(temporary)) await unlink(temporary);
+  }
+  await chmod(dir, 0o500);
   return dir;
 }
 
@@ -252,12 +280,20 @@ export async function projectGlobalMemoryForLaunch(
   switch (cfg.globalMemoryProjection) {
     case "claude-append-file":
       if (isSdkHostLaunch(argv)) {
-        const dir = await ensureClaudeProjection(memoryPath, home);
-        return {
-          argv: ["--add-dir", dir, ...argv],
-          env: { CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: "1" },
-          memoryPath,
-        };
+        // A projection problem must never stop the launch: fall back to the file flag.
+        try {
+          const dir = await ensureClaudeProjection(memoryPath, home);
+          // One token, so a positional that follows is never read as a second folder.
+          return {
+            argv: [`--add-dir=${dir}`, ...argv],
+            env: { CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: "1" },
+            memoryPath,
+          };
+        } catch (error) {
+          console.error(
+            `claude: could not project AIS global memory for the SDK host (${(error as Error).message}); using --append-system-prompt-file`,
+          );
+        }
       }
       return { argv: ["--append-system-prompt-file", memoryPath, ...argv], env: {}, memoryPath };
     case "codex-developer-instructions":
