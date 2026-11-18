@@ -12,7 +12,7 @@ const TOKEN = "aisg_testtoken123";
 beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), "t3-instance-"));
   secrets = join(home, "secrets");
-  await writeFile(secrets, `AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN=${TOKEN}\nAIS_GATEWAY_APP_XAI_TOKEN=${TOKEN}\nAIS_GATEWAY_APP_BAD_TOKEN=sk-real\n`);
+  await writeFile(secrets, `AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN=${TOKEN}\nAIS_GATEWAY_APP_XAI_TOKEN=${TOKEN}\nAIS_GATEWAY_APP_OC_TOKEN=${TOKEN}\nAIS_GATEWAY_APP_BAD_TOKEN=sk-real\n`);
   settingsPath = join(home, ".t3", "userdata", "settings.json");
   await mkdir(join(home, ".t3", "userdata"), { recursive: true });
   await writeFile(settingsPath, JSON.stringify({ theme: "dark", providerInstances: { other: { driver: "codex", enabled: true } } }, null, 2) + "\n", { mode: 0o600 });
@@ -111,6 +111,34 @@ test("grok create: env without secrets, launcher, token, auth.json", async () =>
   expect(await readFile(join(folder, "auth.json"), "utf8")).toContain(TOKEN);
   expect(r.usage?.some((u) => u.status === "updated")).toBe(true);
   expect((await applyT3Instance(opts({ id: "g1", driver: "grok", app: "xai", gatewayUrl: "https://gw.example/gateway/xai", binary: "/opt/grok" }))).status).toBe("current");
+});
+
+test("opencode create: own folder, env, auth.json with only the app token, then current", async () => {
+  const o = opts({ id: "o1", driver: "opencode", app: "oc", gatewayUrl: "https://gw.example/gateway/oc", binary: "/opt/opencode" });
+  const r = await applyT3Instance(o);
+  expect(r.status).toBe("created");
+  const folder = join(home, ".t3", "gateway", "o1");
+  const entry = (await settings()).providerInstances.o1;
+  expect(entry.driver).toBe("opencode");
+  expect(entry.config.binaryPath).toBe("/opt/opencode");
+  expect(entry.environment).toEqual([
+    { name: "OPENCODE_CONFIG_DIR", value: folder, sensitive: false },
+    { name: "XDG_DATA_HOME", value: folder, sensitive: false },
+  ]);
+  expect(JSON.stringify(await settings())).not.toContain(TOKEN);
+  expect(await readFile(join(folder, "token"), "utf8")).toBe(`${TOKEN}\n`);
+  const auth = JSON.parse(await readFile(join(folder, "opencode", "auth.json"), "utf8"));
+  expect(auth).toEqual({ "opencode-go": { type: "api", key: TOKEN } });
+  expect(await mode(join(folder, "opencode", "auth.json"))).toBe(0o600);
+  const cfg = JSON.parse(await readFile(join(folder, "opencode.json"), "utf8"));
+  expect(cfg.provider.gateway.options.baseURL).toBe("https://gw.example/gateway/oc");
+  expect(cfg.disabled_providers).toContain("opencode-go");
+  expect(JSON.stringify(cfg)).not.toContain(TOKEN);
+  expect(r.usage?.some((u) => u.status === "updated")).toBe(true);
+  expect((await applyT3Instance(o)).status).toBe("current");
+  const c = await applyT3Instance({ ...o, check: true });
+  expect(c.status).toBe("current");
+  expect((await applyT3Instance({ ...o, remove: true })).status).toBe("removed");
 });
 
 test("--remove drops the entry, keeps the folder and others", async () => {

@@ -10,7 +10,7 @@ import type { GatewayCliDeps } from "./apps.ts";
 import { DEFAULT_CONNECT_CA } from "./claude-proxy.ts";
 import { readSecretsKey } from "./secrets-file.ts";
 
-const USAGE = "Usage: ais gateway t3-instance <instance-id> --driver=claude|grok --app=<gateway app> [--name=<name>] [--models=a,b] [--like=<claude instance id>] [--binary=<path>] [--check] [--remove]";
+const USAGE = "Usage: ais gateway t3-instance <instance-id> --driver=claude|grok|opencode --app=<gateway app> [--name=<name>] [--models=a,b] [--like=<claude instance id>] [--binary=<path>] [--check] [--remove]";
 
 /**
  * `ais gateway t3-instance`: creates or updates one T3 Code provider instance whose folder holds only the gateway app
@@ -24,7 +24,7 @@ export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["fl
   if (check && remove) throw new CliUsageError("--check and --remove cannot be combined");
   const driver = stringFlag(flags, "driver");
   const app = stringFlag(flags, "app");
-  if (driver !== "claude" && driver !== "grok") throw new CliUsageError(`--driver=claude|grok is required. ${USAGE}`);
+  if (driver !== "claude" && driver !== "grok" && driver !== "opencode") throw new CliUsageError(`--driver=claude|grok|opencode is required. ${USAGE}`);
   if (!app && !remove) throw new CliUsageError(`--app=<gateway app> is required. ${USAGE}`);
   const models = stringFlag(flags, "models")?.split(",").map((m) => m.trim()).filter(Boolean);
   const base: T3InstanceOptions = {
