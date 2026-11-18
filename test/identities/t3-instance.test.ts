@@ -1,8 +1,8 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyT3Instance, type T3InstanceOptions } from "../../src/identities/t3-instance.ts";
+import { applyT3Instance, grokLauncherSource, type T3InstanceOptions } from "../../src/identities/t3-instance.ts";
 
 let home: string;
 let secrets: string;
@@ -101,8 +101,10 @@ test("grok create: env without secrets, launcher, token, auth.json", async () =>
   expect(JSON.stringify(await settings())).not.toContain(TOKEN);
   const src = await readFile(launcher, "utf8");
   expect(src.startsWith("#!/bin/sh")).toBe(true);
-  expect(src).toContain("unset XAI_API_KEY");
-  expect(src).toContain("exec '/opt/grok' \"$@\"");
+  expect(src).toContain("export XAI_API_KEY");
+  expect(src).not.toContain("export GROK_CODE_XAI_API_KEY");
+  expect(src).toContain("BIN='/opt/grok'");
+  expect(src).toContain('exec "$BIN" "$@"');
   expect(await mode(launcher)).toBe(0o755);
   expect(await readFile(join(folder, "token"), "utf8")).toBe(`${TOKEN}\n`);
   expect(await mode(join(folder, "token"))).toBe(0o600);
@@ -126,4 +128,46 @@ test("a non-aisg token is refused and nothing is written", async () => {
   await expect(applyT3Instance(opts({ app: "bad" }))).rejects.toThrow("aisg_");
   expect((await backups()).length).toBe(0);
   expect((await settings()).providerInstances.c1).toBeUndefined();
+});
+
+describe("grok launcher binary resolution", () => {
+  const run = async (src: string, t3Home: string): Promise<string> => {
+    const dir = await mkdtemp(join(tmpdir(), "grok-launcher-"));
+    try {
+      await mkdir(join(dir, "gh"), { recursive: true });
+      await writeFile(join(dir, "gh", "token"), "tok\n");
+      const l = join(dir, "launch");
+      await writeFile(l, src.replace('exec "$BIN"', 'echo "$BIN $XAI_API_KEY"; exit 0 #'));
+      const p = Bun.spawn(["sh", l], { env: { PATH: process.env.PATH ?? "", GROK_HOME: join(dir, "gh") }, stdout: "pipe" });
+      return (await new Response(p.stdout).text()).trim();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  };
+  const setup = async (): Promise<string> => {
+    const t3 = await mkdtemp(join(tmpdir(), "grok-t3-"));
+    const dir = join(t3, "caches", "acp-registry", "package-installs");
+    await mkdir(dir, { recursive: true });
+    for (const [v, exists] of [["1.0.9", true], ["1.0.79", true], ["1.0.100", false]] as const) {
+      const exe = join(t3, `grok-${v}`);
+      if (exists) await writeFile(exe, "");
+      await writeFile(join(dir, `grok-build-${v}.json`), JSON.stringify({ agentId: "grok-build", agentVersion: v, executablePath: exe }));
+    }
+    return t3;
+  };
+  test("explicit binary wins", async () => {
+    const t3 = await setup();
+    expect(await run(grokLauncherSource({ binary: "/opt/grok", t3Home: t3, fallback: "/fb/grok" }), t3)).toBe("/opt/grok tok");
+    await rm(t3, { recursive: true, force: true });
+  });
+  test("newest existing registry install", async () => {
+    const t3 = await setup();
+    expect(await run(grokLauncherSource({ t3Home: t3, fallback: "/fb/grok" }), t3)).toBe(`${t3}/grok-1.0.79 tok`);
+    await rm(t3, { recursive: true, force: true });
+  });
+  test("fallback when no install record", async () => {
+    const t3 = await mkdtemp(join(tmpdir(), "grok-t3-"));
+    expect(await run(grokLauncherSource({ t3Home: t3, fallback: "/fb/grok" }), t3)).toBe("/fb/grok tok");
+    await rm(t3, { recursive: true, force: true });
+  });
 });

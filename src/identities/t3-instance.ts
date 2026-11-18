@@ -91,7 +91,29 @@ export function grokLauncherPath(id: string, opts: { home?: string; env?: Record
 
 const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
-export function grokLauncherSource(binary: string): string {
+/**
+ * The launcher picks the grok binary each time it starts, so a newer T3 install is used without a re-run.
+ * An explicit binary always wins. Without one it uses the newest T3-managed grok from the ACP registry
+ * install records, and then the fallback path.
+ */
+export function grokLauncherSource(opts: { binary?: string; t3Home: string; fallback: string }): string {
+  const resolve = opts.binary
+    ? [`BIN=${shQuote(opts.binary)}`]
+    : [
+        `BIN=""`,
+        `BEST=""`,
+        `for f in ${shQuote(join(opts.t3Home, "caches", "acp-registry", "package-installs"))}/grok-build-*.json; do`,
+        `  [ -r "$f" ] || continue`,
+        `  v=$(sed -n 's/.*"agentVersion"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$f" | head -n 1)`,
+        `  e=$(sed -n 's/.*"executablePath"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$f" | head -n 1)`,
+        `  [ -n "$v" ] && [ -n "$e" ] && [ -f "$e" ] || continue`,
+        `  if [ -z "$BEST" ] || [ "$(printf '%s\\n%s\\n' "$BEST" "$v" | sort -V | tail -n 1)" = "$v" ]; then`,
+        `    BEST="$v"`,
+        `    BIN="$e"`,
+        `  fi`,
+        `done`,
+        `[ -n "$BIN" ] || BIN=${shQuote(opts.fallback)}`,
+      ];
   return [
     "#!/bin/sh",
     "# Written by `ais gateway t3-instance`; do not edit. Starts grok with the gateway token of this instance folder.",
@@ -99,10 +121,14 @@ export function grokLauncherSource(binary: string): string {
     '  echo "grok launcher: cannot read the gateway token at \\$GROK_HOME/token (GROK_HOME=${GROK_HOME:-unset})" >&2',
     "  exit 1",
     "fi",
-    `GROK_CODE_XAI_API_KEY=$(tr -d '\\r\\n' < "$GROK_HOME/token")`,
-    "export GROK_CODE_XAI_API_KEY",
-    "unset XAI_API_KEY",
-    `exec ${shQuote(binary)} "$@"`,
+    "# Use XAI_API_KEY, not GROK_CODE_XAI_API_KEY: with the second one `grok models` says \"You are not authenticated\"",
+    "# and T3 shows the instance as not logged in. This is safe for usage: T3's usage reader checks only the",
+    "# instance environment in settings.json, and that never holds XAI_API_KEY.",
+    `XAI_API_KEY=$(tr -d '\\r\\n' < "$GROK_HOME/token")`,
+    "export XAI_API_KEY",
+    "unset GROK_CODE_XAI_API_KEY",
+    ...resolve,
+    'exec "$BIN" "$@"',
     "",
   ].join("\n");
 }
@@ -224,7 +250,6 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     plans.push({ path: join(folder, ".claude.json"), content: `${JSON.stringify({ hasCompletedOnboarding: true })}\n`, mode: 0o600, label: ".claude.json", onlyIfMissing: true });
   } else {
     const launcher = grokLauncherPath(opts.id, { home, ...(opts.env ? { env: opts.env } : {}) });
-    const binary = opts.binary ?? join(home, ".local", "bin", "grok");
     const config: Json = { ...obj(existing?.config), binaryPath: launcher };
     if (models.length > 0) config.customModels = models;
     else delete config.customModels;
@@ -240,7 +265,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
       ],
       config,
     };
-    plans.push({ path: launcher, content: grokLauncherSource(binary), mode: 0o755, label: "launcher" });
+    plans.push({ path: launcher, content: grokLauncherSource({ ...(opts.binary ? { binary: opts.binary } : {}), t3Home, fallback: join(home, ".local", "bin", "grok") }), mode: 0o755, label: "launcher" });
   }
 
   const changes: string[] = [];
