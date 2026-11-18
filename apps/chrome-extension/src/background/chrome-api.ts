@@ -38,7 +38,6 @@ export interface ChromeApi {
     /** Live groups with exactly this title. */
     queryByTitle(title: string): Promise<GroupInfo[]>;
   };
-  windows: { resize(windowId: number, width: number, height: number): Promise<void> };
   debugger: {
     attach(tabId: number): Promise<void>;
     detach(tabId: number): Promise<void>;
@@ -86,7 +85,6 @@ export function realChromeApi(): ChromeApi {
       },
       queryByTitle: async title => (await chrome.tabGroups.query({ title })).map(g => ({ id: g.id, title: g.title ?? "" })),
     },
-    windows: { resize: async (windowId, width, height) => { await chrome.windows.update(windowId, { width, height }); } },
     debugger: {
       attach: tabId => chrome.debugger.attach({ tabId }, "1.3"),
       detach: tabId => chrome.debugger.detach({ tabId }),

@@ -40,6 +40,8 @@ Swap pools: mint a token for each pool member (`ais browser agent-token <member>
 
 `list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
 
+`resize` emulates the tab's viewport over CDP (`Emulation.setDeviceMetricsOverride`, like DevTools responsive mode). It never resizes or moves the browser window. The override ends when the session detaches.
+
 ### JavaScript dialogs
 
 A page blocked by a JavaScript dialog (alert, confirm, prompt, or beforeunload "Leave site?") answers neither input nor script, so a call on it used to hang until the 30 s timeout. The extension watches `Page.javascriptDialogOpening` / `Page.javascriptDialogClosed` on every tab it is attached to and keeps the open dialog per tab (type, message, url, default prompt text).

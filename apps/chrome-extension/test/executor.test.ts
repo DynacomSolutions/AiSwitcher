@@ -432,8 +432,19 @@ describe("visuals and abort hygiene", () => {
     expect(api.tabList.has(tab.id)).toBe(true);
     state.resume();
     expect(await executor.run(call("resize", { tabId: tab.id, width: 800, height: 600 }))).toMatchObject({ ok: false, error: "stopped_by_user" });
-    expect(api.resizes).toEqual([]);
+    expect(api.cdpLog.filter(c => c.method === "Emulation.setDeviceMetricsOverride")).toEqual([]);
     api.tabs.get = get;
+  });
+
+  test("resize emulates the tab viewport over CDP and never touches the window", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    const r = await executor.run(call("resize", { tabId: tab.id, width: 800, height: 600 }));
+    expect(r.ok).toBe(true);
+    expect(JSON.stringify(r)).toContain("The browser window was not changed.");
+    const sent = api.cdpLog.filter(c => c.method === "Emulation.setDeviceMetricsOverride");
+    expect(sent).toEqual([{ tabId: tab.id, method: "Emulation.setDeviceMetricsOverride", params: { width: 800, height: 600, deviceScaleFactor: 0, mobile: false } }]);
+    expect("windows" in api).toBe(false);
   });
 
   test("main-frame navigation from a click clears domReady; subframes do not", async () => {

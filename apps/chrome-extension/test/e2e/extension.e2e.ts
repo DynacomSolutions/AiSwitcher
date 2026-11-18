@@ -362,7 +362,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     await call(agents.a!, "navigate", { tabId: tabA, url: `http://127.0.0.1:${site.port}/?s=a` });
 
     await call(agents.a!, "resize", { tabId: tabA, width: 2400, height: 1400 });
-    await sleep(500); // let the window settle (the headless screen may clamp the size)
+    expect(await pageA.eval<number[]>(`[innerWidth, innerHeight]`)).toEqual([2400, 1400]);
     const shotRes = await call(agents.a!, "screenshot", { tabId: tabA });
     expect(shotRes.ok ? "ok" : JSON.stringify(shotRes)).toBe("ok");
     const img = shotRes.ok ? shotRes.content[0] : undefined;
@@ -373,7 +373,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     expect(Math.max(size.width, size.height)).toBeLessThanOrEqual(1568);
     expect(Math.max(size.width, size.height)).toBeGreaterThan(1000);
     await call(agents.a!, "resize", { tabId: tabA, width: 1280, height: 800 });
-    await until("window back to 1280 wide", async () => (await pageA.eval<number>(`innerWidth`)) <= 1300);
+    expect(await pageA.eval<number[]>(`[innerWidth, innerHeight]`)).toEqual([1280, 800]);
   }, 60_000);
 
   it("controlled tab shows the indicator pill and border, closed off from the page", async () => {

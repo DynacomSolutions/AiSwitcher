@@ -15,7 +15,6 @@ export class FakeChrome implements ChromeApi {
   detachCalls: number[] = [];
   removedListeners: Array<(id: number) => void> = [];
   eventListeners: Array<(tabId: number, method: string, params: Record<string, unknown>, sessionId?: string) => void> = [];
-  resizes: Array<[number, number, number]> = [];
   createdListeners: Array<(tab: TabInfo) => void> = [];
   activatedListeners: Array<(tabId: number, windowId: number) => void> = [];
   /** Tabs the extension made active (only ever to give the owner their tab back). */
@@ -93,7 +92,6 @@ export class FakeChrome implements ChromeApi {
     get: async (id: number) => (this.groupLive(id) ? { id, title: this.groups.get(id)?.title ?? "" } : undefined),
     queryByTitle: async (title: string) => [...this.groups].filter(([id, g]) => g.title === title && this.groupLive(id)).map(([id, g]) => ({ id, title: g.title })),
   };
-  windows = { resize: async (w: number, width: number, height: number) => { this.resizes.push([w, width, height]); } };
   debugger = {
     attach: async (id: number) => { this.attachedTabs.add(id); },
     detach: async (id: number) => { this.attachedTabs.delete(id); this.detachCalls.push(id); },
