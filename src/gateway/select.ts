@@ -67,11 +67,12 @@ export async function allowedMembers(app: GatewayApp, deps: Pick<GatewayDeps, "p
   return names;
 }
 
-/** The usage readings of the members an app may use, for the native limit answer (reset times), as they apply to `model`. */
+/** The usage readings of the members an app may use, for the native limit answer (reset times), as they apply to `model`; `unfiltered` keeps every per-model window. */
 export async function memberUsages(
   app: GatewayApp,
   deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">,
   model?: string,
+  unfiltered = false,
 ): Promise<Array<PoolUsage | undefined>> {
   let names: string[];
   try {
@@ -79,7 +80,7 @@ export async function memberUsages(
   } catch {
     return [];
   }
-  return Promise.all(names.map(async (n) => usageForModel(await usageOf(deps, app, n), model)));
+  return Promise.all(names.map(async (n) => (unfiltered ? await usageOf(deps, app, n) : usageForModel(await usageOf(deps, app, n), model))));
 }
 
 /**

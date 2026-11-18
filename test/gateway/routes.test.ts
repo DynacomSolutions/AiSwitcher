@@ -360,6 +360,16 @@ describe("served from pool state", () => {
     expect(without).not.toHaveProperty("limits");
   });
 
+  test("a claude pool's usage carries the chosen member's Fable window, and a full Fable window does not unselect it", async () => {
+    await addApp("cl", "claude", "anthropic");
+    const win = [{ label: "five-hour", utilization: 20, resetsAt: "2026-11-02T13:00:00.000Z" }, { label: "seven-day", utilization: 10, resetsAt: "2026-11-05T00:00:00.000Z" }];
+    usage.a = { status: "live", maxUtilization: 60, capturedAt: "", windows: [{ label: "five-hour", utilization: 60 }, { label: "seven-day", utilization: 50 }] };
+    usage.b = { status: "live", maxUtilization: 20, capturedAt: "", windows: [...win, { label: "seven-day (Fable)", model: "Fable", utilization: 100, resetsAt: "2026-11-05T01:00:00.000Z" }] };
+    const body = (await (await call("cl", "/api/oauth/usage", { method: "GET" })).json()) as { five_hour: { utilization: number }; limits: unknown[] };
+    expect(body.five_hour.utilization).toBe(20); // b is still the least used on account-wide windows
+    expect(body.limits).toContainEqual({ kind: "weekly_scoped", group: "weekly", percent: 100, resets_at: "2026-11-05T01:00:00.000Z", scope: { model: { id: null, display_name: "Fable" }, surface: null } });
+  });
+
   test("claude usage with no figures answers null windows", async () => {
     await addApp("cl", "claude", "anthropic");
     expect(await (await call("cl", "/api/oauth/usage", { method: "GET" })).json()).toMatchObject({ five_hour: null, seven_day: null });
