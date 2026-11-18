@@ -1,7 +1,7 @@
 /**
  * Keeps a conversation usable when the provider refuses it for a media file it holds itself.
  *
- * Incident 18 Nov 2026 (board 4.212). kimi-code uploads each image to Kimi's file service (`POST /files`) and sends the
+ * Incident 18 Nov 2026 (board 4.213). kimi-code uploads each image to Kimi's file service (`POST /files`) and sends the
  * returned id (`ms://<id>`) in the chat request, caching the id on disk. Kimi answers some uploads `200` with
  * `"status":"error"` (for example `"image moderation unavailable"`). Every chat request that names such a file is then
  * refused with `400 Invalid request Error`, and because the client replays its whole history each turn, the session

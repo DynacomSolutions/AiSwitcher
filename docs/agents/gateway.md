@@ -336,7 +336,7 @@ request as `ms://<id>`, caching the id on disk. Kimi answers some uploads `200` 
 2026: `image moderation unavailable` for images with a side under about 16 px, `parsing failed` for bytes it cannot read).
 kimi-code does not read `status`. Every chat request naming such a file is refused with `400 Invalid request Error`, and
 because the client replays its whole history each turn, the session fails for ever while its turns look complete
-(incident 18 Nov 2026, board 4.212). The same image is accepted when it is sent inline.
+(incident 18 Nov 2026, board 4.213). The same image is accepted when it is sent inline.
 
 - **Upload**: a 2xx answer to `POST [/v1]/files` whose body says `status: "error"` is answered `422` (OpenAI error shape,
   `upload rejected by provider: <status_details>`). kimi-code then sends the image inline and keeps no id. The request log
@@ -468,8 +468,11 @@ What is stored: an encrypted copy of exactly the files the file-based model uses
 `auth.json`), revoked markers, the ownership heartbeat and the host home the registries were written on. Every replica
 writes the rows into its own HOME and follows changes (LISTEN `ais_gateway_files`, plus a 5 s poll), so the refresh, the
 guard and the credential cache work unchanged. Registry paths are translated with `AIS_HOST_HOME`, taken from the
-imported metadata when the deployment does not set it. Opencode's SQLite database is not copied: when only it holds the
-key, the import writes the key to `data/opencode/ais-gateway-key.json` for the replicas (never onto the host).
+imported metadata when the deployment does not set it. Opencode's SQLite database is not copied: when it holds a Go
+credential (static key or the Console login's OAuth access token), the import writes it to
+`data/opencode/ais-gateway-key.json` for the replicas (never onto the host), even when `auth.json` still holds a key.
+OpenCode v2 never updates `auth.json` after a new sign-in, so its key can be long expired. The gateway reads the
+database first, then that derived file, then `auth.json`.
 
 Encryption: AES-256-GCM, key in `AIS_GATEWAY_STORE_KEY` (32 random bytes, base64 or hex; `openssl rand -base64 32`), the
 path as associated data. Losing the key loses the logins (re-run the import from the host files); rotating it means a

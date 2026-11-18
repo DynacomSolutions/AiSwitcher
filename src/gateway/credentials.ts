@@ -206,11 +206,12 @@ async function readCredential(provider: GatewayProvider, id: Identity, registry?
     case "opencode": {
       const v2 = (await readOpencodeV2Credentials(dir))?.find((c) => c.provider === "opencode-go")?.entry.key;
       if (nonEmpty(v2)) return { identity, accessToken: v2 };
-      const legacy = (await readOpencodeAuth(dir))?.["opencode-go"]?.key;
-      if (nonEmpty(legacy)) return { identity, accessToken: legacy };
-      // A replica without the host's SQLite database reads the key the credential store import derived from it (home-import.ts).
+      // A replica without the host's SQLite database reads the key the credential store import derived from it
+      // (home-import.ts). It is the database's copy, so it wins over auth.json, which OpenCode v2 no longer updates.
       const derived = (await readJsonObject(join(dir, "data", "opencode", "ais-gateway-key.json")))?.["opencode-go"] as { key?: unknown } | undefined;
-      return nonEmpty(derived?.key) ? { identity, accessToken: derived.key } : undefined;
+      if (nonEmpty(derived?.key)) return { identity, accessToken: derived.key };
+      const legacy = (await readOpencodeAuth(dir))?.["opencode-go"]?.key;
+      return nonEmpty(legacy) ? { identity, accessToken: legacy } : undefined;
     }
   }
 }

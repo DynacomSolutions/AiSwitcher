@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { cp, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { opencodeDerivedKeyFile } from "../../src/gateway/home-import.ts";
 import { CredentialCache, GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type RefreshFn } from "../../src/gateway/credentials.ts";
 import { SwapLockError } from "../../src/identities/claude-swap-lock.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG } from "../../src/identities/tool-configs.ts";
@@ -225,6 +226,24 @@ describe("CredentialCache", () => {
     db2.close();
     await utimes(dbPath, 1_900_000_000, 1_900_000_000);
     expect((await c.get("opencode", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-opencode-db-0002");
+  }, 20_000);
+
+  test("opencode on a replica (no db) prefers the derived db key over a stale auth.json", async () => {
+    // Fixture auth.json holds SYNTHETIC_FIXTURE-opencode-key-0001 (the stale legacy key).
+    expect((await makeCache().get("opencode", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-opencode-key-0001");
+    await writeFile(join(work, "opencode", "data", "opencode", "ais-gateway-key.json"), JSON.stringify({ "opencode-go": { type: "api", key: "SYNTHETIC_FIXTURE-opencode-derived-0001" } }));
+    expect((await makeCache().get("opencode", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-opencode-derived-0001");
+  });
+
+  test("opencode import derives the db OAuth login even when auth.json still holds a key", async () => {
+    const dir = join(work, "opencode");
+    expect(await opencodeDerivedKeyFile(dir)).toBeUndefined();
+    const db = new Database(join(dir, "data", "opencode", "opencode.db"), { create: true });
+    db.run("CREATE TABLE credential (id TEXT, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER)");
+    db.run("INSERT INTO credential VALUES ('1','opencode','Default', ?, 1, 5)", [JSON.stringify({ type: "oauth", access: "SYNTHETIC_FIXTURE-opencode-oauth-0001", refresh: "SYNTHETIC_FIXTURE-opencode-refresh-0001", expires: 1 })]);
+    db.close();
+    const content = await opencodeDerivedKeyFile(dir);
+    expect(JSON.parse(content!.toString("utf8"))).toEqual({ "opencode-go": { type: "api", key: "SYNTHETIC_FIXTURE-opencode-oauth-0001" } });
   }, 20_000);
 
   test("retired identities are rejected without leaking the token", async () => {
