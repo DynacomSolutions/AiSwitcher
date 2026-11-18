@@ -118,7 +118,8 @@ import os, openai
 client = openai.OpenAI(base_url=os.environ["AIS_GATEWAY_URL"], api_key=os.environ["AIS_GATEWAY_TOKEN"])
 ```
 
-The gateway changes credential headers only. It does not rewrite bodies.
+The gateway changes credential headers only. It does not rewrite bodies, with one exception: Kimi file references the
+provider itself refuses (see "Kimi uploads the provider marked as failed" below).
 
 ## Usage recording
 
@@ -149,7 +150,7 @@ back; meeting it is the app's job.
   its SSE without a `content-type` header, so the gateway sniffs the body
   (`event:`, `data:` or `:` first means SSE) so usage is still recorded.
 - **kimi** (anthropic or openai): the Kimi Coding endpoint; choose the style that
-  matches your SDK.
+  matches your SDK. kimi-code (`type = "kimi"`) speaks the OpenAI-style API under `/v1` whatever style the app has.
 - **grok** (openai style): Chat Completions. The endpoint answers 426 to a caller
   with no Grok CLI version; send the header `x-grok-client-version: 1.0.70` (any
   version from 1.0.13 up).
@@ -328,6 +329,35 @@ so Codex and `codex app-server` show real limits. It reads the app from the fold
 token); a failure there is reported and never hides the minted-token message. `--check` writes nothing and reports each
 folder (`ok` or the problem).
 
+### Kimi uploads the provider marked as failed (`src/gateway/media-recovery.ts`)
+
+kimi-code uploads every image and video to Kimi's file service (`POST /v1/files`) and sends the returned id in the chat
+request as `ms://<id>`, caching the id on disk. Kimi answers some uploads `200` with `"status":"error"` (measured 18 Nov
+2026: `image moderation unavailable` for images with a side under about 16 px, `parsing failed` for bytes it cannot read).
+kimi-code does not read `status`. Every chat request naming such a file is refused with `400 Invalid request Error`, and
+because the client replays its whole history each turn, the session fails for ever while its turns look complete
+(incident 18 Nov 2026, board 4.212). The same image is accepted when it is sent inline.
+
+- **Upload**: a 2xx answer to `POST [/v1]/files` whose body says `status: "error"` is answered `422` (OpenAI error shape,
+  `upload rejected by provider: <status_details>`). kimi-code then sends the image inline and keeps no id. The request log
+  shows `"reason":"upload_rejected"` with the provider's note.
+- **Chat**: when `POST [/v1]/chat/completions` is refused with 400 and its body names `ms://` files, each file (at
+  most 256, eight at a time, 15 s in all) is looked up with the member's login (`GET .../v1/files/<id>`). The parts whose
+  file is failed (`status: "error"`) are replaced by the text `[image removed: rejected by provider]` (or
+  `[video removed: ...]`) and the request is sent once more. The answer carries `x-ais-gateway-media-removed: <parts>`,
+  the log a `media_removed` line and `"reason":"media_removed"` on the request line, and
+  `ais_gateway_media_removed_total{app}` counts the parts.
+- An app pinned to one identity is also repaired when the refusal is 404 and the lookup says a file is gone. A pool app
+  is not: a file belongs to the account that uploaded it, so "not found" may only mean another member holds it.
+- Ids found bad are kept per replica (24 h, at most 2000), so later turns of the same conversation are repaired before
+  the first send. Another replica learns the id on its own first refusal.
+- Nothing else is touched: inline (`data:`) media, other providers, a refusal where every named file is usable, and a
+  lookup that fails or is unclear all leave the provider's answer as it is. A body over the replay limit is not repaired.
+
+A turn that still fails is silent in T3 Code: kimi-code's ACP server ends a failed turn with `stopReason: "end_turn"` and
+only logs the error (its own design note says ACP has no failed stop reason). Neither the gateway nor AIS can change
+that; the session's `agents/main/wire.jsonl` (`turn.ended`, `reason: "failed"`) and the gateway request log hold the reason.
+
 ### Public host
 
 `/metrics`, `/healthz`, `/readyz` and `/browser/pair*` answer 404 when the request names a public host (Host or
@@ -361,6 +391,11 @@ throwaway pod outside the `dev` namespace.
 
 ## Operations notes
 
+- The request log (one JSON line per request on stdout) says why a provider refused: an `upstream_error` line carries
+  `upstream: {type, code, message}` from the provider's error body (first 64 KiB read, message cut to 300 characters,
+  tokens, keys, e-mail addresses and long opaque runs removed; `src/gateway/upstream-error.ts`). A call that failed
+  before any answer has `reason` set to the failure's code or class (`ECONNRESET`, `TimeoutError`). Request bodies,
+  whole response bodies and headers are never logged. `kubectl -n <ns> logs deploy/ais-gateway | grep upstream_error`.
 - Revoking an app needs the database. While the database is down, revoke
   returns 503 and the app stays active; retry once the database is back.
 - The usage table becomes a TimescaleDB hypertable only on the first migration.
