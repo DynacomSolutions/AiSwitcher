@@ -4,19 +4,22 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 /**
- * T3 Code reads its Anthropic account data (usage, reset credits) from api.anthropic.com. To let the AIS gateway answer
- * that, only the T3 server binary routes api.anthropic.com through the gateway CONNECT proxy. This is done with a
+ * T3 Code reads its account data (Anthropic usage and reset credits, OpenCode Go usage, Grok billing) from
+ * api.anthropic.com, opencode.ai and cli-chat-proxy.grok.com. To let the AIS gateway answer that, only the T3 server
+ * binary routes these through the gateway CONNECT proxy: every path of api.anthropic.com, only /zen/go/v1/usage on
+ * opencode.ai and only /v1/billing on cli-chat-proxy.grok.com. This is done with a
  * preload (NODE_OPTIONS=--require in ~/.t3/service.env, which T3 passes to every child). HTTPS_PROXY must never be set
- * there: the CONNECT proxy refuses every other host, so git, gh, npm and codex would all break in every T3 thread.
+ * there: the proxy intercepts only those three hosts (every other host is a plain tunnel), so setting it for every T3
+ * child would send git, gh, npm and codex through the gateway in every T3 thread.
  *
- * The preload acts only when process.execPath is ~/.t3/runtime/versions/<v>/t3, never throws, and leaves every host
- * other than api.anthropic.com on the untouched native fetch. Its exports (isT3Exe, install) exist for tests.
+ * The preload acts only when process.execPath is ~/.t3/runtime/versions/<v>/t3, never throws, and leaves every other
+ * host and path on the untouched native fetch. Its exports (isT3Exe, install) exist for tests.
  */
 export const PRELOAD_SOURCE = String.raw`// Loaded into every Node process T3 starts (NODE_OPTIONS=--require from ~/.t3/service.env).
 // Managed by "ais gateway t3-proxy"; do not edit, it is rewritten on install.
-// It acts ONLY inside the T3 server binary: there, requests to api.anthropic.com go through the AIS gateway
-// CONNECT proxy (so T3's own usage/reset reads and redeems reach the gateway's account API); every other host
-// stays direct. In any other process (node, npm, claude children) it does nothing. It never throws.
+// It acts ONLY inside the T3 server binary: there, requests to api.anthropic.com (every path), opencode.ai
+// (only /zen/go/v1/usage) and cli-chat-proxy.grok.com (only /v1/billing) go through the AIS gateway CONNECT
+// proxy (so T3's own usage reads reach the gateway); every other host and path stays direct. In any other process (node, npm, claude children) it does nothing. It never throws.
 "use strict";
 const T3_EXE = /[\\/]\.t3[\\/]runtime[\\/]versions[\\/][^\\/]+[\\/]t3$/;
 function isT3Exe(exe) {
@@ -29,21 +32,25 @@ function install(opts) {
   if (!proxy || !isT3Exe(exe)) return false;
   const undici = opts.undici || require(path.join(path.dirname(exe), "node_modules", "undici"));
   const target = opts.target || globalThis;
-  const HOSTS = new Set(["api.anthropic.com"]);
   const viaGateway = new undici.ProxyAgent({ uri: proxy });
   const nativeFetch = target.fetch;
-  const hostOf = (input) => {
+  // True for the requests the gateway answers: all of api.anthropic.com, the OpenCode usage path, the Grok billing path.
+  const viaProxy = (input) => {
     try {
       const u = typeof input === "string" || input instanceof URL ? new URL(String(input)) : new URL(input.url);
-      return u.hostname.toLowerCase();
+      const host = u.hostname.toLowerCase();
+      if (host === "api.anthropic.com") return true;
+      if (host === "opencode.ai") return u.pathname === "/zen/go/v1/usage";
+      if (host === "cli-chat-proxy.grok.com") return u.pathname === "/v1/billing";
+      return false;
     } catch {
-      return "";
+      return false;
     }
   };
-  // Only api.anthropic.com changes path: T3's own undici fetch with the proxy agent (same library version, so the
+  // Only those requests change path: T3's own undici fetch with the proxy agent (same library version, so the
   // handler API matches). Every other request uses Node's untouched fetch.
   target.fetch = function aisT3Fetch(input, init) {
-    if (!HOSTS.has(hostOf(input))) return nativeFetch.call(this, input, init);
+    if (!viaProxy(input)) return nativeFetch.call(this, input, init);
     if (typeof input !== "string" && !(input instanceof URL)) {
       return input.arrayBuffer().then((buf) =>
         undici.fetch(input.url, { method: input.method, headers: input.headers, body: buf.byteLength ? buf : undefined, signal: input.signal, ...init, dispatcher: viaGateway }),
@@ -119,7 +126,7 @@ export function forbiddenProxyVars(text: string): string[] {
 function assertNoForbidden(text: string): void {
   const bad = forbiddenProxyVars(text);
   if (bad.length > 0) {
-    throw new Error(`service.env sets ${bad.join(", ")}: that sends every T3 child (git, gh, npm, codex) through the gateway proxy, which refuses every host but api.anthropic.com. Remove it first.`);
+    throw new Error(`service.env sets ${bad.join(", ")}: that sends every T3 child (git, gh, npm, codex) through the gateway proxy, which only intercepts api.anthropic.com, opencode.ai and cli-chat-proxy.grok.com (every other host is a plain tunnel). Remove it first.`);
   }
 }
 
@@ -327,7 +334,7 @@ export async function t3ProxyDoctorProblems(opts: T3Options = {}): Promise<strin
   const text = await readOptional(paths.serviceEnv).catch(() => undefined);
   if (text !== undefined) {
     const bad = forbiddenProxyVars(text);
-    if (bad.length > 0) problems.push(`${paths.serviceEnv} sets ${bad.join(", ")}: this breaks git, gh, npm and codex in every T3 thread (gateway proxy only serves api.anthropic.com); remove it, use ais gateway t3-proxy`);
+    if (bad.length > 0) problems.push(`${paths.serviceEnv} sets ${bad.join(", ")}: this breaks git, gh, npm and codex in every T3 thread (the gateway proxy intercepts only api.anthropic.com, opencode.ai and cli-chat-proxy.grok.com; every other host is a plain tunnel); remove it, use ais gateway t3-proxy`);
   }
   const preload = await readOptional(paths.preload).catch(() => undefined);
   if (preload !== undefined && preload !== PRELOAD_SOURCE) problems.push(`T3 preload ${paths.preload} is out of date; run ais gateway t3-proxy, then restart T3`);

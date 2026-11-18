@@ -180,3 +180,44 @@ test("with the T3 binary, api.anthropic.com goes through the proxy dispatcher an
   expect(mod.install({ exe: "/opt/app/.t3/runtime/versions/1/t3", proxy: "", undici, target: other })).toBe(false);
   expect(other.fetch).toBe(orig);
 });
+
+test("routing rule: opencode usage and grok billing go through the proxy, every other path stays native", async () => {
+  const s = await scratch();
+  await installT3Proxy({ ...s.opts, ...input });
+  const mod = require(t3Paths(s.opts).preload) as { install(o: unknown): boolean };
+  const calls: string[] = [];
+  class ProxyAgent {
+    constructor(public o: { uri: string }) {}
+  }
+  const undici = { ProxyAgent, fetch: async (url: unknown, init: { dispatcher?: unknown }) => (calls.push(`undici ${String(url)} ${init.dispatcher instanceof ProxyAgent}`), new Response("ok")) };
+  const target = { fetch: async (url: unknown) => (calls.push(`native ${url instanceof Request ? url.url : String(url)}`), new Response("ok")) };
+  expect(mod.install({ exe: "/opt/app/.t3/runtime/versions/1/t3", proxy: "http://127.0.0.1:9", undici, target })).toBe(true);
+  await target.fetch("https://opencode.ai/zen/go/v1/usage");
+  await target.fetch("https://opencode.ai/zen/go/v1/chat/completions");
+  await target.fetch("https://opencode.ai/zen/go/v1/usage/extra");
+  await target.fetch("https://opencode.ai/");
+  await target.fetch("https://cli-chat-proxy.grok.com/v1/billing?format=credits");
+  await target.fetch("https://cli-chat-proxy.grok.com/v1/chat/completions");
+  await target.fetch("https://cli-chat-proxy.grok.com/v1/billing/x");
+  await target.fetch(new URL("https://OpenCode.ai/zen/go/v1/usage"));
+  await target.fetch(new Request("https://opencode.ai/zen/go/v1/usage", { headers: { authorization: "Bearer x" } }));
+  await target.fetch(new Request("https://cli-chat-proxy.grok.com/v1/billing?format=credits"));
+  await target.fetch(new Request("https://opencode.ai/zen/go/v1/models"));
+  await target.fetch(new Request("https://cli-chat-proxy.grok.com/v1/models"));
+  await target.fetch("not a url");
+  expect(calls).toEqual([
+    "undici https://opencode.ai/zen/go/v1/usage true",
+    "native https://opencode.ai/zen/go/v1/chat/completions",
+    "native https://opencode.ai/zen/go/v1/usage/extra",
+    "native https://opencode.ai/",
+    "undici https://cli-chat-proxy.grok.com/v1/billing?format=credits true",
+    "native https://cli-chat-proxy.grok.com/v1/chat/completions",
+    "native https://cli-chat-proxy.grok.com/v1/billing/x",
+    "undici https://opencode.ai/zen/go/v1/usage true",
+    "undici https://opencode.ai/zen/go/v1/usage true",
+    "undici https://cli-chat-proxy.grok.com/v1/billing?format=credits true",
+    "native https://opencode.ai/zen/go/v1/models",
+    "native https://cli-chat-proxy.grok.com/v1/models",
+    "native not a url",
+  ]);
+});
