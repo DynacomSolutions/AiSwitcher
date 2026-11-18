@@ -37,6 +37,12 @@ export function wantsAutoBackgroundSync(command: string | undefined, rest: strin
 }
 
 export async function runCli(argv: string[]): Promise<void> {
+  // The ACP relay owns stdin and stdout (a JSON-RPC stream) and passes the agent's arguments on unread, so it runs
+  // before argument parsing, help, home migration and background sync.
+  if (argv[0] === "__acp_relay") {
+    const { runAcpRelayProcess } = await import("./gateway/t3-acp.ts");
+    process.exit(await runAcpRelayProcess(argv.slice(1)));
+  }
   const { positionals, flags } = parseArgs(argv);
   const [command, ...rest] = positionals;
 
