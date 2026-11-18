@@ -6,11 +6,11 @@ import { applyT3Instance, type InstanceDriver, type T3InstanceOptions } from "..
 import { isUsageTrouble, describeUsageResult } from "../../identities/t3-usage-credentials.ts";
 import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
-import type { GatewayCliDeps } from "./apps.ts";
+import { connect, type GatewayCliDeps } from "./apps.ts";
 import { DEFAULT_CONNECT_CA } from "./claude-proxy.ts";
 import { readSecretsKey } from "./secrets-file.ts";
 
-const USAGE = "Usage: ais gateway t3-instance <instance-id> --driver=claude|grok --app=<gateway app> [--name=<name>] [--models=a,b] [--like=<claude instance id>] [--binary=<path>] [--check] [--remove]";
+const USAGE = "Usage: ais gateway t3-instance <instance-id> --driver=claude|grok|pi --app=<gateway app> [--name=<name>|--display-name=<name>] [--provider=<slug>] [--models=a,b] [--like=<claude instance id>] [--binary=<path>] [--check] [--remove]";
 
 /**
  * `ais gateway t3-instance`: creates or updates one T3 Code provider instance whose folder holds only the gateway app
@@ -24,7 +24,7 @@ export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["fl
   if (check && remove) throw new CliUsageError("--check and --remove cannot be combined");
   const driver = stringFlag(flags, "driver");
   const app = stringFlag(flags, "app");
-  if (driver !== "claude" && driver !== "grok") throw new CliUsageError(`--driver=claude|grok is required. ${USAGE}`);
+  if (driver !== "claude" && driver !== "grok" && driver !== "pi") throw new CliUsageError(`--driver=claude|grok|pi is required. ${USAGE}`);
   if (!app && !remove) throw new CliUsageError(`--app=<gateway app> is required. ${USAGE}`);
   const models = stringFlag(flags, "models")?.split(",").map((m) => m.trim()).filter(Boolean);
   const base: T3InstanceOptions = {
@@ -41,11 +41,27 @@ export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["fl
     const v = stringFlag(flags, k);
     if (v) base[k] = v;
   }
+  const displayName = stringFlag(flags, "display-name");
+  if (displayName) base.name = displayName;
   if (models && models.length > 0) base.models = models;
   if (!remove) {
     const root = (await readSecretsKey("AIS_GATEWAY_PROXY_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_PROXY_URL;
     if (!root) throw new CliUsageError("Proxy base URL unknown: set AIS_GATEWAY_PROXY_URL in ~/.secrets");
     base.gatewayUrl = `${root.replace(/\/+$/, "")}/${app}`;
+    if (driver === "pi") {
+      // The upstream provider slug names the pi provider. Without the admin API the app name is used.
+      const given = stringFlag(flags, "provider");
+      if (given) base.provider = given;
+      else {
+        try {
+          const { admin } = await connect(deps);
+          const { json } = await admin.call("GET", `/apps/${app}`);
+          if (typeof json.provider === "string" && json.provider !== "") base.provider = json.provider;
+        } catch {
+          // keep the fallback
+        }
+      }
+    }
     if (driver === "claude") {
       const proxyUrl =
         stringFlag(flags, "proxy") ??

@@ -208,3 +208,67 @@ describe("grok launcher models rewrite", () => {
     expect(r.code).toBe(0);
   });
 });
+
+describe("pi driver", () => {
+  const piOpts = (o: Partial<T3InstanceOptions> = {}) =>
+    opts({ id: "p1", driver: "pi", app: "kimi-app", provider: "kimi", gatewayUrl: "https://gw.example/gateway/kimi-app", models: ["k1", "k2"], name: "Pi One", ...o });
+  beforeEach(async () => {
+    await writeFile(secrets, `AIS_GATEWAY_APP_KIMI_APP_TOKEN=${TOKEN}\n`, { flag: "a" });
+  });
+
+  test("create writes token, models.json, settings.json and the instance entry", async () => {
+    const r = await applyT3Instance(piOpts());
+    expect(r.status).toBe("created");
+    const folder = join(home, ".t3", "gateway", "p1");
+    expect(await readFile(join(folder, "token"), "utf8")).toBe(`${TOKEN}\n`);
+    expect(await mode(join(folder, "token"))).toBe(0o600);
+    const models = JSON.parse(await readFile(join(folder, "models.json"), "utf8"));
+    const prov = models.providers.kimi;
+    expect(prov.baseUrl).toBe("https://gw.example/gateway/kimi-app");
+    expect(prov.api).toBe("anthropic-messages");
+    expect(prov.apiKey).toBe(`!cat '${join(folder, "token")}'`);
+    expect(prov.models.map((m: { id: string }) => m.id)).toEqual(["k1", "k2"]);
+    expect(prov.models[0]).toMatchObject({ contextWindow: 262144, maxTokens: 32768, input: ["text"], reasoning: false });
+    expect(JSON.stringify(models)).not.toContain(TOKEN);
+    expect(await mode(join(folder, "models.json"))).toBe(0o600);
+    expect(JSON.parse(await readFile(join(folder, "settings.json"), "utf8"))).toEqual({ defaultProvider: "kimi", defaultModel: "k1" });
+    expect(await mode(join(folder, "settings.json"))).toBe(0o600);
+    const entry = (await settings()).providerInstances.p1;
+    expect(entry).toEqual({
+      driver: "pi",
+      displayName: "Pi One",
+      enabled: true,
+      environment: [{ name: "PI_CODING_AGENT_DIR", value: folder, sensitive: false }],
+      config: { binaryPath: join(home, ".local", "bin", "pi"), customModels: ["k1", "k2"] },
+    });
+    expect(JSON.stringify(await settings())).not.toContain(TOKEN);
+    expect((await settings()).providerInstances.other).toEqual({ driver: "codex", enabled: true });
+  });
+
+  test("provider falls back to the app name; models are required", async () => {
+    await applyT3Instance(piOpts({ provider: undefined }));
+    const folder = join(home, ".t3", "gateway", "p1");
+    expect(Object.keys(JSON.parse(await readFile(join(folder, "models.json"), "utf8")).providers)).toEqual(["kimi-app"]);
+    await expect(applyT3Instance(piOpts({ id: "p2", models: undefined }))).rejects.toThrow("--models");
+  });
+
+  test("current, --check and update", async () => {
+    expect((await applyT3Instance(piOpts({ check: true }))).status).toBe("created");
+    expect(await settings().then((s) => s.providerInstances.p1)).toBeUndefined();
+    await applyT3Instance(piOpts());
+    expect((await applyT3Instance(piOpts())).status).toBe("current");
+    expect((await applyT3Instance(piOpts({ check: true }))).status).toBe("current");
+    expect((await applyT3Instance(piOpts({ check: true, models: ["k9"] }))).status).toBe("updated");
+    const r = await applyT3Instance(piOpts({ models: ["k9"] }));
+    expect(r.status).toBe("updated");
+    expect(JSON.parse(await readFile(join(home, ".t3", "gateway", "p1", "settings.json"), "utf8")).defaultModel).toBe("k9");
+  });
+
+  test("--remove drops the entry and keeps the folder", async () => {
+    await applyT3Instance(piOpts());
+    expect((await applyT3Instance(piOpts({ remove: true }))).status).toBe("removed");
+    expect((await settings()).providerInstances.p1).toBeUndefined();
+    expect((await stat(join(home, ".t3", "gateway", "p1"))).isDirectory()).toBe(true);
+    expect((await applyT3Instance(piOpts({ remove: true }))).status).toBe("absent");
+  });
+});
