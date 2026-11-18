@@ -409,6 +409,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const ledger = new LedgerBuffer(store, hooks.ledger ?? { max: 50_000, flushMs: 2_000 });
   const metrics = new PrometheusMetrics({ ledgerDepth: () => ledger.depth, ledgerDropped: () => ledger.dropped });
   metrics.publicHostsConfigured(publicHosts.length);
+  metrics.appNoticesUp = () => (store.listening ? 1 : 0);
   if (publicHosts.length === 0) console.warn("gateway: AIS_GATEWAY_PUBLIC_HOSTS is empty, so /metrics, /healthz, /readyz and /browser/pair answer on every host, including a public tunnel; set it to the public host names");
   const alerter = createAlerter(hooks.notify ?? stderrNotifier);
   const failedTokens = new Map<string, string>();

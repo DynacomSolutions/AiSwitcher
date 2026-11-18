@@ -196,3 +196,228 @@ describe("the cache never brings a revoked app back", () => {
     expect(await verifyToken(cache, "web", t.token, new Date(Date.now() + 1000))).toBe(false);
   });
 });
+
+describe("the notice subscription heals itself", () => {
+  const app = { name: "web", owner: "o", namespace: "ns", provider: "claude" as const, style: "anthropic" as const, target: { kind: "pin" as const, identity: "id1" }, state: "active" as const, createdAt: NOW.toISOString() };
+
+  /** Counts subscriptions and can lose pings or fail to subscribe. */
+  class FlakyStore extends MemoryGatewayStore {
+    subscriptions = 0;
+    failListen = 0;
+    losePings = false;
+    override async listenAppChanges(onApp: (name: string) => void): Promise<() => Promise<void>> {
+      if (this.failListen > 0) {
+        this.failListen--;
+        throw new Error("listen failed");
+      }
+      this.subscriptions++;
+      return super.listenAppChanges(onApp);
+    }
+    override async pingAppChanges(payload: string): Promise<void> {
+      if (!this.losePings) await super.pingAppChanges(payload);
+    }
+  }
+
+  /** Records which apps a notice re-read. */
+  function spy(cache: CachedGatewayStore): string[] {
+    const calls: string[] = [];
+    const orig = cache.refreshApp.bind(cache);
+    cache.refreshApp = async (n: string) => {
+      calls.push(n);
+      return orig(n);
+    };
+    return calls;
+  }
+
+  test("a dropped subscription is found by the ping and replaced on a tick", async () => {
+    const flaky = new FlakyStore();
+    await flaky.putApp(app);
+    const cache = new CachedGatewayStore(flaky);
+    caches.push(cache);
+    const calls = spy(cache);
+    await cache.warm();
+    await cache.startListening();
+    expect(flaky.subscriptions).toBe(1);
+    flaky.dropListeners(); // the connection is lost and nobody is told
+    const orig = console.warn;
+    console.warn = () => {};
+    try {
+      cache.startRefresh(10);
+      await waitFor(() => flaky.subscriptions === 2);
+      await waitFor(() => cache.listening);
+      await flaky.putApp({ ...app, name: "probe" });
+      await waitFor(() => calls.includes("probe"));
+    } finally {
+      console.warn = orig;
+    }
+    // Ping notices never re-read an app.
+    expect(calls.every((c) => !c.startsWith("!"))).toBe(true);
+  });
+
+  test("a ping that never comes back triggers a new subscription, and warns once per streak", async () => {
+    const flaky = new FlakyStore();
+    flaky.losePings = true;
+    const cache = new CachedGatewayStore(flaky);
+    caches.push(cache);
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    try {
+      await cache.warm();
+      await cache.startListening();
+      cache.startRefresh(10);
+      await waitFor(() => flaky.subscriptions >= 4);
+    } finally {
+      console.warn = orig;
+    }
+    expect(warnings.filter((w) => w.includes("app change notices unavailable"))).toHaveLength(1);
+  });
+
+  test("a failed subscribe is retried on each tick and warns once", async () => {
+    const flaky = new FlakyStore();
+    flaky.failListen = 3;
+    const cache = new CachedGatewayStore(flaky);
+    caches.push(cache);
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    try {
+      await cache.warm();
+      await expect(cache.startListening()).rejects.toThrow("listen failed");
+      expect(cache.listening).toBe(false);
+      cache.startRefresh(10);
+      await waitFor(() => cache.listening);
+    } finally {
+      console.warn = orig;
+    }
+    expect(flaky.failListen).toBe(0);
+    expect(warnings.filter((w) => w.includes("app change notices unavailable"))).toHaveLength(1);
+  });
+
+  test("stop() ends the ticks and never resubscribes", async () => {
+    const flaky = new FlakyStore();
+    const cache = new CachedGatewayStore(flaky);
+    caches.push(cache);
+    await cache.warm();
+    await cache.startListening();
+    cache.startRefresh(10);
+    cache.stop();
+    flaky.dropListeners();
+    await Bun.sleep(60);
+    expect(flaky.subscriptions).toBe(1);
+    expect(cache.listening).toBe(false);
+  });
+});
+
+describe("races between a write, a notice and a refresh", () => {
+  const app = { name: "x", owner: "o", namespace: "ns", provider: "claude" as const, style: "anthropic" as const, target: { kind: "pin" as const, identity: "id1" }, state: "active" as const, createdAt: NOW.toISOString() };
+
+  test("putApp that is overtaken by a revoke notice keeps the app revoked", async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    // The write reaches the store, then the answer is held back while the revoke happens.
+    class SlowPut extends MemoryGatewayStore {
+      hold = false;
+      override async putApp(a: Parameters<MemoryGatewayStore["putApp"]>[0]): Promise<void> {
+        await super.putApp(a);
+        if (this.hold) await gate;
+      }
+    }
+    const inner = new SlowPut();
+    await inner.putApp(app);
+    const cache = new CachedGatewayStore(inner);
+    caches.push(cache);
+    await cache.warm();
+    await cache.startListening();
+    inner.hold = true;
+    const writing = cache.putApp({ ...app, owner: "o2" });
+    await Bun.sleep(5);
+    await inner.revokeApp("x");
+    await waitFor(async () => (await cache.getApp("x"))?.state === "revoked");
+    open();
+    await expect(writing).rejects.toBeInstanceOf(AppRevokedError);
+    expect((await cache.getApp("x"))?.state).toBe("revoked");
+    // The cache shows what the store holds (the write landed before the revoke), and still revoked.
+    expect((await cache.getApp("x"))?.owner).toBe("o2");
+  });
+
+  test("addToken that is overtaken by a revoke notice does not add the token to the cache", async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    class SlowAdd extends MemoryGatewayStore {
+      hold = false;
+      override async addToken(rec: Parameters<MemoryGatewayStore["addToken"]>[0]): Promise<void> {
+        await super.addToken(rec);
+        if (this.hold) await gate;
+      }
+    }
+    const inner = new SlowAdd();
+    await inner.putApp(app);
+    const cache = new CachedGatewayStore(inner);
+    caches.push(cache);
+    await cache.warm();
+    await cache.startListening();
+    inner.hold = true;
+    const t = generateToken();
+    const adding = cache.addToken({ app: "x", prefix: t.prefix, hash: t.hash, createdAt: NOW.toISOString() });
+    await Bun.sleep(5);
+    await inner.revokeApp("x");
+    await waitFor(async () => (await cache.getApp("x"))?.state === "revoked");
+    open();
+    await expect(adding).rejects.toBeInstanceOf(AppRevokedError);
+    expect(await verifyToken(cache, "x", t.token, new Date(Date.now() + 1000))).toBe(false);
+  });
+
+  test("a burst of writes to other apps does not stop refreshApp from applying a revoke", async () => {
+    await shared.putApp(app);
+    let cache!: CachedGatewayStore;
+    let n = 0;
+    // Every read of x is overtaken by a local write to a different app.
+    const burst = new Proxy(shared, {
+      get(target, prop, receiver) {
+        if (prop === "getApp") {
+          return async (name: string) => {
+            if (name === "x") await cache.putApp({ ...app, name: `o${n++}` });
+            return target.getApp(name);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as MemoryGatewayStore;
+    cache = new CachedGatewayStore(burst);
+    caches.push(cache);
+    await cache.warm();
+    await shared.revokeApp("x");
+    await cache.refreshApp("x");
+    expect(n).toBe(1); // one attempt was enough: the other apps' writes did not count against x
+    expect((await cache.getApp("x"))?.state).toBe("revoked");
+  });
+
+  test("when local writes to the same app keep overtaking the read, a revoked read is still applied", async () => {
+    await shared.putApp(app);
+    let cache!: CachedGatewayStore;
+    let reads = 0;
+    const burst = new Proxy(shared, {
+      get(target, prop, receiver) {
+        if (prop === "getApp") {
+          return async (name: string) => {
+            reads++;
+            if (name === "x") await cache.expireTokens("x", "2099-01-01T00:00:00.000Z");
+            return target.getApp(name);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as MemoryGatewayStore;
+    cache = new CachedGatewayStore(burst);
+    caches.push(cache);
+    await cache.warm();
+    reads = 0;
+    await shared.revokeApp("x");
+    await cache.refreshApp("x");
+    expect(reads).toBe(3);
+    expect((await cache.getApp("x"))?.state).toBe("revoked");
+  });
+});

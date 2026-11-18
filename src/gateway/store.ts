@@ -28,6 +28,8 @@ export interface GatewayStore {
   revokeApp(name: string): Promise<void>;
   /** Calls `onApp` with the app name whenever any replica changes an app or its tokens. Returns an unlisten function. Optional: a store without it relies on the periodic refresh. */
   listenAppChanges?(onApp: (name: string) => void): Promise<() => Promise<void>>;
+  /** Sends a control notice on the app-change channel (payload starts with "!", so no app name can equal it). A cache uses it to check that its subscription is alive. */
+  pingAppChanges?(payload: string): Promise<void>;
   appendUsage(rows: UsageRow[]): Promise<void>;
   usageSince(app: string, since: Date): Promise<number>;
   /** usageSince for every app at once (one ledger scan), keyed by app; apps with no rows are absent. */
@@ -97,6 +99,15 @@ export class MemoryGatewayStore implements GatewayStore {
     return async () => {
       this.appListeners.delete(onApp);
     };
+  }
+
+  async pingAppChanges(payload: string): Promise<void> {
+    this.changed(payload);
+  }
+
+  /** Drops every listener without telling it, as a lost database connection would (for tests). */
+  dropListeners(): void {
+    this.appListeners.clear();
   }
 
   async putApp(app: GatewayApp): Promise<void> {

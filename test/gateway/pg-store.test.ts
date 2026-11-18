@@ -160,6 +160,19 @@ if (!url && process.env.CI && !optOut) {
       expect(seen).toEqual(["web", "web", "web", "web"]);
     });
 
+    test("a ping notice reaches a listener and never names an app", async () => {
+      const writer = await fresh();
+      const listener = new PgGatewayStore(url);
+      stores.push(listener);
+      const seen: string[] = [];
+      const unlisten = await listener.listenAppChanges?.((n) => seen.push(n));
+      await writer.pingAppChanges("!ping:abc");
+      const end = Date.now() + 3000;
+      while (seen.length < 1 && Date.now() < end) await Bun.sleep(10);
+      await unlisten?.();
+      expect(seen).toEqual(["!ping:abc"]);
+    });
+
     test("a revoke through one store makes a cache over another store reject the old token", async () => {
       const writer = await fresh();
       const other = new PgGatewayStore(url);

@@ -139,6 +139,11 @@ export class PgGatewayStore implements GatewayStore {
     };
   }
 
+  /** A control notice on the app-change channel; unlike a write notice it throws, so a failed probe shows. */
+  async pingAppChanges(payload: string): Promise<void> {
+    await this.sql`SELECT pg_notify(${APPS_CHANNEL}, ${payload})`;
+  }
+
   async putApp(a: GatewayApp): Promise<void> {
     const models = a.models === undefined ? null : JSON.stringify(a.models);
     // The WHERE keeps a revoked row untouched: a revoked app is final, whatever a stale replica sends.
