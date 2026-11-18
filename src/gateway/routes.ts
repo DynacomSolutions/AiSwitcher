@@ -316,17 +316,25 @@ function codexAccountsCheck(app: GatewayApp): Response {
   });
 }
 
-/** The reading of the member the pool would route to: the pin, or the pool member with the lowest utilisation. */
-export async function leastUsed(ctx: ServeContext): Promise<PoolUsage | undefined> {
-  const readings = (await memberUsages(ctx.app, ctx.deps)).filter((u) => u !== undefined && utilisationOf(u) !== undefined);
-  let best = readings[0];
-  for (const u of readings) if ((utilisationOf(u) ?? 0) < (utilisationOf(best) ?? 0)) best = u;
-  return best;
+/**
+ * The reading of the member the pool would route to: the pin, or the pool member with the lowest utilisation.
+ * The member is chosen on account-wide windows. With `scoped`, its reading keeps its per-model windows (a Fable weekly).
+ */
+export async function leastUsed(ctx: ServeContext, scoped = false): Promise<PoolUsage | undefined> {
+  const chosen = await memberUsages(ctx.app, ctx.deps);
+  const full = scoped ? await memberUsages(ctx.app, ctx.deps, undefined, true) : chosen;
+  let best: number | undefined;
+  chosen.forEach((u, i) => {
+    const util = utilisationOf(u);
+    if (u === undefined || util === undefined) return;
+    if (best === undefined || util < (utilisationOf(chosen[best]) ?? 0)) best = i;
+  });
+  return best === undefined ? undefined : full[best];
 }
 
 /** The two windows of the member the pool would route to (lowest utilisation), in the shape of Anthropic's usage endpoint. */
 export async function claudeUsageBody(ctx: ServeContext): Promise<Record<string, unknown>> {
-  return claudeUsageBodyOf(await leastUsed(ctx));
+  return claudeUsageBodyOf(await leastUsed(ctx, true));
 }
 
 /** The same body for one reading (a pinned member's own poll data). */
