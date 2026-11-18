@@ -511,6 +511,10 @@ credential (static key or the Console login's OAuth access token), the import wr
 `data/opencode/ais-gateway-key.json` for the replicas (never onto the host), even when `auth.json` still holds a key.
 OpenCode v2 never updates `auth.json` after a new sign-in, so its key can be long expired. The gateway reads the
 database first, then that derived file, then `auth.json`.
+The Console login is a 30-day OAuth grant with a rotating refresh token that OpenCode renews only when it runs. The
+console's auth refresh scheduler renews it 72 hours before expiry (`src/identities/opencode-console-refresh.ts`,
+OpenCode's own `POST <server>/auth/device/token` request) and writes it back to opencode.db with a compare-and-swap;
+the next import carries the new token to the gateway. `ais auth refresh <identity> --tool=opencode` renews it now.
 
 Encryption: AES-256-GCM, key in `AIS_GATEWAY_STORE_KEY` (32 random bytes, base64 or hex; `openssl rand -base64 32`), the
 path as associated data. Losing the key loses the logins (re-run the import from the host files); rotating it means a
