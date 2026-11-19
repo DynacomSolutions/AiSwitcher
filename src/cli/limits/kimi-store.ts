@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { recordReadFailure } from "../../identities/oauth-reconcile.ts";
 import { withOauthRefreshLock } from "../../identities/claude-swap-lock.ts";
-import { isGatewayManagedHere } from "../../identities/gateway-managed.ts";
+import { isGatewayManagedHere, isGatewayOwnerProcess } from "../../identities/gateway-managed.ts";
 import { KIMI_CONFIG, PI_CONFIG } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { isRetired } from "../../identities/retired.ts";
@@ -106,6 +106,19 @@ async function writeJsonAtomic(path: string, value: Record<string, unknown>): Pr
   const temp = `${path}.tmp-${process.pid}`;
   await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   await rename(temp, path);
+}
+
+/** Writes a native credentials file with the access token and expiry only: the refresh token is dropped (a pool copy of a gateway-owned login). */
+async function writeNativeAccessOnly(path: string, next: KimiOAuthCredentials): Promise<void> {
+  const { refresh_token: _spent, ...raw } = ((await readJson(path)) as NativeCredentialsFile | undefined) ?? {};
+  await writeJsonAtomic(path, { ...raw, access_token: next.access_token, ...(next.expires_at !== undefined ? { expires_at: next.expires_at } : {}) });
+}
+
+/** Writes a pi auth.json kimi-coding entry with the access token and expiry only: the refresh token is emptied (pi needs a string there). */
+async function writePiAccessOnly(path: string, next: KimiOAuthCredentials): Promise<void> {
+  const raw = (await readJson(path)) as Record<string, unknown> | undefined;
+  const entry = (raw?.["kimi-coding"] as PiKimiEntry | undefined) ?? {};
+  await writeJsonAtomic(path, { ...(raw ?? {}), "kimi-coding": { ...entry, type: "oauth", access: next.access_token, refresh: "", ...(next.expires_at !== undefined ? { expires: next.expires_at * 1000 } : {}) } });
 }
 
 function storeFor(kind: "native" | "pi", path: string): Store {
@@ -241,6 +254,8 @@ async function writeThroughPools(identity: Identity, next: KimiOAuthCredentials)
   if (isRetired(identity) || identity.swapPool) return;
   const mine = pairIdentity(next.access_token, next.refresh_token).id;
   if (!mine) return;
+  // A login the gateway renews never leaves its refresh token in a pool: a session there could rotate it outside the guard.
+  const gatewayOwned = isGatewayOwnerProcess() || (await isGatewayManagedHere("kimi", identity.name));
   for (const store of await poolStoresFor(identity)) {
     const sameAccount = async () => {
       const current = await store.read();
@@ -251,7 +266,9 @@ async function writeThroughPools(identity: Identity, next: KimiOAuthCredentials)
     const poolDir = store.kind === "native" ? dirname(dirname(store.path)) : dirname(store.path);
     const toolLock = store.kind === "native" ? { path: join(poolDir, "oauth", "kimi-code.lock"), staleMs: 5_000 } : { path: join(poolDir, "auth.json.lock"), staleMs: 30_000 };
     const guarded = () => withOauthRefreshLock(poolDir, () => withLockDir(toolLock.path, toolLock.staleMs, "pool credentials are being refreshed", async () => {
-      if (await sameAccount()) await store.writeUnlocked(next);
+      if (!(await sameAccount())) return;
+      if (gatewayOwned) await (store.kind === "pi" ? writePiAccessOnly(store.path, next) : writeNativeAccessOnly(store.path, next));
+      else await store.writeUnlocked(next);
     }), { timeoutMs: 1_500 });
     await guarded().catch(() => undefined);
   }
@@ -265,8 +282,11 @@ async function writeThroughPools(identity: Identity, next: KimiOAuthCredentials)
 export async function kimiRefreshContext(
   identity: Identity,
   self: "kimi" | "pi",
-): Promise<{ lockDir: string; gatewayManaged?: boolean; reread: () => Promise<KimiOAuthCredentials | undefined> }> {
+  opts: { noRefresh?: boolean } = {},
+): Promise<{ lockDir: string; gatewayManaged?: boolean; noRefresh?: boolean; reread: () => Promise<KimiOAuthCredentials | undefined> }> {
   const lockDir = self === "kimi" ? identity.configDir : ((await configDirFor("kimi", identity.name)) ?? identity.configDir);
-  const gatewayManaged = await isGatewayManagedHere("kimi", identity.name);
-  return { lockDir, ...(gatewayManaged ? { gatewayManaged } : {}), reread: () => readFreshestKimiCredentials(identity, self) };
+  // The gateway process counts as the owner too: its only refresher of a login is the guarded one (journal, advisory lock).
+  // A usage read must never rotate a grant there: it would bypass the guard and the journal.
+  const gatewayManaged = isGatewayOwnerProcess() || (await isGatewayManagedHere("kimi", identity.name));
+  return { lockDir, ...(gatewayManaged ? { gatewayManaged } : {}), ...(opts.noRefresh ? { noRefresh: true } : {}), reread: () => readFreshestKimiCredentials(identity, self) };
 }

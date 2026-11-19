@@ -411,6 +411,15 @@ export async function writeGrantThroughStores(
 /** An expired kimi grant is renewed when the last successful refresh is older than this. */
 const KIMI_EXPIRED_RETRY_S = 2 * 3600;
 
+/** Kimi access tokens live about 15 minutes. */
+export const KIMI_ACCESS_TOKEN_LIFETIME_S = 900;
+/**
+ * The gateway keep-alive renews a kimi token when fewer than this many seconds of its life remain. The line is the lifetime
+ * minus 30 seconds: a 15 minute token is renewed on every tick, even a tick that runs late, and only a token minted in the
+ * last 30 seconds is left alone. So a pool copy is never older than one tick. A busy guard is retried after one minute (serve.ts).
+ */
+export const KIMI_RENEW_BELOW_S = KIMI_ACCESS_TOKEN_LIFETIME_S - 30;
+
 /** The refresh decision for the scheduler's cadence: refresh when the
  * access token is within `expiryWindowHours` of expiry, and at least once
  * a day even for long-lived tokens (so a healthy grant is still exercised
@@ -420,11 +429,18 @@ const KIMI_EXPIRED_RETRY_S = 2 * 3600;
  * the previous refresh token: tools in SHORT_TOKEN_EXPIRY_WINDOW_HOURS cap
  * the window to their entry and skip the daily keep-alive (a valid token
  * rotates naturally). Kimi's ~15min token is shorter than 1.5 ticks, so no
- * window avoids a refresh per tick: the kimi CLI refreshes it when used, and
- * the daemon only runs the daily keep-alive (never the expiry window). */
+ * window avoids a refresh per tick. A caller without `renewBelowSeconds` (the
+ * host daemon, the CLI) refreshes kimi only on the daily keep-alive: this
+ * avoids about 144 rotations a day. The gateway keep-alive is the exception.
+ * It sets `renewBelowSeconds` and renews a gateway-owned kimi login on every
+ * tick, through the guard and the journal. This costs the same rotations as
+ * the old unguarded usage poll, but each one is single-writer and recorded.
+ * The gain is that the token in the store and in the pools is never older than
+ * one tick and never expires between ticks, so a session in a pool keeps
+ * working. The daily keep-alive stays as the fallback. */
 export function shouldAttemptOAuthRefresh(
   grant: OAuthGrant,
-  options: { force?: boolean; expiryWindowHours?: number; lastSuccessAt?: string | null; nowSeconds?: number; tool?: RefreshableTool; renewFraction?: number },
+  options: { force?: boolean; expiryWindowHours?: number; lastSuccessAt?: string | null; nowSeconds?: number; tool?: RefreshableTool; renewFraction?: number; renewBelowSeconds?: number },
 ): { attempt: boolean; reason: string } {
   const now = options.nowSeconds ?? Math.floor(Date.now() / 1000);
   const toolWindow = options.tool === undefined ? undefined : SHORT_TOKEN_EXPIRY_WINDOW_HOURS[options.tool];
@@ -442,6 +458,10 @@ export function shouldAttemptOAuthRefresh(
   const windowSeconds = windowHours * 3600;
   const secondsLeft = grant.expires_at === undefined ? Number.POSITIVE_INFINITY : grant.expires_at - now;
   if (options.force) return { attempt: true, reason: "manual refresh" };
+  // The gateway keep-alive renews a kimi token on every tick (see KIMI_RENEW_BELOW_S). Other callers keep the daily rule below.
+  if (options.tool === "kimi" && options.renewBelowSeconds !== undefined && secondsLeft < options.renewBelowSeconds) {
+    return { attempt: true, reason: `kimi access token has ${Math.max(0, Math.round(secondsLeft))} s left, below the ${Math.round(options.renewBelowSeconds)} s renew line` };
+  }
   if (options.tool !== "kimi" && secondsLeft <= windowSeconds) {
     return {
       attempt: true,
@@ -766,6 +786,8 @@ export interface OAuthRefreshOptions {
   keepAlive?: boolean;
   /** Renew a short-lived token (claude, grok) once this share of its lifetime has passed. Set by the gateway keep-alive only. */
   renewFraction?: number;
+  /** Renew a kimi token when less than this many seconds of its life remain. Set by the gateway keep-alive only (see KIMI_RENEW_BELOW_S). */
+  renewBelowSeconds?: number;
   /** Compare-and-refresh: when set, the refresh proceeds only if the freshest
    * stored access token (re-read under the locks) still has this value;
    * otherwise another process already rotated it and no token request is
@@ -856,6 +878,7 @@ export async function refreshIdentityOAuthGrant(
       nowSeconds: Math.floor((options.now ?? Date.now)() / 1000),
       tool,
       ...(options.renewFraction !== undefined ? { renewFraction: options.renewFraction } : {}),
+      ...(options.renewBelowSeconds !== undefined ? { renewBelowSeconds: options.renewBelowSeconds } : {}),
     });
     if (!decision.attempt) {
       return {
@@ -982,6 +1005,7 @@ async function refreshGrantUnlocked(
     nowSeconds: nowSeconds(),
     tool,
     ...(options.renewFraction !== undefined ? { renewFraction: options.renewFraction } : {}),
+    ...(options.renewBelowSeconds !== undefined ? { renewBelowSeconds: options.renewBelowSeconds } : {}),
   });
   if (!decision.attempt) {
     return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason, storesProbed: true, ...(readFailed ? { unreadableStores: probed.unreadable } : {}) };
