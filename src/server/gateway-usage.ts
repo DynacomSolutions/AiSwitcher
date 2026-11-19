@@ -297,12 +297,104 @@ export function combineHostRows(rows: UsageResult[]): UsageResult {
   };
 }
 
+/** True when the host row label carries the gateway transport ("ais-gateway" or "ais-gateway, openai"). */
+function isGatewayLabelled(row: UsageResult): boolean {
+  return (row.provider ?? "").split(",").some((part) => canonicalUsageProvider(part) === GATEWAY_TRANSPORT_PROVIDER);
+}
+
+/** True when a host row has a daily split that carries cost: a split we can cut at the coverage start. */
+function hasDailyCostSplit(row: UsageResult): boolean {
+  const totals = row.dailyTotals;
+  if (!totals || Object.keys(totals).length === 0) return false;
+  const cost = Object.values(totals).reduce((sum, v) => sum + (Array.isArray(v) ? (v[5] ?? 0) : 0), 0);
+  return cost > 0 || (row.report?.totalCost ?? 0) <= 0;
+}
+
+/** The first instant of a "YYYY-MM-DD" day in an IANA zone (DST edge cases within the hour are ignored). */
+function zoneDayStartMs(day: string, zone: string): number {
+  const guess = Date.parse(`${day}T00:00:00Z`);
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: zone, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).formatToParts(new Date(guess)).map((p) => [p.type, p.value]));
+  const localAsUtc = Date.parse(`${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}Z`);
+  return guess - (localAsUtc - guess);
+}
+
+/**
+ * The share of a host row that counts as pre-coverage history when the row has no usable daily cost split.
+ * No dateSpan, or a span whose last day is before the coverage start: the whole report is history (fraction 1).
+ * A span that overlaps coverage: the share by time, fraction = (coverageStartMs - firstMs) / (lastMs - firstMs),
+ * clamped 0..1, applied to every numeric field of every entry. Days before the coverage start stay in the daily maps.
+ */
+function preCoverageShare(row: UsageResult, start: string | undefined, zone: string): UsageResult | undefined {
+  if (!row.report) return undefined;
+  const span = row.dateSpan;
+  let fraction = 1;
+  let startMs = Number.POSITIVE_INFINITY;
+  if (start && span && dayInZone(span.lastMs, zone) >= start) {
+    startMs = zoneDayStartMs(start, zone);
+    fraction = span.lastMs > span.firstMs ? (startMs - span.firstMs) / (span.lastMs - span.firstMs) : (span.firstMs < startMs ? 1 : 0);
+    fraction = Math.min(1, Math.max(0, fraction));
+  }
+  if (fraction <= 0) return undefined;
+  const entries = row.report.entries.map((e) => {
+    const scaled = { ...e };
+    for (const f of NUMERIC_ENTRY_FIELDS) scaled[f] = e[f] * fraction;
+    return scaled;
+  });
+  const keepDay = (day: string) => !start || day < start;
+  const dailyUsage = row.dailyUsage ? Object.fromEntries(Object.entries(row.dailyUsage).filter(([d]) => keepDay(d))) : undefined;
+  const dailyTotals = row.dailyTotals ? Object.fromEntries(Object.entries(row.dailyTotals).filter(([d]) => keepDay(d))) as DailyTotals : undefined;
+  return {
+    ...row,
+    report: {
+      entries,
+      totalInput: entries.reduce((x, e) => x + e.input, 0),
+      totalOutput: entries.reduce((x, e) => x + e.output, 0),
+      totalCacheRead: entries.reduce((x, e) => x + e.cacheRead, 0),
+      totalCacheWrite: entries.reduce((x, e) => x + e.cacheWrite, 0),
+      totalMessages: entries.reduce((x, e) => x + e.messageCount, 0),
+      totalCost: entries.reduce((x, e) => x + e.cost, 0),
+    },
+    ...(span ? { dateSpan: { firstMs: span.firstMs, lastMs: fraction < 1 ? Math.min(span.lastMs, startMs) : span.lastMs } } : {}),
+    ...(dailyUsage ? { dailyUsage } : {}),
+    ...(dailyTotals ? { dailyTotals } : {}),
+  };
+}
+
+/**
+ * Splices all host rows of one managed key with the gateway row. The rows are NOT combined across the gateway
+ * transport label first, because rows without a daily cost split would be lost in the splice:
+ *  - plain rows with a daily cost split: spliced by day (days before coverage from the host, the rest from the gateway);
+ *  - plain rows without one: kept whole as pre-coverage history when they end before coverage or have no dateSpan,
+ *    else by time share (see preCoverageShare);
+ *  - "ais-gateway" labelled rows: on and after coverage the gateway wins, days before coverage stay when the row has day
+ *    data, and a row without day data is dropped, because the ledger already covers gateway-routed traffic.
+ * The result is one row: report totals are the sum of the entries and the daily maps and span match what is kept.
+ */
+export function spliceHostRowsWithGateway(rows: UsageResult[], gateway: UsageResult, zone: string = usageBucketZone()): Pick<UsageResult, "report" | "dateSpan" | "dailyUsage" | "dailyTotals"> {
+  const gwDays = Object.keys(gateway.dailyTotals ?? {}).sort();
+  const start = gwDays[0] ?? (gateway.dateSpan ? dayInZone(gateway.dateSpan.firstMs, zone) : undefined);
+  const splittable: UsageResult[] = [];
+  const flat: UsageResult[] = [];
+  for (const row of rows) {
+    if (isGatewayLabelled(row)) {
+      // Dropped without day data: the gateway ledger already holds the traffic routed through the gateway.
+      if (row.dailyTotals && Object.keys(row.dailyTotals).length > 0) splittable.push(row);
+    } else if (hasDailyCostSplit(row)) splittable.push(row);
+    else flat.push(row);
+  }
+  const base = spliceHostWithGateway(splittable.length > 0 ? combineHostRows(splittable) : { ...rows[0]!, report: undefined, dailyTotals: undefined }, gateway, zone);
+  const pieces = flat.flatMap((row) => preCoverageShare(row, start, zone) ?? []);
+  if (pieces.length === 0) return base;
+  const combined = combineHostRows([{ provider: rows[0]!.provider, identity: rows[0]!.identity, ...base } as UsageResult, ...pieces]);
+  return { report: combined.report, dateSpan: combined.dateSpan, dailyUsage: combined.dailyUsage, dailyTotals: combined.dailyTotals };
+}
+
 /**
  * Merges the gateway rows into a host usage payload. History is never deleted. The gateway is authoritative for the
  * tokens, cost, messages and per-day figures of the identities it manages from its first ledger day on. Host days
  * before that day stay (see spliceHostWithGateway), so all-time totals keep the history from before the gateway
- * existed. Host rows that share one managed key (another provider label) are combined first (see combineHostRows),
- * never dropped. The host's registry entry and overage stay. A managed identity is one the gateway reported or the
+ * existed. Host rows that share one managed key (another provider label) are spliced together (see spliceHostRowsWithGateway):
+ * rows with no daily cost split stay as pre-coverage history, never dropped. The host's registry entry and overage stay. A managed identity is one the gateway reported or the
  * host registries list as gateway-managed. With no ledger rows in the window the combined host row stays as it is,
  * because host history is then the only record. When the gateway read fails the host numbers stay and the row gains a
  * "gateway usage unavailable" error. Host rows for identities the gateway does not manage stay as they are; gateway
@@ -360,7 +452,7 @@ export async function mergeGatewayUsage(
     const gateway = gatewayByKey.get(key);
     if (gateway?.report) {
       used.add(key);
-      const spliced = spliceHostWithGateway(row, gateway);
+      const spliced = spliceHostRowsWithGateway(groups.get(key)!, gateway);
       return [{
         ...stripNumbers(row),
         provider,

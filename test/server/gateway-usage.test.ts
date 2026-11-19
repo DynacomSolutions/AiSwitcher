@@ -354,3 +354,91 @@ describe("host history before gateway coverage", () => {
     expect(added.report.totalCost).toBeCloseTo(3);
   });
 });
+
+describe("host rows with no daily cost split", () => {
+  const entry = (cost: number, input = 100) => ({ model: "gpt", provider: "openai", input, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, messageCount: 10, cost });
+  const rep = (cost: number, input = 100) => ({ entries: [entry(cost, input)], totalInput: input, totalOutput: 0, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 10, totalCost: cost });
+  const gwRows = [modelRow("codex", "team-a", "web", "gpt", { inputTokens: 30, outputTokens: 10, estCostUsd: 3, requests: 4, firstTs: "2026-11-02T01:00:00.000Z", lastTs: "2026-11-04T01:00:00.000Z" })];
+  const gwDaily = [
+    { day: "2026-11-02", provider: "codex", identity: "team-a", model: "gpt", inputTokens: 30, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 3, unpricedRequests: 0, requests: 4 } as ModelDailyUsageRow,
+  ];
+  const run = async (hosts: unknown[]) => ((await mergeGatewayUsage(payload(hosts), view(gwRows, { daily: gwDaily, dailyZone: "UTC" }), {}, noRegistries, noManaged)) as any).results;
+  const bare = (provider: string, over: Record<string, unknown>) => ({ provider, identity: identity("team-a"), ...over });
+
+  test("a row whose daily totals carry no cost and ends before coverage stays whole", async () => {
+    const host = bare("openai", {
+      report: rep(21983),
+      dateSpan: { firstMs: Date.parse("2026-04-24T01:00:00Z"), lastMs: Date.parse("2026-04-24T23:00:00Z") },
+      dailyUsage: { "2026-04-24": 100 },
+      dailyTotals: { "2026-04-24": [100, 0, 0, 0, 10, 0] },
+    });
+    const rows = await run([host]);
+    expect(rows).toHaveLength(1);
+    const r = rows[0];
+    expect(r.report.totalCost).toBeCloseTo(21983 + 3);
+    expect(r.report.totalInput).toBe(130);
+    expect(r.dailyUsage["2026-04-24"]).toBe(100);
+    expect(r.dailyTotals["2026-11-02"]).toEqual([30, 10, 0, 0, 4, 3]);
+    expect(r.dateSpan.firstMs).toBe(Date.parse("2026-04-24T01:00:00Z"));
+    expect(r.dateSpan.lastMs).toBe(Date.parse("2026-11-04T01:00:00.000Z"));
+  });
+
+  test("rows with no dateSpan and no daily data stay whole, one row per key", async () => {
+    const rows = await run([bare("openai", { report: rep(1522) }), bare("openai", { report: rep(324) })]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].report.totalCost).toBeCloseTo(1522 + 324 + 3);
+    expect(rows[0].report.entries).toHaveLength(1);
+  });
+
+  test("a row without a cost split that overlaps coverage keeps the share by time", async () => {
+    const host = bare("openai", {
+      report: rep(100),
+      dateSpan: { firstMs: Date.parse("2026-10-23T00:00:00Z"), lastMs: Date.parse("2026-11-12T00:00:00Z") },
+    });
+    const r = (await run([host]))[0];
+    // (Nov 2 - Oct 23) / (Nov 12 - Oct 23) = 10 / 20 = 0.5
+    expect(r.report.totalCost).toBeCloseTo(50 + 3);
+    expect(r.report.totalInput).toBeCloseTo(50 + 30);
+    expect(r.report.totalMessages).toBeCloseTo(5 + 4);
+    expect(r.dateSpan.firstMs).toBe(Date.parse("2026-10-23T00:00:00Z"));
+  });
+
+  test("a row with a cost split is still spliced by day", async () => {
+    const host = bare("openai", {
+      report: rep(20),
+      dateSpan: { firstMs: Date.parse("2026-10-01T00:00:00Z"), lastMs: Date.parse("2026-11-02T12:00:00Z") },
+      dailyUsage: { "2026-10-01": 50, "2026-11-02": 50 },
+      dailyTotals: { "2026-10-01": [50, 0, 0, 0, 5, 10], "2026-11-02": [50, 0, 0, 0, 5, 10] },
+    });
+    const r = (await run([host]))[0];
+    expect(r.report.totalCost).toBeCloseTo(10 + 3);
+    expect(Object.keys(r.dailyTotals).sort()).toEqual(["2026-10-01", "2026-11-02"]);
+  });
+
+  test("labelled gateway rows without day data are dropped, labelled rows with day data keep days before coverage", async () => {
+    const noDays = bare("ais-gateway, openai", { report: rep(848) });
+    const withDays = bare("ais-gateway, openai", {
+      report: rep(10),
+      dateSpan: { firstMs: Date.parse("2026-10-01T00:00:00Z"), lastMs: Date.parse("2026-11-03T00:00:00Z") },
+      dailyUsage: { "2026-10-01": 50, "2026-11-03": 50 },
+      dailyTotals: { "2026-10-01": [50, 0, 0, 0, 5, 5], "2026-11-03": [50, 0, 0, 0, 5, 5] },
+    });
+    const dropped = (await run([noDays]))[0];
+    expect(dropped.report.totalCost).toBeCloseTo(3);
+    const kept = (await run([noDays, withDays]))[0];
+    expect(kept.report.totalCost).toBeCloseTo(5 + 3);
+    expect(kept.dailyTotals["2026-10-01"]).toEqual([50, 0, 0, 0, 5, 5]);
+    expect(kept.dailyTotals["2026-11-03"]).toBeUndefined();
+  });
+
+  test("the real mix gives one row whose totals are the sum of its entries", async () => {
+    const rows = await run([
+      bare("openai", { report: rep(21983), dateSpan: { firstMs: Date.parse("2026-04-24T01:00:00Z"), lastMs: Date.parse("2026-04-24T23:00:00Z") }, dailyUsage: { "2026-04-24": 100 }, dailyTotals: { "2026-04-24": [100, 0, 0, 0, 10, 0] } }),
+      bare("ais-gateway, openai", { report: rep(848) }),
+    ]);
+    expect(rows).toHaveLength(1);
+    const r = rows[0];
+    expect(r.report.totalCost).toBeCloseTo(r.report.entries.reduce((x: number, e: any) => x + e.cost, 0));
+    expect(r.report.totalCost).toBeCloseTo(21983 + 3);
+  });
+});
