@@ -4,6 +4,7 @@ import type { FetchedLimitResult } from "../../cli/limits/types.ts";
 import { KIMI_CONFIG } from "../tool-configs.ts";
 import type { Identity } from "../types.ts";
 import { createGrantFileAdapter, usageFromLimits, type GrantFile } from "./grant-file-adapter.ts";
+import { isKimiLoginGatewayOwned } from "./gateway-pool.ts";
 import { nonEmpty, pairIdentity } from "./token-account.ts";
 
 /**
@@ -20,9 +21,12 @@ import { nonEmpty, pairIdentity } from "./token-account.ts";
  * and heal take too. The one hazard is a refresh in flight during a swap
  * (it would save the old account's rotated tokens over the new account); the
  * lock closes that window and heal captures anything that still lands.
+ *
+ * A member the gateway owns (sticky ownership, gateway-owned.ts) never puts its refresh token in the pool: the pool holds the
+ * access token only and a session there cannot rotate the grant. Nothing the pool holds is written back to that member's vault.
  */
 
-type Fetch = (identity: Identity) => Promise<FetchedLimitResult>;
+type Fetch = (identity: Identity, opts?: { noRefresh?: boolean }) => Promise<FetchedLimitResult>;
 
 export const kimiAdapter = createGrantFileAdapter({
   tool: "kimi",
@@ -41,9 +45,20 @@ export const kimiAdapter = createGrantFileAdapter({
     const identical = owner.access_token === pool.access_token && owner.refresh_token === pool.refresh_token;
     return !identical && expiry(pool) > expiry(owner) ? { next: { ...owner, ...pool } } : undefined;
   },
+  // The cluster gateway renews a login it ever named (sticky ownership). A pool copy of it has no refresh token, and
+  // nothing a pool session holds goes back to the member's vault: the gateway is the only process that rotates the token.
+  gatewayOwned: (member) => isKimiLoginGatewayOwned(member.name),
+  ownedRefresh: (g) => (nonEmpty(g?.refresh_token) ? String(g.refresh_token) : undefined),
+  ownedExpiry: (g) => (typeof g?.expires_at === "number" ? g.expires_at : undefined),
+  poolView: (g) => {
+    const { refresh_token: _spent, ...rest } = g;
+    return rest;
+  },
   toolLock: (dir) => ({ path: join(dir, "oauth", "kimi-code.lock"), staleMs: 5_000 }),
   fetchUsage: async (member, deps) => {
-    const fetcher = (deps as { fetchKimiLimits?: Fetch } | undefined)?.fetchKimiLimits ?? fetchKimiLimits;
-    return usageFromLimits([await fetcher(member)]);
+    const d = deps as { fetchKimiLimits?: Fetch; noRefresh?: boolean } | undefined;
+    const fetcher = d?.fetchKimiLimits ?? fetchKimiLimits;
+    // The gateway's usage poll passes noRefresh: a read must never rotate the login (only the guarded refresher does).
+    return usageFromLimits([await fetcher(member, d?.noRefresh ? { noRefresh: true } : undefined)]);
   },
 });

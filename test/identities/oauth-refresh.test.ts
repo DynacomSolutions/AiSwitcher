@@ -942,20 +942,31 @@ describe("gateway keep-alive cadence with the real refresh", () => {
     expect(lastSuccess.get(`kimi/${ACME}`)).toBeDefined();
   });
 
-  test("a grant minted an hour ago is not refreshed on a cold first pass, codex or kimi", async () => {
+  test("a codex grant minted an hour ago is not refreshed on a cold first pass", async () => {
     await json(CODEX_FILE(), {
       OPENAI_API_KEY: null,
       tokens: { access_token: fakeJwt({ iat: nowS() - 3600, exp: nowS() + 9 * 86_400 }), refresh_token: "rt-old-1" },
       last_refresh: new Date((nowS() - 3600) * 1000).toISOString(),
     });
-    await mkdir(join(dirs.kimi, "credentials"), { recursive: true });
-    await json(KIMI_FILE(), { access_token: "at-syn-kim", refresh_token: "rt-old-1", expires_at: nowS() - 2700 }); // 15 min token, minted an hour ago
     const { calls, fetchImpl } = stubFetch([{ access_token: fakeJwt({ iat: nowS(), exp: nowS() + 864_000 }), refresh_token: "rt-new-1", expires_in: 900 }]);
     const { keepAliveOnce, grantMintedAt } = await import("../../src/gateway/serve.ts");
     await withOwner(async () => {
-      await keepAliveOnce({ refresh: ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never, accounts: async (t) => [identityIn(t === "codex" ? dirs.codex : dirs.kimi)], tools: ["codex", "kimi"], mintedAt: grantMintedAt, metrics: { keepAlive: () => {} } });
+      await keepAliveOnce({ refresh: ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never, accounts: async () => [identityIn(dirs.codex)], tools: ["codex"], mintedAt: grantMintedAt, metrics: { keepAlive: () => {} } });
     });
     expect(calls).toHaveLength(0);
+  });
+
+  test("a kimi token past the renew line is renewed on the first pass, once; the next tick finds it fresh", async () => {
+    await mkdir(join(dirs.kimi, "credentials"), { recursive: true });
+    await json(KIMI_FILE(), { access_token: "at-syn-kim", refresh_token: "rt-old-1", expires_at: nowS() - 2700 }); // 15 min token, minted an hour ago
+    const { calls, fetchImpl } = stubFetch([{ access_token: "at-syn-new", refresh_token: "rt-new-1", expires_in: 900 }]);
+    const { keepAliveOnce, grantMintedAt } = await import("../../src/gateway/serve.ts");
+    await withOwner(async () => {
+      const deps = { refresh: ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never, accounts: async () => [identityIn(dirs.kimi)], tools: ["kimi"], mintedAt: grantMintedAt, metrics: { keepAlive: () => {} } };
+      await keepAliveOnce(deps);
+      await keepAliveOnce(deps);
+    });
+    expect(calls).toHaveLength(1);
   });
 
   test("a 401-driven refresh stamps the login so the next keep-alive pass makes no second POST", async () => {

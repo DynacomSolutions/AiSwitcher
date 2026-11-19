@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisHome } from "../shared/ais-home.ts";
@@ -47,4 +48,16 @@ export async function heartbeatHolds(tool: string, identityName: string, nowMs: 
   if (!hb) return false;
   const age = nowMs - Date.parse(hb.passAt);
   return age <= HEARTBEAT_FRESH_MS && age >= -60_000 && Object.hasOwn(hb.held, `${tool}/${identityName}`);
+}
+
+/** The same check without awaiting (pool adapters decide inside synchronous callbacks). */
+export function heartbeatHoldsSync(tool: string, identityName: string, nowMs: number = Date.now(), path: string = heartbeatPath()): boolean {
+  try {
+    const hb = JSON.parse(readFileSync(path, "utf8")) as Partial<GatewayHeartbeat>;
+    if (hb.version !== 1 || typeof hb.passAt !== "string" || typeof hb.held !== "object" || hb.held === null || Array.isArray(hb.held)) return false;
+    const age = nowMs - Date.parse(hb.passAt);
+    return age <= HEARTBEAT_FRESH_MS && age >= -60_000 && Object.hasOwn(hb.held, `${tool}/${identityName}`);
+  } catch {
+    return false;
+  }
 }

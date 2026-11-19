@@ -217,6 +217,12 @@ async function opencodeInstance(id: string, env: InstanceEnv, opts: UsageOptions
   return out;
 }
 
+/**
+ * T3 merges usage rows by driver and account email. Without an email, every T3 environment shows its own row for the
+ * same Grok account. A fixed email per gateway app gives one row for each app across all T3 environments.
+ */
+export const grokAccountEmail = (app: string): string => `${app}@gateway.invalid`;
+
 async function grokInstance(id: string, env: InstanceEnv, opts: UsageOptions, home: string): Promise<UsageResult[]> {
   const grokHome = env.values.get("GROK_HOME");
   if (!grokHome) return [{ id, driver: "grok", file: "-", status: "skipped", detail: "GROK_HOME not set on the instance" }];
@@ -236,7 +242,7 @@ async function grokInstance(id: string, env: InstanceEnv, opts: UsageOptions, ho
     return out;
   }
   try {
-    out.push(await ensureFile({ id, driver: "grok", file: authFile }, asJson({ [GROK_CREDENTIAL]: { key: token, auth_mode: "oidc" } }), opts.check === true));
+    out.push(await ensureFile({ id, driver: "grok", file: authFile }, asJson({ [GROK_CREDENTIAL]: { key: token, auth_mode: "oidc", email: grokAccountEmail(app ?? id) } }), opts.check === true));
   } catch (err) {
     out.push({ id, driver: "grok", file: authFile, status: "failed", detail: (err as Error).message });
   }

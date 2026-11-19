@@ -3,6 +3,7 @@ import { fetchPiLimits } from "../../cli/limits/pi-limits.ts";
 import type { ToolLimitResult } from "../../cli/limits/types.ts";
 import { PI_CONFIG } from "../tool-configs.ts";
 import type { Identity } from "../types.ts";
+import { isKimiLoginGatewayOwned } from "./gateway-pool.ts";
 import { createGrantFileAdapter, usageFromLimits, type GrantFile } from "./grant-file-adapter.ts";
 import { nonEmpty, pairIdentity, tokenAccount } from "./token-account.ts";
 
@@ -26,6 +27,9 @@ import { nonEmpty, pairIdentity, tokenAccount } from "./token-account.ts";
  * (the one with an account claim) when the pool holds the member's account next
  * to parts that may be another member's; a newer entry that cannot move is
  * backed up instead. AIS never refreshes the pool itself.
+ *
+ * A member whose kimi login the gateway renews never puts its kimi-coding refresh token in the pool (an empty string stays,
+ * because pi needs a string), and the pool's kimi-coding entry never goes back to the member's vault.
  */
 
 const KIMI_ENTRY = "kimi-coding";
@@ -100,6 +104,20 @@ export const piAdapter = createGrantFileAdapter({
       // Other providers' OAuth entries are never copied between vaults: a newer one would be lost, so keep a copy.
       return key !== KIMI_ENTRY && isOauth(v) && typeof e.expires === "number" && e.expires > (typeof v.expires === "number" ? v.expires : -1) && (e.access !== v.access || e.refresh !== v.refresh);
     }),
+  // The pi member's kimi-coding entry is the kimi login. When the gateway renews that login, a pool copy keeps the access
+  // token and expiry but an empty refresh token (pi needs a string there), so pi cannot rotate it. The pool's kimi-coding
+  // entry is never written back to the member. Other providers' entries behave as before.
+  gatewayOwned: (member) => isKimiLoginGatewayOwned(member.name),
+  poolView: (g) => {
+    const e = kimiEntry(g);
+    return e ? { ...g, [KIMI_ENTRY]: { ...e, refresh: "" } } : g;
+  },
+  ownedRefresh: (g) => (nonEmpty(kimiEntry(g)?.refresh) ? String(kimiEntry(g)!.refresh) : undefined),
+  ownedExpiry: (g) => (typeof kimiEntry(g)?.expires === "number" ? (kimiEntry(g)!.expires as number) : undefined),
+  withoutOwned: (g) => {
+    const { [KIMI_ENTRY]: _owned, ...rest } = g;
+    return rest;
+  },
   toolLock: (dir) => ({ path: join(dir, "auth.json.lock"), staleMs: 30_000 }),
   fetchUsage: async (member, deps) => {
     const fetcher = (deps as { fetchPiLimits?: (identity: Identity) => Promise<ToolLimitResult[]> } | undefined)?.fetchPiLimits ?? ((m: Identity) => fetchPiLimits(m, true));

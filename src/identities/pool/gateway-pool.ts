@@ -6,6 +6,7 @@ import { isGatewayAccessToken, isGatewayRoutedDir } from "../claude-gateway-entr
 import { codexAuthPath, readCodexAuthText } from "../codex-auth.ts";
 import { buildCodexGatewayAuth, parseGatewayProvider } from "../codex-gateway-home.ts";
 import { hasMemberCopy, isMemberStoreTool } from "../gateway-members.ts";
+import { heartbeatHoldsSync } from "../gateway-heartbeat.ts";
 import { isStickyOwnedSync } from "../gateway-owned.ts";
 import { classifyLogin, folderHoldsGatewayEntry } from "../gateway-routed.ts";
 import { expandPath } from "../match.ts";
@@ -68,6 +69,12 @@ export function isGatewayMember(tool: string, member: Identity, root?: string): 
   if (!isMemberStoreTool(tool)) return false;
   return hasMemberCopy(tool, member.name, root) || folderHoldsGatewayEntry(tool, member) || isStickyOwnedSync(tool, member.name);
 }
+
+/**
+ * True when the gateway renews this kimi login: sticky ownership, or a fresh heartbeat that names it (the rule of
+ * isGatewayManagedHere). The kimi and pi pool adapters use it: a pool copy of such a login holds no refresh token.
+ */
+export const isKimiLoginGatewayOwned = (name: string): boolean => isStickyOwnedSync("kimi", name) || heartbeatHoldsSync("kimi", name);
 
 /** The note every swap of a routed pool carries. */
 export const gatewaySelectsNote = (pool: string): string =>
