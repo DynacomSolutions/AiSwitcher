@@ -258,15 +258,15 @@ async function writeThroughPools(identity: Identity, next: KimiOAuthCredentials)
 }
 
 /** What a refresh needs to be serialised with the daemon refresher: the kimi
- * identity's configDir lock (the one refreshIdentityOAuthGrant("kimi") takes)
- * and a re-read of the freshest copy. Undefined when the account has no kimi
- * identity (pi-only): there is then no cross-process refresher to race. */
+ * identity's configDir lock (the one refreshIdentityOAuthGrant("kimi") takes),
+ * the gateway ownership check and a re-read of the freshest copy. An account
+ * with no kimi identity (pi-only) uses the pi identity's own folder for the
+ * lock, so no kimi refresh is ever sent without the lock and the ownership check. */
 export async function kimiRefreshContext(
   identity: Identity,
   self: "kimi" | "pi",
-): Promise<{ lockDir: string; gatewayManaged?: boolean; reread: () => Promise<KimiOAuthCredentials | undefined> } | undefined> {
-  const lockDir = self === "kimi" ? identity.configDir : await configDirFor("kimi", identity.name);
-  if (!lockDir) return undefined;
+): Promise<{ lockDir: string; gatewayManaged?: boolean; reread: () => Promise<KimiOAuthCredentials | undefined> }> {
+  const lockDir = self === "kimi" ? identity.configDir : ((await configDirFor("kimi", identity.name)) ?? identity.configDir);
   const gatewayManaged = await isGatewayManagedHere("kimi", identity.name);
   return { lockDir, ...(gatewayManaged ? { gatewayManaged } : {}), reread: () => readFreshestKimiCredentials(identity, self) };
 }

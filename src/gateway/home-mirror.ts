@@ -32,6 +32,11 @@ export interface MirrorOptions {
   warn?: (message: string) => void;
   /** Called with each row's outcome (host sync counts what it wrote and pushed). */
   onOutcome?: (path: string, outcome: ReconcileOutcome) => void;
+  /**
+   * File store only. Asked before a login row is written into a host file (HOME-relative path): true means the file holds a
+   * login the gateway owns, so the row is never copied into it (outcome "kept"). Pushes of the file are not affected.
+   */
+  keepHostLogin?: (relPath: string) => Promise<boolean>;
 }
 
 export type ReconcileOutcome = "same" | "wrote" | "pushed" | "kept" | "conflict";
@@ -189,6 +194,7 @@ export class HomeMirror {
   private draining: Promise<void> | undefined;
   private readonly warn: (message: string) => void;
   private readonly onOutcome: ((path: string, outcome: ReconcileOutcome) => void) | undefined;
+  private readonly keepHostLogin: ((relPath: string) => Promise<boolean>) | undefined;
   /** Time of the last full pass that reached the database (ms). */
   lastSyncAt = 0;
 
@@ -200,6 +206,7 @@ export class HomeMirror {
     this.fileStore = opts.fileStore === true;
     this.warn = opts.warn ?? ((m) => console.warn(`gateway store: ${m}`));
     this.onOutcome = opts.onOutcome;
+    this.keepHostLogin = opts.keepHostLogin;
   }
 
   /** HOME-relative form of an absolute path, or undefined outside HOME. */
@@ -243,7 +250,8 @@ export class HomeMirror {
     const local = await readLocal(abs);
     const base = this.bases.get(row.path);
     this.kinds.set(row.path, { kind: row.kind, account: row.account });
-    const write = async (): Promise<"wrote"> => {
+    const write = async (): Promise<"wrote" | "kept"> => {
+      if (this.fileStore && row.kind === "login" && this.keepHostLogin && (await this.keepHostLogin(row.path).catch(() => true))) return "kept";
       await writeAtomic(abs, row.content);
       this.bases.set(row.path, { version: row.version, sha: row.sha256 });
       return "wrote";

@@ -80,12 +80,13 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|store|release|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
       serve: sub("ais gateway serve [--port=] [--admin-port=]", "Run the proxy and admin API (env: AIS_GATEWAY_PORT, AIS_GATEWAY_ADMIN_PORT, AIS_GATEWAY_DATABASE_URL, AIS_GATEWAY_ADMIN_TOKEN; PostgreSQL credential store: AIS_GATEWAY_CREDENTIAL_STORE=pg, AIS_GATEWAY_STORE_KEY, AIS_GATEWAY_FILE_STORE, AIS_GATEWAY_STORE_IMPORT, AIS_GATEWAY_REPLICA_URL)"),
       store: sub("ais gateway store import [--dry-run] | sync [--once] | setup --key-file=<path>", "import: copy this host's gateway logins, registries and heartbeat into the PostgreSQL credential store; idempotent, a login is only replaced by a fresher one (env: AIS_GATEWAY_DATABASE_URL, AIS_GATEWAY_STORE_KEY). sync: keep this host's login files in step with the store (gateway refreshes written back, new host logins pushed; newest token wins); the profile-sync daemon runs it whenever the store is configured. setup: record the store's database URL (stdin) and key in ~/.secrets for sync (env or ~/.secrets: AIS_GATEWAY_STORE_DATABASE_URL, AIS_GATEWAY_STORE_KEY or AIS_GATEWAY_STORE_KEY_FILE)"),
+      release: sub("ais gateway release <tool>/<identity> [--force]", "End the gateway's sticky ownership of one login on this host. Until then no host refresher renews a login the gateway ever named in its heartbeat, even when the heartbeat is stale. Refused while a fresh heartbeat still names the login, unless --force"),
       local: sub("ais gateway local [install|status]", "Host-local failover proxy on 127.0.0.1 (env: AIS_GATEWAY_LOCAL_PORT, AIS_GATEWAY_REMOTE_URL); also a CONNECT relay on 127.0.0.1:47132 that fails over across AIS_GATEWAY_CONNECT_UPSTREAMS (host:port list, ~/.secrets or env; port AIS_GATEWAY_CONNECT_LOCAL_PORT); install sets up the ais-gateway-local.service user unit"),
       app: sub(
         "ais gateway app add|update <name> --namespace=<ns> --provider=<p> [--style=anthropic|openai] (--pool [--identities=a,b] | --identity=<id>) [--models=glob,glob] [--daily-tokens=N] [--reserve=100]; app list|show|rotate|revoke [<name>]",

@@ -2,7 +2,7 @@ import * as clack from "@clack/prompts";
 import { expandPath } from "../../identities/match.ts";
 import { reconcilePiOAuthStores, renderOAuthReconcileReport } from "../../identities/oauth-reconcile.ts";
 import { isRetired } from "../../identities/retired.ts";
-import { importPiCredentials, type PiCredentialSourceDirs } from "../../identities/pi-auth.ts";
+import { importPiCredentials, type PiCredentialSourceDirs, type PiCredentialSourceNames } from "../../identities/pi-auth.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import {
   ALI_CONFIG,
@@ -26,7 +26,7 @@ const SOURCES = {
   ali: ALI_CONFIG,
 } as const;
 
-async function resolveConfigDir(cfg: ToolConfig, key: string): Promise<string> {
+async function resolveSource(cfg: ToolConfig, key: string): Promise<{ configDir: string; name: string }> {
   const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
   const identity = findIdentityByNameOrAlias(file.identities, key);
   if (!identity) throw new CliUsageError(`No ${cfg.toolName} identity named "${key}".`);
@@ -35,7 +35,7 @@ async function resolveConfigDir(cfg: ToolConfig, key: string): Promise<string> {
       `${cfg.toolName} identity "${identity.name}" is retired and cannot be a credential source. Run "ais identities unretire ${identity.name} --tool=${cfg.toolName}" first.`,
     );
   }
-  return expandPath(identity.configDir);
+  return { configDir: expandPath(identity.configDir), name: identity.name };
 }
 
 export async function openCodeGoApiKey(flags: ParsedArgs["flags"]): Promise<string | undefined> {
@@ -83,9 +83,13 @@ export async function runPiAuthImport(positionals: string[], flags: ParsedArgs["
   }
 
   const sourceDirs: PiCredentialSourceDirs = {};
+  const sourceNames: PiCredentialSourceNames = {};
   for (const [name, cfg] of Object.entries(SOURCES)) {
     const identityKey = stringFlag(flags, name);
-    if (identityKey) sourceDirs[name as keyof PiCredentialSourceDirs] = await resolveConfigDir(cfg, identityKey);
+    if (!identityKey) continue;
+    const source = await resolveSource(cfg, identityKey);
+    sourceDirs[name as keyof PiCredentialSourceDirs] = source.configDir;
+    if (name === "claude" || name === "codex" || name === "grok" || name === "kimi") sourceNames[name] = source.name;
   }
   sourceDirs.opencodeGoApiKey = await openCodeGoApiKey(flags);
 
@@ -97,8 +101,11 @@ export async function runPiAuthImport(positionals: string[], flags: ParsedArgs["
   // where needed); the import below then converges pi from an
   // already-freshest native store.
   const preReconciliation = await reconcilePiOAuthStores({ ...piIdentity, configDir }, { write: true });
-  const result = await importPiCredentials(configDir, sourceDirs);
+  const result = await importPiCredentials(configDir, sourceDirs, sourceNames);
   console.log(`Imported Pi credentials for: ${result.providers.join(", ")}.`);
+  if (result.skippedOwned.length > 0) {
+    console.log(`Left out (the cluster gateway owns and renews these logins, so pi never holds a copy): ${result.skippedOwned.join(", ")}.`);
+  }
   console.log(`Credential store: ${result.authPath} (mode 0600).`);
   if (result.modelsPath) console.log(`Alibaba provider catalogue: ${result.modelsPath} (mode 0600).`);
   const healed = preReconciliation.entries.filter(
