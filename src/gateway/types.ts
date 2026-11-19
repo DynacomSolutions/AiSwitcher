@@ -84,3 +84,25 @@ export interface UsageRow {
   latencyMs: number;
   streamed: boolean;
 }
+
+/** One imported history figure. A null `day` is an all-time figure; a null `model` covers every model of the day. */
+export interface UsageHistoryRow {
+  /** Where the figures came from, for example "host-snapshot-models". Part of the key, so two sources never overwrite each other. */
+  source: string;
+  provider: string;
+  identity: string;
+  /** Calendar day "YYYY-MM-DD", or null for an all-time figure. */
+  day: string | null;
+  model: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  messages: number;
+  estCostUsd: number;
+}
+
+/** A stored history row, with the time of its latest import. */
+export interface UsageHistoryStored extends UsageHistoryRow {
+  importedAt: string;
+}

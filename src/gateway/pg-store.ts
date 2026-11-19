@@ -3,7 +3,7 @@ import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browse
 import { bumpSideCountOn, type SqlTag } from "./side-count.ts";
 import { errorTag } from "./ledger-buffer.ts";
 import { AppRevokedError, type GatewayStore } from "./store.ts";
-import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
@@ -12,6 +12,7 @@ import sideCounts0004 from "./migrations/0004_side_counts.sql" with { type: "tex
 import homeFiles0005 from "./migrations/0005_home_files.sql" with { type: "text" };
 import browserPresence0006 from "./migrations/0006_browser_presence.sql" with { type: "text" };
 import refreshJournalCode0007 from "./migrations/0007_refresh_journal_code.sql" with { type: "text" };
+import usageHistory0008 from "./migrations/0008_usage_history.sql" with { type: "text" };
 
 const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0001_init", sql: init0001 },
@@ -21,6 +22,7 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0005_home_files", sql: homeFiles0005 },
   { version: "0006_browser_presence", sql: browserPresence0006 },
   { version: "0007_refresh_journal_code", sql: refreshJournalCode0007 },
+  { version: "0008_usage_history", sql: usageHistory0008 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
@@ -382,6 +384,49 @@ export class PgGatewayStore implements GatewayStore {
       requests: Number(r.requests),
       firstTs: iso(r.first_ts),
       lastTs: iso(r.last_ts),
+    }));
+  }
+
+  async upsertUsageHistory(rows: UsageHistoryRow[]): Promise<void> {
+    // One statement per row inside one transaction: a batch lands whole or not at all.
+    await this.sql.begin(async (tx) => {
+      for (const r of rows) {
+        await tx`
+          INSERT INTO gateway_usage_history (source, provider, identity, day, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, messages, est_cost_usd)
+          VALUES (${r.source}, ${r.provider}, ${r.identity}, ${r.day}::date, ${r.model}, ${r.inputTokens}, ${r.outputTokens}, ${r.cacheReadTokens}, ${r.cacheWriteTokens}, ${r.messages}, ${r.estCostUsd})
+          ON CONFLICT (source, provider, identity, (COALESCE(day, 'infinity'::date)), (COALESCE(model, ''))) DO UPDATE SET
+            input_tokens = GREATEST(gateway_usage_history.input_tokens, EXCLUDED.input_tokens),
+            output_tokens = GREATEST(gateway_usage_history.output_tokens, EXCLUDED.output_tokens),
+            cache_read_tokens = GREATEST(gateway_usage_history.cache_read_tokens, EXCLUDED.cache_read_tokens),
+            cache_write_tokens = GREATEST(gateway_usage_history.cache_write_tokens, EXCLUDED.cache_write_tokens),
+            messages = GREATEST(gateway_usage_history.messages, EXCLUDED.messages),
+            est_cost_usd = GREATEST(gateway_usage_history.est_cost_usd, EXCLUDED.est_cost_usd),
+            imported_at = now()`;
+      }
+    });
+  }
+
+  async usageHistory(filter: { source?: string; provider?: string; identity?: string } = {}): Promise<UsageHistoryStored[]> {
+    const rows = await this.sql`
+      SELECT source, provider, identity, to_char(day, 'YYYY-MM-DD') AS day, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, messages, est_cost_usd, imported_at
+      FROM gateway_usage_history
+      WHERE (${filter.source ?? null}::text IS NULL OR source = ${filter.source ?? null})
+        AND (${filter.provider ?? null}::text IS NULL OR provider = ${filter.provider ?? null})
+        AND (${filter.identity ?? null}::text IS NULL OR identity = ${filter.identity ?? null})
+      ORDER BY provider, identity, day NULLS FIRST, model NULLS FIRST, source`;
+    return rows.map((r: Record<string, unknown>) => ({
+      source: String(r.source),
+      provider: String(r.provider),
+      identity: String(r.identity),
+      day: r.day === null || r.day === undefined ? null : String(r.day),
+      model: r.model === null || r.model === undefined ? null : String(r.model),
+      inputTokens: Number(r.input_tokens),
+      outputTokens: Number(r.output_tokens),
+      cacheReadTokens: Number(r.cache_read_tokens),
+      cacheWriteTokens: Number(r.cache_write_tokens),
+      messages: Number(r.messages),
+      estCostUsd: Number(r.est_cost_usd),
+      importedAt: iso(r.imported_at),
     }));
   }
 

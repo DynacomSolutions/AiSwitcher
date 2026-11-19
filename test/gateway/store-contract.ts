@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { AppRevokedError, type GatewayStore } from "../../src/gateway/store.ts";
-import type { GatewayApp, UsageRow } from "../../src/gateway/types.ts";
+import type { GatewayApp, UsageHistoryRow, UsageRow } from "../../src/gateway/types.ts";
 
 const base: GatewayApp = {
   name: "a",
@@ -206,6 +206,30 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     // The days add up to the per-model totals over the same window.
     const total = (await s.usageByModel(new Date("2026-11-02T00:00:00.000Z"))).reduce((n, r) => n + r.inputTokens, 0);
     expect(utc.reduce((n, r) => n + r.inputTokens, 0)).toBe(total);
+  });
+
+  test("usage history upserts idempotently, only raises figures, keeps sources apart and never deletes", async () => {
+    const s = await makeStore();
+    const h = (over: Partial<UsageHistoryRow> = {}): UsageHistoryRow => ({ source: "host-snapshot-models", provider: "claude", identity: "m1", day: null, model: "opus", inputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40, messages: 5, estCostUsd: 1.5, ...over });
+    await s.upsertUsageHistory([]);
+    await s.upsertUsageHistory([h(), h({ model: null }), h({ day: "2026-10-01", model: null, source: "host-snapshot-daily" })]);
+    // The same batch again changes nothing.
+    await s.upsertUsageHistory([h(), h({ model: null }), h({ day: "2026-10-01", model: null, source: "host-snapshot-daily" })]);
+    const all = await s.usageHistory();
+    expect(all).toHaveLength(3);
+    expect(all.reduce((n, r) => n + r.estCostUsd, 0)).toBe(4.5);
+    // A lower figure never lowers history; a higher one raises it.
+    await s.upsertUsageHistory([h({ inputTokens: 1, estCostUsd: 0.1, messages: 99 })]);
+    const opus = (await s.usageHistory({ provider: "claude", identity: "m1", source: "host-snapshot-models" })).find((r) => r.model === "opus");
+    expect(opus).toMatchObject({ inputTokens: 10, estCostUsd: 1.5, messages: 99, day: null });
+    expect(typeof opus?.importedAt).toBe("string");
+    await s.upsertUsageHistory([h({ estCostUsd: 2 })]);
+    expect((await s.usageHistory({ source: "host-snapshot-models" })).find((r) => r.model === "opus")?.estCostUsd).toBe(2);
+    // A null model and a null day are keys of their own.
+    expect((await s.usageHistory({ source: "host-snapshot-models" })).map((r) => r.model)).toEqual([null, "opus"]);
+    expect(await s.usageHistory({ source: "host-snapshot-daily" })).toMatchObject([{ day: "2026-10-01", model: null }]);
+    expect(await s.usageHistory({ provider: "codex" })).toEqual([]);
+    expect(await s.usageHistory({ identity: "nobody" })).toEqual([]);
   });
 
   test("appendUsage accepts an empty batch", async () => {
