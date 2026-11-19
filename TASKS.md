@@ -311,13 +311,15 @@ AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gat
 | 199 | Host clients reach the gateway without the local ClusterIP (node failover) | done | claude | gateway-node-loss | 14.195 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/536, released v0.5.53; host relay on, Claude folders and T3 env point at it.<br>Live proof: client with the cluster service range dropped, real `claude -p` answered through a replica on another node; relay also failed over by itself during a real host reboot. |
 
 ## 15. Gateway logins never revoked by AIS
-ETA: 2026-11-20 01:00 ICT
+ETA: 2026-11-19 20:00 ICT
 One refresher per login across replicas and hosts, early renewal, a dead grant never sent again, renewal state visible on the WebUI and in metrics.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 221 | Gateway: dead grant never resent, guard-only refresh, renew at 50% of lifetime, refresh logs and metrics | in_progress | claude | gateway-single-refresher | | 2026-11-19 15:00 ICT | Journal: one replica sent a dead refresh token about 630 times in 7 h after the first dead-grant answer. |
-| 222 | Host refreshers never refresh a gateway-owned login (local gateway, WebUI daemon, auth refresh, kimi, pi) | in_progress | claude | host-no-owned-refresh | | 2026-11-19 15:00 ICT | Ownership must not depend on a fresh heartbeat. |
-| 223 | WebUI Auth page shows the gateway renewal state, not a stale host stamp | in_progress | claude | webui-gateway-renewal | 15.221 | 2026-11-19 16:00 ICT | Today every gateway login shows a 4 to 5 Nov stamp or "Never". |
-| 224 | Watchdog rules: login not renewed within its lifetime, login revoked | in_progress | claude | gateway-refresh-alerts | 15.221 | 2026-11-19 16:00 ICT | .cluster GitOps PR. |
-| 225 | Release, rollout to the host and the cluster, check no login lapses after one token lifetime | todo | claude | | 15.221, 15.222, 15.223, 15.224 | 2026-11-20 01:00 ICT | |
+| 221 | Gateway: dead grant never resent, guard-only refresh, renew at 50% of lifetime, refresh logs and metrics | done | claude | gateway-single-refresher | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/608 (c309b11), Opus review fixed.<br>Live in v0.5.74: new metrics and /logins/renewal answer. |
+| 222 | Host refreshers never refresh a gateway-owned login (local gateway, WebUI daemon, auth refresh, kimi, pi) | done | claude | host-no-owned-refresh | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/609 (4f5fc27).<br>Sticky ownership record; host at v0.5.74. |
+| 223 | WebUI Auth page shows the gateway renewal state, not a stale host stamp | done | claude | webui-gateway-renewal | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/607 (3f42f80).<br>Live API check: every gateway login shows its real last and next refresh. |
+| 224 | Watchdog rules: login not renewed within its lifetime, login revoked | in_review | claude | gateway-refresh-alerts-kimi | 15.221 | 2026-11-19 20:00 ICT | Rules merged in .cluster PR 2646.<br>Kimi exception: .cluster PR 2657, CI queued. |
+| 225 | Release, rollout to the host and the cluster, check no login lapses after one token lifetime | in_progress | claude | | 15.221, 15.222, 15.223, 15.224 | 2026-11-19 20:00 ICT | v0.5.74 released; host and all 6 gateway pods on 0.5.74.<br>Lapse check due 20:00 ICT. |
+| 226 | Kimi login has one refresher: the gateway usage poll no longer rotates it, pools hold no refresh token | done | claude | kimi-single-refresher | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/611 (00b8524), Opus review fixed.<br>Live: kimi journal chain continuous, one renewal per tick. |
+| 227 | Credential store holds only logins the gateway manages; WebUI ownership from the gateway list | done | claude | store-owned-matches-gateway | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/612 (375b818), Opus review fixed.<br>Prune removed 2 stale rows; live host copies kept. |
