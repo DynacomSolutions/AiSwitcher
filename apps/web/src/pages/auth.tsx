@@ -37,7 +37,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { flowIsLive, qk, useAuthQuery, useAuthRefreshQuery, useLoginFlowQuery } from "@/hooks/queries";
 import { api, supportsFix } from "@/lib/api";
 import { relTime } from "@/lib/format";
-import type { AuthEntry, AuthRefreshStatus, LoginFlowStatus } from "@/types/api";
+import { renewalView } from "@/lib/renewal-view";
+import type { AuthEntry, LoginFlowStatus, RenewalRow } from "@/types/api";
 
 export function flowStatusLabel(status: LoginFlowStatus): string {
   switch (status) {
@@ -409,85 +410,71 @@ function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: stri
   );
 }
 
-/** Mirrors ESCALATION_THRESHOLD in src/server/auth-refresh.ts: past this many
- * consecutive failures the renewal row shows the escalated destructive badge
- * instead of a bare count. */
-const AUTH_REFRESH_ESCALATION_THRESHOLD = 3;
+const TONE_VARIANT = { ok: "success", warning: "warning", destructive: "destructive", muted: "secondary" } as const;
 
-function RenewalRow({ status }: { status: AuthRefreshStatus }) {
+function RenewalRowView({ row }: { row: RenewalRow }) {
   const qc = useQueryClient();
+  const view = renewalView(row);
   const mutation = useMutation({
-    mutationFn: () => api.refreshCredential(status.tool, status.identity),
+    mutationFn: () => api.refreshCredential(row.tool, row.identity),
     onSuccess: (result) => {
       void qc.invalidateQueries({ queryKey: qk.authRefresh });
-      if (result.ok) toast.success("Credential refreshed", { description: `${status.tool}/${status.identity}` });
-      else toast.warning("Refresh did not write cookies", { description: `${status.tool}/${status.identity}` });
+      if (result.ok) toast.success("Credential refreshed", { description: `${row.tool}/${row.identity}` });
+      else toast.warning("Refresh did not write cookies", { description: `${row.tool}/${row.identity}` });
     },
     onError: (error) => toast.error("Refresh failed", { description: error.message }),
   });
+  const running = row.host?.running ?? false;
 
   return (
     <TableRow>
       <TableCell>
-        <ToolBadge tool={status.tool} />
+        <ToolBadge tool={row.tool} />
       </TableCell>
-      <TableCell className="font-medium">{status.identity}</TableCell>
-      <TableCell className="text-xs text-muted-foreground">
-        {status.lastAttemptAt ? relTime(status.lastAttemptAt) : "never"}
-      </TableCell>
-      <TableCell className="text-xs">
-        {status.lastSuccessAt ? (
-          relTime(status.lastSuccessAt)
-        ) : (
-          <Badge variant="warning">Never</Badge>
-        )}
-      </TableCell>
-      <TableCell className="text-xs">
-        {status.consecutiveFailures >= AUTH_REFRESH_ESCALATION_THRESHOLD ? (
-          <Badge variant="destructive">{status.consecutiveFailures} consecutive</Badge>
-        ) : status.consecutiveFailures > 0 ? (
-          <Badge variant="warning">{status.consecutiveFailures}</Badge>
-        ) : (
-          <span className="text-xs text-muted-foreground">-</span>
-        )}
-      </TableCell>
-      <TableCell className="max-w-72">
-        {status.lastError ? (
-          <span className="block truncate text-xs text-destructive" title={status.lastError}>
-            {status.lastError}
+      <TableCell className="font-medium">{row.identity}</TableCell>
+      <TableCell className="text-xs text-muted-foreground">{view.renewedBy}</TableCell>
+      <TableCell className="text-xs">{view.lastRefresh}</TableCell>
+      <TableCell className="text-xs text-muted-foreground">{view.nextRefresh}</TableCell>
+      <TableCell className="text-xs text-muted-foreground">{view.expires}</TableCell>
+      <TableCell className="max-w-72 text-xs">
+        <Badge variant={TONE_VARIANT[view.status.tone]}>{view.status.label}</Badge>
+        {view.error ? (
+          <span className="mt-1 block truncate text-destructive" title={view.error}>
+            {view.error}
           </span>
-        ) : (
-          <span className="text-xs text-muted-foreground">-</span>
-        )}
+        ) : null}
       </TableCell>
       <TableCell className="text-right">
-        <Button variant="outline" size="sm" disabled={mutation.isPending || status.running} onClick={() => mutation.mutate()}>
-          {status.running || mutation.isPending ? "Refreshing…" : "Refresh now"}
-        </Button>
+        {view.canRefreshHere ? (
+          <Button variant="outline" size="sm" disabled={mutation.isPending || running} onClick={() => mutation.mutate()}>
+            {running || mutation.isPending ? "Refreshing…" : "Refresh now"}
+          </Button>
+        ) : null}
       </TableCell>
     </TableRow>
   );
 }
 
-/** Daemon-side scheduled renewal (Alibaba console cookies today). */
+/** Credential renewal: the gateway renews its own logins, this host renews the rest. */
 function RenewalCard() {
   const query = useAuthRefreshQuery();
-  const results = query.data?.results ?? [];
-  const healthy = results.filter((r) => r.lastSuccessAt && !r.lastError).length;
+  const rows = query.data?.rows ?? [];
+  const gatewayState = query.data?.gateway?.state;
+  const healthy = rows.filter((r) => renewalView(r).status.tone === "ok").length;
 
   return (
     <Card className="gap-3">
       <CardHeader>
         <CardTitle className="text-base">Scheduled credential renewal</CardTitle>
         <CardDescription>
-          The daemon renews Alibaba console cookies on a 10-minute loop while it runs, so
-          dashboards and quota checks keep working without the host timers.
+          The gateway renews the logins it owns every few hours. This host renews only the logins the gateway does
+          not own, on a 10-minute loop while the daemon runs.
         </CardDescription>
       </CardHeader>
       <CardContent>
         {query.isLoading ? (
           <div className="h-16 animate-pulse rounded-lg bg-muted" />
-        ) : results.length === 0 ? (
+        ) : rows.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             No renewals recorded yet. The first pass runs about 15 seconds after the daemon starts,
             and refreshable credentials appear here.
@@ -495,7 +482,8 @@ function RenewalCard() {
         ) : (
           <>
             <p className="mb-3 text-xs text-muted-foreground">
-              {healthy} of {results.length} renewing cleanly
+              {healthy} of {rows.length} renewing cleanly
+              {gatewayState && gatewayState !== "ok" ? " (gateway renewal state unavailable)" : ""}
             </p>
             <div className="overflow-hidden rounded-lg border">
               <Table>
@@ -503,16 +491,17 @@ function RenewalCard() {
                   <TableRow className="hover:bg-transparent">
                     <TableHead>Tool</TableHead>
                     <TableHead>Identity</TableHead>
-                    <TableHead>Last attempt</TableHead>
-                    <TableHead>Last success</TableHead>
-                    <TableHead>Fails</TableHead>
-                    <TableHead>Error</TableHead>
+                    <TableHead>Renewed by</TableHead>
+                    <TableHead>Last refresh</TableHead>
+                    <TableHead>Next refresh</TableHead>
+                    <TableHead>Token expires</TableHead>
+                    <TableHead>Status</TableHead>
                     <TableHead className="text-right"> </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {results.map((status) => (
-                    <RenewalRow key={`${status.tool}/${status.identity}`} status={status} />
+                  {rows.map((row) => (
+                    <RenewalRowView key={`${row.tool}/${row.identity}`} row={row} />
                   ))}
                 </TableBody>
               </Table>

@@ -756,8 +756,40 @@ export interface AuthRefreshStatus {
   running: boolean;
 }
 
+export interface GatewayRenewalLogin {
+  provider: string;
+  identity: string;
+  lastRefreshAt: string | null;
+  lastRefreshReplica: string | null;
+  lastError: { at: string; code: string; detail: string } | null;
+  expiresAt: string | null;
+  nextRefreshAt: string | null;
+  revoked: boolean;
+}
+
+/** One row of the Auth page renewal table: who renews the login, and its state. */
+export interface RenewalRow {
+  tool: string;
+  identity: string;
+  renewer: "gateway" | "host" | "pool";
+  gateway: GatewayRenewalLogin | null;
+  gatewayState?: "ok" | "unconfigured" | "unavailable";
+  host: {
+    lastAttemptAt: string | null;
+    lastSuccessAt: string | null;
+    lastError: string | null;
+    lastDetail: string | null;
+    revoked: boolean;
+    consecutiveFailures: number;
+    running: boolean;
+  } | null;
+  note: string;
+}
+
 export interface AuthRefreshResponse {
   results: AuthRefreshStatus[];
+  rows: RenewalRow[];
+  gateway: { state: "ok" | "unconfigured" | "unavailable"; error?: string };
 }
 
 /* Files */
