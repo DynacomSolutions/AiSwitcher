@@ -1734,7 +1734,7 @@ describe("native limit answers", () => {
     usage.b = full("2026-11-02T12:30:00.000Z");
     const res = await call("/cx/v1/responses", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    expect(await res.json()).toEqual({ error: { type: "usage_limit_reached", message: "You've hit your 5-hour limit. Resets at 2026-11-02T12:30:00.000Z.", resets_at: 1793622600, resets_in_seconds: 9000 } });
+    expect(await res.json()).toEqual({ error: { type: "usage_limit_reached", message: "You've hit your 5-hour limit (resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z.", resets_at: 1793622600, resets_in_seconds: 9000 } });
     expect(res.headers.get("x-codex-primary-reset-at")).toBe("1793622600");
   });
 
@@ -1759,7 +1759,7 @@ describe("native limit answers", () => {
     expect(res.status).toBe(429);
     expect(res.headers.get("retry-after")).toBe("14400");
     const message = ((await res.json()) as { error: { message: string } }).error.message;
-    expect(message).toBe("You've hit your usage limit (identity is at its usage reserve). Resets at 2026-11-02T14:00:00.000Z.");
+    expect(message).toBe("You've hit your usage limit (identity is at its usage reserve; resets 21:00 ICT Mon 2 Nov, 14:00 GMT Mon 2 Nov). Resets at 2026-11-02T14:00:00.000Z.");
   });
 
   const realBody = '{"type":"error","error":{"type":"rate_limit_error","message":"Number 3 SYNTHETIC_FIXTURE"},"request_id":"req_SYNTHETIC_FIXTURE"}';
@@ -1805,7 +1805,7 @@ describe("native limit answers", () => {
     expect(res.status).toBe(429);
     expect(seen.length).toBe(2);
     const message = ((await res.json()) as { error: { message: string } }).error.message;
-    expect(message).toMatch(/^You've hit your usage limit \(Number 3 SYNTHETIC_FIXTURE\)\. Resets at \d{4}-\d\d-\d\dT[\d:.]+Z\.$/);
+    expect(message).toMatch(/^You've hit your usage limit \(Number 3 SYNTHETIC_FIXTURE; resets [^)]+\)\. Resets at \d{4}-\d\d-\d\dT[\d:.]+Z\.$/);
     expect(Number(res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
     const resetMs = Date.parse(/Resets at (\S+?)\.$/.exec(message)![1]!);
     expect(resetMs - NOW.getTime()).toBe(Number(res.headers.get("retry-after")) * 1000);
@@ -1814,7 +1814,7 @@ describe("native limit answers", () => {
   test("an upstream 429 whose text already ends in a reset time passes through byte for byte", async () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pin", identity: "id1" } }));
     usage.id1 = live(10);
-    const own = '{"error":{"message":"You\'ve hit your usage limit. Resets at 2026-11-02T12:30:00.000Z.","type":"rate_limit_error"}}';
+    const own = '{"error":{"message":"You\'ve hit your usage limit (resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z.","type":"rate_limit_error"}}';
     handler = () => new Response(own, { status: 429, headers: { "content-type": "application/json" } });
     const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
@@ -1828,7 +1828,7 @@ describe("native limit answers", () => {
     const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
     expect(res.headers.get("retry-after")).toBe("14400");
-    expect(((await res.json()) as { error: { message: string } }).error.message).toBe("You've hit your usage limit (quota used up). Resets at 2026-11-02T14:00:00.000Z.");
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe("You've hit your usage limit (quota used up; resets 21:00 ICT Mon 2 Nov, 14:00 GMT Mon 2 Nov). Resets at 2026-11-02T14:00:00.000Z.");
   });
 
   test("a non-429 upstream error of a provider with no native shape passes through byte for byte", async () => {
