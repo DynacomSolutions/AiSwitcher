@@ -341,6 +341,8 @@ export interface KimiRefreshContext {
   lockDir: string;
   /** The cluster gateway owns this login: never refresh it here, use the stored token as it is. */
   gatewayManaged?: boolean;
+  /** A read-only poll (the gateway's usage poll): never refresh, whatever the login. Only the gateway's guarded refresher rotates a grant there. */
+  noRefresh?: boolean;
   reread: () => Promise<KimiOAuthCredentials | undefined>;
 }
 
@@ -354,7 +356,7 @@ async function refreshCredentials(
     await persist(next);
     return next;
   };
-  if (ctx.gatewayManaged) throw new Error("login is owned by the cluster gateway - not refreshed here");
+  if (ctx.gatewayManaged || ctx.noRefresh) throw new Error("login is owned by the cluster gateway - not refreshed here");
   // The refresh token rotates: hold the identity lock (shared with the daemon refresher) and
   // re-read, so a grant rotated meanwhile is used as-is instead of POSTing the spent token.
   return withOauthRefreshLock(ctx.lockDir, async () => {
@@ -395,7 +397,7 @@ export async function fetchKimiUsageForCredentials(
 
   const secondsUntilExpiry =
     credentials.expires_at === undefined ? Number.POSITIVE_INFINITY : credentials.expires_at - Date.now() / 1000;
-  if (secondsUntilExpiry <= EXPIRY_SKEW_SECONDS && credentials.refresh_token) {
+  if (secondsUntilExpiry <= EXPIRY_SKEW_SECONDS && credentials.refresh_token && !refreshCtx.noRefresh) {
     refreshAttempted = true;
     try {
       accessToken = (await refreshCredentials(credentials, persist, refreshCtx)).access_token;
@@ -422,7 +424,7 @@ export async function fetchKimiUsageForCredentials(
     return { error: `usage fetch failed: ${errorMessage(err)}` };
   }
 
-  const gatewayOwned = refreshCtx.gatewayManaged === true;
+  const gatewayOwned = refreshCtx.gatewayManaged === true || refreshCtx.noRefresh === true;
   if ((response.status === 401 || response.status === 403) && gatewayOwned) {
     // The gateway renews this login: re-read the store once (it may have just rotated) and retry; never refresh here.
     const current = await refreshCtx.reread().catch(() => undefined);
@@ -492,7 +494,7 @@ export async function fetchKimiUsageForCredentials(
  * - top-level `usage`: the weekly quota (resetTime exactly 7 days out),
  *   reported separately from `limits[]`.
  */
-export async function fetchKimiLimits(identity: Identity): Promise<FetchedLimitResult> {
+export async function fetchKimiLimits(identity: Identity, opts: { noRefresh?: boolean } = {}): Promise<FetchedLimitResult> {
   const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "kimi", identity };
   const credentialsPath = join(identity.configDir, "credentials", "kimi-code.json");
   // A swap pool's file is a copy of its active member's grant: refreshing it here would spend the rotating token.
@@ -535,7 +537,7 @@ export async function fetchKimiLimits(identity: Identity): Promise<FetchedLimitR
   // so the two never race for the live refresh token (see kimi-store.ts).
   const persist = (next: KimiOAuthCredentials): Promise<void> => persistKimiCredentials(identity, "kimi", next);
 
-  const outcome = await fetchKimiUsageForCredentials(source, persist, await kimiRefreshContext(identity, "kimi"));
+  const outcome = await fetchKimiUsageForCredentials(source, persist, await kimiRefreshContext(identity, "kimi", opts));
   if (outcome.error || !outcome.windows) {
     return { ...base, windows: [], status: "unavailable", error: outcome.error };
   }

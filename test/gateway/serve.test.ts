@@ -919,6 +919,30 @@ describe("keep-alive across every refreshable tool", () => {
   });
 });
 
+describe("kimi renewal retry", () => {
+  test("a kimi renewal the guard could not take is tried again after the short retry wait, not a full tick later", async () => {
+    const { RefreshGuardRetryable } = await import("../../src/gateway/refresh-guard.ts");
+    const member = (name: string) => ({ name, label: name, configDir: `/x/${name}` }) as never;
+    const stamps: Array<{ tool: string; at: number }> = [];
+    const t0 = Date.now();
+    const g = await boot({
+      keepAliveMs: 600, // the full tick
+      kimiRetryMs: 30,
+      keepAliveAccounts: async (tool: string) => (tool === "kimi" || tool === "codex" ? [member(tool === "kimi" ? "km" : "cx")] : []),
+      refreshImpl: (async (tool: string, id: { name: string }) => {
+        stamps.push({ tool, at: Date.now() - t0 });
+        if (tool === "kimi" && stamps.filter((s) => s.tool === "kimi").length === 1) throw new RefreshGuardRetryable("database busy");
+        return { tool, identity: id.name, outcome: "refreshed", detail: "", afterFingerprint: "bbbb2222", written: [], writeFailures: [] };
+      }) as never,
+    });
+    await waitFor(() => stamps.filter((s) => s.tool === "kimi").length >= 2);
+    const kimi = stamps.filter((s) => s.tool === "kimi");
+    expect(kimi[1]!.at - kimi[0]!.at).toBeLessThan(400); // the retry, well before the next full tick
+    expect(stamps.filter((s) => s.tool === "codex")).toHaveLength(1); // the retry pass runs kimi only
+    await g.stop();
+  });
+});
+
 describe("ali session ownership", () => {
   test("the gateway timer renews the ali console session of each live ali login", async () => {
     const member = (name: string) => ({ name, label: name, configDir: `/x/${name}` }) as never;

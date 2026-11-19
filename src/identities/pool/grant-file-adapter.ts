@@ -90,6 +90,18 @@ export interface GrantFileSpec {
    * drop and no write-back carries over (logins made inside the pool, edited
    * static keys). Optional: a single-grant file has none. */
   hasPoolOnlyContent?(pool: GrantFile, vault: GrantFile | undefined): boolean;
+  /** The member's login belongs to the cluster gateway, the only process that rotates its refresh token. A pool never writes
+   * a token back to such a member, and its copy of the login carries no refresh token (see `poolView`). Optional: none owned. */
+  gatewayOwned?(member: Identity): boolean;
+  /** The copy of an owned member's login a pool may hold: the same grant without the refresh token, so a session in the pool can
+   * never rotate a token the gateway renews. */
+  poolView?(g: GrantFile): GrantFile;
+  /** The refresh token of the owned login in a grant (undefined when it holds none). Needed with `gatewayOwned`. */
+  ownedRefresh?(g: GrantFile | undefined): string | undefined;
+  /** The expiry of the owned login in a grant, in one unit across grants of this tool (undefined when unknown). */
+  ownedExpiry?(g: GrantFile | undefined): number | undefined;
+  /** The grant without the owned login's entry, for tools whose file holds other logins too (pi). Optional: the whole file is the login. */
+  withoutOwned?(g: GrantFile): GrantFile;
   /** The lock directory the tool itself takes around its own refreshes. */
   toolLock(configDir: string): { path: string; staleMs: number };
   fetchUsage(member: Identity, deps?: unknown): Promise<PoolUsage>;
@@ -208,6 +220,12 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
     const grant = parseGrantFile(text);
     return { text, grant, who: spec.identity(grant) };
   };
+  /** True when the gateway owns this member's login (see `GrantFileSpec.gatewayOwned`). */
+  const owned = (member: Identity | undefined): boolean => member !== undefined && spec.gatewayOwned?.(member) === true && spec.poolView !== undefined;
+  /** The grant a pool holds for `member`: its vault grant as it is, or the refresh-token-free view of an owned member's. */
+  const poolGrantOf = (member: Identity, grant: GrantFile): GrantFile => (owned(member) ? spec.poolView!(grant) : grant);
+  /** The file text a pool holds for `member`: the vault text as it is, or the view of an owned member's. */
+  const poolTextOf = (member: Identity, vault: { text?: string; grant?: GrantFile }): string => (owned(member) && vault.grant ? json(spec.poolView!(vault.grant)) : vault.text!);
 
   async function ownerByAccount(members: Identity[], accountId: string, activeName: string | null): Promise<Identity | undefined> {
     const ordered = [...members].sort((a, b) => Number(b.name === activeName) - Number(a.name === activeName));
@@ -235,16 +253,40 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
   /** Writes the pool's grant into the owning member's vault when it is newer.
    * The caller holds the owner's oauth and tool locks (see `withHeldLocks`), so the read
    * and compare below can never overwrite a concurrent member refresh. */
-  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile, mode: WriteBackMode, members: Identity[]): Promise<WriteBackOutcome> {
+  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile, mode: WriteBackMode, members: Identity[], at?: { poolDir: string; kind: "swap" | "heal" }): Promise<WriteBackOutcome> {
     const poolId = spec.identity(poolGrant).id;
+    let incoming = poolGrant;
+    if (owned(owner)) {
+      // The gateway renews this login. A pool copy made by this build holds no refresh token and has nothing to give back.
+      // A copy from before (it still holds a real refresh token that is not the vault's) may carry the only live chain:
+      // keep a 0600 copy of it, and adopt it into the vault when it is newer (the host store sync then checks it against
+      // the gateway's journal before it reaches the store). It is never discarded.
+      const poolRefresh = spec.ownedRefresh?.(poolGrant);
+      const vault = await load(owner.configDir);
+      if (poolRefresh !== undefined && poolRefresh !== spec.ownedRefresh?.(vault.grant)) {
+        if (at) await writeBackup(fileOf(at.poolDir), at.kind, json(poolGrant));
+        const poolExpiry = spec.ownedExpiry?.(poolGrant) ?? -1;
+        const vaultExpiry = spec.ownedExpiry?.(vault.grant) ?? -1;
+        const sameAccount = !spec.usable(vault.grant) || vault.who.id === poolId;
+        if (sameAccount && poolExpiry > vaultExpiry) {
+          const merge = spec.newerInto(spec.usable(vault.grant) ? vault.grant : undefined, poolGrant, mode, await otherGrants(owner, members));
+          if (merge?.next) {
+            await writeText(owner.configDir, json(merge.next));
+            return "written";
+          }
+        }
+      }
+      if (!spec.withoutOwned) return "none-gateway-owned";
+      incoming = spec.withoutOwned(poolGrant);
+    }
     const { grant: ownerGrant, who } = await load(owner.configDir);
     if (spec.usable(ownerGrant)) {
       if (who.id !== poolId) return "none-account-mismatch";
-      if (spec.fingerprint(ownerGrant!) === spec.fingerprint(poolGrant)) return "none-identical";
+      if (spec.fingerprint(ownerGrant!) === spec.fingerprint(incoming)) return "none-identical";
     }
-    const merge = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, poolGrant, mode, await otherGrants(owner, members));
+    const merge = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, incoming, mode, await otherGrants(owner, members));
     if (merge?.backup) await writeBackup(fileOf(owner.configDir), "merge", json(merge.backup));
-    if (!merge?.next) return "none-member-newer";
+    if (!merge?.next) return owned(owner) ? "none-gateway-owned" : "none-member-newer";
     await writeText(owner.configDir, json(merge.next));
     return "written";
   }
@@ -290,7 +332,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
       const activeName = pool.swapPool.active ?? null;
       const live = await load(poolDir);
 
-      if (activeName === target.name && live.who.id === target_.who.id && spec.usable(live.grant) && spec.fingerprint(live.grant!) === spec.fingerprint(target_.grant!)) {
+      if (activeName === target.name && live.who.id === target_.who.id && spec.usable(live.grant) && spec.fingerprint(live.grant!) === spec.fingerprint(poolGrantOf(target, target_.grant!))) {
         return { pool: pool.name, from: activeName, to: target.name, noop: true, writeBack: "none-identical" as const, notes };
       }
 
@@ -305,7 +347,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         if (!owner) {
           writeBack = "none-unknown-owner";
         } else {
-          writeBack = await writeBackToOwner(owner, live.grant!, owner.name === activeName ? "same" : "capture", members);
+          writeBack = await writeBackToOwner(owner, live.grant!, owner.name === activeName ? "same" : "capture", members, { poolDir, kind: "swap" });
           if (activeName && owner.name !== activeName) notes.push(`pool held "${owner.name}"'s account, not the recorded active "${activeName}"; wrote it back to "${owner.name}"`);
         }
       }
@@ -326,7 +368,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         const refreshed = await load(target.configDir);
         if (refreshed.text !== undefined && spec.usable(refreshed.grant) && refreshed.who.id === target_.who.id) target_ = refreshed;
       }
-      await writeText(poolDir, target_.text!);
+      await writeText(poolDir, poolTextOf(target, target_));
       const after = (await load(poolDir)).who;
       if (after.id !== target_.who.id) {
         if (live.text !== undefined) await writeText(poolDir, live.text).catch(() => undefined);
@@ -362,14 +404,18 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
     const classify = async () => {
       const cur = await load(pool.configDir);
       const grant = cur.grant;
-      const vaultGrant = vault.grant!;
-      const complete = grant !== undefined && spec.usable(grant) && spec.complete(grant);
+      const vaultGrant = poolGrantOf(active!, vault.grant!);
+      const gatewayOwned = owned(active);
+      // An owned member's pool copy has no refresh token by design: it is complete when it is usable.
+      const complete = grant !== undefined && spec.usable(grant) && (gatewayOwned || spec.complete(grant));
       let kind: "damaged" | "hybrid" | "foreign" | "same" | "behind" | "ok";
       if (!complete) kind = "damaged";
       else if (cur.who.hybrid) kind = "hybrid";
       else if (!cur.who.id) kind = "damaged";
       else if (cur.who.id !== vault.who.id) kind = "foreign";
       else if (spec.fingerprint(grant!) === spec.fingerprint(vaultGrant)) kind = "ok";
+      // Never read newer tokens in the pool as the vault's: the gateway renews the vault, so the pool follows it.
+      else if (gatewayOwned) kind = "behind";
       else if (spec.newerInto(vaultGrant, grant!, "same", await otherGrants(active!, members))?.next) kind = "same";
       else if (spec.newerInto(grant!, vaultGrant, "same", [])?.next) kind = "behind";
       else kind = "ok";
@@ -409,14 +455,14 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
       if (now.kind === "ok") return [];
       if (now.kind === "same") {
         // Same account as the active vault: never restore over it, keep the newer tokens in the vault.
-        const outcome = await writeBackToOwner(active!, now.grant!, "same", members);
+        const outcome = await writeBackToOwner(active!, now.grant!, "same", members, { poolDir: pool.configDir, kind: "heal" });
         return [`pool ${pool.name} held newer tokens for "${activeName}"; vault write-back: ${outcome}`];
       }
       if (now.kind === "foreign") {
         const owner = await ownerByAccount(members, now.who.id!, activeName!);
         if (owner && !held.has(resolve(expandPath(owner.configDir)))) return { needLock: owner.configDir };
         if (owner) {
-          const outcome = await writeBackToOwner(owner, now.grant!, "capture", members);
+          const outcome = await writeBackToOwner(owner, now.grant!, "capture", members, { poolDir: pool.configDir, kind: "heal" });
           notes.push(`pool ${pool.name} held "${owner.name}"'s account instead of "${activeName}"; ${outcome === "written" ? `captured it into "${owner.name}"` : `left "${owner.name}" as it was (${outcome})`}`);
         } else {
           backedUp = true;
@@ -427,6 +473,11 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         notes.push(`pool ${pool.name} credentials were hybrid (parts disagree on the account); kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
       } else if (now.kind === "behind") {
         notes.push(`pool ${pool.name} was behind the vault of "${activeName}" (a member refresh missed it)`);
+        if (owned(active)) {
+          // A pool copy from before this build may hold a refresh token the vault lacks: keep it, adopt it when newer.
+          const outcome = await writeBackToOwner(active!, now.grant!, "same", members, { poolDir: pool.configDir, kind: "heal" });
+          if (outcome === "written") notes.push(`pool ${pool.name} held a newer login for "${activeName}": adopted it into the vault; a 0600 copy is kept`);
+        }
       } else {
         notes.push(`pool ${pool.name} credentials were empty or partial`);
       }
@@ -436,8 +487,9 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         notes.push(`pool ${pool.name} credentials held content the vault lacks; kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
       }
       // Re-read the vault: a write-back above may have merged newer tokens into it.
-      const restoreText = (await readText(active!.configDir)) ?? vault.text!;
-      await writeText(pool.configDir, restoreText);
+      const restoreVault = { text: (await readText(active!.configDir)) ?? vault.text!, grant: undefined as GrantFile | undefined };
+      restoreVault.grant = parseGrantFile(restoreVault.text);
+      await writeText(pool.configDir, poolTextOf(active!, restoreVault));
       notes.push(`restored "${activeName}" into ${pool.name}`);
       return notes;
     });

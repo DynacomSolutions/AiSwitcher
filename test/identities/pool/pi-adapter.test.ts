@@ -20,7 +20,10 @@ let root: string;
 let registry: string;
 let ledger: string;
 const saved = { kimi: KIMI_CONFIG.identitiesJsonPath, pi: PI_CONFIG.identitiesJsonPath };
+// An earlier gateway test in the same process may have marked it the gateway process; these tests are host-side.
+const savedOwner = process.env.AIS_GATEWAY_OWNER;
 beforeEach(async () => {
+  process.env.AIS_GATEWAY_OWNER = "0";
   root = await mkdtemp(join(tmpdir(), "ais-pi-pool-"));
   registry = join(root, "pi-identities.json");
   ledger = join(root, "pi-swap.jsonl");
@@ -29,6 +32,8 @@ beforeEach(async () => {
   (KIMI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = join(root, "kimi-identities.json");
 });
 afterEach(async () => {
+  if (savedOwner === undefined) delete process.env.AIS_GATEWAY_OWNER;
+  else process.env.AIS_GATEWAY_OWNER = savedOwner;
   (KIMI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved.kimi;
   (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved.pi;
   await rm(root, { recursive: true, force: true });
