@@ -5,6 +5,7 @@ import { allowedAccounts, isSwapPool, type PoolIdentity } from "../identities/po
 import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { t3Paths } from "../identities/t3-anthropic-proxy.ts";
+import { MCP_KEY_ENV, launchHeaders, mcpUrl } from "../browser/mcp-http-config.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 
 /** Longest relay call (wait: 120 s) plus margin; the MCP client must not give up first. */
@@ -26,7 +27,28 @@ export interface BrowserWiring {
    * wiring needs a token in ANY of these (allowed, non-retired) member config dirs.
    */
   pool?: { name: string; memberConfigDirs: string[] };
+  /**
+   * Shared MCP service form (set when the service unit is installed): the launch gets an HTTP server entry
+   * instead of a stdio one. The key is never part of the args: the tool reads it from the MCP_KEY_ENV variable.
+   */
+  http?: HttpWiring;
 }
+
+export interface HttpWiring {
+  port: number;
+  /** The launcher's own pid. The real tool replaces it (execve), so it is the agent's pid. */
+  ownerPid: number;
+  cwd?: string;
+  /** The launch's own CLAUDE_CONFIG_DIR / CODEX_HOME, where the transcript lives. */
+  home?: string;
+  /** Claude transcript id from `--session-id` / `--resume`, when the launch names one. */
+  sessionId?: string;
+  t3Thread?: string;
+  t3Home?: string;
+}
+
+/** TOML inline table with quoted keys. JSON string escapes are valid TOML basic-string escapes. */
+const tomlInlineTable = (entries: Record<string, string>): string => `{${Object.entries(entries).map(([k, v]) => `${JSON.stringify(k)}=${JSON.stringify(v)}`).join(",")}}`;
 
 /** Config dirs of the allowed, non-retired members of `pool` (retired identities are never wired). */
 export function poolMemberConfigDirs(file: IdentitiesFile, pool: PoolIdentity): string[] {
@@ -136,6 +158,30 @@ export function browserMcpArgs(tool: string, configDir: string, identity: Pick<I
     if (!w.pool.memberConfigDirs.some((d) => exists(join(d, TOKEN_FILE)))) return [];
   } else if (!exists(join(configDir, TOKEN_FILE))) return [];
   if (tool === "claude" && w.firstArg !== undefined && CLAUDE_SUBCOMMANDS.has(w.firstArg)) return [];
+  if (w.http) {
+    const headers = launchHeaders({
+      tool,
+      ...(w.pool ? { pool: w.pool.name } : { identity: w.identityName, configDir }),
+      home: w.http.home,
+      gateway: w.gateway,
+      sessionId: tool === "claude" ? w.http.sessionId : undefined,
+      t3Thread: w.http.t3Thread,
+      t3Home: w.http.t3Home,
+      cwd: w.http.cwd,
+      ownerPid: w.http.ownerPid,
+    });
+    const url = mcpUrl(w.http.port);
+    if (tool === "claude") {
+      // Claude Code expands ${VAR} in server headers: the key stays out of argv and the process list.
+      return [`--mcp-config=${JSON.stringify({ mcpServers: { "ais-browser": { type: "http", url, headers: { ...headers, Authorization: `Bearer \${${MCP_KEY_ENV}}` } } } })}`];
+    }
+    return [
+      "-c", `mcp_servers.ais-browser.url=${JSON.stringify(url)}`,
+      "-c", `mcp_servers.ais-browser.bearer_token_env_var=${JSON.stringify(MCP_KEY_ENV)}`,
+      "-c", `mcp_servers.ais-browser.http_headers=${tomlInlineTable(headers)}`,
+      "-c", `mcp_servers.ais-browser.tool_timeout_sec=${TOOL_TIMEOUT_SEC}`,
+    ];
+  }
   const target = w.pool
     ? ["--pool", w.pool.name, "--tool", tool]
     : ["--config-dir", configDir, ...(w.identityName ? ["--identity", w.identityName] : [])];
@@ -176,6 +222,8 @@ export interface LaunchBrowserWiringInput {
   exists?: (p: string) => boolean;
   real?: (p: string) => string;
   t3Gateway?: string;
+  /** Shared service form of the wiring. Absent: the stdio form. `key` goes to the launch env only. */
+  http?: HttpWiring & { key: string };
 }
 
 export interface LaunchBrowserWiring {
@@ -185,6 +233,8 @@ export interface LaunchBrowserWiring {
   /** Folder that holds the browser token (the identity's own, not a launcher's folder). */
   configDir: string;
   args: string[];
+  /** Env the launch needs for these args (the service key for the HTTP form). */
+  env: Record<string, string>;
 }
 
 /**
@@ -203,6 +253,7 @@ export async function browserLaunchWiring(i: LaunchBrowserWiringInput): Promise<
     ...(pool ? { pool } : {}),
     ...(i.firstArg !== undefined ? { firstArg: i.firstArg } : {}),
     ...(i.exists ? { exists: i.exists } : {}),
+    ...(i.http ? { http: { ...i.http, home: i.http.home ?? i.configDirValue } } : {}),
   });
-  return { identity, pool, identityName, configDir, args };
+  return { identity, pool, identityName, configDir, args, env: i.http && args.length > 0 ? { [MCP_KEY_ENV]: i.http.key } : {} };
 }
