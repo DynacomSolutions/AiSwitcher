@@ -2,7 +2,7 @@ import { startUsageProxy, type RunningUsageProxy } from "./usage-proxy.ts";
 import { parseToken, verifyToken } from "./tokens.ts";
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { DEAD_REFRESH_CODES, DEFAULT_ACCESS_TOKEN_LIFETIME_S, effectiveGrantPaths, GATEWAY_RENEW_FRACTION, OAuthRefreshError, type IdentityGrantRefresh, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, DEFAULT_ACCESS_TOKEN_LIFETIME_S, effectiveGrantPaths, GATEWAY_RENEW_FRACTION, kimiRenewBelowSeconds, OAuthRefreshError, type IdentityGrantRefresh, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SQL } from "bun";
 import { readFile } from "node:fs/promises";
 import { ClusterBrowserHub, RELAY_PATH } from "./browser/cluster.ts";
@@ -375,6 +375,9 @@ export async function trackedHeartbeatWrite(deps: { metrics: Pick<PrometheusMetr
   }
 }
 
+/** The idle keep-alive pass runs on this tick (milliseconds). */
+const KEEP_ALIVE_TICK_MS = 600_000;
+
 /** Short-lived access tokens: the gateway renews these at half their lifetime. */
 const RENEW_AHEAD_TOOLS: ReadonlySet<string> = new Set(["claude", "grok"]);
 
@@ -396,6 +399,8 @@ export async function keepAliveOnce(deps: {
   shouldStop?: () => boolean;
   /** Renew claude and grok logins at this share of the access-token lifetime (default 0.5). Codex and kimi keep their own rules. */
   renewFraction?: number;
+  /** The keep-alive tick in milliseconds (default 10 minutes): it sets the kimi renew line. */
+  tickMs?: number;
 }): Promise<void> {
   // A grant diagnosed revoked is remembered by fingerprint and not POSTed again until a re-login mints a different one.
   const revoked = deps.revoked ?? new Map<string, string>();
@@ -424,6 +429,8 @@ export async function keepAliveOnce(deps: {
           lastSuccessAt: lastSuccess.get(key) ?? null,
           ...(known ? { revokedFingerprint: known } : {}),
           ...(RENEW_AHEAD_TOOLS.has(tool) ? { renewFraction: deps.renewFraction ?? GATEWAY_RENEW_FRACTION } : {}),
+          // kimi: renew on every tick, so the stored token (and the pool copies) never expires between two ticks.
+          ...(tool === "kimi" ? { renewBelowSeconds: kimiRenewBelowSeconds(deps.tickMs ?? KEEP_ALIVE_TICK_MS) } : {}),
         });
         if (r.outcome === "skipped-revoked" && r.beforeFingerprint) revoked.set(key, r.beforeFingerprint);
         else revoked.delete(key);
@@ -901,6 +908,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       lastSuccess: lastSuccessAt,
       now,
       mintedAt: grantMintedAt,
+      tickMs: hooks.keepAliveMs ?? KEEP_ALIVE_TICK_MS,
       shouldStop: () => draining,
       // The heartbeat also names the ali logins this gateway renews, so the host timer, the daemon and the CLI stand down.
       onPass: hooks.noHeartbeat
@@ -923,7 +931,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       .finally(() => {
         keepAliveRunning = false;
       });
-  }, hooks.keepAliveMs ?? 600_000);
+  }, hooks.keepAliveMs ?? KEEP_ALIVE_TICK_MS);
   keepAliveTimer.unref?.();
   // Refresh-journal retention: old resolved rows go, the newest per account and any rotated-out evidence stay.
   const pruneJournal = (): void => void Promise.resolve(refreshBackend.prune?.(JOURNAL_RETENTION_MS)).catch(() => undefined);

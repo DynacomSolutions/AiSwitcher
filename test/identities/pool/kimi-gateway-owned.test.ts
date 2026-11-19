@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { grantMintedAt, keepAliveOnce } from "../../../src/gateway/serve.ts";
-import { shouldAttemptOAuthRefresh } from "../../../src/identities/oauth-refresh.ts";
+import { kimiRenewBelowSeconds, refreshIdentityOAuthGrant, shouldAttemptOAuthRefresh } from "../../../src/identities/oauth-refresh.ts";
 import { fetchKimiLimits } from "../../../src/cli/limits/kimi-limits.ts";
 import { persistKimiCredentials } from "../../../src/cli/limits/kimi-store.ts";
 import { recordOwned } from "../../../src/identities/gateway-owned.ts";
@@ -226,5 +226,76 @@ describe("the gateway keep-alive renews a kimi login daily", () => {
 
   test("a grant an outside writer minted 10 minutes ago hides the daily pass: why the pass never ran before the fix", async () => {
     expect(await decision(now() + 300)).toBe(false);
+  });
+});
+
+describe("the gateway keep-alive renews a kimi login on every tick", () => {
+  const TICK_MS = 600_000;
+  const line = kimiRenewBelowSeconds(TICK_MS);
+  const NOW = 1_789_300_000;
+  const decide = (secondsLeft: number, extra: { renewBelowSeconds?: number; lastSuccessAt?: string | null } = {}) =>
+    shouldAttemptOAuthRefresh({ access_token: "x", expires_at: NOW + secondsLeft }, { tool: "kimi", expiryWindowHours: 24, nowSeconds: NOW, lastSuccessAt: new Date((NOW - 60) * 1000).toISOString(), ...extra });
+
+  test("the renew line is lifetime minus one tick plus the margin, never above the lifetime", () => {
+    expect(line).toBe(900 - 600 + 120);
+    expect(kimiRenewBelowSeconds(60_000)).toBe(900);
+    expect(kimiRenewBelowSeconds(1_000_000)).toBe(20);
+    expect(kimiRenewBelowSeconds(3_600_000)).toBe(900); // a tick longer than the lifetime renews every time
+  });
+
+  test("a token minted one tick ago (5 minutes left) is renewed; a fresh one is not", () => {
+    expect(decide(300, { renewBelowSeconds: line }).attempt).toBe(true);
+    expect(decide(300, { renewBelowSeconds: line }).reason).toContain("renew line");
+    expect(decide(line - 1, { renewBelowSeconds: line }).attempt).toBe(true);
+    expect(decide(line, { renewBelowSeconds: line }).attempt).toBe(false);
+    expect(decide(880, { renewBelowSeconds: line }).attempt).toBe(false);
+  });
+
+  test("an expired token is renewed on the tick, whatever the last success", () => {
+    expect(decide(-30, { renewBelowSeconds: line }).attempt).toBe(true);
+  });
+
+  test("without the renew line (host daemon, CLI) kimi keeps the daily rule only", () => {
+    expect(decide(300).attempt).toBe(false);
+    expect(decide(300, { lastSuccessAt: new Date((NOW - 30 * 3600) * 1000).toISOString() }).reason).toContain("daily keep-alive");
+  });
+
+  test("the keep-alive sets the line for kimi only", async () => {
+    const seen: Record<string, number | undefined> = {};
+    await keepAliveOnce({
+      tools: ["claude", "codex", "kimi"],
+      tickMs: TICK_MS,
+      accounts: async () => [member("one")],
+      metrics: { keepAlive() {} },
+      refresh: (async (tool: string, _acct: Identity, opts?: { renewBelowSeconds?: number }) => {
+        seen[tool] = opts?.renewBelowSeconds;
+        return { outcome: "skipped-fresh" };
+      }) as never,
+    });
+    expect(seen).toEqual({ claude: undefined, codex: undefined, kimi: line });
+  });
+
+  test("a renewal in the gateway reaches the pool as an access token and expiry only; the vault keeps the full grant", async () => {
+    await setup();
+    process.env.AIS_GATEWAY_OWNER = "1";
+    const nowS = Math.floor(Date.now() / 1000);
+    await put("owned", creds("user-owned", nowS + 300, "owned-1")); // one tick after minting: 5 minutes left
+    await put("pool", creds("user-owned", nowS + 300, "owned-1"));
+    const bodies: string[] = [];
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      bodies.push(String(init?.body));
+      return new Response(JSON.stringify({ access_token: jwt("user-owned", nowS), refresh_token: fake("rt-owned-2"), expires_in: 900 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const result = await refreshIdentityOAuthGrant("kimi", member("owned"), { keepAlive: true, renewBelowSeconds: line, fetchImpl, now: () => nowS * 1000 });
+    expect(result.outcome).toBe("refreshed");
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain(fake("rt-owned-1")); // the spent token went out exactly once
+    const vault = await readGrant("owned");
+    expect(vault.refresh_token).toBe(fake("rt-owned-2"));
+    expect(vault.expires_at).toBeGreaterThan(nowS + 800);
+    const pool = await readGrant("pool");
+    expect(pool.access_token).toBe(vault.access_token);
+    expect(pool.expires_at).toBe(vault.expires_at);
+    expect(pool.refresh_token).toBeUndefined();
   });
 });
