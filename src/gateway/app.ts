@@ -1151,6 +1151,23 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
   }
 
+  if (up.status === 429 && !side && app.provider !== "claude" && app.provider !== "codex") {
+    // A provider with no native limit shape: its 429 text has no reset time, so a client such as T3 Code cannot wake the
+    // thread. Unless the text already ends in one, the client gets the generic limit answer with the member's hold time.
+    const p = await peek(up, ERROR_PEEK_BYTES);
+    up = p.res;
+    const upstreamMessage = summariseUpstreamError(p.bytes)?.message;
+    if (!(upstreamMessage !== undefined && LIMIT_RESET_TEXT.test(upstreamMessage))) {
+      const nowDate = deps.now();
+      const heldUntil = exhausted.get(exKey(servedBy));
+      const resetAtSec = heldUntil !== undefined && heldUntil > nowDate.getTime()
+        ? Math.ceil(heldUntil / 1000)
+        : summariseLimit(await memberUsages(app, deps, model), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, nowDate, limitResets).resetAtSec;
+      await discard(up);
+      up = genericLimitResponse(style, resetAtSec, nowDate, redactText(upstreamMessage ?? "upstream rate limit", 120));
+    }
+  }
+
   // The upstream has answered: no replay is possible or needed any more, so the request bytes can go.
   body = { kind: "none" };
   releaseBody?.();
@@ -1211,6 +1228,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   return new Response(out, { status: httpStatus, statusText: up.statusText, headers });
   }
 }
+
+/** The form T3 Code reads a reset time from: `Resets at <ISO UTC>Z.` at the end of the message. */
+const LIMIT_RESET_TEXT = /\bResets at (\d{4}-\d\d-\d\dT[\d:.]+Z)\.?\s*$/;
 
 interface Hold {
   kind: "burst" | "cred";

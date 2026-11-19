@@ -1796,7 +1796,7 @@ describe("native limit answers", () => {
     expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe("1793622600");
   });
 
-  test("a pool of a provider with no native shape passes the last upstream 429 through byte for byte", async () => {
+  test("a pool of a provider with no native shape answers an upstream 429 with the reset in the text", async () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", target: { kind: "pool" } }));
     usage.a = live(10);
     usage.b = live(20);
@@ -1804,8 +1804,43 @@ describe("native limit answers", () => {
     const res = await call("/k/v1/messages", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
     expect(seen.length).toBe(2);
-    expect(await res.text()).toBe(realBody);
-    for (const [k, v] of Object.entries(realHeaders)) expect(res.headers.get(k)).toBe(v);
+    const message = ((await res.json()) as { error: { message: string } }).error.message;
+    expect(message).toMatch(/^You've hit your usage limit \(Number 3 SYNTHETIC_FIXTURE\)\. Resets at \d{4}-\d\d-\d\dT[\d:.]+Z\.$/);
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+    const resetMs = Date.parse(/Resets at (\S+?)\.$/.exec(message)![1]!);
+    expect(resetMs - NOW.getTime()).toBe(Number(res.headers.get("retry-after")) * 1000);
+  });
+
+  test("an upstream 429 whose text already ends in a reset time passes through byte for byte", async () => {
+    const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pin", identity: "id1" } }));
+    usage.id1 = live(10);
+    const own = '{"error":{"message":"You\'ve hit your usage limit. Resets at 2026-11-02T12:30:00.000Z.","type":"rate_limit_error"}}';
+    handler = () => new Response(own, { status: 429, headers: { "content-type": "application/json" } });
+    const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe(own);
+  });
+
+  test("a pinned member's upstream 429 without a reset in its text gets one from the usage reading", async () => {
+    const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pin", identity: "id1" } }));
+    usage.id1 = { status: "live", maxUtilization: 10, capturedAt: NOW.toISOString(), windows: [{ label: "week", utilization: 10, resetsAt: "2026-11-02T14:00:00.000Z" }] };
+    handler = () => new Response('{"error":{"message":"quota used up","type":"rate_limit_error"}}', { status: 429, headers: { "content-type": "application/json" } });
+    const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(res.headers.get("retry-after")).toBe("14400");
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe("You've hit your usage limit (quota used up). Resets at 2026-11-02T14:00:00.000Z.");
+  });
+
+  test("a non-429 upstream error of a provider with no native shape passes through byte for byte", async () => {
+    const t = await addApp(baseApp({ name: "k", provider: "kimi", target: { kind: "pool" } }));
+    usage.a = live(10);
+    usage.b = live(20);
+    const bad = '{"error":{"message":"bad request SYNTHETIC_FIXTURE","type":"invalid_request_error"}}';
+    handler = () => new Response(bad, { status: 400, headers: { "content-type": "application/json", "x-upstream": "1" } });
+    const res = await call("/k/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(400);
+    expect(res.headers.get("x-upstream")).toBe("1");
+    expect(await res.text()).toBe(bad);
   });
 });
 
