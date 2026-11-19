@@ -3,6 +3,7 @@ import { expandPath } from "./match.ts";
 import { poolsOf } from "./pool/swap-pool.ts";
 import { heartbeatHolds } from "./gateway-heartbeat.ts";
 import { hasMemberCopy, isMemberStoreTool } from "./gateway-members.ts";
+import { isStickyOwned, recordOwned } from "./gateway-owned.ts";
 import { folderHoldsGatewayEntry } from "./gateway-routed.ts";
 import { adapterFor } from "../gateway/providers/index.ts";
 import { isRetired } from "./retired.ts";
@@ -99,18 +100,24 @@ async function routedElsewhere(tool: string, identityName: string, registryPath?
  * codex, grok and kimi also need a fresh gateway heartbeat naming the login (see gateway-heartbeat.ts). An account whose login
  * was moved into the gateway member store is the gateway's whatever the heartbeat says: its local folder holds only the
  * gateway entry, and a refresh here would fork the gateway's rotating refresh token. So is one whose folder holds the
- * gateway entry synced from the host that routed it (routedElsewhere). Unreadable registry or unserved tool:
- * not managed.
+ * gateway entry synced from the host that routed it (routedElsewhere). So is every login of a served tool that the gateway
+ * ever named in its heartbeat (sticky ownership, gateway-owned.ts): a stale heartbeat, a stopped gateway or a failed push from
+ * the database never hands the login to a host refresher; only `ais gateway release` does. Unreadable registry or unserved
+ * tool: not managed.
  */
 export async function isGatewayManagedHere(tool: string, identityName: string, registryPath?: string): Promise<boolean> {
   if (!isGatewayOwnerProcess() && hasMemberCopy(tool, identityName)) return true;
   if (!isGatewayOwnerProcess() && (await routedElsewhere(tool, identityName, registryPath))) return true;
+  if (!isGatewayOwnerProcess() && isGatewayServedTool(tool) && (await isStickyOwned(tool, identityName))) return true;
   if ((GATEWAY_SESSION_TOOLS as readonly string[]).includes(tool)) {
     // A session tool is the gateway's only while a fresh heartbeat names it, so a stopped gateway hands it back at once.
     if (isGatewayOwnerProcess() || !(await heartbeatHolds(tool, identityName))) return false;
     return (await listAliAccounts(registryPath)).some((i) => i.name === identityName);
   }
   if (!isGatewayServedTool(tool) || isGatewayOwnerProcess()) return false;
-  if (tool !== "claude" && !(await heartbeatHolds(tool, identityName))) return false; // no live gateway has said it holds this login: refresh as before
-  return (await listGatewayManagedAccounts(registryPath, tool)).some((i) => i.name === identityName);
+  if (tool !== "claude" && !(await heartbeatHolds(tool, identityName))) return false; // no live gateway has said it holds this login (and none ever did, see above): refresh as before
+  const managed = (await listGatewayManagedAccounts(registryPath, tool)).some((i) => i.name === identityName);
+  // A live gateway named it: latch the ownership, so a later stale heartbeat never hands the login back.
+  if (managed && tool !== "claude") await recordOwned([`${tool}/${identityName}`], new Date().toISOString()).catch(() => undefined);
+  return managed;
 }

@@ -10,6 +10,7 @@ describe("gateway ownership beyond claude", () => {
   let registry: string;
   let saved: string | undefined;
   let savedBeat: string | undefined;
+  let savedOwned: string | undefined;
   const beat = (ageMs: number, held: string[]) =>
     writeHeartbeat({ version: 1, passAt: new Date(Date.now() - ageMs).toISOString(), held: Object.fromEntries(held.map((k) => [k, {}])) });
 
@@ -27,6 +28,8 @@ describe("gateway ownership beyond claude", () => {
     saved = process.env.AIS_GATEWAY_OWNER;
     savedBeat = process.env.AIS_GATEWAY_HEARTBEAT;
     process.env.AIS_GATEWAY_HEARTBEAT = join(root, "heartbeat.json");
+    savedOwned = process.env.AIS_GATEWAY_OWNED;
+    process.env.AIS_GATEWAY_OWNED = join(root, "owned.json"); // a login latched by an earlier test must not make this one owned
     await beat(1000, ["codex/live", "grok/live", "kimi/live", "codex/gone", "codex/pool"]);
   });
   afterEach(async () => {
@@ -34,6 +37,8 @@ describe("gateway ownership beyond claude", () => {
     else process.env.AIS_GATEWAY_OWNER = saved;
     if (savedBeat === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT;
     else process.env.AIS_GATEWAY_HEARTBEAT = savedBeat;
+    if (savedOwned === undefined) delete process.env.AIS_GATEWAY_OWNED;
+    else process.env.AIS_GATEWAY_OWNED = savedOwned;
     await rm(root, { recursive: true, force: true });
   });
 

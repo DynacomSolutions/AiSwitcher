@@ -6,6 +6,7 @@ import { isGatewayAccessToken, isGatewayRoutedDir } from "../claude-gateway-entr
 import { codexAuthPath, readCodexAuthText } from "../codex-auth.ts";
 import { buildCodexGatewayAuth, parseGatewayProvider } from "../codex-gateway-home.ts";
 import { hasMemberCopy, isMemberStoreTool } from "../gateway-members.ts";
+import { isStickyOwnedSync } from "../gateway-owned.ts";
 import { classifyLogin, folderHoldsGatewayEntry } from "../gateway-routed.ts";
 import { expandPath } from "../match.ts";
 import type { Identity } from "../types.ts";
@@ -62,10 +63,10 @@ export async function isGatewayRoutedPool(tool: string, configDir: string): Prom
   return false;
 }
 
-/** True when the gateway holds this member's login: a member store copy on this host, or its folder holds the gateway entry. */
+/** True when the gateway holds this member's login: a member store copy on this host, its folder holds the gateway entry, or the gateway named it in its heartbeat before (sticky ownership). */
 export function isGatewayMember(tool: string, member: Identity, root?: string): boolean {
   if (!isMemberStoreTool(tool)) return false;
-  return hasMemberCopy(tool, member.name, root) || folderHoldsGatewayEntry(tool, member);
+  return hasMemberCopy(tool, member.name, root) || folderHoldsGatewayEntry(tool, member) || isStickyOwnedSync(tool, member.name);
 }
 
 /** The note every swap of a routed pool carries. */

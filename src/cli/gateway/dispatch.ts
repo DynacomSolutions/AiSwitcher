@@ -52,11 +52,12 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     return runT3InstanceCommand(rest, flags, merged);
   }
   if (sub === "store") return runStoreCommand(rest, flags, merged);
+  if (sub === "release") return runReleaseCommand(rest, boolFlag(flags, "force"), merged);
   if (sub === "codex-home") {
     const { runCodexHomeCommand } = await import("./codex-home.ts");
     return runCodexHomeCommand(rest, flags, merged);
   }
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...  (ais gateway --help)");
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|store|release|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");
@@ -154,6 +155,31 @@ export function replicaUrlFromEnv(env: Record<string, string | undefined>, admin
   const ip = env.POD_IP?.trim();
   if (!ip) return undefined;
   return `http://${ip.includes(":") ? `[${ip}]` : ip}:${adminPort}`;
+}
+
+const RELEASE_USAGE = "Usage: ais gateway release <tool>/<identity> [--force]";
+
+/**
+ * `ais gateway release <tool>/<identity>`: ends the sticky gateway ownership of one login on this host (gateway-owned.ts), so
+ * host refreshers may renew it again. For a login whose gateway route was removed. Refused while a fresh heartbeat still names the
+ * login, unless --force.
+ */
+export async function runReleaseCommand(args: string[], force: boolean, deps: GatewayCliDeps): Promise<void> {
+  const target = args[0];
+  const slash = target?.indexOf("/") ?? -1;
+  if (!target || args.length !== 1 || slash <= 0 || slash === target.length - 1) throw new CliUsageError(RELEASE_USAGE);
+  const [tool, identity] = [target.slice(0, slash), target.slice(slash + 1)];
+  const { isStickyOwned, releaseOwned } = await import("../../identities/gateway-owned.ts");
+  if (!(await isStickyOwned(tool, identity))) {
+    deps.out(`gateway release: ${target} is not owned by the gateway on this host; nothing changed`);
+    return;
+  }
+  const { heartbeatHolds } = await import("../../identities/gateway-heartbeat.ts");
+  if (!force && (await heartbeatHolds(tool, identity))) {
+    throw new CliUsageError(`${target} is still named by a fresh gateway heartbeat, so the gateway still renews it. Remove its gateway route first, or pass --force.`);
+  }
+  await releaseOwned(tool, identity);
+  deps.out(`gateway release: ${target} released; host refreshers may renew it again`);
 }
 
 const STORE_USAGE = "Usage: ais gateway store import [--dry-run] | sync [--once] | setup --key-file=<path>  (database URL on stdin)";
