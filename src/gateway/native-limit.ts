@@ -1,11 +1,14 @@
 import type { PoolUsage } from "../identities/pool/adapter.ts";
-import type { GatewayProvider } from "./types.ts";
+import { providerError } from "./errors.ts";
+import type { ApiStyle, GatewayProvider } from "./types.ts";
 
 /**
  * Provider-native "you are out of capacity" answers. Claude Code and Codex CLI decide whether to show their built-in
  * wait/continue prompt (and when to resume) from the provider's own 429 shape, not from a generic gateway error:
  *   - Claude Code reads `anthropic-ratelimit-unified-status|reset|representative-claim|5h-*|7d-*|overage-*` and `retry-after`.
  *   - Codex reads the `usage_limit_reached` error body (`resets_at`, `resets_in_seconds`) and the `x-codex-*` headers.
+ * The message text also ends in `Resets at <ISO>Z.` (see `limitMessage`): T3 Code (OpenCode driver) reads the reset time only
+ * from the text, to snooze a thread and wake it again.
  */
 
 /** Used when no member carries a reset time: long enough not to hammer, short enough to recover soon. */
@@ -102,8 +105,27 @@ export function summariseLimit(usages: Array<PoolUsage | undefined>, reservePerc
   return { resetAtSec: nowSec + FALLBACK_RESET_SECONDS, guessed: true, claim: "short", windows: [] };
 }
 
-const ANTHROPIC_MESSAGE = "This request would exceed your account's rate limit. Please try again later.";
-const CODEX_MESSAGE = "The usage limit has been reached";
+/**
+ * The text of every limit answer the gateway makes: `You've hit your <kind> limit. Resets at <ISO UTC>.` The sentence
+ * and the final timestamp are the form T3 Code reads (it matches `^You've hit your ... limit` and a trailing
+ * `Resets at <ISO>Z.`) to snooze a thread until the reset and then resume it. Nothing may follow the final full stop.
+ * An AIS reason goes in brackets before the first full stop.
+ */
+export function limitMessage(kind: string, resetAtSec: number, reason?: string): string {
+  return `You've hit your ${kind} limit${reason ? ` (${reason})` : ""}. Resets at ${new Date(resetAtSec * 1000).toISOString()}.`;
+}
+
+/**
+ * A limit answer for a provider with no native shape: the provider-style error body, the shared message and `retry-after`.
+ * `kind` defaults to "usage".
+ */
+export function genericLimitResponse(style: ApiStyle, resetAtSec: number, now: Date, reason: string, kind = "usage"): Response {
+  const res = providerError(style, 429, limitMessage(kind, resetAtSec, reason));
+  res.headers.set("retry-after", String(Math.max(1, resetAtSec - Math.floor(now.getTime() / 1000))));
+  return res;
+}
+
+const kindOf = (claim: LimitSlot): string => (claim === "short" ? "5-hour" : "weekly");
 
 function slotFor(info: LimitInfo, slot: LimitSlot): LimitWindow | undefined {
   return info.windows.find((w) => w.slot === slot);
@@ -138,7 +160,7 @@ export function anthropicLimitResponse(info: LimitInfo, now: Date): Response {
     headers.set(`anthropic-ratelimit-unified-${abbrev}-reset`, String(slot === info.claim ? info.resetAtSec : (w?.resetsAtSec ?? info.resetAtSec)));
     headers.set(`anthropic-ratelimit-unified-${abbrev}-utilization`, blocked ? "1" : fraction(w?.utilization ?? 0));
   }
-  return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: ANTHROPIC_MESSAGE } }), { status: 429, headers });
+  return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: limitMessage(kindOf(info.claim), info.resetAtSec) } }), { status: 429, headers });
 }
 
 /**
@@ -162,7 +184,7 @@ export function codexLimitResponse(info: LimitInfo, now: Date): Response {
     headers.set("x-codex-secondary-window-minutes", "10080");
     headers.set("x-codex-secondary-reset-at", String(secondary.resetsAtSec ?? info.resetAtSec));
   }
-  const body = { error: { type: "usage_limit_reached", message: CODEX_MESSAGE, resets_at: info.resetAtSec, resets_in_seconds: Math.max(1, info.resetAtSec - nowSec) } };
+  const body = { error: { type: "usage_limit_reached", message: limitMessage(kindOf(info.claim), info.resetAtSec), resets_at: info.resetAtSec, resets_in_seconds: Math.max(1, info.resetAtSec - nowSec) } };
   return new Response(JSON.stringify(body), { status: 429, headers });
 }
 
