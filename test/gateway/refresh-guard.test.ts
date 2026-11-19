@@ -231,11 +231,12 @@ describe("refresh guard", () => {
       },
     };
     const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, warn: () => {}, lockTimeoutMs: 50, callTimeoutMs: 20 });
-    const first = await guard("claude", ID, { force: true }); // the outer bound fires: degraded refresh
-    expect(first.outcome).toBe("refreshed");
+    // The outer bound fires: with a database backend nothing is refreshed.
+    await expect(guard("claude", ID, { force: true })).rejects.toBeInstanceOf(RefreshGuardRetryable);
+    expect(w.posts).toBe(0);
     await sleep(100); // the late handle arrives and is released
     const second = await guard("claude", ID, { force: true });
-    expect(second.outcome).not.toBeUndefined();
+    expect(second.outcome).toBe("refreshed");
     expect(inner.entries.some((e) => e.outcome === "refreshed")).toBe(true);
   });
 
@@ -244,7 +245,7 @@ describe("refresh guard", () => {
     const reasons: string[] = [];
     const err = Object.assign(new Error("unsupported startup parameter: statement_timeout (postgres://user:pw@host/db)"), { name: "ConnectionError", code: "ERR_CONNECT" });
     const backend: RefreshGuardBackend = { acquire: async () => { throw err; } };
-    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, onDegraded: (_a, why) => void reasons.push(why) });
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, fileLockFallback: true, onDegraded: (_a, why) => void reasons.push(why) });
     await guard("claude", ID, { force: true });
     expect(reasons[0]).toBe("ConnectionError ERR_CONNECT - unsupported startup parameter: statement_timeout (<url>");
     expect(reasons[0]).not.toContain("pw");
@@ -255,7 +256,7 @@ describe("refresh guard", () => {
       const w = world();
       const out: string[] = [];
       const backend: RefreshGuardBackend = { acquire: async () => { throw err; } };
-      await guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, onDegraded: (_a, why) => void out.push(why) })("claude", ID, { force: true });
+      await guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, fileLockFallback: true, onDegraded: (_a, why) => void out.push(why) })("claude", ID, { force: true });
       return out[0] as string;
     };
     const pg = Object.assign(new Error('unsupported startup parameter: statement_timeout'), { name: "PostgresError", code: "ERR_POSTGRES_SERVER_ERROR", errno: "08P01" });
@@ -296,7 +297,7 @@ describe("refresh guard", () => {
         return inner.acquire(a, t);
       },
     };
-    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read });
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, fileLockFallback: true });
     const old = w.grant;
     await guard("claude", ID, { force: true });
     w.grant = old;
@@ -349,7 +350,7 @@ describe("refresh guard", () => {
     };
     const metrics = metricsOf();
     const raised: string[] = [];
-    const guard = guardRefresh(w.refresh, { backend: broken, metrics, readGrant: w.read, onDegraded: (a, why) => void raised.push(`${a.provider}/${a.identity}:${why}`) });
+    const guard = guardRefresh(w.refresh, { backend: broken, metrics, readGrant: w.read, fileLockFallback: true, onDegraded: (a, why) => void raised.push(`${a.provider}/${a.identity}:${why}`) });
     const res = await guard("claude", ID, { force: true });
     expect(res.outcome).toBe("refreshed");
     expect(w.posts).toBe(1);
@@ -363,7 +364,7 @@ describe("refresh guard", () => {
     const orig = backend.acquire.bind(backend);
     backend.acquire = async (...a) => ({ ...(await orig(...a)), claim: () => new Promise<number>(() => {}) });
     const raised: string[] = [];
-    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, callTimeoutMs: 40, onDegraded: (_a, why) => void raised.push(why) });
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, callTimeoutMs: 40, fileLockFallback: true, onDegraded: (_a, why) => void raised.push(why) });
     const res = await guard("claude", ID, { force: true });
     expect(res.outcome).toBe("refreshed");
     expect(w.posts).toBe(1);
@@ -449,8 +450,8 @@ describe("refresh guard", () => {
     expect(w.posts).toBe(0);
     expect(degraded).toHaveLength(1);
     expect(metrics.render()).toContain('ais_gateway_refresh_failures_total{provider="claude",identity="acct1"} 1');
-    // Without the store the old behaviour stays: the refresh goes ahead on the file lock.
-    const plain = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read });
+    // A gateway with no database (fileLockFallback) still refreshes on the file lock.
+    const plain = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, fileLockFallback: true });
     expect((await plain("claude", ID, { force: true })).outcome).toBe("refreshed");
   });
 

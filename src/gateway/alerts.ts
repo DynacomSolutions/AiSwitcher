@@ -1,10 +1,10 @@
 import type { LedgerBuffer } from "./ledger-buffer.ts";
 
-export type AlertKind = "refresh-failed" | "store-unreadable" | "ledger-drop" | "refresh-guard-degraded" | "credential-store-write-failed" | "refresh-interrupted" | "heartbeat-write-failed" | "ali-setup-missing" | "side-count-unavailable";
+export type AlertKind = "refresh-failed" | "store-unreadable" | "ledger-drop" | "refresh-guard-degraded" | "credential-store-write-failed" | "refresh-interrupted" | "heartbeat-write-failed" | "ali-setup-missing" | "side-count-unavailable" | "login-revoked";
 
 export interface OwnerAlert {
   kind: AlertKind;
-  /** Deduplication key: `<provider>/<identity>` for a login, `ledger` for the buffer. */
+  /** Deduplication key: `<provider>/<identity>` for a login (`<provider>/<identity>:<fingerprint>` for login-revoked), `ledger` for the buffer. */
   key: string;
   /** Plain text; never carries tokens, paths or provider response text. */
   message: string;

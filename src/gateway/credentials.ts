@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { codexAccountOf, jwtAccountId, parseCodexAuth, readCodexAuthText } from "../identities/codex-auth.ts";
@@ -230,6 +231,11 @@ export class CredentialCache {
   private readonly entries = new Map<string, Entry>();
   private readonly lastRefreshAt = new Map<string, number>();
   private readonly inflight = new Map<string, Promise<ProviderCredential>>();
+  /**
+   * Digest of the stored access token of a login the token endpoint answered with a dead-grant code. While the store still holds
+   * that very token, no refresh runs (ensureUsable and the 401 path never resend a dead refresh token). A new login changes it.
+   */
+  private readonly deadFor = new Map<string, string>();
   private readonly refresh: RefreshFn;
 
   constructor(private readonly deps: CredentialCacheDeps = {}) {
@@ -295,6 +301,9 @@ export class CredentialCache {
     if (current.accessToken !== staleToken && !isGatewayAccessToken(current.accessToken)) return current;
     staleToken = current.accessToken;
     const key = `${provider}\u0000${identity}`;
+    const staleDigest = createHash("sha256").update(staleToken).digest("hex");
+    if (this.deadFor.get(key) === staleDigest) throw new GatewayCredentialError("login-dead", provider, identity);
+    this.deadFor.delete(key);
     const now = (this.deps.now ?? Date.now)();
     const last = this.lastRefreshAt.get(key);
     if (last !== undefined && now - last < REFRESH_COOLDOWN_MS) throw new RefreshCooldownError(provider, identity);
@@ -307,13 +316,25 @@ export class CredentialCache {
       // Raw errors can carry lock paths or provider text: keep them as `cause` only.
       // Only a dead-grant OAuth code (invalid_grant, refresh_token_expired/reused/invalidated) in the token endpoint's body proves the login is gone; any other 400/401 is not enough.
       const revoked = err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode);
-      if (revoked) await markLoginRevoked(provider, identity, err.oauthCode!, err.refreshFingerprint);
+      if (revoked) {
+        this.deadFor.set(key, staleDigest);
+        await markLoginRevoked(provider, identity, err.oauthCode!, err.refreshFingerprint);
+      }
       throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : revoked ? "login-dead" : "refresh-failed", provider, identity, err);
+    }
+    // The result path: a failed result can carry the token endpoint's dead code instead of throwing.
+    if (result.outcome === "failed" && result.code !== undefined && DEAD_REFRESH_CODES.has(result.code)) {
+      this.deadFor.set(key, staleDigest);
+      await markLoginRevoked(provider, identity, result.code, result.beforeFingerprint);
+      throw new GatewayCredentialError("login-dead", provider, identity);
     }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
     const next = await this.reload(provider, id);
     if (next.accessToken !== staleToken && !isGatewayAccessToken(next.accessToken)) return next;
-    if (result.outcome === "skipped-revoked") await markLoginRevoked(provider, identity, "revoked", result.beforeFingerprint);
+    if (result.outcome === "skipped-revoked") {
+      this.deadFor.set(key, staleDigest);
+      await markLoginRevoked(provider, identity, "revoked", result.beforeFingerprint);
+    }
     // Detail from the refresher may carry local paths: surface only a reason code.
     // A swap pool's no-grant and any failed refresh are transient here; only a revoked diagnosis or a plain identity with no grant is a dead login.
     const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id) && !result.readError) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" || result.outcome === "skipped-read-error" ? "refresh-failed" : "token-unchanged";

@@ -11,6 +11,7 @@ import refreshJournal0003 from "./migrations/0003_refresh_journal.sql" with { ty
 import sideCounts0004 from "./migrations/0004_side_counts.sql" with { type: "text" };
 import homeFiles0005 from "./migrations/0005_home_files.sql" with { type: "text" };
 import browserPresence0006 from "./migrations/0006_browser_presence.sql" with { type: "text" };
+import refreshJournalCode0007 from "./migrations/0007_refresh_journal_code.sql" with { type: "text" };
 
 const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0001_init", sql: init0001 },
@@ -19,6 +20,7 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0004_side_counts", sql: sideCounts0004 },
   { version: "0005_home_files", sql: homeFiles0005 },
   { version: "0006_browser_presence", sql: browserPresence0006 },
+  { version: "0007_refresh_journal_code", sql: refreshJournalCode0007 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */

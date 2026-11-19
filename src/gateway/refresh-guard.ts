@@ -1,6 +1,6 @@
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { grantFingerprint, type OAuthGrant } from "../identities/oauth-reconcile.ts";
-import { OAuthRefreshError, readEffectiveGrant, type IdentityGrantRefresh, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, OAuthRefreshError, readEffectiveGrant, type IdentityGrantRefresh, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import type { Identity } from "../identities/types.ts";
 import type { RefreshFn } from "./credentials.ts";
 
@@ -13,13 +13,15 @@ import type { RefreshFn } from "./credentials.ts";
  *  2. adopt-first: the latest stored grant is re-read under the lock and used as it is when another holder already refreshed it;
  *  3. journalled: a claim is written immediately before the token request (never for a pass that sends nothing) and
  *     resolved after it, as fingerprints only;
- *  4. fail-closed on a known-spent token: one the journal shows as rotated out is never sent again. An unresolved claim
- *     (a crash) is treated like a failed transport attempt: one journalled retry, then refused.
- * When the database (or the guard) is unavailable, refreshing carries on under AIS's own file lock and the
- * expectedAccessToken compare-and-swap, with an alert: the guard never stops all refreshes.
+ *  4. fail-closed on a known-spent token: one the journal shows as rotated out, or as answered with a dead-grant code
+ *     (outcome `dead`), is never sent again, on any replica. An unresolved claim (a crash) is treated like a failed
+ *     transport attempt: one journalled retry, then refused.
+ * When the database (or the guard) is unavailable, nothing refreshes: the current access token is served until it
+ * expires. Only a gateway with no database (`fileLockFallback`) refreshes under AIS's own file lock and the
+ * expectedAccessToken compare-and-swap, with an alert.
  */
 
-export type JournalOutcome = "refreshed" | "failed" | "lost" | "interrupted" | "recovered";
+export type JournalOutcome = "refreshed" | "failed" | "lost" | "interrupted" | "recovered" | "dead";
 
 export interface JournalEntry {
   id: number;
@@ -33,6 +35,16 @@ export interface JournalEntry {
   newFp?: string;
   /** Undefined while the claim is unresolved. */
   outcome?: JournalOutcome;
+  /** The OAuth error code of a `dead` or `failed` answer (a short public name, never a token). */
+  code?: string;
+}
+
+/** What the journal knows about one account, for the metrics seed and the admin renewal route. */
+export interface RefreshSummaryRow {
+  provider: string;
+  identity: string;
+  refreshed?: { id: number; ts: string; holder: string };
+  error?: { id: number; ts: string; holder: string; outcome: "failed" | "dead"; code?: string; oldFp: string };
 }
 
 export interface RefreshAccount {
@@ -47,9 +59,9 @@ export interface RefreshJournalOps {
   /** Marks unresolved claims for any other fingerprint as recovered (the stores moved on). */
   closeStale(currentFp: string): Promise<number>;
   claim(oldFp: string, holder: string): Promise<number>;
-  resolve(id: number, outcome: JournalOutcome, newFp?: string): Promise<void>;
+  resolve(id: number, outcome: JournalOutcome, newFp?: string, code?: string): Promise<void>;
   /** Same write on a fresh connection, for retries after the lock's own connection failed. Defaults to `resolve`. */
-  resolveFresh?(id: number, outcome: JournalOutcome, newFp?: string): Promise<void>;
+  resolveFresh?(id: number, outcome: JournalOutcome, newFp?: string, code?: string): Promise<void>;
 }
 
 export interface RefreshLockHandle extends RefreshJournalOps {
@@ -69,6 +81,8 @@ export interface RefreshGuardBackend {
    * rotated-out evidence (`refreshed`, `lost`, `interrupted`) are kept EVIDENCE_RETENTION_FACTOR times as long.
    */
   prune?(retentionMs: number): Promise<number>;
+  /** Newest `refreshed` row and newest `failed` or `dead` row per account (no lock needed). */
+  summary?(): Promise<RefreshSummaryRow[]>;
   close?(): Promise<void>;
 }
 
@@ -87,6 +101,20 @@ export class RefreshGuardRetryable extends Error {
 
 /** The journal proves this refresh token must not be sent. */
 class RefreshRefused extends OAuthRefreshError {}
+
+/** The dead-grant OAuth code of an error, when the token endpoint's own answer says only a new login helps. */
+export function deadCodeOf(err: unknown): string | undefined {
+  return err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode) ? err.oauthCode : undefined;
+}
+
+/** A short code for a failed (not dead) answer, for the journal and the admin route: never a message, never a token. */
+function failureCodeOf(err: unknown): string {
+  if (err instanceof OAuthRefreshError) {
+    if (err.oauthCode !== undefined) return err.oauthCode.slice(0, 64);
+    return err.message.startsWith("token endpoint unreachable") ? "transport" : "other";
+  }
+  return "other";
+}
 
 export const JOURNAL_RETENTION_MS = 30 * 24 * 3_600_000;
 /** Rotated-out evidence outlives other rows by this factor (30 days x 12 = a year). */
@@ -150,13 +178,26 @@ export class MemoryRefreshBackend implements RefreshGuardBackend {
         this.entries.push({ id, ts: new Date().toISOString(), ...account, holder, oldFp });
         return id;
       },
-      resolve: async (id, outcome, newFp) => {
+      resolve: async (id, outcome, newFp, code) => {
         const e = this.entries.find((x) => x.id === id);
         if (!e) return;
         e.outcome = outcome;
         if (newFp !== undefined) e.newFp = newFp;
+        if (code !== undefined) e.code = code;
       },
     };
+  }
+
+  async summary(): Promise<RefreshSummaryRow[]> {
+    const rows = new Map<string, RefreshSummaryRow>();
+    for (const e of [...this.entries].sort((a, b) => a.id - b.id)) {
+      const key = `${e.provider}\u0000${e.identity}`;
+      const row = rows.get(key) ?? { provider: e.provider, identity: e.identity };
+      if (e.outcome === "refreshed") row.refreshed = { id: e.id, ts: e.ts, holder: e.holder };
+      else if (e.outcome === "failed" || e.outcome === "dead") row.error = { id: e.id, ts: e.ts, holder: e.holder, outcome: e.outcome, oldFp: e.oldFp, ...(e.code !== undefined ? { code: e.code } : {}) };
+      rows.set(key, row);
+    }
+    return [...rows.values()];
   }
 
   async prune(retentionMs: number): Promise<number> {
@@ -167,7 +208,7 @@ export class MemoryRefreshBackend implements RefreshGuardBackend {
     for (const rows of perAccount.values()) for (const e of rows.sort((a, b) => b.id - a.id).slice(0, JOURNAL_KEEP_PER_ACCOUNT)) keep.add(e.id);
     const before = this.entries.length;
     const evidenceCutoff = Date.now() - retentionMs * EVIDENCE_RETENTION_FACTOR;
-    const evidence = (e: JournalEntry): boolean => e.outcome === "refreshed" || e.outcome === "lost" || e.outcome === "interrupted";
+    const evidence = (e: JournalEntry): boolean => e.outcome === "refreshed" || e.outcome === "lost" || e.outcome === "interrupted" || e.outcome === "dead";
     const kept = this.entries.filter((e) => keep.has(e.id) || e.outcome === undefined || Date.parse(e.ts) >= (evidence(e) ? evidenceCutoff : cutoff));
     this.entries.length = 0;
     this.entries.push(...kept);
@@ -185,8 +226,20 @@ export interface GuardDeps {
   lockTimeoutMs?: number;
   /** Bound on every other backend call. */
   callTimeoutMs?: number;
-  /** The guard could not run for this account and the refresh went ahead on the file lock alone. */
+  /**
+   * Only for a gateway with no database: when the guard cannot run, refresh on AIS's file lock and compare-and-swap alone.
+   * Default false: with a database backend a guard failure (lock timeout, connection error, journal error) never refreshes.
+   */
+  fileLockFallback?: boolean;
+  /** The guard could not run for this account (and nothing was refreshed, unless `fileLockFallback` is set). */
   onDegraded?(account: RefreshAccount, reason: string): void;
+  /**
+   * The token endpoint answered a dead-grant code for the refresh token `fingerprint` (`fresh`), or the journal showed that
+   * answer and the token was refused (`fresh` false). Raised at the first dead answer, on whichever replica sent it.
+   */
+  onDead?(account: RefreshAccount, info: { fingerprint: string; code: string; fresh: boolean }): void;
+  /** The fingerprint of the stored refresh token, read under the lock: a changed value means a new login landed. */
+  onGrantSeen?(account: RefreshAccount, fingerprint: string): void;
   /** Consecutive interrupted attempts with the current refresh token (0 once it is cleared). Alert from 2 up. */
   onInterrupted?(account: RefreshAccount, count: number): void;
   /** A refresh's result could not be written to the credential store (after retries); the local file stays ahead for the background pass. */
@@ -263,6 +316,14 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
     rotatedOut.add(key);
     if (rotatedOut.size > 2000) rotatedOut.delete(rotatedOut.values().next().value as string);
   };
+  /** Refresh tokens this process saw answered with a dead-grant code, with the code (same reason as `rotatedOut`). */
+  const deadOut = new Map<string, string>();
+  const markDead = (key: string, code: string): void => {
+    deadOut.set(key, code);
+    if (deadOut.size > 2000) deadOut.delete(deadOut.keys().next().value as string);
+  };
+  const failClosed = deps.fileLockFallback !== true;
+  const refusedDead = (fingerprint: string, code: string): RefreshRefused => new RefreshRefused(`refresh refused: the journal shows the token endpoint answered ${code} for this refresh token; it is not sent again, re-login required`, true, fingerprint, code);
   const ROTATED_OUT_MESSAGE = "refresh refused: this refresh token was already rotated out (journal) and is not sent again; the newer grant is missing from the stores";
 
   /** Pushes what a refresh wrote; retried, then left to the store's background pass (the local file stays ahead). */
@@ -306,11 +367,11 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
         count("failure");
         throw err;
       }
-      if (deps.sync) {
+      if (deps.sync || failClosed) {
         // Each replica's file lock is local: refreshing here could send the same single-use refresh token as another replica.
         count("failure");
         deps.onDegraded?.(account, reason(err));
-        throw new RefreshGuardRetryable(`refresh lock unavailable (${reason(err)}); not refreshing without it on the shared credential store`);
+        throw new RefreshGuardRetryable(`refresh lock unavailable (${reason(err)}); not refreshing without it, the current access token is served until it expires`);
       }
       // The guard cannot run. Refreshing still goes ahead under AIS's file lock and the expectedAccessToken compare-and-swap.
       count("degraded");
@@ -334,11 +395,11 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       deps.onDegraded?.(account, reason(err));
     };
     /** Resolve writes: the first on the lock's connection, the retries on a fresh pool connection (the lock's may be the broken one). */
-    const resolveClaim = async (id: number, outcome: JournalOutcome, newFp?: string): Promise<void> => {
+    const resolveClaim = async (id: number, outcome: JournalOutcome, newFp?: string, code?: string): Promise<void> => {
       let attempt = 0;
       await journal(() => {
         const fresh = attempt++ > 0 && lock.resolveFresh;
-        return fresh ? lock.resolveFresh!(id, outcome, newFp) : lock.resolve(id, outcome, newFp);
+        return fresh ? lock.resolveFresh!(id, outcome, newFp, code) : lock.resolve(id, outcome, newFp, code);
       });
     };
     const journal = async (fn: () => Promise<void>): Promise<void> => {
@@ -353,6 +414,7 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       }
     };
 
+    let lastFp: string | undefined;
     try {
       let latest: OAuthGrant | undefined;
       try {
@@ -365,6 +427,8 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       }
       if (latest?.refresh_token) {
         const cur = grantFingerprint(latest);
+        lastFp = cur;
+        deps.onGrantSeen?.(account, cur);
         // Adopt-first: another holder already refreshed this account while we waited.
         const moved =
           (before?.refresh_token !== undefined && grantFingerprint(before) !== cur) ||
@@ -375,7 +439,14 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
 
       // The claim is written by the refresher itself, under its file locks, immediately before the token request.
       const refuseIfRotatedOut = (fingerprint: string): void => {
+        refuseIfDead(fingerprint);
         if (rotatedOut.has(`${tool}\u0000${identity.name}\u0000${fingerprint}`)) throw new RefreshRefused(ROTATED_OUT_MESSAGE, false);
+      };
+      const refuseIfDead = (fingerprint: string): void => {
+        const code = deadOut.get(`${tool}\u0000${identity.name}\u0000${fingerprint}`);
+        if (code === undefined) return;
+        deps.onDead?.(account, { fingerprint, code, fresh: false });
+        throw refusedDead(fingerprint, code);
       };
       const beforePost = async ({ fingerprint }: { fingerprint: string }): Promise<void> => {
         let rows: JournalEntry[];
@@ -385,9 +456,13 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
         } catch (err) {
           degrade(err);
           refuseIfRotatedOut(fingerprint);
+          if (failClosed) throw new RefreshGuardRetryable(`refresh journal unreadable (${reason(err)}); not refreshing without it`);
           return;
         }
         for (const e of rows) if (e.outcome === "refreshed" && e.newFp !== undefined && e.newFp !== e.oldFp) markRotatedOut(`${tool}\u0000${identity.name}\u0000${e.oldFp}`);
+        const deadRow = rows.find((e) => e.outcome === "dead");
+        if (deadRow) markDead(`${tool}\u0000${identity.name}\u0000${fingerprint}`, deadRow.code ?? "invalid_grant");
+        refuseIfDead(fingerprint);
         if (rotatedOut.has(`${tool}\u0000${identity.name}\u0000${fingerprint}`)) throw new RefreshRefused(ROTATED_OUT_MESSAGE, false);
         let interrupted = rows.filter((e) => e.outcome === "interrupted").length;
         try {
@@ -400,6 +475,7 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
         } catch (err) {
           degrade(err);
           refuseIfRotatedOut(fingerprint);
+          if (failClosed) throw new RefreshGuardRetryable(`refresh journal write failed (${reason(err)}); not refreshing without it`);
           return;
         }
         deps.onInterrupted?.(account, interrupted);
@@ -407,14 +483,29 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
           claim = await bounded(lock.claim(fingerprint, holder), callMs, "refresh journal");
         } catch (err) {
           degrade(err);
+          if (failClosed) throw new RefreshGuardRetryable(`refresh journal claim failed (${reason(err)}); not refreshing without it`);
         }
+      };
+
+      /** Records a dead-grant answer: journal row, in-process memory and the owner callback, at the first answer. */
+      const recordDead = async (fingerprint: string, code: string): Promise<void> => {
+        markDead(`${tool}\u0000${identity.name}\u0000${fingerprint}`, code);
+        if (claim !== undefined) await resolveClaim(claim, "dead", undefined, code).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
+        deps.onDead?.(account, { fingerprint, code, fresh: true });
       };
 
       let res: IdentityGrantRefresh;
       try {
         res = await refresh(tool, identity, { ...opts, beforePost });
       } catch (err) {
-        if (claim !== undefined) await resolveClaim(claim, "failed").catch((e) => warn(`refresh journal write failed (${reason(e)})`));
+        const dead = deadCodeOf(err);
+        if (err instanceof RefreshRefused) {
+          // Refused before any request: nothing was claimed and nothing is sent.
+        } else if (dead !== undefined) {
+          await recordDead((err as OAuthRefreshError).refreshFingerprint ?? lastFp ?? "", dead);
+        } else if (claim !== undefined) {
+          await resolveClaim(claim, "failed", undefined, failureCodeOf(err)).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
+        }
         await pushBack(tool, identity, []);
         count("failure");
         throw err;
@@ -425,11 +516,15 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
         markRotatedOut(`${tool}\u0000${identity.name}\u0000${res.beforeFingerprint}`);
         deps.onInterrupted?.(account, 0);
       }
-      if (claim !== undefined) {
+      // The result path: a "failed" result can carry the token endpoint's dead code instead of throwing.
+      const resultDead = res.outcome === "failed" && res.code !== undefined && DEAD_REFRESH_CODES.has(res.code) ? res.code : undefined;
+      if (resultDead !== undefined) {
+        await recordDead(res.beforeFingerprint ?? lastFp ?? "", resultDead);
+      } else if (claim !== undefined) {
         const lost = res.outcome === "failed" && res.afterFingerprint !== undefined;
         const outcome: JournalOutcome = res.outcome === "refreshed" ? "refreshed" : lost ? "lost" : res.outcome === "failed" ? "failed" : "recovered";
         const id = claim;
-        await resolveClaim(id, outcome, outcome === "refreshed" || lost ? res.afterFingerprint : undefined).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
+        await resolveClaim(id, outcome, outcome === "refreshed" || lost ? res.afterFingerprint : undefined, outcome === "failed" && res.code !== undefined ? res.code : undefined).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
       }
       if (!degraded) deps.onHealthy?.(account);
       return settle(res);

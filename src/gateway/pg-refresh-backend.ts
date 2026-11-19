@@ -1,8 +1,10 @@
 import { SQL } from "bun";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
-import { bounded, BACKEND_CALL_TIMEOUT_MS, EVIDENCE_RETENTION_FACTOR, JOURNAL_KEEP_PER_ACCOUNT, type JournalEntry, type JournalOutcome, type RefreshAccount, type RefreshGuardBackend, type RefreshLockHandle } from "./refresh-guard.ts";
+import { bounded, BACKEND_CALL_TIMEOUT_MS, EVIDENCE_RETENTION_FACTOR, JOURNAL_KEEP_PER_ACCOUNT, type JournalEntry, type JournalOutcome, type RefreshAccount, type RefreshGuardBackend, type RefreshLockHandle, type RefreshSummaryRow } from "./refresh-guard.ts";
 
 const POLL_MS = 100;
+/** Pause before the next attempt on a fresh connection after a slow or failed lock call. */
+const RETRY_PAUSE_MS = 250;
 /** Connections in the backend's own pool. */
 const POOL_MAX = 10;
 /** Concurrent lock holders: each pins one reserved connection, so two stay free for retention and for any queries that need the pool. */
@@ -21,6 +23,7 @@ const toEntry = (r: any): JournalEntry => ({
   oldFp: r.old_fp,
   ...(r.new_fp !== null ? { newFp: r.new_fp } : {}),
   ...(r.outcome !== null ? { outcome: r.outcome as JournalOutcome } : {}),
+  ...(r.code !== null && r.code !== undefined ? { code: r.code as string } : {}),
 });
 
 /**
@@ -36,8 +39,9 @@ export class PgRefreshBackend implements RefreshGuardBackend {
   private holders = 0;
   private readonly waiters: Array<() => void> = [];
 
-  constructor(url: string, private readonly callMs = BACKEND_CALL_TIMEOUT_MS) {
-    this.sql = new SQL(url, { max: POOL_MAX });
+  /** `sql` replaces the driver pool (tests only). */
+  constructor(url: string, private readonly callMs = BACKEND_CALL_TIMEOUT_MS, sql?: SQL) {
+    this.sql = sql ?? new SQL(url, { max: POOL_MAX });
   }
 
   async close(): Promise<void> {
@@ -78,30 +82,44 @@ export class PgRefreshBackend implements RefreshGuardBackend {
     let conn: Awaited<ReturnType<SQL["reserve"]>> | undefined;
     let contended = this.holders >= MAX_HOLDERS && Date.now() - started > 0;
     const timedOut = (): SwapLockError => new SwapLockError(`refresh lock for ${account.provider}/${account.identity} busy for ${timeoutMs} ms`, name, true);
+    /** Ends a connection that may still hold the lock (or hang): it is never returned to the pool. */
+    const endConn = async (dead: typeof conn): Promise<void> => {
+      if (dead) await Promise.race([dead.close().catch(() => undefined), new Promise((r) => setTimeout(r, this.callMs))]);
+    };
     try {
       if (Date.now() >= deadline) throw timedOut();
-      const reserving = this.sql.reserve();
-      try {
-        conn = await bounded(reserving, Math.min(this.callMs, Math.max(1, deadline - Date.now())), "guard connection");
-      } catch (err) {
-        // A connection that arrives after we gave up goes back to the pool instead of leaking.
-        reserving.then((late) => late.release(), () => undefined);
-        throw err;
-      }
-      const c = conn;
-      // Server-side bound too, where the server allows a SET (never a startup parameter); the client timeout is what is relied on.
-      await bounded(c.unsafe(`SET statement_timeout = ${Math.trunc(this.callMs)}`), this.callMs, "guard setup").catch(() => undefined);
-      for (;;) {
-        if (Date.now() >= deadline) throw timedOut();
-        const rows = await bounded(c`SELECT pg_try_advisory_lock(hashtextextended(${name}, 0)) AS got`, this.callMs, "guard lock");
-        if (rows[0]?.got === true) break;
-        contended = true;
-        if (Date.now() >= deadline) throw timedOut();
-        await new Promise((r) => setTimeout(r, POLL_MS));
+      // A slow or failed call (a database restart, a failover) is retried on a fresh connection while the lock deadline lasts,
+      // never on the same one: a lock query that arrives late could still take the lock on the old session.
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const reserving = this.sql.reserve();
+          try {
+            conn = await bounded(reserving, Math.min(this.callMs, Math.max(1, deadline - Date.now())), "guard connection");
+          } catch (err) {
+            // A connection that arrives after we gave up goes back to the pool instead of leaking.
+            reserving.then((late) => late.release(), () => undefined);
+            throw err;
+          }
+          const c = conn;
+          // Server-side bound too, where the server allows a SET (never a startup parameter); the client timeout is what is relied on.
+          await bounded(c.unsafe(`SET statement_timeout = ${Math.trunc(this.callMs)}`), this.callMs, "guard setup").catch(() => undefined);
+          for (;;) {
+            if (Date.now() >= deadline) throw timedOut();
+            const rows = await bounded(c`SELECT pg_try_advisory_lock(hashtextextended(${name}, 0)) AS got`, this.callMs, "guard lock");
+            if (rows[0]?.got === true) break;
+            contended = true;
+            if (Date.now() >= deadline) throw timedOut();
+            await new Promise((r) => setTimeout(r, POLL_MS));
+          }
+          break;
+        } catch (err) {
+          await endConn(conn);
+          conn = undefined;
+          if (err instanceof SwapLockError || Date.now() + RETRY_PAUSE_MS >= deadline) throw err;
+          await new Promise((r) => setTimeout(r, RETRY_PAUSE_MS * Math.min(attempt + 1, 4)));
+        }
       }
     } catch (err) {
-      // A connection that may still hold the lock (or hang) is ended, never returned to the pool.
-      if (conn) await Promise.race([conn.close().catch(() => undefined), new Promise((r) => setTimeout(r, this.callMs))]);
       this.freeSlot();
       throw err;
     }
@@ -129,7 +147,7 @@ export class PgRefreshBackend implements RefreshGuardBackend {
       },
       findByOldFp: async (fp) => {
         const rows = await c`
-          SELECT id, ts, provider, identity, holder, old_fp, new_fp, outcome
+          SELECT id, ts, provider, identity, holder, old_fp, new_fp, outcome, code
           FROM gateway_refresh_journal
           WHERE provider = ${account.provider} AND identity = ${account.identity} AND old_fp = ${fp}
           ORDER BY id DESC`;
@@ -150,20 +168,52 @@ export class PgRefreshBackend implements RefreshGuardBackend {
           RETURNING id`;
         return Number(rows[0].id);
       },
-      resolve: async (id, outcome, newFp) => {
+      resolve: async (id, outcome, newFp, code) => {
         await c`
           UPDATE gateway_refresh_journal
-          SET outcome = ${outcome}, new_fp = COALESCE(${newFp ?? null}, new_fp), resolved_at = now()
+          SET outcome = ${outcome}, new_fp = COALESCE(${newFp ?? null}, new_fp), code = COALESCE(${code ?? null}, code), resolved_at = now()
           WHERE id = ${id}`;
       },
       // The lock's own connection may be the broken one: retries go through the pool (two connections are kept free for this).
-      resolveFresh: async (id, outcome, newFp) => {
+      resolveFresh: async (id, outcome, newFp, code) => {
         await this.sql`
           UPDATE gateway_refresh_journal
-          SET outcome = ${outcome}, new_fp = COALESCE(${newFp ?? null}, new_fp), resolved_at = now()
+          SET outcome = ${outcome}, new_fp = COALESCE(${newFp ?? null}, new_fp), code = COALESCE(${code ?? null}, code), resolved_at = now()
           WHERE id = ${id}`;
       },
     };
+  }
+
+  /** Newest `refreshed` row and newest `failed` or `dead` row per account (index scan per account, no lock). */
+  async summary(): Promise<RefreshSummaryRow[]> {
+    const refreshed = await bounded(
+      this.sql`
+        SELECT DISTINCT ON (provider, identity) provider, identity, id, ts, holder
+        FROM gateway_refresh_journal WHERE outcome = 'refreshed'
+        ORDER BY provider, identity, id DESC`,
+      10_000,
+      "journal summary",
+    );
+    const errors = await bounded(
+      this.sql`
+        SELECT DISTINCT ON (provider, identity) provider, identity, id, ts, holder, outcome, code, old_fp
+        FROM gateway_refresh_journal WHERE outcome IN ('failed', 'dead')
+        ORDER BY provider, identity, id DESC`,
+      10_000,
+      "journal summary",
+    );
+    const rows = new Map<string, RefreshSummaryRow>();
+    const row = (provider: string, identity: string): RefreshSummaryRow => {
+      const key = `${provider}\u0000${identity}`;
+      const found = rows.get(key) ?? { provider, identity };
+      rows.set(key, found);
+      return found;
+    };
+    // biome-ignore lint/suspicious/noExplicitAny: driver rows are untyped
+    for (const r of refreshed as any[]) row(r.provider, r.identity).refreshed = { id: Number(r.id), ts: iso(r.ts), holder: r.holder };
+    // biome-ignore lint/suspicious/noExplicitAny: driver rows are untyped
+    for (const r of errors as any[]) row(r.provider, r.identity).error = { id: Number(r.id), ts: iso(r.ts), holder: r.holder, outcome: r.outcome as "failed" | "dead", oldFp: r.old_fp, ...(r.code !== null && r.code !== undefined ? { code: r.code as string } : {}) };
+    return [...rows.values()];
   }
 
   /**
@@ -180,7 +230,7 @@ export class PgRefreshBackend implements RefreshGuardBackend {
           ) t
           WHERE t.rn > ${JOURNAL_KEEP_PER_ACCOUNT}
             AND t.outcome IS NOT NULL
-            AND t.ts < now() - make_interval(secs => ${retentionMs / 1000} * CASE WHEN t.outcome IN ('refreshed', 'lost', 'interrupted') THEN ${EVIDENCE_RETENTION_FACTOR} ELSE 1 END)
+            AND t.ts < now() - make_interval(secs => ${retentionMs / 1000} * CASE WHEN t.outcome IN ('refreshed', 'lost', 'interrupted', 'dead') THEN ${EVIDENCE_RETENTION_FACTOR} ELSE 1 END)
         ) RETURNING id`,
       30_000,
       "journal retention",
