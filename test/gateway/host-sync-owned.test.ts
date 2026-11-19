@@ -73,7 +73,7 @@ describe("host sync and sticky ownership", () => {
 
   test("a store row for a login the gateway owns is never written into its identity folder, nor is one for a login the gateway does not manage", async () => {
     const home = await tmp();
-    await put(home, ".claude/identities.json", JSON.stringify({ version: 1, identities: [{ name: "acme", label: "acme", configDir: join(home, ".claude/identities/acme") }, { name: "plain", label: "plain", configDir: join(home, ".claude/identities/plain") }] }));
+    await put(home, ".claude/identities.json", JSON.stringify({ version: 1, identities: [{ name: "acme", label: "acme", configDir: join(home, ".claude/identities/acme") }, { name: "plain", label: "plain", retired: true, configDir: join(home, ".claude/identities/plain") }] }));
     await recordOwned(["claude/acme"], "2026-01-01T00:00:00.000Z", join(home, ".ais", "gateway-owned.json"));
     await put(home, FOLDER, login("folder"));
     await put(home, OTHER, login("plain-old"));
@@ -90,7 +90,7 @@ describe("host sync and sticky ownership", () => {
     await sync(empty, store);
     await expect(readFile(join(empty, FOLDER), "utf8")).rejects.toThrow();
     const open = await tmp();
-    await put(open, ".claude/identities.json", JSON.stringify({ version: 1, identities: [{ name: "acme", label: "acme", configDir: join(open, ".claude/identities/acme") }] }));
+    await put(open, ".claude/identities.json", JSON.stringify({ version: 1, identities: [{ name: "acme", label: "acme", retired: true, configDir: join(open, ".claude/identities/acme") }] }));
     await sync(open, store);
     // Not owned and not managed by the gateway either (host-login-gate.ts): the folder login belongs to the host, so no row lands on it.
     await expect(readFile(join(open, FOLDER), "utf8")).rejects.toThrow();

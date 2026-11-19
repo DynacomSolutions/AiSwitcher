@@ -17,7 +17,11 @@ const CONFIGS = { claude: CLAUDE_CONFIG, codex: CODEX_CONFIG, grok: GROK_CONFIG,
 const savedPaths: Record<string, string> = {};
 const registryOf = (tool: string) => join(work, `${tool}-registry.json`);
 // Registries are repointed at empty temp files so no test ever reads the real home directory.
+
+// The gateway manages every live claude login, so a host process never refreshes one: these tests run as the gateway process.
+const savedOwnerRole = process.env.AIS_GATEWAY_OWNER;
 beforeEach(async () => {
+  process.env.AIS_GATEWAY_OWNER = "1";
   await mkdir(SCRATCH, { recursive: true });
   work = await mkdtemp(join(SCRATCH, "gw-cred-"));
   await cp(FIXTURES, work, { recursive: true });
@@ -28,6 +32,8 @@ beforeEach(async () => {
   }
 });
 afterEach(async () => {
+  if (savedOwnerRole === undefined) delete process.env.AIS_GATEWAY_OWNER;
+  else process.env.AIS_GATEWAY_OWNER = savedOwnerRole;
   for (const [tool, config] of Object.entries(CONFIGS)) (config as { identitiesJsonPath: string }).identitiesJsonPath = savedPaths[tool]!;
   await rm(work, { recursive: true, force: true });
 });
