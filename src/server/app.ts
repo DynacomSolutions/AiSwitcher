@@ -26,8 +26,9 @@ import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { accountKey, collectAccounts } from "../identities/account-info.ts";
 import { invalidateLimitsCache, runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
-import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
+import { loadGatewayModelUsage, loadGatewayUsage, type GatewayModelUsageView, type GatewayUsageView } from "../gateway/usage-view.ts";
 import { loadGatewayLimits, mergeGatewayLimits, type GatewayLimitsView } from "./gateway-limits.ts";
+import { GATEWAY_USAGE_WINDOW_DAYS, mergeGatewayUsage } from "./gateway-usage.ts";
 import * as gatewayApps from "./gateway-apps.ts";
 import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -85,6 +86,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   gatewayUsage?: (days: number) => Promise<GatewayUsageView>;
   /** Test seam for the gateway limits merge on GET /api/limits; defaults to the gateway admin API. */
   gatewayLimits?: () => Promise<GatewayLimitsView>;
+  /** Test seam for the gateway usage merge on GET /api/usage; defaults to the gateway admin API. */
+  gatewayModelUsage?: () => Promise<GatewayModelUsageView>;
   /** Test seam for the /api/gateway/apps routes; defaults to the gateway admin API (and the CLI rotate path). */
   gatewayApps?: Partial<{
     list: () => Promise<gatewayApps.GatewayAppsView>;
@@ -290,12 +293,19 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     return c.json(await withRowAccounts(payload));
   });
   app.get("/api/usage", async (c) => {
-    const result = await runScanIsolated("usage", {
+    const filters = {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
-    }, scanTimeoutAboveTokscale(60_000));
+    };
+    // The cluster gateway ledger is the source of truth for the usage of the identities it manages; the host scan covers the rest.
+    // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
+    const [result, gateway] = await Promise.all([
+      runScanIsolated("usage", filters, scanTimeoutAboveTokscale(60_000)),
+      (deps.gatewayModelUsage ?? (() => loadGatewayModelUsage(GATEWAY_USAGE_WINDOW_DAYS)))().catch(() => undefined),
+    ]);
     if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
-    return c.json(result.payload);
+    const payload = gateway ? await mergeGatewayUsage(result.payload, gateway, filters) : result.payload;
+    return c.json(payload);
   });
   // Per-app gateway tokens from the admin API; "configured: false" when this
   // process has no admin URL and token, so the console can hide the section.
@@ -363,12 +373,14 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   app.get("/api/pools/usage", async (c) => c.json(await (deps.poolsUsage ?? (() => poolsUsage()))()));
   // Per-project usage from the native store, written by the host collector
   // (projects.json). Read only: this request never scans anything.
+  // Host-only: the gateway ledger records no working directory, so it cannot answer per-project usage.
   app.get("/api/usage/projects", (c) => {
     const projects = (deps.usageProjects ?? (() => readUsageProjects()))();
     return c.json(projects ?? { pending: true, rows: [] });
   });
   // The shared breakdown snapshot is read immediately; this API request only
   // queues a refresh marker. The host collector owns all history scans.
+  // Host-only: the gateway ledger records no tool-call categories, so it cannot answer the breakdown.
   app.get("/api/usage/breakdown", async (c) => {
     const query = {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
