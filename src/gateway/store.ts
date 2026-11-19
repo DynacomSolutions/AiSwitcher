@@ -1,5 +1,5 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
-import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
+import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 
 /** The message for any attempt to reuse or extend a revoked app. */
@@ -43,12 +43,12 @@ export interface GatewayStore {
   /** Ledger totals per day (bucketed in the IANA zone `tz`), provider, identity and model; apps are summed. Same window as usageByModel. */
   usageByModelDaily(since: Date, until: Date | undefined, tz: string): Promise<ModelDailyUsageRow[]>;
   /**
-   * Imports history rows. Idempotent: a row with the same key (source, provider, identity, day, model) is raised
-   * to the larger value of each figure, never lowered. Nothing is ever deleted.
+   * Imports history rows. A row with the same key (source, generation, provider, identity, day, model) is replaced
+   * exactly, so importing one generation again is idempotent. A new generation adds rows. Nothing is ever deleted.
    */
   upsertUsageHistory(rows: UsageHistoryRow[]): Promise<void>;
-  /** Every history row, optionally for one source, provider or identity, sorted by provider, identity, day, model. */
-  usageHistory(filter?: { source?: string; provider?: string; identity?: string }): Promise<UsageHistoryStored[]>;
+  /** History rows, by default the latest generation of each source, optionally for one source, provider, identity or generation, sorted by provider, identity, day, model. */
+  usageHistory(filter?: UsageHistoryFilter): Promise<UsageHistoryStored[]>;
   putBrowserBinding(b: BrowserBinding): Promise<void>;
   getBrowserBinding(name: string): Promise<BrowserBinding | undefined>;
   listBrowserBindings(): Promise<BrowserBinding[]>;
@@ -285,23 +285,18 @@ export class MemoryGatewayStore implements GatewayStore {
   async upsertUsageHistory(rows: UsageHistoryRow[]): Promise<void> {
     const at = new Date().toISOString();
     for (const r of rows) {
-      const key = [r.source, r.provider, r.identity, r.day ?? "", r.model ?? ""].join("\u0000");
-      const old = this.history.get(key);
-      this.history.set(key, {
-        ...r,
-        inputTokens: Math.max(r.inputTokens, old?.inputTokens ?? 0),
-        outputTokens: Math.max(r.outputTokens, old?.outputTokens ?? 0),
-        cacheReadTokens: Math.max(r.cacheReadTokens, old?.cacheReadTokens ?? 0),
-        cacheWriteTokens: Math.max(r.cacheWriteTokens, old?.cacheWriteTokens ?? 0),
-        messages: Math.max(r.messages, old?.messages ?? 0),
-        estCostUsd: Math.max(r.estCostUsd, old?.estCostUsd ?? 0),
-        importedAt: at,
-      });
+      const generation = new Date(r.generation).toISOString();
+      const key = [r.source, generation, r.provider, r.identity, r.day ?? "", r.model ?? ""].join("\u0000");
+      this.history.set(key, { ...r, generation, importedAt: at });
     }
   }
 
-  async usageHistory(filter: { source?: string; provider?: string; identity?: string } = {}): Promise<UsageHistoryStored[]> {
+  async usageHistory(filter: UsageHistoryFilter = {}): Promise<UsageHistoryStored[]> {
+    const latest = new Map<string, string>();
+    for (const r of this.history.values()) if ((latest.get(r.source) ?? "") < r.generation) latest.set(r.source, r.generation);
+    const generation = filter.generation === undefined || filter.generation === "latest" ? undefined : new Date(filter.generation).toISOString();
     return [...this.history.values()]
+      .filter((r) => (generation === undefined ? r.generation === latest.get(r.source) : r.generation === generation))
       .filter((r) => (filter.source === undefined || r.source === filter.source) && (filter.provider === undefined || r.provider === filter.provider) && (filter.identity === undefined || r.identity === filter.identity))
       .map((r) => ({ ...r }))
       .sort((a, b) => a.provider.localeCompare(b.provider) || a.identity.localeCompare(b.identity) || (a.day ?? "").localeCompare(b.day ?? "") || (a.model ?? "").localeCompare(b.model ?? "") || a.source.localeCompare(b.source));

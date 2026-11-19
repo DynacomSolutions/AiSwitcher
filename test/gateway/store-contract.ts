@@ -208,26 +208,35 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(utc.reduce((n, r) => n + r.inputTokens, 0)).toBe(total);
   });
 
-  test("usage history upserts idempotently, only raises figures, keeps sources apart and never deletes", async () => {
+  test("usage history: a generation replaces itself exactly, a new generation adds rows and becomes latest, nothing is deleted", async () => {
     const s = await makeStore();
-    const h = (over: Partial<UsageHistoryRow> = {}): UsageHistoryRow => ({ source: "host-snapshot-models", provider: "claude", identity: "m1", day: null, model: "opus", inputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40, messages: 5, estCostUsd: 1.5, ...over });
+    const G1 = "2026-11-18T10:00:00.000Z";
+    const G2 = "2026-11-19T20:19:38.328Z";
+    const h = (over: Partial<UsageHistoryRow> = {}): UsageHistoryRow => ({ source: "host-snapshot-models", generation: G1, provider: "claude", identity: "m1", day: null, model: "opus", inputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40, messages: 5, estCostUsd: 1.5, firstDay: "2026-04-01", lastDay: "2026-11-01", zone: "Asia/Bangkok", ...over });
+    const daily = (over: Partial<UsageHistoryRow> = {}) => h({ day: "2026-10-01", model: null, source: "host-snapshot-daily", ...over });
     await s.upsertUsageHistory([]);
-    await s.upsertUsageHistory([h(), h({ model: null }), h({ day: "2026-10-01", model: null, source: "host-snapshot-daily" })]);
-    // The same batch again changes nothing.
-    await s.upsertUsageHistory([h(), h({ model: null }), h({ day: "2026-10-01", model: null, source: "host-snapshot-daily" })]);
+    await s.upsertUsageHistory([h(), h({ model: null }), daily()]);
+    // The same generation again changes nothing.
+    await s.upsertUsageHistory([h(), h({ model: null }), daily()]);
     const all = await s.usageHistory();
     expect(all).toHaveLength(3);
     expect(all.reduce((n, r) => n + r.estCostUsd, 0)).toBe(4.5);
-    // A lower figure never lowers history; a higher one raises it.
-    await s.upsertUsageHistory([h({ inputTokens: 1, estCostUsd: 0.1, messages: 99 })]);
+    expect(all[0]).toMatchObject({ generation: G1, firstDay: "2026-04-01", lastDay: "2026-11-01", zone: "Asia/Bangkok" });
+    // The same generation is an exact replace: a lower figure lowers it, a null span replaces a span.
+    await s.upsertUsageHistory([h({ inputTokens: 1, estCostUsd: 0.1, messages: 99, firstDay: null, lastDay: null })]);
     const opus = (await s.usageHistory({ provider: "claude", identity: "m1", source: "host-snapshot-models" })).find((r) => r.model === "opus");
-    expect(opus).toMatchObject({ inputTokens: 10, estCostUsd: 1.5, messages: 99, day: null });
+    expect(opus).toMatchObject({ inputTokens: 1, estCostUsd: 0.1, messages: 99, day: null, firstDay: null, lastDay: null });
     expect(typeof opus?.importedAt).toBe("string");
-    await s.upsertUsageHistory([h({ estCostUsd: 2 })]);
-    expect((await s.usageHistory({ source: "host-snapshot-models" })).find((r) => r.model === "opus")?.estCostUsd).toBe(2);
-    // A null model and a null day are keys of their own.
-    expect((await s.usageHistory({ source: "host-snapshot-models" })).map((r) => r.model)).toEqual([null, "opus"]);
-    expect(await s.usageHistory({ source: "host-snapshot-daily" })).toMatchObject([{ day: "2026-10-01", model: null }]);
+    // A new generation adds rows and becomes the latest of its source; the old rows stay readable by generation.
+    await s.upsertUsageHistory([h({ generation: G2, estCostUsd: 2 })]);
+    const latest = await s.usageHistory({ source: "host-snapshot-models" });
+    expect(latest.map((r) => `${r.generation}/${r.model}/${r.estCostUsd}`)).toEqual([`${G2}/opus/2`]);
+    expect((await s.usageHistory({ source: "host-snapshot-models", generation: "latest" })).map((r) => r.generation)).toEqual([G2]);
+    const old = await s.usageHistory({ source: "host-snapshot-models", generation: G1 });
+    expect(old.map((r) => `${r.model}/${r.estCostUsd}`)).toEqual(["null/1.5", "opus/0.1"]);
+    // Latest is per source: the daily source still reads its own generation.
+    expect(await s.usageHistory({ source: "host-snapshot-daily" })).toMatchObject([{ generation: G1, day: "2026-10-01", model: null }]);
+    expect(await s.usageHistory({ generation: "2026-01-01T00:00:00.000Z" })).toEqual([]);
     expect(await s.usageHistory({ provider: "codex" })).toEqual([]);
     expect(await s.usageHistory({ identity: "nobody" })).toEqual([]);
   });
