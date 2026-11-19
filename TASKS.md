@@ -179,7 +179,7 @@ ETA: 2026-11-15 23:00 ICT
 | 220 | Gateway: a revoked app stays revoked, its old tokens never work again | done | claude | gateway-revoke-revive | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/599 (41dfaf3), live on all 6 replicas.<br>Revoked name: add, rotate and admin PUT and mint give 409.<br>Leaked revoked tokens give 401 on every replica. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-20 00:30 ICT
+ETA: 2026-11-20 03:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -202,6 +202,7 @@ ETA: 2026-11-20 00:30 ICT
 | 152 | Usage collector: permanent 5 MB/s disk cap; cold exports finish across cycles | in_review | claude-20261108-usage-cold-cap | ais-usage-cold-cap | 5.150 | 2026-11-09 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/423.<br>Tokscale checkpoints its cache; fixture: 6 killed cycles then complete, sha equal.<br>Install rebuilds Tokscale when its build stamp is stale; 5M only with a checkpointing build, else 20M. |
 | 229 | Gateway limit answers carry the reset time so T3 snoozes and resumes threads | in_progress | claude | gw-limit-reset-text | | 2026-11-19 23:30 ICT | OpenCode thread showed Limited and never woke.<br>The gateway 429 text had no reset time.<br>Fix: every limit answer says "Resets at <ISO>" and has retry-after. |
 | 230 | Limits page: the cluster gateway is the source of truth, not stale host files | in_review | claude | gateway-limits-truth | | 2026-11-20 00:30 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/622.<br>Gateway admin GET /limits reads the cached usage source. The console merges gateway rows over the host scan.<br>20 new tests. Full suite 4607 pass, 0 fail. |
+| 232 | Usage page: the cluster gateway ledger is the source of truth, not host scans | in_review | claude | usage-view-truth | | 2026-11-20 03:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/624.<br>Phase 2 after 5.230: /api/usage merges gateway ledger rows per identity and model. Host scan stays the fallback.<br>Breakdown and projects stay host-only. No per-day split yet.<br>17 new tests. Full suite 4624 pass, 0 fail. |
 
 | 177 | Usage breakdown: tokens and cost per project, repo and GitHub org | done | claude | ais-webui-tabs-usage-breakdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/489 (4b3910f), released v0.5.47.<br>Breakdown collector records each session's cwd (Claude line cwd, Codex session_meta/turn_context) and maps it to git toplevel and origin owner/repo from .git files.<br>Shown on Usage tabs Projects, Repos, Orgs. |
 | 187 | Usage projects, repos and orgs from the usage store so totals match the Usage page | done | claude | usage-projects-native | | 2026-11-12 12:00 ICT | Was 186. Local org folders count toward their org.<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/502.<br>v0.5.47 tabs read transcripts: All time capped to 30 d ($3k vs $184k), deleted transcripts missing, Claude counted 1.7-3.5x.<br>Usage store messages carry workspace_key for 100% of $180k. |
