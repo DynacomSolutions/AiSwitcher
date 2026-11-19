@@ -417,11 +417,15 @@ const KIMI_EXPIRED_RETRY_S = 2 * 3600;
  * the daemon only runs the daily keep-alive (never the expiry window). */
 export function shouldAttemptOAuthRefresh(
   grant: OAuthGrant,
-  options: { force?: boolean; expiryWindowHours?: number; lastSuccessAt?: string | null; nowSeconds?: number; tool?: RefreshableTool },
+  options: { force?: boolean; expiryWindowHours?: number; lastSuccessAt?: string | null; nowSeconds?: number; tool?: RefreshableTool; renewFraction?: number },
 ): { attempt: boolean; reason: string } {
   const now = options.nowSeconds ?? Math.floor(Date.now() / 1000);
   const toolWindow = options.tool === undefined ? undefined : SHORT_TOKEN_EXPIRY_WINDOW_HOURS[options.tool];
-  const windowHours = Math.min(options.expiryWindowHours ?? DEFAULT_EXPIRY_WINDOW_HOURS, toolWindow ?? Infinity);
+  let windowHours = Math.min(options.expiryWindowHours ?? DEFAULT_EXPIRY_WINDOW_HOURS, toolWindow ?? Infinity);
+  // The gateway renews a short-lived token once this share of its lifetime has passed (never closer than the tick allows).
+  if (options.renewFraction !== undefined && toolWindow !== undefined && options.tool !== undefined) {
+    windowHours = Math.max(MIN_RENEW_WINDOW_S, options.renewFraction * accessTokenLifetimeSeconds(grant, options.tool)) / 3600;
+  }
   const windowSeconds = windowHours * 3600;
   const secondsLeft = grant.expires_at === undefined ? Number.POSITIVE_INFINITY : grant.expires_at - now;
   if (options.force) return { attempt: true, reason: "manual refresh" };
@@ -464,6 +468,18 @@ export const SHORT_TOKEN_EXPIRY_WINDOW_HOURS: Partial<Record<RefreshableTool, nu
   grok: 1,
 };
 export const DEFAULT_EXPIRY_WINDOW_HOURS = 24;
+/** Access-token lifetime used when a grant records no mint time: claude about eight hours, grok about six. */
+export const DEFAULT_ACCESS_TOKEN_LIFETIME_S: Partial<Record<RefreshableTool, number>> = { claude: 8 * 3600, grok: 6 * 3600 };
+/** The renew-ahead window never gets shorter than this: it stays above the 10-minute keep-alive tick with margin. */
+export const MIN_RENEW_WINDOW_S = 20 * 60;
+/** Share of the access-token lifetime after which the gateway renews a claude or grok login. */
+export const GATEWAY_RENEW_FRACTION = 0.5;
+
+/** Access-token lifetime in seconds: expiry minus mint time when both are known, else the provider default. */
+export function accessTokenLifetimeSeconds(grant: OAuthGrant, tool: RefreshableTool): number {
+  if (grant.expires_at !== undefined && grant.minted_at !== undefined && grant.expires_at > grant.minted_at) return grant.expires_at - grant.minted_at;
+  return DEFAULT_ACCESS_TOKEN_LIFETIME_S[tool] ?? 8 * 3600;
+}
 /** Claude access tokens live about eight hours: a mint time is estimated as expiry minus this when the token carries none. */
 const CLAUDE_ACCESS_TOKEN_LIFETIME_S = 8 * 3600;
 
@@ -713,6 +729,8 @@ export interface IdentityGrantRefresh {
   storesProbed?: boolean;
   beforeFingerprint?: string;
   afterFingerprint?: string;
+  /** The OAuth error code of a "failed" result that carries the token endpoint's answer (a dead code means only a new login helps). */
+  code?: string;
   /** New access-token expiry (unix seconds) on success. */
   expiresAt?: number;
   written: string[];
@@ -730,6 +748,8 @@ export interface OAuthRefreshOptions {
   lastSuccessAt?: string | null;
   /** The gateway's idle keep-alive pass: an identity with no OAuth grant (API key or logged out) is skipped quietly, not alerted. */
   keepAlive?: boolean;
+  /** Renew a short-lived token (claude, grok) once this share of its lifetime has passed. Set by the gateway keep-alive only. */
+  renewFraction?: number;
   /** Compare-and-refresh: when set, the refresh proceeds only if the freshest
    * stored access token (re-read under the locks) still has this value;
    * otherwise another process already rotated it and no token request is
@@ -819,6 +839,7 @@ export async function refreshIdentityOAuthGrant(
       lastSuccessAt: options.lastSuccessAt,
       nowSeconds: Math.floor((options.now ?? Date.now)() / 1000),
       tool,
+      ...(options.renewFraction !== undefined ? { renewFraction: options.renewFraction } : {}),
     });
     if (!decision.attempt) {
       return {
@@ -944,6 +965,7 @@ async function refreshGrantUnlocked(
     lastSuccessAt: options.lastSuccessAt,
     nowSeconds: nowSeconds(),
     tool,
+    ...(options.renewFraction !== undefined ? { renewFraction: options.renewFraction } : {}),
   });
   if (!decision.attempt) {
     return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason, storesProbed: true, ...(readFailed ? { unreadableStores: probed.unreadable } : {}) };

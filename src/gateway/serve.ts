@@ -2,7 +2,7 @@ import { startUsageProxy, type RunningUsageProxy } from "./usage-proxy.ts";
 import { parseToken, verifyToken } from "./tokens.ts";
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { DEAD_REFRESH_CODES, effectiveGrantPaths, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, DEFAULT_ACCESS_TOKEN_LIFETIME_S, effectiveGrantPaths, GATEWAY_RENEW_FRACTION, OAuthRefreshError, type IdentityGrantRefresh, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SQL } from "bun";
 import { readFile } from "node:fs/promises";
 import { ClusterBrowserHub, RELAY_PATH } from "./browser/cluster.ts";
@@ -25,7 +25,7 @@ import { createGatewayApp, markGatewayResponse, styleForPath, type GatewayDeps }
 import { authBrowserToken } from "./browser/auth.ts";
 import { BrowserHub } from "./browser/hub.ts";
 import { CachedGatewayStore } from "./cache-store.ts";
-import { CredentialCache, type RefreshFn } from "./credentials.ts";
+import { CredentialCache, loginCommand, type RefreshFn } from "./credentials.ts";
 import { providerError } from "./errors.ts";
 import { errorTag, LedgerBuffer } from "./ledger-buffer.ts";
 import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
@@ -36,7 +36,9 @@ import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
 import { enableMemberStore, memberStoreEnabled, setLocalWriteHook } from "../identities/gateway-members.ts";
-import { recordLoginRevoked } from "../identities/gateway-revoked.ts";
+import { clearLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
+import { grantFingerprint } from "../identities/oauth-reconcile.ts";
+import { buildRenewalReport } from "./renewal.ts";
 import { GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
@@ -72,6 +74,8 @@ export interface GatewayHooks {
   creds?: GatewayDeps["creds"];
   /** Test hook: the refresh the guard wraps (default AIS's locked refresh). */
   refreshImpl?: RefreshFn;
+  /** Test hook: how the guard reads the stored grant under the lock (default: the freshest grant AIS's refresh itself reads). */
+  readGrant?: Parameters<typeof guardRefresh>[1]["readGrant"];
   /** Lock and journal that guard login refreshes across replicas. Default: the gateway's PostgreSQL. */
   refreshBackend?: RefreshGuardBackend & { close?(): Promise<void> };
   fetch?: typeof fetch;
@@ -129,8 +133,14 @@ export interface RunningGateway {
 /** Wraps a login refresh so every attempt is counted and a failure raises one owner alert until it recovers. `failed` remembers the stale token a failed refresh was for. */
 export function instrumentRefresh(
   refresh: RefreshFn,
-  deps: { metrics: Pick<PrometheusMetrics, "refresh">; alerter: Alerter; failed?: Map<string, string> },
+  deps: { metrics: Pick<PrometheusMetrics, "refresh">; alerter: Alerter; failed?: Map<string, string>; log?: (line: string) => void; replica?: string },
 ): RefreshFn {
+  const log = deps.log ?? ((line: string) => console.info(line));
+  const replica = deps.replica ?? process.env.HOSTNAME ?? "gateway";
+  /** One JSON line per refresh result: ids, outcome, expiry and OAuth code only (no token, no email). */
+  const logResult = (tool: string, name: string, outcome: string, expiresAt: number | undefined, code: string | undefined): void => {
+    log(JSON.stringify({ event: "refresh", provider: tool, identity: name, replica, outcome, expiresAt: expiresAt !== undefined ? new Date(expiresAt * 1000).toISOString() : null, code: code ?? null }));
+  };
   return (async (tool, identity, opts) => {
     const key = `${tool}/${identity.name}`;
     const fail = (): void => {
@@ -155,6 +165,12 @@ export function instrumentRefresh(
     try {
       const result = await refresh(tool, identity, opts);
       deps.metrics.refresh(tool, result.outcome);
+      const resultDead = result.outcome === "failed" && result.code !== undefined && DEAD_REFRESH_CODES.has(result.code);
+      // A pass that sent nothing and changed nothing (token not due, idle login) is not a refresh result worth a line.
+      const adopted = result.outcome === "skipped-fresh" && result.detail?.startsWith("adopted") === true;
+      if (result.outcome !== "skipped-fresh" && !(result.outcome === "no-grant" && opts?.keepAlive === true && !result.readError)) logResult(tool, identity.name, resultDead ? "dead" : result.outcome, result.expiresAt, result.code);
+      else if (adopted) logResult(tool, identity.name, "adopted", result.expiresAt, undefined);
+      if (resultDead) await markRevoked(tool, identity.name, result.code!, result.beforeFingerprint);
       const idleNoGrant = result.outcome === "no-grant" && opts?.keepAlive === true && !result.readError;
       if (result.outcome === "failed" || (result.outcome === "no-grant" && !idleNoGrant) || result.outcome === "skipped-revoked") fail();
       if (result.outcome === "skipped-revoked") await markRevoked(tool, identity.name, "revoked", result.beforeFingerprint);
@@ -169,9 +185,11 @@ export function instrumentRefresh(
       // A busy lock or a transient guard/read error is retried by the next caller or tick: it never means the login needs a person.
       if ((err instanceof SwapLockError && err.timedOut) || err instanceof RefreshGuardRetryable) {
         deps.metrics.refresh(tool, err instanceof RefreshGuardRetryable ? "retryable" : "lock-timeout");
+        logResult(tool, identity.name, err instanceof RefreshGuardRetryable ? "retryable" : "lock-timeout", undefined, undefined);
         throw err;
       }
       deps.metrics.refresh(tool, "failed");
+      logResult(tool, identity.name, err instanceof OAuthRefreshError && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode) ? "dead" : "failed", undefined, err instanceof OAuthRefreshError ? err.oauthCode ?? (err.message.startsWith("token endpoint unreachable") ? "transport" : undefined) : undefined);
       fail();
       // Only a dead-grant OAuth code proves the login is gone (as in credentials.ts): record it where the portal can read it.
       if (err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode)) await markRevoked(tool, identity.name, err.oauthCode, err.refreshFingerprint);
@@ -304,16 +322,26 @@ const describe = (err: unknown): string => {
  * traffic (AIS's normal expiry window decides; a fresh login is left alone). Counted per outcome; a failure raises the usual alert.
  */
 /** Records the time of every successful refresh per "tool/name", whoever asked (keep-alive, 401 path, ensureUsable). */
-export function stampRefreshSuccess(refresh: RefreshFn, lastSuccess: Map<string, string>, now: () => Date): RefreshFn {
+export function stampRefreshSuccess(refresh: RefreshFn, lastSuccess: Map<string, string>, now: () => Date, onSuccess?: (tool: string, identity: string, at: Date, result: IdentityGrantRefresh) => void): RefreshFn {
   return (async (tool, identity, opts) => {
     const r = await refresh(tool, identity, opts);
-    if (r.outcome === "refreshed") lastSuccess.set(`${tool}/${identity.name}`, now().toISOString());
+    if (r.outcome === "refreshed") {
+      lastSuccess.set(`${tool}/${identity.name}`, now().toISOString());
+      onSuccess?.(tool, identity.name, now(), r);
+    }
     return r;
   }) as RefreshFn;
 }
 
 /** Typical access-token lifetimes, used to date a grant that records only its expiry. */
 const ACCESS_TOKEN_LIFETIME_S: Record<string, number> = { kimi: 900, codex: 10 * 86_400 };
+
+/** Access-token lifetime of a stored grant: expiry minus mint time, else the provider's typical lifetime. */
+export function grantLifetimeSeconds(tool: string, grant: { expires_at?: number; minted_at?: number; access_token: string }): number | undefined {
+  if (grant.expires_at !== undefined && grant.minted_at !== undefined && grant.expires_at > grant.minted_at) return grant.expires_at - grant.minted_at;
+  const typical = ACCESS_TOKEN_LIFETIME_S[tool] ?? DEFAULT_ACCESS_TOKEN_LIFETIME_S[tool as RefreshableTool];
+  return typical;
+}
 
 /** When the stored grant was minted: its own minted_at, else expiry minus the tool's token lifetime. Undefined when unknown. */
 export async function grantMintedAt(tool: string, account: Identity): Promise<number | undefined> {
@@ -338,6 +366,9 @@ export async function trackedHeartbeatWrite(deps: { metrics: Pick<PrometheusMetr
   }
 }
 
+/** Short-lived access tokens: the gateway renews these at half their lifetime. */
+const RENEW_AHEAD_TOOLS: ReadonlySet<string> = new Set(["claude", "grok"]);
+
 export async function keepAliveOnce(deps: {
   refresh: RefreshFn;
   accounts: (tool: string) => Promise<Identity[]>;
@@ -354,6 +385,10 @@ export async function keepAliveOnce(deps: {
   onPass?: (held: Record<string, { lastSuccessAt?: string }>, at: Date) => Promise<void>;
   /** Checked before each account: true ends the pass (the gateway is stopping and its stores are about to close). */
   shouldStop?: () => boolean;
+  /** Called for each account before its refresh: the gateway reads the stored login for its expiry and revoked gauges. Failures are ignored. */
+  observe?: (tool: string, account: Identity) => Promise<void>;
+  /** Renew claude and grok logins at this share of the access-token lifetime (default 0.5). Codex and kimi keep their own rules. */
+  renewFraction?: number;
 }): Promise<void> {
   // A grant diagnosed revoked is remembered by fingerprint and not POSTed again until a re-login mints a different one.
   const revoked = deps.revoked ?? new Map<string, string>();
@@ -377,7 +412,13 @@ export async function keepAliveOnce(deps: {
           const have = lastSuccess.get(key);
           if (!have || have < iso) lastSuccess.set(key, iso);
         }
-        const r = await deps.refresh(tool as RefreshableTool, account, { keepAlive: true, lastSuccessAt: lastSuccess.get(key) ?? null, ...(known ? { revokedFingerprint: known } : {}) });
+        await deps.observe?.(tool, account).catch(() => undefined);
+        const r = await deps.refresh(tool as RefreshableTool, account, {
+          keepAlive: true,
+          lastSuccessAt: lastSuccess.get(key) ?? null,
+          ...(known ? { revokedFingerprint: known } : {}),
+          ...(RENEW_AHEAD_TOOLS.has(tool) ? { renewFraction: deps.renewFraction ?? GATEWAY_RENEW_FRACTION } : {}),
+        });
         if (r.outcome === "skipped-revoked" && r.beforeFingerprint) revoked.set(key, r.beforeFingerprint);
         else revoked.delete(key);
         if (r.outcome === "refreshed") lastSuccess.set(key, now().toISOString());
@@ -422,10 +463,35 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   if (mirror) setLocalWriteHook(async (abs, kind, account) => mirror.push([abs], account, kind));
   const grantPaths = (tool: RefreshableTool, identity: Identity): Promise<string[]> => effectiveGrantPaths(tool, identity).catch(() => [] as string[]);
   const inflightRefreshes = new Set<Promise<unknown>>();
+  /** Logins diagnosed dead, by "tool/name": the refresh-token fingerprint the provider rejected and its OAuth code. Cleared when a new login lands. */
+  const deadLogins = new Map<string, { fingerprint: string; code: string }>();
+  const markRevokedMarker = async (tool: string, name: string, code: string, rejected: string | undefined): Promise<void> => {
+    if (memberStoreEnabled()) await recordLoginRevoked(tool, name, code, rejected).catch(() => undefined);
+  };
   const guarded = guardRefresh(hooks.refreshImpl ?? refreshIdentityOAuthGrant, {
     backend: refreshBackend,
     metrics,
-    onDegraded: (account, why) => alerter.raise("refresh-guard-degraded", `${account.provider}/${account.identity}`, `the refresh guard is unavailable (${why}); refreshing under the file lock and compare-and-swap only`),
+    ...(hooks.readGrant ? { readGrant: hooks.readGrant } : {}),
+    // The gateway always has a database: a guard failure never refreshes (the file-lock fallback is for a gateway with no database).
+    onDegraded: (account, why) => alerter.raise("refresh-guard-degraded", `${account.provider}/${account.identity}`, `the refresh guard is unavailable (${why}); the ${account.provider} login "${account.identity}" is not refreshed until the guard works again, and its current access token is served until it expires`),
+    onDead: (account, { fingerprint, code, fresh }) => {
+      const key = `${account.provider}/${account.identity}`;
+      deadLogins.set(key, { fingerprint, code });
+      if (fresh) metrics.deadGrant(account.provider, account.identity, code);
+      metrics.loginState(account.provider, account.identity, { revoked: true });
+      alerter.raise("login-revoked", `${key}:${fingerprint}`, `the ${account.provider} login "${account.identity}" is dead: the provider answered ${code} and only a new login helps; the gateway sends no more refresh requests for it. Log back in with: ${loginCommand(account.provider as GatewayProvider, account.identity)}`);
+      if (fingerprint) void markRevokedMarker(account.provider, account.identity, code, fingerprint);
+    },
+    onGrantSeen: (account, fingerprint) => {
+      const key = `${account.provider}/${account.identity}`;
+      const dead = deadLogins.get(key);
+      if (!dead || dead.fingerprint === fingerprint) return;
+      // A new login (a different refresh token) landed: the marker, the alert and the gauge clear.
+      deadLogins.delete(key);
+      alerter.recover("login-revoked", `${key}:${dead.fingerprint}`);
+      metrics.loginState(account.provider, account.identity, { revoked: false });
+      if (memberStoreEnabled()) void clearLoginRevoked(account.provider, account.identity).catch(() => undefined);
+    },
     onInterrupted: (account, count) => {
       const key = `${account.provider}/${account.identity}`;
       if (count >= 2) alerter.raise("refresh-interrupted", key, `refreshes of the ${account.provider} login "${account.identity}" keep ending with an unknown outcome (${count} times); the token is retried, check the gateway and the provider`);
@@ -460,7 +526,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   /** The one guarded refresh: the credential cache and the keep-alive both go through it, and stop() waits for it. */
   /** Last successful refresh per "tool/name", stamped for every gateway refresh (keep-alive, 401 path, ensureUsable). */
   const lastSuccessAt = new Map<string, string>();
-  const stamped = stampRefreshSuccess(instrumented, lastSuccessAt, now);
+  const stamped = stampRefreshSuccess(instrumented, lastSuccessAt, now, (tool, name, at, result) => {
+    metrics.refreshSucceededAt(tool, name, Math.floor(at.getTime() / 1000));
+    if (result.expiresAt !== undefined) metrics.loginState(tool, name, { expiresAtSeconds: result.expiresAt, lifetimeSeconds: Math.max(0, result.expiresAt - Math.floor(at.getTime() / 1000)), revoked: false });
+  });
   const refreshLogin = ((...a: Parameters<RefreshFn>) => {
     const p = stamped(...a);
     inflightRefreshes.add(p);
@@ -513,7 +582,19 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     }
     return undefined;
   };
-  const admin = createAdminApp({ store, readStore: inner, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, browserPoolMembers, browserIdentityExists, browserHub: browser, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
+  const renewalAccounts = hooks.keepAliveAccounts ?? ((tool: string) => listGatewayManagedAccounts(undefined, tool));
+  const admin = createAdminApp({
+    store,
+    readStore: inner,
+    adminToken: opts.adminToken,
+    now,
+    renewal: () => buildRenewalReport({ tools: GATEWAY_REFRESH_TOOLS, accounts: renewalAccounts, summary: () => refreshBackend.summary?.() ?? Promise.resolve([]), isRevoked: (tool, name, fingerprint) => fingerprint !== undefined && deadLogins.get(`${tool}/${name}`)?.fingerprint === fingerprint, now }),
+    identityState: hooks.identityState ?? defaultIdentityState,
+    browserPoolMembers,
+    browserIdentityExists,
+    browserHub: browser,
+    ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}),
+  });
 
   let warmed = false;
   let draining = false;
@@ -631,6 +712,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         await store.warm();
         if (draining) return;
         warmed = true;
+        void seedFromJournal();
         pruneJournal();
         store.startRefresh(hooks.refreshIntervalMs ?? 15_000);
         // Other replicas' changes (a revoke above all) arrive at once; the timed refresh stays as the fallback.
@@ -708,6 +790,34 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const alertTimer = setInterval(checkLedger, hooks.alertCheckMs ?? 5_000);
   alertTimer.unref?.();
   const revokedGrants = new Map<string, string>();
+  /**
+   * Seeds the last-success gauges (and the dead-login memory) from the shared journal, so a restarted replica reports the
+   * cluster-wide truth. Runs at start and once per keep-alive pass on the leader; failures only skip the seed.
+   */
+  async function seedFromJournal(): Promise<void> {
+    try {
+      for (const row of (await refreshBackend.summary?.()) ?? []) {
+        if (row.refreshed) metrics.refreshSucceededAt(row.provider, row.identity, Math.floor(Date.parse(row.refreshed.ts) / 1000));
+        const key = `${row.provider}/${row.identity}`;
+        if (row.error?.outcome === "dead" && (!row.refreshed || row.error.id > row.refreshed.id) && !deadLogins.has(key)) deadLogins.set(key, { fingerprint: row.error.oldFp, code: row.error.code ?? "invalid_grant" });
+      }
+    } catch {
+      // the journal is unreadable now: the gauges fill from this replica's own refreshes until the next pass
+    }
+  }
+  /** Reads the stored login for its expiry, lifetime and revoked gauges. */
+  async function observeLogin(tool: string, account: Identity): Promise<void> {
+    const found = await readEffectiveGrant(tool as RefreshableTool, account).catch(() => undefined);
+    const grant = found?.grant;
+    if (!grant) return;
+    const dead = deadLogins.get(`${tool}/${account.name}`);
+    const lifetime = grantLifetimeSeconds(tool, grant);
+    metrics.loginState(tool, account.name, {
+      ...(grant.expires_at !== undefined ? { expiresAtSeconds: grant.expires_at } : {}),
+      ...(lifetime !== undefined ? { lifetimeSeconds: lifetime } : {}),
+      revoked: dead !== undefined && grant.refresh_token !== undefined && dead.fingerprint === grantFingerprint(grant),
+    });
+  }
   // Seeded from the previous heartbeat so a restart does not rotate every codex and kimi login again at once.
   // With the credential store the heartbeat arrives with the first pull, so the seed runs then.
   async function seedFromHeartbeat(): Promise<void> {
@@ -737,6 +847,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     // Several replicas: only the leader runs the idle pass and writes the heartbeat (on-demand refreshes run everywhere).
     if (leader && !leader.isLeader()) return;
     keepAliveRunning = true;
+    void seedFromJournal();
     keepAliveRun = keepAliveOnce({
       refresh: refreshLogin,
       accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)),
@@ -745,6 +856,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       now,
       mintedAt: grantMintedAt,
       shouldStop: () => draining,
+      observe: observeLogin,
       // The heartbeat also names the ali logins this gateway renews, so the host timer, the daemon and the CLI stand down.
       onPass: hooks.noHeartbeat
         ? undefined
