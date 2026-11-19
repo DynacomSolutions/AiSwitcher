@@ -26,9 +26,9 @@ import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { accountKey, collectAccounts } from "../identities/account-info.ts";
 import { invalidateLimitsCache, runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
-import { loadGatewayModelUsage, loadGatewayUsage, type GatewayModelUsageView, type GatewayUsageView } from "../gateway/usage-view.ts";
+import { loadGatewayModelUsage, loadGatewayUsage, loadGatewayUsageHistory, type GatewayModelUsageView, type GatewayUsageHistoryView, type GatewayUsageView } from "../gateway/usage-view.ts";
 import { loadGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, type GatewayLimitsView } from "./gateway-limits.ts";
-import { GATEWAY_USAGE_WINDOW_DAYS, gatewayUsageAnswered, mergeGatewayUsage, usageBucketZone } from "./gateway-usage.ts";
+import { GATEWAY_USAGE_WINDOW_DAYS, mergeGatewayUsageWithHistory, usageBucketZone } from "./gateway-usage.ts";
 import * as gatewayApps from "./gateway-apps.ts";
 import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -88,6 +88,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   gatewayLimits?: () => Promise<GatewayLimitsView>;
   /** Test seam for the gateway usage merge on GET /api/usage; defaults to the gateway admin API. */
   gatewayModelUsage?: () => Promise<GatewayModelUsageView>;
+  /** Test seam for the imported host history on GET /api/usage; defaults to the gateway admin API. */
+  gatewayUsageHistory?: () => Promise<GatewayUsageHistoryView>;
   /** Test seam for the /api/gateway/apps routes; defaults to the gateway admin API (and the CLI rotate path). */
   gatewayApps?: Partial<{
     list: () => Promise<gatewayApps.GatewayAppsView>;
@@ -297,19 +299,19 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
     };
-    // The cluster gateway ledger is the source of truth for the usage of the identities it manages; the host scan covers the rest.
-    // Both reads run together. A managed identity never shows host numbers: a failed gateway read marks it with an error.
-    // A failed host scan never blanks the page when the gateway answered.
-    const [result, gateway] = await Promise.all([
-      runScanIsolated("usage", filters, scanTimeoutAboveTokscale(60_000)),
-      (deps.gatewayModelUsage ?? (() => loadGatewayModelUsage(GATEWAY_USAGE_WINDOW_DAYS, { zone: usageBucketZone() })))().catch((): GatewayModelUsageView => ({ configured: true, rows: [], error: "admin unreachable" })),
-    ]);
-    if (!result.ok) {
-      if (!gatewayUsageAnswered(gateway)) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
-      const hostOnly = { results: [], generatedAt: new Date().toISOString(), stale: false, pending: false, lastError: "host usage scan failed", lastErrorAt: new Date().toISOString() };
-      return c.json(await mergeGatewayUsage(hostOnly, gateway, filters));
+    // With a gateway admin configured, everything comes from the gateway: the ledger plus the imported host history
+    // for the days before the ledger. The host scan never runs. A failed gateway read is an honest 502, never host numbers.
+    const gateway = await (deps.gatewayModelUsage ?? (() => loadGatewayModelUsage(GATEWAY_USAGE_WINDOW_DAYS, { zone: usageBucketZone() })))().catch((): GatewayModelUsageView => ({ configured: true, rows: [], error: "admin unreachable" }));
+    if (gateway.configured) {
+      if (gateway.error) throw new HttpError(502, `gateway usage unavailable: ${gateway.error}`);
+      const history = await (deps.gatewayUsageHistory ?? (() => loadGatewayUsageHistory()))().catch((): GatewayUsageHistoryView => ({ configured: true, rows: [], error: "admin unreachable" }));
+      if (history.configured && history.error) throw new HttpError(502, `gateway usage history unavailable: ${history.error}`);
+      return c.json(await mergeGatewayUsageWithHistory(gateway, history, filters));
     }
-    return c.json(gateway ? await mergeGatewayUsage(result.payload, gateway, filters) : result.payload);
+    // No gateway admin (local development): the host scan is the only source.
+    const result = await runScanIsolated("usage", filters, scanTimeoutAboveTokscale(60_000));
+    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
+    return c.json(result.payload);
   });
   // Per-app gateway tokens from the admin API; "configured: false" when this
   // process has no admin URL and token, so the console can hide the section.

@@ -6,7 +6,7 @@ import { aisNativeTokscaleConfigDir, readTokscaleBucketTimezone, tokscalePinnedZ
 import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
 import { GATEWAY_REFRESH_TOOLS, listAliAccounts, listGatewayManagedAccounts } from "../identities/gateway-managed.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
-import type { GatewayModelUsageView } from "../gateway/usage-view.ts";
+import type { GatewayModelUsageView, GatewayUsageHistoryView } from "../gateway/usage-view.ts";
 
 /**
  * The cluster gateway ledger is the source of truth for the token usage of the identities it manages.
@@ -478,4 +478,94 @@ export async function mergeGatewayUsage(
     merged.push(...added.map((row) => ({ ...row, ...(row.report ? { report: publicReport(row.report) } : {}) })));
   }
   return { ...(payload as object), results: merged };
+}
+
+/** The day after a "YYYY-MM-DD" day. */
+function nextDay(day: string): string {
+  return new Date(Date.parse(`${day}T00:00:00Z`) + 86400_000).toISOString().slice(0, 10);
+}
+
+/**
+ * Shapes the imported history rows like host rows, so the splice for host rows (spliceHostRowsWithGateway) can run
+ * on them unchanged. One result per provider and identity, built only from results that have a models row (the
+ * all-time per-model figures). Each source is read on its own and never added to another:
+ *  - host-snapshot-models: report entries and the date span (first and last day, whole days in the row's zone);
+ *  - host-snapshot-daily: dailyTotals and dailyUsage (input plus output);
+ *  - host-snapshot-daily-tokens: dailyUsage only, for results with no cost days.
+ * The tool and identity filters apply here, like they do for ledger rows.
+ */
+export function historyHostRows(view: GatewayUsageHistoryView, filters: { tool?: string; identity?: string } = {}): UsageResult[] {
+  if (!view.configured || view.error) return [];
+  type Group = { provider: string; identity: string; entries: Map<string, TokscaleEntry>; first?: string; last?: string; zone: string; totals: DailyTotals; daily: Record<string, number>; tokenDays: Record<string, number> };
+  const groups = new Map<string, Group>();
+  const groupFor = (r: { provider: string; identity: string; zone: string }): Group => {
+    const key = `${r.provider}\u0000${r.identity}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { provider: PROVIDER_BY_TOOL[r.provider] ?? r.provider, identity: r.identity, entries: new Map(), zone: r.zone, totals: {}, daily: {}, tokenDays: {} };
+      groups.set(key, g);
+    }
+    return g;
+  };
+  for (const r of view.rows) {
+    if (filters.tool !== undefined && r.provider !== filters.tool) continue;
+    if (filters.identity !== undefined && r.identity !== filters.identity) continue;
+    if (r.source === "host-snapshot-models") {
+      const g = groupFor(r);
+      const model = r.model ?? "(unknown)";
+      let e = g.entries.get(model);
+      if (!e) {
+        e = { client: "host", model, provider: g.provider, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, messageCount: 0, cost: 0 };
+        g.entries.set(model, e);
+      }
+      e.input += r.inputTokens; e.output += r.outputTokens; e.cacheRead += r.cacheReadTokens; e.cacheWrite += r.cacheWriteTokens; e.messageCount += r.messages; e.cost += r.estCostUsd;
+      if (r.firstDay && (g.first === undefined || r.firstDay < g.first)) g.first = r.firstDay;
+      if (r.lastDay && (g.last === undefined || r.lastDay > g.last)) g.last = r.lastDay;
+    } else if (r.source === "host-snapshot-daily" && r.day) {
+      const g = groupFor(r);
+      addDailyTotals(g.totals, r.day, r.inputTokens, r.outputTokens, r.cacheReadTokens, r.cacheWriteTokens, r.messages, r.estCostUsd);
+      g.daily[r.day] = (g.daily[r.day] ?? 0) + r.inputTokens + r.outputTokens;
+    } else if (r.source === "host-snapshot-daily-tokens" && r.day) {
+      const g = groupFor(r);
+      g.tokenDays[r.day] = (g.tokenDays[r.day] ?? 0) + r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens;
+    }
+  }
+  const results: UsageResult[] = [];
+  for (const g of groups.values()) {
+    if (g.entries.size === 0) continue;
+    const entries = [...g.entries.values()].sort((a, b) => b.cost - a.cost || a.model.localeCompare(b.model));
+    const hasCostDays = Object.keys(g.totals).length > 0;
+    results.push({
+      provider: g.provider,
+      identity: { name: g.identity, label: g.identity, configDir: "" },
+      report: {
+        entries,
+        totalInput: entries.reduce((s, e) => s + e.input, 0),
+        totalOutput: entries.reduce((s, e) => s + e.output, 0),
+        totalCacheRead: entries.reduce((s, e) => s + e.cacheRead, 0),
+        totalCacheWrite: entries.reduce((s, e) => s + e.cacheWrite, 0),
+        totalMessages: entries.reduce((s, e) => s + e.messageCount, 0),
+        totalCost: entries.reduce((s, e) => s + e.cost, 0),
+      },
+      ...(g.first && g.last ? { dateSpan: { firstMs: zoneDayStartMs(g.first, g.zone), lastMs: zoneDayStartMs(nextDay(g.last), g.zone) - 1 } } : {}),
+      ...(hasCostDays ? { dailyUsage: g.daily, dailyTotals: g.totals } : Object.keys(g.tokenDays).length > 0 ? { dailyUsage: g.tokenDays } : {}),
+    });
+  }
+  return results;
+}
+
+/**
+ * The console usage answer built from the gateway alone: the ledger, plus the imported host history for the days
+ * before each identity's first ledger day. The history rows take the place of the host scan in mergeGatewayUsage, so
+ * the same splice applies. History for an identity the ledger does not cover stays whole. Never reads the host.
+ */
+export async function mergeGatewayUsageWithHistory(
+  view: GatewayModelUsageView,
+  history: GatewayUsageHistoryView,
+  filters: { tool?: string; identity?: string } = {},
+  loadRegistries?: () => Promise<LoadedFile[]>,
+): Promise<{ results: unknown[]; generatedAt: string; stale: boolean; pending: boolean }> {
+  const base = { results: historyHostRows(history, filters), generatedAt: new Date().toISOString(), stale: false, pending: false };
+  const merged = (await mergeGatewayUsage(base, view, filters, loadRegistries, async () => [])) as typeof base;
+  return merged;
 }
