@@ -18,6 +18,19 @@ export function relTime(iso: string, nowMs: number = Date.now()): string {
   return relSeconds(Math.round((nowMs - then) / 1000));
 }
 
+/** Relative time for an ISO timestamp in the future ("in 3h"); a past or equal time reads "now". */
+export function relUntil(iso: string, nowMs: number = Date.now()): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return iso;
+  const seconds = Math.round((then - nowMs) / 1000);
+  if (seconds < 60) return "now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `in ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `in ${hours}h`;
+  return `in ${Math.floor(hours / 24)}d`;
+}
+
 /** Elapsed duration between an ISO timestamp and now, e.g. "3h 12m". */
 export function durationSince(iso: string, nowMs: number = Date.now()): string {
   const then = Date.parse(iso);

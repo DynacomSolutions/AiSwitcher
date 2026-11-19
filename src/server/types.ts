@@ -1,3 +1,4 @@
+import type { AccountWithShared } from "../identities/account-info.ts";
 import type { ToolConfig } from "../identities/types.ts";
 
 /** Shared response/body types for the console API. docs/API.md is the
@@ -118,6 +119,8 @@ export interface AuthEntryDto {
   lastRefreshAt?: string;
   /** ali only: last daemon-side refresh error, if any. */
   refreshError?: string;
+  /** The account this identity's login belongs to (email or label, never a secret). */
+  account?: AccountWithShared;
 }
 
 export interface AuthDto {
@@ -161,6 +164,8 @@ export interface LoginFlowDto {
   error?: string;
   /** A completed sign-in that needs the owner to know something (for example it could not be handed to the gateway). */
   note?: string;
+  /** What handing the sign-in to the gateway came to (routed identities only). "adopted": the gateway uses the new login (accountChange set when the account changed). "attention": it does, but read the message. "error": a step failed. */
+  gateway?: { outcome: "adopted" | "attention" | "error"; message: string; accountChange?: { from?: string; to?: string } };
   startedAt: string;
   updatedAt: string;
   endedAt?: string;

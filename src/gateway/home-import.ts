@@ -10,7 +10,7 @@ import { effectiveGrantPaths, type RefreshableTool } from "../identities/oauth-r
 import { isRetired } from "../identities/retired.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import type { Identity } from "../identities/types.ts";
-import { isFresher, refreshFingerprints } from "./home-mirror.ts";
+import { isFresher, isReplacedLogin, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
 import { sha256Hex, type HomeFileKind, type PgHomeStore } from "./home-store.ts";
 import type { RefreshGuardBackend } from "./refresh-guard.ts";
 
@@ -95,6 +95,7 @@ export async function collectImportEntries(home: string = homedir()): Promise<Im
           const dir = memberDir(tool, id.name);
           if (tool === "claude" && (await exists(join(dir, ".claude.json")))) add({ abs: join(dir, ".claude.json"), account, kind: "login" });
           if (await exists(join(dir, REVOKED_MARKER_FILE))) add({ abs: join(dir, REVOKED_MARKER_FILE), account, kind: "marker" });
+          if (await exists(join(dir, REPLACED_MARKER_FILE))) add({ abs: join(dir, REPLACED_MARKER_FILE), account, kind: "marker" });
         }
       } else if (tool === "zai" || tool === "ali") {
         const p = join(id.configDir, "crush.json");
@@ -132,6 +133,10 @@ export async function importHome(
     const content = e.content ?? (await readFile(e.abs).catch(() => undefined));
     if (!content) continue;
     const once = async (): Promise<void> => {
+      if (e.kind === "login" && (await isReplacedLogin(store, rel, content.toString("utf8")))) {
+        report.skipped.push({ path: rel, why: "it holds a login the owner replaced with another account's" });
+        return;
+      }
       const [row] = await store.get([rel]);
       if (!row) {
         if (!opts.dryRun) {

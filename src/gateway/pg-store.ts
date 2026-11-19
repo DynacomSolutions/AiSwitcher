@@ -11,6 +11,7 @@ import refreshJournal0003 from "./migrations/0003_refresh_journal.sql" with { ty
 import sideCounts0004 from "./migrations/0004_side_counts.sql" with { type: "text" };
 import homeFiles0005 from "./migrations/0005_home_files.sql" with { type: "text" };
 import browserPresence0006 from "./migrations/0006_browser_presence.sql" with { type: "text" };
+import refreshJournalCode0007 from "./migrations/0007_refresh_journal_code.sql" with { type: "text" };
 
 const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0001_init", sql: init0001 },
@@ -19,13 +20,36 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0004_side_counts", sql: sideCounts0004 },
   { version: "0005_home_files", sql: homeFiles0005 },
   { version: "0006_browser_presence", sql: browserPresence0006 },
+  { version: "0007_refresh_journal_code", sql: refreshJournalCode0007 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
 const MIGRATION_LOCK_KEY = 7_410_102;
 
+export interface MigrateOptions {
+  /** A migration statement that waits longer than this for a table lock fails (default 5 s), so it never queues behind long work. */
+  lockTimeoutMs?: number;
+  /** Attempts after a lock timeout (default 3), with a short pause between them. */
+  attempts?: number;
+}
+
 /** Applies pending migrations. Idempotent and safe to run from several processes at once. */
-export async function migrate(url: string): Promise<void> {
+export async function migrate(url: string, opts: MigrateOptions = {}): Promise<void> {
+  const attempts = opts.attempts ?? 3;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await migrateOnce(url, opts.lockTimeoutMs ?? 5_000);
+      return;
+    } catch (err) {
+      // 55P03: lock_not_available. A queued ALTER blocks every query behind it, so it gives up and tries again later.
+      const lockTimeout = (err as { errno?: unknown; code?: unknown } | null)?.errno === "55P03";
+      if (!lockTimeout || attempt >= attempts) throw err;
+      await new Promise((r) => setTimeout(r, 500 * attempt));
+    }
+  }
+}
+
+async function migrateOnce(url: string, lockTimeoutMs: number): Promise<void> {
   const sql = new SQL(url);
   try {
     await sql.begin(async (tx) => {
@@ -38,6 +62,7 @@ export async function migrate(url: string): Promise<void> {
       const done = new Set((await tx`SELECT version FROM schema_migrations`).map((r: { version: string }) => r.version));
       for (const m of MIGRATIONS) {
         if (done.has(m.version)) continue;
+        await tx.unsafe(`SET LOCAL lock_timeout = ${Math.trunc(lockTimeoutMs)}`);
         await tx.unsafe(m.sql);
         if (m.version === "0001_init") await tryHypertable(tx);
         await tx`INSERT INTO schema_migrations (version) VALUES (${m.version})`;

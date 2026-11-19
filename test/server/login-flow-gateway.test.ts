@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -140,21 +140,26 @@ describe("portal sign-in on a gateway-routed codex identity", () => {
     expect(e.detail).toContain("via gateway member store");
   });
 
-  test("a different account is refused: the folder keeps the new login, the store its own, and the flow says so", async () => {
+  test("a different account is the owner's choice: the store is replaced (old copy backed up), the folder gets the entry, the flow says who", async () => {
     const flow = await portalLogin(codexLogin("other", NEW, "acct-2"));
     expect(flow.status).toBe("completed");
-    expect(flow.note).toContain("the gateway still uses its older login");
-    expect(flow.note).toContain("different account");
-    expect(refreshOf("codex", await storeText())).toBe("rt-SYNTHETIC_FIXTURE-dead");
-    expect(classifyLogin("codex", await folderText())).toBe("login");
+    expect(flow.note).toBeUndefined();
+    expect(flow.gateway?.outcome).toBe("adopted");
+    expect(flow.gateway?.message).toContain("work now uses acct-2 (was acct-1)");
+    expect(flow.gateway?.accountChange).toEqual({ from: "acct-1", to: "acct-2" });
+    expect(refreshOf("codex", await storeText())).toBe("rt-SYNTHETIC_FIXTURE-other");
+    expect(classifyLogin("codex", await folderText())).toBe("gateway");
+    const backups = readdirSync(memberDir("codex", "work")).filter((f) => f.startsWith("auth.json.pre-gateway."));
+    expect(backups.length).toBe(1);
+    expect(readFileSync(join(memberDir("codex", "work"), backups[0]!), "utf8")).toContain("rt-SYNTHETIC_FIXTURE-dead");
   });
 
-  test("a login that is not provably fresher is refused BEFORE the folder is touched (it stays a login, no backup buries it)", async () => {
+  test("a login that is not provably fresher still replaces the store copy: the owner signed in", async () => {
     const flow = await portalLogin(codexLogin("older", "2029-12-01T00:00:00.000Z"));
-    expect(flow.note).toContain("the gateway still uses its older login");
-    expect(refreshOf("codex", await storeText())).toBe("rt-SYNTHETIC_FIXTURE-dead");
-    expect(classifyLogin("codex", await folderText())).toBe("login");
-    expect(refreshOf("codex", await folderText())).toBe("rt-SYNTHETIC_FIXTURE-older");
+    expect(flow.gateway?.outcome ?? "adopted").toBe("adopted");
+    expect(flow.note).toBeUndefined();
+    expect(refreshOf("codex", await storeText())).toBe("rt-SYNTHETIC_FIXTURE-older");
+    expect(classifyLogin("codex", await folderText())).toBe("gateway");
   });
 
   test("an identity the gateway does not hold (no store copy) is left alone", async () => {
@@ -172,14 +177,13 @@ describe("portal sign-in on a gateway-routed codex identity", () => {
     ["a gateway built before the member store", { memberStore: false }, "predates the member store"],
     ["a gateway that does not hold the account", { held: ["codex/other"] }, "does not hold this account"],
   ] as const) {
-    test(`${label} refuses the hand-over, leaves the folder's new login and says so`, async () => {
+    test(`${label}: an owner sign-in is never refused for the heartbeat (${expected})`, async () => {
       if (hb === "none") await rm(join(home, "heartbeat.json"));
       else await heartbeat(hb);
       const flow = await portalLogin(codexLogin("new", NEW));
-      expect(flow.note).toContain("the gateway still uses its older login");
-      expect(flow.note).toContain(expected);
-      expect(classifyLogin("codex", await folderText())).toBe("login");
-      expect(refreshOf("codex", await storeText())).toBe("rt-SYNTHETIC_FIXTURE-dead");
+      expect(flow.note).toBeUndefined();
+      expect(classifyLogin("codex", await folderText())).toBe("gateway");
+      expect(refreshOf("codex", await storeText())).toBe("rt-SYNTHETIC_FIXTURE-new");
     });
   }
 
@@ -207,10 +211,11 @@ describe("portal sign-in on a gateway-routed codex identity", () => {
         return Date.now();
       },
     };
-    const note = await adoptLoginIntoGateway("codex", "work", folder, opts);
+    const result = await adoptLoginIntoGateway("codex", "work", folder, opts);
     expect(started).toBe(true);
-    expect(note).toContain("WARNING");
-    expect(note).toContain("4401");
+    expect(result?.outcome).toBe("attention");
+    expect(result?.message).toContain("WARNING");
+    expect(result?.message).toContain("4401");
   });
 });
 
@@ -276,30 +281,54 @@ describe("portal sign-in on a gateway-routed claude identity", () => {
     expect(readLoginRevoked("claude", "work")).toBeUndefined();
   });
 
-  test("a login that is not fresher is refused before the folder is touched", async () => {
+  test("a login that is not fresher still replaces the store copy", async () => {
     await seedClaude();
     await signIn(EARLIER);
-    const note = await adoptLoginIntoGateway("claude", "work", cfolder, routeOpts);
-    expect(note).toContain("the gateway still uses its older login");
-    expect(await folderKind()).toBe("login");
-    expect(await storeRefresh()).toBe("rt-SYNTHETIC_FIXTURE-dead");
+    expect(await adoptLoginIntoGateway("claude", "work", cfolder, routeOpts)).toBeUndefined();
+    expect(await folderKind()).toBe("gateway");
+    expect(await storeRefresh()).toBe("rt-SYNTHETIC_FIXTURE-new");
   });
 
-  test("a store copy with no account record cannot be matched: refused, the folder keeps the new login", async () => {
+  test("a store copy with no account record: replaced, the message names no old account", async () => {
     await seedClaude({ storeAccount: null });
     await signIn(LATER);
-    const note = await adoptLoginIntoGateway("claude", "work", cfolder, routeOpts);
-    expect(note).toContain("the gateway still uses its older login");
-    expect(note).toContain("could not confirm");
-    expect(await folderKind()).toBe("login");
-    expect(await storeRefresh()).toBe("rt-SYNTHETIC_FIXTURE-dead");
+    expect(await adoptLoginIntoGateway("claude", "work", cfolder, routeOpts)).toBeUndefined();
+    expect(await folderKind()).toBe("gateway");
+    expect(await storeRefresh()).toBe("rt-SYNTHETIC_FIXTURE-new");
   });
 
-  test("a different account is refused", async () => {
+  test("a different account: store replaced, backup made, account record and revoked marker handled, result says now uses B (was A)", async () => {
+    await seedClaude();
+    await writeFile(join(cstore(), ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "uuid-1", emailAddress: "alice@example.test" } }));
+    await writeFile(join(cfolder, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "uuid-2", emailAddress: "bob@example.test" } }));
+    await writeFile(join(cfolder, ".credentials.json"), claudeLogin("new", EARLIER));
+    const result = await adoptLoginIntoGateway("claude", "work", cfolder, routeOpts);
+    expect(result?.outcome).toBe("adopted");
+    expect(result?.message).toContain("work now uses bob@example.test (was alice@example.test)");
+    expect(await storeRefresh()).toBe("rt-SYNTHETIC_FIXTURE-new");
+    expect(await folderKind()).toBe("gateway");
+    expect(JSON.parse(await readFile(join(cstore(), ".claude.json"), "utf8")).oauthAccount.accountUuid).toBe("uuid-2");
+    expect(readdirSync(cstore()).some((f) => f.startsWith(".credentials.json.pre-gateway."))).toBe(true);
+    expect(readLoginRevoked("claude", "work")).toBeUndefined();
+  });
+
+  test("an owner sign-in cannot end as 'gateway not updated': sessions are reported, a missing key is an error", async () => {
     await seedClaude();
     await signIn(LATER, "uuid-2");
-    const note = await adoptLoginIntoGateway("claude", "work", cfolder, routeOpts);
-    expect(note).toContain("different account");
+    await mkdir(join(home, "proc", "4402"), { recursive: true });
+    await writeFile(join(home, "proc", "4402", "cmdline"), "/usr/bin/claude\0");
+    await writeFile(join(home, "proc", "4402", "environ"), `PATH=/x\0CLAUDE_CONFIG_DIR=${cfolder}`);
+    const busy = await adoptLoginIntoGateway("claude", "work", cfolder, routeOpts);
+    expect(busy?.outcome).toBe("attention");
+    expect(busy?.message).toContain("4402");
+    expect(await storeRefresh()).toBe("rt-SYNTHETIC_FIXTURE-new");
+    expect(await folderKind()).toBe("gateway");
+    // No gateway key anywhere: a real error, not a soft refusal.
+    await seedClaude();
+    await signIn(LATER);
+    await writeFile(join(home, "secrets"), "");
+    const noKey = await adoptLoginIntoGateway("claude", "work", cfolder, routeOpts);
+    expect(noKey?.outcome).toBe("error");
     expect(await folderKind()).toBe("login");
   });
 });

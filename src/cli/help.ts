@@ -33,6 +33,7 @@ export const HELP: Record<string, HelpNode> = {
       retire: sub(`ais identities retire <name> [${TOOL}] [--yes]`, "Retire: never selected again, credentials deleted"),
       unretire: sub(`ais identities unretire <name> [${TOOL}]`, "Restore a retired identity (sign in again)"),
       "route-all-via-gateway": sub("ais identities route-all-via-gateway [--dry-run]", "Move each login the gateway holds into its member store, back up and replace it with the gateway entry"),
+      "adopt-login": sub("ais identities adopt-login <claude|codex> <identity>", "Use the login already in the folder as the gateway's account for a routed identity (replaces the member store copy, old one backed up)"),
       "add-directory": sub(`ais identities add-directory <name> <pattern> ${TOOL}`, "Select this identity in a directory"),
       "remove-directory": sub(`ais identities remove-directory <name> <pattern> ${TOOL}`, "Drop a directory pattern"),
       "add-alias": sub(`ais identities add-alias <name> <alias> ${TOOL}`, "Add an alias"),

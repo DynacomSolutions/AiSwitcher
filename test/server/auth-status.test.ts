@@ -373,3 +373,23 @@ describe("grok probe", () => {
     expect(entry.state).toBe("missing");
   });
 });
+
+describe("authStatus account", () => {
+  test("carries the account email and flags a shared account", async () => {
+    const root = await tempHome();
+    const a = join(root, "identity-alpha");
+    const b = join(root, "identity-beta");
+    for (const dir of [a, b]) {
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "alice@example.test", accountUuid: "00000000-0000-0000-0000-000000000001" } }));
+    }
+    await writeFile(
+      join(root, "identities.json"),
+      JSON.stringify({ version: 1, identities: [{ name: "alpha", label: "A", configDir: a }, { name: "beta", label: "B", configDir: b }] }),
+    );
+    const dto = await authStatus([configFor("claude", root)]);
+    expect(dto.entries[0]!.account?.email).toBe("alice@example.test");
+    expect(dto.entries[0]!.account?.sharedWith).toEqual(["beta"]);
+    expect(dto.entries[1]!.account?.sharedWith).toEqual(["alpha"]);
+  });
+});

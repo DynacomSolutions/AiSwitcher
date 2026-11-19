@@ -33,6 +33,7 @@ import { Separator } from "@/components/ui/separator";
 import { qk, useLimitsQuery, usePoolsUsageQuery } from "@/hooks/queries";
 import { api } from "@/lib/api";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
+import { AccountWarnings } from "@/components/account-line";
 import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseResetResult } from "@/types/api";
 
 function StatusBadge({ status }: { status: LimitFetchStatus }) {
@@ -281,6 +282,14 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
           </div>
           <StatusBadge status={result.status} />
         </div>
+        {result.account ? (
+          <div className="space-y-0.5 text-xs">
+            <div className="break-all text-muted-foreground" title={result.account.email ?? result.account.label}>
+              {result.account.email ?? result.account.label ?? result.account.accountId}
+            </div>
+            <AccountWarnings account={result.account} />
+          </div>
+        ) : null}
         <CardDescription>
           {result.capturedAt ? `Captured ${relTime(result.capturedAt)}` : "No capture timestamp"}
         </CardDescription>

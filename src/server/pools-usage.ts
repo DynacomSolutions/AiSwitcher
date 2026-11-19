@@ -1,13 +1,14 @@
 import { TOOL_CONFIGS, loadAll } from "../cli/identities/resolve-tool.ts";
 import { poolsOf } from "../identities/pool/swap-pool.ts";
 import { loadGatewayIdentityUsage, type GatewayIdentityUsageView } from "../gateway/usage-view.ts";
+import { accountKey, collectAccounts, type AccountWithShared } from "../identities/account-info.ts";
 import type { IdentityUsageRow } from "../gateway/types.ts";
 
 export interface PoolRef {
   tool: string;
   name: string;
   active?: string;
-  members: Array<{ name: string; allowed: boolean }>;
+  members: Array<{ name: string; allowed: boolean; account?: AccountWithShared }>;
 }
 
 export interface GatewayPeriod {
@@ -31,6 +32,8 @@ export interface PoolsUsageDeps {
   pools?: () => Promise<PoolRef[]>;
   gateway?: (since: Date) => Promise<GatewayIdentityUsageView>;
   now?: () => Date;
+  /** Test seam: accounts keyed `tool/identity`; defaults to reading the registries and the member store. */
+  accounts?: () => Promise<Map<string, AccountWithShared>>;
 }
 
 export async function loadPoolRefs(): Promise<PoolRef[]> {
@@ -57,6 +60,23 @@ export async function poolsUsage(deps: PoolsUsageDeps = {}): Promise<PoolsUsageR
   const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6);
   const load = deps.gateway ?? ((since: Date) => loadGatewayIdentityUsage(since));
   const [pools, today, week] = await Promise.all([(deps.pools ?? loadPoolRefs)(), load(dayStart), load(weekStart)]);
+  const withAccounts = await addMemberAccounts(pools, deps.accounts ?? (async () => collectAccounts(await loadAll(Object.values(TOOL_CONFIGS)))));
   const period = (v: GatewayIdentityUsageView): GatewayPeriod => ({ configured: v.configured, rows: v.rows, ...(v.error ? { error: v.error } : {}) });
-  return { todayKey: key(now), weekStartKey: key(weekStart), pools, gateway: { today: period(today), week: period(week) } };
+  return { todayKey: key(now), weekStartKey: key(weekStart), pools: withAccounts, gateway: { today: period(today), week: period(week) } };
+}
+
+/** Adds each member's account (same keys as the Auth page). A failed read leaves the pools unchanged. */
+async function addMemberAccounts(pools: PoolRef[], load: () => Promise<Map<string, AccountWithShared>>): Promise<PoolRef[]> {
+  try {
+    const accounts = await load();
+    return pools.map((p) => ({
+      ...p,
+      members: p.members.map((m) => {
+        const account = accounts.get(accountKey(p.tool, m.name));
+        return account ? { ...m, account } : m;
+      }),
+    }));
+  } catch {
+    return pools;
+  }
 }

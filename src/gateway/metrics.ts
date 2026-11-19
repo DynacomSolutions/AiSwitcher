@@ -59,6 +59,20 @@ class Counter {
   }
 }
 
+class Gauge {
+  private readonly values = new Map<string, { l: Record<string, string>; n: number }>();
+  constructor(readonly name: string, readonly help: string) {}
+  set(l: Record<string, string>, n: number): void {
+    this.values.set(JSON.stringify(l), { l, n });
+  }
+  get(l: Record<string, string>): number | undefined {
+    return this.values.get(JSON.stringify(l))?.n;
+  }
+  render(): string[] {
+    return [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} gauge`, ...[...this.values.values()].map((v) => `${this.name}${labels(v.l)} ${v.n}`)];
+  }
+}
+
 /**
  * Prometheus text exposition. Labels are limited to app, provider, identity,
  * status, reason, kind and outcome, all drawn from configuration or fixed
@@ -76,6 +90,11 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly refreshDegraded = new Counter("ais_gateway_refresh_guard_degraded_total", "Refreshes run without the guard (database unavailable), under the file lock and compare-and-swap only, per account.");
   private readonly refreshLockWaits = new Counter("ais_gateway_refresh_lock_waits_total", "Refreshes that had to wait for another holder's account lock, per account.");
   private readonly refreshLockWaitSeconds = new Counter("ais_gateway_refresh_lock_wait_seconds_total", "Seconds spent waiting for account refresh locks, per account.");
+  private readonly deadGrants = new Counter("ais_gateway_refresh_dead_grant_total", "Refresh answers that proved the login dead (the token endpoint sent a dead-grant code), per account and OAuth code.");
+  private readonly lastSuccess = new Gauge("ais_gateway_refresh_last_success_timestamp_seconds", "Unix time of the newest successful refresh of the login, seeded from the shared journal at start.");
+  private readonly loginExpiry = new Gauge("ais_gateway_login_expiry_timestamp_seconds", "Unix time the stored login's access token expires.");
+  private readonly loginLifetime = new Gauge("ais_gateway_login_lifetime_seconds", "Access-token lifetime of the stored login (expiry minus mint time, or the provider default when the mint time is unknown).");
+  private readonly loginRevokedGauge = new Gauge("ais_gateway_login_revoked", "1 while the stored login is diagnosed dead (only a new login helps), else 0.");
   private readonly rejections = new Counter("ais_gateway_rejections_total", "Requests rejected before reaching a provider.");
   private readonly failovers = new Counter("ais_gateway_failovers_total", "Requests retried on another pool member.");
   private readonly failOpens = new Counter("ais_gateway_fail_open_total", "Safety checks skipped so the request could proceed.");
@@ -185,6 +204,25 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.refreshes.inc({ provider, outcome });
   }
 
+  /** A dead-grant answer was seen for this login (once per answer actually sent to the token endpoint). */
+  deadGrant(provider: string, identity: string, code: string): void {
+    this.deadGrants.inc({ provider, identity, code });
+  }
+
+  /** Keeps the newest value: a replica that restarts reports the cluster-wide last success, never an older one. */
+  refreshSucceededAt(provider: string, identity: string, epochSeconds: number): void {
+    const l = { provider, identity };
+    const have = this.lastSuccess.get(l);
+    if (have === undefined || epochSeconds > have) this.lastSuccess.set(l, epochSeconds);
+  }
+
+  loginState(provider: string, identity: string, state: { expiresAtSeconds?: number; lifetimeSeconds?: number; revoked?: boolean }): void {
+    const l = { provider, identity };
+    if (state.expiresAtSeconds !== undefined) this.loginExpiry.set(l, state.expiresAtSeconds);
+    if (state.lifetimeSeconds !== undefined) this.loginLifetime.set(l, state.lifetimeSeconds);
+    if (state.revoked !== undefined) this.loginRevokedGauge.set(l, state.revoked ? 1 : 0);
+  }
+
   refreshGuard(event: "attempt" | "success" | "failure" | "lock_wait" | "degraded", provider: string, identity: string, seconds = 0): void {
     const l = { provider, identity };
     if (event === "attempt") this.refreshAttempts.inc(l);
@@ -199,7 +237,8 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
+    for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
     out.push(`ais_gateway_upstream_seconds_bucket{le="+Inf"} ${this.durationCount}`, `ais_gateway_upstream_seconds_sum ${this.durationSum}`, `ais_gateway_upstream_seconds_count ${this.durationCount}`);

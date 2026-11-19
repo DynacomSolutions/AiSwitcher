@@ -91,6 +91,23 @@ if (!url && process.env.CI && !optOut) {
       await lock.release();
     });
 
+    test("a dead answer is stored with its OAuth code, and the summary reports the newest success and error per account", async () => {
+      await prepare();
+      const backend = open();
+      const lock = await backend.acquire(account, 1000);
+      const ok = await lock.claim("aaaa1111", "pod-1:5");
+      await lock.resolve(ok, "refreshed", "bbbb2222");
+      const bad = await lock.claim("bbbb2222", "pod-2:9");
+      await lock.resolve(bad, "dead", undefined, "invalid_grant");
+      expect((await lock.findByOldFp("bbbb2222"))[0]).toMatchObject({ outcome: "dead", code: "invalid_grant" });
+      await lock.release();
+      const rows = await backend.summary();
+      const row = rows.find((r) => r.provider === account.provider && r.identity === account.identity);
+      expect(row?.refreshed).toMatchObject({ holder: "pod-1:5" });
+      expect(row?.error).toMatchObject({ holder: "pod-2:9", outcome: "dead", code: "invalid_grant", oldFp: "bbbb2222" });
+      expect((row?.error?.id ?? 0) > (row?.refreshed?.id ?? 0)).toBe(true);
+    });
+
     /** A stand-in pooler in front of the test database. `rule` sees each client chunk: reject the startup, drop the link, or forward. */
     function startPooler(rule: (chunk: Buffer, first: boolean) => "reject" | "drop" | "swallow" | "forward") {
       const target = new URL(url as string);

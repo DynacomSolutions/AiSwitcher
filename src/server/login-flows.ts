@@ -174,39 +174,55 @@ export interface FingerprintFn {
   (paths: string[]): Promise<string | undefined>;
 }
 
+/** What handing an owner's sign-in to the gateway came to. There is no "refused" outcome: the owner's choice of account stands. */
+export interface AdoptResult {
+  /** "adopted": the gateway uses the new login. "attention": it does, but the owner must read the message (a running session). "error": a step could not run. */
+  outcome: "adopted" | "attention" | "error";
+  message: string;
+  /** The account changed: who it was and who it is now (email, else account id). */
+  accountChange?: { from?: string; to?: string };
+}
+
+export function accountChangeText(identity: string, { from, to }: { from?: string; to?: string }): string {
+  return `${identity} now uses ${to ?? "the new account"}${from ? ` (was ${from})` : ""}`;
+}
+
 /**
- * After a sign-in on a gateway-routed identity: the gateway reads the account's login from its member store, not from the
- * folder the tool just wrote the new login into (over the gateway entry). Hands the new login to the store and puts the gateway
- * entry back, by the route-all-via-gateway rules (same account, provably fresher than the store copy, no running session, no
- * other holder). Returns a warning for the owner when the new login did not (fully) reach the gateway, and undefined when the
- * gateway now uses it or does not hold the identity at all.
+ * After an owner-started sign-in on a gateway-routed identity: the gateway reads the account's login from its member store,
+ * not from the folder the tool just wrote the new login into (over the gateway entry). The sign-in is the owner's choice of
+ * account, so it always replaces the store copy (the old one is backed up) and the gateway entry goes back into the folder
+ * (route-all `afterLogin`). Running sessions are reported, never a reason to refuse. Undefined when there is nothing to hand
+ * over (not a gateway identity, or the folder holds no new login). An "error" outcome means a step could not run.
  */
-export async function adoptLoginIntoGateway(toolName: string, identityName: string, configDir: string, opts: RouteAllOptions = {}, gatewayKey?: string): Promise<string | undefined> {
+export async function adoptLoginIntoGateway(toolName: string, identityName: string, configDir: string, opts: RouteAllOptions = {}, gatewayKey?: string): Promise<AdoptResult | undefined> {
   if (!isMemberStoreTool(toolName)) return undefined;
   const root = opts.memberRoot ?? memberStoreRoot();
   if (!hasMemberCopy(toolName, identityName, root)) return undefined;
   const folder = await Bun.file(`${configDir}/${memberLoginFile(toolName)}`).text().catch(() => undefined);
   if (classifyLogin(toolName, folder) !== "login") return undefined;
-  const refused = (why: string): string => `signed in, but the gateway still uses its older login for this identity: ${why}`;
+  const error = (why: string): AdoptResult => ({ outcome: "error", message: `signed in, but the gateway could not take the new login: ${why}` });
+  let line;
   try {
     const report = await routeAllViaGateway({ ...opts, memberRoot: root, only: { tool: toolName, identity: identityName }, afterLogin: true, ...(gatewayKey ? { fallbackToken: gatewayKey } : {}) });
-    const line = report.lines[0];
-    if (!line) return refused(report.unroutedTools[0]?.reason ?? "the identity could not be routed");
-    if (line.status !== "routed") return refused(line.detail ?? line.status);
-    // Routed, but a session started during the switch may hold the old login: the owner must hear it.
-    if (line.attention) return line.detail ?? "signed in and routed, but a running session needs attention";
+    line = report.lines[0];
+    if (!line) return error(report.unroutedTools[0]?.reason ?? "the identity could not be routed");
   } catch (err) {
-    return refused(`routing failed (${err instanceof Error ? err.name : "error"})`);
+    return error(`routing failed (${err instanceof Error ? err.name : "error"})`);
   }
-  // A routed run can keep the store copy (not provably fresher): then the new login was only backed up.
+  if (line.status === "refused") return error(line.detail ?? line.status);
+  if (line.status !== "routed") return undefined;
   const store = await Bun.file(`${memberDir(toolName, identityName, root)}/${memberLoginFile(toolName)}`).text().catch(() => undefined);
-  if (refreshOf(toolName, store) !== refreshOf(toolName, folder)) return refused("the new login is not provably fresher than the gateway's copy, so the gateway kept its own (the new login is in the folder's .pre-gateway backup)");
+  if (refreshOf(toolName, store) !== refreshOf(toolName, folder)) return error("the member store does not hold the new login after the write");
+  const change = line.accountChange;
+  const head = change ? accountChangeText(identityName, change) : undefined;
+  if (line.attention) return { outcome: "attention", message: [head, line.detail].filter(Boolean).join(". "), ...(change ? { accountChange: change } : {}) };
+  if (change) return { outcome: "adopted", message: [head, line.storeNote].filter(Boolean).join(". "), accountChange: change };
   return undefined;
 }
 
 export interface LoginFlowManagerDeps {
-  /** Hands a finished sign-in on a routed identity to the gateway (injectable; default adoptLoginIntoGateway). Resolves to a warning, or undefined when all is well. */
-  adoptLogin?: (toolName: ToolConfig["toolName"], identityName: string, configDir: string, gatewayKey?: string) => Promise<string | undefined>;
+  /** Hands a finished sign-in on a routed identity to the gateway (injectable; default adoptLoginIntoGateway). Resolves to the outcome, or undefined when there was nothing to hand over. */
+  adoptLogin?: (toolName: ToolConfig["toolName"], identityName: string, configDir: string, gatewayKey?: string) => Promise<AdoptResult | undefined>;
   spawn?: SpawnFn;
   /** util-linux script binary for PTY mode; discovery is injectable so
    * tests never depend on the host. */
@@ -641,13 +657,17 @@ export class LoginFlowManager {
     // The switch runs to the end whatever the clock or the user says: the flow must not read "timed out" or "cancelled" meanwhile.
     record.adopting = true;
     this.clearTimers(record);
-    let note: string | undefined;
+    let result: AdoptResult | undefined;
     try {
-      note = await this.adoptLogin(record.dto.toolName, record.dto.identity, record.configDir, record.gatewayKey);
+      result = await this.adoptLogin(record.dto.toolName, record.dto.identity, record.configDir, record.gatewayKey);
     } catch {
-      note = "signed in, but handing the new login to the gateway failed";
+      result = { outcome: "error", message: "signed in, but handing the new login to the gateway failed" };
     }
-    if (note) record.dto.note = note;
+    if (result) {
+      record.dto.gateway = { outcome: result.outcome, message: result.message, ...(result.accountChange ? { accountChange: result.accountChange } : {}) };
+      // Kept for older readers: only a message the owner must act on.
+      if (result.outcome !== "adopted") record.dto.note = result.message;
+    }
     this.finish(record, "completed");
   }
 

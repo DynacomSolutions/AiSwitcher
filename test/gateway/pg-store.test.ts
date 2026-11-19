@@ -66,6 +66,38 @@ if (!url && process.env.CI && !optOut) {
   }
 
   describe("migrate", () => {
+    test("a migration that cannot get its table lock gives up quickly instead of queueing, and succeeds on retry", async () => {
+      await reset();
+      await migrate(url);
+      const admin = new SQL(url);
+      const holder = new SQL(url);
+      await admin`ALTER TABLE gateway_refresh_journal DROP COLUMN IF EXISTS code`;
+      await admin`DELETE FROM schema_migrations WHERE version = '0007_refresh_journal_code'`;
+      // Make 0007 pending again, then hold a share lock: its ALTER needs ACCESS EXCLUSIVE and would queue behind the holder.
+      let releaseLock!: () => void;
+      const held = new Promise<void>((r) => (releaseLock = r));
+      let locked!: () => void;
+      const lockTaken = new Promise<void>((r) => (locked = r));
+      const tx = holder.begin(async (t) => {
+        await t`LOCK TABLE gateway_refresh_journal IN ACCESS SHARE MODE`;
+        locked();
+        await held;
+      });
+      await lockTaken;
+      const started = Date.now();
+      const failure = await migrate(url, { lockTimeoutMs: 200, attempts: 1 }).then(() => undefined, (e) => e);
+      expect((failure as { errno?: string } | undefined)?.errno).toBe("55P03");
+      expect(Date.now() - started).toBeLessThan(5_000);
+      // The retry path: the lock is released while the migration waits between attempts.
+      setTimeout(() => releaseLock(), 300);
+      await migrate(url, { lockTimeoutMs: 200, attempts: 5 });
+      await tx;
+      const col = await admin`SELECT 1 AS x FROM information_schema.columns WHERE table_name = 'gateway_refresh_journal' AND column_name = 'code'`;
+      expect(col.length).toBe(1);
+      await holder.close();
+      await admin.close();
+    });
+
     test("migrate is idempotent", async () => {
       await reset();
       await migrate(url);
@@ -74,7 +106,7 @@ if (!url && process.env.CI && !optOut) {
       const sql = new SQL(url);
       try {
         const rows = await sql`SELECT version FROM schema_migrations`;
-        expect(rows.length).toBe(6);
+        expect(rows.length).toBe(7);
         const t = await sql`SELECT to_regclass('gateway_usage') AS r`;
         expect(t[0].r).toBe("gateway_usage");
         const ext = await sql`SELECT 1 AS x FROM pg_extension WHERE extname = 'timescaledb'`;
