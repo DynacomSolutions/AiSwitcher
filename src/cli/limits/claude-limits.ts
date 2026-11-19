@@ -248,8 +248,8 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
   await (deps.reconcile ?? reconcileOnceForFetch)("claude", identity);
 
   // Shared across processes: a read younger than the TTL (by any caller) answers without touching the endpoint, unless
-  // its reset grants are older. The pool poll rewrites the windows every minute but carries the grants it cannot read
-  // (its endpoint has no cedar_ember), so a reset spent outside AIS would never show while pollers keep the file fresh.
+  // its reset grants are older. The pool poll reads the grants with the windows (the same cedar_ember request), so a
+  // reset spent outside AIS shows on the next poll; a read left by an older poller (fresh windows, old grants) is read again.
   const nowMs = Date.now();
   const fresh = await freshLastGood(identity, cacheDir, nowMs);
   if (fresh && grantsCurrent(fresh, nowMs)) return fresh;

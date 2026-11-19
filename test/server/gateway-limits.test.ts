@@ -102,6 +102,47 @@ describe("mapGatewayLimitRow: claude", () => {
     const failed = mapGatewayLimitRow({ provider: "claude", identity: "m1", status: "unavailable", windows: [], error: "not authenticated" })!;
     expect(failed.error).toBe("not authenticated");
   });
+
+  test("reset grants map through unchanged, a stale carried list included", () => {
+    const grants = {
+      availableCount: 1,
+      label: "Full reset SYNTHETIC_FIXTURE",
+      grants: [{ id: "full-reset-SYNTHETIC_FIXTURE-1", kind: "full" as const, resetsLeft: 1, usableNow: true, paused: false, endsAt: "2099-01-01T00:00:00.000Z" }],
+      grantsCapturedAt: STAMP,
+    };
+    expect(mapGatewayLimitRow(claudeRow(upstreamBody(), { manualReset: grants }))!.manualReset).toEqual(grants);
+    const carried = { availableCount: 0, grants: grants.grants, stale: true, grantsCapturedAt: STAMP };
+    const row = mapGatewayLimitRow(claudeRow(upstreamBody(), { manualReset: carried, stale: true, status: "rate-limited" }))!;
+    expect(row.status).toBe("cached");
+    expect(row.manualReset).toEqual(carried);
+  });
+
+  test("a malformed reset block maps to none; bad grant entries are skipped, never guessed", () => {
+    const base = claudeRow(upstreamBody());
+    for (const junk of [null, "x", 42, {}, { availableCount: "1" }]) {
+      expect(mapGatewayLimitRow({ ...base, manualReset: junk } as unknown as GatewayLimitRow)!.manualReset).toBeUndefined();
+    }
+    const mixed = {
+      availableCount: 1,
+      grants: [
+        null,
+        { id: "" },
+        { id: "bad-kind-SYNTHETIC_FIXTURE", kind: "weird", resetsLeft: 1, usableNow: true, paused: false },
+        { id: "ok-SYNTHETIC_FIXTURE", kind: "full", resetsLeft: 1, usableNow: true, paused: false },
+      ],
+    };
+    const row = mapGatewayLimitRow({ ...base, manualReset: mixed } as unknown as GatewayLimitRow)!;
+    expect(row.manualReset).toEqual({ availableCount: 1, grants: [{ id: "ok-SYNTHETIC_FIXTURE", kind: "full", resetsLeft: 1, usableNow: true, paused: false }] });
+    // A malformed grants list keeps the count but carries no list.
+    const noList = mapGatewayLimitRow({ ...base, manualReset: { availableCount: 1, grants: "x" } } as unknown as GatewayLimitRow)!;
+    expect(noList.manualReset).toEqual({ availableCount: 1 });
+  });
+
+  test("an unavailable reading carries no grants", () => {
+    const row = mapGatewayLimitRow({ provider: "claude", identity: "m1", status: "unavailable", windows: [], manualReset: { availableCount: 1 } } as unknown as GatewayLimitRow)!;
+    expect(row.status).toBe("unavailable");
+    expect(row.manualReset).toBeUndefined();
+  });
 });
 
 describe("mapGatewayLimitRow: codex, kimi, zai", () => {
@@ -138,6 +179,22 @@ describe("mapGatewayLimitRow: codex, kimi, zai", () => {
     const r = mapGatewayLimitRow(row("kimi", [{ label: "week", utilization: 50 }]))!;
     expect(r.windows[0]!.resetsAt).toBeUndefined();
     expect(r.windows[0]!.resetsAtMs).toBeUndefined();
+  });
+
+  test("codex reset credits map through with their expiries; kimi and zai report none", () => {
+    const manualReset = {
+      availableCount: 1,
+      label: "Full reset (Weekly + 5 hr)",
+      creditExpiries: [{ id: "credit-SYNTHETIC_FIXTURE-1", label: "Full reset (Weekly + 5 hr)", endsAt: "2099-01-01T00:00:00.000Z" }],
+    };
+    const codex = mapGatewayLimitRow(row("codex", [{ label: "week", utilization: 15 }], { manualReset }))!;
+    expect(codex.manualReset).toEqual(manualReset);
+    // Malformed credit entries are skipped; a credit without an expiry never renders.
+    const mixed = { availableCount: 1, creditExpiries: [{ id: "ok-SYNTHETIC_FIXTURE", endsAt: "2099-01-01T00:00:00.000Z" }, { id: "no-end-SYNTHETIC_FIXTURE" }, null] };
+    const partial = mapGatewayLimitRow({ ...row("codex", [{ label: "week", utilization: 15 }]), manualReset: mixed } as unknown as GatewayLimitRow)!;
+    expect(partial.manualReset).toEqual({ availableCount: 1, creditExpiries: [{ id: "ok-SYNTHETIC_FIXTURE", endsAt: "2099-01-01T00:00:00.000Z" }] });
+    expect(mapGatewayLimitRow(row("kimi", [{ label: "month", utilization: 30 }]))!.manualReset).toBeUndefined();
+    expect(mapGatewayLimitRow(row("zai", [{ label: "week", utilization: 30 }]))!.manualReset).toBeUndefined();
   });
 });
 
@@ -249,6 +306,35 @@ describe("mergeGatewayLimits", () => {
     expect(merged.results[1]).toEqual(host.results[1]); // the pool is not a managed member row
     expect(merged.results[2]!.status).toBe("live");
     expect(merged.results[2]!.identity).toEqual(identity("c1"));
+  });
+
+  test("the gateway's grants are authoritative, a stale carried list included", async () => {
+    const hostGrants = { availableCount: 1, grants: [{ id: "host-SYNTHETIC_FIXTURE", kind: "full" as const, resetsLeft: 1, usableNow: true, paused: false }] };
+    const gwGrants = {
+      availableCount: 0,
+      grants: [{ id: "gateway-SYNTHETIC_FIXTURE", kind: "full" as const, resetsLeft: 1, usableNow: false, paused: false }],
+      stale: true,
+      grantsCapturedAt: STAMP,
+    };
+    const host = payload([hostRow("claude", "m1", { manualReset: hostGrants })]);
+    const merged = (await mergeGatewayLimits(host, view([gatewayRow("claude", "m1", { manualReset: gwGrants })]), {}, noRegistries)) as typeof host;
+    expect(merged.results[0]!.manualReset).toEqual(gwGrants);
+  });
+
+  test("the host's grants survive only when the gateway row carries none", async () => {
+    const hostGrants = { availableCount: 1, grants: [{ id: "host-SYNTHETIC_FIXTURE", kind: "full" as const, resetsLeft: 1, usableNow: true, paused: false }] };
+    const host = payload([hostRow("claude", "m1", { manualReset: hostGrants }), hostRow("codex", "c1", { manualReset: hostGrants })]);
+    const credits = { availableCount: 1, creditExpiries: [{ id: "credit-SYNTHETIC_FIXTURE-c1", endsAt: "2099-01-01T00:00:00.000Z" }] };
+    const merged = (await mergeGatewayLimits(host, view([gatewayRow("claude", "m1"), gatewayRow("codex", "c1", { manualReset: credits })]), {}, noRegistries)) as typeof host;
+    expect(merged.results[0]!.manualReset).toEqual(hostGrants); // no gateway grants: the host's stay
+    expect(merged.results[1]!.manualReset).toEqual(credits); // the gateway's credits replace the host's
+  });
+
+  test("added gateway rows keep their grants", async () => {
+    const gwGrants = { availableCount: 1, grants: [{ id: "gateway-SYNTHETIC_FIXTURE", kind: "full" as const, resetsLeft: 1, usableNow: true, paused: false }] };
+    const merged = (await mergeGatewayLimits(payload([]), view([gatewayRow("claude", "m9", { manualReset: gwGrants })]), {}, noRegistries)) as { results: ToolLimitResult[] };
+    expect(merged.results).toHaveLength(1);
+    expect(merged.results[0]!.manualReset).toEqual(gwGrants);
   });
 
   test("gateway rows with no host row are added with their registry entry when one exists", async () => {

@@ -11,8 +11,9 @@ import { loadLastGood, saveLastGood, windowsFromUsageBody } from "../cli/limits/
 
 /**
  * Cheap live limits for one claude account: a single read-only
- * GET /api/oauth/usage with the account's own access token (the same call
- * Claude Code's /usage makes), instead of spawning `claude -p /usage`.
+ * GET /api/oauth/usage?cedar_ember=1 with the account's own access token (the
+ * same call Claude Code's /usage and /limit-reset make), instead of spawning
+ * `claude -p /usage`. The one read carries the windows and the reset grants.
  * Refreshes first, through the shared oauth-refresh write-through, when the
  * access token has expired.
  */
@@ -51,6 +52,8 @@ export interface MemberUsage {
   /** Highest utilisation of the two windows, when at least one is known. */
   maxUtilization?: number;
   extraUsage?: ExtraUsageInfo;
+  /** Reset grants from the same read's cedar_ember block; carried over (stale) when a later read omits them. */
+  manualReset?: ManualResetInfo;
   error?: string;
   retryAfterSeconds?: number;
   capturedAt: string;
@@ -208,6 +211,7 @@ function usageFromLastGood(last: Awaited<ReturnType<typeof loadLastGood>>): Memb
   return {
     status: "live",
     ...(last.extraUsage ? { extraUsage: last.extraUsage } : {}),
+    ...(last.manualReset ? { manualReset: last.manualReset } : {}),
     ...(fiveHour ? { fiveHour } : {}),
     ...(sevenDay ? { sevenDay } : {}),
     ...(scoped.length > 0 ? { scoped } : {}),
@@ -331,7 +335,8 @@ async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir:
   if (!token) return { status: "unavailable", error: error ?? "no token", capturedAt };
   let response: Response;
   try {
-    response = await getUsage(token, CLAUDE_USAGE_URL, deps);
+    // The same single read the host limits fast path makes: windows plus the cedar_ember reset grants.
+    response = await getUsage(token, CLAUDE_RESETS_URL, deps, true);
   } catch (err) {
     return { status: "unavailable", error: `usage endpoint unreachable: ${err instanceof Error ? err.message : String(err)}`, capturedAt };
   }
@@ -349,12 +354,13 @@ async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir:
   }
   const usage = parseUsageBody(body, capturedAt);
   await clearBackoff(member, cacheDir);
-  if (usage.status === "live") {
-    // Keep ais limits' extra fields (overage, manual reset); replace what this read knows.
-    const { extraUsage: _old, ...prev } = (await loadLastGood(member, cacheDir)) ?? { toolName: "claude" as const };
-    await saveLastGood(member, { ...prev, toolName: "claude", identity: member, windows: windowsFromUsageBody(body), status: "live", capturedAt, ...(usage.extraUsage ? { extraUsage: usage.extraUsage } : {}) }, cacheDir);
-  }
-  return usage;
+  if (usage.status !== "live") return usage;
+  // Keep ais limits' extra fields (overage); replace what this read knows, the grant list included.
+  const { extraUsage: _old, manualReset: prevReset, ...prev } = (await loadLastGood(member, cacheDir)) ?? { toolName: "claude" as const };
+  // Anthropic includes cedar_ember only near a limit: without it, keep the last seen grant list (marked stale), exactly as the host read does.
+  const manualReset = manualResetFromCedarEmber((body as { cedar_ember?: unknown }).cedar_ember, nowMs) ?? carriedManualReset(prevReset, nowMs);
+  await saveLastGood(member, { ...prev, toolName: "claude", identity: member, windows: windowsFromUsageBody(body), status: "live", capturedAt, ...(usage.extraUsage ? { extraUsage: usage.extraUsage } : {}), ...(manualReset ? { manualReset } : {}) }, cacheDir);
+  return { ...usage, ...(manualReset ? { manualReset } : {}) };
 }
 
 /** Full, Fable-only or other, read from the grant's id and label (e.g. `full-reset-2611`, `launch-2610-fable`). */

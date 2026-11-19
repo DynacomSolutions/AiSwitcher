@@ -370,9 +370,11 @@ When the gateway admin API is configured (`AIS_GATEWAY_ADMIN_URL` and
 `AIS_GATEWAY_ADMIN_TOKEN`), the cluster gateway is the source of truth for
 the identities it manages: its `GET /limits` rows replace the host-scan rows
 of the same tool and identity (a stale gateway reading shows as `cached`).
-Host rows the gateway does not cover stay unchanged, and an unconfigured or
-unreachable gateway leaves the host scan as it is. The `tool` and `identity`
-filters apply to both sources.
+The gateway's `manualReset` (available reset grants) is authoritative too;
+the host's survives only when the gateway row carries none. Host rows the
+gateway does not cover stay unchanged, and an unconfigured or unreachable
+gateway leaves the host scan as it is. The `tool` and `identity` filters
+apply to both sources.
 
 ```jsonc
 {

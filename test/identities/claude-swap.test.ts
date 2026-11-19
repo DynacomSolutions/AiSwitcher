@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { activeMemberAt, decideWriteBack, performSwap, readSwapEvents } from "../../src/identities/claude-swap.ts";
 import { withClaudeLocks, withOauthRefreshLock, SwapLockError } from "../../src/identities/claude-swap-lock.ts";
 import { chooseBest, swapIfLimited } from "../../src/identities/claude-swap-ops.ts";
-import { parseUsageBody, fetchMemberUsage, fetchMemberResets, fetchUsageBodyWithResets, manualResetFromCedarEmber, extraUsageFromBody, CLAUDE_RESETS_USER_AGENT } from "../../src/identities/claude-usage-api.ts";
+import { parseUsageBody, fetchMemberUsage, fetchMemberResets, fetchUsageBodyWithResets, manualResetFromCedarEmber, extraUsageFromBody, CLAUDE_RESETS_URL, CLAUDE_RESETS_USER_AGENT } from "../../src/identities/claude-usage-api.ts";
 import { refreshIdentityOAuthGrant, writeGrantThroughStores, convergeClaudePoolStores } from "../../src/identities/oauth-refresh.ts";
 import { PI_CONFIG } from "../../src/identities/tool-configs.ts";
 import { chmod, utimes } from "node:fs/promises";
@@ -598,6 +598,106 @@ describe("usage api", () => {
       expect(headers.Authorization).toBe("Bearer at-b1");
       const boom = (async () => { throw new Error("down"); }) as unknown as typeof fetch;
       expect(await fetchMemberResets(b, { ...deps, fetchImpl: boom })).toBeUndefined();
+    });
+  });
+
+  describe("the pool usage reading carries the reset grants", () => {
+    const grantId = "full-reset-SYNTHETIC_FIXTURE-1";
+    const endingId = "ending-SYNTHETIC_FIXTURE-2";
+    const windows = { five_hour: { utilization: 10 }, seven_day: { utilization: 96 } };
+    const cedar = (extra: Record<string, unknown> = {}) => ({
+      eligible: true,
+      grants: [
+        { id: grantId, label: "Full reset SYNTHETIC_FIXTURE", resets_total: 1, resets_left: 1, ends_at: "2099-01-01T00:00:00Z", paused: false },
+        { id: endingId, resets_total: 1, resets_left: 1, ends_at: new Date((NOW_S + 60) * 1000).toISOString(), paused: false },
+      ],
+      ...extra,
+    });
+    const memberB = async () => {
+      await writeRegistry();
+      return (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
+    };
+
+    test("the one usage read asks for cedar_ember with the claude-cli UA and returns the grants", async () => {
+      const b = await memberB();
+      let url = "";
+      let headers: Record<string, string> = {};
+      let calls = 0;
+      const impl = (async (u: unknown, init?: { headers?: Record<string, string> }) => {
+        calls += 1;
+        url = String(u);
+        headers = init?.headers ?? {};
+        return new Response(JSON.stringify({ ...windows, cedar_ember: cedar() }), { status: 200 });
+      }) as unknown as typeof fetch;
+      const deps = { fetchImpl: impl, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000, noRefresh: true };
+      const u = await fetchMemberUsage(b, deps);
+      expect(calls).toBe(1); // windows and grants ride on the same single request
+      expect(url).toBe(CLAUDE_RESETS_URL);
+      expect(headers["User-Agent"]).toBe(CLAUDE_RESETS_USER_AGENT);
+      expect(headers.Authorization).toBe("Bearer at-b1");
+      expect(u.manualReset).toMatchObject({ availableCount: 2, grants: [{ id: grantId, kind: "full", resetsLeft: 1, usableNow: true }, { id: endingId, usableNow: true }] });
+      // The shared last-good file holds the grants too, so ais limits answers from the same read.
+      const saved = await read(join(root, "cache", "claude-limits", "b.json"));
+      expect(saved.manualReset).toMatchObject({ availableCount: 2, grants: [{ id: grantId }, { id: endingId }] });
+      // noRefresh: the poll never rotates the grant.
+      expect((await read(join(root, "b", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-b1");
+    });
+
+    test("a fresh shared read keeps the grants with no second fetch", async () => {
+      const b = await memberB();
+      let calls = 0;
+      const impl = (async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ ...windows, cedar_ember: cedar() }), { status: 200 });
+      }) as unknown as typeof fetch;
+      let t = NOW_S * 1000;
+      const deps = { fetchImpl: impl, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => t };
+      await fetchMemberUsage(b, deps);
+      t += 30_000;
+      const reused = await fetchMemberUsage(b, deps);
+      expect(calls).toBe(1);
+      expect(reused.manualReset).toMatchObject({ availableCount: 2, grants: [{ id: grantId }, { id: endingId }] });
+    });
+
+    test("a later read without cedar_ember carries the grants stale, dropping ended ones", async () => {
+      const b = await memberB();
+      let body: unknown = { ...windows, cedar_ember: cedar() };
+      const impl = (async () => new Response(JSON.stringify(body), { status: 200 })) as unknown as typeof fetch;
+      let t = NOW_S * 1000;
+      const deps = { fetchImpl: impl, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => t };
+      const first = await fetchMemberUsage(b, deps);
+      expect(first.manualReset).toMatchObject({ availableCount: 2 });
+      expect(first.manualReset?.stale).toBeUndefined();
+      t += 120_000; // past the fresh-read TTL; the ending grant has ended by now
+      body = windows; // Anthropic omits cedar_ember away from a limit
+      const later = await fetchMemberUsage(b, deps);
+      expect(later.manualReset).toMatchObject({
+        availableCount: 0,
+        stale: true,
+        grants: [{ id: grantId, resetsLeft: 1 }],
+        grantsCapturedAt: new Date(NOW_S * 1000).toISOString(),
+      });
+      expect(later.manualReset?.grants).toHaveLength(1);
+      expect(later.manualReset?.label).toBeUndefined();
+      expect(later.manualReset?.expiresAt).toBeUndefined();
+    });
+
+    test("the 429 backoff repeats the last-good grants with the windows", async () => {
+      const b = await memberB();
+      let t = NOW_S * 1000;
+      const deps = { claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => t };
+      let calls = 0;
+      const good = (async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ ...windows, cedar_ember: cedar() }), { status: 200 });
+      }) as unknown as typeof fetch;
+      await fetchMemberUsage(b, { ...deps, fetchImpl: good });
+      t += 90_000;
+      const limited = (async () => new Response("", { status: 429 })) as unknown as typeof fetch;
+      await fetchMemberUsage(b, { ...deps, fetchImpl: limited });
+      const again = await fetchMemberUsage(b, { ...deps, fetchImpl: limited });
+      expect(calls).toBe(1); // the backoff answers from the shared last-good read
+      expect(again).toMatchObject({ status: "rate-limited", maxUtilization: 96, manualReset: { availableCount: 2, grants: [{ id: grantId }, { id: endingId }] } });
     });
   });
 

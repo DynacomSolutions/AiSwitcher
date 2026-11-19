@@ -22,15 +22,27 @@ const reading = (over: Partial<PoolUsage> = {}): PoolUsage => ({
     { label: "seven-day (Fable)", model: "Fable", utilization: 10, resetsAt: RESET_WEEK },
   ],
   extraUsage: { enabled: true, available: true, usedPercent: 25, label: "extra usage" },
+  manualReset: {
+    availableCount: 1,
+    label: "Full reset SYNTHETIC_FIXTURE",
+    grants: [{ id: "full-reset-SYNTHETIC_FIXTURE-m1", kind: "full", resetsLeft: 1, usableNow: true, paused: false, endsAt: "2099-01-01T00:00:00.000Z" }],
+    grantsCapturedAt: STAMP,
+  },
   capturedAt: STAMP,
   ...over,
 });
+
+const codexCredits: PoolUsage["manualReset"] = {
+  availableCount: 1,
+  label: "Full reset (Weekly + 5 hr)",
+  creditExpiries: [{ id: "credit-SYNTHETIC_FIXTURE-c1", endsAt: "2099-01-01T00:00:00.000Z" }],
+};
 
 /** The usage source's readings, keyed "provider/identity"; a missing key is a cold miss (undefined). */
 const readings = new Map<string, PoolUsage>([
   ["claude/m1", reading()],
   ["claude/m2", reading({ stale: true, status: "rate-limited" })],
-  ["codex/c1", { status: "live", maxUtilization: 15, windows: [{ label: "week", utilization: 15, resetsAt: RESET_WEEK }], capturedAt: STAMP }],
+  ["codex/c1", { status: "live", maxUtilization: 15, windows: [{ label: "week", utilization: 15, resetsAt: RESET_WEEK }], manualReset: codexCredits, capturedAt: STAMP }],
   ["codex/c2", { status: "unavailable", error: "not authenticated", capturedAt: STAMP }],
 ]);
 const asked: string[] = [];
@@ -105,10 +117,14 @@ describe("admin GET /limits", () => {
     expect(m1).toMatchObject({ provider: "claude", identity: "m1", status: "live", maxUtilization: 100, capturedAt: STAMP });
     expect(m1.windows).toEqual(reading().windows);
     expect(m1.extraUsage).toEqual(reading().extraUsage);
-    expect(limits[1]).toMatchObject({ identity: "m2", stale: true, status: "rate-limited" });
+    // The reset grants ride on the row unchanged: claude's cedar_ember list and codex's reset credits.
+    expect(m1.manualReset).toEqual(reading().manualReset);
+    expect(limits[1]).toMatchObject({ identity: "m2", stale: true, status: "rate-limited", manualReset: reading().manualReset });
     // A cold identity answers unavailable with no figure; the background refresh fills it in later.
     expect(limits[2]).toEqual({ provider: "claude", identity: "solo", status: "unavailable", windows: [] });
+    expect(limits[3]!.manualReset).toEqual(codexCredits);
     expect(limits[4]).toMatchObject({ identity: "c2", status: "unavailable", error: "not authenticated" });
+    expect(limits[4]!.manualReset).toBeUndefined();
     // kimi's registry read failed: its pinned identity still answers.
     expect(limits[5]).toEqual({ provider: "kimi", identity: "k9", status: "unavailable", windows: [] });
   });

@@ -224,6 +224,38 @@ describe("pool selection details", () => {
   });
 });
 
+describe("reset grants on the reading", () => {
+  const grants = {
+    availableCount: 2,
+    grants: [{ id: "full-reset-SYNTHETIC_FIXTURE-1", kind: "full" as const, resetsLeft: 2, usableNow: true, paused: false }],
+  };
+
+  test("selection ignores grants: utilisation decides, and grants never break a tie or bypass the reserve", async () => {
+    const poolApp: GatewayApp = { ...app, target: { kind: "pool" } };
+    const usages: Record<string, PoolUsage> = { a: { ...live(90), manualReset: grants }, b: live(50) };
+    const deps = { usageFor: async (_p: string, n: string) => usages[n], poolMembers: async () => ["a", "b"] };
+    expect(await pickIdentity(poolApp, deps)).toEqual({ identity: "b" });
+    usages.a = live(50);
+    usages.b = { ...live(50), manualReset: grants };
+    expect(await pickIdentity(poolApp, deps)).toEqual({ identity: "a" }); // equal figures: grants do not rank
+    const pinned = { usageFor: async () => ({ ...live(95), manualReset: grants }), poolMembers: async () => ["id1"] };
+    expect(await pickIdentity(app, pinned)).toEqual({ reject: "reserve" }); // grants never bypass the reserve
+  });
+
+  test("a kept figure carries its grants while the source cannot refresh", async () => {
+    let next: PoolUsage = { ...live(95), manualReset: grants };
+    let t = 0;
+    const src = createUsageSource({ fetchUsage: async () => next, ttlMs: 1000, now: () => t });
+    await src.prefill("claude", "id1");
+    expect((await src.get("claude", "id1"))?.manualReset).toEqual(grants);
+    next = { status: "rate-limited", error: "HTTP 429", capturedAt: "b" };
+    t += 5000;
+    await src.get("claude", "id1");
+    await src.idle();
+    expect(await src.get("claude", "id1")).toMatchObject({ maxUtilization: 95, stale: true, manualReset: grants });
+  });
+});
+
 describe("refreshNow (after a quota answer)", () => {
   test("reads the source with `fresh`, once for concurrent calls, after a plain read already in flight", async () => {
     const calls: Array<boolean | undefined> = [];

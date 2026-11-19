@@ -1,6 +1,6 @@
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { categorizeByLabel, categorizeByMinutes } from "../cli/limits/bucket.ts";
-import type { ExtraUsageInfo, LimitCategory, LimitWindow, OverageInfo, ToolLimitResult } from "../cli/limits/types.ts";
+import type { ExtraUsageInfo, LimitCategory, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult } from "../cli/limits/types.ts";
 import { providerForTool } from "../cli/usage/providers.ts";
 import { loadAll, type LoadedFile } from "../cli/identities/resolve-tool.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
@@ -23,6 +23,7 @@ export interface GatewayLimitRow {
   maxUtilization?: number;
   windows?: Array<{ label: string; utilization: number; resetsAt?: string; model?: string }>;
   extraUsage?: ExtraUsageInfo;
+  manualReset?: ManualResetInfo;
   error?: string;
 }
 
@@ -78,6 +79,47 @@ function parseExtraUsage(raw: unknown): ExtraUsageInfo | undefined {
   };
 }
 
+/** Defensive read of one reset grant; a malformed entry is skipped, never guessed. */
+function parseResetGrant(raw: unknown): ResetGrant | undefined {
+  const g = raw as Record<string, unknown> | null;
+  if (!g || typeof g !== "object" || typeof g.id !== "string" || !g.id) return undefined;
+  if (g.kind !== "full" && g.kind !== "fable" && g.kind !== "other") return undefined;
+  if (typeof g.resetsLeft !== "number" || !Number.isFinite(g.resetsLeft) || typeof g.usableNow !== "boolean" || typeof g.paused !== "boolean") return undefined;
+  return {
+    id: g.id,
+    kind: g.kind,
+    resetsLeft: g.resetsLeft,
+    usableNow: g.usableNow,
+    paused: g.paused,
+    ...(typeof g.label === "string" && g.label ? { label: g.label } : {}),
+    ...(typeof g.endsAt === "string" && g.endsAt ? { endsAt: g.endsAt } : {}),
+  };
+}
+
+/** Defensive read of the usage source's manual-reset block (claude grants, codex reset credits). */
+function parseManualReset(raw: unknown): ManualResetInfo | undefined {
+  const m = raw as Record<string, unknown> | null;
+  if (!m || typeof m !== "object" || typeof m.availableCount !== "number" || !Number.isFinite(m.availableCount)) return undefined;
+  const grants = Array.isArray(m.grants) ? m.grants.flatMap((g) => parseResetGrant(g) ?? []) : undefined;
+  const creditExpiries = Array.isArray(m.creditExpiries)
+    ? m.creditExpiries.flatMap((rawCredit) => {
+        const c = rawCredit as Record<string, unknown> | null;
+        if (!c || typeof c !== "object" || typeof c.id !== "string" || !c.id || typeof c.endsAt !== "string" || !c.endsAt) return [];
+        return [{ id: c.id, ...(typeof c.label === "string" && c.label ? { label: c.label } : {}), endsAt: c.endsAt }];
+      })
+    : undefined;
+  return {
+    availableCount: m.availableCount,
+    ...(typeof m.label === "string" && m.label ? { label: m.label } : {}),
+    ...(typeof m.expiresAt === "string" && m.expiresAt ? { expiresAt: m.expiresAt } : {}),
+    ...(grants ? { grants } : {}),
+    ...(typeof m.cooldownUntil === "string" && m.cooldownUntil ? { cooldownUntil: m.cooldownUntil } : {}),
+    ...(typeof m.grantsCapturedAt === "string" && m.grantsCapturedAt ? { grantsCapturedAt: m.grantsCapturedAt } : {}),
+    ...(m.stale === true ? { stale: true } : {}),
+    ...(creditExpiries && creditExpiries.length > 0 ? { creditExpiries } : {}),
+  };
+}
+
 /** The claude adapter's overage semantics, from the extra-usage block: the available flag decides, confirmed-zero states carry $0. */
 function overageFromExtraUsage(extra: ExtraUsageInfo): OverageInfo {
   if (!extra.enabled) return { active: false, label: "subscription only", spentUsd: 0 };
@@ -120,6 +162,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
     };
   }
   const extraUsage = parseExtraUsage(r.extraUsage);
+  const manualReset = parseManualReset(r.manualReset);
   return {
     ...base,
     windows,
@@ -127,6 +170,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
     status: r.stale === true ? "cached" : "live",
     ...(capturedAt ? { capturedAt } : {}),
     ...(extraUsage ? { extraUsage, overage: overageFromExtraUsage(extraUsage) } : {}),
+    ...(manualReset ? { manualReset } : {}),
   };
 }
 
@@ -167,8 +211,9 @@ export async function loadGatewayLimits(deps: LoadGatewayLimitsDeps = {}): Promi
 
 /**
  * Merges the gateway rows into a host limits payload. The gateway is authoritative for the identities it
- * manages: its row replaces the host row of the same tool and identity, keeping the host's registry entry
- * and reset grants (the gateway usage source reads windows only). Host rows the gateway does not cover stay
+ * manages: its row replaces the host row of the same tool and identity, keeping the host's registry entry.
+ * Its reset grants are authoritative too; the host's manualReset survives only when the gateway row genuinely
+ * carries none (no reading yet, or a read that never saw grants). Host rows the gateway does not cover stay
  * as they are; gateway rows with no host row are added with their registry entry when one exists. An
  * unconfigured or failed gateway read leaves the payload unchanged. The tool and identity filters apply to
  * the gateway rows as well, so a filtered read never gains rows outside its filter.

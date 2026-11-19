@@ -227,6 +227,25 @@ describe("codex helpers", () => {
     expect(await usage([], "unavailable")).toMatchObject({ status: "unavailable", error: "nope" });
   });
 
+  test("fetchUsage carries the reset credits; an unavailable reading carries none", async () => {
+    const member: Identity = { name: "a", label: "a", configDir: dirOf("a") };
+    const manualReset = {
+      availableCount: 1,
+      label: "Full reset (Weekly + 5 hr)",
+      creditExpiries: [{ id: "credit-SYNTHETIC_FIXTURE-1", endsAt: "2099-01-01T00:00:00.000Z" }],
+    };
+    const base = { toolName: "codex" as const, identity: member };
+    const live = await codexAdapter.fetchUsage(member, {
+      fetchCodexLimits: async () => ({ ...base, status: "live" as const, windows: [{ label: "week", category: "week" as const, usedPercent: 15 }], manualReset }),
+    });
+    expect(live.manualReset).toEqual(manualReset);
+    const none = await codexAdapter.fetchUsage(member, {
+      fetchCodexLimits: async () => ({ ...base, status: "unavailable" as const, windows: [], error: "nope", manualReset }),
+    });
+    expect(none).toMatchObject({ status: "unavailable", error: "nope" });
+    expect(none.manualReset).toBeUndefined();
+  });
+
   test("fetchUsage gives reset times as ISO from the epoch, not the yearless display string", async () => {
     const member: Identity = { name: "a", label: "a", configDir: dirOf("a") };
     const resetsAtMs = Date.parse("2026-11-02T13:00:00.000Z");

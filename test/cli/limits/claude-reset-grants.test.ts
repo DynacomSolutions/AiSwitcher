@@ -102,15 +102,15 @@ describe("fetchClaudeLimits keeps the last seen grant list", () => {
   });
 
   // Incident 16 Nov 2026: a reset spent outside AIS (Claude Code /limit-reset) left the Limits page on the old count.
-  // The pool poll rewrites the shared read every minute with fresh windows but the grants it carried from before
-  // (its endpoint has no cedar_ember), so the page kept answering from that "fresh" read and never asked for grants.
+  // A poller that rewrote the shared read every minute with fresh windows but old grants kept the page answering from
+  // that "fresh" read. The pool poll now reads the grants with the windows; this guards against a read left in that state.
   test("a shared fresh read whose grants are older than the TTL is read again, so a spent reset shows", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ais-resets-"));
     const now = Date.now();
     const old = manualResetFromCedarEmber(CEDAR, now - 3_600_000)!;
     const file = join(dir, "claude-limits", `${id.name}.json`);
     await fetchClaudeLimits(id, { ...common, cacheDir: dir, fetchBody: async () => ({ body: { limits: LIMITS, cedar_ember: CEDAR } }) });
-    // What the pool poll leaves: windows read just now, grants from an hour ago.
+    // Fresh windows with hour-old grants, as an older poller left them.
     writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), capturedAt: new Date(now).toISOString(), manualReset: old }));
     let calls = 0;
     const spent = { ...CEDAR, grants: [CEDAR.grants[1]], exhausted: [...CEDAR.exhausted, { ...CEDAR.grants[0], resets_left: 0, usable_now: false }] };

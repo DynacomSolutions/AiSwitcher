@@ -580,10 +580,14 @@ CLIProxyAPI's refresh journal):
 - Admin route `GET /limits` (admin token, optional `provider` and `identity` filters): `{ limits: [...] }`,
   one row per managed identity of claude, codex, kimi and zai (pool members plus the pins of active apps,
   canonical names, deduplicated). Each row carries the usage source's reading: `status`, `capturedAt`,
-  `stale`, `maxUtilization`, `windows[]` (`label`, `utilization`, `resetsAt`, `model`) and `extraUsage`.
-  The reads come from the same 45 s cache the proxy selects on: a request never waits on a fresh fetch
-  and never refreshes a token. An identity with no reading yet answers `status: "unavailable"` and fills
-  in behind. The console Limits page merges these rows over its host scan (`src/server/gateway-limits.ts`).
+  `stale`, `maxUtilization`, `windows[]` (`label`, `utilization`, `resetsAt`, `model`), `extraUsage` and
+  `manualReset` (the available reset grants: claude's `cedar_ember` grants, codex's reset credits).
+  The claude grants ride on the same usage read (`?cedar_ember=1`, the claude-cli UA); Anthropic sends them
+  only near a limit, so a read that omits them keeps the last seen list marked `stale`, exactly as the host
+  adapter does. The reads come from the same 45 s cache the proxy selects on: a request never waits on a
+  fresh fetch and never refreshes a token; selection ignores `manualReset`. An identity with no reading yet
+  answers `status: "unavailable"` and fills in behind. The console Limits page merges these rows over its
+  host scan (`src/server/gateway-limits.ts`); the gateway's grants are authoritative for managed identities.
 
 ## Credential store and replicas
 

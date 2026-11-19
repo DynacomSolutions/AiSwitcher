@@ -228,6 +228,18 @@ status` adds an `extra` column when any member has it enabled. Rules in
 - A rate-limited or failed Claude read keeps `extraUsage` from the member's last good read (`cache/claude-limits/<id>.json`, written by `fetchMemberUsage` and `ais limits`) when at most 6 hours old, marked `stale`.
 Kimi and Pi report no extra usage; their pools are unchanged.
 
+### Reset grants on the usage reading
+
+`PoolUsage.manualReset` (`ManualResetInfo`) carries the resets a member can spend right now: claude's
+`cedar_ember` grants and codex's reset credits. The claude pool read asks for them in the same single usage
+request (`?cedar_ember=1` with the claude-cli UA, `fetchMemberUsage`); Anthropic sends the block only near a
+limit, so a read without it keeps the last seen grant list from the shared last-good file, marked `stale`
+(`carriedManualReset`, the host rule). Codex passes `fetchCodexLimits`'s `manualReset` through; kimi, pi and
+zai report none. The gateway admin `GET /limits` emits it per row and the console merge treats it as
+authoritative for managed identities (docs/agents/gateway.md). Selection never reads it: grants are display
+and spend, never a reason to route or refuse. The usage poll keeps `noRefresh`: grants come from the cached
+usage read, never a token rotation.
+
 
 ### Canonical pools, full limits membership and launch heal (2026-10-25, task kimi-pool-limits-launch)
 

@@ -1,6 +1,6 @@
 import type { Identity, ToolConfig } from "../types.ts";
 import type { LockOptions } from "../claude-swap-lock.ts";
-import type { ExtraUsageInfo } from "../../cli/limits/types.ts";
+import type { ExtraUsageInfo, ManualResetInfo } from "../../cli/limits/types.ts";
 import type { PoolIdentity } from "./swap-pool.ts";
 
 /**
@@ -62,6 +62,8 @@ export interface PoolUsage {
   }>;
   /** Paid capacity the member can fall back on once its windows are full. */
   extraUsage?: ExtraUsageInfo;
+  /** Manual resets the member can spend right now (claude cedar_ember grants, codex reset credits). Display only: selection never reads it. */
+  manualReset?: ManualResetInfo;
   error?: string;
   retryAfterSeconds?: number;
   capturedAt: string;
