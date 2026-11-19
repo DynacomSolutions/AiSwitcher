@@ -1,5 +1,5 @@
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import type { IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow } from "./types.ts";
+import type { IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, UsageHistoryRow } from "./types.ts";
 
 /** One row of the admin `GET /usage` answer: an app's tokens over a window. */
 export interface GatewayAppUsage {
@@ -230,6 +230,70 @@ export async function loadGatewayModelUsage(days: number, deps: LoadGatewayModel
     const rows = mapGatewayModelUsage(await res.json());
     if (dailyRes?.ok) return { configured: true, rows, daily: mapGatewayModelDaily(await dailyRes.json()), dailyZone: zone };
     return { configured: true, rows, dailyError: !dailyRes ? "admin unreachable" : dailyRes.status === 404 ? "gateway admin has no per-day usage yet (older version)" : `admin answered ${dailyRes.status}` };
+  } catch {
+    return { configured: true, rows: [], error: "admin unreachable" };
+  }
+}
+
+export interface GatewayUsageHistoryView {
+  configured: boolean;
+  /** Rows of the three sources, kept apart by `source`: they are different cuts of the same usage and are never summed together. */
+  rows: UsageHistoryRow[];
+  error?: string;
+}
+
+/** The sources of imported host history the console reads. */
+export const USAGE_HISTORY_SOURCES = ["host-snapshot-models", "host-snapshot-daily", "host-snapshot-daily-tokens"] as const;
+
+/** Maps the admin `GET /usage/history` body to rows, dropping malformed entries. */
+export function mapGatewayUsageHistory(json: unknown): UsageHistoryRow[] {
+  const list = (json as { history?: unknown } | null | undefined)?.history;
+  if (!Array.isArray(list)) return [];
+  const n = (v: unknown): number => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
+  const str = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
+  const rows: UsageHistoryRow[] = [];
+  for (const raw of list) {
+    const r = raw as Record<string, unknown> | null;
+    if (!r || typeof r.source !== "string" || typeof r.provider !== "string" || typeof r.identity !== "string" || r.identity === "") continue;
+    rows.push({
+      source: r.source,
+      generation: typeof r.generation === "string" ? r.generation : "",
+      provider: r.provider,
+      identity: r.identity,
+      day: str(r.day),
+      model: str(r.model),
+      inputTokens: n(r.inputTokens),
+      outputTokens: n(r.outputTokens),
+      cacheReadTokens: n(r.cacheReadTokens),
+      cacheWriteTokens: n(r.cacheWriteTokens),
+      messages: n(r.messages),
+      estCostUsd: n(r.estCostUsd),
+      firstDay: str(r.firstDay),
+      lastDay: str(r.lastDay),
+      zone: typeof r.zone === "string" && r.zone !== "" ? r.zone : "UTC",
+    });
+  }
+  return rows;
+}
+
+/**
+ * Reads the latest generation of each imported host history source from the gateway admin API (read-only GETs, one per
+ * source). Never throws: a failed read is the view's `error`, never a partial answer.
+ */
+export async function loadGatewayUsageHistory(deps: LoadGatewayUsageDeps = {}): Promise<GatewayUsageHistoryView> {
+  const url = (await readSecretsKey("AIS_GATEWAY_ADMIN_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_URL;
+  const token = (await readSecretsKey("AIS_GATEWAY_ADMIN_TOKEN", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_TOKEN;
+  if (!url || !token) return { configured: false, rows: [] };
+  const doFetch = deps.fetch ?? fetch;
+  const base = url.replace(/\/+$/, "");
+  try {
+    const rows: UsageHistoryRow[] = [];
+    for (const source of USAGE_HISTORY_SOURCES) {
+      const res = await doFetch(`${base}/usage/history?source=${encodeURIComponent(source)}&generation=latest`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(deps.timeoutMs ?? 15_000) });
+      if (!res.ok) return { configured: true, rows: [], error: res.status === 404 ? "gateway admin has no usage history yet (older version)" : `admin answered ${res.status}` };
+      rows.push(...mapGatewayUsageHistory(await res.json()));
+    }
+    return { configured: true, rows };
   } catch {
     return { configured: true, rows: [], error: "admin unreachable" };
   }

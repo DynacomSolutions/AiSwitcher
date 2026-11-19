@@ -104,7 +104,7 @@ describe("route-all-via-gateway: refuses what the gateway does not hold", () => 
     const saved = process.exitCode;
     await runRouteAllViaGateway({}, { ...opts, out: (l) => out.push(l) });
     expect(process.exitCode).toBe(1);
-    process.exitCode = saved;
+    process.exitCode = saved ?? 0; // bun keeps the code when it is set to undefined
     expect(out.some((l) => l.startsWith("  claude/alpha: refused"))).toBe(true);
     expect(out.some((l) => l.includes("grok: NOT ROUTED"))).toBe(true);
     // never a secret value in the output
@@ -548,7 +548,7 @@ describe("route-all-via-gateway: running sessions", () => {
       const out: string[] = [];
       const saved = process.exitCode;
       await runRouteAllViaGateway({}, { ...opts, out: (l) => out.push(l) });
-      process.exitCode = saved;
+      process.exitCode = saved ?? 0; // bun keeps the code when it is set to undefined
       return out;
     };
     // the pool's active member: every session of the pool holds that login
@@ -730,7 +730,7 @@ describe("route-all-via-gateway: AIS sync remotes", () => {
       const out: string[] = [];
       const saved = process.exitCode;
       await runRouteAllViaGateway({ "dry-run": true }, { ...opts, syncConfigPath: syncConfig, out: (l) => out.push(l) });
-      process.exitCode = saved;
+      process.exitCode = saved ?? 0; // bun keeps the code when it is set to undefined
       return out.join("\n");
     };
     expect(await report()).not.toContain("WARNING: AIS sync");
