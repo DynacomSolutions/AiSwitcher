@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { Identity } from "../../src/identities/types.ts";
 import type { ModelDailyUsageRow, ModelUsageRow } from "../../src/gateway/types.ts";
 import type { GatewayModelUsageView } from "../../src/gateway/usage-view.ts";
-import { GATEWAY_USAGE_WINDOW_DAYS, gatewayUsageResults, mergeGatewayUsage } from "../../src/server/gateway-usage.ts";
+import { GATEWAY_NO_ACCOUNT_NAME, GATEWAY_USAGE_WINDOW_DAYS, gatewayUsageResults, mergeGatewayUsage } from "../../src/server/gateway-usage.ts";
 
 const FIRST = "2026-11-19T07:00:00.000Z";
 const LAST = "2026-11-19T10:00:00.000Z";
@@ -79,11 +79,55 @@ describe("gatewayUsageResults", () => {
   });
 });
 
+describe("gateway rows without an account", () => {
+  test("identity '-' folds into one labelled row per provider and keeps its counts", () => {
+    const rows = [
+      modelRow("claude", "-", "web", null, { requests: 74836, inputTokens: 2, estCostUsd: 0 }),
+      modelRow("claude", "-", "cli", null, { requests: 4, outputTokens: 1 }),
+      modelRow("codex", "-", "web", null, { requests: 7 }),
+      modelRow("claude", "m1", "web", "sonnet", { inputTokens: 10, requests: 1 }),
+    ];
+    const results = gatewayUsageResults(view(rows));
+    expect(results.filter((r) => r.identity.name === "-")).toHaveLength(0);
+    const none = results.filter((r) => r.identity.name === GATEWAY_NO_ACCOUNT_NAME);
+    expect(none.map((r) => r.provider)).toEqual(["anthropic", "openai"]);
+    const anthropic = none[0]!;
+    expect(anthropic.report?.totalMessages).toBe(74840);
+    expect(anthropic.report?.totalInput).toBe(2);
+    expect(anthropic.report?.totalOutput).toBe(1);
+    expect(results.find((r) => r.identity.name === "m1")?.report?.totalInput).toBe(10);
+  });
+});
+
 describe("mergeGatewayUsage", () => {
   const gatewayRows = [
     modelRow("claude", "m1", "web", "sonnet", { inputTokens: 10, outputTokens: 5, estCostUsd: 0.5, requests: 2, firstTs: FIRST, lastTs: LAST }),
     modelRow("codex", "c1", "web", "gpt", { inputTokens: 3, outputTokens: 3, estCostUsd: 1, requests: 1, firstTs: FIRST, lastTs: LAST }),
   ];
+
+  test("a host row labelled 'ais-gateway, openai' merges into one gateway row", async () => {
+    const host = payload([hostRow("ais-gateway, openai", "c1"), hostRow("openai", "c1"), hostRow("anthropic", "pool")]);
+    const merged = (await mergeGatewayUsage(host, view(gatewayRows), {}, noRegistries, noManaged)) as typeof host;
+    const rows = merged.results as Array<Record<string, any>>;
+    const c1 = rows.filter((r) => r.identity.name === "c1");
+    expect(c1).toHaveLength(1);
+    expect(c1[0]!.provider).toBe("openai");
+    expect(c1[0]!.report.totalInput).toBe(3);
+    expect(rows.find((r) => r.identity.name === "pool")).toEqual(host.results[2] as Record<string, any>); // non-gateway host row stays
+  });
+
+  test("a combined host label of a managed identity keeps one zero row when the ledger has no rows", async () => {
+    const host = payload([hostRow("ais-gateway, openai", "c1")]);
+    const merged = (await mergeGatewayUsage(host, view([]), {}, noRegistries, async () => [{ provider: "openai", name: "c1" }])) as typeof host;
+    expect(merged.results).toHaveLength(1);
+    expect((merged.results[0] as Record<string, any>).report.totalInput).toBe(0);
+  });
+
+  test("a combined host label of a non-gateway pair stays as it is", async () => {
+    const host = payload([hostRow("anthropic, openai", "x")]);
+    const merged = (await mergeGatewayUsage(host, view(gatewayRows), {}, noRegistries, noManaged)) as typeof host;
+    expect(merged.results[0]).toEqual(host.results[0]);
+  });
 
   test("gateway rows replace the host report and date span, keeping the host identity and overage", async () => {
     const extraCost = { active: true, label: "using extra usage" };

@@ -38,6 +38,24 @@ const PROVIDER_BY_TOOL: Record<string, string> = {
 /** The reverse map, to find the registry a gateway-only identity belongs to. */
 const TOOL_BY_PROVIDER: Record<string, string> = Object.fromEntries(Object.entries(PROVIDER_BY_TOOL).map(([tool, provider]) => [provider, tool]));
 
+/** The gateway's own provider label on host rows; it is a transport, never a usage provider. */
+const GATEWAY_TRANSPORT_PROVIDER = "ais-gateway";
+
+/** The ledger identity for requests the gateway answered without picking a member (for example 429 refusals). */
+const NO_ACCOUNT_LEDGER_IDENTITY = "-";
+/** The row name that replaces it: one clearly labelled row per provider, with the counts kept. */
+export const GATEWAY_NO_ACCOUNT_NAME = "Gateway (no account)";
+
+/**
+ * The provider a host row counts as for the merge. The host scan labels gateway-routed Codex rows "ais-gateway, openai":
+ * dropping the transport label leaves the one real provider, so the row meets its gateway row. Other labels keep
+ * their canonical form.
+ */
+export function mergeProviderKey(provider: string): string {
+  const parts = [...new Set(provider.split(",").map((part) => canonicalUsageProvider(part)).filter((part) => part !== "unattributed" && part !== GATEWAY_TRANSPORT_PROVIDER))];
+  return parts.length === 1 ? parts[0]! : canonicalUsageProvider(provider);
+}
+
 /**
  * Builds one usage row per provider and identity from the ledger's per-model rows, summing each model
  * across apps. The tool and identity filters apply here, so a filtered read never gains rows outside its
@@ -47,7 +65,8 @@ const TOOL_BY_PROVIDER: Record<string, string> = Object.fromEntries(Object.entri
 export function gatewayUsageResults(view: GatewayModelUsageView, filters: { tool?: string; identity?: string } = {}): UsageResult[] {
   if (!view.configured || view.error) return [];
   const groups = new Map<string, { provider: string; identity: string; models: Map<string, TokscaleEntry>; firstMs?: number; lastMs?: number; daily: Record<string, number>; totals: DailyTotals }>();
-  const groupFor = (rawProvider: string, identity: string) => {
+  const groupFor = (rawProvider: string, ledgerIdentity: string) => {
+    const identity = ledgerIdentity === NO_ACCOUNT_LEDGER_IDENTITY ? GATEWAY_NO_ACCOUNT_NAME : ledgerIdentity;
     const provider = PROVIDER_BY_TOOL[rawProvider] ?? rawProvider;
     const key = `${provider}\u0000${identity}`;
     let g = groups.get(key);
@@ -173,16 +192,20 @@ export async function mergeGatewayUsage(
   if (!view.configured) return payload;
   const results = (payload as { results?: unknown } | null | undefined)?.results;
   if (!Array.isArray(results)) return payload;
-  const keyOf = (provider: string, name: string): string => `${canonicalUsageProvider(provider)}\u0000${name}`;
+  const keyOf = (provider: string, name: string): string => `${mergeProviderKey(provider)}\u0000${name}`;
   const managed = new Set((await loadManaged().catch(() => [] as ManagedUsageAccount[])).map((a) => keyOf(a.provider, a.name)));
   const hostKey = (host: UsageResult): string | undefined => (host?.provider && host.identity?.name ? keyOf(host.provider, host.identity.name) : undefined);
   const stripNumbers = ({ report: _report, dateSpan: _dateSpan, dailyUsage: _dailyUsage, dailyTotals: _dailyTotals, error: _error, pending: _pending, ...rest }: UsageResult) => rest;
 
   if (view.error) {
     const reason = `gateway usage unavailable: ${view.error}`;
-    const merged = (results as UsageResult[]).map((host) => {
+    const seen = new Set<string>();
+    const merged = (results as UsageResult[]).flatMap((host) => {
       const key = hostKey(host);
-      return key && managed.has(key) ? { ...stripNumbers(host), error: reason } : host;
+      if (!key || !managed.has(key)) return [host];
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [{ ...stripNumbers(host), provider: mergeProviderKey(host.provider), error: reason }];
     });
     return { ...(payload as object), results: merged };
   }
@@ -190,23 +213,31 @@ export async function mergeGatewayUsage(
   const gatewayByKey = new Map<string, UsageResult>();
   for (const row of gatewayUsageResults(view, filters)) gatewayByKey.set(keyOf(row.provider, row.identity.name), row);
   const used = new Set<string>();
-  const merged: unknown[] = (results as UsageResult[]).map((host) => {
+  const seenManaged = new Set<string>();
+  const merged: unknown[] = (results as UsageResult[]).flatMap((host): unknown[] => {
     const key = hostKey(host);
-    if (!key) return host;
+    if (!key) return [host];
     const gateway = gatewayByKey.get(key);
+    // A managed identity ends with one row: a second host row for it (another provider label) is dropped.
+    if (gateway?.report || managed.has(key)) {
+      if (seenManaged.has(key)) return [];
+      seenManaged.add(key);
+    }
+    const provider = mergeProviderKey(host.provider);
     if (gateway?.report) {
       used.add(key);
-      return {
+      return [{
         ...stripNumbers(host),
+        provider,
         report: publicReport(gateway.report),
         ...(gateway.dateSpan ? { dateSpan: gateway.dateSpan } : {}),
         ...(gateway.dailyUsage ? { dailyUsage: gateway.dailyUsage } : {}),
         ...(gateway.dailyTotals ? { dailyTotals: gateway.dailyTotals } : {}),
-      };
+      }];
     }
     // Managed but no ledger rows in the window: zero from the gateway, never the host's figures.
-    if (managed.has(key)) return { ...stripNumbers(host), report: EMPTY_REPORT(), dailyUsage: {}, dailyTotals: {} };
-    return host;
+    if (managed.has(key)) return [{ ...stripNumbers(host), provider, report: EMPTY_REPORT(), dailyUsage: {}, dailyTotals: {} }];
+    return [host];
   });
   const added = [...gatewayByKey.values()].filter((row) => !used.has(keyOf(row.provider, row.identity.name)));
   if (added.length > 0) {
