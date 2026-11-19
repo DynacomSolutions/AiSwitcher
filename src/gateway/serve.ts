@@ -97,6 +97,12 @@ export interface GatewayHooks {
   /** How often every managed login is refreshed ahead of expiry with no traffic (default 10 minutes). */
   keepAliveMs?: number;
   keepAliveAccounts?(tool: string): Promise<Identity[]>;
+  /**
+   * Whether the gateway manages (renews) the login of a plain identity. A refresh for any other login is skipped, so a copy in the
+   * credential store of a login a host owns is never refreshed here (the host's CLI keeps rotating its token). Default with a
+   * credential store: membership in listGatewayManagedAccounts, the list the keep-alive and /logins/renewal use. Tests replace it.
+   */
+  isManaged?(tool: string, identity: string): Promise<boolean>;
   /** The ali logins whose console session the gateway renews, and how (tests replace both). */
   aliAccounts?(): Promise<Identity[]>;
   aliRefresh?(identity: Identity, signal?: AbortSignal): Promise<string>;
@@ -539,7 +545,18 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     metrics.refreshSucceededAt(tool, name, Math.floor(at.getTime() / 1000));
     if (result.expiresAt !== undefined) metrics.loginState(tool, name, { expiresAtSeconds: result.expiresAt, lifetimeSeconds: Math.max(0, result.expiresAt - Math.floor(at.getTime() / 1000)), revoked: false });
   });
+  const isManaged = hooks.isManaged ?? (pgCreds ? async (tool: string, name: string) => (await listGatewayManagedAccounts(undefined, tool)).some((i) => i.name === name) : undefined);
   const refreshLogin = ((...a: Parameters<RefreshFn>) => {
+    const [tool, identity] = a;
+    // A swap pool folder holds no login of its own: its refresh goes through the member it names, which is checked there.
+    if (isManaged && !identity.swapPool) {
+      return isManaged(tool, identity.name).then(
+        (managed) => (managed ? refreshManaged(...a) : Promise.resolve<IdentityGrantRefresh>({ tool, identity: identity.name, outcome: "skipped-fresh", written: [], writeFailures: [], detail: "the gateway does not manage this login - not refreshed here" })),
+      );
+    }
+    return refreshManaged(...a);
+  }) as RefreshFn;
+  const refreshManaged = ((...a: Parameters<RefreshFn>) => {
     const p = stamped(...a);
     inflightRefreshes.add(p);
     const done = (): void => void inflightRefreshes.delete(p);

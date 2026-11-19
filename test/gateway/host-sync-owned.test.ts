@@ -71,7 +71,7 @@ describe("host sync and sticky ownership", () => {
     expect(Object.keys(after.owned).sort()).toEqual(["claude/acme", "codex/acme"]);
   });
 
-  test("a store row for a login the gateway owns is never written into its identity folder; an unowned login is", async () => {
+  test("a store row for a login the gateway owns is never written into its identity folder, nor is one for a login the gateway does not manage", async () => {
     const home = await tmp();
     await put(home, ".claude/identities.json", JSON.stringify({ version: 1, identities: [{ name: "acme", label: "acme", configDir: join(home, ".claude/identities/acme") }, { name: "plain", label: "plain", configDir: join(home, ".claude/identities/plain") }] }));
     await recordOwned(["claude/acme"], "2026-01-01T00:00:00.000Z", join(home, ".ais", "gateway-owned.json"));
@@ -92,7 +92,8 @@ describe("host sync and sticky ownership", () => {
     const open = await tmp();
     await put(open, ".claude/identities.json", JSON.stringify({ version: 1, identities: [{ name: "acme", label: "acme", configDir: join(open, ".claude/identities/acme") }] }));
     await sync(open, store);
-    expect(await readFile(join(open, FOLDER), "utf8")).toContain("rt-gateway"); // control: not owned, so it lands
+    // Not owned and not managed by the gateway either (host-login-gate.ts): the folder login belongs to the host, so no row lands on it.
+    await expect(readFile(join(open, FOLDER), "utf8")).rejects.toThrow();
   });
 
   test("the sync guard counts a recorded login as held here, so no merge puts a login in its folder", async () => {

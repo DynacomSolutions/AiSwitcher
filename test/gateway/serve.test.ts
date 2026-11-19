@@ -1112,6 +1112,27 @@ describe("idle keep-alive and the refresh guard", () => {
     expect(backend.entries[0]).toMatchObject({ outcome: "refreshed", newFp: "bbbb2222" });
   });
 
+  test("a login the gateway does not manage is never refreshed, even when a keep-alive list or a request names it", async () => {
+    const sent: string[] = [];
+    const impl = (async (tool: string, id: { name: string }, o?: { beforePost?: (i: { fingerprint: string }) => Promise<void> }) => {
+      await o?.beforePost?.({ fingerprint: "aaaa1111" });
+      sent.push(`${tool}/${id.name}`);
+      return { tool, identity: id.name, outcome: "refreshed", detail: "", afterFingerprint: "bbbb2222", written: [], writeFailures: [] };
+    }) as never;
+    const other = { name: "ka2", label: "ka2", configDir: "/x/ka2" };
+    const g = await boot({
+      keepAliveMs: 20,
+      keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct, other] : []),
+      refreshImpl: impl,
+      isManaged: async (_tool: string, name: string) => name === "ka1",
+    });
+    await waitFor(() => sent.length > 0);
+    await Bun.sleep(100);
+    expect(sent.every((s) => s === "claude/ka1")).toBe(true);
+    expect(sent).not.toContain("claude/ka2");
+    await g.stop();
+  });
+
   test("a bare 400/401 (no dead-grant OAuth code) is not remembered as revoked; invalid_grant is", async () => {
     const accounts = async () => [acct];
     const metrics = { keepAlive: () => {} };

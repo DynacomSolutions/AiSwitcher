@@ -172,6 +172,13 @@ export class PgHomeStore {
     return { ok: true, version: Number(rows[0]!.version) };
   }
 
+  /** Removes a row, only while it is still at `expectedVersion` (compare-and-swap). True when a row went. */
+  async delete(path: string, expectedVersion: number): Promise<boolean> {
+    assertRelPath(path);
+    const rows = await this.sql`DELETE FROM gateway_home_files WHERE path = ${path} AND version = ${expectedVersion} RETURNING version`;
+    return rows.length > 0;
+  }
+
   /** Accounts ("tool/identity") with at least one login row: the logins the gateway's store owns. */
   async ownedAccounts(): Promise<Set<string>> {
     const rows = await this.sql`SELECT DISTINCT account FROM gateway_home_files WHERE kind = 'login' AND account IS NOT NULL`;
@@ -186,40 +193,4 @@ export class PgHomeStore {
       await Promise.resolve(handle?.unlisten?.()).catch(() => undefined);
     };
   }
-}
-
-/**
- * Accounts the gateway's PostgreSQL store owns, for processes that must stand down (the console's refresh scheduler).
- * A short cache. `undefined` means the database could not be read (callers fail closed).
- */
-export function createOwnershipCheck(url: string, ttlMs = 60_000, now: () => number = Date.now): { owned(): Promise<Set<string> | undefined>; close(): Promise<void> } {
-  let sql: SQL | undefined;
-  let cache: { at: number; set: Set<string> } | undefined;
-  let failedAt: number | undefined;
-  return {
-    async owned() {
-      if (cache && now() - cache.at < ttlMs) return cache.set;
-      // A failed read is not retried for a while, so a down database does not stall every caller.
-      if (failedAt !== undefined && now() - failedAt < 15_000) return undefined;
-      try {
-        sql ??= new SQL(url, { max: 1, idleTimeout: 30 });
-        const q = sql`SELECT DISTINCT account FROM gateway_home_files WHERE kind = 'login' AND account IS NOT NULL`;
-        const rows = await Promise.race([q, new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5_000))]);
-        cache = { at: now(), set: new Set((rows as Array<{ account: string }>).map((r) => r.account)) };
-        failedAt = undefined;
-        return cache.set;
-      } catch (err) {
-        // A database without the table (store never used) owns nothing.
-        if ((err as { errno?: unknown })?.errno === "42P01") {
-          cache = { at: now(), set: new Set() };
-          return cache.set;
-        }
-        failedAt = now();
-        return undefined;
-      }
-    },
-    async close() {
-      await sql?.close().catch(() => undefined);
-    },
-  };
 }

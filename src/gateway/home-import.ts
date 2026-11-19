@@ -10,6 +10,8 @@ import { effectiveGrantPaths, type RefreshableTool } from "../identities/oauth-r
 import { isRetired } from "../identities/retired.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import type { Identity } from "../identities/types.ts";
+import { loadGatewayGuard } from "../sync/gateway-guard.ts";
+import { storeMayHoldLogin } from "./host-login-gate.ts";
 import { isFresher, isReplacedLogin, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
 import { sha256Hex, type HomeFileKind, type PgHomeStore } from "./home-store.ts";
 import type { RefreshGuardBackend } from "./refresh-guard.ts";
@@ -72,6 +74,7 @@ export async function collectImportEntries(home: string = homedir()): Promise<Im
     seen.add(e.abs);
     out.push(e);
   };
+  const guard = await loadGatewayGuard(home);
   for (const [tool, cfg] of Object.entries(TOOL_CONFIGS)) {
     if (!(await exists(cfg.identitiesJsonPath))) continue;
     add({ abs: cfg.identitiesJsonPath, account: null, kind: "registry" });
@@ -85,6 +88,8 @@ export async function collectImportEntries(home: string = homedir()): Promise<Im
       if (isRetired(id)) continue;
       const account = `${tool}/${id.name}`;
       if ((OAUTH_TOOLS as readonly string[]).includes(tool)) {
+        // A claude or codex login the gateway does not manage belongs to the host (host-login-gate.ts): never upload it, nor pi's copy of it.
+        if (!(await storeMayHoldLogin(tool, id.name, home, guard).catch(() => false))) continue;
         for (const p of await effectiveGrantPaths(tool as RefreshableTool, id).catch(() => [] as string[])) {
           if (!(await exists(p))) continue;
           // A pi copy belongs to the pi identity; the claude/codex/kimi refresh pulls it by path.

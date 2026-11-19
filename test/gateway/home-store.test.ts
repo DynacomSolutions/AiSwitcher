@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { credentialStoreFromEnv, replicaUrlFromEnv } from "../../src/cli/gateway/dispatch.ts";
 import { grantFreshness, HomeMirror, isFresher, refreshFingerprints } from "../../src/gateway/home-mirror.ts";
-import { createOwnershipCheck, decryptFile, encryptFile, parseStoreKey, PgHomeStore } from "../../src/gateway/home-store.ts";
+import { decryptFile, encryptFile, parseStoreKey, PgHomeStore } from "../../src/gateway/home-store.ts";
 import { PgLeader } from "../../src/gateway/pg-leader.ts";
 import { migrate } from "../../src/gateway/pg-store.ts";
 
@@ -158,17 +158,6 @@ if (!url && process.env.CI && !optOut) {
       await put(h, LOGIN, grant("r9", 2_000_000_900_000));
       await m.pushDirty();
       expect((await store.get([LOGIN]))[0]!.content.toString()).toContain("r9");
-    });
-
-    test("the console's ownership check lists store-owned logins and fails closed when unreachable", async () => {
-      const { store } = await fresh();
-      await store.put(LOGIN, Buffer.from(grant("r0", 1)), { account: "claude/a1", kind: "login", expectedVersion: null });
-      const ok = createOwnershipCheck(url);
-      expect((await ok.owned())?.has("claude/a1")).toBe(true);
-      await ok.close();
-      const down = createOwnershipCheck("postgres://postgres@127.0.0.1:1/gateway_test");
-      expect(await down.owned()).toBeUndefined();
-      await down.close();
     });
   });
 

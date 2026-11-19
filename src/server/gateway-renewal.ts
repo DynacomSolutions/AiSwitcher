@@ -71,6 +71,28 @@ export async function loadGatewayRenewal(deps: GatewayAppsDeps = {}): Promise<Ga
   }
 }
 
+/**
+ * The logins ("provider/identity") the gateway renews, read from its renewal list and cached for a short time. `undefined`
+ * when the list cannot be read (no admin address, an unreachable gateway, an old gateway without the route): callers fail
+ * closed. A failed read is not retried for a while, so a down gateway does not stall every caller.
+ */
+export function gatewayOwnership(load: () => Promise<GatewayRenewalView> = () => loadGatewayRenewal(), ttlMs = 60_000, now: () => number = Date.now): () => Promise<Set<string> | undefined> {
+  let cache: { at: number; set: Set<string> } | undefined;
+  let failedAt: number | undefined;
+  return async () => {
+    if (cache && now() - cache.at < ttlMs) return cache.set;
+    if (failedAt !== undefined && now() - failedAt < 15_000) return undefined;
+    const view = await load().catch(() => undefined);
+    if (view?.state !== "ok") {
+      failedAt = now();
+      return undefined;
+    }
+    failedAt = undefined;
+    cache = { at: now(), set: new Set(view.logins.map((l) => `${l.provider}/${l.identity}`)) };
+    return cache.set;
+  };
+}
+
 /** Who renews a login. `pool`: a pool holds no login of its own. */
 export type Renewer = "gateway" | "host" | "pool";
 
