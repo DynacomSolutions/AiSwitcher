@@ -122,6 +122,15 @@ describe("4. an unreadable registry never reads as complete or as unmanaged", ()
     expect(await check("zai", "anything")).toBe(true);
   });
 
+  test("a kimi login in the kimi registry is managed, so its every-tick renewal runs; a kimi swap pool is never marked unmanaged", async () => {
+    const home = await tmp();
+    const registry = join(home, "kimi-identities.json");
+    await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "k1", label: "k1", configDir: join(home, "k1") }, { name: "kpool", label: "kpool", configDir: join(home, "kpool"), swapPool: { accounts: ["k1"], active: "k1" } }] }));
+    const check = createManagementCheck({ ttlMs: 0, registryPath: () => registry });
+    expect(await check("kimi", "k1")).toBe(true);
+    expect(await check("kimi", "kpool")).toBe(true);
+  });
+
   test("the renewal report throws when a registry read fails, so /logins/renewal answers 503", async () => {
     const accounts = async (): Promise<never> => {
       throw new Error("registry unreadable");
