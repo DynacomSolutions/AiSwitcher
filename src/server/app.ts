@@ -27,6 +27,8 @@ import * as authApi from "./auth.ts";
 import { invalidateLimitsCache, runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
 import * as gatewayApps from "./gateway-apps.ts";
+import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
+import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import * as claudeResets from "./claude-resets.ts";
 import { poolsUsage, type PoolsUsageResponse } from "./pools-usage.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
@@ -86,6 +88,10 @@ export interface ConsoleAppDeps extends GuardDeps {
     rotate: (name: string) => Promise<gatewayApps.GatewayRotateResult>;
     revoke: (name: string) => Promise<{ app: string; state: "revoked" }>;
   }>;
+  /** Test seam for the gateway renewal state on GET /api/auth/refresh; defaults to the gateway admin API. */
+  gatewayRenewal?: () => Promise<GatewayRenewalView>;
+  /** Test seam: "tool/identity" keys of pools (they hold no login); defaults to the registries. */
+  poolKeys?: () => Promise<Set<string>>;
   /** Test seam for POST /api/limits/claude/:identity/resets/:grant; defaults to Anthropic's reset endpoint. */
   claudeUseReset?: (identity: string, grantId: string) => Promise<claudeResets.UseResetResult>;
   /** Test seam: drops the cached /api/limits reads after a spent reset; defaults to the scan daemon's cache. */
@@ -115,6 +121,15 @@ async function freshRefreshStatus(scheduler: AuthRefreshScheduler | undefined): 
   if (!scheduler) return [];
   await scheduler.reconcileStale().catch(() => undefined);
   return scheduler.status();
+}
+
+/** "tool/identity" of every swap pool in the registries (pools hold no login). */
+async function registryPoolKeys(): Promise<Set<string>> {
+  const keys = new Set<string>();
+  for (const { cfg, file } of await loadAll(Object.values(TOOL_CONFIGS))) {
+    for (const identity of file.identities) if (isSwapPool(identity)) keys.add(`${cfg.toolName}/${identity.name}`);
+  }
+  return keys;
 }
 
 export function createApp(deps: ConsoleAppDeps): Hono {
@@ -458,7 +473,14 @@ export function createApp(deps: ConsoleAppDeps): Hono {
 
   /* ----------------------- credential refresh scheduler -------------------- */
 
-  app.get("/api/auth/refresh", async (c) => c.json({ results: await freshRefreshStatus(deps.authRefresh) }));
+  app.get("/api/auth/refresh", async (c) => {
+    const [results, gateway, pools] = await Promise.all([
+      freshRefreshStatus(deps.authRefresh),
+      (deps.gatewayRenewal ?? (() => loadGatewayRenewal()))(),
+      (deps.poolKeys ?? registryPoolKeys)().catch(() => new Set<string>()),
+    ]);
+    return c.json({ results, gateway, rows: buildRenewalRows(results, gateway, pools) });
+  });
 
   app.post("/api/auth/refresh", async (c) => {
     if (!deps.authRefresh) return c.json({ error: "refresh scheduler not running" }, 503);
