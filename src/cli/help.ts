@@ -124,7 +124,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   browser: {
-    usage: "ais browser approve|list|revoke|agent-token|extension|mcp ...",
+    usage: "ais browser approve|list|revoke|agent-token|extension|wiring|mcp ...",
     desc: "AIS Browser: bind Chrome extensions to an identity or swap pool; agent tokens",
     examples: ["ais browser approve ABCD2345 --identity=work --name=work-chrome"],
     subs: {
@@ -138,6 +138,10 @@ export const HELP: Record<string, HelpNode> = {
       extension: sub(
         "ais browser extension path | update [--from=<zip>]",
         "path prints the folder to Load unpacked (~/.ais/browser-extension); update installs the latest ais-browser-extension.zip release asset there atomically (gh, else GITHUB_TOKEN/GH_TOKEN), or --from=<zip> for a local file",
+      ),
+      wiring: sub(
+        "ais browser wiring [--check] [--json]",
+        "For each enabled T3 Code claude/codex instance (from <T3 home>/userdata/settings.json), run the launch wiring steps and print its folder, mapped identity or pool, and wired or NOT wired with the reason. --check exits 1 when any instance is not wired; never prints tokens",
       ),
       mcp: sub("ais browser mcp", "Stdio MCP server exposing the browser tools; started by Claude and Codex launches that have an agent token (not for manual use)"),
     },

@@ -6,8 +6,13 @@ import { chatNameResolver } from "../../src/browser/chat-name.ts";
 import { handleRpc, type ShimContext } from "../../src/browser/mcp-shim.ts";
 
 let dir: string;
-beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "ais-chat-name-")); });
-afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+// A real T3 session sets this; the tests must not read the live database.
+const realT3Thread = process.env.T3CODE_THREAD_ID;
+beforeEach(async () => { delete process.env.T3CODE_THREAD_ID; dir = await mkdtemp(join(tmpdir(), "ais-chat-name-")); });
+afterEach(async () => {
+  if (realT3Thread !== undefined) process.env.T3CODE_THREAD_ID = realT3Thread;
+  await rm(dir, { recursive: true, force: true });
+});
 
 const ID = "0a1b2c3d-1111-2222-3333-444455556666";
 const jl = (...rows: object[]) => rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
@@ -32,18 +37,18 @@ test("claude: auto title, then /rename title wins", async () => {
   expect(await get()).toBe("refactor login");
 });
 
-test("claude: first prompt when no title; short id while there is no transcript", async () => {
-  const get = chatNameResolver({ tool: "claude", configDirs: [dir], id: ID, now: () => 0, ttlMs: 0 });
-  expect(await get()).toBe("0a1b2c");
+test("claude: first prompt when no title; readable fallback while there is no transcript", async () => {
+  const get = chatNameResolver({ tool: "claude", configDirs: [dir], id: ID, cwd: "/work/example", now: () => 0, ttlMs: 0 });
+  expect(await get()).toBe("Claude in example");
   await claudeFile(userRow);
   expect(await get()).toBe("please look at example.com login");
 });
 
-test("codex: thread name from the index, else first prompt, else short id", async () => {
+test("codex: thread name from the index, else first prompt, else readable fallback", async () => {
   const day = join(dir, "sessions", "2026", "11", "08");
   await mkdir(day, { recursive: true });
-  const get = chatNameResolver({ tool: "codex", configDirs: [dir], id: ID, now: () => 0, ttlMs: 0 });
-  expect(await get()).toBe("0a1b2c");
+  const get = chatNameResolver({ tool: "codex", configDirs: [dir], id: ID, cwd: "/work/example", now: () => 0, ttlMs: 0 });
+  expect(await get()).toBe("Codex in example");
   await writeFile(join(day, `rollout-2026-11-08T10-00-00-${ID}.jsonl`), jl(
     { type: "session_meta", payload: { id: ID, cwd: "/work/example", timestamp: "2026-11-08T10:00:00Z" } },
     { type: "event_msg", payload: { type: "user_message", message: "fix the example.com checkout" } },

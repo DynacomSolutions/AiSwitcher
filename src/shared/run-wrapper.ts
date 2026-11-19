@@ -27,7 +27,7 @@ import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import { browserLaunchEnv, browserMcpArgs, browserPoolWiring, identityForConfigDir } from "./browser-wiring.ts";
+import { browserLaunchEnv, browserLaunchWiring } from "./browser-wiring.ts";
 import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
 
@@ -186,17 +186,17 @@ export async function runWrapper(
     const gatewayUrl = cfg.toolName !== "claude" && cfg.toolName !== "codex" ? undefined : process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
     // A preset config dir (T3 Code sets CLAUDE_CONFIG_DIR) resolves no identity; map it back
     // to the registered one so a pool folder gets pool wiring instead of none.
-    const browserIdentity = resolved.identity ?? (resolved.source === "env" ? await loadIdentitiesFile(cfg.identitiesJsonPath).then((f) => identityForConfigDir(f, resolved.configDirValue), () => undefined) : undefined);
-    const browserPool = await browserPoolWiring(cfg.toolName, browserIdentity, () => loadIdentitiesFile(cfg.identitiesJsonPath));
-    const browserIdentityName = browserIdentity?.name ?? activeIdentity;
-    // The token lives in the identity's folder, not in a launcher's own folder that only links to it.
-    const browserConfigDir = browserIdentity && !resolved.identity ? expandPath(browserIdentity.configDir) : resolved.configDirValue;
-    const browserArgs = browserMcpArgs(cfg.toolName, browserConfigDir, browserIdentity, resolveInstalledAisBinary(), {
-      ...(browserIdentityName !== undefined ? { identityName: browserIdentityName } : {}),
-      ...(gatewayUrl ? { gateway: gatewayUrl } : {}),
-      ...(browserPool ? { pool: browserPool } : {}),
-      ...(parsed.cleanedArgv[0] !== undefined ? { firstArg: parsed.cleanedArgv[0] } : {}),
-    });
+    const browserArgs = (await browserLaunchWiring({
+      toolName: cfg.toolName,
+      configDirValue: resolved.configDirValue,
+      resolvedIdentity: resolved.identity,
+      fromEnv: resolved.source === "env",
+      activeIdentity,
+      gatewayUrl,
+      firstArg: parsed.cleanedArgv[0],
+      aisBinary: resolveInstalledAisBinary(),
+      loadFile: () => loadIdentitiesFile(cfg.identitiesJsonPath),
+    })).args;
     const launchArgs = cfg.toolName === "codex"
       ? codexSubcommandConfigArgs([...browserArgs, ...memoryProjection.argv])
       : [...browserArgs, ...gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd())];

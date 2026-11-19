@@ -35,6 +35,7 @@ if (!isolated || homedir() !== isolated) {
   for (const k of [
     "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "AIS_GATEWAY_MEMBERS_DIR", "AIS_GATEWAY_HEARTBEAT", "AIS_GATEWAY_OWNED", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
     "AIS_SECRETS_FILE", "AIS_GATEWAY_STORE_DATABASE_URL", "AIS_GATEWAY_STORE_KEY", "AIS_GATEWAY_STORE_KEY_FILE", "PI_CODING_AGENT_DIR", "AIS_HOST_HOME", "AIS_AWS_PROFILES_CONFIG", "AIS_CHROME_MCP_CONFIG",
+    "T3CODE_HOME", "T3CODE_THREAD_ID",
   ]) delete env[k];
   env.GIT_CONFIG_NOSYSTEM = "1";
   // Keep bun's install cache where it was (tests never install, but bun may look it up).

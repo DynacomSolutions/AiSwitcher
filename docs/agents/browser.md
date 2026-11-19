@@ -36,6 +36,18 @@ Run `ais browser agent-token <identity>` once per identity, not per host; `ais s
 
 Swap pools: mint a token for each pool member (`ais browser agent-token <member>`); the pool directory itself never holds one. A pool launch (claude or codex) wires the `ais-browser` MCP server when any allowed, non-retired member has a token, and the shim is told the pool (`--pool <name> --tool <claude|codex>`) instead of a fixed identity. On every tool call the shim reads the pool's current active member from the registry and uses that member's token, so the browser is matched against whichever member is active at that moment. If the active member has no token the call fails with `no AIS Browser agent token for identity <x>; run ais browser agent-token <x>`. The session id stays the same across swaps. Tab ownership for calls routed through a pool binding is per pool, not per member: the gateway forwards `session.identity` as `pool:<name>` (the caller must still be a live allowed member of the pool) and titles the tab group with the session name, so tabs stay owned across swaps. Identity bindings keep the real identity, and an identity session can never claim a pool session's tabs.
 
+### T3 Code sessions
+
+T3 Code starts Claude and Codex through the AIS shims with `CLAUDE_CONFIG_DIR` / `CODEX_HOME` preset to the instance's home folder. The wiring maps that folder back to a registered identity or pool (`identityForConfigDir` in `src/shared/browser-wiring.ts`), in this order:
+
+1. The folder is the identity's config dir (for example the swap pool folder).
+2. Its `projects` or `sessions` link points into an identity's config dir (`~/.t3/gateway/t3-claude-<name>`).
+3. The folder sits directly in `<T3CODE_HOME>/gateway` (a folder made by `ais gateway t3-instance`, which holds only the gateway app token). Its name matches an identity name or alias, first as is, then without a `t3-claude-` / `t3-codex-` prefix. A remaining name `pool` maps to the tool's only swap pool. Example: a folder `<name>` where `<name>` is an alias of a Claude pool maps to that pool. Kimi and Z.ai folders (`t3-claude-kimi-*`, `t3-claude-zai-*`) never map: they would send page content to another provider.
+
+`ais browser wiring [--check] [--json]` runs the same steps as a launch (`browserLaunchWiring`) for every enabled Claude and Codex instance in `<T3CODE_HOME>/userdata/settings.json`. It prints the instance, its folder, the identity or pool, and `wired` or the reason it is not wired (`no identity`, `no token`, `ais binary not installed`). `--check` exits 1 when an instance is not wired. A session gets the tools only when it starts after the fix: resume a T3 thread or start a new one.
+
+Reason (owner report, 19 Nov 2026): the T3 "Pool (Claude)" instance moved to a folder under `~/.t3/gateway`. That folder matched no identity, so resumed threads lost the `ais-browser` tools.
+
 ## Tools
 
 `list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
@@ -112,6 +124,13 @@ Known limit: the headless Chromium used in CI cannot reproduce headful backgroun
 
 `.github/workflows/release.yml` builds the extension (`bun run build` in `apps/chrome-extension`, `dist/` zipped with `manifest.json` at the root) and uploads `ais-browser-extension.zip` with the other assets. CI builds and tests it when the extension or `src/browser/` changes.
 
-The tab group title and the page pill show the session name only: `AIS_SESSION_NAME` when the launcher sets it, else the short session id. Never the identity. The side panel shows only the sessions using the active tab, with Pause, Stop and Resume (profile-wide), and "No agent is using this tab." when there are none.
+The tab group title and the page pill show a readable session name, never an id and never the identity. The shim picks the first of these and looks again every 30 s:
+
+1. The T3 Code thread title, when the agent runs in T3 Code. T3 sets `T3CODE_THREAD_ID` (and `T3CODE_HOME`) in the agent process, so a shell that runs `ais browser mcp` gets it too. The shim reads the title from `<T3CODE_HOME>/userdata/statev2.sqlite` (table `orchestration_v2_projection_threads`) read-only, with one primary-key lookup (`src/browser/t3-thread-title.ts`). Any failure gives no title.
+2. The Claude or Codex chat name from the transcript (`/rename` or the automatic title).
+3. `AIS_SESSION_NAME`, when the launcher sets it.
+4. `<Tool> in <folder>` (for example `Claude in my-app`): the tool and the last part of the working directory.
+
+Reason (owner report, 19 Nov 2026): T3 sessions have no transcript title, so tab groups showed the short session id. The side panel shows only the sessions using the active tab, with Pause, Stop and Resume (profile-wide), and "No agent is using this tab." when there are none.
 
 Granting a group: when the active tab sits in a tab group no agent uses, the side panel offers "Let an agent use this group" with a picker of the live sessions and a Grant button (a granted group shows the session and Revoke access). A granted session lists the group's tabs in `tabs_context` (`scope: "granted"`, plus `grantedGroups`), can act in them and open tabs inside the group with `tabs_create` `groupId`. It never renames, recolours or closes the group, and `close_tab` only closes tabs it opened. The grant is kept in `chrome.storage.session` and ends on Revoke, Stop, when the group is closed, or after 30 minutes without a call from the session.

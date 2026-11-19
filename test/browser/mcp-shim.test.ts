@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Hono } from "hono";
 import { BROWSER_TOOLS } from "../../src/browser/protocol.ts";
 import { BROWSER_INSTRUCTIONS, handleRpc, STOPPED_BY_USER_NOTE, type ShimContext } from "../../src/browser/mcp-shim.ts";
@@ -211,8 +211,8 @@ test("pool mode resolves the active member per call, stable session id, clear mi
   await go();
   expect(seen.map((s) => s.auth)).toEqual(["Bearer tok-a", "Bearer tok-b"]);
   expect(seen.map((s) => s.body.session)).toEqual([
-    { id: "sess-123456", identity: "a", label: "sess-123456" },
-    { id: "sess-123456", identity: "b", label: "sess-123456" },
+    { id: "sess-123456", identity: "a", label: `Claude in ${basename(process.cwd())}` },
+    { id: "sess-123456", identity: "b", label: `Claude in ${basename(process.cwd())}` },
   ]);
   write("c");
   const r = await go();
@@ -239,12 +239,14 @@ test("parseShimArgs reads --pool and --tool", () => {
   expect(parseShimArgs(["browser", "mcp", "--pool", "p", "--tool=codex"])).toEqual({ pool: "p", tool: "codex" });
 });
 
-test("session label keeps 6 chars for UUIDs and up to 12 for named sessions", async () => {
+test("session label is readable and never the session id", async () => {
   const { contextFromEnv } = await import("../../src/browser/mcp-shim.ts");
+  const dirName = basename(process.cwd());
   const uuid = "3f2a9c1e-1111-4222-8333-444455556666";
-  expect(contextFromEnv({ CLAUDE_SESSION_ID: uuid }, { identity: "work" }).session.label).toBe("3f2a9c");
-  expect(contextFromEnv({ CLAUDE_SESSION_ID: "live-proof" }, { identity: "work" }).session.label).toBe("live-proof");
-  expect(contextFromEnv({ CLAUDE_SESSION_ID: "a-very-long-session-id" }, { identity: "work" }).session.label).toBe("a-very-long-");
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: uuid }, { identity: "work" }).session.label).toBe(`Claude in ${dirName}`);
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: "live-proof" }, { identity: "work" }).session.label).toBe(`Claude in ${dirName}`);
+  expect(contextFromEnv({ CODEX_SESSION_ID: "live-proof" }, { identity: "work" }).session.label).toBe(`Codex in ${dirName}`);
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: uuid, AIS_SESSION_NAME: "My chat" }, { identity: "work" }).session.label).toBe("My chat");
 });
 
 test("without an agent session id the session id is stable across shim respawns", async () => {
