@@ -1133,6 +1133,43 @@ describe("idle keep-alive and the refresh guard", () => {
     await g.stop();
   });
 
+  test("an unmanaged login that is skipped is counted as outcome unmanaged and raises one alert", async () => {
+    const impl = (async () => ({ tool: "claude", identity: "ka1", outcome: "refreshed", detail: "", written: [], writeFailures: [] })) as never;
+    const g = await boot({ keepAliveMs: 20, keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []), refreshImpl: impl, isManaged: async () => false });
+    await waitFor(() => alerts.some((a) => a.kind === "login-unmanaged"));
+    await waitFor(async () => (await (await fetch(`${base(g)}/metrics`)).text()).includes('outcome="unmanaged"'));
+    expect(alerts.filter((a) => a.kind === "login-unmanaged")).toEqual([{ kind: "login-unmanaged", key: "claude/ka1" }]);
+    await g.stop();
+  });
+
+  test("an unreadable registry keeps the login refreshing and raises an alert; only a successful read marks it unmanaged", async () => {
+    const sent: string[] = [];
+    const impl = (async (tool: string, id: { name: string }) => {
+      sent.push(`${tool}/${id.name}`);
+      return { tool, identity: id.name, outcome: "refreshed", detail: "", written: [], writeFailures: [] };
+    }) as never;
+    const g = await boot({ keepAliveMs: 20, keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []), refreshImpl: impl, isManaged: async () => undefined });
+    await waitFor(() => sent.length > 0);
+    expect(alerts.some((a) => a.kind === "login-unmanaged")).toBe(false);
+    await g.stop();
+  });
+
+  test("pool members are only the managed ones, and a pinned unmanaged identity is refused with an alert and a count", async () => {
+    const { onlyManaged, watchCredentialReads } = await import("../../src/gateway/serve.ts");
+    expect(await onlyManaged("claude", ["a", "b", "c"], async (_t, n) => n !== "b")).toEqual(["a", "c"]);
+    const seen: Array<{ kind: string; key: string }> = [];
+    const alerter = createAlerter((a) => void seen.push({ kind: a.kind, key: a.key }));
+    let reads = 0;
+    const inner = { get: async (_p: string, identity: string) => (reads++, { identity, accessToken: "x" }), refreshAfter401: async () => ({ identity: "p", accessToken: "y" }) } as unknown as Parameters<typeof watchCredentialReads>[0];
+    const creds = watchCredentialReads(inner, alerter, new Map(), async (_p, name) => name === "stray");
+    expect((await creds.get("claude", "pinned")).identity).toBe("pinned");
+    const err = await creds.get("claude", "stray").then(() => undefined, (e: unknown) => e);
+    expect(err).toBeInstanceOf((await import("../../src/gateway/credentials.ts")).GatewayCredentialError);
+    expect((err as { code: string }).code).toBe("unmanaged-login");
+    expect((err as { clientMessage: string }).clientMessage).toContain("not managed by the gateway");
+    expect(reads).toBe(1);
+  });
+
   test("a bare 400/401 (no dead-grant OAuth code) is not remembered as revoked; invalid_grant is", async () => {
     const accounts = async () => [acct];
     const metrics = { keepAlive: () => {} };

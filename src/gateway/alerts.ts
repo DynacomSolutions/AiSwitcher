@@ -1,6 +1,6 @@
 import type { LedgerBuffer } from "./ledger-buffer.ts";
 
-export type AlertKind = "refresh-failed" | "store-unreadable" | "ledger-drop" | "refresh-guard-degraded" | "credential-store-write-failed" | "refresh-interrupted" | "heartbeat-write-failed" | "ali-setup-missing" | "side-count-unavailable" | "login-revoked";
+export type AlertKind = "refresh-failed" | "store-unreadable" | "ledger-drop" | "refresh-guard-degraded" | "credential-store-write-failed" | "refresh-interrupted" | "heartbeat-write-failed" | "ali-setup-missing" | "side-count-unavailable" | "login-revoked" | "login-unmanaged" | "managed-check-unavailable";
 
 export interface OwnerAlert {
   kind: AlertKind;

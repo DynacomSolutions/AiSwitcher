@@ -1,13 +1,13 @@
 import { homedir } from "node:os";
 import { loadGatewayGuard } from "../sync/gateway-guard.ts";
-import { gatewayManagesLogin } from "./host-login-gate.ts";
+import { gatewayManagesLogin, piCopyOf } from "./host-login-gate.ts";
 import type { PgHomeStore } from "./home-store.ts";
 
 /**
  * Removes the stale store copy of a host-owned login (host-login-gate.ts): a claude or codex identity folder login row for
  * an identity that neither this host nor the gateway manages. Earlier host store syncs pushed such rows, and the console
  * then took them as proof that the gateway renews the login. The row is removed only when all of these hold:
- * - the row is the folder login of an identity in this host's registry, and it is not a swap pool folder;
+ * - the row is the folder login of an identity in this host's registry (or pi's copy of a claude login), and not a swap pool folder;
  * - this host sees no gateway management of it (no member copy, no sticky ownership, no routed pool);
  * - the gateway's own list of renewed logins (GET /logins/renewal) was read and does not name it;
  * - the row has not moved since it was listed (compare-and-swap on its version).
@@ -37,10 +37,12 @@ export async function pruneUnmanagedLogins(store: Pick<PgHomeStore, "list" | "de
   const guard = await loadGatewayGuard(home);
   for (const meta of await store.list(0)) {
     if (meta.kind !== "login") continue;
-    const login = guard.native.get(meta.path);
+    // The folder login, or pi's auth.json copy of a claude login (same refresh token, account pi/<name>).
+    const piCopy = guard.native.has(meta.path) ? undefined : piCopyOf(guard, meta.path);
+    const login = guard.native.get(meta.path) ?? piCopy;
     if (!login || login.pool) continue;
     const account = `${login.tool}/${login.name}`;
-    if (meta.account !== account) {
+    if (meta.account !== (piCopy ? `pi/${login.name}` : account)) {
       report.kept.push({ path: meta.path, why: "the row names another account" });
       continue;
     }

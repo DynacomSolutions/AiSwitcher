@@ -25,7 +25,7 @@ import { createGatewayApp, markGatewayResponse, styleForPath, type GatewayDeps }
 import { authBrowserToken } from "./browser/auth.ts";
 import { BrowserHub } from "./browser/hub.ts";
 import { CachedGatewayStore } from "./cache-store.ts";
-import { CredentialCache, loginCommand, type RefreshFn } from "./credentials.ts";
+import { CredentialCache, GatewayCredentialError, loginCommand, type RefreshFn } from "./credentials.ts";
 import { providerError } from "./errors.ts";
 import { errorTag, LedgerBuffer } from "./ledger-buffer.ts";
 import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
@@ -39,7 +39,7 @@ import { enableMemberStore, memberStoreEnabled, setLocalWriteHook } from "../ide
 import { clearLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
-import { GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
+import { createManagementCheck, GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, listGatewayManagedAccountsStrict, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
 export const DEFAULT_GATEWAY_ADMIN_PORT = 47131;
@@ -102,7 +102,7 @@ export interface GatewayHooks {
    * credential store of a login a host owns is never refreshed here (the host's CLI keeps rotating its token). Default with a
    * credential store: membership in listGatewayManagedAccounts, the list the keep-alive and /logins/renewal use. Tests replace it.
    */
-  isManaged?(tool: string, identity: string): Promise<boolean>;
+  isManaged?(tool: string, identity: string): Promise<boolean | undefined>;
   /** The ali logins whose console session the gateway renews, and how (tests replace both). */
   aliAccounts?(): Promise<Identity[]>;
   aliRefresh?(identity: Identity, signal?: AbortSignal): Promise<string>;
@@ -226,10 +226,12 @@ export function recoverOnSuccess<M extends GatewayMetrics>(inner: M, alerter: Al
 }
 
 /** A credential read that returns a token other than the one a refresh failed for means the login was repaired: clear its alert. */
-export function watchCredentialReads(creds: GatewayDeps["creds"], alerter: Alerter, failed: Map<string, string>): GatewayDeps["creds"] {
+export function watchCredentialReads(creds: GatewayDeps["creds"], alerter: Alerter, failed: Map<string, string>, refuse?: (provider: GatewayProvider, identity: string) => Promise<boolean>): GatewayDeps["creds"] {
   return {
     ...creds,
     get: async (provider, identity) => {
+      // A login the gateway does not manage is never used or renewed here: a request that names it fails with a plain reason.
+      if (refuse && (await refuse(provider, identity))) throw new GatewayCredentialError("unmanaged-login", provider, identity);
       const cred = await creds.get(provider, identity);
       const key = `${provider}/${cred.identity}`;
       const stale = failed.get(key);
@@ -247,6 +249,13 @@ export function watchCredentialReads(creds: GatewayDeps["creds"], alerter: Alert
 /** The identities an unrestricted pool app may use: real logins only. A swap pool's folder holds no login of its own, so it is never a member. */
 export function appPoolMemberNames(file: IdentitiesFile): string[] {
   return file.identities.filter((i) => !isRetired(i) && !isSwapPool(i)).map((i) => i.name);
+}
+
+/** The names the gateway manages, in order. A name for a tool the check does not cover stays (the check answers true for it). */
+export async function onlyManaged(provider: string, names: string[], isManaged: (tool: string, name: string) => Promise<boolean>): Promise<string[]> {
+  const kept: string[] = [];
+  for (const n of names) if (await isManaged(provider, n)) kept.push(n);
+  return kept;
 }
 
 async function defaultPoolMembers(provider: GatewayProvider): Promise<string[]> {
@@ -545,14 +554,40 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     metrics.refreshSucceededAt(tool, name, Math.floor(at.getTime() / 1000));
     if (result.expiresAt !== undefined) metrics.loginState(tool, name, { expiresAtSeconds: result.expiresAt, lifetimeSeconds: Math.max(0, result.expiresAt - Math.floor(at.getTime() / 1000)), revoked: false });
   });
-  const isManaged = hooks.isManaged ?? (pgCreds ? async (tool: string, name: string) => (await listGatewayManagedAccounts(undefined, tool)).some((i) => i.name === name) : undefined);
+  const managementCheck = hooks.isManaged ?? (pgCreds ? createManagementCheck() : undefined);
+  /**
+   * undefined: no gate (no credential store). true: managed, or the registry could not be read (only a successful read may mark a
+   * login unmanaged, so an unreadable registry keeps the login refreshing as before, with an alert). false: unmanaged.
+   */
+  const isManaged = managementCheck
+    ? async (tool: string, name: string): Promise<boolean> => {
+        if (!(GATEWAY_REFRESH_TOOLS as readonly string[]).includes(tool)) return true;
+        const managed = await managementCheck(tool, name).catch(() => undefined);
+        if (managed === undefined) {
+          alerter.raise("managed-check-unavailable", tool, `the gateway could not read the ${tool} identity registry to check which logins it manages; it keeps renewing logins as before until it can`);
+          return true;
+        }
+        alerter.recover("managed-check-unavailable", tool);
+        return managed;
+      }
+    : undefined;
+  const unmanagedAlert = (tool: string, name: string): void => {
+    metrics.refresh(tool, "unmanaged");
+    console.info(JSON.stringify({ event: "refresh", provider: tool, identity: name, replica: process.env.HOSTNAME ?? "gateway", outcome: "unmanaged", expiresAt: null, code: null }));
+    alerter.raise("login-unmanaged", `${tool}/${name}`, `the ${tool} login "${name}" is not managed by the gateway (it is not a member of a routed pool and has no gateway copy), so the gateway does not renew or serve it; route the identity through the gateway or stop using it in a gateway app`);
+  };
   const refreshLogin = ((...a: Parameters<RefreshFn>) => {
     const [tool, identity] = a;
     // A swap pool folder holds no login of its own: its refresh goes through the member it names, which is checked there.
     if (isManaged && !identity.swapPool) {
-      return isManaged(tool, identity.name).then(
-        (managed) => (managed ? refreshManaged(...a) : Promise.resolve<IdentityGrantRefresh>({ tool, identity: identity.name, outcome: "skipped-fresh", written: [], writeFailures: [], detail: "the gateway does not manage this login - not refreshed here" })),
-      );
+      return isManaged(tool, identity.name).then((managed) => {
+        if (managed) {
+          alerter.recover("login-unmanaged", `${tool}/${identity.name}`);
+          return refreshManaged(...a);
+        }
+        unmanagedAlert(tool, identity.name);
+        return Promise.resolve<IdentityGrantRefresh>({ tool, identity: identity.name, outcome: "skipped-fresh", written: [], writeFailures: [], detail: "the gateway does not manage this login - not refreshed here" });
+      });
     }
     return refreshManaged(...a);
   }) as RefreshFn;
@@ -564,10 +599,28 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     return p;
   }) as RefreshFn;
   const baseCreds = hooks.creds ?? new CredentialCache({ refresh: refreshLogin });
-  const creds = watchCredentialReads(baseCreds, alerter, failedTokens);
+  // Pinned apps and pools name identities: an unmanaged one is refused at use, with an alert and a count, never served until its token lapses.
+  const creds = watchCredentialReads(
+    baseCreds,
+    alerter,
+    failedTokens,
+    isManaged
+      ? async (provider, identity) => {
+          const name = await canonical(provider, identity);
+          if (await isManaged(provider, name)) return false;
+          unmanagedAlert(provider, name);
+          return true;
+        }
+      : undefined,
+  );
   const canonical = hooks.canonical ?? canonicalResolver();
   const usage = createUsageSource({ fetchUsage: hooks.fetchUsage ?? fetchPoolUsage });
-  const poolMembers = hooks.poolMembers ?? defaultPoolMembers;
+  // An unrestricted pool app uses real logins only, and of those only the ones the gateway manages.
+  const poolMembers =
+    hooks.poolMembers ??
+    (isManaged
+      ? async (provider: GatewayProvider): Promise<string[]> => onlyManaged(provider, await defaultPoolMembers(provider), isManaged)
+      : defaultPoolMembers);
   const browserPoolMembers = hooks.browserPoolMembers ?? defaultBrowserPoolMembers;
   const browserIdentityExists = hooks.browserIdentityExists ?? defaultBrowserIdentityExists;
 
@@ -608,7 +661,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     }
     return undefined;
   };
-  const renewalAccounts = hooks.keepAliveAccounts ?? ((tool: string) => listGatewayManagedAccounts(undefined, tool));
+  // The renewal list must not look complete when a registry could not be read: the strict list throws, and the admin route answers 503.
+  const renewalAccounts = hooks.keepAliveAccounts ?? ((tool: string) => listGatewayManagedAccountsStrict(undefined, tool));
   const admin = createAdminApp({
     store,
     readStore: inner,

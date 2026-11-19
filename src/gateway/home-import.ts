@@ -25,6 +25,9 @@ import type { RefreshGuardBackend } from "./refresh-guard.ts";
  * - a login is replaced only by a strictly fresher grant (later expiry), under the account's refresh lock, and never by
  *   a refresh token the journal shows already rotated out;
  * - the heartbeat is only seeded.
+ * Login rows go before the registries, so a replica that reads a new registry already finds the logins it needs. A host-owned claude
+ * login (one the gateway does not manage, host-login-gate.ts) is never uploaded; the rows older versions uploaded stay until
+ * `ais gateway store prune` removes them: run it once when this version rolls out.
  */
 
 /** File that records the host home the registries were written on, so a replica on another node can translate their paths. */
@@ -75,9 +78,11 @@ export async function collectImportEntries(home: string = homedir()): Promise<Im
     out.push(e);
   };
   const guard = await loadGatewayGuard(home);
+  // The registries go last: a replica that applies a new registry (pool membership) must already find the login rows it needs.
+  const registries: ImportEntry[] = [];
   for (const [tool, cfg] of Object.entries(TOOL_CONFIGS)) {
     if (!(await exists(cfg.identitiesJsonPath))) continue;
-    add({ abs: cfg.identitiesJsonPath, account: null, kind: "registry" });
+    registries.push({ abs: cfg.identitiesJsonPath, account: null, kind: "registry" });
     let identities: Identity[];
     try {
       identities = (await loadIdentitiesFile(cfg.identitiesJsonPath)).identities;
@@ -89,7 +94,7 @@ export async function collectImportEntries(home: string = homedir()): Promise<Im
       const account = `${tool}/${id.name}`;
       if ((OAUTH_TOOLS as readonly string[]).includes(tool)) {
         // A claude or codex login the gateway does not manage belongs to the host (host-login-gate.ts): never upload it, nor pi's copy of it.
-        if (!(await storeMayHoldLogin(tool, id.name, home, guard).catch(() => false))) continue;
+        if (!(await storeMayHoldLogin(tool, id, home, guard).catch(() => false))) continue;
         for (const p of await effectiveGrantPaths(tool as RefreshableTool, id).catch(() => [] as string[])) {
           if (!(await exists(p))) continue;
           // A pi copy belongs to the pi identity; the claude/codex/kimi refresh pulls it by path.
@@ -113,6 +118,7 @@ export async function collectImportEntries(home: string = homedir()): Promise<Im
       }
     }
   }
+  for (const r of registries) add(r);
   if (await exists(heartbeatPath())) add({ abs: heartbeatPath(), account: null, kind: "heartbeat" });
   add({ abs: join(home, ...STORE_META_PATH.split("/")), account: null, kind: "meta", content: Buffer.from(`${JSON.stringify({ hostHome: process.env.AIS_HOST_HOME?.trim() || home })}\n`) });
   return out;
