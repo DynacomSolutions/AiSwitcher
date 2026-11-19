@@ -12,9 +12,8 @@ import type { GatewayModelUsageView } from "../gateway/usage-view.ts";
  * The cluster gateway ledger is the source of truth for the token usage of the identities it manages.
  * The console reads the gateway admin routes `GET /usage/models` and `GET /usage/models/daily` server-side
  * (the admin token never reaches the page) and merges them over the host transcript scan, so a pod with stale
- * or missing local history still shows the real figures. Host rows stay only for identities the gateway does
- * not manage; a managed identity never shows host numbers, even when the gateway read fails (it shows an
- * honest error instead).
+ * or missing local history still shows the real figures. History is never deleted: host history the ledger does
+ * not cover stays, also when the gateway read fails (the row then carries an error next to the host numbers).
  *
  * The ledger records tokens, cost and request counts per provider, identity, app, model and instant. The
  * merge fills the report, date span and the per-day figures (dailyUsage, dailyTotals, bucketed in the zone the
@@ -242,18 +241,73 @@ export function spliceHostWithGateway(host: UsageResult, gateway: UsageResult, z
   };
 }
 
-const EMPTY_REPORT = (): TokscaleReport => ({ entries: [], totalInput: 0, totalOutput: 0, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 0, totalCost: 0 });
+const NUMERIC_ENTRY_FIELDS = ["input", "output", "cacheRead", "cacheWrite", "reasoning", "messageCount", "cost"] as const;
 
 /**
- * Merges the gateway rows into a host usage payload. The gateway is authoritative for the tokens, cost, messages and
- * per-day figures of the identities it manages from its first ledger day on. Host days before that day stay (see
- * spliceHostWithGateway), so all-time totals keep the history from before the gateway existed. The host's registry
- * entry and overage stay. A managed identity is one the gateway reported or the host registries list as
- * gateway-managed (the limits merge uses the gateway's rows the same way). Its host numbers never show: with no ledger
- * rows it shows zero, and when the gateway read fails it shows an honest "gateway usage unavailable" error. Host rows
- * for identities the gateway does not manage stay as they are; gateway rows with no host row are added with their
- * registry entry when one exists. An unconfigured gateway leaves the payload unchanged. The tool and identity filters
- * apply to the gateway rows as well.
+ * Combines host rows that share one managed key into one row, so no host history is dropped. Report entries are
+ * summed by model (every numeric field) and the report totals are recomputed. dailyUsage and dailyTotals are summed
+ * per day, and dateSpan widens to the earliest first and the latest last instant. The first row keeps its identity
+ * and every other field.
+ */
+export function combineHostRows(rows: UsageResult[]): UsageResult {
+  const first = rows[0]!;
+  if (rows.length === 1) return first;
+  const withReport = rows.filter((r) => r.report);
+  const models = new Map<string, TokscaleEntry>();
+  for (const r of withReport) {
+    for (const e of r.report!.entries) {
+      const have = models.get(e.model);
+      if (!have) { models.set(e.model, { ...e }); continue; }
+      for (const f of NUMERIC_ENTRY_FIELDS) have[f] += e[f];
+    }
+  }
+  const entries = [...models.values()];
+  const report: TokscaleReport | undefined = withReport.length === 0 ? undefined : {
+    entries,
+    totalInput: entries.reduce((x, e) => x + e.input, 0),
+    totalOutput: entries.reduce((x, e) => x + e.output, 0),
+    totalCacheRead: entries.reduce((x, e) => x + e.cacheRead, 0),
+    totalCacheWrite: entries.reduce((x, e) => x + e.cacheWrite, 0),
+    totalMessages: entries.reduce((x, e) => x + e.messageCount, 0),
+    totalCost: entries.reduce((x, e) => x + e.cost, 0),
+  };
+  let dailyUsage: Record<string, number> | undefined;
+  let dailyTotals: DailyTotals | undefined;
+  for (const r of rows) {
+    if (r.dailyUsage) {
+      dailyUsage ??= {};
+      for (const [d, v] of Object.entries(r.dailyUsage)) dailyUsage[d] = (dailyUsage[d] ?? 0) + v;
+    }
+    if (r.dailyTotals) {
+      dailyTotals ??= {};
+      for (const [d, v] of Object.entries(r.dailyTotals)) {
+        const have = dailyTotals[d];
+        dailyTotals[d] = have ? (have.map((x, i) => x + v[i]!) as DailyTotals[string]) : [...v];
+      }
+    }
+  }
+  const spans = rows.flatMap((r) => (r.dateSpan ? [r.dateSpan] : []));
+  const dateSpan = spans.length === 0 ? undefined : { firstMs: Math.min(...spans.map((x) => x.firstMs)), lastMs: Math.max(...spans.map((x) => x.lastMs)) };
+  return {
+    ...first,
+    ...(report ? { report } : {}),
+    ...(dailyUsage ? { dailyUsage } : {}),
+    ...(dailyTotals ? { dailyTotals } : {}),
+    ...(dateSpan ? { dateSpan } : {}),
+  };
+}
+
+/**
+ * Merges the gateway rows into a host usage payload. History is never deleted. The gateway is authoritative for the
+ * tokens, cost, messages and per-day figures of the identities it manages from its first ledger day on. Host days
+ * before that day stay (see spliceHostWithGateway), so all-time totals keep the history from before the gateway
+ * existed. Host rows that share one managed key (another provider label) are combined first (see combineHostRows),
+ * never dropped. The host's registry entry and overage stay. A managed identity is one the gateway reported or the
+ * host registries list as gateway-managed. With no ledger rows in the window the combined host row stays as it is,
+ * because host history is then the only record. When the gateway read fails the host numbers stay and the row gains a
+ * "gateway usage unavailable" error. Host rows for identities the gateway does not manage stay as they are; gateway
+ * rows with no host row are added with their registry entry when one exists. An unconfigured gateway leaves the
+ * payload unchanged. The tool and identity filters apply to the gateway rows as well.
  */
 export async function mergeGatewayUsage(
   payload: unknown,
@@ -269,39 +323,46 @@ export async function mergeGatewayUsage(
   const managed = new Set((await loadManaged().catch(() => [] as ManagedUsageAccount[])).map((a) => keyOf(a.provider, a.name)));
   const hostKey = (host: UsageResult): string | undefined => (host?.provider && host.identity?.name ? keyOf(host.provider, host.identity.name) : undefined);
   const stripNumbers = ({ report: _report, dateSpan: _dateSpan, dailyUsage: _dailyUsage, dailyTotals: _dailyTotals, error: _error, pending: _pending, ...rest }: UsageResult) => rest;
+  const gatewayByKey = new Map<string, UsageResult>();
+  if (!view.error) for (const row of gatewayUsageResults(view, filters)) gatewayByKey.set(keyOf(row.provider, row.identity.name), row);
+  const isManaged = (key: string): boolean => managed.has(key) || gatewayByKey.get(key)?.report !== undefined;
+  // Host rows of one managed key combine into one row at the first row's position: no host history is dropped.
+  const groups = new Map<string, UsageResult[]>();
+  for (const host of results as UsageResult[]) {
+    const key = hostKey(host);
+    if (key && isManaged(key)) groups.set(key, [...(groups.get(key) ?? []), host]);
+  }
+  const combined = new Map<string, UsageResult>([...groups].map(([key, rows]) => [key, combineHostRows(rows)]));
+  const seenManaged = new Set<string>();
 
   if (view.error) {
     const reason = `gateway usage unavailable: ${view.error}`;
-    const seen = new Set<string>();
-    const merged = (results as UsageResult[]).flatMap((host) => {
+    const out = (results as UsageResult[]).flatMap((host) => {
       const key = hostKey(host);
-      if (!key || !managed.has(key)) return [host];
-      if (seen.has(key)) return [];
-      seen.add(key);
-      return [{ ...stripNumbers(host), provider: mergeProviderKey(host.provider), error: reason }];
+      if (!key || !combined.has(key)) return [host];
+      if (seenManaged.has(key)) return [];
+      seenManaged.add(key);
+      const row = combined.get(key)!;
+      return [{ ...row, provider: mergeProviderKey(row.provider), error: reason }];
     });
-    return { ...(payload as object), results: merged };
+    return { ...(payload as object), results: out };
   }
 
-  const gatewayByKey = new Map<string, UsageResult>();
-  for (const row of gatewayUsageResults(view, filters)) gatewayByKey.set(keyOf(row.provider, row.identity.name), row);
   const used = new Set<string>();
-  const seenManaged = new Set<string>();
   const merged: unknown[] = (results as UsageResult[]).flatMap((host): unknown[] => {
     const key = hostKey(host);
     if (!key) return [host];
+    const row = combined.get(key);
+    if (!row) return [host];
+    if (seenManaged.has(key)) return [];
+    seenManaged.add(key);
+    const provider = mergeProviderKey(row.provider);
     const gateway = gatewayByKey.get(key);
-    // A managed identity ends with one row: a second host row for it (another provider label) is dropped.
-    if (gateway?.report || managed.has(key)) {
-      if (seenManaged.has(key)) return [];
-      seenManaged.add(key);
-    }
-    const provider = mergeProviderKey(host.provider);
     if (gateway?.report) {
       used.add(key);
-      const spliced = spliceHostWithGateway(host, gateway);
+      const spliced = spliceHostWithGateway(row, gateway);
       return [{
-        ...stripNumbers(host),
+        ...stripNumbers(row),
         provider,
         report: publicReport(spliced.report!),
         ...(spliced.dateSpan ? { dateSpan: spliced.dateSpan } : {}),
@@ -309,9 +370,8 @@ export async function mergeGatewayUsage(
         ...(spliced.dailyTotals ? { dailyTotals: spliced.dailyTotals } : {}),
       }];
     }
-    // Managed but no ledger rows in the window: zero from the gateway, never the host's figures.
-    if (managed.has(key)) return [{ ...stripNumbers(host), provider, report: EMPTY_REPORT(), dailyUsage: {}, dailyTotals: {} }];
-    return [host];
+    // Managed but no ledger rows in the window: the gateway has no record, so host history is the only record.
+    return [{ ...row, provider }];
   });
   const added = [...gatewayByKey.values()].filter((row) => !used.has(keyOf(row.provider, row.identity.name)));
   if (added.length > 0) {

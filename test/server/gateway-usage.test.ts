@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { Identity } from "../../src/identities/types.ts";
 import type { ModelDailyUsageRow, ModelUsageRow } from "../../src/gateway/types.ts";
 import type { GatewayModelUsageView } from "../../src/gateway/usage-view.ts";
-import { GATEWAY_NO_ACCOUNT_NAME, GATEWAY_USAGE_WINDOW_DAYS, gatewayUsageResults, mergeGatewayUsage } from "../../src/server/gateway-usage.ts";
+import { GATEWAY_NO_ACCOUNT_NAME, GATEWAY_USAGE_WINDOW_DAYS, gatewayUsageResults, mergeGatewayUsage, combineHostRows } from "../../src/server/gateway-usage.ts";
 
 const FIRST = "2026-11-19T07:00:00.000Z";
 const LAST = "2026-11-19T10:00:00.000Z";
@@ -116,11 +116,52 @@ describe("mergeGatewayUsage", () => {
     expect(rows.find((r) => r.identity.name === "pool")).toEqual(host.results[2] as Record<string, any>); // non-gateway host row stays
   });
 
-  test("a combined host label of a managed identity keeps one zero row when the ledger has no rows", async () => {
+  test("a combined host label of a managed identity keeps its host history when the ledger has no rows", async () => {
     const host = payload([hostRow("ais-gateway, openai", "c1")]);
     const merged = (await mergeGatewayUsage(host, view([]), {}, noRegistries, async () => [{ provider: "openai", name: "c1" }])) as typeof host;
     expect(merged.results).toHaveLength(1);
-    expect((merged.results[0] as Record<string, any>).report.totalInput).toBe(0);
+    const row = merged.results[0] as Record<string, any>;
+    expect(row.provider).toBe("openai");
+    expect(row.report.totalInput).toBe(1);
+  });
+
+  test("two host rows of one managed key are summed, not dropped, then spliced", async () => {
+    const a = hostRow("openai", "c1", {
+      dailyTotals: { "2026-10-01": [10, 10, 0, 0, 1, 1] },
+      dailyUsage: { "2026-10-01": 20 },
+      dateSpan: { firstMs: Date.parse("2026-10-01T00:00:00Z"), lastMs: Date.parse("2026-10-01T12:00:00Z") },
+      report: { entries: [{ model: "m", provider: "openai", input: 10, output: 10, cacheRead: 0, cacheWrite: 0, reasoning: 0, messageCount: 1, cost: 1 }], totalInput: 10, totalOutput: 10, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 1, totalCost: 1 },
+    });
+    const b = hostRow("ais-gateway, openai", "c1", {
+      dailyTotals: { "2026-10-01": [5, 5, 0, 0, 1, 2], "2026-09-30": [1, 1, 0, 0, 1, 1] },
+      dailyUsage: { "2026-10-01": 10, "2026-09-30": 2 },
+      dateSpan: { firstMs: Date.parse("2026-09-30T00:00:00Z"), lastMs: Date.parse("2026-10-02T00:00:00Z") },
+      report: { entries: [{ model: "m", provider: "openai", input: 6, output: 6, cacheRead: 0, cacheWrite: 0, reasoning: 0, messageCount: 2, cost: 3 }], totalInput: 6, totalOutput: 6, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 2, totalCost: 3 },
+    });
+    const gw = [modelRow("codex", "c1", "web", "gpt", { inputTokens: 3, outputTokens: 3, estCostUsd: 1, requests: 1, firstTs: "2026-11-03T01:00:00.000Z", lastTs: "2026-11-03T02:00:00.000Z" })];
+    const merged = (await mergeGatewayUsage(payload([a, b]), view(gw, { dailyZone: "UTC" }), {}, noRegistries, noManaged)) as any;
+    expect(merged.results).toHaveLength(1);
+    const r = merged.results[0];
+    expect(r.provider).toBe("openai");
+    expect(r.dailyTotals["2026-10-01"]).toEqual([15, 15, 0, 0, 2, 3]);
+    expect(r.dailyTotals["2026-09-30"]).toEqual([1, 1, 0, 0, 1, 1]);
+    expect(r.dailyUsage["2026-10-01"]).toBe(30);
+    expect(r.dateSpan.firstMs).toBe(Date.parse("2026-09-30T00:00:00Z"));
+    expect(r.report.totalCost).toBeCloseTo(4 + 1); // combined host history 4, gateway 1
+    expect(r.report.totalInput).toBe(16 + 3);
+  });
+
+  test("combining host rows sums entries by model and recomputes totals", () => {
+    const a = hostRow("openai", "c1") as any;
+    const b = hostRow("ais-gateway, openai", "c1") as any;
+    const c = combineHostRows([a, b]) as any;
+    expect(c.report.entries).toHaveLength(1);
+    expect(c.report.entries[0]).toMatchObject({ input: 2, output: 2, messageCount: 2, cost: 0.02 });
+    expect(c.report).toMatchObject({ totalInput: 2, totalOutput: 2, totalMessages: 2 });
+    expect(c.report.totalCost).toBeCloseTo(0.02);
+    expect(c.dailyTotals["2026-11-19"]).toEqual([2, 2, 0, 0, 2, 0.02]);
+    expect(c.dailyUsage).toEqual({ "2026-11-19": 4 });
+    expect(a.report.totalInput).toBe(1); // inputs are not mutated
   });
 
   test("a combined host label of a non-gateway pair stays as it is", async () => {
@@ -175,27 +216,36 @@ describe("mergeGatewayUsage", () => {
     expect(await mergeGatewayUsage({ generatedAt: STAMP }, view(gatewayRows), {}, noRegistries, noManaged)).toEqual({ generatedAt: STAMP });
   });
 
-  test("a failed gateway read marks managed identities with an error and keeps other host rows", async () => {
+  test("a failed gateway read keeps host numbers, adds an error and keeps other host rows", async () => {
     const host = payload([hostRow("anthropic", "m1", { extraCost: { active: false, label: "x" } }), hostRow("anthropic", "pool"), hostRow("openai", "c1")]);
     const managed = async () => [{ provider: "anthropic", name: "m1" }, { provider: "openai", name: "c1" }];
     const merged = (await mergeGatewayUsage(host, view([], { error: "admin unreachable" }), {}, noRegistries, managed)) as typeof host;
     const m1 = merged.results[0] as Record<string, any>;
     expect(m1.error).toBe("gateway usage unavailable: admin unreachable");
-    expect(m1.report).toBeUndefined();
-    expect(m1.dailyTotals).toBeUndefined();
-    expect(m1.dailyUsage).toBeUndefined();
+    expect(m1.report.totalInput).toBe(1);
+    expect(m1.dailyTotals).toEqual({ "2026-11-19": [1, 1, 0, 0, 1, 0.01] });
+    expect(m1.dailyUsage).toEqual({ "2026-11-19": 2 });
     expect(m1.extraCost).toEqual({ active: false, label: "x" });
     expect(m1.identity).toEqual(identity("m1"));
     expect(merged.results[1]).toEqual(host.results[1]); // not managed by the gateway: host numbers stay
     expect((merged.results[2] as any).error).toContain("gateway usage unavailable");
   });
 
-  test("a managed identity with no ledger rows shows zero, never host numbers", async () => {
+  test("a failed gateway read combines duplicate managed host rows and keeps their numbers", async () => {
+    const host = payload([hostRow("openai", "c1"), hostRow("ais-gateway, openai", "c1")]);
+    const merged = (await mergeGatewayUsage(host, view([], { error: "boom" }), {}, noRegistries, async () => [{ provider: "openai", name: "c1" }])) as any;
+    expect(merged.results).toHaveLength(1);
+    expect(merged.results[0].report.totalInput).toBe(2);
+    expect(merged.results[0].error).toBe("gateway usage unavailable: boom");
+  });
+
+  test("a managed identity with no ledger rows keeps its host history", async () => {
     const host = payload([hostRow("anthropic", "m1"), hostRow("anthropic", "pool")]);
     const managed = async () => [{ provider: "anthropic", name: "m1" }];
     const merged = (await mergeGatewayUsage(host, view([modelRow("codex", "c1", "web", "gpt", { inputTokens: 1 })]), {}, noRegistries, managed)) as typeof host;
     const m1 = merged.results[0] as Record<string, any>;
-    expect(m1.report).toMatchObject({ totalInput: 0, totalOutput: 0, totalMessages: 0, totalCost: 0, entries: [] });
+    expect(m1.report).toMatchObject({ totalInput: 1, totalOutput: 1, totalMessages: 1, totalCost: 0.01 });
+    expect(m1.dailyTotals).toEqual({ "2026-11-19": [1, 1, 0, 0, 1, 0.01] });
     expect(m1.error).toBeUndefined();
     expect(merged.results[1]).toEqual(host.results[1]);
   });
