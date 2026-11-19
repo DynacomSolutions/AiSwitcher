@@ -42,7 +42,7 @@ T3 Code starts Claude and Codex through the AIS shims with `CLAUDE_CONFIG_DIR` /
 
 1. The folder is the identity's config dir (for example the swap pool folder).
 2. Its `projects` or `sessions` link points into an identity's config dir (`~/.t3/gateway/t3-claude-<name>`).
-3. The folder sits directly in `<T3CODE_HOME>/gateway` (a folder made by `ais gateway t3-instance`, which holds only the gateway app token). Its name matches an identity name or alias, first as is, then without a `t3-claude-` / `t3-codex-` prefix, then without a `kimi-` / `zai-` segment. A remaining name `pool` maps to the tool's only swap pool. Example: a folder `<name>` where `<name>` is an alias of a Claude pool maps to that pool.
+3. The folder sits directly in `<T3CODE_HOME>/gateway` (a folder made by `ais gateway t3-instance`, which holds only the gateway app token). Its name matches an identity name or alias, first as is, then without a `t3-claude-` / `t3-codex-` prefix. A remaining name `pool` maps to the tool's only swap pool. Example: a folder `<name>` where `<name>` is an alias of a Claude pool maps to that pool. Kimi and Z.ai folders (`t3-claude-kimi-*`, `t3-claude-zai-*`) never map: they would send page content to another provider.
 
 `ais browser wiring [--check] [--json]` runs the same steps as a launch (`browserLaunchWiring`) for every enabled Claude and Codex instance in `<T3CODE_HOME>/userdata/settings.json`. It prints the instance, its folder, the identity or pool, and `wired` or the reason it is not wired (`no identity`, `no token`, `ais binary not installed`). `--check` exits 1 when an instance is not wired. A session gets the tools only when it starts after the fix: resume a T3 thread or start a new one.
 

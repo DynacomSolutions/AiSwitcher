@@ -106,3 +106,13 @@ test("a rename in the database shows after the TTL", async () => {
   t += 25_000;
   expect(await get()).toBe("After");
 });
+
+test("a failed T3 lookup after a title was found keeps the last T3 title", async () => {
+  seed([["thread:one", "Kept title", null]]);
+  let t = 0;
+  const get = chatNameResolver({ configDirs: [], t3DbPath: dbPath, cwd: "/work/example", now: () => t }, env());
+  expect(await get()).toBe("Kept title");
+  await rm(dbPath);
+  t = 60_000;
+  expect(await get()).toBe("Kept title");
+});

@@ -57,8 +57,9 @@ const realOrNormal = (dir: string, real: (p: string) => string): string => {
 /** Folder-name candidates for a T3 gateway folder, in order of preference. */
 function t3GatewayCandidates(folderName: string): string[] {
   const stem = folderName.replace(/^t3-(?:claude|codex)-/, "");
-  const bare = stem.replace(/^(?:kimi|zai)-/, "");
-  return [...new Set([folderName, stem, bare])];
+  // No kimi-/zai- stripping: a Kimi or Z.ai backed session must never get a Claude identity's browser,
+  // because it would send page content to another provider.
+  return [...new Set([folderName, stem])];
 }
 
 /** Identity for a folder directly inside <T3 home>/gateway, matched by name or alias (T3 instance folders hold only a gateway token). */
@@ -80,7 +81,7 @@ function identityForT3GatewayFolder(live: Identity[], configDir: string, t3Gatew
  * the identity. Match: the folder is the identity's config dir, or (a launcher's own folder, such as
  * T3's per-account ~/.t3/gateway/t3-claude-<name>) its `projects` / `sessions` link points into the
  * identity's config dir, or the folder sits directly in <T3 home>/gateway and its name (without a
- * t3-claude-/t3-codex- prefix and a kimi-/zai- segment) is an identity name or alias. Retired
+ * t3-claude-/t3-codex- prefix) is an identity name or alias. Retired
  * identities are never returned. `t3Gateway` is injectable for tests.
  */
 export function identityForConfigDir(

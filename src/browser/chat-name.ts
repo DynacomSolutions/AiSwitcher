@@ -30,6 +30,7 @@ export function chatNameResolver(src: ChatNameSource, env: NodeJS.ProcessEnv = p
   const ttl = src.ttlMs ?? CHAT_NAME_TTL_MS;
   let threadId: string | undefined;
   let cached: { at: number; name: string } | undefined;
+  let lastT3: string | undefined;
   const fallback = () => clean(env.AIS_SESSION_NAME) || fallbackLabel(src.tool, src.cwd);
   let inflight: Promise<string> | undefined;
   return () => {
@@ -40,7 +41,9 @@ export function chatNameResolver(src: ChatNameSource, env: NodeJS.ProcessEnv = p
   };
   async function lookup(): Promise<string> {
     let found = t3ThreadTitle(env, src.t3DbPath);
-    if (found) return remember(found);
+    // A failed lookup (for example a short SQLITE_BUSY) keeps the last T3 title, so the group name does not flicker.
+    if (!found && lastT3) found = lastT3;
+    if (found) return remember((lastT3 = found));
     let id = typeof src.id === "string" ? src.id : undefined;
     if (!id && typeof src.id === "function") {
       try { id = threadId ??= await (src.id as () => Promise<string | undefined>)(); } catch { /* retry on the next lookup */ }

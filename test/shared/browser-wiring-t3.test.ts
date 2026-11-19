@@ -32,15 +32,16 @@ test("t3-claude-<name> without links maps by name", () => {
   expect(map(join(gw, "t3-claude-alpha"))).toBe("alpha");
 });
 
-test("t3-claude-kimi-<name> maps to <name>; t3-claude-kimi-pool maps to the single pool", () => {
-  expect(map(join(gw, "t3-claude-kimi-alpha"))).toBe("alpha");
-  expect(map(join(gw, "t3-claude-zai-alpha"))).toBe("alpha");
-  expect(map(join(gw, "t3-claude-kimi-pool"))).toBe("team-pool");
+test("Kimi and Z.ai folders never map to a Claude identity", () => {
+  expect(map(join(gw, "t3-claude-kimi-alpha"))).toBeUndefined();
+  expect(map(join(gw, "t3-claude-zai-alpha"))).toBeUndefined();
+  expect(map(join(gw, "t3-claude-kimi-pool"))).toBeUndefined();
 });
 
 test("pool stem needs exactly one swap pool", () => {
+  expect(map(join(gw, "pool"))).toBe("team-pool");
   const two = { ...file, identities: [...file.identities, id("other-pool", { swapPool: { accounts: [], active: "" } })] };
-  expect(map(join(gw, "t3-claude-kimi-pool"), two)).toBeUndefined();
+  expect(map(join(gw, "pool"), two)).toBeUndefined();
 });
 
 test("a matching basename outside the gateway root does not map", () => {
