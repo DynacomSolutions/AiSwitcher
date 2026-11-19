@@ -1,11 +1,13 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 import type { Identity } from "../../identities/types.ts";
 import { FRESH_READ_TTL_MS, freshLastGood, fetchUsageBodyWithResets, manualResetFromCedarEmber, carriedManualReset, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
+import { AIS_LIMITS_PROBE_ENV, isLimitsProbe } from "../../shared/limits-probe.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
+import { acquireProbeLock, type ProbeLockDeps } from "./probe-lock.ts";
 import { categorizeByLabel } from "./bucket.ts";
 import type { LimitWindow, OverageInfo, FetchedLimitResult, ResetGrantKind } from "./types.ts";
 
@@ -14,6 +16,11 @@ const AUTH_STATUS_TIMEOUT_MS = 10_000;
 // (2026-07-20), not a genuinely stuck process; 90s gives `claude -p "/usage"`
 // enough room before this gives up and reports it as hung.
 const USAGE_TIMEOUT_MS = 90_000;
+/** After a failed spawn probe, the same identity is not probed again for this long. */
+export const PROBE_BACKOFF_MS = 10 * 60_000;
+const LOCK_STALE_AFTER_MS = USAGE_TIMEOUT_MS + AUTH_STATUS_TIMEOUT_MS + 30_000;
+/** `--safe-mode` drops plugins, hooks and MCP servers (so the probe cannot start another `ais limits`) but keeps OAuth. */
+export const USAGE_PROBE_ARGS = ["-p", "/usage", "--no-session-persistence", "--safe-mode", "--strict-mcp-config"];
 
 // "Current session: 25% used · resets Jul 15 at 2pm (Asia/Bangkok)"
 // "Current week (all models): 30% used · resets Jul 18 at 8am (Asia/Bangkok)"
@@ -34,7 +41,7 @@ async function runReal(
   identity: Identity,
   timeoutMs: number,
 ): Promise<{ stdout: string; exitCode: number; timedOut: boolean }> {
-  return spawnCapturedBounded(binaryPath, args, { CLAUDE_CONFIG_DIR: identity.configDir }, timeoutMs);
+  return spawnCapturedBounded(binaryPath, args, { CLAUDE_CONFIG_DIR: identity.configDir, [AIS_LIMITS_PROBE_ENV]: "1" }, timeoutMs);
 }
 
 function normalizeLabel(raw: string): string {
@@ -198,6 +205,41 @@ export interface ClaudeLimitsDeps {
   fetchBody?: typeof fetchUsageBodyWithResets;
   cacheDir?: string;
   reconcile?: typeof reconcileOnceForFetch;
+  /** Runs the real binary; replaces the process spawn. */
+  run?: (binaryPath: string, args: string[], identity: Identity, timeoutMs: number) => Promise<{ stdout: string; exitCode: number; timedOut: boolean }>;
+  resolveBinary?: () => string;
+  fetchResets?: typeof fetchMemberResets;
+  /** Probe guard; defaults to the AIS_LIMITS_PROBE environment variable. */
+  isProbe?: boolean;
+  now?: () => number;
+  lock?: ProbeLockDeps;
+  backoffMs?: number;
+}
+
+function probeLockPath(identity: Identity, cacheDir: string): string {
+  return join(cacheDir, "claude-limits", `${encodeURIComponent(identity.name)}.probe.lock`);
+}
+
+function probeFailurePath(identity: Identity, cacheDir: string): string {
+  return join(cacheDir, "claude-limits", `${encodeURIComponent(identity.name)}.probe-failed.json`);
+}
+
+async function loadProbeFailure(identity: Identity, cacheDir: string): Promise<{ atMs: number; error: string } | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(probeFailurePath(identity, cacheDir), "utf8")) as { atMs?: unknown; error?: unknown };
+    return typeof parsed.atMs === "number" ? { atMs: parsed.atMs, error: typeof parsed.error === "string" ? parsed.error : "usage probe failed" } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function recordProbeFailure(identity: Identity, cacheDir: string, atMs: number, error: string): Promise<void> {
+  try {
+    await mkdir(join(cacheDir, "claude-limits"), { recursive: true });
+    await writeFile(probeFailurePath(identity, cacheDir), JSON.stringify({ atMs, error }));
+  } catch {
+    // Bookkeeping only.
+  }
 }
 
 function lastGoodPath(identity: Identity, cacheDir: string): string {
@@ -285,18 +327,59 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
     return { ...base, windows: [], status: "unavailable", error: "rate-limited by Anthropic usage endpoint, retry shortly" };
   }
 
+  const cachedOr = async (error: string): Promise<FetchedLimitResult> => {
+    const last = await loadLastGood(identity, cacheDir);
+    return last ? { ...last, status: "cached" } : { ...base, windows: [], status: "unavailable", error };
+  };
+
+  // A usage probe must never start another probe (see shared/limits-probe.ts).
+  if (deps.isProbe ?? isLimitsProbe()) return cachedOr("usage probes are disabled inside a usage probe");
+
+  // Back off after a failed spawn, so a broken or empty probe is not repeated by every caller.
+  const nowFn = deps.now ?? Date.now;
+  const backoffMs = deps.backoffMs ?? PROBE_BACKOFF_MS;
+  const failure = await loadProbeFailure(identity, cacheDir);
+  if (failure && nowFn() - failure.atMs >= 0 && nowFn() - failure.atMs < backoffMs) {
+    return cachedOr(`${failure.error} (not retried within ${Math.round(backoffMs / 60_000)} min)`);
+  }
+
   let binaryPath: string;
   try {
-    binaryPath = resolveRealBinary("claude");
+    binaryPath = (deps.resolveBinary ?? (() => resolveRealBinary("claude")))();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, windows: [], status: "unavailable", error: message };
   }
 
+  // One probe per identity at a time, across processes.
+  const release = await acquireProbeLock(probeLockPath(identity, cacheDir), LOCK_STALE_AFTER_MS, { now: nowFn, ...deps.lock });
+  if (!release) return cachedOr("another usage probe for this identity is running");
+  try {
+    const result = await probeViaSpawn(identity, base, cacheDir, binaryPath, deps);
+    if (result.status === "live") {
+      await saveLastGood(identity, result, cacheDir);
+      await unlink(probeFailurePath(identity, cacheDir)).catch(() => undefined);
+      return result;
+    }
+    if (result.error) await recordProbeFailure(identity, cacheDir, nowFn(), result.error);
+    return result;
+  } finally {
+    await release();
+  }
+}
+
+async function probeViaSpawn(
+  identity: Identity,
+  base: Pick<FetchedLimitResult, "toolName" | "identity">,
+  cacheDir: string,
+  binaryPath: string,
+  deps: ClaudeLimitsDeps,
+): Promise<FetchedLimitResult> {
+  const run = deps.run ?? runReal;
   let authStdout: string;
   let authTimedOut: boolean;
   try {
-    ({ stdout: authStdout, timedOut: authTimedOut } = await runReal(
+    ({ stdout: authStdout, timedOut: authTimedOut } = await run(
       binaryPath,
       ["auth", "status"],
       identity,
@@ -328,9 +411,9 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
   let usageStdout: string;
   let usageTimedOut: boolean;
   try {
-    ({ stdout: usageStdout, timedOut: usageTimedOut } = await runReal(
+    ({ stdout: usageStdout, timedOut: usageTimedOut } = await run(
       binaryPath,
-      ["-p", "/usage", "--no-session-persistence"],
+      USAGE_PROBE_ARGS,
       identity,
       USAGE_TIMEOUT_MS,
     ));
@@ -367,7 +450,7 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
 
   const overage = overageFromUsageText(usageStdout);
   // Non-fatal and sequential: it may refresh the token, which must not race the /usage spawn above.
-  const manualReset = (await fetchMemberResets(identity)) ?? carriedManualReset((await loadLastGood(identity, cacheDir))?.manualReset);
+  const manualReset = (await (deps.fetchResets ?? fetchMemberResets)(identity)) ?? carriedManualReset((await loadLastGood(identity, cacheDir))?.manualReset);
   return {
     ...base,
     windows,

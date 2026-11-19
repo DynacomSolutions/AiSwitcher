@@ -180,6 +180,8 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     cancelRecovery()
+    // Started by `ais limits` as a usage probe: refreshing would run `ais limits` again.
+    const isProbe = process.env.AIS_LIMITS_PROBE === '1'
     // Clears a status left by an older loaded version after /reload-plugins.
     $.ui.status(undefined)
 
@@ -244,11 +246,13 @@ export const register: Register = on => {
       description: 'Switch the active account of the AIS swap pool',
       argumentHint: '[next | <account>]',
     })
-    void refreshAll()
-    $.clock.every(60_000, () => void refreshStatus())
-    $.clock.every(600_000, () => void refreshUsage())
-    $.clock.every(300_000, () => void refreshLimits())
-    refreshHandle = refreshAll
+    if (!isProbe) {
+      void refreshAll()
+      $.clock.every(60_000, () => void refreshStatus())
+      $.clock.every(600_000, () => void refreshUsage())
+      $.clock.every(300_000, () => void refreshLimits())
+      refreshHandle = refreshAll
+    }
 
     return next(e)
   })
