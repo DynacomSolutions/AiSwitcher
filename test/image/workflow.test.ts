@@ -50,3 +50,22 @@ test("the EFI loader is built from the image's own Arch GRUB modules", () => {
   expect(text).toContain("AIS_GRUB_MODULE_DIR=out/grub-x86_64-efi image/build/assemble.sh");
   expect(readFileSync("image/build/build.sh", "utf8")).toContain('cp -a "$root/usr/lib/grub/x86_64-efi" "$out/grub-x86_64-efi"');
 });
+
+test("the selector fast path covers every metafile input area", () => {
+  // dist/ais.meta.json also lists mods/ and scripts/ inputs, not only src/.
+  const line = lines.find((l) => l.includes("grep -Eq '^(src/"));
+  expect(line).toBeDefined();
+  const pattern = line!.match(/grep -Eq '([^']+)'/)![1]!;
+  const re = new RegExp(pattern);
+  for (const path of [
+    "src/ais.ts", "mods/ais-usage/hooks/model.ts", "scripts/backup.ts",
+    "scripts/systemd/ais-profile-sync.service", "package.json", "image/pins.env",
+    "apps/tui/Cargo.toml", ".github/workflows/live-image.yml", "bun.lock",
+    "bunfig.toml", "tsconfig.json", ".bun-version",
+  ]) {
+    expect(re.test(path)).toBe(true);
+  }
+  for (const path of ["docs/agents/history.md", "apps/web/src/app.tsx", "apps/host/src/App.tsx", "test/gateway/serve.test.ts", "README.md"]) {
+    expect(re.test(path)).toBe(false);
+  }
+});
