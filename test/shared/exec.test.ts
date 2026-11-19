@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { realpathSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -154,26 +154,42 @@ describe("child environment", () => {
 });
 
 describe("spawnCapturedBounded process groups", () => {
+  // Running (non-zombie) members of a process group. A zombie waits for its
+  // reaper (systemd --user), which can be slow on a loaded host.
   const alive = (pgid: number): boolean => {
-    try {
-      process.kill(-pgid, 0);
-      return true;
-    } catch {
-      return false;
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      let stat: string;
+      try {
+        stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+      } catch {
+        continue;
+      }
+      // Fields after the ")" of the command name: state, ppid, pgrp, ...
+      const [state, , pgrp] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      if (Number(pgrp) === pgid && state !== "Z" && state !== "X") return true;
     }
+    return false;
+  };
+  // A killed process can stay a zombie for a moment on a loaded host.
+  const gone = async (pgid: number): Promise<boolean> => {
+    for (let i = 0; i < 100; i++) {
+      if (!alive(pgid)) return true;
+      await Bun.sleep(50);
+    }
+    return false;
   };
 
   test("a timeout kills grandchildren too", async () => {
     const { spawnCapturedBounded } = await import("../../src/shared/exec.ts");
     const started = Date.now();
-    const result = await spawnCapturedBounded("sh", ["-c", "sleep 300 & sleep 300 & echo $$; wait"], {}, 500);
+    const result = await spawnCapturedBounded("sh", ["-c", "echo $$; sleep 300 & sleep 300 & wait"], {}, 3_000);
     expect(result.timedOut).toBe(true);
-    expect(Date.now() - started).toBeLessThan(8_000);
+    expect(Date.now() - started).toBeLessThan(15_000);
     const pgid = Number(result.stdout.trim());
     expect(pgid).toBeGreaterThan(0);
-    await Bun.sleep(100);
-    expect(alive(pgid)).toBe(false);
-  });
+    expect(await gone(pgid)).toBe(true);
+  }, 20_000);
 
   test("returns promptly when a grandchild holds the pipe after the child exits, and kills it", async () => {
     const { spawnCapturedBounded } = await import("../../src/shared/exec.ts");
@@ -181,11 +197,30 @@ describe("spawnCapturedBounded process groups", () => {
     const result = await spawnCapturedBounded("sh", ["-c", "echo $$; sleep 300 &"], {}, 30_000);
     expect(result.timedOut).toBe(false);
     expect(result.exitCode).toBe(0);
-    expect(Date.now() - started).toBeLessThan(6_000);
+    expect(Date.now() - started).toBeLessThan(10_000);
     const pgid = Number(result.stdout.trim());
-    await Bun.sleep(100);
-    expect(alive(pgid)).toBe(false);
-  });
+    expect(await gone(pgid)).toBe(true);
+  }, 20_000);
+
+  test("SIGTERM to the caller kills the live child group too", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ais-exec-reap-"));
+    tempDirs.push(dir);
+    const pidFile = join(dir, "pgid");
+    const execPath = join(import.meta.dir, "../../src/shared/exec.ts");
+    const script = `const { spawnCapturedBounded } = await import(${JSON.stringify(execPath)});
+await spawnCapturedBounded("sh", ["-c", "echo $$ > ${pidFile}; sleep 300 & sleep 300"], {}, 60_000);`;
+    const caller = Bun.spawn(["bun", "-e", script], { stdout: "ignore", stderr: "ignore" });
+    let pgid = 0;
+    for (let i = 0; i < 400 && !pgid; i++) {
+      await Bun.sleep(50);
+      pgid = Number((await Bun.file(pidFile).text().catch(() => "")).trim()) || 0;
+    }
+    expect(pgid).toBeGreaterThan(0);
+    expect(alive(pgid)).toBe(true);
+    caller.kill("SIGTERM");
+    await caller.exited;
+    expect(await gone(pgid)).toBe(true);
+  }, 40_000);
 
   test("a normal run keeps output and exit code", async () => {
     const { spawnCapturedBounded } = await import("../../src/shared/exec.ts");

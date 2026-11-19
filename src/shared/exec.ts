@@ -290,6 +290,8 @@ export async function spawnCapturedBounded(
     detached: true,
   });
   const groupId = proc.pid;
+  liveGroups.add(groupId);
+  installGroupReaper();
   const killGroup = (signal: NodeJS.Signals): void => {
     try {
       process.kill(-groupId, signal);
@@ -315,6 +317,7 @@ export async function spawnCapturedBounded(
     await Promise.race([Promise.all([stdout.done, stderr.done]), Bun.sleep(PIPE_DRAIN_MS)]);
     return { stdout: stdout.text(), stderr: stderr.text(), exitCode, timedOut };
   } finally {
+    liveGroups.delete(groupId);
     clearTimeout(timer);
     if (killTimer) clearTimeout(killTimer);
     stdout.cancel();
@@ -323,6 +326,38 @@ export async function spawnCapturedBounded(
 }
 
 const KILL_GRACE_MS = 2_000;
+
+/** Process groups of bounded children that are still running. */
+const liveGroups = new Set<number>();
+let reaperInstalled = false;
+
+/**
+ * A detached child does not get our terminal signals, and it outlives us if we
+ * die first (for example when a caller kills `ais limits` at its own timeout).
+ * So when this process exits or gets a stop signal, it kills every live group.
+ */
+function installGroupReaper(): void {
+  if (reaperInstalled) return;
+  reaperInstalled = true;
+  const reapAll = (): void => {
+    for (const groupId of liveGroups) {
+      try {
+        process.kill(-groupId, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+    liveGroups.clear();
+  };
+  process.on("exit", reapAll);
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(sig, () => {
+      reapAll();
+      // Keep the default result of the signal when no one else handles it.
+      if (process.listenerCount(sig) <= 1) process.exit(128 + (osConstants.signals[sig] ?? 0));
+    });
+  }
+}
 const PIPE_DRAIN_MS = 2_000;
 
 /** Reads a stream into memory. `cancel` stops reading even if a process still holds the pipe open. */
