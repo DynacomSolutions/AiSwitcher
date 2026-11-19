@@ -63,7 +63,7 @@ describe("nativeLimitResponse for claude", () => {
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({
       type: "error",
-      error: { type: "rate_limit_error", message: "You've hit your 5-hour limit. Resets at 2026-11-02T12:30:00.000Z." },
+      error: { type: "rate_limit_error", message: "You've hit your 5-hour limit (resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z." },
     });
     expect(Object.fromEntries(res.headers)).toEqual({
       "content-type": "application/json",
@@ -114,7 +114,7 @@ describe("nativeLimitResponse for codex", () => {
     const res = nativeLimitResponse("codex", [codexMember(100, T_1400, 20, T_NOV5), codexMember(100, T_1230, 25, T_NOV5)], 100, NOW)!;
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({
-      error: { type: "usage_limit_reached", message: "You've hit your 5-hour limit. Resets at 2026-11-02T12:30:00.000Z.", resets_at: 1793622600, resets_in_seconds: 9000 },
+      error: { type: "usage_limit_reached", message: "You've hit your 5-hour limit (resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z.", resets_at: 1793622600, resets_in_seconds: 9000 },
     });
     expect(Object.fromEntries(res.headers)).toEqual({
       "content-type": "application/json",
@@ -145,7 +145,7 @@ describe("nativeLimitResponse for codex", () => {
     expect(res.headers.get("retry-after")).toBe("9000");
     const body = (await res.json()) as { error: { message: string; type: string } };
     expect(body.error.type).toBe("rate_limit_error");
-    expect(body.error.message).toBe("You've hit your usage limit (identity is at its usage reserve). Resets at 2026-11-02T12:30:00.000Z.");
+    expect(body.error.message).toBe("You've hit your usage limit (identity is at its usage reserve; resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z.");
     expectT3(body.error.message, 1793622600);
     expect(genericLimitResponse("anthropic", 1, NOW, "x").headers.get("retry-after")).toBe("1");
   });
