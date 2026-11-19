@@ -181,7 +181,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     cancelRecovery()
     // Started by `ais limits` as a usage probe: refreshing would run `ais limits` again.
-    const isProbe = process.env.AIS_LIMITS_PROBE === '1'
+    const isProbe = (await $.env.get('AIS_LIMITS_PROBE').catch(() => undefined)) === '1'
     // Clears a status left by an older loaded version after /reload-plugins.
     $.ui.status(undefined)
 
