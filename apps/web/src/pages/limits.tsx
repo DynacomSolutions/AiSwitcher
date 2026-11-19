@@ -33,6 +33,7 @@ import { Separator } from "@/components/ui/separator";
 import { qk, useLimitsQuery, usePoolsUsageQuery } from "@/hooks/queries";
 import { api } from "@/lib/api";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
+import { formatResetTimes } from "@/lib/reset-time";
 import { AccountWarnings } from "@/components/account-line";
 import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseResetResult } from "@/types/api";
 
@@ -66,7 +67,9 @@ function WindowRow({ window }: { window: LimitWindow }) {
       <Progress value={pct} indicatorClassName={windowTone(pct)} />
       {(window.resetsAt || window.note) && (
         <div className="flex items-baseline justify-between gap-3 text-xs text-muted-foreground">
-          <span className="min-w-0 truncate">{window.resetsAt ?? ""}</span>
+          <span className="min-w-0 truncate" title={window.resetsAtMs !== undefined ? formatResetTimes(window.resetsAtMs) : undefined}>
+            {window.resetsAtMs !== undefined ? formatResetTimes(window.resetsAtMs) : (window.resetsAt ?? "")}
+          </span>
           {window.note ? (
             <span className="shrink-0 text-amber-600 dark:text-amber-400">{window.note}</span>
           ) : null}
