@@ -1,6 +1,6 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import { AppRevokedError, type GatewayStore } from "./store.ts";
-import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageRow } from "./types.ts";
 
 /**
  * The proxy's view of the store. Apps and tokens are held in memory so a
@@ -275,6 +275,14 @@ export class CachedGatewayStore implements GatewayStore {
 
   usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {
     return this.inner.usageByIdentity(since, until);
+  }
+
+  usageByModel(since: Date, until?: Date): Promise<ModelUsageRow[]> {
+    return this.inner.usageByModel(since, until);
+  }
+
+  usageByModelDaily(since: Date, until: Date | undefined, tz: string): Promise<ModelDailyUsageRow[]> {
+    return this.inner.usageByModelDaily(since, until, tz);
   }
 
   // Browser records are not on the proxy's hot path: pass straight through to the store.

@@ -179,7 +179,7 @@ ETA: 2026-11-15 23:00 ICT
 | 220 | Gateway: a revoked app stays revoked, its old tokens never work again | done | claude | gateway-revoke-revive | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/599 (41dfaf3), live on all 6 replicas.<br>Revoked name: add, rotate and admin PUT and mint give 409.<br>Leaked revoked tokens give 401 on every replica. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-20 01:30 ICT
+ETA: 2026-11-20 03:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -203,6 +203,7 @@ ETA: 2026-11-20 01:30 ICT
 | 229 | Gateway limit answers carry the reset time so T3 snoozes and resumes threads | done | claude | gw-limit-reset-text | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/620.<br>Every limit answer ends "Resets at <ISO>Z." and has retry-after.<br>T3 snoozes and resumes OpenCode threads (seen live 20 Nov). |
 | 230 | Limits page: the cluster gateway is the source of truth, not stale host files | done | claude | gateway-limits-truth | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/622 (c62a01a), live on ais and all 6 ais-gateway pods.<br>Console /api/limits: 9 live rows, 8 gateway accounts at 100% weekly with reset times.<br>Follow-up: available reset grants still missing in the pod (gateway /limits carries windows only). |
 | 234 | Limits page: reset-grant count and spend buttons from the gateway only | in_review | claude | gateway-resets-only | 5.230 | | PR https://github.com/DynacomSolutions/AiSwitcher/pull/627, supersedes 625.<br>The gateway poll reads cedar_ember and carries the grants to the console row.<br>No host fallback in the merge. The spend goes through a new gateway admin route. |
+| 232 | Usage page: the cluster gateway ledger is the source of truth, not host scans | done | claude | usage-view-truth | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/624 (007812c).<br>/api/usage merges gateway ledger rows per identity, model and day.<br>Gateway-managed rows never show host numbers.<br>Breakdown and projects stay host-only (ledger has no cwd). |
 | 233 | Gateway limit answers and Limits page show ICT first with UK time alongside | done | claude | gw-limit-local-times | 5.229 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/626 (fbab78a).<br>429 text bracket shows ICT and UK times; the ISO tail stays for T3.<br>Limits page renders ICT first. Zones: AIS_GATEWAY_LIMIT_TIME_ZONES. |
 
 | 177 | Usage breakdown: tokens and cost per project, repo and GitHub org | done | claude | ais-webui-tabs-usage-breakdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/489 (4b3910f), released v0.5.47.<br>Breakdown collector records each session's cwd (Claude line cwd, Codex session_meta/turn_context) and maps it to git toplevel and origin owner/repo from .git files.<br>Shown on Usage tabs Projects, Repos, Orgs. |

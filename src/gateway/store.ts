@@ -1,5 +1,5 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
-import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 
 /** The message for any attempt to reuse or extend a revoked app. */
@@ -38,6 +38,10 @@ export interface GatewayStore {
   bumpSideCount(app: string, day: string, signal?: AbortSignal): Promise<number>;
   /** Ledger totals per provider and identity for rows at or after `since` (before `until` when given). */
   usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]>;
+  /** Ledger totals per provider, identity, app and model for rows at or after `since` (before `until` when given). */
+  usageByModel(since: Date, until?: Date): Promise<ModelUsageRow[]>;
+  /** Ledger totals per day (bucketed in the IANA zone `tz`), provider, identity and model; apps are summed. Same window as usageByModel. */
+  usageByModelDaily(since: Date, until: Date | undefined, tz: string): Promise<ModelDailyUsageRow[]>;
   putBrowserBinding(b: BrowserBinding): Promise<void>;
   getBrowserBinding(name: string): Promise<BrowserBinding | undefined>;
   listBrowserBindings(): Promise<BrowserBinding[]>;
@@ -204,6 +208,69 @@ export class MemoryGatewayStore implements GatewayStore {
       }
     }
     return [...by.values()];
+  }
+
+  async usageByModel(since: Date, until?: Date): Promise<ModelUsageRow[]> {
+    const from = since.getTime();
+    const to = until?.getTime() ?? Infinity;
+    const by = new Map<string, ModelUsageRow>();
+    for (const r of this.usage) {
+      const t = Date.parse(r.ts);
+      if (t < from || t >= to) continue;
+      const model = r.model ?? null;
+      const key = `${r.provider}\u0000${r.identity}\u0000${r.app}\u0000${model ?? ""}`;
+      let a = by.get(key);
+      if (!a) {
+        a = { provider: r.provider, identity: r.identity, app: r.app, model, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0, firstTs: r.ts, lastTs: r.ts };
+        by.set(key, a);
+      }
+      a.inputTokens += r.inputTokens;
+      a.outputTokens += r.outputTokens;
+      a.cacheReadTokens += r.cacheReadTokens;
+      a.cacheWriteTokens += r.cacheWriteTokens;
+      a.requests += 1;
+      if (r.estCostUsd !== undefined) a.estCostUsd += r.estCostUsd;
+      else {
+        // Stored without a cost: price from tokens and model now (the ledger is not rewritten).
+        const priced = priceNullCostGroup({ provider: r.provider, identity: r.identity, app: r.app, model, inputTokens: r.inputTokens, outputTokens: r.outputTokens, cacheReadTokens: r.cacheReadTokens, cacheWriteTokens: r.cacheWriteTokens, requests: 1 });
+        a.estCostUsd += priced.cost;
+        a.unpricedRequests += priced.unpriced;
+      }
+      if (t < Date.parse(a.firstTs!)) a.firstTs = r.ts;
+      if (t > Date.parse(a.lastTs!)) a.lastTs = r.ts;
+    }
+    return [...by.values()];
+  }
+
+  async usageByModelDaily(since: Date, until: Date | undefined, tz: string): Promise<ModelDailyUsageRow[]> {
+    const from = since.getTime();
+    const to = until?.getTime() ?? Infinity;
+    const dayOf = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+    const by = new Map<string, ModelDailyUsageRow>();
+    for (const r of this.usage) {
+      const t = Date.parse(r.ts);
+      if (t < from || t >= to) continue;
+      const model = r.model ?? null;
+      const day = dayOf.format(new Date(t));
+      const key = `${day}\u0000${r.provider}\u0000${r.identity}\u0000${model ?? ""}`;
+      let a = by.get(key);
+      if (!a) {
+        a = { day, provider: r.provider, identity: r.identity, model, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0 };
+        by.set(key, a);
+      }
+      a.inputTokens += r.inputTokens;
+      a.outputTokens += r.outputTokens;
+      a.cacheReadTokens += r.cacheReadTokens;
+      a.cacheWriteTokens += r.cacheWriteTokens;
+      a.requests += 1;
+      if (r.estCostUsd !== undefined) a.estCostUsd += r.estCostUsd;
+      else {
+        const priced = priceNullCostGroup({ provider: r.provider, identity: r.identity, app: r.app, model, inputTokens: r.inputTokens, outputTokens: r.outputTokens, cacheReadTokens: r.cacheReadTokens, cacheWriteTokens: r.cacheWriteTokens, requests: 1 });
+        a.estCostUsd += priced.cost;
+        a.unpricedRequests += priced.unpriced;
+      }
+    }
+    return [...by.values()].sort((x, y) => x.day.localeCompare(y.day) || x.provider.localeCompare(y.provider) || x.identity.localeCompare(y.identity) || (x.model === null ? 1 : 0) - (y.model === null ? 1 : 0) || (x.model ?? "").localeCompare(y.model ?? ""));
   }
 
   async putBrowserBinding(b: BrowserBinding): Promise<void> {

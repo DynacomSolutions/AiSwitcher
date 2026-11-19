@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { formatGatewayUsageSection, loadGatewayIdentityUsage, loadGatewayUsage, mapGatewayIdentityUsage, mapGatewayUsage } from "../../src/gateway/usage-view.ts";
+import { formatGatewayUsageSection, loadGatewayIdentityUsage, loadGatewayModelUsage, loadGatewayUsage, mapGatewayIdentityUsage, mapGatewayModelUsage, mapGatewayUsage } from "../../src/gateway/usage-view.ts";
 
 describe("mapGatewayUsage", () => {
   test("sorts by tokens, drops malformed rows, clamps bad numbers", () => {
@@ -108,5 +108,74 @@ describe("gateway identity usage", () => {
     expect(old.error).toContain("older version");
     const down = await loadGatewayIdentityUsage(since, { secretsPath: secretsFile(creds), fetch: (async () => { throw new Error("x"); }) as unknown as typeof fetch });
     expect(down.error).toBe("admin unreachable");
+  });
+});
+
+describe("gateway model usage", () => {
+  const secretsFile = (body: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), "gwmu-"));
+    const p = join(dir, "secrets");
+    writeFileSync(p, body);
+    return p;
+  };
+  const creds = "AIS_GATEWAY_ADMIN_URL=http://gw.invalid/\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n";
+  test("maps rows, keeps a null model, drops malformed ones and clamps bad numbers", () => {
+    expect(mapGatewayModelUsage({
+      models: [
+        { provider: "claude", identity: "m1", app: "x", model: "sonnet", inputTokens: 5, estCostUsd: -1, firstTs: "2026-11-06T00:00:00.000Z", lastTs: "2026-11-06T01:00:00.000Z" },
+        { provider: "claude", identity: "m1", app: "x", inputTokens: 2 },
+        { provider: "claude" },
+      ],
+    })).toEqual([
+      { provider: "claude", identity: "m1", app: "x", model: "sonnet", inputTokens: 5, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0, firstTs: "2026-11-06T00:00:00.000Z", lastTs: "2026-11-06T01:00:00.000Z" },
+      { provider: "claude", identity: "m1", app: "x", model: null, inputTokens: 2, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0 },
+    ]);
+    expect(mapGatewayModelUsage(null)).toEqual([]);
+    expect(mapGatewayModelUsage({ models: "x" })).toEqual([]);
+  });
+  test("requests /usage/models and the daily route with one fixed since and the zone, and maps both", async () => {
+    const urls: string[] = [];
+    const now = new Date("2026-11-20T10:00:00.000Z");
+    const sinceIso = new Date(now.getTime() - 90 * 86400_000 + 60_000).toISOString();
+    const okView = await loadGatewayModelUsage(90, {
+      secretsPath: secretsFile(creds),
+      zone: "Asia/Bangkok",
+      now: () => now,
+      fetch: (async (u: string) => {
+        urls.push(u);
+        return Response.json(u.includes("/daily")
+          ? { days: [{ day: "2026-11-19", provider: "claude", identity: "m1", model: null, inputTokens: 3, outputTokens: 1, requests: 1 }, { day: "bad", provider: "claude", identity: "m1" }] }
+          : { models: [] });
+      }) as unknown as typeof fetch,
+    });
+    expect(urls.sort()).toEqual([
+      `http://gw.invalid/usage/models/daily?since=${encodeURIComponent(sinceIso)}&tz=Asia%2FBangkok`,
+      `http://gw.invalid/usage/models?since=${encodeURIComponent(sinceIso)}`,
+    ].sort());
+    expect(okView).toMatchObject({ configured: true, rows: [], dailyZone: "Asia/Bangkok" });
+    expect(okView.daily).toEqual([{ day: "2026-11-19", provider: "claude", identity: "m1", model: null, inputTokens: 3, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 1 }]);
+  });
+  test("a failed daily route keeps the totals and names the reason; a failed totals route is the error", async () => {
+    const onlyTotals = async (u: string) => (u.includes("/daily") ? new Response("", { status: 404 }) : Response.json({ models: [] }));
+    const partial = await loadGatewayModelUsage(90, { secretsPath: secretsFile(creds), fetch: onlyTotals as unknown as typeof fetch });
+    expect(partial).toEqual({ configured: true, rows: [], dailyError: "gateway admin has no per-day usage yet (older version)" });
+    const old = await loadGatewayModelUsage(90, { secretsPath: secretsFile(creds), fetch: (async () => new Response("", { status: 404 })) as unknown as typeof fetch });
+    expect(old.error).toContain("older version");
+    const down = await loadGatewayModelUsage(90, { secretsPath: secretsFile(creds), fetch: (async () => { throw new Error("x"); }) as unknown as typeof fetch });
+    expect(down.error).toBe("admin unreachable");
+    const bad = await loadGatewayModelUsage(90, { secretsPath: secretsFile(creds), fetch: (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch });
+    expect(bad.error).toBe("admin answered 401");
+    expect(JSON.stringify([old, down, bad])).not.toContain("SYNTHETIC_FIXTURE_token");
+  });
+  test("not configured without url and token", async () => {
+    const saved = [process.env.AIS_GATEWAY_ADMIN_URL, process.env.AIS_GATEWAY_ADMIN_TOKEN];
+    delete process.env.AIS_GATEWAY_ADMIN_URL;
+    delete process.env.AIS_GATEWAY_ADMIN_TOKEN;
+    try {
+      expect(await loadGatewayModelUsage(90, { secretsPath: secretsFile("") })).toEqual({ configured: false, rows: [] });
+    } finally {
+      if (saved[0] !== undefined) process.env.AIS_GATEWAY_ADMIN_URL = saved[0];
+      if (saved[1] !== undefined) process.env.AIS_GATEWAY_ADMIN_TOKEN = saved[1];
+    }
   });
 });

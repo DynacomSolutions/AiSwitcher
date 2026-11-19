@@ -23,7 +23,7 @@ RUN pnpm install --frozen-lockfile
 COPY apps/web ./
 RUN pnpm build
 
-FROM --platform=$BUILDPLATFORM golang:1.26.10-trixie@sha256:a050dcceee6eb9bf110151662dfac7662f3bec40927c7dee48731e3d92083d42 AS kubectl
+FROM --platform=$BUILDPLATFORM golang:1.26.11-trixie@sha256:cff05dd6b81c901f2e8249eb6f91c69a60451d0f12c26bfef08e476a85b32d4d AS kubectl
 # kubectl: the auth-refresh scheduler drives the chrome-auth browser pods
 # through `kubectl port-forward` (WebDriver + noVNC stay loopback-only).
 # Built from the v1.37.2 source with golang.org/x/net and golang.org/x/text
