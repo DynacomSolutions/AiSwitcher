@@ -1,4 +1,5 @@
 import type { PoolUsage } from "../identities/pool/adapter.ts";
+import { formatLimitTimes } from "../shared/limit-times.ts";
 import { providerError } from "./errors.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 
@@ -106,13 +107,14 @@ export function summariseLimit(usages: Array<PoolUsage | undefined>, reservePerc
 }
 
 /**
- * The text of every limit answer the gateway makes: `You've hit your <kind> limit. Resets at <ISO UTC>.` The sentence
- * and the final timestamp are the form T3 Code reads (it matches `^You've hit your ... limit` and a trailing
+ * The text of every limit answer the gateway makes: `You've hit your <kind> limit (<reason>; resets <ICT time>, <UK time>). Resets at <ISO UTC>.`
+ * The opening and the final timestamp are the form T3 Code reads (it matches `^You've hit your ... limit` and a trailing
  * `Resets at <ISO>Z.`) to snooze a thread until the reset and then resume it. Nothing may follow the final full stop.
- * An AIS reason goes in brackets before the first full stop.
+ * The bracket is for people: the AIS reason and the reset in local time (Bangkok first, UK alongside, see `formatLimitTimes`).
  */
-export function limitMessage(kind: string, resetAtSec: number, reason?: string): string {
-  return `You've hit your ${kind} limit${reason ? ` (${reason})` : ""}. Resets at ${new Date(resetAtSec * 1000).toISOString()}.`;
+export function limitMessage(kind: string, resetAtSec: number, reason?: string, zones?: string[]): string {
+  const local = `resets ${formatLimitTimes(resetAtSec * 1000, zones)}`;
+  return `You've hit your ${kind} limit (${reason ? `${reason}; ` : ""}${local}). Resets at ${new Date(resetAtSec * 1000).toISOString()}.`;
 }
 
 /**
