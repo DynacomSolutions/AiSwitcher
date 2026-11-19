@@ -5,6 +5,7 @@ import { registerBrowserAdmin } from "./browser/admin.ts";
 import type { LoginRenewal } from "./renewal.ts";
 import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
+import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord } from "./types.ts";
 
 export const DEFAULT_OVERLAP_MS = 24 * 3600_000;
@@ -12,6 +13,8 @@ const MAX_OVERLAP_HOURS = 24 * 30;
 const MAX_USAGE_DAYS = 90;
 
 const PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"];
+/** Providers whose subscription usage the usage source can read (GET /limits). The others have no account windows. */
+const LIMITS_PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "zai"];
 const STYLES: readonly ApiStyle[] = ["anthropic", "openai"];
 /** Paths the proxy port answers itself; an app of this name could never be reached. */
 const RESERVED_NAMES = new Set(["healthz", "readyz", "metrics", "browser"]);
@@ -37,7 +40,16 @@ export interface AdminDeps {
   browserHub?: { revoke(binding: string): void };
   /** Who renews each gateway login and when (GET /logins/renewal); absent when the gateway has no refresh journal. */
   renewal?(): Promise<LoginRenewal[]>;
+  /** One identity's cached subscription usage (GET /limits); absent when the gateway has no usage source. */
+  usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
+  /** The member accounts of every swap pool of one provider (GET /limits). */
+  poolMembers?(provider: GatewayProvider): Promise<string[]>;
+  /** Resolves an alias to the identity's canonical name (GET /limits). */
+  canonical?(provider: GatewayProvider, identity: string): Promise<string>;
 }
+
+/** One GET /limits row: a managed identity plus the usage source's reading of it (no reading yet: unavailable). */
+type AdminLimitRow = { provider: GatewayProvider; identity: string } & Omit<PoolUsage, "capturedAt"> & { capturedAt?: string };
 
 /** Constant-time comparison: both sides are hashed first so lengths never leak. */
 function sameSecret(given: string, expected: string): boolean {
@@ -126,6 +138,35 @@ export function createAdminApp(deps: AdminDeps): Hono {
   hono.get("/logins/renewal", async (c) => {
     if (!deps.renewal) return err(404, "renewal data is not available");
     return c.json({ logins: await deps.renewal() });
+  });
+
+  // Live subscription windows of every managed identity, from the same cached usage source the proxy selects on.
+  // A read never waits on a fresh fetch and never refreshes a token: a cold identity answers "unavailable" and fills in behind.
+  hono.get("/limits", async (c) => {
+    if (!deps.usageFor) return err(404, "limits data is not available");
+    const providerFilter = c.req.query("provider");
+    if (providerFilter !== undefined && !PROVIDERS.includes(providerFilter as GatewayProvider)) return err(400, "unknown provider");
+    const identityFilter = c.req.query("identity");
+    const apps = await read.listApps();
+    const limits: AdminLimitRow[] = [];
+    for (const provider of LIMITS_PROVIDERS) {
+      if (providerFilter !== undefined && provider !== providerFilter) continue;
+      const names = new Set<string>();
+      // One unreadable registry must not blank the other providers: keep this provider's pinned identities.
+      const members = deps.poolMembers ? await deps.poolMembers(provider).catch(() => [] as string[]) : [];
+      for (const member of members) names.add((await deps.canonical?.(provider, member)) ?? member);
+      for (const app of apps) {
+        if (app.state === "active" && app.provider === provider && app.target.kind === "pin") {
+          names.add((await deps.canonical?.(provider, app.target.identity)) ?? app.target.identity);
+        }
+      }
+      for (const identity of [...names].sort()) {
+        if (identityFilter !== undefined && identity !== identityFilter) continue;
+        const usage = await deps.usageFor(provider, identity).catch(() => undefined);
+        limits.push({ provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }) });
+      }
+    }
+    return c.json({ limits });
   });
 
   hono.get("/apps", async (c) => {
