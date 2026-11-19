@@ -513,27 +513,55 @@ CLIProxyAPI's refresh journal):
   token request, under its file locks, and resolved after it (retried on
   error). A pass that sends nothing journals nothing. Rows hold refresh-token
   fingerprints only, never a token. Outcomes: `refreshed`, `failed`, `lost`
-  (provider rotated but no store was written), `interrupted`, `recovered`.
+  (provider rotated but no store was written), `interrupted`, `recovered`, `dead`
+  (the token endpoint answered a dead-grant code; the OAuth code is stored in the
+  nullable `code` column, migration 0007).
+- Never resend a dead grant: at the first dead answer the claim is resolved `dead`,
+  the revoked marker is written and the `login-revoked` alert is raised (once per
+  login and fingerprint; the text names the provider and identity). Every replica
+  then refuses that refresh token before any request, by the journal, so the keep-alive,
+  the 401 path and `ensureUsable` all stop. A new login (a different refresh token)
+  clears the marker, the alert and `ais_gateway_login_revoked`.
 - Never reuse a rotated-out token: a stored token the journal shows as
-  `refreshed` to a different token is refused (a restored backup or lagging
+  `refreshed` or `lost` (the provider rotated it) to a different token is refused (a restored backup or lagging
   store), and this process also remembers such tokens in memory for the times
   the journal cannot be read. An unresolved claim for the stored token (a
   crash, a network blip between claim and resolve) is closed as `interrupted`
   and the token is sent again: the provider's own dead-grant answer decides, so
   a token that never reached the provider is never stranded. From the second
-  interruption in a row an owner alert (`refresh-interrupted`) is raised. A
-  `lost` write (provider rotated, no store written) is sent once more too. Resolve
+  interruption in a row an owner alert (`refresh-interrupted`) is raised. An open claim
+  younger than 2 minutes that another holder made is a refresh in flight (its lock can be lost
+  to a database failover while the request is out): nothing is sent and the call is retryable.
+  A token request that timed out after it was sent is journalled `interrupted` with code
+  `timeout`; it is sent once more, then refused. Resolve
   retries run on a fresh pool connection, not the lock's. A claim whose token
   the stores have moved past is closed as `recovered`.
 - Retention: every 6 hours resolved rows older than 30 days are deleted,
   keeping the newest 50 per account and all open claims; rotated-out evidence
   (`refreshed`, `lost`, `interrupted`) is kept for a year.
 - A lock handle that arrives after the guard gave up is released, never leaked.
-- Database or guard unavailable: the refresh still runs, under AIS's
-  `.oauth_refresh.lock` file lock and the `expectedAccessToken`
-  compare-and-swap, with a `refresh-guard-degraded` alert and
-  `ais_gateway_refresh_guard_degraded_total`. A lock timeout is not alerted as a
-  dead login.
+- Database or guard unavailable (lock timeout, connection error, journal read or
+  claim error): nothing refreshes. The refresh throws a retryable error, the
+  `refresh-guard-degraded` alert is raised (it says the login is not refreshed
+  until the guard works), and the current access token is served until it expires.
+  A lock call that is slow or fails is retried on a fresh connection while the 60 s
+  lock deadline lasts, so a database restart does not fail the refresh at once. Only a
+  gateway with no database (`fileLockFallback`) refreshes under AIS's
+  `.oauth_refresh.lock` file lock and the `expectedAccessToken` compare-and-swap.
+  A lock timeout is not alerted as a dead login.
+- Renew ahead: the keep-alive renews claude and grok logins at 50% of the access-token
+  lifetime (expiry minus mint time, else 8 h for claude and 6 h for grok), never closer
+  than 20 minutes to expiry. The lifetime is observed when the grant has no mint time: expiry
+  minus the time of the last successful refresh (kept from the journal). No renewal ahead runs again
+  within half of that lifetime after a success. Codex and kimi keep their own rules.
+- Gauges: every replica, every minute, seeds from the journal and re-reads each managed login (expiry, lifetime,
+  revoked), so a new sign-in clears `ais_gateway_login_revoked` on all replicas. The `login-revoked` alert,
+  the dead-grant counter and the marker come only from the replica that received the dead answer; a refusal by
+  the journal is logged and counted as `refused-dead` and raises nothing. A migration waits at most 5 s for its
+  table lock and retries, so it never queues behind the retention delete.
+- One JSON log line per refresh result:
+  `{"event":"refresh","provider","identity","replica","outcome","expiresAt","code"}`.
+  No token and no email.
 - `stop()` waits for refreshes and the keep-alive in flight before closing the
   backend.
 - Metrics, per `provider` and `identity`:
@@ -542,6 +570,13 @@ CLIProxyAPI's refresh journal):
   `ais_gateway_refresh_lock_waits_total`,
   `ais_gateway_refresh_lock_wait_seconds_total` and
   `ais_gateway_refresh_guard_degraded_total`.
+- Renewal metrics, per `provider` and `identity` (aggregate with `max by (provider, identity)` across
+  replicas): `ais_gateway_refresh_last_success_timestamp_seconds` (seeded from the journal at start),
+  `ais_gateway_login_expiry_timestamp_seconds`, `ais_gateway_login_lifetime_seconds`,
+  `ais_gateway_login_revoked` and `ais_gateway_refresh_dead_grant_total{code}`.
+- Admin route `GET /logins/renewal` (admin token): per login, `renewedBy`, `lastRefreshAt`,
+  `lastRefreshReplica`, `lastError` (only while newer than the last success), `expiresAt`,
+  `nextRefreshAt` and `revoked`, from the journal and the stored login.
 
 ## Credential store and replicas
 

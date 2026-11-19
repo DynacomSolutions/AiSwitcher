@@ -1233,3 +1233,116 @@ describe("readiness once warm does not follow the database", () => {
     await waitFor(async () => (await (await fetch(`${base(g)}/readyz`)).text()) === "ready\n");
   });
 });
+
+describe("single refresher: dead logins, seeded metrics and the renewal route", () => {
+  const acct = { name: "ka1", label: "ka1", configDir: "/x/ka1" };
+  const metricsText = async (g: { port: number }): Promise<string> => (await fetch(`${base(g)}/metrics`)).text();
+  const deadRefresh = (counter: { posts: number }, fingerprint: string) =>
+    (async (_tool: string, _id: { name: string }, o?: { beforePost?: (i: { fingerprint: string }) => Promise<void> }) => {
+      await o?.beforePost?.({ fingerprint });
+      counter.posts += 1;
+      throw new OAuthRefreshError("token refresh rejected (HTTP 400 invalid_grant)", true, fingerprint, "invalid_grant");
+    }) as never;
+
+  test("the first dead answer raises one login-revoked alert, is counted once, and nothing is sent again", async () => {
+    const backend = new MemoryRefreshBackend();
+    const counter = { posts: 0 };
+    const g = await boot({ refreshBackend: backend, keepAliveMs: 20, keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []), refreshImpl: deadRefresh(counter, "aaaa1111") });
+    await waitFor(() => alerts.some((a) => a.kind === "login-revoked"));
+    await Bun.sleep(150); // several more keep-alive passes
+    expect(counter.posts).toBe(1);
+    expect(alerts.filter((a) => a.kind === "login-revoked")).toEqual([{ kind: "login-revoked", key: "claude/ka1:aaaa1111" }]);
+    expect(backend.entries.filter((e) => e.outcome === "dead")).toHaveLength(1);
+    expect(backend.entries[0]).toMatchObject({ outcome: "dead", code: "invalid_grant", oldFp: "aaaa1111" });
+    const text = await metricsText(g);
+    expect(text).toContain('ais_gateway_refresh_dead_grant_total{provider="claude",identity="ka1",code="invalid_grant"} 1');
+    expect(text).toContain('ais_gateway_login_revoked{provider="claude",identity="ka1"} 1');
+  });
+
+  test("a new login clears the revoked gauge", async () => {
+    let refresh = "r-one";
+    const counter = { posts: 0 };
+    const grant = () => ({ access_token: "a", refresh_token: refresh, expires_at: 4_000_000_000 });
+    const { grantFingerprint } = await import("../../src/identities/oauth-reconcile.ts");
+    const dead = deadRefresh(counter, grantFingerprint(grant()));
+    const g = await boot({
+      keepAliveMs: 20,
+      keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []),
+      readGrant: async () => grant(),
+      refreshImpl: (async (...a: unknown[]) => (refresh === "r-one" ? (dead as unknown as (...x: unknown[]) => unknown)(...a) : { tool: "claude", identity: "ka1", outcome: "skipped-fresh", detail: "", written: [], writeFailures: [] })) as never,
+    });
+    await waitFor(async () => (await metricsText(g)).includes('ais_gateway_login_revoked{provider="claude",identity="ka1"} 1'));
+    refresh = "r-two"; // the owner logged in again
+    await waitFor(async () => (await metricsText(g)).includes('ais_gateway_login_revoked{provider="claude",identity="ka1"} 0'));
+  });
+
+  test("the last-success gauge is seeded from the shared journal at start", async () => {
+    const backend = new MemoryRefreshBackend();
+    const ts = "2026-11-18T13:07:22.000Z";
+    backend.entries.push({ id: 1, ts, provider: "claude", identity: "ka1", holder: "pod-9:1", oldFp: "aaaa1111", newFp: "bbbb2222", outcome: "refreshed" });
+    const g = await boot({ refreshBackend: backend, keepAliveMs: 3_600_000 });
+    await waitFor(async () => (await metricsText(g)).includes("ais_gateway_refresh_last_success_timestamp_seconds{"));
+    expect(await metricsText(g)).toContain(`ais_gateway_refresh_last_success_timestamp_seconds{provider="claude",identity="ka1"} ${Math.floor(Date.parse(ts) / 1000)}`);
+  });
+
+  test("GET /logins/renewal on the admin port reports the journal and needs the admin token", async () => {
+    const backend = new MemoryRefreshBackend();
+    backend.entries.push({ id: 1, ts: "2026-11-18T13:07:22.000Z", provider: "claude", identity: "ka1", holder: "pod-9:1", oldFp: "aaaa1111", newFp: "bbbb2222", outcome: "refreshed" });
+    const g = await boot({ refreshBackend: backend, keepAliveMs: 3_600_000, keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []) });
+    const url = `http://127.0.0.1:${g.adminPort}/logins/renewal`;
+    expect((await fetch(url)).status).toBe(401);
+    const res = await fetch(url, { headers: { authorization: `Bearer ${ADMIN}` } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { logins: Array<Record<string, unknown>> };
+    expect(body.logins).toHaveLength(1);
+    expect(body.logins[0]).toMatchObject({ provider: "claude", identity: "ka1", renewedBy: "gateway", lastRefreshAt: "2026-11-18T13:07:22.000Z", lastRefreshReplica: "pod-9", lastError: null, revoked: false });
+  });
+
+  test("a refusal by the journal (another replica's dead answer) raises no alert, counts no dead answer and rewrites nothing", async () => {
+    const { grantFingerprint } = await import("../../src/identities/oauth-reconcile.ts");
+    const grant = { access_token: "a", refresh_token: "r-dead", expires_at: 4_000_000_000 };
+    const fp = grantFingerprint(grant);
+    const backend = new MemoryRefreshBackend();
+    backend.entries.push({ id: 1, ts: new Date().toISOString(), provider: "claude", identity: "ka1", holder: "other-pod:1", oldFp: fp, outcome: "dead", code: "invalid_grant" });
+    let posts = 0;
+    const g = await boot({
+      refreshBackend: backend,
+      keepAliveMs: 20,
+      gaugeMs: 20,
+      keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []),
+      readGrant: async () => grant,
+      refreshImpl: (async (_t: string, _i: unknown, o?: { beforePost?: (i: { fingerprint: string }) => Promise<void> }) => {
+        await o?.beforePost?.({ fingerprint: fp });
+        posts += 1;
+        return { outcome: "refreshed", detail: "", written: [], writeFailures: [] };
+      }) as never,
+    });
+    await waitFor(async () => (await metricsText(g)).includes('outcome="refused-dead"'));
+    await Bun.sleep(100);
+    expect(posts).toBe(0);
+    expect(alerts.filter((a) => a.kind === "login-revoked" || a.kind === "refresh-failed")).toEqual([]);
+    const text = await metricsText(g);
+    expect(text).not.toContain("ais_gateway_refresh_dead_grant_total{");
+    expect(text).not.toContain('outcome="failed"');
+    expect(text).toContain('ais_gateway_login_revoked{provider="claude",identity="ka1"} 1');
+  });
+
+  test("every replica re-reads the login gauges each tick: a new sign-in clears revoked with no keep-alive and no refresh", async () => {
+    const { grantFingerprint } = await import("../../src/identities/oauth-reconcile.ts");
+    let refresh = "r-one";
+    const grant = () => ({ access_token: "a", refresh_token: refresh, expires_at: 4_000_000_000 });
+    const backend = new MemoryRefreshBackend();
+    backend.entries.push({ id: 1, ts: new Date().toISOString(), provider: "claude", identity: "ka1", holder: "other-pod:1", oldFp: grantFingerprint(grant()), outcome: "dead", code: "invalid_grant" });
+    const g = await boot({
+      refreshBackend: backend,
+      keepAliveMs: 3_600_000, // this replica never runs the keep-alive (not the leader)
+      gaugeMs: 20,
+      keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []),
+      readGrant: async () => grant(),
+    });
+    await waitFor(async () => (await metricsText(g)).includes('ais_gateway_login_revoked{provider="claude",identity="ka1"} 1'));
+    expect(await metricsText(g)).toContain('ais_gateway_login_expiry_timestamp_seconds{provider="claude",identity="ka1"} 4000000000');
+    refresh = "r-two";
+    await waitFor(async () => (await metricsText(g)).includes('ais_gateway_login_revoked{provider="claude",identity="ka1"} 0'));
+  });
+});
