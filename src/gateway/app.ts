@@ -13,7 +13,7 @@ import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadReque
 import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
-import { nativeLimitResponse, type LimitCandidate } from "./native-limit.ts";
+import { genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit, type LimitCandidate } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
@@ -840,9 +840,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   /**
    * The answer for a pool that is out of capacity. When a member would be free without the short holds, the answer is
    * about the hold, not about usage. Else the provider's native limit answer, whose reset is the earliest across the pool
-   * (readings plus the members' own 429 resets). Undefined when the provider has no native shape.
+   * (readings plus the members' own 429 resets). With `why`, a provider without a native shape gets the generic limit answer; without it, the caller keeps the upstream answer.
    */
-  const outOfCapacity = async (rejectKind: "no-headroom" | "reserve" | "no-identities", reason: string): Promise<Response | undefined> => {
+  const outOfCapacity = async (rejectKind: "no-headroom" | "reserve" | "no-identities", reason: string, why?: string): Promise<Response | undefined> => {
     // When a member would be free without the short holds, the answer is about the hold, not about usage.
     if (rejectKind === "no-headroom" && app.target.kind === "pool") {
       // Only the short holds are ignored: members out for proven quota exhaustion stay excluded.
@@ -861,7 +861,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       if (h?.kind === "burst" && "identity" in free) {
         const secs = Math.min(60, Math.max(1, Math.ceil(((exhausted.get(exKey(free.identity)) ?? 0) - deps.now().getTime()) / 1000)));
         record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
-        const res = providerError(style, 429, "upstream rate limit: retry shortly");
+        const res = providerError(style, 429, limitMessage("rate", Math.floor(deps.now().getTime() / 1000) + secs, "upstream rate limit, retry shortly"));
         res.headers.set("retry-after", String(secs));
         return res;
       }
@@ -871,10 +871,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       }
     }
     if (rejectKind !== "no-identities") {
-      const native = nativeLimitResponse(app.provider, await memberUsages(app, deps, model), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, deps.now(), limitResets);
-      if (native) {
+      const usages = await memberUsages(app, deps, model);
+      const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
+      const now = deps.now();
+      const answer = nativeLimitResponse(app.provider, usages, reserve, now, limitResets) ?? (why === undefined ? undefined : genericLimitResponse(style, summariseLimit(usages, reserve, now, limitResets).resetAtSec, now, why));
+      if (answer) {
         record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
-        return native;
+        return answer;
       }
     }
     return undefined;
@@ -902,7 +905,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
     const reason = pick.reject === "no-headroom" && app.target.kind === "pool" && (await exhaustedNames()).size > 0 ? "no-headroom:exhausted" : pick.reject;
     // Out of capacity (or at the reserve): answer in the provider's own limit shape so its CLI shows its built-in limit handling.
-    const out = await outOfCapacity(pick.reject, reason);
+    const out = await outOfCapacity(pick.reject, reason, why);
     if (out) return out;
     return reject(429, why, identityForRow, model, reason);
   }

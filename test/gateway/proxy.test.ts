@@ -1139,7 +1139,13 @@ describe("failover and refresh", () => {
     expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(15);
     expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0);
     expect(res.headers.get("anthropic-ratelimit-unified-status")).toBeNull();
-    expect(await res.text()).toContain("rate_limit_error");
+    const text = await res.text();
+    expect(text).toContain("rate_limit_error");
+    const message = (JSON.parse(text) as { error: { message: string } }).error.message;
+    expect(message).toMatch(/^You've hit your [^\n]*\blimit\b/);
+    expect(message).toMatch(/\bResets at (\d{4}-\d\d-\d\dT[\d:.]+Z)\.?\s*$/);
+    const resetMs = Date.parse(/Resets at (\S+?)\.$/.exec(message)![1]!);
+    expect(resetMs - clock.ms).toBe(Number(res.headers.get("retry-after")) * 1000);
   });
 
   test("while only credential holds remain, the client gets the stored 502 message", async () => {
@@ -1706,6 +1712,7 @@ describe("native limit answers", () => {
     expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe("1793622600");
     expect(res.headers.get("anthropic-ratelimit-unified-representative-claim")).toBe("five_hour");
     expect(res.headers.get("retry-after")).toBe("9000");
+    expect(((await res.clone().json()) as { error: { message: string } }).error.message).toMatch(/Resets at 2026-11-02T12:30:00\.000Z\.$/);
     expect(((await res.json()) as { error: { type: string } }).error.type).toBe("rate_limit_error");
     expect(seen.length).toBe(0);
     expect((await rows())[0]).toMatchObject({ status: "rejected", httpStatus: 429 });
@@ -1727,7 +1734,7 @@ describe("native limit answers", () => {
     usage.b = full("2026-11-02T12:30:00.000Z");
     const res = await call("/cx/v1/responses", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    expect(await res.json()).toEqual({ error: { type: "usage_limit_reached", message: "The usage limit has been reached", resets_at: 1793622600, resets_in_seconds: 9000 } });
+    expect(await res.json()).toEqual({ error: { type: "usage_limit_reached", message: "You've hit your 5-hour limit. Resets at 2026-11-02T12:30:00.000Z.", resets_at: 1793622600, resets_in_seconds: 9000 } });
     expect(res.headers.get("x-codex-primary-reset-at")).toBe("1793622600");
   });
 
@@ -1737,7 +1744,22 @@ describe("native limit answers", () => {
     usage.b = live(90);
     const res = await call("/k/v1/messages", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    expect(JSON.stringify(await res.json())).toContain("no pool member has headroom");
+    const message = ((await res.json()) as { error: { message: string } }).error.message;
+    expect(message).toContain("no pool member has headroom");
+    expect(message).toMatch(/^You've hit your [^\n]*\blimit\b/);
+    expect(message).toMatch(/\bResets at (\d{4}-\d\d-\d\dT[\d:.]+Z)\.?\s*$/);
+    expect(res.headers.get("retry-after")).toBe(String(300)); // no member reports a reset: the fallback
+    expect(message.endsWith(`Resets at ${new Date(NOW.getTime() + 300_000).toISOString()}.`)).toBe(true);
+  });
+
+  test("a pinned kimi member at its reserve answers with the reset in the text", async () => {
+    const t = await addApp(baseApp({ name: "kp", provider: "kimi", style: "openai", target: { kind: "pin", identity: "id1" }, reservePercent: 50 }));
+    usage.id1 = { status: "live", maxUtilization: 90, capturedAt: NOW.toISOString(), windows: [{ label: "week", utilization: 90, resetsAt: "2026-11-02T14:00:00.000Z" }] };
+    const res = await call("/kp/v1/chat/completions", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(res.headers.get("retry-after")).toBe("14400");
+    const message = ((await res.json()) as { error: { message: string } }).error.message;
+    expect(message).toBe("You've hit your usage limit (identity is at its usage reserve). Resets at 2026-11-02T14:00:00.000Z.");
   });
 
   const realBody = '{"type":"error","error":{"type":"rate_limit_error","message":"Number 3 SYNTHETIC_FIXTURE"},"request_id":"req_SYNTHETIC_FIXTURE"}';
