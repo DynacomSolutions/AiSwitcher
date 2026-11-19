@@ -27,7 +27,7 @@ import * as authApi from "./auth.ts";
 import { accountKey, collectAccounts } from "../identities/account-info.ts";
 import { invalidateLimitsCache, runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
-import { loadGatewayLimits, mergeGatewayLimits, type GatewayLimitsView } from "./gateway-limits.ts";
+import { loadGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, type GatewayLimitsView } from "./gateway-limits.ts";
 import * as gatewayApps from "./gateway-apps.ts";
 import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -316,7 +316,9 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   // Spends one Claude reset grant (cedar_ember) for an identity with its own login.
   // The page refetches limits right after: drop the daemon's cached read so it shows the spent credit and cleared windows.
   app.post("/api/limits/claude/:identity/resets/:grant", async (c) => {
-    const result = await (deps.claudeUseReset ?? ((i, g) => claudeResets.useClaudeReset(i, g)))(decodeSegment(c.req.param("identity")), decodeSegment(c.req.param("grant")));
+    // Through the gateway when this console has an admin URL and token (the gateway holds the logins); else the host's own login.
+    const spend = deps.claudeUseReset ?? (async (i, g) => ((await gatewayApps.gatewayAdminConfig({})) ? ((await useClaudeResetViaGateway(i, g)) as claudeResets.UseResetResult) : claudeResets.useClaudeReset(i, g)));
+    const result = await spend(decodeSegment(c.req.param("identity")), decodeSegment(c.req.param("grant")));
     (deps.invalidateLimits ?? invalidateLimitsCache)();
     return c.json(result);
   });
