@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { readdirSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { grantMintedAt, keepAliveOnce } from "../../../src/gateway/serve.ts";
-import { kimiRenewBelowSeconds, refreshIdentityOAuthGrant, shouldAttemptOAuthRefresh } from "../../../src/identities/oauth-refresh.ts";
+import { KIMI_RENEW_BELOW_S, refreshIdentityOAuthGrant, shouldAttemptOAuthRefresh } from "../../../src/identities/oauth-refresh.ts";
 import { fetchKimiLimits } from "../../../src/cli/limits/kimi-limits.ts";
+import { RefreshGuardRetryable } from "../../../src/gateway/refresh-guard.ts";
 import { persistKimiCredentials } from "../../../src/cli/limits/kimi-store.ts";
 import { recordOwned } from "../../../src/identities/gateway-owned.ts";
 import { grantFileTuning } from "../../../src/identities/pool/grant-file-adapter.ts";
+import { piAdapter } from "../../../src/identities/pool/pi-adapter.ts";
 import { kimiAdapter } from "../../../src/identities/pool/kimi-adapter.ts";
 import { performPoolSwap } from "../../../src/identities/pool/swap.ts";
 import { requirePool } from "../../../src/identities/pool/swap-pool.ts";
@@ -100,26 +103,25 @@ describe("kimi pool: a gateway-owned member never puts its refresh token in the 
     expect(await readFile(credPath("pool"), "utf8")).toBe(before);
   });
 
-  test("newer tokens a session wrote in the pool never go back to the owned vault", async () => {
+  test("an access-only pool copy that is older or equal never goes back to the owned vault", async () => {
     await setup();
     const vaultBefore = await readFile(credPath("owned"), "utf8");
-    await put("pool", creds("user-owned", T0 + 900, "rotated-in-pool")); // a real session refreshed in the pool
+    await put("pool", JSON.stringify({ access_token: jwt("user-owned", T0 - 1800), expires_at: T0 - 900, scope: "kimi-code", token_type: "Bearer" }));
     const notes = await healPool();
-    expect(notes.join("\n")).not.toContain("write-back");
+    expect(notes.join("\n")).not.toContain("adopted");
     expect(await readFile(credPath("owned"), "utf8")).toBe(vaultBefore);
-    const pool = await readGrant("pool");
-    expect(pool.refresh_token).toBeUndefined(); // the rotated refresh token is gone from the pool too
-    expect(pool.expires_at).toBe(T0);
+    expect((await readGrant("pool")).refresh_token).toBeUndefined();
+    expect((await readGrant("pool")).expires_at).toBe(T0); // the pool follows the vault
   });
 
-  test("swapping away from an owned member never writes the pool's tokens into its vault", async () => {
+  test("swapping away from an owned member with an access-only pool copy writes nothing into its vault", async () => {
     await setup();
     const vaultBefore = await readFile(credPath("owned"), "utf8");
-    await put("pool", creds("user-owned", T0 + 900, "rotated-in-pool"));
+    await put("pool", JSON.stringify({ access_token: jwt("user-owned", T0 - 1800), expires_at: T0 - 900 }));
     const result = await swap("free");
     expect(result.writeBack).toBe("none-gateway-owned");
     expect(await readFile(credPath("owned"), "utf8")).toBe(vaultBefore);
-    expect((await readGrant("pool")).refresh_token).toBe("SYNTHETIC_FIXTURE-rt-free-1"); // a plain member still gets its full login
+    expect((await readGrant("pool")).refresh_token).toBe(fake("rt-free-1")); // a plain member still gets its full login
   });
 
   test("swapping to an owned member copies the access token only", async () => {
@@ -230,17 +232,15 @@ describe("the gateway keep-alive renews a kimi login daily", () => {
 });
 
 describe("the gateway keep-alive renews a kimi login on every tick", () => {
-  const TICK_MS = 600_000;
-  const line = kimiRenewBelowSeconds(TICK_MS);
+  const line = KIMI_RENEW_BELOW_S;
   const NOW = 1_789_300_000;
   const decide = (secondsLeft: number, extra: { renewBelowSeconds?: number; lastSuccessAt?: string | null } = {}) =>
     shouldAttemptOAuthRefresh({ access_token: "x", expires_at: NOW + secondsLeft }, { tool: "kimi", expiryWindowHours: 24, nowSeconds: NOW, lastSuccessAt: new Date((NOW - 60) * 1000).toISOString(), ...extra });
 
-  test("the renew line is lifetime minus one tick plus the margin, never above the lifetime", () => {
-    expect(line).toBe(900 - 600 + 120);
-    expect(kimiRenewBelowSeconds(60_000)).toBe(900);
-    expect(kimiRenewBelowSeconds(1_000_000)).toBe(20);
-    expect(kimiRenewBelowSeconds(3_600_000)).toBe(900); // a tick longer than the lifetime renews every time
+  test("the renew line is the token lifetime minus 30 s: a late tick still renews", () => {
+    expect(line).toBe(870);
+    expect(decide(600, { renewBelowSeconds: line }).attempt).toBe(true); // 5 minutes after minting
+    expect(decide(120, { renewBelowSeconds: line }).attempt).toBe(true); // the tick ran 8 minutes late
   });
 
   test("a token minted one tick ago (5 minutes left) is renewed; a fresh one is not", () => {
@@ -248,7 +248,7 @@ describe("the gateway keep-alive renews a kimi login on every tick", () => {
     expect(decide(300, { renewBelowSeconds: line }).reason).toContain("renew line");
     expect(decide(line - 1, { renewBelowSeconds: line }).attempt).toBe(true);
     expect(decide(line, { renewBelowSeconds: line }).attempt).toBe(false);
-    expect(decide(880, { renewBelowSeconds: line }).attempt).toBe(false);
+    expect(decide(890, { renewBelowSeconds: line }).attempt).toBe(false); // minted seconds ago
   });
 
   test("an expired token is renewed on the tick, whatever the last success", () => {
@@ -264,7 +264,6 @@ describe("the gateway keep-alive renews a kimi login on every tick", () => {
     const seen: Record<string, number | undefined> = {};
     await keepAliveOnce({
       tools: ["claude", "codex", "kimi"],
-      tickMs: TICK_MS,
       accounts: async () => [member("one")],
       metrics: { keepAlive() {} },
       refresh: (async (tool: string, _acct: Identity, opts?: { renewBelowSeconds?: number }) => {
@@ -297,5 +296,186 @@ describe("the gateway keep-alive renews a kimi login on every tick", () => {
     expect(pool.access_token).toBe(vault.access_token);
     expect(pool.expires_at).toBe(vault.expires_at);
     expect(pool.refresh_token).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review fixes: pi pools, rollout (a pool copy from before), late tick, one ownership rule.
+
+describe("rollout: a pool copy from before this build is kept, and adopted when it is newer", () => {
+  const baks = async (name: string): Promise<string[]> =>
+    (await readdir(join(dirOf(name), "credentials"))).filter((n) => n.includes(".pre-heal.") && n.endsWith(".bak")).map((n) => join(dirOf(name), "credentials", n));
+
+  test("a pool session rotated before the first heal: its newer grant is backed up (0600) and adopted into the vault", async () => {
+    await setup();
+    await put("pool", creds("user-owned", T0 + 900, "rotated-before-heal")); // real refresh token, newer than the vault's
+    const notes = await healPool();
+    expect(notes.join("\n")).toContain("adopted it into the vault");
+    expect((await readGrant("owned")).refresh_token).toBe(fake("rt-rotated-before-heal")); // the only live chain is kept
+    const files = await baks("pool");
+    expect(files).toHaveLength(1);
+    expect((await stat(files[0]!)).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await readFile(files[0]!, "utf8")).refresh_token).toBe(fake("rt-rotated-before-heal"));
+    expect((await readGrant("pool")).refresh_token).toBeUndefined(); // the pool follows the vault, as a view
+    expect(notes.join("\n")).not.toContain(fake("rt-rotated-before-heal")); // never logged
+  });
+
+  test("a second heal adopts nothing and writes no second backup", async () => {
+    await setup();
+    await put("pool", creds("user-owned", T0 + 900, "rotated-before-heal"));
+    await healPool();
+    expect(await healPool()).toEqual([]);
+    expect(await baks("pool")).toHaveLength(1);
+  });
+
+  test("a pool grant older than the vault's is backed up, not adopted", async () => {
+    await setup();
+    await put("pool", creds("user-owned", T0 - 900, "stale-in-pool"));
+    const vaultBefore = await readFile(credPath("owned"), "utf8");
+    await healPool();
+    expect(await readFile(credPath("owned"), "utf8")).toBe(vaultBefore);
+    expect(await baks("pool")).toHaveLength(1);
+  });
+
+  test("a pool copy with the vault's own refresh token needs no backup", async () => {
+    await setup();
+    await put("pool", creds("user-owned", T0, "owned-1")); // same refresh token as the vault: a plain copy from before
+    await healPool();
+    expect(await baks("pool")).toHaveLength(0);
+    expect((await readGrant("pool")).refresh_token).toBeUndefined();
+  });
+
+  test("swapping away from an owned member adopts a newer pool grant too", async () => {
+    await setup();
+    await put("pool", creds("user-owned", T0 + 900, "rotated-before-swap"));
+    const result = await swap("free");
+    expect(result.writeBack).toBe("written");
+    expect((await readGrant("owned")).refresh_token).toBe(fake("rt-rotated-before-swap"));
+    expect(readdirSync(join(dirOf("pool"), "credentials")).filter((n) => n.includes(".pre-swap.") && n.endsWith(".bak"))).toHaveLength(1);
+  });
+});
+
+describe("one ownership rule: sticky ownership or a fresh heartbeat", () => {
+  const noSticky = () => writeFile(process.env.AIS_GATEWAY_OWNED!, JSON.stringify({ version: 1, owned: {} }));
+  const heartbeat = (passAt: Date) => writeFile(process.env.AIS_GATEWAY_HEARTBEAT!, JSON.stringify({ version: 1, passAt: passAt.toISOString(), held: { "kimi/owned": {} } }));
+
+  test("with neither, a pool copy is the full login as before", async () => {
+    await setup();
+    await noSticky();
+    await put("pool", creds("user-owned", T0 - 3600, "stale"));
+    await healPool();
+    expect((await readGrant("pool")).refresh_token).toBe(fake("rt-owned-1"));
+  });
+
+  test("a fresh heartbeat that names the login makes the pool copy access-only, with no sticky record", async () => {
+    await setup();
+    await noSticky();
+    await heartbeat(new Date());
+    await put("pool", creds("user-owned", T0 - 3600, "stale"));
+    await healPool();
+    expect((await readGrant("pool")).refresh_token).toBeUndefined();
+  });
+
+  test("a stale heartbeat does not count", async () => {
+    await setup();
+    await noSticky();
+    await heartbeat(new Date(Date.now() - 3 * 3600_000));
+    await put("pool", creds("user-owned", T0 - 3600, "stale"));
+    await healPool();
+    expect((await readGrant("pool")).refresh_token).toBe(fake("rt-owned-1"));
+  });
+});
+
+describe("pi pools hold no refresh token of a gateway-owned kimi login", () => {
+  const piAuth = (user: string, exp: number, tag: string, other?: string): string =>
+    JSON.stringify({ "kimi-coding": { type: "oauth", access: jwt(user, exp - 900), refresh: fake(`pirt-${tag}`), expires: exp * 1000 }, ...(other ? { anthropic: { type: "oauth", access: fake(`oa-${other}`), refresh: fake(`or-${other}`), expires: (exp + 7200) * 1000 } } : {}) });
+  const putPi = async (name: string, text: string) => {
+    await mkdir(dirOf(name), { recursive: true });
+    await writeFile(join(dirOf(name), "auth.json"), text);
+  };
+  const readPi = async (name: string) => JSON.parse(await readFile(join(dirOf(name), "auth.json"), "utf8")) as Record<string, { access: string; refresh: string; expires: number }>;
+  const piRegistry = () => PI_CONFIG.identitiesJsonPath;
+  async function setupPi(active = "owned"): Promise<void> {
+    await writeFile(piRegistry(), JSON.stringify({ version: 1, identities: [member("owned"), member("free"), { ...member("pool"), swapPool: { accounts: ["owned", "free"], active } }] }));
+    await putPi("owned", piAuth("user-owned", T0, "owned-1"));
+    await putPi("free", piAuth("user-free", T0, "free-1"));
+    await putPi("pool", piAuth("user-owned", T0, "owned-1"));
+    await recordOwned(["kimi/owned"], new Date().toISOString());
+  }
+  const healPi = async () => {
+    const file = await loadIdentitiesFile(piRegistry());
+    const pool = requirePool(file, "pool", "pi");
+    return piAdapter.heal!(pool, pool.swapPool.accounts.map((n) => file.identities.find((i) => i.name === n)!));
+  };
+  const swapPi = (target: string) => performPoolSwap(piAdapter, { registryPath: piRegistry(), ledgerPath: join(root, "pi-ledger.jsonl"), pool: "pool", target, reason: "manual" });
+
+  test("heal restores the owned vault into the pool with an empty refresh token", async () => {
+    await setupPi();
+    await putPi("pool", piAuth("user-owned", T0 - 3600, "stale"));
+    await healPi();
+    const pool = await readPi("pool");
+    expect(pool["kimi-coding"]!.access).toBe((await readPi("owned"))["kimi-coding"]!.access);
+    expect(pool["kimi-coding"]!.refresh).toBe("");
+    expect((await readPi("owned"))["kimi-coding"]!.refresh).toBe(fake("pirt-owned-1"));
+    expect(await healPi()).toEqual([]); // the access-only copy is whole
+  });
+
+  test("swapping to an owned pi member copies no refresh token", async () => {
+    await setupPi("free");
+    await putPi("pool", piAuth("user-free", T0, "free-1"));
+    await swapPi("owned");
+    expect((await readPi("pool"))["kimi-coding"]!.refresh).toBe("");
+  });
+
+  test("the pool's kimi-coding entry never goes back to the owned vault, other providers still do", async () => {
+    await setupPi();
+    await putPi("owned", piAuth("user-owned", T0, "owned-1", "a"));
+    await putPi("pool", piAuth("user-owned", T0, "owned-1", "a").replace(fake("or-a"), fake("or-b"))); // anthropic rotated in the pool
+    const pool = JSON.parse(await readFile(join(dirOf("pool"), "auth.json"), "utf8"));
+    pool.anthropic.expires += 1000;
+    pool["kimi-coding"].refresh = "";
+    await putPi("pool", JSON.stringify(pool));
+    await healPi();
+    const owned = await readPi("owned");
+    expect(owned["kimi-coding"]!.refresh).toBe(fake("pirt-owned-1"));
+    expect(owned.anthropic!.refresh).toBe(fake("or-b"));
+  });
+
+  test("a pi pool copy from before, with a newer real refresh token, is backed up and adopted", async () => {
+    await setupPi();
+    await putPi("pool", piAuth("user-owned", T0 + 900, "rotated-before-heal"));
+    await healPi();
+    expect((await readPi("owned"))["kimi-coding"]!.refresh).toBe(fake("pirt-rotated-before-heal"));
+    const baks = (await readdir(dirOf("pool"))).filter((n) => n.includes(".pre-heal.") && n.endsWith(".bak"));
+    expect(baks).toHaveLength(1);
+    expect((await stat(join(dirOf("pool"), baks[0]!))).mode & 0o777).toBe(0o600);
+    expect((await readPi("pool"))["kimi-coding"]!.refresh).toBe("");
+  });
+
+  test("a member refresh reaches the pi pool as access token and expiry only", async () => {
+    await setupPi();
+    await putPi("pool", piAuth("user-owned", T0, "owned-1"));
+    await writeFile(registry, JSON.stringify({ version: 1, identities: [member("owned")] })); // kimi registry: the member only
+    const next = { access_token: jwt("user-owned", T0 + 1800), refresh_token: fake("rt-owned-2"), expires_at: T0 + 2700 };
+    await persistKimiCredentials(member("owned"), "pi", next);
+    const pool = await readPi("pool");
+    expect(pool["kimi-coding"]!.access).toBe(next.access_token);
+    expect(pool["kimi-coding"]!.expires).toBe(next.expires_at * 1000);
+    expect(pool["kimi-coding"]!.refresh).toBe("");
+  });
+});
+
+describe("a busy guard at the tick is retried soon for kimi", () => {
+  test("keepAliveOnce names the tools whose renewal the guard could not take", async () => {
+    const result = await keepAliveOnce({
+      tools: ["codex", "kimi"],
+      accounts: async () => [member("one")],
+      metrics: { keepAlive() {} },
+      refresh: (async (tool: string) => {
+        if (tool === "kimi") throw new RefreshGuardRetryable("database busy");
+        return { outcome: "skipped-fresh" };
+      }) as never,
+    });
+    expect(result.retryTools).toEqual(["kimi"]);
   });
 });

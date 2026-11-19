@@ -96,6 +96,12 @@ export interface GrantFileSpec {
   /** The copy of an owned member's login a pool may hold: the same grant without the refresh token, so a session in the pool can
    * never rotate a token the gateway renews. */
   poolView?(g: GrantFile): GrantFile;
+  /** The refresh token of the owned login in a grant (undefined when it holds none). Needed with `gatewayOwned`. */
+  ownedRefresh?(g: GrantFile | undefined): string | undefined;
+  /** The expiry of the owned login in a grant, in one unit across grants of this tool (undefined when unknown). */
+  ownedExpiry?(g: GrantFile | undefined): number | undefined;
+  /** The grant without the owned login's entry, for tools whose file holds other logins too (pi). Optional: the whole file is the login. */
+  withoutOwned?(g: GrantFile): GrantFile;
   /** The lock directory the tool itself takes around its own refreshes. */
   toolLock(configDir: string): { path: string; staleMs: number };
   fetchUsage(member: Identity, deps?: unknown): Promise<PoolUsage>;
@@ -247,18 +253,40 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
   /** Writes the pool's grant into the owning member's vault when it is newer.
    * The caller holds the owner's oauth and tool locks (see `withHeldLocks`), so the read
    * and compare below can never overwrite a concurrent member refresh. */
-  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile, mode: WriteBackMode, members: Identity[]): Promise<WriteBackOutcome> {
-    // The gateway renews this login: a token a session rotated in the pool never goes back to its vault.
-    if (owned(owner)) return "none-gateway-owned";
+  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile, mode: WriteBackMode, members: Identity[], at?: { poolDir: string; kind: "swap" | "heal" }): Promise<WriteBackOutcome> {
     const poolId = spec.identity(poolGrant).id;
+    let incoming = poolGrant;
+    if (owned(owner)) {
+      // The gateway renews this login. A pool copy made by this build holds no refresh token and has nothing to give back.
+      // A copy from before (it still holds a real refresh token that is not the vault's) may carry the only live chain:
+      // keep a 0600 copy of it, and adopt it into the vault when it is newer (the host store sync then checks it against
+      // the gateway's journal before it reaches the store). It is never discarded.
+      const poolRefresh = spec.ownedRefresh?.(poolGrant);
+      const vault = await load(owner.configDir);
+      if (poolRefresh !== undefined && poolRefresh !== spec.ownedRefresh?.(vault.grant)) {
+        if (at) await writeBackup(fileOf(at.poolDir), at.kind, json(poolGrant));
+        const poolExpiry = spec.ownedExpiry?.(poolGrant) ?? -1;
+        const vaultExpiry = spec.ownedExpiry?.(vault.grant) ?? -1;
+        const sameAccount = !spec.usable(vault.grant) || vault.who.id === poolId;
+        if (sameAccount && poolExpiry > vaultExpiry) {
+          const merge = spec.newerInto(spec.usable(vault.grant) ? vault.grant : undefined, poolGrant, mode, await otherGrants(owner, members));
+          if (merge?.next) {
+            await writeText(owner.configDir, json(merge.next));
+            return "written";
+          }
+        }
+      }
+      if (!spec.withoutOwned) return "none-gateway-owned";
+      incoming = spec.withoutOwned(poolGrant);
+    }
     const { grant: ownerGrant, who } = await load(owner.configDir);
     if (spec.usable(ownerGrant)) {
       if (who.id !== poolId) return "none-account-mismatch";
-      if (spec.fingerprint(ownerGrant!) === spec.fingerprint(poolGrant)) return "none-identical";
+      if (spec.fingerprint(ownerGrant!) === spec.fingerprint(incoming)) return "none-identical";
     }
-    const merge = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, poolGrant, mode, await otherGrants(owner, members));
+    const merge = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, incoming, mode, await otherGrants(owner, members));
     if (merge?.backup) await writeBackup(fileOf(owner.configDir), "merge", json(merge.backup));
-    if (!merge?.next) return "none-member-newer";
+    if (!merge?.next) return owned(owner) ? "none-gateway-owned" : "none-member-newer";
     await writeText(owner.configDir, json(merge.next));
     return "written";
   }
@@ -319,7 +347,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         if (!owner) {
           writeBack = "none-unknown-owner";
         } else {
-          writeBack = await writeBackToOwner(owner, live.grant!, owner.name === activeName ? "same" : "capture", members);
+          writeBack = await writeBackToOwner(owner, live.grant!, owner.name === activeName ? "same" : "capture", members, { poolDir, kind: "swap" });
           if (activeName && owner.name !== activeName) notes.push(`pool held "${owner.name}"'s account, not the recorded active "${activeName}"; wrote it back to "${owner.name}"`);
         }
       }
@@ -427,14 +455,14 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
       if (now.kind === "ok") return [];
       if (now.kind === "same") {
         // Same account as the active vault: never restore over it, keep the newer tokens in the vault.
-        const outcome = await writeBackToOwner(active!, now.grant!, "same", members);
+        const outcome = await writeBackToOwner(active!, now.grant!, "same", members, { poolDir: pool.configDir, kind: "heal" });
         return [`pool ${pool.name} held newer tokens for "${activeName}"; vault write-back: ${outcome}`];
       }
       if (now.kind === "foreign") {
         const owner = await ownerByAccount(members, now.who.id!, activeName!);
         if (owner && !held.has(resolve(expandPath(owner.configDir)))) return { needLock: owner.configDir };
         if (owner) {
-          const outcome = await writeBackToOwner(owner, now.grant!, "capture", members);
+          const outcome = await writeBackToOwner(owner, now.grant!, "capture", members, { poolDir: pool.configDir, kind: "heal" });
           notes.push(`pool ${pool.name} held "${owner.name}"'s account instead of "${activeName}"; ${outcome === "written" ? `captured it into "${owner.name}"` : `left "${owner.name}" as it was (${outcome})`}`);
         } else {
           backedUp = true;
@@ -445,6 +473,11 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         notes.push(`pool ${pool.name} credentials were hybrid (parts disagree on the account); kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
       } else if (now.kind === "behind") {
         notes.push(`pool ${pool.name} was behind the vault of "${activeName}" (a member refresh missed it)`);
+        if (owned(active)) {
+          // A pool copy from before this build may hold a refresh token the vault lacks: keep it, adopt it when newer.
+          const outcome = await writeBackToOwner(active!, now.grant!, "same", members, { poolDir: pool.configDir, kind: "heal" });
+          if (outcome === "written") notes.push(`pool ${pool.name} held a newer login for "${activeName}": adopted it into the vault; a 0600 copy is kept`);
+        }
       } else {
         notes.push(`pool ${pool.name} credentials were empty or partial`);
       }

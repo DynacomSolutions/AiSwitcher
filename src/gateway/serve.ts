@@ -2,7 +2,7 @@ import { startUsageProxy, type RunningUsageProxy } from "./usage-proxy.ts";
 import { parseToken, verifyToken } from "./tokens.ts";
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { DEAD_REFRESH_CODES, DEFAULT_ACCESS_TOKEN_LIFETIME_S, effectiveGrantPaths, GATEWAY_RENEW_FRACTION, kimiRenewBelowSeconds, OAuthRefreshError, type IdentityGrantRefresh, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, DEFAULT_ACCESS_TOKEN_LIFETIME_S, effectiveGrantPaths, GATEWAY_RENEW_FRACTION, KIMI_RENEW_BELOW_S, OAuthRefreshError, type IdentityGrantRefresh, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SQL } from "bun";
 import { readFile } from "node:fs/promises";
 import { ClusterBrowserHub, RELAY_PATH } from "./browser/cluster.ts";
@@ -96,6 +96,8 @@ export interface GatewayHooks {
   alertCheckMs?: number;
   /** How often every managed login is refreshed ahead of expiry with no traffic (default 10 minutes). */
   keepAliveMs?: number;
+  /** Tests: the wait before kimi is renewed again after the guard was busy (default one minute). */
+  kimiRetryMs?: number;
   keepAliveAccounts?(tool: string): Promise<Identity[]>;
   /** The ali logins whose console session the gateway renews, and how (tests replace both). */
   aliAccounts?(): Promise<Identity[]>;
@@ -377,6 +379,8 @@ export async function trackedHeartbeatWrite(deps: { metrics: Pick<PrometheusMetr
 
 /** The idle keep-alive pass runs on this tick (milliseconds). */
 const KEEP_ALIVE_TICK_MS = 600_000;
+/** After a kimi renewal the guard could not take, the next try comes after this long (a 15 minute token cannot wait a full tick). */
+const KIMI_RETRY_MS = 60_000;
 
 /** Short-lived access tokens: the gateway renews these at half their lifetime. */
 const RENEW_AHEAD_TOOLS: ReadonlySet<string> = new Set(["claude", "grok"]);
@@ -399,14 +403,14 @@ export async function keepAliveOnce(deps: {
   shouldStop?: () => boolean;
   /** Renew claude and grok logins at this share of the access-token lifetime (default 0.5). Codex and kimi keep their own rules. */
   renewFraction?: number;
-  /** The keep-alive tick in milliseconds (default 10 minutes): it sets the kimi renew line. */
-  tickMs?: number;
-}): Promise<void> {
+}): Promise<{ retryTools: string[] }> {
   // A grant diagnosed revoked is remembered by fingerprint and not POSTed again until a re-login mints a different one.
   const revoked = deps.revoked ?? new Map<string, string>();
   const lastSuccess = deps.lastSuccess ?? new Map<string, string>();
   const now = deps.now ?? (() => new Date());
   const held: Record<string, { lastSuccessAt?: string }> = {};
+  /** Tools whose renewal the guard could not take now (database or lock busy): the caller may run them again soon. */
+  const retryTools = new Set<string>();
   for (const tool of deps.tools ?? ["claude"]) {
     for (const account of await deps.accounts(tool).catch(() => [] as Identity[])) {
       if (deps.shouldStop?.()) break;
@@ -430,13 +434,14 @@ export async function keepAliveOnce(deps: {
           ...(known ? { revokedFingerprint: known } : {}),
           ...(RENEW_AHEAD_TOOLS.has(tool) ? { renewFraction: deps.renewFraction ?? GATEWAY_RENEW_FRACTION } : {}),
           // kimi: renew on every tick, so the stored token (and the pool copies) never expires between two ticks.
-          ...(tool === "kimi" ? { renewBelowSeconds: kimiRenewBelowSeconds(deps.tickMs ?? KEEP_ALIVE_TICK_MS) } : {}),
+          ...(tool === "kimi" ? { renewBelowSeconds: KIMI_RENEW_BELOW_S } : {}),
         });
         if (r.outcome === "skipped-revoked" && r.beforeFingerprint) revoked.set(key, r.beforeFingerprint);
         else revoked.delete(key);
         if (r.outcome === "refreshed") lastSuccess.set(key, now().toISOString());
         deps.metrics.keepAlive(tool, r.outcome);
       } catch (err) {
+        if (err instanceof RefreshGuardRetryable) retryTools.add(tool);
         // Only a dead-grant OAuth code proves the login is gone; any other 400/401 is not enough (as in credentials.ts).
         if (err instanceof OAuthRefreshError && err.revoked && err.refreshFingerprint && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode)) revoked.set(key, err.refreshFingerprint);
         deps.metrics.keepAlive(tool, err instanceof RefreshRefused && err.kind === "dead" ? "refused-dead" : "failed");
@@ -446,6 +451,7 @@ export async function keepAliveOnce(deps: {
     }
   }
   await deps.onPass?.(held, now()).catch(() => undefined);
+  return { retryTools: [...retryTools] };
 }
 
 export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {}): Promise<RunningGateway> {
@@ -896,20 +902,43 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   // With the credential store the ali console session is not renewed here (its browser profile lives on the host): the host
   // and the console keep renewing it, and the heartbeat never claims it.
   const aliList = hooks.aliAccounts ?? (hooks.noHeartbeat || pgCreds ? undefined : listAliAccounts);
+  const keepAliveDeps = (tools: readonly string[]) => ({
+    refresh: refreshLogin,
+    accounts: hooks.keepAliveAccounts ?? ((tool: string) => listGatewayManagedAccounts(undefined, tool)),
+    tools,
+    lastSuccess: lastSuccessAt,
+    now,
+    mintedAt: grantMintedAt,
+    shouldStop: () => draining,
+    metrics,
+    revoked: revokedGrants,
+  });
+  /** A kimi token lives 15 minutes: when the guard was busy at the tick, the next try comes soon, not a full tick later. */
+  let kimiRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleKimiRetry = (): void => {
+    if (kimiRetryTimer || draining) return;
+    kimiRetryTimer = setTimeout(() => {
+      kimiRetryTimer = undefined;
+      if (keepAliveRunning || draining || !warmed || (leader && !leader.isLeader())) return;
+      keepAliveRunning = true;
+      keepAliveRun = keepAliveOnce(keepAliveDeps(["kimi"]))
+        .then((r) => {
+          if (r.retryTools.includes("kimi")) scheduleKimiRetry();
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          keepAliveRunning = false;
+        });
+    }, hooks.kimiRetryMs ?? KIMI_RETRY_MS);
+    kimiRetryTimer.unref?.();
+  };
   const keepAliveTimer = setInterval(() => {
     if (keepAliveRunning || draining || !warmed) return;
     // Several replicas: only the leader runs the idle pass and writes the heartbeat (on-demand refreshes run everywhere).
     if (leader && !leader.isLeader()) return;
     keepAliveRunning = true;
     keepAliveRun = keepAliveOnce({
-      refresh: refreshLogin,
-      accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)),
-      tools: GATEWAY_REFRESH_TOOLS,
-      lastSuccess: lastSuccessAt,
-      now,
-      mintedAt: grantMintedAt,
-      tickMs: hooks.keepAliveMs ?? KEEP_ALIVE_TICK_MS,
-      shouldStop: () => draining,
+      ...keepAliveDeps(GATEWAY_REFRESH_TOOLS),
       // The heartbeat also names the ali logins this gateway renews, so the host timer, the daemon and the CLI stand down.
       onPass: hooks.noHeartbeat
         ? undefined
@@ -921,10 +950,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
             }
             await trackedHeartbeatWrite({ metrics, alerter }, { version: 1, passAt: at.toISOString(), held, memberStore: true });
           },
-      metrics,
-      revoked: revokedGrants,
     })
-      .then(async () => {
+      .then(async (r) => {
+        if (r.retryTools.includes("kimi")) scheduleKimiRetry();
         if (aliList && selfTestEnabled && !aliSetupOk && !aliAbort.signal.aborted) aliSetupOk = (await aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).catch(() => ["error"])).length === 0;
       })
       .then(() => (aliList ? aliSessionOnce({ accounts: aliList, ...(hooks.aliRefresh ? { refresh: hooks.aliRefresh } : {}), metrics, alerter, lastSuccess: lastSuccessAt, now, signal: aliAbort.signal, loginPageSkips: aliSkips }) : undefined))

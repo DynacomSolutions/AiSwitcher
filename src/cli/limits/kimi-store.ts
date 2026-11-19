@@ -114,6 +114,13 @@ async function writeNativeAccessOnly(path: string, next: KimiOAuthCredentials): 
   await writeJsonAtomic(path, { ...raw, access_token: next.access_token, ...(next.expires_at !== undefined ? { expires_at: next.expires_at } : {}) });
 }
 
+/** Writes a pi auth.json kimi-coding entry with the access token and expiry only: the refresh token is emptied (pi needs a string there). */
+async function writePiAccessOnly(path: string, next: KimiOAuthCredentials): Promise<void> {
+  const raw = (await readJson(path)) as Record<string, unknown> | undefined;
+  const entry = (raw?.["kimi-coding"] as PiKimiEntry | undefined) ?? {};
+  await writeJsonAtomic(path, { ...(raw ?? {}), "kimi-coding": { ...entry, type: "oauth", access: next.access_token, refresh: "", ...(next.expires_at !== undefined ? { expires: next.expires_at * 1000 } : {}) } });
+}
+
 function storeFor(kind: "native" | "pi", path: string): Store {
   const nativeWrite = async (next: KimiOAuthCredentials) => {
     const raw = (await readJson(path)) as NativeCredentialsFile | undefined;
@@ -250,7 +257,6 @@ async function writeThroughPools(identity: Identity, next: KimiOAuthCredentials)
   // A login the gateway renews never leaves its refresh token in a pool: a session there could rotate it outside the guard.
   const gatewayOwned = isGatewayOwnerProcess() || (await isGatewayManagedHere("kimi", identity.name));
   for (const store of await poolStoresFor(identity)) {
-    if (gatewayOwned && store.kind === "pi") continue;
     const sameAccount = async () => {
       const current = await store.read();
       return current !== undefined && pairIdentity(current.access_token, current.refresh_token).id === mine;
@@ -261,7 +267,7 @@ async function writeThroughPools(identity: Identity, next: KimiOAuthCredentials)
     const toolLock = store.kind === "native" ? { path: join(poolDir, "oauth", "kimi-code.lock"), staleMs: 5_000 } : { path: join(poolDir, "auth.json.lock"), staleMs: 30_000 };
     const guarded = () => withOauthRefreshLock(poolDir, () => withLockDir(toolLock.path, toolLock.staleMs, "pool credentials are being refreshed", async () => {
       if (!(await sameAccount())) return;
-      if (gatewayOwned) await writeNativeAccessOnly(store.path, next);
+      if (gatewayOwned) await (store.kind === "pi" ? writePiAccessOnly(store.path, next) : writeNativeAccessOnly(store.path, next));
       else await store.writeUnlocked(next);
     }), { timeoutMs: 1_500 });
     await guarded().catch(() => undefined);

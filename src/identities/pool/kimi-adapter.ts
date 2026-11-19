@@ -1,10 +1,10 @@
 import { join } from "node:path";
 import { fetchKimiLimits } from "../../cli/limits/kimi-limits.ts";
 import type { FetchedLimitResult } from "../../cli/limits/types.ts";
-import { isStickyOwnedSync } from "../gateway-owned.ts";
 import { KIMI_CONFIG } from "../tool-configs.ts";
 import type { Identity } from "../types.ts";
 import { createGrantFileAdapter, usageFromLimits, type GrantFile } from "./grant-file-adapter.ts";
+import { isKimiLoginGatewayOwned } from "./gateway-pool.ts";
 import { nonEmpty, pairIdentity } from "./token-account.ts";
 
 /**
@@ -47,7 +47,9 @@ export const kimiAdapter = createGrantFileAdapter({
   },
   // The cluster gateway renews a login it ever named (sticky ownership). A pool copy of it has no refresh token, and
   // nothing a pool session holds goes back to the member's vault: the gateway is the only process that rotates the token.
-  gatewayOwned: (member) => isStickyOwnedSync("kimi", member.name),
+  gatewayOwned: (member) => isKimiLoginGatewayOwned(member.name),
+  ownedRefresh: (g) => (nonEmpty(g?.refresh_token) ? String(g.refresh_token) : undefined),
+  ownedExpiry: (g) => (typeof g?.expires_at === "number" ? g.expires_at : undefined),
   poolView: (g) => {
     const { refresh_token: _spent, ...rest } = g;
     return rest;

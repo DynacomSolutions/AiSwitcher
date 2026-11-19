@@ -413,19 +413,12 @@ const KIMI_EXPIRED_RETRY_S = 2 * 3600;
 
 /** Kimi access tokens live about 15 minutes. */
 export const KIMI_ACCESS_TOKEN_LIFETIME_S = 900;
-/** Extra seconds the kimi renew line keeps above one tick, so a late tick still renews in time. */
-export const KIMI_RENEW_MARGIN_S = 120;
 /**
- * The gateway keep-alive renews a kimi token when fewer than this many seconds of its life remain: lifetime minus one tick
- * plus a margin. With a 15 minute token and a 10 minute tick the line is 7 minutes. A token minted at one tick has 5 minutes
- * left at the next tick, so every tick renews it. The token in the store and in the pools is then never older than one tick
- * and never expires between two ticks. The line never goes above the lifetime. A tick longer than the lifetime renews every time.
+ * The gateway keep-alive renews a kimi token when fewer than this many seconds of its life remain. The line is the lifetime
+ * minus 30 seconds: a 15 minute token is renewed on every tick, even a tick that runs late, and only a token minted in the
+ * last 30 seconds is left alone. So a pool copy is never older than one tick. A busy guard is retried after one minute (serve.ts).
  */
-export const kimiRenewBelowSeconds = (tickMs: number): number => {
-  const line = KIMI_ACCESS_TOKEN_LIFETIME_S - tickMs / 1000 + KIMI_RENEW_MARGIN_S;
-  // A tick as long as the lifetime or longer: the token cannot last to the next tick, so every tick renews it.
-  return line <= 0 ? KIMI_ACCESS_TOKEN_LIFETIME_S : Math.min(KIMI_ACCESS_TOKEN_LIFETIME_S, line);
-};
+export const KIMI_RENEW_BELOW_S = KIMI_ACCESS_TOKEN_LIFETIME_S - 30;
 
 /** The refresh decision for the scheduler's cadence: refresh when the
  * access token is within `expiryWindowHours` of expiry, and at least once
@@ -465,7 +458,7 @@ export function shouldAttemptOAuthRefresh(
   const windowSeconds = windowHours * 3600;
   const secondsLeft = grant.expires_at === undefined ? Number.POSITIVE_INFINITY : grant.expires_at - now;
   if (options.force) return { attempt: true, reason: "manual refresh" };
-  // The gateway keep-alive renews a kimi token on every tick (see kimiRenewBelowSeconds). Other callers keep the daily rule below.
+  // The gateway keep-alive renews a kimi token on every tick (see KIMI_RENEW_BELOW_S). Other callers keep the daily rule below.
   if (options.tool === "kimi" && options.renewBelowSeconds !== undefined && secondsLeft < options.renewBelowSeconds) {
     return { attempt: true, reason: `kimi access token has ${Math.max(0, Math.round(secondsLeft))} s left, below the ${Math.round(options.renewBelowSeconds)} s renew line` };
   }
@@ -793,7 +786,7 @@ export interface OAuthRefreshOptions {
   keepAlive?: boolean;
   /** Renew a short-lived token (claude, grok) once this share of its lifetime has passed. Set by the gateway keep-alive only. */
   renewFraction?: number;
-  /** Renew a kimi token when less than this many seconds of its life remain. Set by the gateway keep-alive only (see kimiRenewBelowSeconds). */
+  /** Renew a kimi token when less than this many seconds of its life remain. Set by the gateway keep-alive only (see KIMI_RENEW_BELOW_S). */
   renewBelowSeconds?: number;
   /** Compare-and-refresh: when set, the refresh proceeds only if the freshest
    * stored access token (re-read under the locks) still has this value;
