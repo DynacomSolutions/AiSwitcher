@@ -1,6 +1,6 @@
 import { expandPath } from "../../identities/match.ts";
 import { reconcilePiOAuthStores, renderOAuthReconcileReport } from "../../identities/oauth-reconcile.ts";
-import { syncPiCredentials, type PiCredentialSourceDirs } from "../../identities/pi-auth.ts";
+import { syncPiCredentials, type PiCredentialSourceDirs, type PiCredentialSourceNames } from "../../identities/pi-auth.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { activeIdentities, isRetired } from "../../identities/retired.ts";
 import {
@@ -33,6 +33,8 @@ export type SourceVia = `--${string} flag` | "same-named identity" | "only ident
 export interface SourceResolution {
   key: SourceKey;
   configDir: string;
+  /** The source identity's name (the gateway ownership check names the login with it). */
+  name: string;
   /** How the source was picked - surfaced so the report stays honest. */
   via: SourceVia;
 }
@@ -104,7 +106,7 @@ export async function resolveSyncSources(
       skipped.push(`${key}: no ${cfg.toolName} identity named "${pick.name}"`);
       continue;
     }
-    resolved.push({ key, configDir: expandPath(identity.configDir), via: pick.via });
+    resolved.push({ key, configDir: expandPath(identity.configDir), name: identity.name, via: pick.via });
   }
   return { resolved, skipped };
 }
@@ -137,8 +139,10 @@ export async function runPiAuthSync(positionals: string[], flags: ParsedArgs["fl
   const { resolved, skipped } = await resolveSyncSources(piName, flags);
 
   const sourceDirs: PiCredentialSourceDirs = {};
+  const sourceNames: PiCredentialSourceNames = {};
   for (const entry of resolved) {
     sourceDirs[entry.key] = entry.configDir;
+    if (entry.key === "claude" || entry.key === "codex" || entry.key === "grok" || entry.key === "kimi") sourceNames[entry.key] = entry.name;
   }
   if (boolFlag(flags, "opencode-go") || process.env.OPENCODE_API_KEY?.trim()) {
     sourceDirs.opencodeGoApiKey = await openCodeGoApiKey(flags);
@@ -147,7 +151,7 @@ export async function runPiAuthSync(positionals: string[], flags: ParsedArgs["fl
   }
 
   const configDir = expandPath(piIdentity.configDir);
-  const result = await syncPiCredentials(configDir, sourceDirs);
+  const result = await syncPiCredentials(configDir, sourceDirs, sourceNames);
 
   console.log(`Pi identity: ${piName} (${configDir})`);
   console.log(
@@ -160,6 +164,9 @@ export async function runPiAuthSync(positionals: string[], flags: ParsedArgs["fl
       `Kept existing credentials for: ${result.kept.join(", ")} (reconciled below - the freshest ` +
         "rotating OAuth copy wins across all stores; see src/identities/oauth-reconcile.ts).",
     );
+  }
+  if (result.skippedOwned.length > 0) {
+    console.log(`Left out (the cluster gateway owns and renews these logins, so pi never holds a copy): ${result.skippedOwned.join(", ")}.`);
   }
   if (result.modelsPath) console.log(`Alibaba provider catalogue: ${result.modelsPath} (mode 0600).`);
   // One credential per (identity, provider): converge every projected OAuth

@@ -347,15 +347,14 @@ export interface KimiRefreshContext {
 async function refreshCredentials(
   credentials: KimiOAuthCredentials,
   persist: (next: KimiOAuthCredentials) => Promise<void>,
-  ctx?: KimiRefreshContext,
+  ctx: KimiRefreshContext,
 ): Promise<KimiOAuthCredentials> {
   const run = async (from: KimiOAuthCredentials) => {
     const next = await refreshKimiOAuthToken(from);
     await persist(next);
     return next;
   };
-  if (ctx?.gatewayManaged) throw new Error("login is owned by the cluster gateway - not refreshed here");
-  if (!ctx) return run(credentials);
+  if (ctx.gatewayManaged) throw new Error("login is owned by the cluster gateway - not refreshed here");
   // The refresh token rotates: hold the identity lock (shared with the daemon refresher) and
   // re-read, so a grant rotated meanwhile is used as-is instead of POSTing the spent token.
   return withOauthRefreshLock(ctx.lockDir, async () => {
@@ -388,7 +387,7 @@ export interface KimiUsageOutcome {
 export async function fetchKimiUsageForCredentials(
   credentials: KimiOAuthCredentials,
   persist: (next: KimiOAuthCredentials) => Promise<void>,
-  refreshCtx?: KimiRefreshContext,
+  refreshCtx: KimiRefreshContext,
 ): Promise<KimiUsageOutcome> {
   let accessToken = credentials.access_token;
   let refreshAttempted = false;
@@ -423,10 +422,10 @@ export async function fetchKimiUsageForCredentials(
     return { error: `usage fetch failed: ${errorMessage(err)}` };
   }
 
-  const gatewayOwned = refreshCtx?.gatewayManaged === true;
+  const gatewayOwned = refreshCtx.gatewayManaged === true;
   if ((response.status === 401 || response.status === 403) && gatewayOwned) {
     // The gateway renews this login: re-read the store once (it may have just rotated) and retry; never refresh here.
-    const current = await refreshCtx!.reread().catch(() => undefined);
+    const current = await refreshCtx.reread().catch(() => undefined);
     if (current && current.access_token !== accessToken) {
       try {
         response = await fetchUsages(current.access_token);

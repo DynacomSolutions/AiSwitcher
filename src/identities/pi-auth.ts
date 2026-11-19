@@ -1,5 +1,6 @@
 import { chmod, mkdir, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { isGatewayManagedHere } from "./gateway-managed.ts";
 
 export type PiCredentialSource = "claude" | "codex" | "grok" | "kimi" | "zai" | "ali";
 
@@ -17,6 +18,34 @@ export interface PiCredentialSourceDirs {
   opencodeGoApiKey?: string;
 }
 
+/** The identity names behind the OAuth source folders, so the gateway ownership check can name each login. Missing: the folder's own name. */
+export type PiCredentialSourceNames = Partial<Record<"claude" | "codex" | "grok" | "kimi", string>>;
+
+const OAUTH_SOURCES = ["claude", "codex", "grok", "kimi"] as const;
+const PI_PROVIDER_OF_SOURCE = { claude: "anthropic", codex: "openai-codex", grok: "xai", kimi: "kimi-coding" } as const;
+
+/**
+ * Drops every OAuth source whose login the cluster gateway owns (gateway-managed.ts, sticky ownership included). Copying
+ * its refresh token into pi's auth.json would give pi a second holder of a single-use token the gateway renews, and pi
+ * refreshes what it holds. Returns the sources that stay and the pi providers that were left out.
+ */
+export async function withoutGatewayOwned(
+  sourceDirs: PiCredentialSourceDirs,
+  names: PiCredentialSourceNames = {},
+): Promise<{ sourceDirs: PiCredentialSourceDirs; skippedOwned: string[] }> {
+  const kept: PiCredentialSourceDirs = { ...sourceDirs };
+  const skippedOwned: string[] = [];
+  for (const source of OAUTH_SOURCES) {
+    const dir = sourceDirs[source];
+    if (!dir) continue;
+    if (await isGatewayManagedHere(source, names[source] ?? basename(dir))) {
+      delete kept[source];
+      skippedOwned.push(PI_PROVIDER_OF_SOURCE[source]);
+    }
+  }
+  return { sourceDirs: kept, skippedOwned };
+}
+
 export type JsonObject = Record<string, unknown>;
 type PiCredential =
   | { type: "api_key"; key: string }
@@ -24,6 +53,8 @@ type PiCredential =
 
 export interface PiCredentialImportResult {
   providers: string[];
+  /** pi providers left out because the cluster gateway owns that login. */
+  skippedOwned: string[];
   authPath: string;
   modelsPath?: string;
 }
@@ -227,12 +258,16 @@ export async function readPiCredentialSources(
  */
 export async function importPiCredentials(
   piConfigDir: string,
-  sourceDirs: PiCredentialSourceDirs,
+  supplied: PiCredentialSourceDirs,
+  names: PiCredentialSourceNames = {},
 ): Promise<PiCredentialImportResult> {
   const authPath = join(piConfigDir, "auth.json");
   const auth = (await Bun.file(authPath).exists()) ? await readJson(authPath) : {};
+  const { sourceDirs, skippedOwned } = await withoutGatewayOwned(supplied, names);
   const { credentials, providers, alibabaProvider } = await readPiCredentialSources(sourceDirs);
-  if (providers.length === 0) throw new Error("No Pi credential sources were supplied");
+  if (providers.length === 0) {
+    throw new Error(skippedOwned.length > 0 ? `Nothing to import: the cluster gateway owns the login for ${skippedOwned.join(", ")}, so it is never copied into pi` : "No Pi credential sources were supplied");
+  }
   for (const [provider, credential] of Object.entries(credentials)) {
     auth[provider] = credential;
   }
@@ -243,7 +278,7 @@ export async function importPiCredentials(
     modelsPath = await mergeAlibabaCatalogue(piConfigDir, alibabaProvider);
   }
 
-  return { providers, authPath, ...(modelsPath ? { modelsPath } : {}) };
+  return { providers, skippedOwned, authPath, ...(modelsPath ? { modelsPath } : {}) };
 }
 
 /** Writes the Alibaba provider catalogue into the identity's models.json
@@ -317,18 +352,22 @@ export function planPiCredentialSync(
  */
 export async function syncPiCredentials(
   piConfigDir: string,
-  sourceDirs: PiCredentialSourceDirs,
+  supplied: PiCredentialSourceDirs,
+  names: PiCredentialSourceNames = {},
 ): Promise<{
   added: string[];
   kept: string[];
+  /** pi providers left out because the cluster gateway owns that login. */
+  skippedOwned: string[];
   authPath: string;
   modelsPath?: string;
 }> {
   const authPath = join(piConfigDir, "auth.json");
   const auth = (await Bun.file(authPath).exists()) ? await readJson(authPath) : {};
+  const { sourceDirs, skippedOwned } = await withoutGatewayOwned(supplied, names);
   const collected = await readPiCredentialSources(sourceDirs);
   if (Object.keys(collected.credentials).length === 0) {
-    throw new Error("No Pi credential sources were supplied");
+    throw new Error(skippedOwned.length > 0 ? `Nothing to sync: the cluster gateway owns the login for ${skippedOwned.join(", ")}, so it is never copied into pi` : "No Pi credential sources were supplied");
   }
   const plan = planPiCredentialSync(auth, collected);
   if (plan.added.length > 0) {
@@ -338,5 +377,5 @@ export async function syncPiCredentials(
   if (plan.mergeAlibabaCatalogue && collected.alibabaProvider !== undefined) {
     modelsPath = await mergeAlibabaCatalogue(piConfigDir, collected.alibabaProvider);
   }
-  return { added: plan.added, kept: plan.kept, authPath, ...(modelsPath ? { modelsPath } : {}) };
+  return { added: plan.added, kept: plan.kept, skippedOwned, authPath, ...(modelsPath ? { modelsPath } : {}) };
 }
