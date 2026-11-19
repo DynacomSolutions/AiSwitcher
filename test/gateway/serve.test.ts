@@ -1297,4 +1297,52 @@ describe("single refresher: dead logins, seeded metrics and the renewal route", 
     expect(body.logins).toHaveLength(1);
     expect(body.logins[0]).toMatchObject({ provider: "claude", identity: "ka1", renewedBy: "gateway", lastRefreshAt: "2026-11-18T13:07:22.000Z", lastRefreshReplica: "pod-9", lastError: null, revoked: false });
   });
+
+  test("a refusal by the journal (another replica's dead answer) raises no alert, counts no dead answer and rewrites nothing", async () => {
+    const { grantFingerprint } = await import("../../src/identities/oauth-reconcile.ts");
+    const grant = { access_token: "a", refresh_token: "r-dead", expires_at: 4_000_000_000 };
+    const fp = grantFingerprint(grant);
+    const backend = new MemoryRefreshBackend();
+    backend.entries.push({ id: 1, ts: new Date().toISOString(), provider: "claude", identity: "ka1", holder: "other-pod:1", oldFp: fp, outcome: "dead", code: "invalid_grant" });
+    let posts = 0;
+    const g = await boot({
+      refreshBackend: backend,
+      keepAliveMs: 20,
+      gaugeMs: 20,
+      keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []),
+      readGrant: async () => grant,
+      refreshImpl: (async (_t: string, _i: unknown, o?: { beforePost?: (i: { fingerprint: string }) => Promise<void> }) => {
+        await o?.beforePost?.({ fingerprint: fp });
+        posts += 1;
+        return { outcome: "refreshed", detail: "", written: [], writeFailures: [] };
+      }) as never,
+    });
+    await waitFor(async () => (await metricsText(g)).includes('outcome="refused-dead"'));
+    await Bun.sleep(100);
+    expect(posts).toBe(0);
+    expect(alerts.filter((a) => a.kind === "login-revoked" || a.kind === "refresh-failed")).toEqual([]);
+    const text = await metricsText(g);
+    expect(text).not.toContain("ais_gateway_refresh_dead_grant_total{");
+    expect(text).not.toContain('outcome="failed"');
+    expect(text).toContain('ais_gateway_login_revoked{provider="claude",identity="ka1"} 1');
+  });
+
+  test("every replica re-reads the login gauges each tick: a new sign-in clears revoked with no keep-alive and no refresh", async () => {
+    const { grantFingerprint } = await import("../../src/identities/oauth-reconcile.ts");
+    let refresh = "r-one";
+    const grant = () => ({ access_token: "a", refresh_token: refresh, expires_at: 4_000_000_000 });
+    const backend = new MemoryRefreshBackend();
+    backend.entries.push({ id: 1, ts: new Date().toISOString(), provider: "claude", identity: "ka1", holder: "other-pod:1", oldFp: grantFingerprint(grant()), outcome: "dead", code: "invalid_grant" });
+    const g = await boot({
+      refreshBackend: backend,
+      keepAliveMs: 3_600_000, // this replica never runs the keep-alive (not the leader)
+      gaugeMs: 20,
+      keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []),
+      readGrant: async () => grant(),
+    });
+    await waitFor(async () => (await metricsText(g)).includes('ais_gateway_login_revoked{provider="claude",identity="ka1"} 1'));
+    expect(await metricsText(g)).toContain('ais_gateway_login_expiry_timestamp_seconds{provider="claude",identity="ka1"} 4000000000');
+    refresh = "r-two";
+    await waitFor(async () => (await metricsText(g)).includes('ais_gateway_login_revoked{provider="claude",identity="ka1"} 0'));
+  });
 });

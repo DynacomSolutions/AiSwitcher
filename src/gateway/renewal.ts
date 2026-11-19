@@ -26,7 +26,7 @@ export function nextRefreshSeconds(tool: string, grant: { expires_at?: number; m
   const daily = lastRefreshSeconds === undefined ? undefined : lastRefreshSeconds + DAY_S;
   if (tool === "claude" || tool === "grok") {
     if (grant.expires_at === undefined) return undefined;
-    const lifetime = accessTokenLifetimeSeconds({ access_token: "", ...grant }, tool);
+    const lifetime = accessTokenLifetimeSeconds({ access_token: "", ...grant }, tool, lastRefreshSeconds === undefined ? undefined : new Date(lastRefreshSeconds * 1000).toISOString());
     return grant.expires_at - Math.max(MIN_RENEW_WINDOW_S, GATEWAY_RENEW_FRACTION * lifetime);
   }
   const byExpiry = tool === "codex" && grant.expires_at !== undefined ? grant.expires_at - DEFAULT_EXPIRY_WINDOW_HOURS * 3600 : undefined;

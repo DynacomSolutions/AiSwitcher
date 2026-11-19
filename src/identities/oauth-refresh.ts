@@ -82,9 +82,12 @@ export class OAuthRefreshError extends Error {
   readonly refreshFingerprint?: string;
   /** The OAuth `error` code from the token endpoint's JSON body, when it sent one (for example "invalid_grant"). */
   readonly oauthCode?: string;
-  constructor(message: string, revoked: boolean, refreshFingerprint?: string, oauthCode?: string) {
+  /** True when the request was sent and no answer came in time: the provider may have processed it (a rotating token may be spent). */
+  readonly timedOut: boolean;
+  constructor(message: string, revoked: boolean, refreshFingerprint?: string, oauthCode?: string, timedOut = false) {
     super(message);
     this.oauthCode = oauthCode;
+    this.timedOut = timedOut;
     this.name = "OAuthRefreshError";
     this.revoked = revoked;
     this.refreshFingerprint = refreshFingerprint;
@@ -151,9 +154,13 @@ export async function postRefreshTokenGrant(
       signal: AbortSignal.timeout(deps.timeoutMs ?? REFRESH_TIMEOUT_MS),
     });
   } catch (err) {
+    const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
     throw new OAuthRefreshError(
       `token endpoint unreachable: ${err instanceof Error ? err.message : String(err)}`,
       false,
+      undefined,
+      undefined,
+      timedOut,
     );
   }
   let parsed: TokenResponseWire = {};
@@ -424,7 +431,13 @@ export function shouldAttemptOAuthRefresh(
   let windowHours = Math.min(options.expiryWindowHours ?? DEFAULT_EXPIRY_WINDOW_HOURS, toolWindow ?? Infinity);
   // The gateway renews a short-lived token once this share of its lifetime has passed (never closer than the tick allows).
   if (options.renewFraction !== undefined && toolWindow !== undefined && options.tool !== undefined) {
-    windowHours = Math.max(MIN_RENEW_WINDOW_S, options.renewFraction * accessTokenLifetimeSeconds(grant, options.tool)) / 3600;
+    const lifetime = accessTokenLifetimeSeconds(grant, options.tool, options.lastSuccessAt);
+    windowHours = Math.max(MIN_RENEW_WINDOW_S, options.renewFraction * lifetime) / 3600;
+    // Never renew ahead again within the renew share of the last success's lifetime, whatever the stored expiry says.
+    const lastOk = options.lastSuccessAt !== null && options.lastSuccessAt !== undefined ? Date.parse(options.lastSuccessAt) / 1000 : Number.NaN;
+    if (!options.force && Number.isFinite(lastOk) && now >= lastOk && now - lastOk < options.renewFraction * lifetime && (grant.expires_at === undefined || grant.expires_at - now > 0)) {
+      return { attempt: false, reason: `refreshed ${Math.round((now - lastOk) / 60)} min ago, inside the renew share of its ${Math.round(lifetime / 60)} min lifetime — nothing to do` };
+    }
   }
   const windowSeconds = windowHours * 3600;
   const secondsLeft = grant.expires_at === undefined ? Number.POSITIVE_INFINITY : grant.expires_at - now;
@@ -475,9 +488,14 @@ export const MIN_RENEW_WINDOW_S = 20 * 60;
 /** Share of the access-token lifetime after which the gateway renews a claude or grok login. */
 export const GATEWAY_RENEW_FRACTION = 0.5;
 
-/** Access-token lifetime in seconds: expiry minus mint time when both are known, else the provider default. */
-export function accessTokenLifetimeSeconds(grant: OAuthGrant, tool: RefreshableTool): number {
+/**
+ * Access-token lifetime in seconds. Order: expiry minus mint time; else expiry minus the time of the last successful refresh
+ * (the refresh that produced this grant, so the lifetime is observed, not assumed); else the provider default.
+ */
+export function accessTokenLifetimeSeconds(grant: OAuthGrant, tool: RefreshableTool, lastSuccessAt?: string | null): number {
   if (grant.expires_at !== undefined && grant.minted_at !== undefined && grant.expires_at > grant.minted_at) return grant.expires_at - grant.minted_at;
+  const last = lastSuccessAt !== null && lastSuccessAt !== undefined ? Date.parse(lastSuccessAt) / 1000 : Number.NaN;
+  if (grant.expires_at !== undefined && Number.isFinite(last) && grant.expires_at > last) return grant.expires_at - last;
   return DEFAULT_ACCESS_TOKEN_LIFETIME_S[tool] ?? 8 * 3600;
 }
 /** Claude access tokens live about eight hours: a mint time is estimated as expiry minus this when the token carries none. */
@@ -729,8 +747,6 @@ export interface IdentityGrantRefresh {
   storesProbed?: boolean;
   beforeFingerprint?: string;
   afterFingerprint?: string;
-  /** The OAuth error code of a "failed" result that carries the token endpoint's answer (a dead code means only a new login helps). */
-  code?: string;
   /** New access-token expiry (unix seconds) on success. */
   expiresAt?: number;
   written: string[];

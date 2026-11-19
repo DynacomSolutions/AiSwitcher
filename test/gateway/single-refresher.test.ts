@@ -213,23 +213,6 @@ describe("one refresher per login", () => {
     expect(dead.slice(1).every((d) => d.fresh === false && d.fingerprint === fp)).toBe(true);
   });
 
-  test("a failed result that carries a dead code (no throw) is journalled dead at the first answer", async () => {
-    const backend = new MemoryRefreshBackend();
-    const dead: string[] = [];
-    let posts = 0;
-    const refresh = (async (tool: string, id: { name: string }, o?: { beforePost?: (i: { fingerprint: string }) => Promise<void> }): Promise<IdentityGrantRefresh> => {
-      await o?.beforePost?.({ fingerprint: "ab12cd34" });
-      posts += 1;
-      return { tool, identity: id.name, outcome: "failed", code: "refresh_token_reused", beforeFingerprint: "ab12cd34", detail: "", written: [], writeFailures: [] } as unknown as IdentityGrantRefresh;
-    }) as never;
-    const readGrant = async (): Promise<OAuthGrant> => ({ access_token: "a", refresh_token: "r", expires_at: 1 });
-    const mk = () => guardRefresh(refresh, { backend, metrics: metricsOf(), readGrant, onDead: (_a, i) => void dead.push(`${i.code}:${i.fresh}`) });
-    const first = await mk()("claude", ID(), { force: true });
-    expect(first.outcome).toBe("failed");
-    expect(backend.entries[0]).toMatchObject({ outcome: "dead", code: "refresh_token_reused", oldFp: "ab12cd34" });
-    expect(dead).toEqual(["refresh_token_reused:true"]);
-  });
-
   test("a new login (a different refresh token) is seen by onGrantSeen and sends again", async () => {
     const server = new FakeOAuthServer();
     await writeLogin(server.enrollSpent(1, "rt-spent-1"), "at-seed-1", NOW + 600);
@@ -270,27 +253,13 @@ describe("the credential cache stops resending a dead grant", () => {
     expect((await cache.get("claude", "acct-a")).accessToken).toBe("at-fake-1");
     expect(server.posts).toBe(2);
   });
-
-  test("a failed result with a dead code marks the login dead without a throw", async () => {
-    await writeLogin("rt-x", "at-expired", 1000);
-    let calls = 0;
-    const cache = new CredentialCache({
-      resolveConfigDir: async () => configDir,
-      claudeRegistryPath: registry,
-      refresh: (async (tool: string, id: { name: string }) => {
-        calls += 1;
-        return { tool, identity: id.name, outcome: "failed", code: "invalid_grant", beforeFingerprint: "00ff00ff", detail: "", written: [], writeFailures: [] };
-      }) as never,
-    });
-    await expect(cache.refreshAfter401("claude", "acct-a", "at-expired")).rejects.toMatchObject({ code: "login-dead" });
-    await expect(cache.refreshAfter401("claude", "acct-a", "at-expired")).rejects.toMatchObject({ code: "login-dead" });
-    expect(calls).toBe(1);
-  });
 });
 
 describe("renew at half the access-token lifetime", () => {
   const at = (expiresInSeconds: number, minted?: number) => ({ access_token: "a", refresh_token: "r", expires_at: NOW + expiresInSeconds, ...(minted !== undefined ? { minted_at: NOW + expiresInSeconds - minted } : {}) });
-  const decide = (tool: "claude" | "grok" | "codex" | "kimi", grant: OAuthGrant, extra: { renewFraction?: number } = { renewFraction: 0.5 }) => shouldAttemptOAuthRefresh(grant, { tool, nowSeconds: NOW, lastSuccessAt: new Date(NOW * 1000).toISOString(), ...extra });
+  const decide = (tool: "claude" | "grok" | "codex" | "kimi", grant: OAuthGrant, extra: { renewFraction?: number; lastSuccessAt?: string | null } = { renewFraction: 0.5, lastSuccessAt: null }) =>
+    shouldAttemptOAuthRefresh(grant, { tool, nowSeconds: NOW, lastSuccessAt: tool === "codex" || tool === "kimi" ? new Date(NOW * 1000).toISOString() : null, ...extra });
+  const ago = (seconds: number): string => new Date((NOW - seconds) * 1000).toISOString();
 
   test("claude: the provider default (8 h) gives a 4 h window when the mint time is unknown", () => {
     expect(decide("claude", at(4 * 3600 + 120)).attempt).toBe(false);
@@ -312,8 +281,17 @@ describe("renew at half the access-token lifetime", () => {
   test("without the gateway option claude keeps the one hour window; codex and kimi keep their rules", () => {
     expect(decide("claude", at(2 * 3600), {}).attempt).toBe(false);
     expect(decide("claude", at(50 * 60), {}).attempt).toBe(true);
-    expect(decide("codex", at(5 * 86_400)).attempt).toBe(false); // a recent success and a far expiry: nothing to do
-    expect(decide("kimi", at(600)).attempt).toBe(false); // kimi never uses an expiry window
+    expect(decide("codex", at(5 * 86_400), {}).attempt).toBe(false); // a recent success and a far expiry: nothing to do
+    expect(decide("kimi", at(600), {}).attempt).toBe(false); // kimi never uses an expiry window
+  });
+  test("the lifetime is observed from the last refresh: a 1 h token is not renewed every tick", () => {
+    // The refresh that made this token ran 10 minutes ago and it expires in 50 minutes: the lifetime is 1 h, the window 30 min.
+    expect(decide("claude", at(50 * 60), { renewFraction: 0.5, lastSuccessAt: ago(10 * 60) }).attempt).toBe(false);
+    expect(decide("claude", at(25 * 60), { renewFraction: 0.5, lastSuccessAt: ago(35 * 60) }).attempt).toBe(true);
+    // Whatever the stored expiry says, no renewal ahead within half the lifetime of the last success.
+    expect(decide("claude", at(10 * 60), { renewFraction: 0.5, lastSuccessAt: ago(60) }).attempt).toBe(false);
+    // An expired token is always renewed.
+    expect(decide("claude", at(-60), { renewFraction: 0.5, lastSuccessAt: ago(60) }).attempt).toBe(true);
   });
   test("the keep-alive passes the fraction for claude and grok only", async () => {
     const seen: Record<string, number | undefined> = {};
@@ -351,6 +329,21 @@ describe("the refresh log line", () => {
     expect(JSON.parse(lines[0] as string)).toMatchObject({ outcome: "dead", code: "invalid_grant", expiresAt: null });
     expect(lines[0]).not.toContain(secret);
     expect(Object.keys(JSON.parse(lines[0] as string)).sort()).toEqual(["code", "event", "expiresAt", "identity", "outcome", "provider", "replica"]);
+  });
+
+  test("a journal refusal of a dead token logs refused-dead, has its own metric outcome, and raises no refresh-failed alert", async () => {
+    const { RefreshRefused } = await import("../../src/gateway/refresh-guard.ts");
+    const lines: string[] = [];
+    const alerts: string[] = [];
+    const metrics = metricsOf();
+    const wrapped = instrumentRefresh((async () => {
+      throw new RefreshRefused("refresh refused: dead", true, "ab12cd34", "invalid_grant", "dead");
+    }) as never, { metrics, alerter: createAlerter((a) => void alerts.push(a.kind)), log: (l) => void lines.push(l), replica: "pod-x" });
+    await wrapped("claude", acct, { force: true } as never).catch(() => undefined);
+    expect(JSON.parse(lines[0] as string)).toMatchObject({ outcome: "refused-dead", code: "invalid_grant" });
+    expect(alerts).toEqual([]);
+    expect(metrics.render()).toContain('ais_gateway_refresh_total{provider="claude",outcome="refused-dead"} 1');
+    expect(metrics.render()).not.toContain('outcome="failed"');
   });
 
   test("a transport failure logs code transport; a pass that sent nothing logs nothing", async () => {

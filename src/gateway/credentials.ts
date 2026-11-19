@@ -322,12 +322,6 @@ export class CredentialCache {
       }
       throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : revoked ? "login-dead" : "refresh-failed", provider, identity, err);
     }
-    // The result path: a failed result can carry the token endpoint's dead code instead of throwing.
-    if (result.outcome === "failed" && result.code !== undefined && DEAD_REFRESH_CODES.has(result.code)) {
-      this.deadFor.set(key, staleDigest);
-      await markLoginRevoked(provider, identity, result.code, result.beforeFingerprint);
-      throw new GatewayCredentialError("login-dead", provider, identity);
-    }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
     const next = await this.reload(provider, id);
     if (next.accessToken !== staleToken && !isGatewayAccessToken(next.accessToken)) return next;

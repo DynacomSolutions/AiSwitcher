@@ -26,8 +26,30 @@ const MIGRATIONS: { version: string; sql: string }[] = [
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
 const MIGRATION_LOCK_KEY = 7_410_102;
 
+export interface MigrateOptions {
+  /** A migration statement that waits longer than this for a table lock fails (default 5 s), so it never queues behind long work. */
+  lockTimeoutMs?: number;
+  /** Attempts after a lock timeout (default 3), with a short pause between them. */
+  attempts?: number;
+}
+
 /** Applies pending migrations. Idempotent and safe to run from several processes at once. */
-export async function migrate(url: string): Promise<void> {
+export async function migrate(url: string, opts: MigrateOptions = {}): Promise<void> {
+  const attempts = opts.attempts ?? 3;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await migrateOnce(url, opts.lockTimeoutMs ?? 5_000);
+      return;
+    } catch (err) {
+      // 55P03: lock_not_available. A queued ALTER blocks every query behind it, so it gives up and tries again later.
+      const lockTimeout = (err as { errno?: unknown; code?: unknown } | null)?.errno === "55P03";
+      if (!lockTimeout || attempt >= attempts) throw err;
+      await new Promise((r) => setTimeout(r, 500 * attempt));
+    }
+  }
+}
+
+async function migrateOnce(url: string, lockTimeoutMs: number): Promise<void> {
   const sql = new SQL(url);
   try {
     await sql.begin(async (tx) => {
@@ -40,6 +62,7 @@ export async function migrate(url: string): Promise<void> {
       const done = new Set((await tx`SELECT version FROM schema_migrations`).map((r: { version: string }) => r.version));
       for (const m of MIGRATIONS) {
         if (done.has(m.version)) continue;
+        await tx.unsafe(`SET LOCAL lock_timeout = ${Math.trunc(lockTimeoutMs)}`);
         await tx.unsafe(m.sql);
         if (m.version === "0001_init") await tryHypertable(tx);
         await tx`INSERT INTO schema_migrations (version) VALUES (${m.version})`;

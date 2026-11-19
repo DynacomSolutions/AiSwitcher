@@ -99,8 +99,13 @@ export class RefreshGuardRetryable extends Error {
   }
 }
 
-/** The journal proves this refresh token must not be sent. */
-class RefreshRefused extends OAuthRefreshError {}
+/** The journal proves this refresh token must not be sent. `kind` says why: a dead answer, a rotated-out token, or repeated timeouts. */
+export class RefreshRefused extends OAuthRefreshError {
+  constructor(message: string, revoked: boolean, refreshFingerprint?: string, oauthCode?: string, readonly kind: "dead" | "rotated-out" | "timeout" = "rotated-out") {
+    super(message, revoked, refreshFingerprint, oauthCode);
+    this.name = "RefreshRefused";
+  }
+}
 
 /** The dead-grant OAuth code of an error, when the token endpoint's own answer says only a new login helps. */
 export function deadCodeOf(err: unknown): string | undefined {
@@ -121,6 +126,13 @@ export const JOURNAL_RETENTION_MS = 30 * 24 * 3_600_000;
 export const EVIDENCE_RETENTION_FACTOR = 12;
 export const DEFAULT_LOCK_TIMEOUT_MS = 60_000;
 export const BACKEND_CALL_TIMEOUT_MS = 5_000;
+/**
+ * An unresolved claim younger than this is a refresh that may still run on another holder (its lock can be lost to a
+ * database failover while the request is out): token request timeout (15 s) + store push bounds + margin.
+ */
+export const CLAIM_IN_FLIGHT_MS = 120_000;
+/** A token request that timed out after it was sent may have rotated the token: it is sent once more, then refused. */
+export const MAX_TIMEOUT_INTERRUPTIONS = 2;
 /** Resolved rows kept per account whatever their age. */
 export const JOURNAL_KEEP_PER_ACCOUNT = 50;
 
@@ -226,6 +238,8 @@ export interface GuardDeps {
   lockTimeoutMs?: number;
   /** Bound on every other backend call. */
   callTimeoutMs?: number;
+  /** An unresolved claim younger than this counts as a refresh in flight elsewhere (default CLAIM_IN_FLIGHT_MS). */
+  inFlightMs?: number;
   /**
    * Only for a gateway with no database: when the guard cannot run, refresh on AIS's file lock and compare-and-swap alone.
    * Default false: with a database backend a guard failure (lock timeout, connection error, journal error) never refreshes.
@@ -323,7 +337,10 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
     if (deadOut.size > 2000) deadOut.delete(deadOut.keys().next().value as string);
   };
   const failClosed = deps.fileLockFallback !== true;
-  const refusedDead = (fingerprint: string, code: string): RefreshRefused => new RefreshRefused(`refresh refused: the journal shows the token endpoint answered ${code} for this refresh token; it is not sent again, re-login required`, true, fingerprint, code);
+  const inFlightMs = deps.inFlightMs ?? CLAIM_IN_FLIGHT_MS;
+  /** Journal ids of this process's claims whose attempt is still running. */
+  const openClaims = new Set<number>();
+  const refusedDead = (fingerprint: string, code: string): RefreshRefused => new RefreshRefused(`refresh refused: the journal shows the token endpoint answered ${code} for this refresh token; it is not sent again, re-login required`, true, fingerprint, code, "dead");
   const ROTATED_OUT_MESSAGE = "refresh refused: this refresh token was already rotated out (journal) and is not sent again; the newer grant is missing from the stores";
 
   /** Pushes what a refresh wrote; retried, then left to the store's background pass (the local file stays ahead). */
@@ -459,12 +476,24 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
           if (failClosed) throw new RefreshGuardRetryable(`refresh journal unreadable (${reason(err)}); not refreshing without it`);
           return;
         }
-        for (const e of rows) if (e.outcome === "refreshed" && e.newFp !== undefined && e.newFp !== e.oldFp) markRotatedOut(`${tool}\u0000${identity.name}\u0000${e.oldFp}`);
+        // `lost` is rotated out too: the provider issued a new token and spent this one, even though no store kept the new one.
+        for (const e of rows) if ((e.outcome === "refreshed" || e.outcome === "lost") && e.newFp !== undefined && e.newFp !== e.oldFp) markRotatedOut(`${tool}\u0000${identity.name}\u0000${e.oldFp}`);
         const deadRow = rows.find((e) => e.outcome === "dead");
         if (deadRow) markDead(`${tool}\u0000${identity.name}\u0000${fingerprint}`, deadRow.code ?? "invalid_grant");
         refuseIfDead(fingerprint);
         if (rotatedOut.has(`${tool}\u0000${identity.name}\u0000${fingerprint}`)) throw new RefreshRefused(ROTATED_OUT_MESSAGE, false);
         let interrupted = rows.filter((e) => e.outcome === "interrupted").length;
+        // A young claim may be a request in flight on another holder whose lock was lost (a database failover): sending the
+        // same token now could rotate it twice. Wait for it; only an older claim counts as interrupted.
+        const nowMs = Date.now();
+        // An open claim of this process counts only while its attempt still runs (openClaims); one whose attempt already returned
+        // (for example its resolve write failed) is stale at once.
+        if (rows.some((x) => x.outcome === undefined && (openClaims.has(x.id) || (x.holder !== holder && nowMs - Date.parse(x.ts) < inFlightMs)))) {
+          throw new RefreshGuardRetryable("a refresh of this login may still be running on another holder (open journal claim); not sending the same token now");
+        }
+        if (rows.filter((e) => e.outcome === "interrupted" && e.code === "timeout").length >= MAX_TIMEOUT_INTERRUPTIONS) {
+          throw new RefreshRefused("refresh refused: the token request for this refresh token timed out twice after it was sent, so the provider may have rotated it; it is not sent again", false, fingerprint, undefined, "timeout");
+        }
         try {
           // An unresolved claim for this very token is a request whose outcome is unknown, like a failed transport attempt:
           // it is retried (the provider's own dead-grant answer decides), and the owner is alerted from the second one.
@@ -481,6 +510,7 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
         deps.onInterrupted?.(account, interrupted);
         try {
           claim = await bounded(lock.claim(fingerprint, holder), callMs, "refresh journal");
+          openClaims.add(claim);
         } catch (err) {
           degrade(err);
           if (failClosed) throw new RefreshGuardRetryable(`refresh journal claim failed (${reason(err)}); not refreshing without it`);
@@ -499,10 +529,14 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
         res = await refresh(tool, identity, { ...opts, beforePost });
       } catch (err) {
         const dead = deadCodeOf(err);
-        if (err instanceof RefreshRefused) {
-          // Refused before any request: nothing was claimed and nothing is sent.
+        if (err instanceof RefreshRefused || err instanceof RefreshGuardRetryable) {
+          // Refused before any request: nothing was sent. A claim made before such an error is closed as failed.
+          if (claim !== undefined) await resolveClaim(claim, "failed", undefined, "other").catch((e) => warn(`refresh journal write failed (${reason(e)})`));
         } else if (dead !== undefined) {
           await recordDead((err as OAuthRefreshError).refreshFingerprint ?? lastFp ?? "", dead);
+        } else if (claim !== undefined && err instanceof OAuthRefreshError && err.timedOut) {
+          // The request was sent and no answer came: the provider may have rotated the token. Closed as interrupted, one retry only.
+          await resolveClaim(claim, "interrupted", undefined, "timeout").catch((e) => warn(`refresh journal write failed (${reason(e)})`));
         } else if (claim !== undefined) {
           await resolveClaim(claim, "failed", undefined, failureCodeOf(err)).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
         }
@@ -516,19 +550,17 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
         markRotatedOut(`${tool}\u0000${identity.name}\u0000${res.beforeFingerprint}`);
         deps.onInterrupted?.(account, 0);
       }
-      // The result path: a "failed" result can carry the token endpoint's dead code instead of throwing.
-      const resultDead = res.outcome === "failed" && res.code !== undefined && DEAD_REFRESH_CODES.has(res.code) ? res.code : undefined;
-      if (resultDead !== undefined) {
-        await recordDead(res.beforeFingerprint ?? lastFp ?? "", resultDead);
-      } else if (claim !== undefined) {
+      if (claim !== undefined) {
         const lost = res.outcome === "failed" && res.afterFingerprint !== undefined;
         const outcome: JournalOutcome = res.outcome === "refreshed" ? "refreshed" : lost ? "lost" : res.outcome === "failed" ? "failed" : "recovered";
         const id = claim;
-        await resolveClaim(id, outcome, outcome === "refreshed" || lost ? res.afterFingerprint : undefined, outcome === "failed" && res.code !== undefined ? res.code : undefined).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
+        if (lost && res.beforeFingerprint) markRotatedOut(`${tool}\u0000${identity.name}\u0000${res.beforeFingerprint}`);
+        await resolveClaim(id, outcome, outcome === "refreshed" || lost ? res.afterFingerprint : undefined).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
       }
       if (!degraded) deps.onHealthy?.(account);
       return settle(res);
     } finally {
+      if (claim !== undefined) openClaims.delete(claim);
       await bounded(lock.release(), callMs, "refresh lock release").catch((e) => warn(`refresh lock release failed (${reason(e)})`));
     }
   }) as RefreshFn;
