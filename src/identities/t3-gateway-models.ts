@@ -23,6 +23,7 @@ export interface GatewayModel {
   id: string;
   displayName?: string;
   contextLength?: number;
+  maxOutput?: number;
   input: string[];
   reasoning: boolean;
   alwaysThinking: boolean;
@@ -80,10 +81,12 @@ export function parseGatewayModels(body: unknown): GatewayModel[] {
     const tools = isObj(raw.tools) ? raw.tools : undefined;
     const displayName = str(raw.display_name) ?? str(raw.name);
     const contextLength = num(raw.context_length) ?? num(limit?.context) ?? num(raw.context_window);
+    const maxOutput = num(limit?.output) ?? num(raw.max_output_tokens) ?? num(raw.max_completion_tokens);
     out.push({
       id,
       ...(displayName ? { displayName } : {}),
       ...(contextLength ? { contextLength } : {}),
+      ...(maxOutput ? { maxOutput } : {}),
       input: [...input],
       reasoning: raw.supports_reasoning === true || raw.reasoning === true || thinkingType !== undefined,
       alwaysThinking: thinkingType === "only",
@@ -219,12 +222,19 @@ export function opencodeGatewayProviders(config: Json): { name: string; baseUrl:
   return out;
 }
 
-/** New `provider.<name>.models` map: gateway ids in gateway order; a kept entry keeps its keys, `name` follows the gateway. */
+/** Output limit when the gateway gives none: OpenCode needs `output` beside `context`, so use a safe cap. */
+const DEFAULT_OUTPUT_LIMIT = 32768;
+
+/** New `provider.<name>.models` map: gateway ids in gateway order; a kept entry keeps its keys, `name` and `limit` follow the gateway (a hand-set `limit` stays when the gateway has no context). */
 export function opencodeModelsMap(old: Json, models: GatewayModel[]): Json {
   const out: Json = {};
   for (const m of models) {
     const prev = isObj(old[m.id]) ? (old[m.id] as Json) : {};
-    out[m.id] = { ...prev, name: m.displayName ?? str(prev.name) ?? m.id };
+    const prevLimit = isObj(prev.limit) ? prev.limit : {};
+    const limit = m.contextLength
+      ? { ...prevLimit, context: m.contextLength, output: Math.min(m.maxOutput ?? num(prevLimit.output) ?? DEFAULT_OUTPUT_LIMIT, m.contextLength) }
+      : undefined;
+    out[m.id] = { ...prev, name: m.displayName ?? str(prev.name) ?? m.id, ...(limit ? { limit } : {}) };
   }
   return out;
 }
