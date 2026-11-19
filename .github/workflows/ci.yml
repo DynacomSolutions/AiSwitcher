@@ -10,8 +10,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  # Selects the jobs and tests that the change set can affect, from the source
+  # dependency graph (scripts/ci/affected.ts). Pushes to main run everything.
+  # Shared inputs run everything. Any doubt fails open.
+  changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      macos: ${{ steps.select.outputs.macos }}
+      extension: ${{ steps.select.outputs.extension }}
+      web: ${{ steps.select.outputs.web }}
+      tests: ${{ steps.select.outputs.tests }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Select jobs and tests from the dependency graph
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bun run scripts/ci/affected.ts --github
+
+  test:
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Gateway store tests (test/gateway/pg-store.test.ts), on a pinned
     # TimescaleDB image so the hypertable path is exercised.
     services:
@@ -92,57 +121,71 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      # The live-image script tests drive expect and node.
+      # The live-image script tests drive expect and node. PRs run only the
+      # selected tests; pushes to main run the full suite in test-shard.
       - name: Install test tools
+        if: github.event_name == 'pull_request' && needs.changes.outputs.tests != 'none'
         run: |
           bash scripts/ci/apt-install.sh --no-install-recommends expect nodejs
 
       - name: Test
+        if: github.event_name == 'pull_request' && needs.changes.outputs.tests != 'none'
         env:
           AIS_REQUIRE_LIVE_TEST_TOOLS: "1"
           AIS_GATEWAY_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/gateway_test
-        run: bun test
+          TESTS: ${{ needs.changes.outputs.tests }}
+        run: |
+          # TESTS is "all" or a space-separated list of test files (no spaces in paths).
+          if [ "$TESTS" = "all" ]; then
+            bun test
+          else
+            bun test $TESTS
+          fi
 
-  # Decides whether the macOS job is needed. Pushes to main always run it.
-  # The host app is built and tested by host-app.yml.
-  changes:
+  # The full suite on pushes to main, split round-robin into four shards.
+  # PRs run their selected tests in the test job instead.
+  test-shard:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    outputs:
-      macos: ${{ steps.filter.outputs.macos }}
-      extension: ${{ steps.filter.outputs.extension }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    services:
+      postgres:
+        image: timescale/timescaledb:2.17.2-pg17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: gateway_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Filter paths that can affect execve on macOS
-        id: filter
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install test tools
         run: |
-          # Fails open: any doubt about the diff runs the job.
-          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
-            echo "macos=true" >> "$GITHUB_OUTPUT"
-            echo "extension=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA"); then
-            echo "macos=true" >> "$GITHUB_OUTPUT"
-            echo "extension=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # The extension imports protocol types from src/browser; shared inputs run everything.
-          if printf '%s\n' "$changed" | grep -Eq '^(apps/chrome-extension/|src/browser/|\.github/workflows/ci\.yml$|package\.json$|bun\.lock$|\.bun-version$)'; then
-            echo "extension=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "extension=false" >> "$GITHUB_OUTPUT"
-          fi
-          if printf '%s\n' "$changed" | grep -Eq '^(src/|test/|\.github/workflows/ci\.yml$|package\.json$|bun\.lock$|tsconfig\.json$)'; then
-            echo "macos=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "macos=false" >> "$GITHUB_OUTPUT"
-          fi
+          bash scripts/ci/apt-install.sh --no-install-recommends expect nodejs
+
+      - name: Test shard ${{ matrix.shard }} of 4
+        env:
+          AIS_REQUIRE_LIVE_TEST_TOOLS: "1"
+          AIS_GATEWAY_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/gateway_test
+        run: |
+          files=$(bun run scripts/ci/affected.ts --shard "${{ matrix.shard }}" --shards 4)
+          bun test $files
 
   # GitHub-hosted runner only: this repository is public, never self-hosted.
   test-macos:
@@ -192,6 +235,8 @@ jobs:
 
   # Builds the WebUI and loads every route in real Chromium at phone widths (apps/web/test/mobile-layout.e2e.ts).
   web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -219,7 +264,7 @@ jobs:
   # Always runs, so a required check keeps reporting when path-gated jobs are skipped.
   ci-gate:
     if: always()
-    needs: [test, changes, test-macos, extension, web]
+    needs: [test, changes, test-macos, extension, web, test-shard]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

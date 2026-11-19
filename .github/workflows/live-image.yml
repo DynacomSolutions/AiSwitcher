@@ -48,12 +48,25 @@ jobs:
           set -euo pipefail
           result=true
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ] \
-            && changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA") \
-            && bun install --frozen-lockfile \
-            && bun run build \
-            && picked=$(printf '%s\n' "$changed" | bun image/build/affected.ts dist/ais.meta.json) \
-            && [ "$picked" = false ]; then
-            result=false
+            && changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA"); then
+            # A version-only bump of the root package.json changes no image input.
+            if printf '%s\n' "$changed" | grep -q '^package\.json$' \
+              && [ "$(bun scripts/ci/affected.ts --version-only)" = true ]; then
+              changed=$(printf '%s\n' "$changed" | grep -v '^package\.json$' || true)
+            fi
+            # Fast path: only these paths can reach the image binary or its
+            # build (the metafile also lists mods/ and scripts/ inputs), so
+            # anything else skips the install and build below.
+            if printf '%s\n' "$changed" | grep -Eq '^(src/|mods/|scripts/|image/|apps/tui/|\.github/workflows/|package\.json$|bun\.lock$|bunfig\.toml$|tsconfig\.json$|\.bun-version$)'; then
+              if bun install --frozen-lockfile \
+                && bun run build \
+                && picked=$(printf '%s\n' "$changed" | bun image/build/affected.ts dist/ais.meta.json) \
+                && [ "$picked" = false ]; then
+                result=false
+              fi
+            else
+              result=false
+            fi
           fi
           echo "affected=$result" >> "$GITHUB_OUTPUT"
 

@@ -1,57 +1,39 @@
+// Host app change selection, on the shared dependency graph engine
+// (scripts/ci/affected.ts). The host package consumes the adapter sidecar
+// sources, the test/host import graph, apps/host, scripts/host, image/contract
+// and the packaged trust key and licence. Anything else skips the host jobs.
+// Shared inputs and unknown paths fail open to a full run.
 import { appendFileSync } from "node:fs";
+import { diffChanges, filterVersionOnlyBump, selectChanges, showFile } from "../ci/affected.ts";
 
 export type HostCheckSelection = "host" | "all";
 
-const hostInputs = [
-  /^apps\/host\//,
-  /^scripts\/host\//,
-  /^test\/host\//,
-  /^src\/host\//,
-  /^image\/contract\//,
-];
-const knownUnrelated = [
-  /^(README|TASKS)\.md$/,
-  /^docs\/agents\/[^/]+\.md$/,
-  /^apps\/web\//,
-  /^apps\/tui\//,
-];
-const fullCheckInputs = [
-  /^\.github\/workflows\//,
-  /^package\.json$/,
-  /^tsconfig\.json$/,
-  /^scripts\/identifier-allowlist\.ts$/,
-  /^Cargo\.toml$/,
-  /^Cargo\.lock$/,
-  /^apps\/host\/Cargo\.lock$/,
-  /^image\/release-key\.pub$/,
-  /^src\/(shared|identities|sync|live)\//,
-];
-
-export function affectedHostChecks(paths: readonly string[]): HostCheckSelection[] {
+export function affectedHostChecks(paths: readonly string[], options: { hasDeletions?: boolean } = {}): HostCheckSelection[] {
   if (paths.length === 0) return [];
-  const unknown = paths.some((path) => !hostInputs.some((pattern) => pattern.test(path)) && !knownUnrelated.some((pattern) => pattern.test(path)) && !fullCheckInputs.some((pattern) => pattern.test(path)));
-  if (unknown) return ["all"];
-  if (paths.some((path) => /(^|\/)(bun\.lock|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|Cargo\.lock)$/.test(path))) return ["all"];
-  if (paths.some((path) => fullCheckInputs.some((pattern) => pattern.test(path)))) return ["all"];
-  if (paths.some((path) => hostInputs.some((pattern) => pattern.test(path)))) return ["host"];
-  if (paths.every((path) => knownUnrelated.some((pattern) => pattern.test(path)))) return [];
-  return ["all"];
+  const selection = selectChanges(paths, options);
+  if (selection.full) return ["all"];
+  if (selection.host) return ["host"];
+  return [];
 }
 
 if (import.meta.main) {
   let paths = Bun.argv.slice(2);
   let forceAll = false;
+  let hasDeletions = false;
   if (paths.includes("--github")) {
     forceAll = process.env.GITHUB_EVENT_NAME !== "pull_request" || process.env.HOST_PRODUCTION === "true";
     const base = process.env.BASE_SHA ?? "";
     const head = process.env.HEAD_SHA ?? "";
-    if (!forceAll && /^[a-f0-9]{40}$/.test(base) && /^[a-f0-9]{40}$/.test(head)) {
-      const diff = Bun.spawnSync(["git", "diff", "--name-only", "-z", `${base}...${head}`], { timeout: 30_000 });
-      if (diff.exitCode === 0) paths = diff.stdout.toString().split("\0").filter(Boolean);
-      else forceAll = true;
-    } else forceAll = true;
+    if (!forceAll) {
+      const diff = diffChanges(base, head);
+      if (diff) {
+        // A version-only bump of the root package.json changes no build input.
+        paths = filterVersionOnlyBump(diff.paths, showFile(base, "package.json"), showFile(head, "package.json"));
+        hasDeletions = diff.hasDeletions;
+      } else forceAll = true;
+    }
   }
-  const selection = forceAll ? ["all"] : affectedHostChecks(paths);
+  const selection = forceAll ? ["all"] : affectedHostChecks(paths, { hasDeletions });
   const value = selection.length ? selection.join(" ") : "skip";
   if (Bun.argv.includes("--github")) {
     if (!process.env.GITHUB_OUTPUT) throw new Error("GITHUB_OUTPUT is required.");
