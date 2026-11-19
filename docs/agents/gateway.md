@@ -42,7 +42,17 @@ Other commands:
 ```sh
 ais gateway app list | show <name> | update <name> [flags] | rotate <name> | revoke <name>
 ais gateway usage [--app=billing] [--provider=claude] [--days=7] [--json]
+ais gateway usage-history import [--snapshot=<path>] [--batch-size=500] [--dry-run] [--verify-only]
 ```
+
+`usage-history import` copies the host usage history into the gateway database
+(table `gateway_usage_history`, admin `POST` and `GET /usage/history`). It reads
+the host snapshot and never changes it. It imports two sources: `host-snapshot-models`
+(per identity and model, all time, every provider) and `host-snapshot-daily` (per
+identity and day, only where the host snapshot holds days). Do not add the two
+sources together. The import only raises figures and never deletes. It prints host
+cost against gateway cost per provider and identity, and exits non-zero when any
+figure differs by more than $1.
 
 The console (`ais web`) has a Gateway page with the same list, edit (reserve,
 models, daily cap; it can also clear them), rotate and revoke. Its rotate calls the CLI's own
