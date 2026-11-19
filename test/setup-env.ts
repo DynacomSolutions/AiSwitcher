@@ -1,3 +1,4 @@
+import { beforeEach } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -32,7 +33,7 @@ if (!isolated || homedir() !== isolated) {
   // Point XDG dirs into the scratch home too; git must not read the real global config.
   // Every variable that points AIS or a tool at a real-home file goes too (secrets, pi agent dir, host home, AWS profiles, Chrome MCP).
   for (const k of [
-    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "AIS_GATEWAY_MEMBERS_DIR", "AIS_GATEWAY_HEARTBEAT", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "AIS_GATEWAY_MEMBERS_DIR", "AIS_GATEWAY_HEARTBEAT", "AIS_GATEWAY_OWNED", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
     "AIS_SECRETS_FILE", "PI_CODING_AGENT_DIR", "AIS_HOST_HOME", "AIS_AWS_PROFILES_CONFIG", "AIS_CHROME_MCP_CONFIG",
   ]) delete env[k];
   env.GIT_CONFIG_NOSYSTEM = "1";
@@ -46,3 +47,9 @@ if (!isolated || homedir() !== isolated) {
 mkdirSync(join(isolated, ".ais"), { recursive: true });
 // Even inside the scratch home: a test that starts a gateway process must not switch the whole run onto the member store.
 process.env.AIS_GATEWAY_MEMBER_STORE = "0";
+
+// The sticky gateway ownership record (src/identities/gateway-owned.ts) lives in the scratch home, which every test file of the run
+// shares. A test that sees a fresh heartbeat latches a login there, so each test starts without a record: no ownership leaks across tests.
+beforeEach(() => {
+  rmSync(join(isolated, ".ais", "gateway-owned.json"), { force: true });
+});
