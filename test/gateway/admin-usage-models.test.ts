@@ -71,3 +71,35 @@ describe("admin GET /usage/models", () => {
     expect((await call(`/usage/models?since=${encodeURIComponent(at(91 * 86400_000))}`)).status).toBe(400);
   });
 });
+
+describe("admin GET /usage/models/daily", () => {
+  const base = { app: "web", provider: "claude" as const, cacheReadTokens: 0, cacheWriteTokens: 0, status: "ok", httpStatus: 200, latencyMs: 1, streamed: false };
+  const seed = () =>
+    inner.appendUsage([
+      { ...base, ts: "2026-11-02T08:00:00.000Z", identity: "m1", model: "sonnet", inputTokens: 10, outputTokens: 5, estCostUsd: 0.5 },
+      { ...base, ts: "2026-11-02T18:30:00.000Z", identity: "m1", model: "sonnet", inputTokens: 1, outputTokens: 1, estCostUsd: 0.1 },
+      { ...base, ts: "2026-11-01T08:00:00.000Z", provider: "codex", identity: "c1", model: "gpt", inputTokens: 2, outputTokens: 2, estCostUsd: 1 },
+    ]);
+
+  test("401 without the admin token", async () => {
+    expect((await call("/usage/models/daily", null)).status).toBe(401);
+  });
+
+  test("returns per-day rows, UTC by default, and the zone shifts the day", async () => {
+    await seed();
+    const utc = (await (await call("/usage/models/daily?days=7")).json()) as any;
+    expect(utc.tz).toBe("UTC");
+    expect(utc.days.map((r: any) => `${r.day}/${r.provider}/${r.inputTokens}`)).toEqual(["2026-11-01/codex/2", "2026-11-02/claude/11"]);
+    const bkk = (await (await call("/usage/models/daily?days=7&tz=Asia/Bangkok&provider=claude")).json()) as any;
+    expect(bkk.tz).toBe("Asia/Bangkok");
+    expect(bkk.days.map((r: any) => `${r.day}/${r.inputTokens}`)).toEqual(["2026-11-02/10", "2026-11-03/1"]);
+  });
+
+  test("validates the window, provider and zone like /usage/models", async () => {
+    expect((await call("/usage/models/daily?days=0")).status).toBe(400);
+    expect((await call("/usage/models/daily?days=91")).status).toBe(400);
+    expect((await call("/usage/models/daily?provider=bogus")).status).toBe(400);
+    expect((await call("/usage/models/daily?tz=Mars/Base")).status).toBe(400);
+    expect((await call("/usage/models/daily?tz=%2B07:00")).status).toBe(400);
+  });
+});

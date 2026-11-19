@@ -183,6 +183,31 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(await s.usageByModel(new Date("2027-01-01T00:00:00.000Z"))).toEqual([]);
   });
 
+  test("usageByModelDaily buckets per day in the zone, sums apps, prices null costs and bounds the window", async () => {
+    const s = await makeStore();
+    await s.appendUsage([
+      { ...row("a", "2026-11-02T01:00:00.000Z", 10, 20), identity: "m1", model: "ma", cacheReadTokens: 5, estCostUsd: 0.5 },
+      { ...row("b", "2026-11-02T03:00:00.000Z", 3, 4), identity: "m1", model: "ma", estCostUsd: 0.25 },
+      // 18:00 UTC is already the next day in Bangkok (UTC+7).
+      { ...row("a", "2026-11-02T18:00:00.000Z", 7, 0), identity: "m1", model: "ma", estCostUsd: 0.125 },
+      { ...row("a", "2026-11-02T05:00:00.000Z", 2, 2), identity: "m1" },
+      { ...row("a", "2026-10-01T00:00:00.000Z", 999, 0), identity: "m1", model: "ma", estCostUsd: 9 },
+    ]);
+    const utc = await s.usageByModelDaily(new Date("2026-11-02T00:00:00.000Z"), undefined, "UTC");
+    expect(utc).toEqual([
+      { day: "2026-11-02", provider: "codex", identity: "m1", model: "ma", inputTokens: 20, outputTokens: 24, cacheReadTokens: 5, cacheWriteTokens: 0, estCostUsd: 0.875, unpricedRequests: 0, requests: 3 },
+      { day: "2026-11-02", provider: "codex", identity: "m1", model: null, inputTokens: 2, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 1, requests: 1 },
+    ]);
+    const bkk = await s.usageByModelDaily(new Date("2026-11-02T00:00:00.000Z"), undefined, "Asia/Bangkok");
+    expect(bkk.map((r) => `${r.day}/${r.model}/${r.inputTokens}`)).toEqual(["2026-11-02/ma/13", "2026-11-02/null/2", "2026-11-03/ma/7"]);
+    const win = await s.usageByModelDaily(new Date("2026-11-02T00:00:00.000Z"), new Date("2026-11-02T04:00:00.000Z"), "UTC");
+    expect(win.map((r) => r.requests)).toEqual([2]);
+    expect(await s.usageByModelDaily(new Date("2027-01-01T00:00:00.000Z"), undefined, "UTC")).toEqual([]);
+    // The days add up to the per-model totals over the same window.
+    const total = (await s.usageByModel(new Date("2026-11-02T00:00:00.000Z"))).reduce((n, r) => n + r.inputTokens, 0);
+    expect(utc.reduce((n, r) => n + r.inputTokens, 0)).toBe(total);
+  });
+
   test("appendUsage accepts an empty batch", async () => {
     const s = await makeStore();
     await s.appendUsage([]);

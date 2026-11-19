@@ -3,7 +3,7 @@ import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browse
 import { bumpSideCountOn, type SqlTag } from "./side-count.ts";
 import { errorTag } from "./ledger-buffer.ts";
 import { AppRevokedError, type GatewayStore } from "./store.ts";
-import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
@@ -383,6 +383,55 @@ export class PgGatewayStore implements GatewayStore {
       firstTs: iso(r.first_ts),
       lastTs: iso(r.last_ts),
     }));
+  }
+
+  async usageByModelDaily(since: Date, until: Date | undefined, tz: string): Promise<ModelDailyUsageRow[]> {
+    const to = until ? until.toISOString() : null;
+    // One pass over the ts range: rows with a cost sum it, rows without one are priced from their tokens below.
+    const rows = await this.sql`
+      SELECT to_char(ts AT TIME ZONE ${tz}, 'YYYY-MM-DD') AS day, provider, identity, model,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd,
+        COUNT(*) AS requests,
+        COALESCE(SUM(input_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_input,
+        COALESCE(SUM(output_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_output,
+        COALESCE(SUM(cache_read_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_cache_read,
+        COALESCE(SUM(cache_write_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_cache_write,
+        COUNT(*) FILTER (WHERE est_cost_usd IS NULL) AS n_requests
+      FROM gateway_usage WHERE ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+      GROUP BY 1, provider, identity, model ORDER BY 1, provider, identity, model`;
+    return rows.map((r: Record<string, unknown>) => {
+      const nullRequests = Number(r.n_requests);
+      const priced = nullRequests > 0
+        ? priceNullCostGroup({
+            provider: String(r.provider) as GatewayProvider,
+            identity: String(r.identity),
+            app: "",
+            model: r.model === null || r.model === undefined ? null : String(r.model),
+            inputTokens: Number(r.n_input),
+            outputTokens: Number(r.n_output),
+            cacheReadTokens: Number(r.n_cache_read),
+            cacheWriteTokens: Number(r.n_cache_write),
+            requests: nullRequests,
+          })
+        : { cost: 0, unpriced: 0 };
+      return {
+        day: String(r.day),
+        provider: String(r.provider),
+        identity: String(r.identity),
+        model: r.model === null || r.model === undefined ? null : String(r.model),
+        inputTokens: Number(r.input_tokens),
+        outputTokens: Number(r.output_tokens),
+        cacheReadTokens: Number(r.cache_read_tokens),
+        cacheWriteTokens: Number(r.cache_write_tokens),
+        estCostUsd: Number(r.est_cost_usd) + priced.cost,
+        unpricedRequests: priced.unpriced,
+        requests: Number(r.requests),
+      };
+    });
   }
 
   async putBrowserBinding(b: BrowserBinding): Promise<void> {

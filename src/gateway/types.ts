@@ -52,6 +52,22 @@ export interface ModelUsageRow extends IdentityUsageRow {
   lastTs?: string;
 }
 
+/** Ledger totals for one day, provider, identity and model (the admin `GET /usage/models/daily` row). Apps are summed. */
+export interface ModelDailyUsageRow {
+  /** Calendar day "YYYY-MM-DD" in the zone the request named. */
+  day: string;
+  provider: string;
+  identity: string;
+  model: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  estCostUsd: number;
+  unpricedRequests: number;
+  requests: number;
+}
+
 export interface UsageRow {
   ts: string;
   app: string;

@@ -133,14 +133,32 @@ describe("gateway model usage", () => {
     expect(mapGatewayModelUsage(null)).toEqual([]);
     expect(mapGatewayModelUsage({ models: "x" })).toEqual([]);
   });
-  test("requests /usage/models with days and reports failures as short errors", async () => {
-    let url = "";
+  test("requests /usage/models and the daily route with one fixed since and the zone, and maps both", async () => {
+    const urls: string[] = [];
+    const now = new Date("2026-11-20T10:00:00.000Z");
+    const sinceIso = new Date(now.getTime() - 90 * 86400_000 + 60_000).toISOString();
     const okView = await loadGatewayModelUsage(90, {
       secretsPath: secretsFile(creds),
-      fetch: (async (u: string) => ((url = u), Response.json({ models: [] }))) as unknown as typeof fetch,
+      zone: "Asia/Bangkok",
+      now: () => now,
+      fetch: (async (u: string) => {
+        urls.push(u);
+        return Response.json(u.includes("/daily")
+          ? { days: [{ day: "2026-11-19", provider: "claude", identity: "m1", model: null, inputTokens: 3, outputTokens: 1, requests: 1 }, { day: "bad", provider: "claude", identity: "m1" }] }
+          : { models: [] });
+      }) as unknown as typeof fetch,
     });
-    expect(okView).toEqual({ configured: true, rows: [] });
-    expect(url).toBe("http://gw.invalid/usage/models?days=90");
+    expect(urls.sort()).toEqual([
+      `http://gw.invalid/usage/models/daily?since=${encodeURIComponent(sinceIso)}&tz=Asia%2FBangkok`,
+      `http://gw.invalid/usage/models?since=${encodeURIComponent(sinceIso)}`,
+    ].sort());
+    expect(okView).toMatchObject({ configured: true, rows: [], dailyZone: "Asia/Bangkok" });
+    expect(okView.daily).toEqual([{ day: "2026-11-19", provider: "claude", identity: "m1", model: null, inputTokens: 3, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 1 }]);
+  });
+  test("a failed daily route keeps the totals and names the reason; a failed totals route is the error", async () => {
+    const onlyTotals = async (u: string) => (u.includes("/daily") ? new Response("", { status: 404 }) : Response.json({ models: [] }));
+    const partial = await loadGatewayModelUsage(90, { secretsPath: secretsFile(creds), fetch: onlyTotals as unknown as typeof fetch });
+    expect(partial).toEqual({ configured: true, rows: [], dailyError: "gateway admin has no per-day usage yet (older version)" });
     const old = await loadGatewayModelUsage(90, { secretsPath: secretsFile(creds), fetch: (async () => new Response("", { status: 404 })) as unknown as typeof fetch });
     expect(old.error).toContain("older version");
     const down = await loadGatewayModelUsage(90, { secretsPath: secretsFile(creds), fetch: (async () => { throw new Error("x"); }) as unknown as typeof fetch });

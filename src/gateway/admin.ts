@@ -7,6 +7,7 @@ import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord } from "./types.ts";
+import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
 
 export const DEFAULT_OVERLAP_MS = 24 * 3600_000;
 const MAX_OVERLAP_HOURS = 24 * 30;
@@ -319,6 +320,19 @@ export function createAdminApp(deps: AdminDeps): Hono {
     if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
     const rows = (await store.usageByModel(win.since, win.until)).filter((r) => provider === undefined || r.provider === provider);
     return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), models: rows });
+  });
+
+  // Per-day split of the same ledger (apps summed), bucketed in the IANA zone `tz` (default UTC), so the console can chart days.
+  // Same window rules as /usage/models; one GROUP BY over the ts range.
+  hono.get("/usage/models/daily", async (c) => {
+    const win = usageWindow((n) => c.req.query(n), deps.now());
+    if (typeof win === "string") return err(400, win);
+    const provider = c.req.query("provider");
+    if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
+    const tz = c.req.query("tz") ?? "UTC";
+    if (!TOKSCALE_TIME_ZONE_NAMES.has(tz) && tz !== "UTC") return err(400, "tz must be an IANA time zone name");
+    const rows = (await store.usageByModelDaily(win.since, win.until, tz)).filter((r) => provider === undefined || r.provider === provider);
+    return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), tz, days: rows });
   });
 
   return hono;
