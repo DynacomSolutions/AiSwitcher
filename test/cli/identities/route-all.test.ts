@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backupUnique, classifyLogin, codexConfigRouted, codexKeyHelperPath, heldProblem, routeAllViaGateway, routeCodexConfigText, runRouteAllViaGateway, type RouteAllOptions } from "../../../src/cli/identities/route-all.ts";
 import { writeHeartbeat } from "../../../src/identities/gateway-heartbeat.ts";
+import { isGatewayManagedHere, listGatewayManagedAccounts } from "../../../src/identities/gateway-managed.ts";
 import { hasMemberCopy, memberDir } from "../../../src/identities/gateway-members.ts";
 import { refreshFingerprint, routingOf } from "../../../src/identities/gateway-routed.ts";
 import { loadIdentitiesFile, saveIdentitiesFile } from "../../../src/identities/store.ts";
@@ -66,6 +67,7 @@ beforeEach(async () => {
     procRoot: join(home, "proc"),
     port: 47140,
     now: () => NOW,
+    storePush: async () => "pushed (test stub)",
     hostname: "routing-host-SYNTHETIC",
     out: () => {},
   };
@@ -174,6 +176,37 @@ describe("route-all-via-gateway: routing", () => {
     const again = await routeAllViaGateway(opts);
     expect(again.lines.every((l) => l.status === "already-routed" && l.detail === undefined)).toBe(true);
     expect([await files(dir), await files(cdir), await files(store)]).toEqual(snapshot);
+  });
+
+  test("a live claude identity with only a folder login is routed, pushed to the store, and then counts as managed", async () => {
+    await registry("claude", ".claude", ["alpha", "beta", "gamma"]);
+    await writeFile(join(dirOf(".claude", "gamma"), ".credentials.json"), claudeLogin("gamma"));
+    await writeFile(join(dirOf(".claude", "gamma"), ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "u-gamma" } }));
+    const claudeRegistry = opts.registries!.claude!;
+    // the gateway lists the folder-only identity before any member copy exists, so its heartbeat can hold it
+    expect((await listGatewayManagedAccounts(claudeRegistry, "claude")).map((i) => i.name)).toContain("gamma");
+    expect(hasMemberCopy("claude", "gamma", opts.memberRoot)).toBe(false);
+    await heartbeat(["claude/gamma"]);
+    const pushed: string[] = [];
+    const r = await routeAllViaGateway({ ...opts, only: { tool: "claude", identity: "gamma" }, storePush: async (t, n) => { pushed.push(`${t}/${n}`); return "pushed"; } });
+    expect(claudeLine(r, "gamma")?.status).toBe("routed");
+    expect(pushed).toEqual(["claude/gamma"]);
+    expect(await readFile(join(storeOf("claude", "gamma"), ".credentials.json"), "utf8")).toBe(claudeLogin("gamma"));
+    const entry = JSON.parse(await readFile(join(dirOf(".claude", "gamma"), ".credentials.json"), "utf8")).claudeAiOauth;
+    expect(entry.accessToken).toBe(CLAUDE_KEY);
+    expect(entry.refreshToken).toBeNull();
+    const saved = { owner: process.env.AIS_GATEWAY_OWNER, members: process.env.AIS_GATEWAY_MEMBERS_DIR };
+    process.env.AIS_GATEWAY_OWNER = "0";
+    process.env.AIS_GATEWAY_MEMBERS_DIR = opts.memberRoot!;
+    try {
+      expect(await isGatewayManagedHere("claude", "gamma", claudeRegistry)).toBe(true);
+      expect((await listGatewayManagedAccounts(claudeRegistry, "claude")).map((i) => i.name)).toContain("gamma");
+    } finally {
+      if (saved.owner === undefined) delete process.env.AIS_GATEWAY_OWNER;
+      else process.env.AIS_GATEWAY_OWNER = saved.owner;
+      if (saved.members === undefined) delete process.env.AIS_GATEWAY_MEMBERS_DIR;
+      else process.env.AIS_GATEWAY_MEMBERS_DIR = saved.members;
+    }
   });
 
   test("a re-run adds the routing record to an entry written without one, and changes nothing else", async () => {

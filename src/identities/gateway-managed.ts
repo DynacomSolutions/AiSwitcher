@@ -58,10 +58,11 @@ export function isGatewayServedTool(tool: string): tool is GatewayRefreshTool {
 }
 
 /**
- * Accounts the gateway owns for `tool`, whoever asks. claude: members of gateway-routed pools, plus every account moved
- * into the gateway member store (gateway-members.ts). codex, grok, kimi: every
- * live (not retired, not a swap pool) identity in the tool's registry, which is exactly what the gateway serves.
- * Unreadable registry or a tool the gateway does not serve: none.
+ * Accounts the gateway owns for `tool`, whoever asks: every live (not retired, not a swap pool) identity in the tool's
+ * registry, which is exactly what the gateway serves. For claude this also holds the members of gateway-routed pools, even
+ * when retired. An identity whose login is still only in its host folder is listed too: `ais identities
+ * route-all-via-gateway` then moves it into the member store (gateway-members.ts), and the gateway never serves an unlisted
+ * login. Unreadable registry or a tool the gateway does not serve: none.
  */
 export async function listGatewayManagedAccounts(registryPath?: string, tool: string = "claude"): Promise<Identity[]> {
   return listGatewayManagedAccountsStrict(registryPath, tool).catch(() => []);
@@ -75,11 +76,12 @@ export async function listGatewayManagedAccountsStrict(registryPath?: string, to
   if (!isGatewayServedTool(tool)) return [];
   const file = await loadIdentitiesFile(registryPath ?? REGISTRY_OF[tool]);
   if (tool !== "claude") return file.identities.filter((i) => !isRetired(i) && !i.swapPool);
+  // A retired member of a routed pool stays listed (the pool still names it); every other live identity is the gateway's.
   const names = new Set<string>();
   for (const pool of poolsOf(file)) {
     if (await isGatewayRoutedDir(expandPath(pool.configDir))) for (const a of pool.swapPool.accounts) names.add(a);
   }
-  return file.identities.filter((i) => !i.swapPool && (names.has(i.name) || (!isRetired(i) && hasMemberCopy(tool, i.name))));
+  return file.identities.filter((i) => !i.swapPool && (names.has(i.name) || !isRetired(i)));
 }
 
 /**

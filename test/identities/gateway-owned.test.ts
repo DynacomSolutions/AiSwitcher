@@ -101,12 +101,15 @@ describe("one check: isGatewayManagedHere", () => {
     expect(await isGatewayManagedHere("codex", NAME, registry())).toBe(false);
   });
 
-  test("a recorded claude login outside any routed pool is owned too, and a release hands it back", async () => {
-    expect(await isGatewayManagedHere("claude", NAME, registry())).toBe(false);
+  test("a recorded claude login of a retired identity stays owned until a release hands it back; an active identity is always managed", async () => {
+    const reg = join(root, "claude-identities.json");
+    await writeFile(reg, JSON.stringify({ version: 1, identities: [{ name: NAME, label: NAME, configDir: join(root, "folder", NAME), retired: true }, { name: "live", label: "live", configDir: join(root, "folder", "live") }] }));
+    expect(await isGatewayManagedHere("claude", "live", reg)).toBe(true);
+    expect(await isGatewayManagedHere("claude", NAME, reg)).toBe(false);
     await recordOwned([`claude/${NAME}`], new Date().toISOString());
-    expect(await isGatewayManagedHere("claude", NAME, registry())).toBe(true);
+    expect(await isGatewayManagedHere("claude", NAME, reg)).toBe(true);
     await releaseOwned("claude", NAME);
-    expect(await isGatewayManagedHere("claude", NAME, registry())).toBe(false);
+    expect(await isGatewayManagedHere("claude", NAME, reg)).toBe(false);
   });
 
   test("the gateway process itself is never blocked, and an unserved tool is never claimed", async () => {

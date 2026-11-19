@@ -40,6 +40,22 @@ const GROK_FILE = () => join(dirs.grok, "auth.json");
 const KIMI_FILE = () => join(dirs.kimi, "credentials", "kimi-code.json");
 const PI_AUTH = () => join(dirs.pi, "auth.json");
 
+/**
+ * The gateway manages every live claude login, so a host process never refreshes one. These tests exercise the refresh
+ * machinery itself, which only the gateway (the owner process) runs.
+ */
+const ownerRole = {
+  saved: undefined as string | undefined,
+  on(): void {
+    this.saved = process.env.AIS_GATEWAY_OWNER;
+    process.env.AIS_GATEWAY_OWNER = "1";
+  },
+  off(): void {
+    if (this.saved === undefined) delete process.env.AIS_GATEWAY_OWNER;
+    else process.env.AIS_GATEWAY_OWNER = this.saved;
+  },
+};
+
 beforeEach(async () => {
   const root = await mkdtemp(join(tmpdir(), "ais-oauth-refresh-"));
   tempDirs.push(root);
@@ -521,6 +537,8 @@ describe("refreshIdentityOAuthGrant: anthropic swap pool locking", () => {
       claudeAiOauth: { accessToken: "at-syn-cla", refreshToken: refresh, expiresAt: expiresAtSeconds * 1000 },
     });
 
+  beforeEach(() => ownerRole.on());
+  afterEach(() => ownerRole.off());
   beforeEach(async () => {
     poolDir = join(dirs.claude, "..", "pool");
     await mkdir(poolDir, { recursive: true });
@@ -595,6 +613,8 @@ describe("refreshIdentityOAuthGrant: anthropic swap pool review fixes", () => {
     (await readJson<{ claudeAiOauth: { refreshToken: string } }>(join(dir, ".credentials.json"))).claudeAiOauth.refreshToken;
   const opts = (extra: Record<string, unknown> = {}) => ({ claudeRegistryPath: registry, now: () => NOW * 1000, ...extra });
 
+  beforeEach(() => ownerRole.on());
+  afterEach(() => ownerRole.off());
   beforeEach(async () => {
     poolDir = join(dirs.claude, "..", "pool");
     await mkdir(poolDir, { recursive: true });

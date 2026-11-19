@@ -167,8 +167,8 @@ describe("sync merge of gateway-routed logins", () => {
     warnings.restore();
     expect(await f.read(CLAUDE)).toBe(claudeLogin("signed-in-here", 5000));
     expect(warnings.lines.filter((l) => l.includes("claude identity alpha: kept this host's login, a sign-in made after the identity was routed")).length).toBe(2);
-    // this host refreshes its own login normally: it is not the gateway's here
-    expect(await isGatewayManagedHere("claude", "alpha", join(f.home, ".claude", "identities.json"))).toBe(false);
+    // the gateway manages every live claude identity: this host never refreshes the login
+    expect(await isGatewayManagedHere("claude", "alpha", join(f.home, ".claude", "identities.json"))).toBe(true); // the gateway manages every live claude identity, routed here or not
     await expect(stat(join(f.home, ".ais", "gateway-replaced"))).rejects.toThrow();
   });
 
@@ -191,7 +191,7 @@ describe("sync merge of gateway-routed logins", () => {
     await routerHost.put(routerHost.incoming, CLAUDE, entryFromHere, T + 300);
     await routerHost.merge();
     expect(await routerHost.read(CLAUDE)).toBe(claudeLogin("routed", 1000));
-    expect(await isGatewayManagedHere("claude", "alpha", join(routerHost.home, ".claude", "identities.json"))).toBe(false);
+    expect(await isGatewayManagedHere("claude", "alpha", join(routerHost.home, ".claude", "identities.json"))).toBe(true); // the gateway manages every live claude identity, routed here or not
 
     // the other host: its entry is replaced by the restored login the gateway renewed since the routing
     const otherHost = await fixture();
@@ -217,7 +217,7 @@ describe("sync merge of gateway-routed logins", () => {
     await f.put(f.incoming, CLAUDE, claudeLogin("remote"), T + 100);
     await f.merge();
     expect(await f.read(CLAUDE)).toBe(claudeLogin("remote"));
-    expect(await isGatewayManagedHere("claude", "alpha", join(f.home, ".claude", "identities.json"))).toBe(false);
+    expect(await isGatewayManagedHere("claude", "alpha", join(f.home, ".claude", "identities.json"))).toBe(true); // the gateway manages every live claude identity, routed here or not
   });
 
   test("pi's copy of a routed login is dropped from what arrives and from the live file, other providers kept", async () => {
