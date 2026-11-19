@@ -11,31 +11,47 @@ describe("host dependency selection", () => {
   });
 
   test("runs the host suite for adapter and B contract inputs", () => {
-    expect(affectedHostChecks(["src/host/contract.ts"])).toEqual(["host"]);
+    expect(affectedHostChecks(["src/host/adapter.ts"])).toEqual(["host"]);
+    expect(affectedHostChecks(["src/host/protocol.ts"])).toEqual(["host"]);
     expect(affectedHostChecks(["image/contract/manifest.schema.json"])).toEqual(["host"]);
+    expect(affectedHostChecks(["image/release/minisign.pub"])).toEqual(["host"]);
+    expect(affectedHostChecks(["apps/host/bun.lock"])).toEqual(["host"]);
+    expect(affectedHostChecks(["apps/host/Cargo.lock"])).toEqual(["host"]);
+  });
+
+  test("runs the host suite when the adapter graph reaches a changed module", () => {
+    // adapter -> host/import -> sync/tree-merge -> identities/retire-credentials
+    // -> identities/auth-session -> identities/gateway-managed.
+    expect(affectedHostChecks(["src/identities/gateway-managed.ts"])).toEqual(["host"]);
+  });
+
+  test("skips the host jobs for gateway, web, tui and image-only changes", () => {
+    expect(affectedHostChecks(["src/gateway/serve.ts"])).toEqual([]);
+    expect(affectedHostChecks(["src/sync/service.ts"])).toEqual([]);
+    expect(affectedHostChecks(["src/shared/run-wrapper.ts"])).toEqual([]);
+    expect(affectedHostChecks(["apps/web/pnpm-lock.yaml"])).toEqual([]);
+    expect(affectedHostChecks(["apps/tui/src/main.rs"])).toEqual([]);
+    expect(affectedHostChecks(["image/pins.env"])).toEqual([]);
+    expect(affectedHostChecks(["docs/agents/history.md"])).toEqual([]);
   });
 
   test("fails safe to all host checks for uncertain shared inputs", () => {
     expect(affectedHostChecks(["package.json"])).toEqual(["all"]);
     expect(affectedHostChecks(["apps/other/unknown.txt"])).toEqual(["all"]);
     expect(affectedHostChecks(["apps/host/src/App.tsx", "apps/other/unknown.txt"])).toEqual(["all"]);
-    expect(affectedHostChecks(["src/sync/service.ts"])).toEqual(["all"]);
-    expect(affectedHostChecks(["src/live/dispatch.ts"])).toEqual(["all"]);
-    expect(affectedHostChecks(["image/release/minisign.pub"])).toEqual(["all"]);
-    expect(affectedHostChecks(["apps/web/pnpm-lock.yaml"])).toEqual(["all"]);
-    expect(affectedHostChecks(["apps/host/bun.lock"])).toEqual(["all"]);
     expect(affectedHostChecks(["Cargo.lock"])).toEqual(["all"]);
     expect(affectedHostChecks(["package.json", "apps/host/src/App.tsx"])).toEqual(["all"]);
     expect(affectedHostChecks(["apps/host/src/App.tsx", "unknown/path.ts"])).toEqual(["all"]);
-    expect(affectedHostChecks(["src/shared/run-wrapper.ts"])).toEqual(["all"]);
+    expect(affectedHostChecks([".github/workflows/host-app.yml"])).toEqual(["all"]);
+    // No static importer: these files run through subprocesses, so fail open.
+    expect(affectedHostChecks(["src/host/contract.ts"])).toEqual(["all"]);
+    expect(affectedHostChecks(["src/live/dispatch.ts"])).toEqual(["all"]);
     expect(affectedHostChecks(["src/identities/registry.ts"])).toEqual(["all"]);
-    expect(affectedHostChecks(["image/release-key/signing.ts"])).toEqual(["all"]);
   });
 
-  test("skips unrelated prose while checking build and workflow inputs", () => {
-    expect(affectedHostChecks(["docs/agents/history.md"])).toEqual([]);
-    expect(affectedHostChecks(["apps/host/Cargo.lock"])).toEqual(["all"]);
-    expect(affectedHostChecks([".github/workflows/host-app.yml"])).toEqual(["all"]);
+  test("a deleted file forces a full run", () => {
+    expect(affectedHostChecks(["apps/host/src/App.tsx"], { hasDeletions: true })).toEqual(["all"]);
+    expect(affectedHostChecks(["src/gateway/serve.ts"], { hasDeletions: true })).toEqual(["all"]);
   });
 
   test("the production entry and capabilities expose no mock bridge or broad access", () => {
