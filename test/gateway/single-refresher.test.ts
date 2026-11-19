@@ -113,7 +113,11 @@ afterAll(() => {
   else process.env.AIS_GATEWAY_MEMBER_STORE = savedMemberStore;
 });
 
+// The gateway process alone refreshes a claude login (every live claude identity is gateway managed), so these tests run as it.
+let savedOwnerRole: string | undefined;
 beforeEach(async () => {
+  savedOwnerRole = process.env.AIS_GATEWAY_OWNER;
+  process.env.AIS_GATEWAY_OWNER = "1";
   root = await mkdtemp(join(tmpdir(), "ais-single-refresher-"));
   configDir = join(root, "identities", "acct-a");
   await mkdir(configDir, { recursive: true });
@@ -121,6 +125,8 @@ beforeEach(async () => {
   await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "acct-a", label: "acct-a", configDir }] }));
 });
 afterEach(async () => {
+  if (savedOwnerRole === undefined) delete process.env.AIS_GATEWAY_OWNER;
+  else process.env.AIS_GATEWAY_OWNER = savedOwnerRole;
   await rm(root, { recursive: true, force: true });
 });
 
