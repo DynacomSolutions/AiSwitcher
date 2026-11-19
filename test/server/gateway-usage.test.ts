@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Identity } from "../../src/identities/types.ts";
-import type { ModelUsageRow } from "../../src/gateway/types.ts";
+import type { ModelDailyUsageRow, ModelUsageRow } from "../../src/gateway/types.ts";
 import type { GatewayModelUsageView } from "../../src/gateway/usage-view.ts";
 import { GATEWAY_USAGE_WINDOW_DAYS, gatewayUsageResults, mergeGatewayUsage } from "../../src/server/gateway-usage.ts";
 
@@ -41,6 +41,7 @@ const hostRow = (provider: string, name: string, over: Record<string, unknown> =
 });
 const payload = (results: unknown[]) => ({ results, generatedAt: STAMP, stale: false, pending: false });
 const noRegistries = async () => [];
+const noManaged = async () => [];
 
 describe("gatewayUsageResults", () => {
   const rows = [
@@ -91,7 +92,7 @@ describe("mergeGatewayUsage", () => {
       hostRow("anthropic", "pool"),
       hostRow("openai", "c1"),
     ]);
-    const merged = (await mergeGatewayUsage(host, view(gatewayRows), {}, noRegistries)) as typeof host;
+    const merged = (await mergeGatewayUsage(host, view(gatewayRows), {}, noRegistries, noManaged)) as typeof host;
     expect(merged.generatedAt).toBe(STAMP);
     expect(merged.results).toHaveLength(3);
     const m1 = merged.results[0] as Record<string, any>;
@@ -100,7 +101,7 @@ describe("mergeGatewayUsage", () => {
     expect(m1.report.entries[0].model).toBe("sonnet");
     expect(m1.report.entries[0].client).toBeUndefined();
     expect(m1.dateSpan).toEqual({ firstMs: Date.parse(FIRST), lastMs: Date.parse(LAST) });
-    // The gateway cannot split by day, so the host day splits and stale error are dropped, never faked.
+    // The view has no per-day rows here, so the host day splits and stale error are dropped, never faked.
     expect(m1.dailyTotals).toBeUndefined();
     expect(m1.dailyUsage).toBeUndefined();
     expect(m1.error).toBeUndefined();
@@ -124,11 +125,66 @@ describe("mergeGatewayUsage", () => {
     expect((merged.results[1] as any).report.entries[0].client).toBeUndefined();
   });
 
-  test("an unconfigured or failed gateway read leaves the host payload unchanged", async () => {
+  test("an unconfigured gateway read leaves the host payload unchanged", async () => {
     const host = payload([hostRow("anthropic", "m1")]);
-    expect(await mergeGatewayUsage(host, { configured: false, rows: [] }, {}, noRegistries)).toBe(host);
-    expect(await mergeGatewayUsage(host, view(gatewayRows, { error: "admin unreachable" }), {}, noRegistries)).toBe(host);
-    expect(await mergeGatewayUsage({ generatedAt: STAMP }, view(gatewayRows), {}, noRegistries)).toEqual({ generatedAt: STAMP });
+    expect(await mergeGatewayUsage(host, { configured: false, rows: [] }, {}, noRegistries, noManaged)).toBe(host);
+    expect(await mergeGatewayUsage({ generatedAt: STAMP }, view(gatewayRows), {}, noRegistries, noManaged)).toEqual({ generatedAt: STAMP });
+  });
+
+  test("a failed gateway read marks managed identities with an error and keeps other host rows", async () => {
+    const host = payload([hostRow("anthropic", "m1", { extraCost: { active: false, label: "x" } }), hostRow("anthropic", "pool"), hostRow("openai", "c1")]);
+    const managed = async () => [{ provider: "anthropic", name: "m1" }, { provider: "openai", name: "c1" }];
+    const merged = (await mergeGatewayUsage(host, view([], { error: "admin unreachable" }), {}, noRegistries, managed)) as typeof host;
+    const m1 = merged.results[0] as Record<string, any>;
+    expect(m1.error).toBe("gateway usage unavailable: admin unreachable");
+    expect(m1.report).toBeUndefined();
+    expect(m1.dailyTotals).toBeUndefined();
+    expect(m1.dailyUsage).toBeUndefined();
+    expect(m1.extraCost).toEqual({ active: false, label: "x" });
+    expect(m1.identity).toEqual(identity("m1"));
+    expect(merged.results[1]).toEqual(host.results[1]); // not managed by the gateway: host numbers stay
+    expect((merged.results[2] as any).error).toContain("gateway usage unavailable");
+  });
+
+  test("a managed identity with no ledger rows shows zero, never host numbers", async () => {
+    const host = payload([hostRow("anthropic", "m1"), hostRow("anthropic", "pool")]);
+    const managed = async () => [{ provider: "anthropic", name: "m1" }];
+    const merged = (await mergeGatewayUsage(host, view([modelRow("codex", "c1", "web", "gpt", { inputTokens: 1 })]), {}, noRegistries, managed)) as typeof host;
+    const m1 = merged.results[0] as Record<string, any>;
+    expect(m1.report).toMatchObject({ totalInput: 0, totalOutput: 0, totalMessages: 0, totalCost: 0, entries: [] });
+    expect(m1.error).toBeUndefined();
+    expect(merged.results[1]).toEqual(host.results[1]);
+  });
+
+  test("per-day rows fill dailyUsage and dailyTotals in the host shape, summed across models", async () => {
+    const day = (d: string, model: string | null, over: Partial<ModelDailyUsageRow> = {}): ModelDailyUsageRow => ({
+      day: d, provider: "claude", identity: "m1", model, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0, ...over,
+    });
+    const daily = [
+      day("2026-11-19", "sonnet", { inputTokens: 6, outputTokens: 3, cacheReadTokens: 50, estCostUsd: 0.3, requests: 1 }),
+      day("2026-11-19", null, { inputTokens: 1, outputTokens: 1, requests: 1 }),
+      day("2026-11-18", "sonnet", { inputTokens: 4, outputTokens: 2, cacheWriteTokens: 7, estCostUsd: 0.2, requests: 1 }),
+      { ...day("2026-11-19", "gpt", { inputTokens: 3, outputTokens: 3, estCostUsd: 1, requests: 1 }), provider: "codex", identity: "c1" },
+    ];
+    const host = payload([hostRow("anthropic", "m1"), hostRow("openai", "c1")]);
+    const merged = (await mergeGatewayUsage(host, view(gatewayRows, { daily, dailyZone: "UTC" }), {}, noRegistries, noManaged)) as typeof host;
+    const m1 = merged.results[0] as Record<string, any>;
+    expect(m1.dailyUsage).toEqual({ "2026-11-19": 11, "2026-11-18": 6 });
+    expect(m1.dailyTotals).toEqual({
+      "2026-11-19": [7, 4, 50, 0, 2, 0.3],
+      "2026-11-18": [4, 2, 0, 7, 1, 0.2],
+    });
+    expect((merged.results[1] as any).dailyTotals).toEqual({ "2026-11-19": [3, 3, 0, 0, 1, 1] });
+  });
+
+  test("the daily filters follow the tool and identity filters", () => {
+    const daily: ModelDailyUsageRow[] = [
+      { day: "2026-11-19", provider: "claude", identity: "m1", model: "s", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 1 },
+      { day: "2026-11-19", provider: "codex", identity: "c1", model: "g", inputTokens: 2, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 1 },
+    ];
+    const results = gatewayUsageResults(view([], { daily }), { tool: "codex" });
+    expect(results.map((r) => r.identity.name)).toEqual(["c1"]);
+    expect(results[0]!.dailyUsage).toEqual({ "2026-11-19": 4 });
   });
 
   test("the tool and identity filters apply to the gateway rows too", async () => {
@@ -138,9 +194,9 @@ describe("mergeGatewayUsage", () => {
       modelRow("claude", "m9", "web", "sonnet", { inputTokens: 4, outputTokens: 4, estCostUsd: 0.2, requests: 1 }),
       modelRow("codex", "c9", "web", "gpt", { inputTokens: 5, outputTokens: 5, estCostUsd: 0.3, requests: 1 }),
     ];
-    const byTool = (await mergeGatewayUsage(host, view(rows), { tool: "claude" }, noRegistries)) as typeof host;
+    const byTool = (await mergeGatewayUsage(host, view(rows), { tool: "claude" }, noRegistries, noManaged)) as typeof host;
     expect(byTool.results.map((r: any) => `${r.provider}/${r.identity.name}`)).toEqual(["anthropic/m1", "openai/c1", "anthropic/m9"]);
-    const byIdentity = (await mergeGatewayUsage(host, view(rows), { identity: "m1" }, noRegistries)) as typeof host;
+    const byIdentity = (await mergeGatewayUsage(host, view(rows), { identity: "m1" }, noRegistries, noManaged)) as typeof host;
     expect(byIdentity.results.map((r: any) => r.identity.name)).toEqual(["m1", "c1"]);
     expect((byIdentity.results[0] as any).report.totalInput).toBe(10);
   });

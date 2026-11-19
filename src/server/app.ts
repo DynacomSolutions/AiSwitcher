@@ -28,7 +28,7 @@ import { accountKey, collectAccounts } from "../identities/account-info.ts";
 import { invalidateLimitsCache, runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayModelUsage, loadGatewayUsage, type GatewayModelUsageView, type GatewayUsageView } from "../gateway/usage-view.ts";
 import { loadGatewayLimits, mergeGatewayLimits, type GatewayLimitsView } from "./gateway-limits.ts";
-import { GATEWAY_USAGE_WINDOW_DAYS, mergeGatewayUsage } from "./gateway-usage.ts";
+import { GATEWAY_USAGE_WINDOW_DAYS, gatewayUsageAnswered, mergeGatewayUsage, usageBucketZone } from "./gateway-usage.ts";
 import * as gatewayApps from "./gateway-apps.ts";
 import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -298,14 +298,18 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
     };
     // The cluster gateway ledger is the source of truth for the usage of the identities it manages; the host scan covers the rest.
-    // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
+    // Both reads run together. A managed identity never shows host numbers: a failed gateway read marks it with an error.
+    // A failed host scan never blanks the page when the gateway answered.
     const [result, gateway] = await Promise.all([
       runScanIsolated("usage", filters, scanTimeoutAboveTokscale(60_000)),
-      (deps.gatewayModelUsage ?? (() => loadGatewayModelUsage(GATEWAY_USAGE_WINDOW_DAYS)))().catch(() => undefined),
+      (deps.gatewayModelUsage ?? (() => loadGatewayModelUsage(GATEWAY_USAGE_WINDOW_DAYS, { zone: usageBucketZone() })))().catch((): GatewayModelUsageView => ({ configured: true, rows: [], error: "admin unreachable" })),
     ]);
-    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
-    const payload = gateway ? await mergeGatewayUsage(result.payload, gateway, filters) : result.payload;
-    return c.json(payload);
+    if (!result.ok) {
+      if (!gatewayUsageAnswered(gateway)) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
+      const hostOnly = { results: [], generatedAt: new Date().toISOString(), stale: false, pending: false, lastError: "host usage scan failed", lastErrorAt: new Date().toISOString() };
+      return c.json(await mergeGatewayUsage(hostOnly, gateway, filters));
+    }
+    return c.json(gateway ? await mergeGatewayUsage(result.payload, gateway, filters) : result.payload);
   });
   // Per-app gateway tokens from the admin API; "configured: false" when this
   // process has no admin URL and token, so the console can hide the section.

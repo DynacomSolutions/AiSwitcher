@@ -2,19 +2,24 @@ import { canonicalUsageProvider } from "../cli/usage/providers.ts";
 import type { UsageResult } from "../cli/usage/run.ts";
 import type { TokscaleEntry, TokscaleReport } from "../cli/usage/tokscale.ts";
 import { loadAll, type LoadedFile } from "../cli/identities/resolve-tool.ts";
+import { aisNativeTokscaleConfigDir, readTokscaleBucketTimezone, tokscalePinnedZone, addDailyTotals, type DailyTotals } from "../cli/usage/tokscale.ts";
+import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
+import { GATEWAY_REFRESH_TOOLS, listAliAccounts, listGatewayManagedAccounts } from "../identities/gateway-managed.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import type { GatewayModelUsageView } from "../gateway/usage-view.ts";
 
 /**
  * The cluster gateway ledger is the source of truth for the token usage of the identities it manages.
- * The console reads the gateway admin route `GET /usage/models` server-side (the admin token never reaches
- * the page) and merges its per-model totals over the host transcript scan, so a pod with stale or missing
- * local history still shows the real figures. Host rows the gateway does not cover stay as they are.
+ * The console reads the gateway admin routes `GET /usage/models` and `GET /usage/models/daily` server-side
+ * (the admin token never reaches the page) and merges them over the host transcript scan, so a pod with stale
+ * or missing local history still shows the real figures. Host rows stay only for identities the gateway does
+ * not manage; a managed identity never shows host numbers, even when the gateway read fails (it shows an
+ * honest error instead).
  *
- * The ledger records tokens, cost and request counts per provider, identity, app and model. It has no
- * per-day split, no tool-call categories and no working directory, so this merge replaces the report and
- * date span only: a merged row counts under "All time" (the web period view says so honestly), and the
- * breakdown and projects views stay host-only.
+ * The ledger records tokens, cost and request counts per provider, identity, app, model and instant. The
+ * merge fills the report, date span and the per-day figures (dailyUsage, dailyTotals, bucketed in the zone the
+ * host usage view uses). It has no tool-call categories and no working directory, so the breakdown and
+ * projects views stay host-only.
  */
 
 /** The ledger window the console reads: the admin API bounds it to 90 days. */
@@ -41,17 +46,22 @@ const TOOL_BY_PROVIDER: Record<string, string> = Object.fromEntries(Object.entri
  */
 export function gatewayUsageResults(view: GatewayModelUsageView, filters: { tool?: string; identity?: string } = {}): UsageResult[] {
   if (!view.configured || view.error) return [];
-  const groups = new Map<string, { provider: string; identity: string; models: Map<string, TokscaleEntry>; firstMs?: number; lastMs?: number }>();
+  const groups = new Map<string, { provider: string; identity: string; models: Map<string, TokscaleEntry>; firstMs?: number; lastMs?: number; daily: Record<string, number>; totals: DailyTotals }>();
+  const groupFor = (rawProvider: string, identity: string) => {
+    const provider = PROVIDER_BY_TOOL[rawProvider] ?? rawProvider;
+    const key = `${provider}\u0000${identity}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { provider, identity, models: new Map(), daily: {}, totals: {} };
+      groups.set(key, g);
+    }
+    return g;
+  };
   for (const row of view.rows) {
     if (filters.tool !== undefined && row.provider !== filters.tool) continue;
     if (filters.identity !== undefined && row.identity !== filters.identity) continue;
-    const provider = PROVIDER_BY_TOOL[row.provider] ?? row.provider;
-    const key = `${provider}\u0000${row.identity}`;
-    let g = groups.get(key);
-    if (!g) {
-      g = { provider, identity: row.identity, models: new Map() };
-      groups.set(key, g);
-    }
+    const g = groupFor(row.provider, row.identity);
+    const provider = g.provider;
     const model = row.model ?? "(unknown)";
     let e = g.models.get(model);
     if (!e) {
@@ -68,6 +78,14 @@ export function gatewayUsageResults(view: GatewayModelUsageView, filters: { tool
     const last = row.lastTs === undefined ? Number.NaN : Date.parse(row.lastTs);
     if (Number.isFinite(first)) g.firstMs = g.firstMs === undefined ? first : Math.min(g.firstMs, first);
     if (Number.isFinite(last)) g.lastMs = g.lastMs === undefined ? last : Math.max(g.lastMs, last);
+  }
+  // The per-day split: the same window as the totals, so the days add up to the report. Only days with activity appear.
+  for (const row of view.daily ?? []) {
+    if (filters.tool !== undefined && row.provider !== filters.tool) continue;
+    if (filters.identity !== undefined && row.identity !== filters.identity) continue;
+    const g = groupFor(row.provider, row.identity);
+    g.daily[row.day] = (g.daily[row.day] ?? 0) + row.inputTokens + row.outputTokens;
+    addDailyTotals(g.totals, row.day, row.inputTokens, row.outputTokens, row.cacheReadTokens, row.cacheWriteTokens, row.requests, row.estCostUsd);
   }
   const results: UsageResult[] = [];
   for (const g of groups.values()) {
@@ -86,6 +104,7 @@ export function gatewayUsageResults(view: GatewayModelUsageView, filters: { tool
       identity: { name: g.identity, label: g.identity, configDir: "" },
       report,
       ...(g.firstMs !== undefined && g.lastMs !== undefined ? { dateSpan: { firstMs: g.firstMs, lastMs: g.lastMs } } : {}),
+      ...(view.daily ? { dailyUsage: g.daily, dailyTotals: g.totals } : {}),
     });
   }
   return results.sort((a, b) => a.provider.localeCompare(b.provider) || a.identity.name.localeCompare(b.identity.name));
@@ -96,34 +115,98 @@ function publicReport(report: TokscaleReport) {
   return { ...report, entries: report.entries.map(({ client: _client, ...entry }) => entry) };
 }
 
+/** One identity the gateway manages: its canonical console provider and registry name. */
+export interface ManagedUsageAccount {
+  provider: string;
+  name: string;
+}
+
 /**
- * Merges the gateway rows into a host usage payload. The gateway is authoritative for the tokens, cost and
- * messages of the identities it manages: its report and date span replace the host's, keeping the host's
- * registry entry and overage. The host's per-day splits and error are dropped (the gateway answer replaces
- * them and cannot split by day). Host rows the gateway does not cover stay as they are; gateway rows with no
- * host row are added with their registry entry when one exists. An unconfigured or failed gateway read leaves
- * the payload unchanged. The tool and identity filters apply to the gateway rows as well.
+ * The identities the gateway manages, from the host registries (the same set the host refreshers skip, see
+ * identities/gateway-managed.ts): every live identity of a tool the gateway serves, plus its ali browser sessions.
+ * The merge needs it when the gateway read fails, because there are no ledger rows to name them then.
+ */
+export async function listManagedUsageAccounts(): Promise<ManagedUsageAccount[]> {
+  const out: ManagedUsageAccount[] = [];
+  for (const tool of GATEWAY_REFRESH_TOOLS) {
+    for (const identity of await listGatewayManagedAccounts(undefined, tool).catch(() => [])) out.push({ provider: canonicalUsageProvider(PROVIDER_BY_TOOL[tool] ?? tool), name: identity.name });
+  }
+  for (const identity of await listAliAccounts().catch(() => [])) out.push({ provider: canonicalUsageProvider(PROVIDER_BY_TOOL.ali ?? "ali"), name: identity.name });
+  return out;
+}
+
+/**
+ * The IANA zone the host usage view buckets its days in: the zone pinned in the native Tokscale settings, else the
+ * machine's own zone. A zone the gateway would reject falls back to UTC.
+ */
+export function usageBucketZone(): string {
+  const pinned = tokscalePinnedZone(readTokscaleBucketTimezone(aisNativeTokscaleConfigDir()));
+  if (pinned) return pinned;
+  const local = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return TOKSCALE_TIME_ZONE_NAMES.has(local) ? local : "UTC";
+}
+
+/** True when the gateway answered the usage read (configured, no error): its rows may replace host rows. */
+export function gatewayUsageAnswered(view: GatewayModelUsageView | undefined): view is GatewayModelUsageView {
+  return view !== undefined && view.configured && !view.error;
+}
+
+const EMPTY_REPORT = (): TokscaleReport => ({ entries: [], totalInput: 0, totalOutput: 0, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 0, totalCost: 0 });
+
+/**
+ * Merges the gateway rows into a host usage payload. The gateway is authoritative for the tokens, cost, messages and
+ * per-day figures of the identities it manages: its report, date span and day splits replace the host's, keeping the
+ * host's registry entry and overage. A managed identity is one the gateway reported or the host registries list as
+ * gateway-managed (the limits merge uses the gateway's rows the same way). Its host numbers never show: with no ledger
+ * rows it shows zero, and when the gateway read fails it shows an honest "gateway usage unavailable" error. Host rows
+ * for identities the gateway does not manage stay as they are; gateway rows with no host row are added with their
+ * registry entry when one exists. An unconfigured gateway leaves the payload unchanged. The tool and identity filters
+ * apply to the gateway rows as well.
  */
 export async function mergeGatewayUsage(
   payload: unknown,
   view: GatewayModelUsageView,
   filters: { tool?: string; identity?: string } = {},
   loadRegistries: () => Promise<LoadedFile[]> = () => loadAll(),
+  loadManaged: () => Promise<ManagedUsageAccount[]> = listManagedUsageAccounts,
 ): Promise<unknown> {
-  if (!view.configured || view.error) return payload;
+  if (!view.configured) return payload;
   const results = (payload as { results?: unknown } | null | undefined)?.results;
   if (!Array.isArray(results)) return payload;
   const keyOf = (provider: string, name: string): string => `${canonicalUsageProvider(provider)}\u0000${name}`;
+  const managed = new Set((await loadManaged().catch(() => [] as ManagedUsageAccount[])).map((a) => keyOf(a.provider, a.name)));
+  const hostKey = (host: UsageResult): string | undefined => (host?.provider && host.identity?.name ? keyOf(host.provider, host.identity.name) : undefined);
+  const stripNumbers = ({ report: _report, dateSpan: _dateSpan, dailyUsage: _dailyUsage, dailyTotals: _dailyTotals, error: _error, pending: _pending, ...rest }: UsageResult) => rest;
+
+  if (view.error) {
+    const reason = `gateway usage unavailable: ${view.error}`;
+    const merged = (results as UsageResult[]).map((host) => {
+      const key = hostKey(host);
+      return key && managed.has(key) ? { ...stripNumbers(host), error: reason } : host;
+    });
+    return { ...(payload as object), results: merged };
+  }
+
   const gatewayByKey = new Map<string, UsageResult>();
   for (const row of gatewayUsageResults(view, filters)) gatewayByKey.set(keyOf(row.provider, row.identity.name), row);
   const used = new Set<string>();
   const merged: unknown[] = (results as UsageResult[]).map((host) => {
-    const key = host?.provider && host.identity?.name ? keyOf(host.provider, host.identity.name) : undefined;
-    const gateway = key ? gatewayByKey.get(key) : undefined;
-    if (!key || !gateway || !gateway.report) return host;
-    used.add(key);
-    const { report: _report, dateSpan: _dateSpan, dailyUsage: _dailyUsage, dailyTotals: _dailyTotals, error: _error, pending: _pending, ...rest } = host;
-    return { ...rest, report: publicReport(gateway.report), ...(gateway.dateSpan ? { dateSpan: gateway.dateSpan } : {}) };
+    const key = hostKey(host);
+    if (!key) return host;
+    const gateway = gatewayByKey.get(key);
+    if (gateway?.report) {
+      used.add(key);
+      return {
+        ...stripNumbers(host),
+        report: publicReport(gateway.report),
+        ...(gateway.dateSpan ? { dateSpan: gateway.dateSpan } : {}),
+        ...(gateway.dailyUsage ? { dailyUsage: gateway.dailyUsage } : {}),
+        ...(gateway.dailyTotals ? { dailyTotals: gateway.dailyTotals } : {}),
+      };
+    }
+    // Managed but no ledger rows in the window: zero from the gateway, never the host's figures.
+    if (managed.has(key)) return { ...stripNumbers(host), report: EMPTY_REPORT(), dailyUsage: {}, dailyTotals: {} };
+    return host;
   });
   const added = [...gatewayByKey.values()].filter((row) => !used.has(keyOf(row.provider, row.identity.name)));
   if (added.length > 0) {
