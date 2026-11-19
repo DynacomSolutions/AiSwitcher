@@ -1,4 +1,4 @@
-import type { GatewayPeriod, LimitWindow, PoolRef, PoolsUsageResponse, ToolLimitResult, UsageResult } from "../types/api";
+import type { AccountInfo, GatewayPeriod, LimitWindow, PoolRef, PoolsUsageResponse, ToolLimitResult, UsageResult } from "../types/api";
 
 /** The usage provider each pool tool's native figures are filed under. */
 const USAGE_PROVIDER: Record<string, string> = { claude: "anthropic", codex: "openai", kimi: "kimi" };
@@ -29,6 +29,7 @@ export interface MemberPeriod {
 export interface MemberUsage {
   name: string;
   allowed: boolean;
+  account?: AccountInfo;
   today: MemberPeriod;
   week: MemberPeriod;
   /** Worst window utilisation over the member's limit windows, or why there is none. */
@@ -155,7 +156,7 @@ export function summarisePools(pools: PoolRef[], usage: UsageResult[], limits: T
         native: dayFigure(result, name === "today" ? resp.todayKey : resp.weekStartKey, resp.todayKey),
         gateway: gatewayFigure(resp.gateway[name], gwProvider, m.name),
       });
-      const out: MemberUsage = { name: m.name, allowed: m.allowed, today: period("today"), week: period("week") };
+      const out: MemberUsage = { name: m.name, allowed: m.allowed, ...(m.account ? { account: m.account } : {}), today: period("today"), week: period("week") };
       const lim = limitsFor(pool.tool, m.name, limits);
       if ("missing" in lim) out.limitMissing = lim.missing;
       else {

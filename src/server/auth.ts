@@ -12,6 +12,7 @@ import { readZaiApiKey, writeZaiAuthFile } from "../identities/zai-auth.ts";
 import { withUsableCwd } from "../shared/exec.ts";
 import { resolveRealBinary } from "../shared/resolve-binary.ts";
 import { hasMemberCopy, memberDir, memberStoreRoot, type MemberStoreTool } from "../identities/gateway-members.ts";
+import { collectAccounts, accountKey } from "../identities/account-info.ts";
 import { folderHoldsGatewayEntry } from "../identities/gateway-routed.ts";
 import { readLoginRevoked } from "../identities/gateway-revoked.ts";
 import { LOGIN_FLOW_SPECS, type LoginFlowSpec } from "./login-specs.ts";
@@ -330,6 +331,7 @@ export async function authStatus(
   refreshStatus: RefreshStatusDto[] = [],
 ): Promise<AuthDto> {
   const loaded = await loadAll(configs);
+  const accounts = await collectAccounts(loaded);
   const entries: AuthEntryDto[] = [];
   for (const { cfg, file } of loaded) {
     for (const identity of file.identities) {
@@ -414,6 +416,7 @@ export async function authStatus(
         ...(result.expiresAt ? { expiresAt: result.expiresAt } : {}),
         ...(refresh?.lastSuccessAt ? { lastRefreshAt: refresh.lastSuccessAt } : {}),
         ...(refresh?.lastError ? { refreshError: refresh.lastError } : {}),
+        ...(accounts.get(accountKey(cfg.toolName, identity.name)) ? { account: accounts.get(accountKey(cfg.toolName, identity.name))! } : {}),
       });
     }
   }

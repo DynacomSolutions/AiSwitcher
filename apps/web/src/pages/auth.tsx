@@ -3,6 +3,7 @@ import { ExternalLink, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
+import { AccountLine } from "@/components/account-line";
 import { AuthStateBadge, ToolBadge } from "@/components/badges";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
@@ -85,8 +86,9 @@ function LoginFlowDialog({ flowId, onClose }: { flowId: string; onClose: () => v
     if (flow?.status === "completed" && !completedRef.current) {
       completedRef.current = true;
       void qc.invalidateQueries({ queryKey: qk.auth });
-      if (flow.note) toast.warning("Signed in, but the gateway is not using the new login", { description: flow.note });
-      else toast.success("Logged in", { description: `${flow.toolName}/${flow.identity}` });
+      if (flow.gateway?.outcome === "error") toast.error("Signed in, but the gateway could not take the new login", { description: flow.gateway.message });
+      else if (flow.gateway?.outcome === "attention") toast.warning("Signed in", { description: flow.gateway.message });
+      else toast.success("Logged in", { description: flow.gateway?.message ?? `${flow.toolName}/${flow.identity}` });
     }
   }, [flow, qc]);
 
@@ -129,11 +131,7 @@ function LoginFlowDialog({ flowId, onClose }: { flowId: string; onClose: () => v
         ) : (
           <div className="space-y-4">
             <div className="flex items-center justify-between gap-2">
-              {flow.status === "completed" && flow.note ? (
-                <Badge variant="warning">Signed in, gateway not updated</Badge>
-              ) : (
-                <FlowStatusBadge status={flow.status} />
-              )}
+              <FlowStatusBadge status={flow.status} />
               {live ? (
                 <span className="text-xs text-muted-foreground">polling every 1.5s...</span>
               ) : null}
@@ -193,9 +191,17 @@ function LoginFlowDialog({ flowId, onClose }: { flowId: string; onClose: () => v
               </form>
             ) : null}
 
-            {flow.note ? (
-              <p className="break-words rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
-                {flow.note}
+            {flow.gateway ? (
+              <p
+                className={`break-words rounded-lg border p-2.5 text-xs ${
+                  flow.gateway.outcome === "error"
+                    ? "border-destructive/40 bg-destructive/10 text-destructive"
+                    : flow.gateway.outcome === "attention"
+                      ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                      : "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                }`}
+              >
+                {flow.gateway.message}
               </p>
             ) : null}
 
@@ -549,6 +555,7 @@ export function AuthPage() {
               <TableRow className="hover:bg-transparent">
                 <TableHead>Tool</TableHead>
                 <TableHead>Identity</TableHead>
+                <TableHead>Account</TableHead>
                 <TableHead>Kind</TableHead>
                 <TableHead>State</TableHead>
                 <TableHead>Detail</TableHead>
@@ -562,6 +569,9 @@ export function AuthPage() {
                     <ToolBadge tool={entry.toolName} />
                   </TableCell>
                   <TableCell className="font-medium">{entry.identity}</TableCell>
+                  <TableCell className="max-w-80 whitespace-normal">
+                    <AccountLine account={entry.account} />
+                  </TableCell>
                   <TableCell>
                     <Badge variant="outline" className="font-mono text-[10px]">
                       {entry.kind}
