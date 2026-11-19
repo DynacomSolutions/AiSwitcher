@@ -675,6 +675,7 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     await chmod(root, 0o700);
   }
   // The gateway refreshes this account under these locks: holding them, the login copied below is the latest one.
+  let storeWritten = false;
   const outcome = await withOauthRefreshLocks([dir, memberDir(tool, identity.name, root)], async () => {
     // A session may have started while this run waited for the locks.
     const busyNow = await sessionsProblem(tool, dir, opts);
@@ -698,6 +699,7 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
       if (plan.write) {
         wroteStore = true;
         const note = await writeStoreCopy(tool, identity, localText!, root, plan.write.replacing, now, owner);
+        storeWritten = true;
         if (note) notes.push(note);
       }
       // Nothing local changes unless the store demonstrably holds a usable login now.
@@ -713,9 +715,10 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     return undefined;
   });
   if (outcome) return { ...line, status: "refused", detail: outcome };
-  // An owner sign-in reaches the PostgreSQL store at once (when this process has its config); a failure only adds a note.
+  // An owner sign-in, or a login this run moved into the member store (a folder-only login the gateway now holds), reaches
+  // the PostgreSQL store at once (when this process has its config); a failure only adds a note.
   let storeNote: string | undefined;
-  if (owner && kind === "login") {
+  if (kind === "login" && (owner || storeWritten)) {
     storeNote = await (opts.storePush ?? ((t, n, r) => pushOwnerLogin(t, n, { root: r, ...(opts.home ? { home: opts.home } : {}), ...(opts.secretsPath ? { secretsPath: opts.secretsPath } : {}) })))(tool, identity.name, root);
     notes.push(storeNote);
   }

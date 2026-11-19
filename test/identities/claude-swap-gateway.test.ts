@@ -266,7 +266,10 @@ describe("a gateway token that leaked into a member store (older build converged
     const a = ((await read(registry)) as IdentitiesFile).identities.find((i) => i.name === "a")!;
     await writeFile(join(poolDir(), ".credentials.json"), cred("at-a2", "rt-a1", NOW_S + 3000));
     await rm(join(poolDir(), "settings.json"));
-    await convergeClaudePoolStores(a, registry);
+    // Convergence is the gateway process's work: a host process never writes a gateway-managed login.
+    const savedRole = process.env.AIS_GATEWAY_OWNER;
+    process.env.AIS_GATEWAY_OWNER = "1";
+    try { await convergeClaudePoolStores(a, registry); } finally { if (savedRole === undefined) delete process.env.AIS_GATEWAY_OWNER; else process.env.AIS_GATEWAY_OWNER = savedRole; }
     expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.accessToken).toBe("at-a2");
   });
 
@@ -432,10 +435,10 @@ describe("the cluster gateway owns gateway-managed logins; nothing local touches
     expect(posts).toBe(1);
   });
 
-  test("a member of no gateway-routed pool is still refreshed locally", async () => {
+  test("every live claude identity is the gateway's, in a routed pool or not; an unknown name is not", async () => {
     const { isGatewayManagedHere } = await import("../../src/identities/gateway-managed.ts");
     await withRole("0", async () => {
-      expect(await isGatewayManagedHere("claude", "a", registry)).toBe(false); // pool folder not routed
+      expect(await isGatewayManagedHere("claude", "a", registry)).toBe(true); // pool folder not routed
       await routeThroughProxy();
       expect(await isGatewayManagedHere("claude", "a", registry)).toBe(true);
       expect(await isGatewayManagedHere("claude", "unknown", registry)).toBe(false);

@@ -159,10 +159,11 @@ describe("an account moved into the gateway member store is the gateway's", () =
 
   test("claimed by every non-owner process without a heartbeat; never by the gateway itself", async () => {
     process.env.AIS_GATEWAY_OWNER = "0";
-    for (const tool of ["claude", "codex"]) {
-      expect(await isGatewayManagedHere(tool, "moved", registry)).toBe(true);
-      expect(await isGatewayManagedHere(tool, "plain", registry)).toBe(false);
-    }
+    expect(await isGatewayManagedHere("codex", "moved", registry)).toBe(true);
+    expect(await isGatewayManagedHere("codex", "plain", registry)).toBe(false);
+    // claude: every active identity is the gateway's, with or without a member store file
+    expect(await isGatewayManagedHere("claude", "moved", registry)).toBe(true);
+    expect(await isGatewayManagedHere("claude", "plain", registry)).toBe(true);
     process.env.AIS_GATEWAY_OWNER = "1";
     expect(await isGatewayManagedHere("claude", "moved", registry)).toBe(false);
   });
@@ -171,11 +172,13 @@ describe("an account moved into the gateway member store is the gateway's", () =
     process.env.AIS_GATEWAY_OWNER = "0";
     await writeFile(join(root, "members", "codex", "moved", "auth.json"), "");
     await writeFile(join(root, "members", "claude", "moved", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "a", refreshToken: "" } }));
-    for (const tool of ["claude", "codex"]) expect(await isGatewayManagedHere(tool, "moved", registry)).toBe(false);
+    expect(await isGatewayManagedHere("codex", "moved", registry)).toBe(false);
+    // a claude identity is the gateway's whatever its store file holds: it is live and not a swap pool
+    expect(await isGatewayManagedHere("claude", "moved", registry)).toBe(true);
   });
 
-  test("claude lists a moved account even outside a gateway-routed pool (retired ones excluded)", async () => {
-    expect((await listGatewayManagedAccounts(registry, "claude")).map((i) => i.name)).toEqual(["moved"]);
+  test("claude lists every active identity, with a member store file or only a folder login (retired and pools excluded)", async () => {
+    expect((await listGatewayManagedAccounts(registry, "claude")).map((i) => i.name)).toEqual(["moved", "plain"]);
   });
 
   test("a non-owner refresh of a moved claude account is skipped with no request", async () => {
