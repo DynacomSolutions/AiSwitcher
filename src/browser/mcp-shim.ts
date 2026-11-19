@@ -243,11 +243,11 @@ export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimO
   // The session key stays `agent-<ppid>` for Codex without an id in the env; only the NAME lookup finds the thread.
   const lookup = tool === "claude" && claudeId ? claudeId : tool === "codex" ? (env.CODEX_SESSION_ID || (() => findCodexThreadId(configDirs[0] ?? codexHome, process.ppid, process.cwd()))) : undefined;
   return {
-    ...(tool && lookup ? { chatName: chatNameResolver({ tool, configDirs, id: lookup, fallbackId: id }, env) } : {}),
+    chatName: chatNameResolver({ ...(tool && lookup ? { tool, id: lookup } : { tool }), configDirs }, env),
     gatewayUrl: async () => opts.gateway || env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL")),
     token: () => readToken(env, opts.configDir),
     ...(opts.pool ? { resolveAuth: () => resolvePoolAuth(opts.pool!, opts.tool ?? "claude", opts.registryPath) } : {}),
-    session: { id, identity, label: sessionName(id, env) },
+    session: { id, identity, label: sessionName(env, tool) },
     fetch,
     inflight: new Map(),
   };
