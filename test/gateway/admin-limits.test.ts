@@ -140,3 +140,39 @@ describe("admin GET /limits", () => {
     expect(limits[1]).toMatchObject({ identity: "m2", stale: true });
   });
 });
+describe("admin reset grants", () => {
+  const grants = { availableCount: 1, grants: [{ id: "full-reset-2611", kind: "full" as const, resetsLeft: 1, usableNow: true, paused: false }] };
+
+  test("GET /limits carries the reset grants of a claude row", async () => {
+    readings.set("claude/m1", reading({ manualReset: grants }));
+    try {
+      const { limits } = (await (await call(appWith({}), "/limits?provider=claude&identity=m1")).json()) as { limits: Array<Record<string, unknown>> };
+      expect(limits[0]!.manualReset).toEqual(grants);
+    } finally {
+      readings.set("claude/m1", reading());
+    }
+  });
+
+  const post = (app: ReturnType<typeof createAdminApp>, path: string, token: string | null = ADMIN) =>
+    app.request(`http://admin.test${path}`, { method: "POST", headers: token ? { authorization: `Bearer ${token}` } : {} });
+
+  test("POST spends through the gateway seam under the canonical name; needs the admin token", async () => {
+    const spent: string[] = [];
+    const app = appWith({ spendReset: async (identity, grant) => { spent.push(`${identity}:${grant}`); return { identity, grantId: grant, result: "reset", cleared: [] }; } });
+    expect((await post(app, "/limits/claude/alias-one/resets/g1", null)).status).toBe(401);
+    const res = await post(app, "/limits/claude/alias-one/resets/g1");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ identity: "m1", result: "reset" });
+    expect(spent).toEqual(["m1:g1"]);
+  });
+
+  test("refusals keep a known status and a short reason; no seam is 404", async () => {
+    const refuse = appWith({ spendReset: async () => { throw Object.assign(new Error("no usable Claude login"), { status: 409 }); } });
+    const res = await post(refuse, "/limits/claude/m1/resets/g1");
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "no usable Claude login" });
+    const odd = appWith({ spendReset: async () => { throw new Error("x"); } });
+    expect((await post(odd, "/limits/claude/m1/resets/g1")).status).toBe(502);
+    expect((await post(appWith({}), "/limits/claude/m1/resets/g1")).status).toBe(404);
+  });
+});

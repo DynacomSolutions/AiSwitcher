@@ -165,4 +165,32 @@ describe("useClaudeReset", () => {
     expect(refused.status).toBe(409);
     expect(invalidated).toBe(1);
   });
+  test("with a gateway admin configured the route delegates to the gateway and reads no host token", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ais-route-gw-"));
+    const secrets = join(dir, "secrets");
+    writeFileSync(secrets, "AIS_GATEWAY_ADMIN_URL=https://gw.test\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n");
+    const prev = { secrets: process.env.AIS_SECRETS_FILE, url: process.env.AIS_GATEWAY_ADMIN_URL, token: process.env.AIS_GATEWAY_ADMIN_TOKEN };
+    const realFetch = globalThis.fetch;
+    const urls: string[] = [];
+    process.env.AIS_SECRETS_FILE = secrets;
+    delete process.env.AIS_GATEWAY_ADMIN_URL;
+    delete process.env.AIS_GATEWAY_ADMIN_TOKEN;
+    globalThis.fetch = (async (url: unknown) => {
+      urls.push(String(url));
+      return Response.json({ identity: "acct", grantId: GRANT, result: "reset", cleared: [] });
+    }) as unknown as typeof fetch;
+    try {
+      const app = createApp({ token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1", peerPort: 50000, peerUid: () => process.getuid?.(), invalidateLimits: () => {} });
+      const res = await app.request(`/api/limits/claude/acct/resets/${GRANT}`, { method: "POST", headers: { Host: "127.0.0.1:47129", "X-AIS-Console": "1" } });
+      expect(res.status).toBe(200);
+      // Only the gateway admin was called: no profile or reset call to Anthropic with a host token.
+      expect(urls).toEqual([`https://gw.test/limits/claude/acct/resets/${GRANT}`]);
+    } finally {
+      globalThis.fetch = realFetch;
+      for (const [k, v] of [["AIS_SECRETS_FILE", prev.secrets], ["AIS_GATEWAY_ADMIN_URL", prev.url], ["AIS_GATEWAY_ADMIN_TOKEN", prev.token]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
 });

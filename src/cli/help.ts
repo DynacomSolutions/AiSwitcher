@@ -80,7 +80,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|store|release|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -93,6 +93,7 @@ export const HELP: Record<string, HelpNode> = {
         "Manage gateway apps; add and rotate write Secret ais-gateway-<app> and ~/.secrets (admin: AIS_GATEWAY_ADMIN_URL, AIS_GATEWAY_ADMIN_TOKEN, AIS_GATEWAY_PROXY_URL in ~/.secrets). Tokens: add makes a new app only and is refused on any existing name, a revoked one included; update changes no token; rotate mints a new token and the old tokens keep working for the overlap (default 24 h; admin API overlapHours 0 to 720, 0 cuts them off at once) and is refused on a revoked app; revoke is final, every token stops at once on every replica and the name can never be used again",
       ),
       usage: sub("ais gateway usage [--app=] [--provider=] [--days=7] [--json]", "Tokens used per app"),
+      "usage-history": sub("ais gateway usage-history import [--snapshot=<path>] [--zone=<IANA zone>] [--batch-size=500] [--dry-run] [--verify-only]", "Import the host usage history (per model all time, per day, per day tokens only) into the gateway database under the snapshot generation, skipping ais-gateway results, then print host against gateway per provider and identity; exits non-zero when a cost differs by more than $1 or tokens differ. Same generation is idempotent, a newer one adds rows, nothing is deleted. --dry-run prints the host figures only; --verify-only skips the import"),
       "claude-proxy": sub(
         "ais gateway claude-proxy <claude config dir>... [--proxy=<url>] [--ca=<path>] [--check]",
         "Point Claude folders at the gateway usage proxy (HTTPS_PROXY, NODE_EXTRA_CA_CERTS, always with a loopback NO_PROXY); --check only reports folders whose proxy would break a loopback base URL (proxy: AIS_GATEWAY_CONNECT_PROXY_URL in ~/.secrets or env; CA default ~/.ais/gateway-connect-ca.pem)",

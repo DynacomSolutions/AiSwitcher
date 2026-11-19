@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import type { LimitWindow } from "../../cli/limits/types.ts";
+import type { LimitWindow, ManualResetInfo } from "../../cli/limits/types.ts";
 import { lockOrder, withOauthRefreshLock } from "../claude-swap-lock.ts";
 import { expandPath } from "../match.ts";
 import type { Identity, ToolConfig } from "../types.ts";
@@ -121,7 +121,7 @@ export function parseGrantFile(text: string | undefined): GrantFile | undefined 
 }
 
 /** Maps the limits windows of one or more fetches onto a pool usage reading. */
-export function usageFromLimits(results: Array<{ status: string; windows: LimitWindow[]; error?: string }>, error?: string): PoolUsage {
+export function usageFromLimits(results: Array<{ status: string; windows: LimitWindow[]; error?: string; manualReset?: ManualResetInfo }>, error?: string): PoolUsage {
   const capturedAt = new Date().toISOString();
   const live = results.filter((r) => r.status !== "unavailable");
   const windows = live.flatMap((r) => r.windows);
@@ -130,9 +130,11 @@ export function usageFromLimits(results: Array<{ status: string; windows: LimitW
     return { status: "unavailable", ...(reason ? { error: reason } : {}), capturedAt };
   }
   const maxUtilization = Math.max(...windows.map((w) => w.usedPercent));
+  const manualReset = live.find((r) => r.manualReset)?.manualReset;
   return {
     status: maxUtilization >= 100 ? "rate-limited" : "live",
     maxUtilization,
+    ...(manualReset ? { manualReset } : {}),
     windows: windows.map((w) => ({
       label: w.label,
       utilization: w.usedPercent,

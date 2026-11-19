@@ -3,7 +3,7 @@ import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browse
 import { bumpSideCountOn, type SqlTag } from "./side-count.ts";
 import { errorTag } from "./ledger-buffer.ts";
 import { AppRevokedError, type GatewayStore } from "./store.ts";
-import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
@@ -12,6 +12,7 @@ import sideCounts0004 from "./migrations/0004_side_counts.sql" with { type: "tex
 import homeFiles0005 from "./migrations/0005_home_files.sql" with { type: "text" };
 import browserPresence0006 from "./migrations/0006_browser_presence.sql" with { type: "text" };
 import refreshJournalCode0007 from "./migrations/0007_refresh_journal_code.sql" with { type: "text" };
+import usageHistory0008 from "./migrations/0008_usage_history.sql" with { type: "text" };
 
 const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0001_init", sql: init0001 },
@@ -21,6 +22,7 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0005_home_files", sql: homeFiles0005 },
   { version: "0006_browser_presence", sql: browserPresence0006 },
   { version: "0007_refresh_journal_code", sql: refreshJournalCode0007 },
+  { version: "0008_usage_history", sql: usageHistory0008 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
@@ -382,6 +384,62 @@ export class PgGatewayStore implements GatewayStore {
       requests: Number(r.requests),
       firstTs: iso(r.first_ts),
       lastTs: iso(r.last_ts),
+    }));
+  }
+
+  async upsertUsageHistory(rows: UsageHistoryRow[]): Promise<void> {
+    // One statement per row inside one transaction: a batch lands whole or not at all.
+    await this.sql.begin(async (tx) => {
+      for (const r of rows) {
+        await tx`
+          INSERT INTO gateway_usage_history (source, generation, provider, identity, day, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, messages, est_cost_usd, first_day, last_day, zone)
+          VALUES (${r.source}, ${r.generation}::timestamptz, ${r.provider}, ${r.identity}, ${r.day}::date, ${r.model}, ${r.inputTokens}, ${r.outputTokens}, ${r.cacheReadTokens}, ${r.cacheWriteTokens}, ${r.messages}, ${r.estCostUsd}, ${r.firstDay}::date, ${r.lastDay}::date, ${r.zone})
+          ON CONFLICT (source, generation, provider, identity, (COALESCE(day, 'infinity'::date)), (COALESCE(model, ''))) DO UPDATE SET
+            input_tokens = EXCLUDED.input_tokens,
+            output_tokens = EXCLUDED.output_tokens,
+            cache_read_tokens = EXCLUDED.cache_read_tokens,
+            cache_write_tokens = EXCLUDED.cache_write_tokens,
+            messages = EXCLUDED.messages,
+            est_cost_usd = EXCLUDED.est_cost_usd,
+            first_day = EXCLUDED.first_day,
+            last_day = EXCLUDED.last_day,
+            zone = EXCLUDED.zone,
+            imported_at = now()`;
+      }
+    });
+  }
+
+  async usageHistory(filter: UsageHistoryFilter = {}): Promise<UsageHistoryStored[]> {
+    const generation = filter.generation === undefined || filter.generation === "latest" ? null : new Date(filter.generation).toISOString();
+    const rows = await this.sql`
+      SELECT source, generation, provider, identity, to_char(day, 'YYYY-MM-DD') AS day, model,
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, messages, est_cost_usd,
+        to_char(first_day, 'YYYY-MM-DD') AS first_day, to_char(last_day, 'YYYY-MM-DD') AS last_day, zone, imported_at
+      FROM gateway_usage_history h
+      WHERE (${generation}::timestamptz IS NULL AND h.generation = (SELECT max(m.generation) FROM gateway_usage_history m WHERE m.source = h.source)
+             OR h.generation = ${generation}::timestamptz)
+        AND (${filter.source ?? null}::text IS NULL OR source = ${filter.source ?? null})
+        AND (${filter.provider ?? null}::text IS NULL OR provider = ${filter.provider ?? null})
+        AND (${filter.identity ?? null}::text IS NULL OR identity = ${filter.identity ?? null})
+      ORDER BY provider, identity, day NULLS FIRST, model NULLS FIRST, source`;
+    const opt = (v: unknown): string | null => (v === null || v === undefined ? null : String(v));
+    return rows.map((r: Record<string, unknown>) => ({
+      source: String(r.source),
+      generation: iso(r.generation),
+      provider: String(r.provider),
+      identity: String(r.identity),
+      day: opt(r.day),
+      model: opt(r.model),
+      inputTokens: Number(r.input_tokens),
+      outputTokens: Number(r.output_tokens),
+      cacheReadTokens: Number(r.cache_read_tokens),
+      cacheWriteTokens: Number(r.cache_write_tokens),
+      messages: Number(r.messages),
+      estCostUsd: Number(r.est_cost_usd),
+      firstDay: opt(r.first_day),
+      lastDay: opt(r.last_day),
+      zone: String(r.zone),
+      importedAt: iso(r.imported_at),
     }));
   }
 

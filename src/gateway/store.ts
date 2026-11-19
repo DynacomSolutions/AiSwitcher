@@ -1,5 +1,5 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
-import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 
 /** The message for any attempt to reuse or extend a revoked app. */
@@ -42,6 +42,13 @@ export interface GatewayStore {
   usageByModel(since: Date, until?: Date): Promise<ModelUsageRow[]>;
   /** Ledger totals per day (bucketed in the IANA zone `tz`), provider, identity and model; apps are summed. Same window as usageByModel. */
   usageByModelDaily(since: Date, until: Date | undefined, tz: string): Promise<ModelDailyUsageRow[]>;
+  /**
+   * Imports history rows. A row with the same key (source, generation, provider, identity, day, model) is replaced
+   * exactly, so importing one generation again is idempotent. A new generation adds rows. Nothing is ever deleted.
+   */
+  upsertUsageHistory(rows: UsageHistoryRow[]): Promise<void>;
+  /** History rows, by default the latest generation of each source, optionally for one source, provider, identity or generation, sorted by provider, identity, day, model. */
+  usageHistory(filter?: UsageHistoryFilter): Promise<UsageHistoryStored[]>;
   putBrowserBinding(b: BrowserBinding): Promise<void>;
   getBrowserBinding(name: string): Promise<BrowserBinding | undefined>;
   listBrowserBindings(): Promise<BrowserBinding[]>;
@@ -271,6 +278,28 @@ export class MemoryGatewayStore implements GatewayStore {
       }
     }
     return [...by.values()].sort((x, y) => x.day.localeCompare(y.day) || x.provider.localeCompare(y.provider) || x.identity.localeCompare(y.identity) || (x.model === null ? 1 : 0) - (y.model === null ? 1 : 0) || (x.model ?? "").localeCompare(y.model ?? ""));
+  }
+
+  private history = new Map<string, UsageHistoryStored>();
+
+  async upsertUsageHistory(rows: UsageHistoryRow[]): Promise<void> {
+    const at = new Date().toISOString();
+    for (const r of rows) {
+      const generation = new Date(r.generation).toISOString();
+      const key = [r.source, generation, r.provider, r.identity, r.day ?? "", r.model ?? ""].join("\u0000");
+      this.history.set(key, { ...r, generation, importedAt: at });
+    }
+  }
+
+  async usageHistory(filter: UsageHistoryFilter = {}): Promise<UsageHistoryStored[]> {
+    const latest = new Map<string, string>();
+    for (const r of this.history.values()) if ((latest.get(r.source) ?? "") < r.generation) latest.set(r.source, r.generation);
+    const generation = filter.generation === undefined || filter.generation === "latest" ? undefined : new Date(filter.generation).toISOString();
+    return [...this.history.values()]
+      .filter((r) => (generation === undefined ? r.generation === latest.get(r.source) : r.generation === generation))
+      .filter((r) => (filter.source === undefined || r.source === filter.source) && (filter.provider === undefined || r.provider === filter.provider) && (filter.identity === undefined || r.identity === filter.identity))
+      .map((r) => ({ ...r }))
+      .sort((a, b) => a.provider.localeCompare(b.provider) || a.identity.localeCompare(b.identity) || (a.day ?? "").localeCompare(b.day ?? "") || (a.model ?? "").localeCompare(b.model ?? "") || a.source.localeCompare(b.source));
   }
 
   async putBrowserBinding(b: BrowserBinding): Promise<void> {

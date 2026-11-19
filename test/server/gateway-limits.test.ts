@@ -6,7 +6,7 @@ import { windowsFromUsageBody } from "../../src/cli/limits/claude-limits.ts";
 import type { ToolLimitResult } from "../../src/cli/limits/types.ts";
 import { extraUsageFromBody, parseUsageBody } from "../../src/identities/claude-usage-api.ts";
 import type { Identity } from "../../src/identities/types.ts";
-import { loadGatewayLimits, mapGatewayLimitRow, mapGatewayLimits, mergeGatewayLimits, type GatewayLimitRow, type GatewayLimitsView } from "../../src/server/gateway-limits.ts";
+import { loadGatewayLimits, mapGatewayLimitRow, mapGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, type GatewayLimitRow, type GatewayLimitsView } from "../../src/server/gateway-limits.ts";
 
 const RESET_SESSION = "2026-11-19T18:00:00.000Z";
 const RESET_WEEK = "2026-11-20T15:00:00.000Z";
@@ -234,7 +234,7 @@ describe("mergeGatewayLimits", () => {
   const view = (rows: ToolLimitResult[], over: Partial<GatewayLimitsView> = {}): GatewayLimitsView => ({ configured: true, rows, ...over });
   const noRegistries = async () => [];
 
-  test("gateway rows replace the matching host rows and keep the host identity and reset grants", async () => {
+  test("gateway rows replace the matching host rows and keep the host identity; reset grants come from the gateway only", async () => {
     const grants = { availableCount: 1, grants: [{ id: "g", kind: "full" as const, resetsLeft: 1, usableNow: true, paused: false }] };
     const host = payload([
       hostRow("claude", "m1", { manualReset: grants }),
@@ -244,7 +244,11 @@ describe("mergeGatewayLimits", () => {
     const merged = (await mergeGatewayLimits(host, view([gatewayRow("claude", "m1"), gatewayRow("codex", "c1")]), {}, noRegistries)) as typeof host;
     expect(merged.cached).toBe(true);
     expect(merged.results).toHaveLength(3);
-    expect(merged.results[0]).toMatchObject({ status: "live", capturedAt: STAMP, identity: identity("m1"), manualReset: grants });
+    expect(merged.results[0]).toMatchObject({ status: "live", capturedAt: STAMP, identity: identity("m1") });
+    // No host fallback: the host row's grants never reach a gateway-managed identity.
+    expect(merged.results[0]!.manualReset).toBeUndefined();
+    const withGateway = (await mergeGatewayLimits(host, view([gatewayRow("claude", "m1", { manualReset: { availableCount: 2 } })]), {}, noRegistries)) as typeof host;
+    expect(withGateway.results[0]!.manualReset).toEqual({ availableCount: 2 });
     expect(merged.results[0]!.windows[0]!.usedPercent).toBe(100);
     expect(merged.results[1]).toEqual(host.results[1]); // the pool is not a managed member row
     expect(merged.results[2]!.status).toBe("live");
@@ -275,5 +279,67 @@ describe("mergeGatewayLimits", () => {
     const byIdentity = (await mergeGatewayLimits(host, view(rows), { identity: "m1" }, noRegistries)) as typeof host;
     expect(byIdentity.results.map((r) => r.identity.name)).toEqual(["m1", "c1"]);
     expect(byIdentity.results[0]!.status).toBe("live");
+  });
+});
+describe("reset grants from the gateway", () => {
+  const grantRow = {
+    ...claudeRow(upstreamBody()),
+    manualReset: {
+      availableCount: 1,
+      label: "Full reset",
+      grantsCapturedAt: STAMP,
+      stale: true,
+      grants: [
+        { id: "full-reset-2611", label: "Full reset", kind: "full", resetsLeft: 1, usableNow: true, paused: false, endsAt: "2026-12-01T00:00:00.000Z" },
+        { id: "launch-2610-fable", kind: "fable", resetsLeft: 0, usableNow: false, paused: false },
+        { nope: true },
+      ],
+    },
+  };
+
+  test("a claude row carries the count and every grant to the console row", () => {
+    const row = mapGatewayLimitRow(grantRow);
+    expect(row?.manualReset).toMatchObject({ availableCount: 1, label: "Full reset", stale: true, grantsCapturedAt: STAMP });
+    expect(row?.manualReset?.grants?.map((g) => [g.id, g.kind, g.usableNow])).toEqual([["full-reset-2611", "full", true], ["launch-2610-fable", "fable", false]]);
+  });
+
+  test("a row without grants, a malformed block and a non-claude row carry none", () => {
+    expect(mapGatewayLimitRow(claudeRow(upstreamBody()))?.manualReset).toBeUndefined();
+    expect(mapGatewayLimitRow({ ...grantRow, manualReset: { grants: [] } })?.manualReset).toBeUndefined();
+    expect(mapGatewayLimitRow({ provider: "codex", identity: "c1", status: "live", windows: [{ label: "week", utilization: 5 }], manualReset: grantRow.manualReset })?.manualReset).toBeUndefined();
+  });
+
+  test("the spend goes to the gateway admin route with the admin token only", async () => {
+    const calls: Array<{ url: string; method?: string; auth: string | null }> = [];
+    const fake = (async (url: unknown, init?: RequestInit) => {
+      calls.push({ url: String(url), method: init?.method, auth: new Headers(init?.headers).get("authorization") });
+      return Response.json({ identity: "m 1", grantId: "g/1", result: "reset", cleared: [] });
+    }) as unknown as typeof fetch;
+    const dir = mkdtempSync(join(tmpdir(), "ais-gwspend-"));
+    const secretsPath = join(dir, "secrets");
+    writeFileSync(secretsPath, "AIS_GATEWAY_ADMIN_URL=https://gw.test/admin/\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n");
+    expect(await useClaudeResetViaGateway("m 1", "g/1", { fetch: fake, secretsPath })).toMatchObject({ result: "reset" });
+    expect(calls).toEqual([{ url: "https://gw.test/admin/limits/claude/m%201/resets/g%2F1", method: "POST", auth: "Bearer SYNTHETIC_FIXTURE_token" }]);
+  });
+
+  test("gateway refusals keep their status and reason; no admin config is 503", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ais-gwspend-"));
+    const secretsPath = join(dir, "secrets");
+    const prevUrl = process.env.AIS_GATEWAY_ADMIN_URL;
+    const prevToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
+    delete process.env.AIS_GATEWAY_ADMIN_URL;
+    delete process.env.AIS_GATEWAY_ADMIN_TOKEN;
+    try {
+      writeFileSync(secretsPath, "");
+      await expect(useClaudeResetViaGateway("m1", "g", { secretsPath })).rejects.toMatchObject({ status: 503 });
+      writeFileSync(secretsPath, "AIS_GATEWAY_ADMIN_URL=https://gw.test\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n");
+      const refuse = (async () => Response.json({ error: "Anthropic refused the reset (HTTP 409): cooldown" }, { status: 409 })) as unknown as typeof fetch;
+      await expect(useClaudeResetViaGateway("m1", "g", { fetch: refuse, secretsPath })).rejects.toMatchObject({ status: 409, message: expect.stringContaining("cooldown") });
+      const down = (async () => { throw new Error("boom"); }) as unknown as typeof fetch;
+      await expect(useClaudeResetViaGateway("m1", "g", { fetch: down, secretsPath })).rejects.toMatchObject({ status: 502 });
+    } finally {
+      if (prevUrl !== undefined) process.env.AIS_GATEWAY_ADMIN_URL = prevUrl;
+      if (prevToken !== undefined) process.env.AIS_GATEWAY_ADMIN_TOKEN = prevToken;
+    }
   });
 });
