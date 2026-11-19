@@ -96,7 +96,7 @@ export function loginCommand(provider: GatewayProvider, identity: string): strin
 
 /** Generic credential failure; `code` is a stable reason, the message never carries paths or token values. */
 export class GatewayCredentialError extends Error {
-  constructor(readonly code: "refresh-failed" | "refresh-lock-timeout" | "token-unchanged" | "no-credential" | "unknown-identity" | "retired" | "login-dead", readonly provider: GatewayProvider, readonly identity: string, cause?: unknown) {
+  constructor(readonly code: "refresh-failed" | "refresh-lock-timeout" | "token-unchanged" | "no-credential" | "unknown-identity" | "retired" | "login-dead" | "unmanaged-login", readonly provider: GatewayProvider, readonly identity: string, cause?: unknown) {
     super(`gateway: ${provider} identity "${identity}" credential unavailable (${code})`, cause === undefined ? undefined : { cause });
     this.name = "GatewayCredentialError";
   }
@@ -108,6 +108,7 @@ export class GatewayCredentialError extends Error {
 
   /** Text for the client: plain about a dead login, a bare reason code otherwise. */
   get clientMessage(): string {
+    if (this.code === "unmanaged-login") return `${this.provider} identity "${this.identity}" is not managed by the gateway, so the gateway does not use or renew its login. Route the identity through the gateway first (ais identities route-all-via-gateway), or use another identity`;
     if (this.loggedOut) return `${this.provider} identity "${this.identity}" is logged out (its saved login cannot be refreshed). Log back in with: ${loginCommand(this.provider, this.identity)}`;
     return `upstream credential unavailable (${this.code})`;
   }

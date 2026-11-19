@@ -46,7 +46,8 @@ export async function buildRenewalReport(deps: {
   for (const r of await deps.summary()) rows.set(`${r.provider}/${r.identity}`, r);
   const out: LoginRenewal[] = [];
   for (const tool of deps.tools) {
-    for (const account of await deps.accounts(tool).catch(() => [] as Identity[])) {
+    // A registry that cannot be read throws: a partial list must never read as a complete one.
+    for (const account of await deps.accounts(tool)) {
       const grant = (await readEffectiveGrant(tool as RefreshableTool, account).catch(() => undefined))?.grant;
       const row = rows.get(`${tool}/${account.name}`);
       const fingerprint = grant?.refresh_token ? grantFingerprint(grant) : undefined;
