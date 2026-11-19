@@ -1,10 +1,13 @@
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { categorizeByLabel, categorizeByMinutes } from "../cli/limits/bucket.ts";
-import type { ExtraUsageInfo, LimitCategory, LimitWindow, OverageInfo, ToolLimitResult } from "../cli/limits/types.ts";
+import type { ExtraUsageInfo, LimitCategory, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult } from "../cli/limits/types.ts";
 import { providerForTool } from "../cli/usage/providers.ts";
 import { loadAll, type LoadedFile } from "../cli/identities/resolve-tool.ts";
+import { resetGrantKind } from "../identities/claude-usage-api.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import type { Identity, ToolConfig } from "../identities/types.ts";
+import { gatewayAdminConfig } from "./gateway-apps.ts";
+import { HttpError } from "./types.ts";
 
 /**
  * The cluster gateway is the source of truth for the subscription limits of the identities it manages.
@@ -23,6 +26,7 @@ export interface GatewayLimitRow {
   maxUtilization?: number;
   windows?: Array<{ label: string; utilization: number; resetsAt?: string; model?: string }>;
   extraUsage?: ExtraUsageInfo;
+  manualReset?: ManualResetInfo;
   error?: string;
 }
 
@@ -78,6 +82,37 @@ function parseExtraUsage(raw: unknown): ExtraUsageInfo | undefined {
   };
 }
 
+/** Defensive read of the reset-grant block the gateway poll carries (claude cedar_ember). */
+function parseManualReset(raw: unknown): ManualResetInfo | undefined {
+  const m = raw as Record<string, unknown> | null;
+  if (!m || typeof m !== "object" || typeof m.availableCount !== "number" || !Number.isFinite(m.availableCount)) return undefined;
+  const grants: ResetGrant[] = [];
+  for (const rawGrant of Array.isArray(m.grants) ? m.grants : []) {
+    const g = rawGrant as Record<string, unknown> | null;
+    if (!g || typeof g.id !== "string" || g.id === "") continue;
+    const label = typeof g.label === "string" && g.label ? g.label : undefined;
+    const kind = g.kind === "full" || g.kind === "fable" || g.kind === "other" ? g.kind : resetGrantKind(g.id, label);
+    grants.push({
+      id: g.id,
+      ...(label ? { label } : {}),
+      kind,
+      resetsLeft: typeof g.resetsLeft === "number" && Number.isFinite(g.resetsLeft) ? g.resetsLeft : 0,
+      usableNow: g.usableNow === true,
+      paused: g.paused === true,
+      ...(typeof g.endsAt === "string" ? { endsAt: g.endsAt } : {}),
+    });
+  }
+  return {
+    availableCount: m.availableCount,
+    ...(typeof m.label === "string" ? { label: m.label } : {}),
+    ...(typeof m.expiresAt === "string" ? { expiresAt: m.expiresAt } : {}),
+    ...(Array.isArray(m.grants) ? { grants } : {}),
+    ...(typeof m.cooldownUntil === "string" ? { cooldownUntil: m.cooldownUntil } : {}),
+    ...(typeof m.grantsCapturedAt === "string" ? { grantsCapturedAt: m.grantsCapturedAt } : {}),
+    ...(m.stale === true ? { stale: true } : {}),
+  };
+}
+
 /** The claude adapter's overage semantics, from the extra-usage block: the available flag decides, confirmed-zero states carry $0. */
 function overageFromExtraUsage(extra: ExtraUsageInfo): OverageInfo {
   if (!extra.enabled) return { active: false, label: "subscription only", spentUsd: 0 };
@@ -111,18 +146,22 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
   }
   const capturedAt = typeof r.capturedAt === "string" ? r.capturedAt : undefined;
   if (r.status === "unavailable" || windows.length === 0) {
+    const resetOnly = r.provider === "claude" ? parseManualReset(r.manualReset) : undefined;
     return {
       ...base,
       windows: [],
+      ...(resetOnly ? { manualReset: resetOnly } : {}),
       status: "unavailable",
       error: typeof r.error === "string" && r.error ? r.error : "no usage reading from the gateway yet",
       ...(capturedAt ? { capturedAt } : {}),
     };
   }
   const extraUsage = parseExtraUsage(r.extraUsage);
+  const manualReset = r.provider === "claude" ? parseManualReset(r.manualReset) : undefined;
   return {
     ...base,
     windows,
+    ...(manualReset ? { manualReset } : {}),
     // "rate-limited" with a figure is a live reading at 100% (codex/kimi/zai) or a stale claude backoff (stale: true).
     status: r.stale === true ? "cached" : "live",
     ...(capturedAt ? { capturedAt } : {}),
@@ -167,8 +206,8 @@ export async function loadGatewayLimits(deps: LoadGatewayLimitsDeps = {}): Promi
 
 /**
  * Merges the gateway rows into a host limits payload. The gateway is authoritative for the identities it
- * manages: its row replaces the host row of the same tool and identity, keeping the host's registry entry
- * and reset grants (the gateway usage source reads windows only). Host rows the gateway does not cover stay
+ * manages: its row replaces the host row of the same tool and identity and keeping the host's registry entry.
+ * Reset grants come from the gateway only: no host fallback. Host rows the gateway does not cover stay
  * as they are; gateway rows with no host row are added with their registry entry when one exists. An
  * unconfigured or failed gateway read leaves the payload unchanged. The tool and identity filters apply to
  * the gateway rows as well, so a filtered read never gains rows outside its filter.
@@ -196,7 +235,7 @@ export async function mergeGatewayLimits(
     const gateway = key ? gatewayByKey.get(key) : undefined;
     if (!key || !gateway) return host;
     used.add(key);
-    return { ...gateway, identity: host.identity, ...(host.manualReset && !gateway.manualReset ? { manualReset: host.manualReset } : {}) };
+    return { ...gateway, identity: host.identity };
   });
   const added = [...gatewayByKey.entries()].filter(([key]) => !used.has(key)).map(([, row]) => row);
   if (added.length > 0) {
@@ -211,4 +250,33 @@ export async function mergeGatewayLimits(
     merged.push(...added);
   }
   return { ...(payload as object), results: merged };
+}
+/**
+ * Spends one Claude reset grant through the gateway admin API. The gateway spends it with the stored member
+ * credential; the console never reads an account token. Answers with the admin's JSON, or throws an HttpError
+ * with the gateway's short reason.
+ */
+export async function useClaudeResetViaGateway(
+  identity: string,
+  grantId: string,
+  deps: { fetch?: typeof fetch; secretsPath?: string; timeoutMs?: number } = {},
+): Promise<unknown> {
+  const cfg = await gatewayAdminConfig({ ...(deps.secretsPath ? { secretsPath: deps.secretsPath } : {}) });
+  if (!cfg) throw new HttpError(503, "gateway admin is not configured on this console");
+  let res: Response;
+  try {
+    res = await (deps.fetch ?? fetch)(`${cfg.url}/limits/claude/${encodeURIComponent(identity)}/resets/${encodeURIComponent(grantId)}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${cfg.token}` },
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 30_000),
+    });
+  } catch {
+    throw new HttpError(502, "gateway admin unreachable");
+  }
+  const body = (await res.json().catch(() => undefined)) as { error?: unknown } | undefined;
+  if (!res.ok) {
+    const status = [400, 404, 409, 429, 503].includes(res.status) ? res.status : 502;
+    throw new HttpError(status, typeof body?.error === "string" ? body.error.slice(0, 300) : `gateway admin answered ${res.status}`);
+  }
+  return body;
 }
