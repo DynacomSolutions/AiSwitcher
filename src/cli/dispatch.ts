@@ -33,7 +33,7 @@ import { runBrowserCommand } from "./browser/dispatch.ts";
  * command saves its own change could race the write and undo it. */
 export function wantsAutoBackgroundSync(command: string | undefined, rest: string[]): boolean {
   if (command === undefined || !["identities", "usage", "limits", "doctor"].includes(command)) return false;
-  return !(command === "identities" && (rest[0] === "retire" || rest[0] === "unretire" || rest[0] === "route-all-via-gateway"));
+  return !(command === "identities" && (rest[0] === "retire" || rest[0] === "unretire" || rest[0] === "route-all-via-gateway" || rest[0] === "adopt-login"));
 }
 
 export async function runCli(argv: string[]): Promise<void> {

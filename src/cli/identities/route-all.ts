@@ -18,6 +18,9 @@ import { isRetired } from "../../identities/retired.ts";
 import { loadIdentitiesFile } from "../../identities/store.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG } from "../../identities/tool-configs.ts";
 import type { Identity } from "../../identities/types.ts";
+import { accountInfoFor } from "../../identities/account-info.ts";
+import { recordLoginReplaced } from "../../gateway/login-replaced.ts";
+import { pushOwnerLogin } from "../../gateway/owner-store-push.ts";
 import { loadSyncConfig, syncConfigPath } from "../../sync/config.ts";
 import { appTokenKey, defaultSecretsPath, readSecretsKey } from "../gateway/secrets-file.ts";
 
@@ -105,6 +108,8 @@ export interface RouteAllOptions {
    * account, provably fresher than the store copy, no running session, no other holder.
    */
   afterLogin?: boolean;
+  /** Tests: replaces the push of an adopted login to the PostgreSQL store (default pushOwnerLogin). Returns a note. */
+  storePush?: (tool: MemberStoreTool, identity: string, root: string) => Promise<string>;
   /**
    * The app key (aisg_) the identity's folder held as its gateway entry before a sign-in overwrote it, used only when the
    * secrets file has none (a host without ~/.secrets, e.g. the console pod). The secrets file stays the first source.
@@ -122,6 +127,10 @@ export interface RouteLine {
   detail?: string;
   /** Routed, but something needs the user now (a session started during the switch): the exit code is non-zero. */
   attention?: boolean;
+  /** An owner sign-in changed the account the gateway uses: who it was and who it is now (email, else account id). */
+  accountChange?: { from?: string; to?: string };
+  /** Owner sign-in: what happened to the PostgreSQL store push (pushed, or left to the host sync). */
+  storeNote?: string;
 }
 
 export interface RouteReport {
@@ -198,6 +207,8 @@ interface StorePlan {
   note?: string;
   /** Set when the folder's login goes into the store: `replacing` an older store copy of the same account, or a new one. */
   write?: { replacing: boolean };
+  /** Owner sign-in only: the account the store copy held, when it differs from the folder's. */
+  accountChange?: { from?: string; to?: string };
 }
 
 /**
@@ -207,11 +218,13 @@ interface StorePlan {
  * would move the membership); an older, equally fresh or undatable local login leaves the store copy as it is (a restored
  * or touched folder may hold a refresh token the gateway already spent).
  */
-async function planStoreMove(tool: MemberStoreTool, identity: Identity, localText: string, root: string): Promise<StorePlan> {
+async function planStoreMove(tool: MemberStoreTool, identity: Identity, localText: string, root: string, afterLogin = false): Promise<StorePlan> {
   const dir = memberDir(tool, identity.name, root);
   const storeText = await readText(join(dir, memberLoginFile(tool)));
   if (!hasMemberCopy(tool, identity.name, root) || storeText === undefined) return { write: { replacing: false } };
   if (storeText === localText) return {};
+  // An owner-started sign-in is the owner's choice of account: it always replaces the store copy (the old one is backed up).
+  if (afterLogin) return { write: { replacing: true }, ...(await accountChangeOf(tool, identity, dir, localText, storeText)) };
   const [localAccount, storeAccount] = [await accountOf(tool, identity.configDir, localText), await accountOf(tool, dir, storeText)];
   if (localAccount !== undefined && storeAccount !== undefined && localAccount !== storeAccount) {
     return { refused: "the folder's login is a different account than the gateway's member store copy; nothing changed (sign the folder back into its own account, or give the other account its own identity)" };
@@ -222,19 +235,39 @@ async function planStoreMove(tool: MemberStoreTool, identity: Identity, localTex
   return { write: { replacing: true } };
 }
 
+/** Who the store copy was and who the folder's login is, when they are different accounts (email, else account id). */
+async function accountChangeOf(tool: MemberStoreTool, identity: Identity, storeDir: string, localText: string, storeText: string): Promise<{ accountChange?: { from?: string; to?: string } }> {
+  const [localAccount, storeAccount] = [await accountOf(tool, identity.configDir, localText), await accountOf(tool, storeDir, storeText)];
+  const [oldInfo, newInfo] = await Promise.all([accountInfoOfDir(tool, storeDir), accountInfoOfDir(tool, identity.configDir)]);
+  const differ = (localAccount !== undefined && storeAccount !== undefined && localAccount !== storeAccount) || (oldInfo?.email !== undefined && newInfo?.email !== undefined && oldInfo.email.toLowerCase() !== newInfo.email.toLowerCase());
+  if (!differ) return {};
+  const name = (i: { email?: string; accountId?: string } | undefined, id: string | undefined): string | undefined => i?.email ?? i?.accountId ?? id;
+  const from = name(oldInfo, storeAccount);
+  const to = name(newInfo, localAccount);
+  return { accountChange: { ...(from ? { from } : {}), ...(to ? { to } : {}) } };
+}
+
+/** Email and account id recorded in a folder (claude `.claude.json`, codex `auth.json`), read only. */
+async function accountInfoOfDir(tool: MemberStoreTool, dir: string): Promise<{ email?: string; accountId?: string } | undefined> {
+  const info = await accountInfoFor(tool, { name: "x", label: "x", configDir: dir }, join(dir, "__no_member_store__"));
+  return info ? { ...(info.email ? { email: info.email } : {}), ...(info.accountId ? { accountId: info.accountId } : {}) } : undefined;
+}
+
 /**
  * Writes the planned store copy: a replaced copy is backed up uniquely first. The login file is written last, durably, and
  * read back: its presence is what makes the gateway switch to the store.
  */
-async function writeStoreCopy(tool: MemberStoreTool, identity: Identity, localText: string, root: string, replacing: boolean, now: () => number): Promise<string | undefined> {
+async function writeStoreCopy(tool: MemberStoreTool, identity: Identity, localText: string, root: string, replacing: boolean, now: () => number, ownerSignIn = false): Promise<string | undefined> {
   const dir = memberDir(tool, identity.name, root);
   const storePath = join(dir, memberLoginFile(tool));
   if (replacing) {
+    const old = ownerSignIn ? await readText(storePath) : undefined;
     const b = await backupUnique(storePath, now);
+    if (old !== undefined) await recordLoginReplaced(tool, identity.name, old, root, now);
     await writeAccountRecord(tool, identity, dir);
     await writeFileDurable(storePath, localText);
     await clearLoginRevoked(tool, identity.name, root); // the new login is not the one the gateway found dead
-    return `the fresher local login of the same account replaced the member store copy (old copy backed up to ${b})`;
+    return ownerSignIn ? `the new sign-in replaced the member store copy (old copy backed up to ${b})` : `the fresher local login of the same account replaced the member store copy (old copy backed up to ${b})`;
   }
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await chmod(dir, 0o700);
@@ -613,20 +646,30 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   if (kind === "gateway" && !stored) return { ...line, status: "refused", detail: "the folder already holds the gateway entry but the member store has no login for it; restore the login from its .pre-gateway backup first" };
   if (kind === "login") {
     // After a sign-in on a routed identity the gateway only has to hold the account; that it has not yet renewed it successfully (its login is dead) is the reason for the sign-in.
+    // An owner sign-in needs no proof that the gateway renewed the old login: the owner chose this account.
     const problem = heldProblem(tool, identity.name, ctx.hb, now());
-    if (problem && !(opts.afterLogin && stored && problem === NOT_RENEWED)) return { ...line, status: "refused", detail: problem };
+    if (problem && !(opts.afterLogin && stored)) return { ...line, status: "refused", detail: problem };
   }
+  // An owner sign-in is reported on (attention), never refused, for sessions and other holders.
+  const owner = opts.afterLogin === true;
+  const reported: string[] = [];
   const busy = await sessionsProblem(tool, dir, opts);
-  if (busy) return { ...line, status: "refused", detail: busy };
-  const holders = await holdersProblem(identity, ctx, await readText(join(dir, memberLoginFile(tool))));
-  if (holders.refused) return { ...line, status: "refused", detail: holders.refused };
+  if (busy && !owner) return { ...line, status: "refused", detail: busy };
+  if (busy) reported.push(`WARNING: ${busy}`);
+  let holders = await holdersProblem(identity, ctx, await readText(join(dir, memberLoginFile(tool))));
+  if (holders.refused && !owner) return { ...line, status: "refused", detail: holders.refused };
+  if (holders.refused) {
+    reported.push(`WARNING: ${holders.refused}`);
+    holders = { piRemovals: [] };
+  }
   if (opts.dryRun) {
     const pi = holders.piRemovals.map((r) => `; pi identity ${r.name}'s ${r.provider} entry would be removed (backed up)`).join("");
     return { ...line, status: "would-route", detail: `${kind === "login" ? "login would move to the member store, local files backed up, then replaced" : "gateway entry would be completed"}${pi}` };
   }
 
-  const notes: string[] = [];
+  const notes: string[] = [...reported];
   let removedPi = false;
+  let accountChange: RouteLine["accountChange"];
   if (kind === "login") {
     await mkdir(root, { recursive: true, mode: 0o700 });
     await chmod(root, 0o700);
@@ -635,15 +678,15 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   const outcome = await withOauthRefreshLocks([dir, memberDir(tool, identity.name, root)], async () => {
     // A session may have started while this run waited for the locks.
     const busyNow = await sessionsProblem(tool, dir, opts);
-    if (busyNow) return busyNow;
+    if (busyNow && !owner) return busyNow;
     const localText = await readText(join(dir, memberLoginFile(tool)));
-    const holdersNow = await holdersProblem(identity, ctx, localText);
-    if (holdersNow.refused) return holdersNow.refused;
+    let holdersNow = await holdersProblem(identity, ctx, localText);
+    if (holdersNow.refused && !owner) return holdersNow.refused;
+    if (holdersNow.refused) holdersNow = { piRemovals: [] };
     const nowKind = classifyLogin(tool, localText);
-    const plan = nowKind === "login" ? await planStoreMove(tool, identity, localText!, root) : {};
+    const plan = nowKind === "login" ? await planStoreMove(tool, identity, localText!, root, owner) : {};
     if (plan.refused) return plan.refused;
-    // A sign-in just made must reach the store: when the store copy is kept, replacing the folder would bury the new login in a backup.
-    if (opts.afterLogin && nowKind === "login" && !plan.write && plan.note) return `${plan.note}; the new login stays in the folder and the gateway keeps its own copy`;
+    accountChange = plan.accountChange;
     if (nowKind !== "login" && !hasMemberCopy(tool, identity.name, root)) return "the login disappeared while waiting for the lock; nothing changed";
     // pi's copy goes first: a failure here (PiChanged, EACCES) leaves the store and the folder as they were.
     for (const r of holdersNow.piRemovals) notes.push(await removePiCopy(r, now));
@@ -654,7 +697,7 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     try {
       if (plan.write) {
         wroteStore = true;
-        const note = await writeStoreCopy(tool, identity, localText!, root, plan.write.replacing, now);
+        const note = await writeStoreCopy(tool, identity, localText!, root, plan.write.replacing, now, owner);
         if (note) notes.push(note);
       }
       // Nothing local changes unless the store demonstrably holds a usable login now.
@@ -670,10 +713,16 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     return undefined;
   });
   if (outcome) return { ...line, status: "refused", detail: outcome };
+  // An owner sign-in reaches the PostgreSQL store at once (when this process has its config); a failure only adds a note.
+  let storeNote: string | undefined;
+  if (owner && kind === "login") {
+    storeNote = await (opts.storePush ?? ((t, n, r) => pushOwnerLogin(t, n, { root: r, ...(opts.home ? { home: opts.home } : {}), ...(opts.secretsPath ? { secretsPath: opts.secretsPath } : {}) })))(tool, identity.name, root);
+    notes.push(storeNote);
+  }
   // A session that started during the switch (after the check under the locks) holds the old login: report it.
   const late = await lateSessions(tool, dir, removedPi, opts);
   if (late) notes.push(late);
-  return { ...line, status: "routed", ...(late ? { attention: true } : {}), ...(notes.length > 0 ? { detail: notes.join("; ") } : {}) };
+  return { ...line, status: "routed", ...(late || reported.length > 0 ? { attention: true } : {}), ...(accountChange ? { accountChange } : {}), ...(storeNote ? { storeNote } : {}), ...(notes.length > 0 ? { detail: notes.join("; ") } : {}) };
 }
 
 /* ------------------------------------------------------------------ swap pool folders */

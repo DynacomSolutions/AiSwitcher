@@ -140,6 +140,30 @@ export function mergeByKey(mine: string, theirs: string): Buffer | undefined {
   return Buffer.from(`${JSON.stringify(out, null, 2)}\n`);
 }
 
+/** File beside a member-store login that lists the refresh tokens the owner replaced (login-replaced.ts). */
+export const REPLACED_MARKER_FILE = "login-replaced.json";
+
+/** The marker row beside a member-store login path (same folder), or undefined. A read problem counts as none. */
+export async function replacedFingerprintsFor(store: PgHomeStore, loginRel: string): Promise<Set<string>> {
+  const slash = loginRel.lastIndexOf("/");
+  if (slash < 0 || !loginRel.includes("gateway-members/")) return new Set();
+  const markerRel = `${loginRel.slice(0, slash)}/${REPLACED_MARKER_FILE}`;
+  try {
+    const [row] = await store.get([markerRel]);
+    const parsed = row ? (JSON.parse(row.content.toString("utf8")) as { fingerprints?: unknown }) : undefined;
+    return new Set(Array.isArray(parsed?.fingerprints) ? parsed.fingerprints.filter((f): f is string => typeof f === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** True when `content` still holds a refresh token the owner replaced at `loginRel`. */
+export async function isReplacedLogin(store: PgHomeStore, loginRel: string, content: string): Promise<boolean> {
+  const replaced = await replacedFingerprintsFor(store, loginRel);
+  if (replaced.size === 0) return false;
+  return refreshFingerprints(content).some((fp) => replaced.has(fp));
+}
+
 const MERGE_ATTEMPTS = 5;
 const STOP_PUSH_MS = 5_000;
 
@@ -232,6 +256,8 @@ export class HomeMirror {
       return "same";
     }
     if (base && localSha === base.sha) return write();
+    // The owner replaced this login with another account's: a copy still holding the replaced token never wins.
+    if (row.kind === "login" && (await isReplacedLogin(this.store, row.path, local.toString("utf8")))) return write();
     const push = async (expected: number): Promise<"pushed" | "conflict"> => {
       const r = await this.store.put(row.path, local, { account: row.account, kind: row.kind, expectedVersion: expected });
       if (!r.ok) return "conflict";

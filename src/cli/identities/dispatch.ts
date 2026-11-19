@@ -205,6 +205,11 @@ export async function runIdentitiesCommand(
       return runRouteAllViaGateway(flags);
     }
 
+    case "adopt-login": {
+      const { runAdoptLogin } = await import("./adopt-login.ts");
+      return runAdoptLogin(rest);
+    }
+
     case "chrome-overrides":
       return runChromeOverrides(rest, flags);
 

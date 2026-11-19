@@ -251,6 +251,20 @@ export interface UseResetResult {
 
 export type LimitFetchStatus = "live" | "cached" | "unavailable" | "pending";
 
+/** The account behind an identity's login. Never holds a secret. */
+export interface AccountInfo {
+  email?: string;
+  label?: string;
+  accountId?: string;
+  organization?: string;
+  /** One entry per provider login, for tools whose file holds several. */
+  logins?: Array<{ provider: string; email?: string; label?: string; accountId?: string }>;
+  source: "gateway-member" | "folder";
+  mismatch?: { folderEmail?: string; folderAccountId?: string };
+  /** Other identities of the same tool on the same account. */
+  sharedWith?: string[];
+}
+
 export interface ToolLimitResult {
   toolName: ToolName;
   /** The upstream provider these windows belong to — the grouping key for
@@ -264,6 +278,7 @@ export interface ToolLimitResult {
   capturedAt?: string;
   overage?: OverageInfo;
   manualReset?: ManualResetInfo;
+  account?: AccountInfo;
 }
 
 export interface LimitsResponse {
@@ -429,7 +444,7 @@ export interface PoolRef {
   tool: string;
   name: string;
   active?: string;
-  members: Array<{ name: string; allowed: boolean }>;
+  members: Array<{ name: string; allowed: boolean; account?: AccountInfo }>;
 }
 
 export interface GatewayIdentityUsage {
@@ -686,6 +701,7 @@ export interface AuthEntry {
   lastRefreshAt?: string;
   /** ali only: last daemon-side refresh error, if any. */
   refreshError?: string;
+  account?: AccountInfo;
 }
 
 export interface AuthResponse {
@@ -713,8 +729,8 @@ export interface LoginFlow {
   instruction?: string;
   acceptsPaste: boolean;
   error?: string;
-  /** Set on a completed sign-in whose new login did not (fully) reach the gateway; the owner must read it. */
-  note?: string;
+  /** Set on a completed sign-in on a gateway identity: what handing the new login to the gateway came to. */
+  gateway?: { outcome: "adopted" | "attention" | "error"; message: string; accountChange?: { from?: string; to?: string } };
   startedAt: string;
   updatedAt: string;
   endedAt?: string;

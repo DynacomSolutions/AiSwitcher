@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 
+import { AccountWarnings } from "@/components/account-line";
 import { ToolBadge } from "@/components/badges";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
@@ -100,6 +101,12 @@ function PoolCard({ pool }: { pool: PoolSummary }) {
               <span className="tabular-nums" title={m.worstLabel ?? m.limitMissing}>
                 {m.worstPercent !== undefined ? `${clampPercent(m.worstPercent).toFixed(0)}%` : `n/a: ${m.limitMissing}`}
               </span>
+              {m.account ? (
+                <div className="col-span-3 space-y-0.5 text-xs">
+                  <div className="break-all text-muted-foreground">{m.account.email ?? m.account.label ?? m.account.accountId}</div>
+                  <AccountWarnings account={m.account} />
+                </div>
+              ) : null}
             </div>
           ))}
         </div>

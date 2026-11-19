@@ -124,7 +124,8 @@ for (const t of ["codex", "claude"] as const) {
     test("no key anywhere: the refusal note stays and the key is not invented", async () => {
       await seed(t, t === "codex" ? codexLogin("plain", "2030-01-02T00:00:00.000Z") : claudeLogin("plain", Date.parse("2030-06-01T00:00:00Z")));
       const { done } = await portalLogin(t);
-      expect(done.note).toContain("signed in, but the gateway still uses its older login for this identity");
+      expect(done.note).toContain("signed in, but the gateway could not take the new login");
+      expect(done.gateway?.outcome).toBe("error");
       expect(done.note).toContain("no AIS_GATEWAY_APP_AGENTS_");
       expect(classifyLogin(t, await readFile(join(folderOf(t), loginFile(t)), "utf8"))).toBe("login");
       expect(refreshOf(t, await readFile(join(memberDir(t, "work"), loginFile(t)), "utf8"))).toBe("rt-SYNTHETIC_FIXTURE-dead");
@@ -133,7 +134,7 @@ for (const t of ["codex", "claude"] as const) {
     test("a folder entry whose key is not an aisg_ key is not used", async () => {
       await seed(t, t === "codex" ? JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "sk-SYNTHETIC_FIXTURE-plain" }) : JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-SYNTHETIC_FIXTURE-x", refreshToken: null } }));
       const { done } = await portalLogin(t);
-      expect(done.note).toContain("the gateway still uses its older login");
+      expect(done.note).toContain("the gateway could not take the new login");
     });
   });
 }

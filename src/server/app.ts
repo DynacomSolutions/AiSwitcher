@@ -24,6 +24,7 @@ import { collectTargets } from "../cli/usage/run.ts";
 import { readUsageProjects } from "../cli/usage/projects.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
+import { accountKey, collectAccounts } from "../identities/account-info.ts";
 import { invalidateLimitsCache, runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
 import * as gatewayApps from "./gateway-apps.ts";
@@ -262,7 +263,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       maxAgeS: numberQuery(c, "maxAge", 45),
     }, 45_000);
     if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "limits scan failed");
-    return c.json(result.payload);
+    return c.json(await withRowAccounts(result.payload));
   });
   app.get("/api/usage", async (c) => {
     const result = await runScanIsolated("usage", {
@@ -610,5 +611,23 @@ export async function distDirExists(path: string): Promise<boolean> {
     return (await stat(resolve(path))).isDirectory();
   } catch {
     return false;
+  }
+}
+
+/** Adds the account (email, label, shared-account list) to every limits row. A failed read leaves the payload unchanged. */
+async function withRowAccounts(payload: unknown): Promise<unknown> {
+  try {
+    const results = (payload as { results?: unknown } | undefined)?.results;
+    if (!Array.isArray(results)) return payload;
+    const accounts = await collectAccounts(await loadAll());
+    return {
+      ...(payload as object),
+      results: results.map((row: { toolName?: string; identity?: { name?: string } }) => {
+        const account = row?.toolName && row.identity?.name ? accounts.get(accountKey(row.toolName, row.identity.name)) : undefined;
+        return account ? { ...row, account } : row;
+      }),
+    };
+  } catch {
+    return payload;
   }
 }
