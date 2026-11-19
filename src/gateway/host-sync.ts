@@ -2,8 +2,11 @@ import { readFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { defaultSecretsPath, readSecretsKey } from "../cli/gateway/secrets-file.ts";
+import { readHeartbeat } from "../identities/gateway-heartbeat.ts";
+import { ownedPath, recordOwned } from "../identities/gateway-owned.ts";
 import { aisStateDir } from "../shared/ais-home.ts";
 import { STORE_DATABASE_URL_KEY } from "../sync/store-sync-supervisor.ts";
+import { loadGatewayGuard, memberHere } from "../sync/gateway-guard.ts";
 import { importHome, type ImportEntry, type ImportReport } from "./home-import.ts";
 import { HomeMirror } from "./home-mirror.ts";
 import { parseStoreKey, PgHomeStore, STORE_KEY_ENV } from "./home-store.ts";
@@ -75,6 +78,25 @@ export interface HostSyncOptions {
 class CountingMirror extends HomeMirror {
   wrote = 0;
   pushed = 0;
+  /** Records still running for a heartbeat row (see recordHeld). */
+  recording: Promise<unknown>[] = [];
+}
+
+const HEARTBEAT_FILE = "gateway-heartbeat.json";
+
+/**
+ * Sticky ownership (gateway-owned.ts): every login the gateway's heartbeat names, as this host sees it, is written to the
+ * host's ownership record. The record never shrinks here, so a heartbeat that goes stale later never hands a login back to a
+ * host refresher. Reads the host file the mirror just wrote (or kept). Never throws.
+ */
+async function recordHeld(home: string, rel: string, warn?: (m: string) => void): Promise<void> {
+  const file = join(home, ...rel.split("/"));
+  try {
+    const hb = await readHeartbeat(file);
+    if (hb) await recordOwned(Object.keys(hb.held), hb.passAt, ownedPath(home));
+  } catch (err) {
+    warn?.(`could not record the logins the gateway owns (${(err as NodeJS.ErrnoException).code ?? (err as Error).name})`);
+  }
 }
 
 function mirrorFor(store: PgHomeStore, home: string, warn?: (m: string) => void): CountingMirror {
@@ -83,9 +105,21 @@ function mirrorFor(store: PgHomeStore, home: string, warn?: (m: string) => void)
     home,
     fileStore: true,
     ...(warn ? { warn } : {}),
-    onOutcome: (_path, outcome) => {
+    // A row for a login the gateway owns (member copy here, or sticky ownership) never lands in its identity folder.
+    keepHostLogin: async (rel) => {
+      const guard = await loadGatewayGuard(home);
+      const login = guard.native.get(rel);
+      return login !== undefined && memberHere(guard, login);
+    },
+    onOutcome: (path, outcome) => {
       if (outcome === "wrote") counts.m!.wrote += 1;
       else if (outcome === "pushed") counts.m!.pushed += 1;
+      if (path.endsWith(HEARTBEAT_FILE) && outcome !== "conflict") {
+        const task = recordHeld(home, path, warn).finally(() => {
+          counts.m!.recording = counts.m!.recording.filter((t) => t !== task);
+        });
+        counts.m!.recording.push(task);
+      }
     },
   });
   counts.m = m;
@@ -109,6 +143,7 @@ async function pass(mirror: CountingMirror, store: PgHomeStore, lock: RefreshGua
   mirror.pushed = 0;
   await mirror.pullAll();
   await mirror.pushDirty();
+  await Promise.allSettled(mirror.recording);
   return { imported, wrote: mirror.wrote, pushed: mirror.pushed };
 }
 

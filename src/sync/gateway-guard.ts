@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { withOauthRefreshLock } from "../identities/claude-swap-lock.ts";
+import { isStickyOwnedSync, ownedPath } from "../identities/gateway-owned.ts";
 import { hasMemberCopy, MEMBER_STORE_TOOLS, memberLoginFile, memberStoreRoot, type MemberStoreTool } from "../identities/gateway-members.ts";
 import { backupUnique, classifyLogin, isPureGatewayEntry, loginAccount, relateToRouting, routingOf } from "../identities/gateway-routed.ts";
 import { expandPath } from "../identities/match.ts";
@@ -62,6 +63,8 @@ export interface GuardedPiFile {
 
 export interface GatewayGuard {
   memberRoot: string;
+  /** The sticky gateway ownership record of the HOME being guarded (gateway-owned.ts). */
+  ownedFile: string;
   /** This host's name, compared with the routing record's host. */
   host: string;
   /** Home-relative login file of every claude/codex identity (swap pool folders marked `pool`). */
@@ -82,7 +85,7 @@ function relativeTo(home: string, path: string): string | undefined {
 
 /** Reads the registries under `home` (an unreadable registry contributes nothing). */
 export async function loadGatewayGuard(home: string = homedir(), registries: Partial<Record<MemberStoreTool | "pi", string>> = {}, host: string = hostname()): Promise<GatewayGuard> {
-  const guard: GatewayGuard = { memberRoot: memberStoreRoot(home), host, native: new Map(), pi: new Map() };
+  const guard: GatewayGuard = { memberRoot: memberStoreRoot(home), ownedFile: ownedPath(home), host, native: new Map(), pi: new Map() };
   for (const tool of [...MEMBER_STORE_TOOLS, "pi"] as const) {
     let identities;
     try {
@@ -120,8 +123,12 @@ const readSync = (path: string): string | undefined => {
   }
 };
 
-/** True when this host holds the gateway member store copy of the identity's login (never for a pool folder). */
-export const memberHere = (guard: GatewayGuard, login: GuardedLogin): boolean => !login.pool && hasMemberCopy(login.tool, login.name, guard.memberRoot);
+/**
+ * True when this host holds the gateway member store copy of the identity's login, or the gateway owns it by sticky ownership
+ * (gateway-owned.ts; never for a pool folder). Either way sync never writes a login into its folder.
+ */
+export const memberHere = (guard: GatewayGuard, login: GuardedLogin): boolean =>
+  !login.pool && (hasMemberCopy(login.tool, login.name, guard.memberRoot) || isStickyOwnedSync(login.tool, login.name, guard.ownedFile));
 
 /** Names of the identities routed on this host right now (a member store copy, or the folder holds the gateway entry). */
 export function routedNow(guard: GatewayGuard): Record<MemberStoreTool, Set<string>> {

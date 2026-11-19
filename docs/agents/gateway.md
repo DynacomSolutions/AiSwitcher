@@ -671,6 +671,15 @@ holds a refresh token: an empty or partial file left by a crash is ignored.
   (`isGatewayManagedHere`), heartbeat or not: it never refreshes, heals or reconciles that login. For claude, such an account
   is gateway-managed even when it is not a member of a gateway-routed pool. Usage readers skip a folder that holds the
   gateway app token, so it never reaches Anthropic.
+- Sticky ownership (`src/identities/gateway-owned.ts`, file `~/.ais/gateway-owned.json`): a login the gateway ever named
+  in its heartbeat stays the gateway's on the host until `ais gateway release <tool>/<identity>`. The host store sync
+  records the heartbeat's held list each time it pulls the heartbeat, and `isGatewayManagedHere` records a codex, grok or
+  kimi login the first time it sees a fresh heartbeat name it. The record never shrinks by itself, so a stale heartbeat
+  (gateway down, database push failing) never hands a login to a host refresher. Every host refresher goes through that one
+  check: `ais gateway local`, the web daemon, `ais auth refresh` (also with `--force`), the kimi usage refresh (also for a
+  pi-only kimi login, now under a lock), and the pi import and sync (an owned login is left out of pi's `auth.json`).
+  The store sync never writes a store row into the identity folder of an owned login, and the sync merge guard and swap
+  pools count it as held here. `release` refuses while a fresh heartbeat still names the login, unless `--force`.
 
 `ais identities route-all-via-gateway [--dry-run]` (host CLI only, never inside a gateway process) does the switch. Per
 identity, under the account's refresh locks (the ones the gateway takes before it renews the login):
