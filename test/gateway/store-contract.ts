@@ -160,6 +160,29 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(await s.usageByIdentity(new Date("2027-01-01T00:00:00.000Z"))).toEqual([]);
   });
 
+  test("usageByModel totals per provider, identity, app and model inside the window", async () => {
+    const s = await makeStore();
+    await s.appendUsage([
+      { ...row("a", "2026-11-02T01:00:00.000Z", 10, 20), identity: "m1", model: "ma", cacheReadTokens: 5, estCostUsd: 0.5 },
+      { ...row("a", "2026-11-02T03:00:00.000Z", 3, 4), identity: "m1", model: "ma", estCostUsd: 0.2 },
+      { ...row("b", "2026-11-02T02:00:00.000Z", 1, 1), identity: "m1", model: "ma", estCostUsd: 0.3 },
+      { ...row("a", "2026-11-02T04:00:00.000Z", 7, 0), identity: "m1", model: "mb", estCostUsd: 0.1 },
+      { ...row("a", "2026-11-02T05:00:00.000Z", 2, 2), identity: "m1" },
+      { ...row("a", "2026-10-01T00:00:00.000Z", 999, 0), identity: "m1", model: "ma", estCostUsd: 9 },
+    ]);
+    const got = await s.usageByModel(new Date("2026-11-02T00:00:00.000Z"));
+    const sorted = [...got].sort((x, y) => `${x.identity}/${x.app}/${x.model ?? ""}`.localeCompare(`${y.identity}/${y.app}/${y.model ?? ""}`));
+    expect(sorted).toEqual([
+      { provider: "codex", identity: "m1", app: "a", model: null, inputTokens: 2, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 1, requests: 1, firstTs: "2026-11-02T05:00:00.000Z", lastTs: "2026-11-02T05:00:00.000Z" },
+      { provider: "codex", identity: "m1", app: "a", model: "ma", inputTokens: 13, outputTokens: 24, cacheReadTokens: 5, cacheWriteTokens: 0, estCostUsd: 0.7, unpricedRequests: 0, requests: 2, firstTs: "2026-11-02T01:00:00.000Z", lastTs: "2026-11-02T03:00:00.000Z" },
+      { provider: "codex", identity: "m1", app: "a", model: "mb", inputTokens: 7, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0.1, unpricedRequests: 0, requests: 1, firstTs: "2026-11-02T04:00:00.000Z", lastTs: "2026-11-02T04:00:00.000Z" },
+      { provider: "codex", identity: "m1", app: "b", model: "ma", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0.3, unpricedRequests: 0, requests: 1, firstTs: "2026-11-02T02:00:00.000Z", lastTs: "2026-11-02T02:00:00.000Z" },
+    ]);
+    const win = await s.usageByModel(new Date("2026-11-02T00:00:00.000Z"), new Date("2026-11-02T03:00:00.000Z"));
+    expect(win.map((r) => `${r.app}/${r.model}`).sort()).toEqual(["a/ma", "b/ma"]);
+    expect(await s.usageByModel(new Date("2027-01-01T00:00:00.000Z"))).toEqual([]);
+  });
+
   test("appendUsage accepts an empty batch", async () => {
     const s = await makeStore();
     await s.appendUsage([]);

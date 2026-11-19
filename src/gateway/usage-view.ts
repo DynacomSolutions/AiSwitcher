@@ -1,5 +1,5 @@
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import type { IdentityUsageRow } from "./types.ts";
+import type { IdentityUsageRow, ModelUsageRow } from "./types.ts";
 
 /** One row of the admin `GET /usage` answer: an app's tokens over a window. */
 export interface GatewayAppUsage {
@@ -131,6 +131,58 @@ export async function loadGatewayIdentityUsage(since: Date, deps: LoadGatewayUsa
     });
     if (!res.ok) return { configured: true, rows: [], error: res.status === 404 ? "gateway admin has no per-identity usage yet (older version)" : `admin answered ${res.status}` };
     return { configured: true, rows: mapGatewayIdentityUsage(await res.json()) };
+  } catch {
+    return { configured: true, rows: [], error: "admin unreachable" };
+  }
+}
+
+export interface GatewayModelUsageView {
+  configured: boolean;
+  rows: ModelUsageRow[];
+  error?: string;
+}
+
+/** Maps the admin `GET /usage/models` body to rows, dropping malformed entries. A missing model stays null (its tokens still count). */
+export function mapGatewayModelUsage(json: unknown): ModelUsageRow[] {
+  const list = (json as { models?: unknown } | null | undefined)?.models;
+  if (!Array.isArray(list)) return [];
+  const n = (v: unknown): number => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
+  const rows: ModelUsageRow[] = [];
+  for (const raw of list) {
+    const r = raw as Record<string, unknown> | null;
+    if (!r || typeof r.identity !== "string" || r.identity === "" || typeof r.provider !== "string") continue;
+    rows.push({
+      provider: r.provider,
+      identity: r.identity,
+      app: typeof r.app === "string" ? r.app : "",
+      model: typeof r.model === "string" && r.model !== "" ? r.model : null,
+      inputTokens: n(r.inputTokens),
+      outputTokens: n(r.outputTokens),
+      cacheReadTokens: n(r.cacheReadTokens),
+      cacheWriteTokens: n(r.cacheWriteTokens),
+      estCostUsd: n(r.estCostUsd),
+      unpricedRequests: n(r.unpricedRequests),
+      requests: n(r.requests),
+      ...(typeof r.firstTs === "string" ? { firstTs: r.firstTs } : {}),
+      ...(typeof r.lastTs === "string" ? { lastTs: r.lastTs } : {}),
+    });
+  }
+  return rows;
+}
+
+/** Ledger totals per provider, identity, app and model over the last `days`, from the admin API. Failures come back as a short `error`, never thrown. */
+export async function loadGatewayModelUsage(days: number, deps: LoadGatewayUsageDeps = {}): Promise<GatewayModelUsageView> {
+  const url = (await readSecretsKey("AIS_GATEWAY_ADMIN_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_URL;
+  const token = (await readSecretsKey("AIS_GATEWAY_ADMIN_TOKEN", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_TOKEN;
+  if (!url || !token) return { configured: false, rows: [] };
+  const doFetch = deps.fetch ?? fetch;
+  try {
+    const res = await doFetch(`${url.replace(/\/+$/, "")}/usage/models?days=${encodeURIComponent(String(days))}`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 15_000),
+    });
+    if (!res.ok) return { configured: true, rows: [], error: res.status === 404 ? "gateway admin has no per-model usage yet (older version)" : `admin answered ${res.status}` };
+    return { configured: true, rows: mapGatewayModelUsage(await res.json()) };
   } catch {
     return { configured: true, rows: [], error: "admin unreachable" };
   }

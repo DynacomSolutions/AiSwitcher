@@ -121,6 +121,30 @@ async function jsonBody(req: Request): Promise<unknown> {
   return JSON.parse(text);
 }
 
+/**
+ * Validates the ledger usage window shared by `GET /usage/identities` and `GET /usage/models`.
+ * `since` (ISO instant, optional `until`) wins over `days`; both are bounded by MAX_USAGE_DAYS.
+ * Returns the window, or a message naming the problem.
+ */
+function usageWindow(query: (name: string) => string | undefined, now: Date): { since: Date; until?: Date } | string {
+  const sinceRaw = query("since");
+  let since: Date;
+  if (sinceRaw !== undefined) {
+    since = new Date(sinceRaw);
+    if (Number.isNaN(since.getTime())) return "since must be an ISO date-time";
+  } else {
+    const days = query("days") === undefined ? 1 : Number(query("days"));
+    if (!Number.isInteger(days) || days < 1 || days > MAX_USAGE_DAYS) return `days must be a whole number from 1 to ${MAX_USAGE_DAYS}`;
+    since = new Date(now.getTime() - days * 86400_000);
+  }
+  if (now.getTime() - since.getTime() > MAX_USAGE_DAYS * 86400_000) return `since must be within ${MAX_USAGE_DAYS} days`;
+  const untilRaw = query("until");
+  if (untilRaw === undefined) return { since };
+  const until = new Date(untilRaw);
+  if (Number.isNaN(until.getTime())) return "until must be an ISO date-time";
+  return { since, until };
+}
+
 export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
   const read = deps.readStore ?? store;
@@ -278,28 +302,23 @@ export function createAdminApp(deps: AdminDeps): Hono {
   // Ledger totals per provider and identity, so the console can sum a pool's members.
   // `since` (ISO instant, optional `until`) wins over `days`; both are bounded by MAX_USAGE_DAYS.
   hono.get("/usage/identities", async (c) => {
-    const now = deps.now();
-    const sinceRaw = c.req.query("since");
-    const untilRaw = c.req.query("until");
-    let since: Date;
-    if (sinceRaw !== undefined) {
-      since = new Date(sinceRaw);
-      if (Number.isNaN(since.getTime())) return err(400, "since must be an ISO date-time");
-    } else {
-      const days = c.req.query("days") === undefined ? 1 : Number(c.req.query("days"));
-      if (!Number.isInteger(days) || days < 1 || days > MAX_USAGE_DAYS) return err(400, `days must be a whole number from 1 to ${MAX_USAGE_DAYS}`);
-      since = new Date(now.getTime() - days * 86400_000);
-    }
-    if (now.getTime() - since.getTime() > MAX_USAGE_DAYS * 86400_000) return err(400, `since must be within ${MAX_USAGE_DAYS} days`);
-    let until: Date | undefined;
-    if (untilRaw !== undefined) {
-      until = new Date(untilRaw);
-      if (Number.isNaN(until.getTime())) return err(400, "until must be an ISO date-time");
-    }
+    const win = usageWindow((n) => c.req.query(n), deps.now());
+    if (typeof win === "string") return err(400, win);
     const provider = c.req.query("provider");
     if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
-    const rows = (await store.usageByIdentity(since, until)).filter((r) => provider === undefined || r.provider === provider);
-    return c.json({ since: since.toISOString(), ...(until ? { until: until.toISOString() } : {}), identities: rows });
+    const rows = (await store.usageByIdentity(win.since, win.until)).filter((r) => provider === undefined || r.provider === provider);
+    return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), identities: rows });
+  });
+
+  // Ledger totals per provider, identity, app and model, so the console can show per-model usage.
+  // Same window rules as /usage/identities.
+  hono.get("/usage/models", async (c) => {
+    const win = usageWindow((n) => c.req.query(n), deps.now());
+    if (typeof win === "string") return err(400, win);
+    const provider = c.req.query("provider");
+    if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
+    const rows = (await store.usageByModel(win.since, win.until)).filter((r) => provider === undefined || r.provider === provider);
+    return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), models: rows });
   });
 
   return hono;

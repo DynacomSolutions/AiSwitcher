@@ -43,6 +43,15 @@ export interface IdentityUsageRow {
   requests: number;
 }
 
+/** Ledger totals for one provider, identity, app and model over a window (the admin `GET /usage/models` row). */
+export interface ModelUsageRow extends IdentityUsageRow {
+  /** The model the requests used; null when the proxy recorded no model. Never dropped: its tokens still count. */
+  model: string | null;
+  /** Earliest and latest ledger timestamp in the group (ISO instants), for the report's date span. */
+  firstTs?: string;
+  lastTs?: string;
+}
+
 export interface UsageRow {
   ts: string;
   app: string;

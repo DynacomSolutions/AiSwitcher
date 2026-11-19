@@ -3,7 +3,7 @@ import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browse
 import { bumpSideCountOn, type SqlTag } from "./side-count.ts";
 import { errorTag } from "./ledger-buffer.ts";
 import { AppRevokedError, type GatewayStore } from "./store.ts";
-import type { GatewayApp, GatewayProvider, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelUsageRow, TokenRecord, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
@@ -320,6 +320,68 @@ export class PgGatewayStore implements GatewayStore {
       estCostUsd: Number(r.est_cost_usd) + (extra.get(`${String(r.provider)}\u0000${String(r.identity)}\u0000${String(r.app)}`)?.cost ?? 0),
       unpricedRequests: extra.get(`${String(r.provider)}\u0000${String(r.identity)}\u0000${String(r.app)}`)?.unpriced ?? 0,
       requests: Number(r.requests),
+    }));
+  }
+
+  async usageByModel(since: Date, until?: Date): Promise<ModelUsageRow[]> {
+    const to = until ? until.toISOString() : null;
+    const rows = await this.sql`
+      SELECT provider, identity, app, model,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd,
+        0 AS unpriced,
+        COUNT(*) AS requests,
+        MIN(ts) AS first_ts,
+        MAX(ts) AS last_ts
+      FROM gateway_usage WHERE ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+      GROUP BY provider, identity, app, model ORDER BY provider, identity, app, model`;
+    // Rows stored without a cost are priced from tokens and model at read time.
+    const nulls = await this.sql`
+      SELECT provider, identity, app, model,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COUNT(*) AS requests
+      FROM gateway_usage WHERE est_cost_usd IS NULL AND ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+      GROUP BY provider, identity, app, model`;
+    const mkey = (m: unknown): string => (m === null || m === undefined ? "" : String(m));
+    const gkey = (r: Record<string, unknown>): string => `${String(r.provider)}\u0000${String(r.identity)}\u0000${String(r.app)}\u0000${mkey(r.model)}`;
+    const extra = new Map<string, { cost: number; unpriced: number }>();
+    for (const n of nulls as Record<string, unknown>[]) {
+      const priced = priceNullCostGroup({
+        provider: String(n.provider) as GatewayProvider,
+        identity: String(n.identity),
+        app: String(n.app),
+        model: n.model === null || n.model === undefined ? null : String(n.model),
+        inputTokens: Number(n.input_tokens),
+        outputTokens: Number(n.output_tokens),
+        cacheReadTokens: Number(n.cache_read_tokens),
+        cacheWriteTokens: Number(n.cache_write_tokens),
+        requests: Number(n.requests),
+      });
+      const e = extra.get(gkey(n)) ?? { cost: 0, unpriced: 0 };
+      e.cost += priced.cost;
+      e.unpriced += priced.unpriced;
+      extra.set(gkey(n), e);
+    }
+    return rows.map((r: Record<string, unknown>) => ({
+      provider: String(r.provider),
+      identity: String(r.identity),
+      app: String(r.app),
+      model: r.model === null || r.model === undefined ? null : String(r.model),
+      inputTokens: Number(r.input_tokens),
+      outputTokens: Number(r.output_tokens),
+      cacheReadTokens: Number(r.cache_read_tokens),
+      cacheWriteTokens: Number(r.cache_write_tokens),
+      estCostUsd: Number(r.est_cost_usd) + (extra.get(gkey(r))?.cost ?? 0),
+      unpricedRequests: extra.get(gkey(r))?.unpriced ?? 0,
+      requests: Number(r.requests),
+      firstTs: iso(r.first_ts),
+      lastTs: iso(r.last_ts),
     }));
   }
 
