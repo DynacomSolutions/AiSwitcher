@@ -29,7 +29,9 @@ export type WriteBackOutcome =
   | "none-identical"
   | "none-member-newer"
   | "none-unknown-owner"
-  | "none-account-mismatch";
+  | "none-account-mismatch"
+  /** The owner's login belongs to the cluster gateway: a pool never writes a token back to it. */
+  | "none-gateway-owned";
 
 export interface SwapResult {
   pool: string;
