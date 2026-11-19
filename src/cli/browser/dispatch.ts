@@ -18,6 +18,12 @@ export async function runBrowserCommand(positionals: string[], flags: ParsedArgs
     await runMcpShim();
     return;
   }
+  if (sub === "wiring") {
+    const { runBrowserWiring } = await import("./wiring.ts");
+    const { ok } = await runBrowserWiring(flags, deps.out ? { out: deps.out } : {});
+    if (!ok && (flags.check === true || flags.check === "true")) process.exitCode = 1;
+    return;
+  }
   if (sub === "extension") {
     await runBrowserExtension(rest, flags, { ...(deps.extensionDir !== undefined ? { extensionDir: deps.extensionDir } : {}), ...(deps.home !== undefined ? { home: deps.home } : {}), ...(deps.fetch ? { fetch: deps.fetch } : {}), ...(deps.out ? { out: deps.out } : {}), ...(deps.env ? { env: deps.env } : {}), ...(deps.platform ? { platform: deps.platform } : {}), ...(deps.run ? { run: deps.run } : {}) });
     return;
