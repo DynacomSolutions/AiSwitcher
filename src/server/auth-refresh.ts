@@ -15,7 +15,7 @@ import { grantFingerprint, withReadErrorProbe } from "../identities/oauth-reconc
 import { isRetired } from "../identities/retired.ts";
 import type { Identity } from "../identities/types.ts";
 import { consoleWebDir } from "./state.ts";
-import { gatewayOwnership } from "./gateway-renewal.ts";
+import { createOwnershipCheck } from "../gateway/home-store.ts";
 import { GATEWAY_REFRESH_TOOLS } from "../identities/gateway-managed.ts";
 import { OPENCODE_CONSOLE_EXPIRY_WINDOW_HOURS, opencodeConsoleFingerprint, refreshOpencodeConsoleGrant } from "../identities/opencode-console-refresh.ts";
 
@@ -143,18 +143,16 @@ export const STORE_DATABASE_ENV = "AIS_GATEWAY_STORE_DATABASE_URL";
 const STORE_REFRESHED_TOOLS: ReadonlySet<string> = new Set(GATEWAY_REFRESH_TOOLS);
 
 /**
- * Accounts ("tool/identity") the gateway renews, or undefined when that cannot be read. The set is the gateway's own list
- * of logins it keeps alive (admin GET /logins/renewal, see gateway-renewal.ts), never the credential store's rows: a row for
- * a login the gateway does not manage is a stale copy, and the console must still renew that login. Built from
- * AIS_GATEWAY_STORE_DATABASE_URL (the sign that this console runs against a gateway store); without it nothing is owned
- * (the console refreshes as before). An unreachable gateway reads as undefined, so the console stands down.
+ * Accounts ("tool/identity") the gateway's PostgreSQL store owns, or undefined when the store cannot be read. Built from
+ * AIS_GATEWAY_STORE_DATABASE_URL; without it nothing is owned (the console refreshes as before).
  */
 export type StoreOwnership = () => Promise<Set<string> | undefined>;
 
 function storeOwnershipFromEnv(): StoreOwnership {
   const url = process.env[STORE_DATABASE_ENV]?.trim();
   if (!url) return async () => new Set<string>();
-  return gatewayOwnership();
+  const check = createOwnershipCheck(url);
+  return () => check.owned();
 }
 
 export function parseRefreshExpiryWindowHours(raw: string | undefined): number {

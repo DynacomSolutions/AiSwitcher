@@ -9,7 +9,6 @@ import { STORE_DATABASE_URL_KEY } from "../sync/store-sync-supervisor.ts";
 import { loadGatewayGuard, memberHere } from "../sync/gateway-guard.ts";
 import { importHome, type ImportEntry, type ImportReport } from "./home-import.ts";
 import { HomeMirror } from "./home-mirror.ts";
-import { hostOwnsFolderLogin } from "./host-login-gate.ts";
 import { parseStoreKey, PgHomeStore, STORE_KEY_ENV } from "./home-store.ts";
 import { PgRefreshBackend } from "./pg-refresh-backend.ts";
 import type { RefreshGuardBackend } from "./refresh-guard.ts";
@@ -112,8 +111,6 @@ function mirrorFor(store: PgHomeStore, home: string, warn?: (m: string) => void)
       const login = guard.native.get(rel);
       return login !== undefined && memberHere(guard, login);
     },
-    // A folder login of an identity the gateway does not manage belongs to the host: it never goes to the store, and no row lands on it.
-    hostOwnsLogin: (rel) => hostOwnsFolderLogin(home, rel),
     onOutcome: (path, outcome) => {
       if (outcome === "wrote") counts.m!.wrote += 1;
       else if (outcome === "pushed") counts.m!.pushed += 1;

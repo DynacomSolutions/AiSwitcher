@@ -73,7 +73,7 @@ export interface GatewayGuard {
   pi: Map<string, GuardedPiFile>;
 }
 
-export function rerooted(path: string, home: string): string {
+function rerooted(path: string, home: string): string {
   const real = homedir();
   return path.startsWith(`${real}/`) ? join(home, path.slice(real.length + 1)) : path;
 }

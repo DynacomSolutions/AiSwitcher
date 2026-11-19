@@ -731,7 +731,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   };
   /** Hold a member whose credential failed: ten minutes (or until its credential file changes) when only a person can fix it, else briefly. */
   const holdCredentialFailure = async (name: string, err: unknown): Promise<void> => {
-    const long = err instanceof GatewayCredentialError && (err.loggedOut || err.code === "retired" || err.code === "unknown-identity" || err.code === "unmanaged-login");
+    const long = err instanceof GatewayCredentialError && (err.loggedOut || err.code === "retired" || err.code === "unknown-identity");
     const message = err instanceof GatewayCredentialError ? err.clientMessage : "upstream credential unavailable";
     exhausted.set(exKey(name), deps.now().getTime() + (long ? CREDENTIAL_HOLD_MS : BURST_HOLD_DEFAULT_MS));
     holds.set(exKey(name), { kind: "cred", long, message, sig: await credentialSignature(deps, app.provider, name) });

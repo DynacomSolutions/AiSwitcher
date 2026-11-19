@@ -182,12 +182,11 @@ export async function runReleaseCommand(args: string[], force: boolean, deps: Ga
   deps.out(`gateway release: ${target} released; host refreshers may renew it again`);
 }
 
-const STORE_USAGE = "Usage: ais gateway store import [--dry-run] | sync [--once] | prune [--dry-run] | setup --key-file=<path>  (database URL on stdin)";
+const STORE_USAGE = "Usage: ais gateway store import [--dry-run] | sync [--once] | setup --key-file=<path>  (database URL on stdin)";
 
 /**
  * `ais gateway store import [--dry-run]`: copies this host's gateway login files into the PostgreSQL store (idempotent).
  * `ais gateway store sync [--once]`: keeps this host's login files in step with the store (host-sync.ts).
- * `ais gateway store prune [--dry-run]`: removes the stale store copy of a login the host owns and the gateway does not manage (store-prune.ts).
  * `ais gateway store setup --key-file=<path>`: records the store's database URL (stdin) and key in ~/.secrets for the sync.
  */
 async function runStoreCommand(args: string[], flags: ParsedArgs["flags"], deps: GatewayCliDeps): Promise<void> {
@@ -195,7 +194,6 @@ async function runStoreCommand(args: string[], flags: ParsedArgs["flags"], deps:
   if (extra.length > 0) throw new CliUsageError(STORE_USAGE);
   if (action === "sync") return runStoreSync(boolFlag(flags, "once"), deps);
   if (action === "setup") return runStoreSetup(stringFlag(flags, "key-file"), deps);
-  if (action === "prune") return runStorePrune(boolFlag(flags, "dry-run"), deps);
   if (action !== "import") throw new CliUsageError(STORE_USAGE);
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");
@@ -254,30 +252,6 @@ async function runStoreSync(once: boolean, deps: GatewayCliDeps): Promise<void> 
     } catch {
       // already gone
     }
-  }
-}
-
-async function runStorePrune(dryRun: boolean, deps: GatewayCliDeps): Promise<void> {
-  const { hostStoreConfig } = await import("../../gateway/host-sync.ts");
-  const cfg = await hostStoreConfig();
-  if (!cfg) throw new CliUsageError("No credential store configured on this host: run `ais gateway store setup --key-file=<path>` first");
-  const { PgHomeStore } = await import("../../gateway/home-store.ts");
-  const { pruneUnmanagedLogins } = await import("../../gateway/store-prune.ts");
-  const { loadGatewayRenewal } = await import("../../server/gateway-renewal.ts");
-  const store = new PgHomeStore(cfg.databaseUrl, cfg.key, `prune:${process.env.HOSTNAME ?? "host"}:${process.pid}`);
-  try {
-    const r = await pruneUnmanagedLogins(store, {
-      dryRun,
-      gatewayLogins: async () => {
-        const view = await loadGatewayRenewal();
-        return view.state === "ok" ? new Set(view.logins.map((l) => `${l.provider}/${l.identity}`)) : undefined;
-      },
-    });
-    deps.out(`gateway store prune: ${r.removed.length} ${dryRun ? "would be removed" : "removed"}, ${r.kept.length} kept`);
-    for (const p of r.removed) deps.out(`  - ${p}`);
-    for (const k of r.kept) deps.out(`  = ${k.path} (${k.why})`);
-  } finally {
-    await store.close().catch(() => undefined);
   }
 }
 

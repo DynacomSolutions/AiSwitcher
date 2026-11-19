@@ -64,50 +64,18 @@ export function isGatewayServedTool(tool: string): tool is GatewayRefreshTool {
  * Unreadable registry or a tool the gateway does not serve: none.
  */
 export async function listGatewayManagedAccounts(registryPath?: string, tool: string = "claude"): Promise<Identity[]> {
-  return listGatewayManagedAccountsStrict(registryPath, tool).catch(() => []);
-}
-
-/**
- * Like listGatewayManagedAccounts, but a registry that cannot be read throws, so a caller can tell "no managed logins" from
- * "could not tell". A tool the gateway does not serve is none.
- */
-export async function listGatewayManagedAccountsStrict(registryPath?: string, tool: string = "claude"): Promise<Identity[]> {
   if (!isGatewayServedTool(tool)) return [];
-  const file = await loadIdentitiesFile(registryPath ?? REGISTRY_OF[tool]);
-  if (tool !== "claude") return file.identities.filter((i) => !isRetired(i) && !i.swapPool);
-  const names = new Set<string>();
-  for (const pool of poolsOf(file)) {
-    if (await isGatewayRoutedDir(expandPath(pool.configDir))) for (const a of pool.swapPool.accounts) names.add(a);
-  }
-  return file.identities.filter((i) => !i.swapPool && (names.has(i.name) || (!isRetired(i) && hasMemberCopy(tool, i.name))));
-}
-
-/**
- * Answers "does the gateway manage this login?" for the gateway process, with a short cache of each tool's list. Undefined
- * when the registry cannot be read: only a successful read may call a login unmanaged. A tool the gateway does not serve, a
- * swap pool folder and a name the registry does not hold are never unmanaged (the credential lookup deals with those).
- */
-export function createManagementCheck(opts: { ttlMs?: number; now?: () => number; registryPath?: (tool: string) => string | undefined } = {}): (tool: string, identity: string) => Promise<boolean | undefined> {
-  const ttl = opts.ttlMs ?? 5_000;
-  const now = opts.now ?? Date.now;
-  /** managed: the gateway's list. plain: real (non swap pool) identities in the registry. */
-  const cache = new Map<string, { at: number; managed: Set<string>; plain: Set<string> }>();
-  return async (tool, identity) => {
-    if (!isGatewayServedTool(tool)) return true;
-    let hit = cache.get(tool);
-    if (!hit || now() - hit.at >= ttl) {
-      try {
-        const path = opts.registryPath?.(tool);
-        const file = await loadIdentitiesFile(path ?? REGISTRY_OF[tool]);
-        const managed = new Set((await listGatewayManagedAccountsStrict(path, tool)).map((i) => i.name));
-        hit = { at: now(), managed, plain: new Set(file.identities.filter((i) => !i.swapPool).map((i) => i.name)) };
-        cache.set(tool, hit);
-      } catch {
-        return undefined;
-      }
+  try {
+    const file = await loadIdentitiesFile(registryPath ?? REGISTRY_OF[tool]);
+    if (tool !== "claude") return file.identities.filter((i) => !isRetired(i) && !i.swapPool);
+    const names = new Set<string>();
+    for (const pool of poolsOf(file)) {
+      if (await isGatewayRoutedDir(expandPath(pool.configDir))) for (const a of pool.swapPool.accounts) names.add(a);
     }
-    return hit.managed.has(identity) || !hit.plain.has(identity);
-  };
+    return file.identities.filter((i) => !i.swapPool && (names.has(i.name) || (!isRetired(i) && hasMemberCopy(tool, i.name))));
+  } catch {
+    return [];
+  }
 }
 
 /**
