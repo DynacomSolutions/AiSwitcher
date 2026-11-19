@@ -366,6 +366,14 @@ Returns the exact `ToolLimitResult[]` shape the CLI's JSON mode emits
 min 5) controls staleness tolerance. Concurrent identical requests share one
 upstream fetch.
 
+When the gateway admin API is configured (`AIS_GATEWAY_ADMIN_URL` and
+`AIS_GATEWAY_ADMIN_TOKEN`), the cluster gateway is the source of truth for
+the identities it manages: its `GET /limits` rows replace the host-scan rows
+of the same tool and identity (a stale gateway reading shows as `cached`).
+Host rows the gateway does not cover stay unchanged, and an unconfigured or
+unreachable gateway leaves the host scan as it is. The `tool` and `identity`
+filters apply to both sources.
+
 ```jsonc
 {
   "results": [ /* ToolLimitResult[] */ ],

@@ -577,6 +577,13 @@ CLIProxyAPI's refresh journal):
 - Admin route `GET /logins/renewal` (admin token): per login, `renewedBy`, `lastRefreshAt`,
   `lastRefreshReplica`, `lastError` (only while newer than the last success), `expiresAt`,
   `nextRefreshAt` and `revoked`, from the journal and the stored login.
+- Admin route `GET /limits` (admin token, optional `provider` and `identity` filters): `{ limits: [...] }`,
+  one row per managed identity of claude, codex, kimi and zai (pool members plus the pins of active apps,
+  canonical names, deduplicated). Each row carries the usage source's reading: `status`, `capturedAt`,
+  `stale`, `maxUtilization`, `windows[]` (`label`, `utilization`, `resetsAt`, `model`) and `extraUsage`.
+  The reads come from the same 45 s cache the proxy selects on: a request never waits on a fresh fetch
+  and never refreshes a token. An identity with no reading yet answers `status: "unavailable"` and fills
+  in behind. The console Limits page merges these rows over its host scan (`src/server/gateway-limits.ts`).
 
 ## Credential store and replicas
 

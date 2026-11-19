@@ -27,6 +27,7 @@ import * as authApi from "./auth.ts";
 import { accountKey, collectAccounts } from "../identities/account-info.ts";
 import { invalidateLimitsCache, runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
+import { loadGatewayLimits, mergeGatewayLimits, type GatewayLimitsView } from "./gateway-limits.ts";
 import * as gatewayApps from "./gateway-apps.ts";
 import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -82,6 +83,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   localModels?: () => Promise<LocalModelsDto>;
   /** Test seam for GET /api/gateway/usage; defaults to the gateway admin API. */
   gatewayUsage?: (days: number) => Promise<GatewayUsageView>;
+  /** Test seam for the gateway limits merge on GET /api/limits; defaults to the gateway admin API. */
+  gatewayLimits?: () => Promise<GatewayLimitsView>;
   /** Test seam for the /api/gateway/apps routes; defaults to the gateway admin API (and the CLI rotate path). */
   gatewayApps?: Partial<{
     list: () => Promise<gatewayApps.GatewayAppsView>;
@@ -272,13 +275,19 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   // never take the HTTP loop down with it.
 
   app.get("/api/limits", async (c) => {
-    const result = await runScanIsolated("limits", {
+    const filters = {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
-      maxAgeS: numberQuery(c, "maxAge", 45),
-    }, 45_000);
+    };
+    // The cluster gateway is the source of truth for the limits of the identities it manages; the host scan covers the rest.
+    // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
+    const [result, gateway] = await Promise.all([
+      runScanIsolated("limits", { ...filters, maxAgeS: numberQuery(c, "maxAge", 45) }, 45_000),
+      (deps.gatewayLimits ?? loadGatewayLimits)().catch(() => undefined),
+    ]);
     if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "limits scan failed");
-    return c.json(await withRowAccounts(result.payload));
+    const payload = gateway ? await mergeGatewayLimits(result.payload, gateway, filters) : result.payload;
+    return c.json(await withRowAccounts(payload));
   });
   app.get("/api/usage", async (c) => {
     const result = await runScanIsolated("usage", {

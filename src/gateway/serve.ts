@@ -683,6 +683,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     now,
     renewal: () => buildRenewalReport({ tools: GATEWAY_REFRESH_TOOLS, accounts: renewalAccounts, summary: () => refreshBackend.summary?.() ?? Promise.resolve([]), isRevoked: (tool, name, fingerprint) => fingerprint !== undefined && deadLogins.get(`${tool}/${name}`)?.fingerprint === fingerprint, now }),
     identityState: hooks.identityState ?? defaultIdentityState,
+    // The same cached usage reads the proxy selects on: the console Limits page shows them through GET /limits.
+    usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
+    poolMembers,
+    canonical,
     browserPoolMembers,
     browserIdentityExists,
     browserHub: browser,
