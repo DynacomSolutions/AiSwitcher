@@ -2,7 +2,7 @@ import { canonicalUsageProvider } from "../cli/usage/providers.ts";
 import type { UsageResult } from "../cli/usage/run.ts";
 import type { TokscaleEntry, TokscaleReport } from "../cli/usage/tokscale.ts";
 import { loadAll, type LoadedFile } from "../cli/identities/resolve-tool.ts";
-import { aisNativeTokscaleConfigDir, readTokscaleBucketTimezone, tokscalePinnedZone, addDailyTotals, type DailyTotals } from "../cli/usage/tokscale.ts";
+import { aisNativeTokscaleConfigDir, readTokscaleBucketTimezone, tokscalePinnedZone, addDailyTotals, mergeDailyTotals, type DailyTotals } from "../cli/usage/tokscale.ts";
 import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
 import { GATEWAY_REFRESH_TOOLS, listAliAccounts, listGatewayManagedAccounts } from "../identities/gateway-managed.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
@@ -170,12 +170,85 @@ export function gatewayUsageAnswered(view: GatewayModelUsageView | undefined): v
   return view !== undefined && view.configured && !view.error;
 }
 
+/** The "YYYY-MM-DD" day of an instant in the given IANA zone. */
+function dayInZone(ms: number, zone: string): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+}
+
+/**
+ * Splices one host row and its gateway row by day. The ledger only starts when the gateway went live, so the host
+ * transcript history before that day is the only record and must stay. Coverage start is the first gateway day (the
+ * first daily row, else the first ledger instant in the bucket zone). Days before it come from the host; days on or
+ * after it come from the gateway only, so no day counts twice.
+ *
+ * The host report has per-model totals but no per-day per-model split, so the pre-coverage model figures are an
+ * honest proportional share: each host model entry is scaled, field by field, by (host days before coverage) / (all
+ * host days) taken from host dailyTotals. The model entries then add up exactly to the pre-coverage day totals.
+ * Without host dailyTotals the host cannot be split, so the gateway row stands alone.
+ */
+export function spliceHostWithGateway(host: UsageResult, gateway: UsageResult, zone: string = usageBucketZone()): Pick<UsageResult, "report" | "dateSpan" | "dailyUsage" | "dailyTotals"> {
+  const gw = gateway.report!;
+  const gwDays = Object.keys(gateway.dailyTotals ?? {}).sort();
+  const start = gwDays[0] ?? (gateway.dateSpan ? dayInZone(gateway.dateSpan.firstMs, zone) : undefined);
+  const hostTotals = host.dailyTotals;
+  const gatewayOnly = { report: gw, ...(gateway.dateSpan ? { dateSpan: gateway.dateSpan } : {}), ...(gateway.dailyUsage ? { dailyUsage: gateway.dailyUsage } : {}), ...(gateway.dailyTotals ? { dailyTotals: gateway.dailyTotals } : {}) };
+  if (!start || !host.report || !hostTotals) return gatewayOnly;
+  const preTotals: DailyTotals = {};
+  const hostAll = [0, 0, 0, 0, 0, 0];
+  const pre = [0, 0, 0, 0, 0, 0];
+  for (const [day, v] of Object.entries(hostTotals)) {
+    for (let i = 0; i < 6; i++) hostAll[i]! += v[i]!;
+    if (day < start) {
+      preTotals[day] = [...v];
+      for (let i = 0; i < 6; i++) pre[i]! += v[i]!;
+    }
+  }
+  if (Object.keys(preTotals).length === 0) return gatewayOnly;
+  const preDailyUsage: Record<string, number> = {};
+  for (const [day, tokens] of Object.entries(host.dailyUsage ?? {})) if (day < start) preDailyUsage[day] = tokens;
+  const ratio = (i: number) => (hostAll[i]! > 0 ? Math.min(1, pre[i]! / hostAll[i]!) : 0);
+  const [rIn, rOut, rCr, rCw, rMsg, rCost] = [0, 1, 2, 3, 4, 5].map(ratio) as [number, number, number, number, number, number];
+  const models = new Map<string, TokscaleEntry>();
+  for (const e of host.report.entries) {
+    const scaled: TokscaleEntry = { ...e, input: e.input * rIn, output: e.output * rOut, cacheRead: e.cacheRead * rCr, cacheWrite: e.cacheWrite * rCw, messageCount: e.messageCount * rMsg, cost: e.cost * rCost };
+    const have = models.get(e.model);
+    if (!have) { models.set(e.model, scaled); continue; }
+    have.input += scaled.input; have.output += scaled.output; have.cacheRead += scaled.cacheRead; have.cacheWrite += scaled.cacheWrite; have.messageCount += scaled.messageCount; have.cost += scaled.cost;
+  }
+  for (const e of gw.entries) {
+    const have = models.get(e.model);
+    if (!have) { models.set(e.model, { ...e }); continue; }
+    have.input += e.input; have.output += e.output; have.cacheRead += e.cacheRead; have.cacheWrite += e.cacheWrite; have.messageCount += e.messageCount; have.cost += e.cost;
+  }
+  const entries = [...models.values()].filter((e) => e.input + e.output + e.cacheRead + e.cacheWrite + e.messageCount + e.cost > 0).sort((a, b) => b.cost - a.cost || a.model.localeCompare(b.model));
+  const report: TokscaleReport = {
+    entries,
+    totalInput: entries.reduce((x, e) => x + e.input, 0),
+    totalOutput: entries.reduce((x, e) => x + e.output, 0),
+    totalCacheRead: entries.reduce((x, e) => x + e.cacheRead, 0),
+    totalCacheWrite: entries.reduce((x, e) => x + e.cacheWrite, 0),
+    totalMessages: entries.reduce((x, e) => x + e.messageCount, 0),
+    totalCost: entries.reduce((x, e) => x + e.cost, 0),
+  };
+  const dailyTotals = mergeDailyTotals(preTotals, gateway.dailyTotals) ?? {};
+  const dailyUsage: Record<string, number> = { ...preDailyUsage, ...(gateway.dailyUsage ?? {}) };
+  const firstMs = Math.min(host.dateSpan?.firstMs ?? Number.POSITIVE_INFINITY, gateway.dateSpan?.firstMs ?? Number.POSITIVE_INFINITY);
+  const lastMs = gateway.dateSpan?.lastMs ?? host.dateSpan?.lastMs;
+  return {
+    report,
+    ...(Number.isFinite(firstMs) && lastMs !== undefined ? { dateSpan: { firstMs, lastMs } } : {}),
+    dailyUsage,
+    dailyTotals,
+  };
+}
+
 const EMPTY_REPORT = (): TokscaleReport => ({ entries: [], totalInput: 0, totalOutput: 0, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 0, totalCost: 0 });
 
 /**
  * Merges the gateway rows into a host usage payload. The gateway is authoritative for the tokens, cost, messages and
- * per-day figures of the identities it manages: its report, date span and day splits replace the host's, keeping the
- * host's registry entry and overage. A managed identity is one the gateway reported or the host registries list as
+ * per-day figures of the identities it manages from its first ledger day on. Host days before that day stay (see
+ * spliceHostWithGateway), so all-time totals keep the history from before the gateway existed. The host's registry
+ * entry and overage stay. A managed identity is one the gateway reported or the host registries list as
  * gateway-managed (the limits merge uses the gateway's rows the same way). Its host numbers never show: with no ledger
  * rows it shows zero, and when the gateway read fails it shows an honest "gateway usage unavailable" error. Host rows
  * for identities the gateway does not manage stay as they are; gateway rows with no host row are added with their
@@ -226,13 +299,14 @@ export async function mergeGatewayUsage(
     const provider = mergeProviderKey(host.provider);
     if (gateway?.report) {
       used.add(key);
+      const spliced = spliceHostWithGateway(host, gateway);
       return [{
         ...stripNumbers(host),
         provider,
-        report: publicReport(gateway.report),
-        ...(gateway.dateSpan ? { dateSpan: gateway.dateSpan } : {}),
-        ...(gateway.dailyUsage ? { dailyUsage: gateway.dailyUsage } : {}),
-        ...(gateway.dailyTotals ? { dailyTotals: gateway.dailyTotals } : {}),
+        report: publicReport(spliced.report!),
+        ...(spliced.dateSpan ? { dateSpan: spliced.dateSpan } : {}),
+        ...(spliced.dailyUsage ? { dailyUsage: spliced.dailyUsage } : {}),
+        ...(spliced.dailyTotals ? { dailyTotals: spliced.dailyTotals } : {}),
       }];
     }
     // Managed but no ledger rows in the window: zero from the gateway, never the host's figures.

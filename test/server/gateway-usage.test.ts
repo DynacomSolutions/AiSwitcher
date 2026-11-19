@@ -245,3 +245,62 @@ describe("mergeGatewayUsage", () => {
     expect((byIdentity.results[0] as any).report.totalInput).toBe(10);
   });
 });
+
+describe("host history before gateway coverage", () => {
+  const day = (d: string, over: Partial<ModelDailyUsageRow> = {}): ModelDailyUsageRow => ({
+    day: d, provider: "claude", identity: "m1", model: "sonnet", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0, ...over,
+  });
+  const gwRows = [modelRow("claude", "m1", "web", "sonnet", { inputTokens: 30, outputTokens: 10, estCostUsd: 3, requests: 4, firstTs: "2026-11-03T01:00:00.000Z", lastTs: "2026-11-04T01:00:00.000Z" })];
+  const gwDaily = [
+    day("2026-11-03", { inputTokens: 10, outputTokens: 5, estCostUsd: 1, requests: 2 }),
+    day("2026-11-04", { inputTokens: 20, outputTokens: 5, estCostUsd: 2, requests: 2 }),
+  ];
+  const host = (over: Record<string, unknown> = {}) => hostRow("anthropic", "m1", {
+    report: {
+      entries: [
+        { model: "sonnet", provider: "anthropic", input: 100, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0, messageCount: 10, cost: 10 },
+        { model: "opus", provider: "anthropic", input: 100, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0, messageCount: 10, cost: 30 },
+      ],
+      totalInput: 200, totalOutput: 200, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 20, totalCost: 40,
+    },
+    // Two days before coverage (half of everything) and one overlap day (the other half).
+    dailyTotals: { "2026-10-01": [50, 50, 0, 0, 5, 10], "2026-10-02": [50, 50, 0, 0, 5, 10], "2026-11-03": [100, 100, 0, 0, 10, 20] },
+    dailyUsage: { "2026-10-01": 100, "2026-10-02": 100, "2026-11-03": 200 },
+    dateSpan: { firstMs: Date.parse("2026-10-01T00:00:00Z"), lastMs: Date.parse("2026-11-03T12:00:00Z") },
+    ...over,
+  });
+  const run = async (h: unknown) => ((await mergeGatewayUsage(payload([h]), view(gwRows, { daily: gwDaily, dailyZone: "UTC" }), {}, noRegistries, noManaged)) as any).results[0];
+
+  test("host days before coverage stay, overlap days come only from the gateway", async () => {
+    const r = await run(host());
+    expect(Object.keys(r.dailyTotals).sort()).toEqual(["2026-10-01", "2026-10-02", "2026-11-03", "2026-11-04"]);
+    expect(r.dailyTotals["2026-10-01"]).toEqual([50, 50, 0, 0, 5, 10]);
+    expect(r.dailyTotals["2026-11-03"]).toEqual([10, 5, 0, 0, 2, 1]); // the host figure for that day is dropped
+    expect(r.dailyUsage).toEqual({ "2026-10-01": 100, "2026-10-02": 100, "2026-11-03": 15, "2026-11-04": 25 });
+    expect(r.dateSpan.firstMs).toBe(Date.parse("2026-10-01T00:00:00Z"));
+    expect(r.dateSpan.lastMs).toBe(Date.parse("2026-11-04T01:00:00.000Z"));
+  });
+
+  test("report totals equal the sum of the days and never double count", async () => {
+    const r = await run(host());
+    const sum = (i: number) => Object.values(r.dailyTotals as Record<string, number[]>).reduce((x, v) => x + v[i]!, 0);
+    expect(r.report.totalInput).toBeCloseTo(sum(0));
+    expect(r.report.totalOutput).toBeCloseTo(sum(1));
+    expect(r.report.totalMessages).toBeCloseTo(sum(4));
+    expect(r.report.totalCost).toBeCloseTo(sum(5));
+    expect(r.report.totalCost).toBeCloseTo(10 + 10 + 1 + 2); // pre-coverage host cost 20, gateway 3
+    expect(r.report.totalCost).toBeCloseTo(23);
+    const models = Object.fromEntries(r.report.entries.map((e: any) => [e.model, e]));
+    expect(models.opus.cost).toBeCloseTo(15); // half of the host opus cost, no gateway opus
+    expect(models.sonnet.cost).toBeCloseTo(5 + 3); // half of the host sonnet cost plus the gateway
+    expect(models.sonnet.input).toBeCloseTo(50 + 30);
+  });
+
+  test("an identity with only gateway data keeps the gateway result", async () => {
+    const r = await run(host({ dailyTotals: { "2026-11-03": [1, 1, 0, 0, 1, 0.1] }, dailyUsage: { "2026-11-03": 2 } }));
+    expect(r.report.totalCost).toBeCloseTo(3);
+    expect(r.dailyTotals).toEqual({ "2026-11-03": [10, 5, 0, 0, 2, 1], "2026-11-04": [20, 5, 0, 0, 2, 2] });
+    const added = ((await mergeGatewayUsage(payload([]), view(gwRows, { daily: gwDaily }), {}, noRegistries, noManaged)) as any).results[0];
+    expect(added.report.totalCost).toBeCloseTo(3);
+  });
+});
