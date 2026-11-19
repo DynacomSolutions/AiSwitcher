@@ -51,6 +51,8 @@ export interface MemberUsage {
   /** Highest utilisation of the two windows, when at least one is known. */
   maxUtilization?: number;
   extraUsage?: ExtraUsageInfo;
+  /** Reset grants (cedar_ember); carried over, marked stale, when a read omitted them. */
+  manualReset?: ManualResetInfo;
   error?: string;
   retryAfterSeconds?: number;
   capturedAt: string;
@@ -208,6 +210,7 @@ function usageFromLastGood(last: Awaited<ReturnType<typeof loadLastGood>>): Memb
   return {
     status: "live",
     ...(last.extraUsage ? { extraUsage: last.extraUsage } : {}),
+    ...(last.manualReset ? { manualReset: last.manualReset } : {}),
     ...(fiveHour ? { fiveHour } : {}),
     ...(sevenDay ? { sevenDay } : {}),
     ...(scoped.length > 0 ? { scoped } : {}),
@@ -331,7 +334,8 @@ async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir:
   if (!token) return { status: "unavailable", error: error ?? "no token", capturedAt };
   let response: Response;
   try {
-    response = await getUsage(token, CLAUDE_USAGE_URL, deps);
+    // With cedar_ember (and the claude-cli UA it needs): the reset grants ride on the same read, so the gateway poll shows them.
+    response = await getUsage(token, CLAUDE_RESETS_URL, deps, true);
   } catch (err) {
     return { status: "unavailable", error: `usage endpoint unreachable: ${err instanceof Error ? err.message : String(err)}`, capturedAt };
   }
@@ -350,9 +354,12 @@ async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir:
   const usage = parseUsageBody(body, capturedAt);
   await clearBackoff(member, cacheDir);
   if (usage.status === "live") {
-    // Keep ais limits' extra fields (overage, manual reset); replace what this read knows.
-    const { extraUsage: _old, ...prev } = (await loadLastGood(member, cacheDir)) ?? { toolName: "claude" as const };
-    await saveLastGood(member, { ...prev, toolName: "claude", identity: member, windows: windowsFromUsageBody(body), status: "live", capturedAt, ...(usage.extraUsage ? { extraUsage: usage.extraUsage } : {}) }, cacheDir);
+    // Keep ais limits' extra fields (overage); replace what this read knows. Anthropic sends cedar_ember only near a limit:
+    // without it the last seen grant list stays, marked stale.
+    const { extraUsage: _old, manualReset: prevReset, ...prev } = (await loadLastGood(member, cacheDir)) ?? { toolName: "claude" as const };
+    const manualReset = manualResetFromCedarEmber((body as { cedar_ember?: unknown } | null)?.cedar_ember, nowMs) ?? carriedManualReset(prevReset, nowMs);
+    await saveLastGood(member, { ...prev, toolName: "claude", identity: member, windows: windowsFromUsageBody(body), status: "live", capturedAt, ...(usage.extraUsage ? { extraUsage: usage.extraUsage } : {}), ...(manualReset ? { manualReset } : {}) }, cacheDir);
+    return manualReset ? { ...usage, manualReset } : usage;
   }
   return usage;
 }
