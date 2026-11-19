@@ -152,3 +152,44 @@ describe("child environment", () => {
     }
   });
 });
+
+describe("spawnCapturedBounded process groups", () => {
+  const alive = (pgid: number): boolean => {
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  test("a timeout kills grandchildren too", async () => {
+    const { spawnCapturedBounded } = await import("../../src/shared/exec.ts");
+    const started = Date.now();
+    const result = await spawnCapturedBounded("sh", ["-c", "sleep 300 & sleep 300 & echo $$; wait"], {}, 500);
+    expect(result.timedOut).toBe(true);
+    expect(Date.now() - started).toBeLessThan(8_000);
+    const pgid = Number(result.stdout.trim());
+    expect(pgid).toBeGreaterThan(0);
+    await Bun.sleep(100);
+    expect(alive(pgid)).toBe(false);
+  });
+
+  test("returns promptly when a grandchild holds the pipe after the child exits, and kills it", async () => {
+    const { spawnCapturedBounded } = await import("../../src/shared/exec.ts");
+    const started = Date.now();
+    const result = await spawnCapturedBounded("sh", ["-c", "echo $$; sleep 300 &"], {}, 30_000);
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(Date.now() - started).toBeLessThan(6_000);
+    const pgid = Number(result.stdout.trim());
+    await Bun.sleep(100);
+    expect(alive(pgid)).toBe(false);
+  });
+
+  test("a normal run keeps output and exit code", async () => {
+    const { spawnCapturedBounded } = await import("../../src/shared/exec.ts");
+    const result = await spawnCapturedBounded("sh", ["-c", "echo out; echo err >&2; exit 3"], {}, 5_000);
+    expect(result).toEqual({ stdout: "out\n", stderr: "err\n", exitCode: 3, timedOut: false });
+  });
+});
