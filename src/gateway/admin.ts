@@ -46,6 +46,8 @@ export interface AdminDeps {
   poolMembers?(provider: GatewayProvider): Promise<string[]>;
   /** Resolves an alias to the identity's canonical name (GET /limits). */
   canonical?(provider: GatewayProvider, identity: string): Promise<string>;
+  /** Spends one Claude reset grant of a managed identity with the store's member credential (POST /limits/claude/:identity/resets/:grant); absent when the gateway cannot. Throws an error with a numeric `status` and a short message to refuse. */
+  spendReset?(identity: string, grantId: string): Promise<unknown>;
 }
 
 /** One GET /limits row: a managed identity plus the usage source's reading of it (no reading yet: unavailable). */
@@ -167,6 +169,20 @@ export function createAdminApp(deps: AdminDeps): Hono {
       }
     }
     return c.json({ limits });
+  });
+
+  // Spends one reset grant at the gateway, with the member credential from the store. The console never holds that credential.
+  hono.post("/limits/claude/:identity/resets/:grant", async (c) => {
+    if (!deps.spendReset) return err(404, "reset spending is not available");
+    const requested = decodeURIComponent(c.req.param("identity"));
+    const identity = (await deps.canonical?.("claude", requested).catch(() => requested)) ?? requested;
+    try {
+      return c.json(await deps.spendReset(identity, decodeURIComponent(c.req.param("grant"))));
+    } catch (e) {
+      const status = (e as { status?: unknown }).status;
+      const known = status === 400 || status === 404 || status === 409 || status === 429 ? status : 502;
+      return Response.json({ error: e instanceof Error ? e.message.slice(0, 300) : "reset failed" }, { status: known });
+    }
   });
 
   hono.get("/apps", async (c) => {

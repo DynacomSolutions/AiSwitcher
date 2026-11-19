@@ -39,6 +39,7 @@ import { enableMemberStore, memberStoreEnabled, setLocalWriteHook } from "../ide
 import { clearLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
+import { useClaudeReset } from "../server/claude-resets.ts";
 import { createManagementCheck, GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, listGatewayManagedAccountsStrict, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
@@ -81,6 +82,8 @@ export interface GatewayHooks {
   fetch?: typeof fetch;
   now?(): Date;
   usageFor?: GatewayDeps["usageFor"];
+  /** Tests: replaces the reset spend behind POST /limits/claude/:identity/resets/:grant. */
+  spendReset?(identity: string, grantId: string): Promise<unknown>;
   /** Replaces the AIS adapter fetch behind the default (cached) usage source. */
   fetchUsage?: FetchUsage;
   canonical?: GatewayDeps["canonical"];
@@ -687,6 +690,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
     poolMembers,
     canonical,
+    // The member's stored credential spends the grant; never refreshed here (the keep-alive owns rotation).
+    spendReset: hooks.spendReset ?? (async (identity, grantId) => {
+      const out = await useClaudeReset(identity, grantId, { noRefresh: true });
+      void usage.refreshNow("claude", identity).catch(() => {});
+      return out;
+    }),
     browserPoolMembers,
     browserIdentityExists,
     browserHub: browser,
