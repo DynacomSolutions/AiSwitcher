@@ -126,8 +126,8 @@ test("grok writes auth.json with the gateway token, 0600, from ~/.secrets", asyn
   const r = await syncT3UsageCredentials(s.opts);
   expect(statuses(r)).toEqual(["g:updated"]);
   const file = join(g.dir, "auth.json");
-  expect(await readFile(file, "utf8")).toBe(`${JSON.stringify({ [GROK_KEY]: { key: TOKEN, auth_mode: "oidc" } }, null, 2)}\n`);
-  expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ [GROK_KEY]: { key: TOKEN, auth_mode: "oidc" } });
+  expect(await readFile(file, "utf8")).toBe(`${JSON.stringify({ [GROK_KEY]: { key: TOKEN, auth_mode: "oidc", email: "myapp@gateway.invalid" } }, null, 2)}\n`);
+  expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ [GROK_KEY]: { key: TOKEN, auth_mode: "oidc", email: "myapp@gateway.invalid" } });
   expect(await mode(file)).toBe(0o600);
 });
 
