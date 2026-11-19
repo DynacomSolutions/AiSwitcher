@@ -42,7 +42,29 @@ Other commands:
 ```sh
 ais gateway app list | show <name> | update <name> [flags] | rotate <name> | revoke <name>
 ais gateway usage [--app=billing] [--provider=claude] [--days=7] [--json]
+ais gateway usage-history import [--snapshot=<path>] [--zone=<IANA zone>] [--batch-size=500] [--dry-run] [--verify-only]
 ```
+
+`usage-history import` copies the host usage history into the gateway database
+(table `gateway_usage_history`, admin `POST` and `GET /usage/history`). It reads
+the host snapshot and never changes it. Host results labelled `ais-gateway` are
+skipped, because the gateway ledger holds that traffic already. It imports three
+sources. Never add them together:
+- `host-snapshot-models`: per identity and model, all time, every provider.
+- `host-snapshot-daily`: per identity and day, cost and tokens, where the host holds day splits.
+- `host-snapshot-daily-tokens`: per identity and day, tokens only (cost 0 means unknown), for results without day costs.
+
+Every row carries a `generation` (the snapshot's `aggregateGeneratedAt`), the
+first and last day of its host result, and the `zone` that buckets the days. A
+reader uses the days to trim the overlap with the ledger. Importing the same
+generation again replaces exactly its own rows. A newer snapshot adds a new
+generation. Nothing is ever deleted. `GET /usage/history` needs `source`, reads
+the `latest` generation by default (`generation=<ISO instant>` for another), and
+treats `since` and `until` as inclusive days (YYYY-MM-DD). The command reads back
+only the sources and the generation it imported. It prints host cost against
+gateway cost per provider and identity, and exits non-zero when a cost differs by
+more than $1 or a token count differs. A host report total that differs from the
+sum of its entries is a warning only.
 
 The console (`ais web`) has a Gateway page with the same list, edit (reserve,
 models, daily cap; it can also clear them), rotate and revoke. Its rotate calls the CLI's own

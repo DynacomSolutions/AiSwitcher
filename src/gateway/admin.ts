@@ -6,7 +6,7 @@ import type { LoginRenewal } from "./renewal.ts";
 import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
-import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord } from "./types.ts";
+import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord, UsageHistoryRow } from "./types.ts";
 import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
 
 export const DEFAULT_OVERLAP_MS = 24 * 3600_000;
@@ -146,6 +146,60 @@ function usageWindow(query: (name: string) => string | undefined, now: Date): { 
   const until = new Date(untilRaw);
   if (Number.isNaN(until.getTime())) return "until must be an ISO date-time";
   return { since, until };
+}
+
+/** The largest history batch one POST accepts. */
+export const MAX_HISTORY_BATCH = 2000;
+const HISTORY_DAY = /^\d{4}-\d{2}-\d{2}$/;
+const HISTORY_SOURCE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+const validInstant = (v: string): boolean => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(v) && !Number.isNaN(Date.parse(v));
+const validZone = (v: string): boolean => {
+  try {
+    new Intl.DateTimeFormat("en-GB", { timeZone: v });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const validDay = (v: string): boolean => HISTORY_DAY.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`)) && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v);
+
+/** Validates a history import body into rows, or a message naming the first problem. */
+export function parseHistoryBody(raw: unknown): UsageHistoryRow[] | string {
+  const list = isObj(raw) ? raw.rows : undefined;
+  if (!Array.isArray(list)) return "rows must be a list";
+  if (list.length === 0) return "rows must not be empty";
+  if (list.length > MAX_HISTORY_BATCH) return `rows must hold at most ${MAX_HISTORY_BATCH} entries`;
+  const out: UsageHistoryRow[] = [];
+  for (const [i, r] of list.entries()) {
+    if (!isObj(r)) return `rows[${i}] must be an object`;
+    if (typeof r.source !== "string" || !HISTORY_SOURCE.test(r.source)) return `rows[${i}].source must be 1 to 64 lowercase letters, digits, . _ or -`;
+    if (typeof r.provider !== "string" || r.provider === "" || r.provider.length > 120) return `rows[${i}].provider is required`;
+    if (typeof r.identity !== "string" || r.identity === "" || r.identity.length > 200) return `rows[${i}].identity is required`;
+    if (typeof r.generation !== "string" || !validInstant(r.generation)) return `rows[${i}].generation must be an ISO instant ending in Z`;
+    if (typeof r.zone !== "string" || !validZone(r.zone)) return `rows[${i}].zone must be an IANA time zone`;
+    const day = r.day === undefined ? null : r.day;
+    if (day !== null && (typeof day !== "string" || !validDay(day))) return `rows[${i}].day must be YYYY-MM-DD or null`;
+    const span: Record<string, string | null> = {};
+    for (const k of ["firstDay", "lastDay"] as const) {
+      const v = r[k] === undefined ? null : r[k];
+      if (v !== null && (typeof v !== "string" || !validDay(v))) return `rows[${i}].${k} must be YYYY-MM-DD or null`;
+      span[k] = v;
+    }
+    const model = r.model === undefined || r.model === "" ? null : r.model;
+    if (model !== null && (typeof model !== "string" || model.length > 300)) return `rows[${i}].model must be a text or null`;
+    const nums: Record<string, number> = {};
+    for (const k of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "messages"] as const) {
+      const v = r[k] === undefined ? 0 : r[k];
+      if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) return `rows[${i}].${k} must be a whole number of 0 or more`;
+      nums[k] = v;
+    }
+    const cost = r.estCostUsd === undefined ? 0 : r.estCostUsd;
+    if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) return `rows[${i}].estCostUsd must be a number of 0 or more`;
+    out.push({ source: r.source, generation: new Date(r.generation).toISOString(), zone: r.zone, firstDay: span.firstDay!, lastDay: span.lastDay!, provider: r.provider, identity: r.identity, day, model, inputTokens: nums.inputTokens!, outputTokens: nums.outputTokens!, cacheReadTokens: nums.cacheReadTokens!, cacheWriteTokens: nums.cacheWriteTokens!, messages: nums.messages!, estCostUsd: cost });
+  }
+  return out;
 }
 
 export function createAdminApp(deps: AdminDeps): Hono {
@@ -349,6 +403,43 @@ export function createAdminApp(deps: AdminDeps): Hono {
     if (!TOKSCALE_TIME_ZONE_NAMES.has(tz) && tz !== "UTC") return err(400, "tz must be an IANA time zone name");
     const rows = (await store.usageByModelDaily(win.since, win.until, tz)).filter((r) => provider === undefined || r.provider === provider);
     return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), tz, days: rows });
+  });
+
+  // Imports a batch of host usage history. Rows of one generation replace each other exactly (idempotent); a new generation adds rows. Never a delete.
+  hono.post("/usage/history", async (c) => {
+    let raw: unknown;
+    try {
+      raw = await jsonBody(c.req.raw);
+    } catch {
+      return err(400, "body is not valid JSON");
+    }
+    const rows = parseHistoryBody(raw);
+    if (typeof rows === "string") return err(400, rows);
+    await store.upsertUsageHistory(rows);
+    return c.json({ imported: rows.length }, 200);
+  });
+
+  // Imported history of ONE source (required: sources are different cuts of the same usage and must never be summed together).
+  // `generation` is "latest" (default, the newest generation of the source) or one exact ISO instant.
+  // `since` and `until` are inclusive days (YYYY-MM-DD, in the zone each row carries); a window leaves out all-time rows (no day). Filters: provider, identity.
+  hono.get("/usage/history", async (c) => {
+    const source = c.req.query("source");
+    if (source === undefined || !HISTORY_SOURCE.test(source)) return err(400, "source is required: one of host-snapshot-models, host-snapshot-daily or host-snapshot-daily-tokens (sources must never be summed together)");
+    const day = (name: string): string | undefined | null => {
+      const v = c.req.query(name);
+      if (v === undefined) return undefined;
+      return validDay(v) ? v : null;
+    };
+    const since = day("since");
+    const until = day("until");
+    if (since === null) return err(400, "since must be a day, YYYY-MM-DD");
+    if (until === null) return err(400, "until must be a day, YYYY-MM-DD (inclusive)");
+    const generation = c.req.query("generation") ?? "latest";
+    if (generation !== "latest" && !validInstant(generation)) return err(400, "generation must be latest or an ISO instant ending in Z");
+    const filter = { source, generation, ...(c.req.query("provider") !== undefined ? { provider: c.req.query("provider") as string } : {}), ...(c.req.query("identity") !== undefined ? { identity: c.req.query("identity") as string } : {}) };
+    let rows = await read.usageHistory(filter);
+    if (since !== undefined || until !== undefined) rows = rows.filter((r) => r.day !== null && (since === undefined || r.day >= since) && (until === undefined || r.day <= until));
+    return c.json({ source, generation, ...(since !== undefined ? { since } : {}), ...(until !== undefined ? { until } : {}), history: rows });
   });
 
   return hono;

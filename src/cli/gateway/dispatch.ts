@@ -26,6 +26,10 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   const merged: GatewayCliDeps = { ...defaultDeps(), ...deps };
   if (sub === "app") return runAppCommand(rest[0], rest.slice(1), flags, merged);
   if (sub === "usage") return runUsageCommand(flags, merged);
+  if (sub === "usage-history") {
+    const { runUsageHistoryCommand } = await import("./usage-history.ts");
+    return runUsageHistoryCommand(rest, flags, merged);
+  }
   if (sub === "local") return runLocal(rest, merged, boolFlag(flags, "check"));
   if (sub === "claude-proxy") {
     const { runClaudeProxyCommand } = await import("./claude-proxy.ts");
@@ -57,7 +61,7 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     const { runCodexHomeCommand } = await import("./codex-home.ts");
     return runCodexHomeCommand(rest, flags, merged);
   }
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|store|release|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...  (ais gateway --help)");
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");
