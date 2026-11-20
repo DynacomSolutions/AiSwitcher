@@ -1,6 +1,6 @@
 # AIS Browser (Chrome extension)
 
-Lets Claude and Codex sessions drive a real Chrome profile through the gateway. The extension (`apps/chrome-extension`, MV3) holds a WebSocket to the gateway relay; each agent session reaches it through the `ais-browser` MCP server (`ais browser mcp`). Source of truth for the design: the AIS Browser design spec in the task data folder.
+Lets Claude and Codex sessions drive a real Chrome profile through the gateway. The extension (`apps/chrome-extension`, MV3) holds a WebSocket to the gateway relay; each agent session reaches it through the `ais-browser` MCP server. The shared server is the gateway itself (`POST <gateway>/browser/mcp`). The stdio server `ais browser mcp` is the fallback. Source of truth for the design: the AIS Browser design spec in the task data folder.
 
 ## Install on the Mac
 
@@ -48,38 +48,40 @@ T3 Code starts Claude and Codex through the AIS shims with `CLAUDE_CONFIG_DIR` /
 
 Reason (owner report, 19 Nov 2026): the T3 "Pool (Claude)" instance moved to a folder under `~/.t3/gateway`. That folder matched no identity, so resumed threads lost the `ais-browser` tools.
 
-## Shared MCP service
+## Shared MCP service (the gateway)
 
-Reason (owner report, 19 Nov 2026): a moved T3 folder and one MCP process per session left sessions without browser tools. Each launch started its own stdio `ais browser mcp` process (about 110 MB each). When the wiring failed, the session had no tools at all. The owner asked for one shared server that starts when needed.
+Reason (owner decisions, 19 and 20 Nov 2026): one stdio `ais browser mcp` process per session cost about 110 MB each, and a failed wiring left a session with no tools. The owner asked for one shared, stateless server that starts when needed. AIS is being removed from the hosts, so the server must not be a host daemon or a systemd unit. Everything is meant to run in the agent pods later. The one shared server is therefore the AIS gateway, which runs in k3s and is always on. An earlier design (PR 635) ran a loopback daemon `ais browser mcp-serve` with a systemd unit. It was never installed on a host and is removed.
 
 Design:
-- `ais browser mcp-serve` is one daemon for all sessions on a host. It speaks MCP Streamable HTTP on `127.0.0.1` only, port 47150 (env `AIS_BROWSER_MCP_PORT`), path `/mcp`.
-- It answers `POST` with `application/json` (no SSE), `202` for notifications, `405` for `GET /mcp`, and `GET /healthz` with `200` (`503` while it drains). `DELETE /mcp` ends that session.
-- It is stateless per request. It needs no `initialize` and ignores an unknown `Mcp-Session-Id`, so a daemon restart is invisible to clients.
-- Code: `src/browser/mcp-http.ts` (daemon), `src/browser/mcp-http-config.ts` (headers, key, auto start), `src/cli/browser/mcp-service.ts` (unit). The daemon reuses `handleRpc`, `callTool` and `sendSessionEnd` from `mcp-shim.ts`.
-- The launch describes its session in headers: `X-AIS-Pool`, `X-AIS-Tool`, `X-AIS-Identity`, `X-AIS-Config-Dir`, `X-AIS-Home`, `X-AIS-Gateway`, `X-AIS-Session-Id`, `X-AIS-T3-Thread`, `X-AIS-T3-Home`, `X-AIS-Cwd`, `X-AIS-Owner-Pid`. Paths are percent-encoded. The daemon checks every value: absolute paths without `..`, numeric pid, known tool.
-- The session key is the Claude transcript id (from `<home>/sessions/<pid>.json`, else the `--session-id` or `--resume` value of the launch, else `agent-<pid>`). The daemon keeps one context per key, so chat-name caching, call cancel and session end work as in the stdio shim.
+- `POST <gateway>/browser/mcp` is MCP Streamable HTTP. It answers `application/json` (no SSE), `202` for notifications, `405` for `GET`. `DELETE` ends a session. Code: `src/gateway/browser/mcp.ts`, mounted next to `/browser/call` in `src/gateway/app.ts`.
+- Auth: `Authorization: Bearer <agent token>`, checked by the same code as `/browser/call` (`agentFromRequest`, `authAgentToken`). The identity comes from the token only.
+- It is stateless. `initialize`, `ping` and `tools/list` do the token check and nothing else: no store, database or file work, so tool registration stays cheap under load. Any gateway replica can answer any request.
+- `tools/call` runs the `/browser/call` code in-process (`createBrowserCaller` in `src/gateway/browser/routing.ts`). It makes no HTTP call to itself.
+- Shared parts of the shim and the endpoint (`BROWSER_INSTRUCTIONS`, `mapCallResult`, protocol versions) live in `src/browser/mcp-core.ts`. It has no Node or file system code.
+- Metric: `ais_gateway_browser_mcp_requests_total{method,outcome}`. The labels come from fixed sets (see `src/gateway/metrics.ts`).
 
-Key and safety:
-- The key is in `~/.ais/browser-mcp/key` (file 0600, folder 0700, 32 random bytes as hex). The daemon or the installer creates it. Requests need `Authorization: Bearer <key>`, compared in constant time. AIS never logs or prints the key.
-- A `Host` or `Origin` that is not loopback gets `403` (DNS rebinding guard).
-- Claude Code expands `${AIS_BROWSER_MCP_KEY}` in the `headers` of `--mcp-config`. The launch passes `Bearer ${AIS_BROWSER_MCP_KEY}` in the args and sets the real key only in the environment of the launched tool, so the key never shows in `ps`. Codex 0.167 supports `url`, `http_headers` and `bearer_token_env_var`: it gets the same env variable and `bearer_token_env_var`.
+Session description (request headers, set at launch and validated by the gateway):
+- `X-AIS-Session-Id`: for Claude, the `--session-id` or `--resume` value of the launch. Else the gateway uses `Mcp-Session-Id`. A client with neither gets one: the `initialize` reply carries a new `Mcp-Session-Id`, and the client sends it back. A `tools/call` with no session id is a tool error.
+- `X-AIS-Session-Label`: a readable name, percent-encoded, cleaned and capped at 80 characters. It names the tab group.
+- `X-AIS-Pool`: the pool name for a pool launch. The gateway checks that the token's identity is a live allowed member of that pool, as `/browser/call` does for a pool binding. A non-member gets a tool error (`DELETE`: 403). Tab ownership stays per pool, as described under Agent tokens.
+- A bad id, pool name or label gets `400`.
+
+Launch wiring (`browserMcpArgs`, `browserLaunchWiring`, `run-wrapper`):
+- When the gateway URL is known (`AIS_GATEWAY_PROXY_URL`, env or `~/.secrets`) and a token file is readable, the launch wires the HTTP form to `<gateway>/browser/mcp`. The token is the identity's token. For a pool it is the active member's token, else the token of any allowed member.
+- Claude: `--mcp-config` with `type: http` and headers. `Authorization` is `Bearer ${AIS_BROWSER_AGENT_TOKEN}`: Claude Code expands the variable. Codex 0.167: `url`, `bearer_token_env_var="AIS_BROWSER_AGENT_TOKEN"`, `http_headers` and `tool_timeout_sec=135`.
+- The token is set only in the environment of the launched tool, never in argv. `MCP_TOOL_TIMEOUT` stays for Claude (see Tool timeout).
+- The session label is the T3 thread title (read-only lookup, `src/browser/t3-thread-title.ts`, 150 ms busy limit, 200 ms wait), else `<Tool> in <folder>`.
+- The launch starts no process and probes nothing. Without a gateway URL or a token it uses the stdio form `ais browser mcp`, as before.
+- `ais browser wiring` prints `mode: http` or `mode: stdio` (`--json` adds `mode` to each row).
+- A session that started before a change keeps its old wiring until you resume it.
+
+Local proxy: Claude sessions run with `HTTPS_PROXY` set to the local gateway proxy and `NODE_EXTRA_CA_CERTS`. That proxy (`src/gateway/connect-relay.ts`, `src/gateway/usage-proxy.ts`) pipes every CONNECT as plain TCP bytes. It reads TLS only for `api.anthropic.com`, `opencode.ai` and `cli-chat-proxy.grok.com` on port 443. A request to the gateway's own `/browser/mcp` passes unchanged, with its `Authorization` header, and an open tunnel has no timeout, so a 135 s call is fine. No `NO_PROXY` entry is needed.
 
 Session end:
-- `DELETE /mcp` sends the session end notice, so the extension closes the tabs of the session.
-- A reaper runs every 30 s and sends the notice when `X-AIS-Owner-Pid` no longer exists (the launcher execs the tool, so it is the agent pid). A context without a pid expires after 30 min idle.
-- On SIGTERM the daemon stops accepting, finishes in-flight calls and exits, with no timers. It never sends session end for live sessions on its own restart.
+- `DELETE <gateway>/browser/mcp` (with `X-AIS-Session-Id` or `Mcp-Session-Id`) sends the session end notice, so the extension closes the tabs the session created.
+- There is no timer that closes tabs. A tab may wait for the owner (see "When to close a tab"). The stdio shim keeps its own end notice when the agent process ends.
 
-Unit and install:
-- `ais-browser-mcp.service` is a systemd user unit (`Restart=always`, `RestartSec=1s`, `MemoryHigh=512M`, `MemoryMax=1G`). It is ready only when the port listens.
-- `ais browser mcp-service install|status|uninstall` manages it. `ais update` and the host install run the install with `respectDisabled` (a unit you stopped stays stopped) and restart it when the binary changes.
-- Linux with a systemd user manager only. On macOS or without systemd nothing is installed.
-
-Wiring and fallback:
-- While the unit file exists, launches wire the HTTP form (Claude `type: http`, Codex `url`). If the port does not answer a 200 ms TCP connect, the launch runs `systemctl --user start --no-block ais-browser-mcp.service` and goes on.
-- Without the unit file the stdio wiring is unchanged (macOS, and hosts that did not install the service).
-- `ais browser wiring` prints `mode: http` or `mode: stdio` and whether the daemon answers (`--json` adds `mode` and `daemonAnswering` to each row).
-- A session that started before the install keeps its stdio process until you resume it.
+Deploy: the gateway image must contain this code. No new config is needed. The deploy requirements below (Mapping timeout, replicas) already cover `/browser/mcp`.
 
 ## Tools
 
@@ -114,10 +116,12 @@ A page blocked by a JavaScript dialog (alert, confirm, prompt, or beforeunload "
 
 ### File upload
 
-`upload_file` puts files on a page's file input. The agent gives `paths`: files on the machine the agent runs on, which is often not the machine that runs Chrome. The `ais-browser` MCP server reads them there, with the rights the agent session already has, and sends only their content (`files`: name, MIME type from the file extension, base64 data) through the gateway. The target is a `ref` or a `coordinate`:
+`upload_file` puts files on a page's file input. The agent gives `paths`: files on the machine the agent runs on, which is often not the machine that runs Chrome. The stdio `ais-browser` MCP server reads them there, with the rights the agent session already has, and sends only their content (`files`: name, MIME type from the file extension, base64 data) through the gateway. The target is a `ref` or a `coordinate`:
 
 - A ref to the file input itself: the files are set on it directly.
 - Anything else (the button or drop area that opens the file dialog, also inside an iframe): the extension clicks it with file chooser interception on (`Page.setInterceptFileChooserDialog`), so no dialog opens in the owner's window, and sets the files on the input that asked for them. Interception is on for that call only; the owner's own file dialogs open as usual. A cross-origin iframe is its own debugger target, so the first upload in a tab attaches to the tab's iframes (`Target.setAutoAttach`, iframes only) to catch a chooser opened inside one.
+
+Gateway MCP server: it cannot read the agent's files, so `upload_file` with `paths` there answers a tool error. The error holds the command to run in the agent's shell, with the real session id: `ais browser upload --session <id> --tab <tabId> (--ref <ref> | --coordinate <x,y>) [--browser <name>] <paths...>`. The command reads the files locally with the same limits, finds the token as a launch does (the identity of `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, a pool's active member, or `--identity` and `--pool`), and posts one `upload_file` call with the content to `<gateway>/browser/call`. `upload_file` with `files` (content) works over the gateway as on the wire.
 
 Isolation: no tool reads a file from the disk of the machine that runs Chrome, so an agent cannot reach other identities' tokens or `~/.secrets` there. The gateway and the extension accept file content only: the wire schema has no path field, a name with a folder in it is refused, and the gateway answers 400 before any browser sees the call. The extension builds the `File` objects in the page from the content (`DataTransfer`) and never calls `DOM.setFileInputFiles`, the debugger command that takes host paths. Do not add a tool or argument that takes a path on the Chrome host.
 
@@ -151,7 +155,7 @@ Known limit: the headless Chromium used in CI cannot reproduce headful backgroun
 
 ## Metrics
 
-`ais_gateway_browsers_connected`, `ais_gateway_browser_sessions_active`, `ais_gateway_browser_calls_total`, `ais_gateway_browser_call_seconds` (histogram: `_bucket`, `_count`, `_sum`), `ais_gateway_browser_pairings_total`.
+`ais_gateway_browsers_connected`, `ais_gateway_browser_sessions_active`, `ais_gateway_browser_calls_total`, `ais_gateway_browser_call_seconds` (histogram: `_bucket`, `_count`, `_sum`), `ais_gateway_browser_pairings_total`, `ais_gateway_browser_mcp_requests_total` (`method`, `outcome`).
 
 ## Release
 
