@@ -240,3 +240,20 @@ test('usage is read from the collector snapshot: no --scan, one call per interva
     expect(c.argv).toEqual(['claude-swap', 'usage', '--json'])
   }
 })
+
+test('a usage probe session runs no ais command', async ($, on) => {
+  mock.env(on, { CLAUDE_CONFIG_DIR: dir, HOME: '/h', AIS_LIMITS_PROBE: '1' })
+  const clock = mock.clock(on)
+  mock.store(on)
+  const runs: string[][] = []
+  on('fs.write', () => ({ value: undefined }) as never)
+  on('session.start', ($$: any, e: any) => ({ cwd: e.cwd }))
+  on('command.register', () => ({ value: { command: 'ais-usage' } }))
+  on('process.run', ($$: any, e: any) => {
+    runs.push(e.argv)
+    return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+  })
+  await $.session.start?.({ cwd: '/', surface: 'terminal', isInteractive: false } as never)
+  await clock.advance(600_001)
+  expect(runs).toEqual([])
+})

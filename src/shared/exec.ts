@@ -264,11 +264,10 @@ export async function spawnCaptured(
  * Spawn a REAL binary (never this project's own shim — callers resolve that
  * via resolveRealBinary first) with the full inherited environment plus
  * `extraEnv`, capturing stdout/stderr and enforcing a hard timeout.
- * Bun.spawn's `signal` kills the child on abort rather than rejecting this
- * promise — it resolves with whatever partial output was captured and the
- * signal-kill exit code, indistinguishable from a fast clean exit by
- * exitCode/stdout alone. `timedOut` (derived from `controller.signal.aborted`
- * after the fact — the only reliable signal) is what actually tells "hung"
+ * On timeout the whole process group gets SIGTERM, then SIGKILL after a short
+ * grace, and the promise resolves with whatever partial output was captured
+ * and the signal-kill exit code, indistinguishable from a fast clean exit by
+ * exitCode/stdout alone. `timedOut` is what actually tells "hung"
  * apart from "exited fast with nothing to say". Confirmed necessary against
  * a real incident (2026-07-17: two identities hanging indefinitely
  * on every claude prompt) where the failure mode was exactly that
@@ -281,22 +280,104 @@ export async function spawnCapturedBounded(
   extraEnv: Record<string, string>,
   timeoutMs: number,
 ): Promise<BoundedSpawnResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // The child leads its own process group (setsid), so one signal to the
+  // group reaches grandchildren too. Bun's `signal` option kills only the
+  // direct child and leaves the rest as orphans.
+  const proc = Bun.spawn([cmdPath, ...args], {
+    env: { ...process.env, ...extraEnv },
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: true,
+  });
+  const groupId = proc.pid;
+  liveGroups.add(groupId);
+  installGroupReaper();
+  const killGroup = (signal: NodeJS.Signals): void => {
+    try {
+      process.kill(-groupId, signal);
+    } catch {
+      // ESRCH: nobody is left in the group.
+    }
+  };
+
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    killGroup("SIGTERM");
+    killTimer = setTimeout(() => killGroup("SIGKILL"), KILL_GRACE_MS);
+  }, timeoutMs);
+
+  const stdout = collectBounded(proc.stdout);
+  const stderr = collectBounded(proc.stderr);
   try {
-    const proc = Bun.spawn([cmdPath, ...args], {
-      env: { ...process.env, ...extraEnv },
-      stdout: "pipe",
-      stderr: "pipe",
-      signal: controller.signal,
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    return { stdout, stderr, exitCode, timedOut: controller.signal.aborted };
+    const exitCode = await proc.exited;
+    // Whatever is still in the group now is a straggler.
+    killGroup("SIGKILL");
+    await Promise.race([Promise.all([stdout.done, stderr.done]), Bun.sleep(PIPE_DRAIN_MS)]);
+    return { stdout: stdout.text(), stderr: stderr.text(), exitCode, timedOut };
   } finally {
+    liveGroups.delete(groupId);
     clearTimeout(timer);
+    if (killTimer) clearTimeout(killTimer);
+    stdout.cancel();
+    stderr.cancel();
   }
+}
+
+const KILL_GRACE_MS = 2_000;
+
+/** Process groups of bounded children that are still running. */
+const liveGroups = new Set<number>();
+let reaperInstalled = false;
+
+/**
+ * A detached child does not get our terminal signals, and it outlives us if we
+ * die first (for example when a caller kills `ais limits` at its own timeout).
+ * So when this process exits or gets a stop signal, it kills every live group.
+ */
+function installGroupReaper(): void {
+  if (reaperInstalled) return;
+  reaperInstalled = true;
+  const reapAll = (): void => {
+    for (const groupId of liveGroups) {
+      try {
+        process.kill(-groupId, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+    liveGroups.clear();
+  };
+  process.on("exit", reapAll);
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(sig, () => {
+      reapAll();
+      // Keep the default result of the signal when no one else handles it.
+      if (process.listenerCount(sig) <= 1) process.exit(128 + (osConstants.signals[sig] ?? 0));
+    });
+  }
+}
+const PIPE_DRAIN_MS = 2_000;
+
+/** Reads a stream into memory. `cancel` stops reading even if a process still holds the pipe open. */
+function collectBounded(stream: ReadableStream<Uint8Array>): { done: Promise<void>; text: () => string; cancel: () => void } {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  const done = (async () => {
+    try {
+      for (;;) {
+        const { value, done: finished } = await reader.read();
+        if (finished) return;
+        if (value) chunks.push(value);
+      }
+    } catch {
+      // A cancelled or broken pipe ends the read.
+    }
+  })();
+  return {
+    done,
+    text: () => Buffer.concat(chunks).toString("utf8"),
+    cancel: () => void reader.cancel().catch(() => undefined),
+  };
 }
