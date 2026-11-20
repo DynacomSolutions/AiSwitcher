@@ -125,7 +125,7 @@ ETA: 2026-11-07 18:00 ICT
 | 98 | Fix main CI: spend guard canary and Host app Browser smoke | done | claude-20261031-main-ci-red | main-ci-red | | 2026-10-31 23:30 ICT | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/319 (b9e97f3).<br>Canary tests now use the Bun binary as `codex`; @playwright/test 1.58.2 to 1.64.1 for ubuntu26.04.<br>All PR 319 checks green. |
 
 ## 4. AIS AI Gateway for cluster apps
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-20 21:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -177,6 +177,7 @@ ETA: 2026-11-15 23:00 ICT
 | 215 | T3 Code ACP agents: a failed turn shows its error in the thread | done | claude | acp-turn-errors | | | Before: a failed kimi-code turn showed an empty, completed turn; Grok and Z.ai showed "Internal error".<br>Fix: `ais gateway t3-acp` starts the three agents behind an AIS relay that reports the reason.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/575 (0dfb643), released v0.5.65, installed on the host.<br>Live 2026-11-18: relay set on 4 provider instances, `--check` passes, a new Kimi session in T3 Code runs behind `ais __acp_relay` and answers. |
 | 218 | Gateway pool: no member 429 to the agent while a member has headroom | done | claude | gw-pool-failover-wait | 4.139 | | Owner report 19 Nov 01:06 ICT: T3 pool agent got "weekly limit, resets 2am" while one member had 71% headroom.<br>Fix: failover waits out short holds; with no member left, the pool answers natively with the earliest pool reset.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/596 (e0ef5e1); dev/ais-gateway pods run it. |
 | 220 | Gateway: a revoked app stays revoked, its old tokens never work again | done | claude | gateway-revoke-revive | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/599 (41dfaf3), live on all 6 replicas.<br>Revoked name: add, rotate and admin PUT and mint give 409.<br>Leaked revoked tokens give 401 on every replica. |
+| 245 | T3 gateway homes get agent-guard when AIS creates or updates them | in_progress | claude | t3-home-agent-guard | | 2026-11-20 21:00 ICT | Both T3 pool homes had no agent-guard until a manual install.<br>AIS runs the installer per tool after a home change and checks all homes in `ais update`. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
 ETA: 2026-11-20 14:00 ICT
