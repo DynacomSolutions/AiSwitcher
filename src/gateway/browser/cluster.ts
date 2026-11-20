@@ -3,6 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { CallRequest, CallResult } from "../../browser/protocol.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import { sanitiseResult, type BrowserHub, type HubSocket } from "./hub.ts";
+import { pgPoolOptions } from "../pg-pool.ts";
 
 export const BROWSER_CHANNEL = "ais_gateway_browser";
 export const RELAY_PATH = "/internal/browser/relay";
@@ -89,7 +90,12 @@ export class ClusterBrowserHub {
   async start(): Promise<void> {
     if (!this.stopped) return;
     this.stopped = false;
-    this.sql = new SQL(this.opts.databaseUrl);
+    this.sql = new SQL(
+      this.opts.databaseUrl,
+      // LISTEN needs one connection that stays open. Bun may run it with this pool's options, and an idle timeout
+      // could then close the listener without a sound. So this pool gets no idle timeout, only a small size cap.
+      pgPoolOptions({ maxCap: 2, idle: false }),
+    );
     await this.listen();
     await this.sync(true);
     this.timer = setInterval(() => {

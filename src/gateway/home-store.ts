@@ -1,5 +1,6 @@
 import { SQL } from "bun";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { pgPoolOptions } from "./pg-pool.ts";
 
 /**
  * The gateway credential store in PostgreSQL: an encrypted mirror of the files the gateway's login model is made of
@@ -87,7 +88,7 @@ export class PgHomeStore {
     readonly holder: string = `${process.env.HOSTNAME ?? "gateway"}:${process.pid}`,
     private readonly warn: (message: string) => void = (m) => console.warn(`gateway store: ${m}`),
   ) {
-    this.sql = new SQL(url, { max: 4 });
+    this.sql = new SQL(url, pgPoolOptions({ maxCap: 4 }));
   }
 
   async close(): Promise<void> {
