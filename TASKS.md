@@ -346,5 +346,7 @@ The console serves the Headlamp widget panel API, so its identities, limits and 
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 242 | Console widget panel API: /api/widgets list and panels, read-only widgets listener | in_progress | claude | dashboard-widgets | | 2026-11-20 19:00 ICT | Panels follow the headlamp-plugins agent contract (PanelInfo, PanelModel v1).<br>Widgets listener off by default (AIS_WIDGETS_PORT). |
-| 243 | Cluster: widgets Service port and AIS_WIDGETS_PORT on the console | todo | claude | | 16.242 | | GitOps change in .cluster ais/k8s.<br>Headlamp reads it through the service proxy (RBAC). |
+| 242 | Console widget panel API: /api/widgets list and panels, read-only widgets listener | done | claude | dashboard-widgets | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/645 (5e4b2cb), Opus review fixed.<br>Live: 6 panels through the service proxy. |
+| 243 | Cluster: widgets Service port and AIS_WIDGETS_PORT on the console | done | claude | ais-widgets-port | 16.242 | | Merged .cluster PR 2788 (4516e7c).<br>Role headlamp-ais-widgets, widgets port only. |
+| 246 | Claude swap widget: member usage from the gateway limits | done | claude | widgets-swap-usage | 16.242 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/651 (28d0149).<br>Live: 8 of 8 members with data. |
+| 247 | Widgets: no row cap, no Other bucket | done | claude | widgets-no-cap | 16.242 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/654 (81eb879).<br>Live: agents 120 of 120 rows, gateway usage 83 of 83. |
