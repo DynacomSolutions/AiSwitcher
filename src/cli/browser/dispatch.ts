@@ -18,10 +18,17 @@ export async function runBrowserCommand(positionals: string[], flags: ParsedArgs
     await runMcpShim();
     return;
   }
-  if (sub === "wiring") {
-    const { runBrowserWiring } = await import("./wiring.ts");
-    const { ok } = await runBrowserWiring(flags, deps.out ? { out: deps.out } : {});
-    if (!ok && (flags.check === true || flags.check === "true")) process.exitCode = 1;
+  if (sub === "headers") {
+    const { browserHeaders } = await import("../../browser/headers.ts");
+    const tool = flags.tool === "claude" || flags.tool === "codex" ? flags.tool : undefined;
+    const configDir = typeof flags["config-dir"] === "string" ? flags["config-dir"] : undefined;
+    // The output is the only thing on stdout: Claude and Codex read it as JSON headers.
+    (deps.out ?? ((l: string) => process.stdout.write(`${l}\n`)))(JSON.stringify(await browserHeaders({ env: process.env, cwd: process.cwd(), tool, configDir })));
+    return;
+  }
+  if (sub === "codex-config") {
+    const { runCodexConfig } = await import("./codex-config.ts");
+    if (!(await runCodexConfig(rest, flags, deps.out ? { out: deps.out } : {}))) process.exitCode = 1;
     return;
   }
   if (sub === "extension") {

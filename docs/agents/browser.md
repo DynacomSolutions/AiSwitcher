@@ -1,6 +1,6 @@
 # AIS Browser (Chrome extension)
 
-Lets Claude and Codex sessions drive a real Chrome profile through the gateway. The extension (`apps/chrome-extension`, MV3) holds a WebSocket to the gateway relay; each agent session reaches it through the `ais-browser` MCP server. The shared server is the gateway itself (`POST <gateway>/browser/mcp`). The stdio server `ais browser mcp` is the fallback. Source of truth for the design: the AIS Browser design spec in the task data folder.
+Lets Claude and Codex sessions drive a real Chrome profile through the gateway. The extension (`apps/chrome-extension`, MV3) holds a WebSocket to the gateway relay; each agent session reaches it through the `ais-browser` MCP server. The shared server is the gateway itself (`POST <gateway>/browser/mcp`). Claude gets the server entry from the shared-skills plugin in the `.ais` repository, Codex from `ais browser codex-config`. The AIS launcher adds no browser wiring. The stdio server `ais browser mcp` is only a fallback that nothing starts. Source of truth for the design: the AIS Browser design spec in the task data folder.
 
 ## Install on the Mac
 
@@ -38,13 +38,11 @@ Swap pools: mint a token for each pool member (`ais browser agent-token <member>
 
 ### T3 Code sessions
 
-T3 Code starts Claude and Codex through the AIS shims with `CLAUDE_CONFIG_DIR` / `CODEX_HOME` preset to the instance's home folder. The wiring maps that folder back to a registered identity or pool (`identityForConfigDir` in `src/shared/browser-wiring.ts`), in this order:
+T3 Code starts Claude and Codex with `CLAUDE_CONFIG_DIR` / `CODEX_HOME` preset to the instance's home folder. `ais browser headers` maps that folder back to a registered identity or pool (`identityForConfigDir` in `src/shared/browser-wiring.ts`), in this order:
 
 1. The folder is the identity's config dir (for example the swap pool folder).
 2. Its `projects` or `sessions` link points into an identity's config dir (`~/.t3/gateway/t3-claude-<name>`).
 3. The folder sits directly in `<T3CODE_HOME>/gateway` (a folder made by `ais gateway t3-instance`, which holds only the gateway app token). Its name matches an identity name or alias, first as is, then without a `t3-claude-` / `t3-codex-` prefix. A remaining name `pool` maps to the tool's only swap pool. Example: a folder `<name>` where `<name>` is an alias of a Claude pool maps to that pool. Kimi and Z.ai folders (`t3-claude-kimi-*`, `t3-claude-zai-*`) never map: they would send page content to another provider.
-
-`ais browser wiring [--check] [--json]` runs the same steps as a launch (`browserLaunchWiring`) for every enabled Claude and Codex instance in `<T3CODE_HOME>/userdata/settings.json`. It prints the instance, its folder, the identity or pool, and `wired` or the reason it is not wired (`no identity`, `no token`, `ais binary not installed`). `--check` exits 1 when an instance is not wired. A session gets the tools only when it starts after the fix: resume a T3 thread or start a new one.
 
 Reason (owner report, 19 Nov 2026): the T3 "Pool (Claude)" instance moved to a folder under `~/.t3/gateway`. That folder matched no identity, so resumed threads lost the `ais-browser` tools.
 
@@ -62,20 +60,19 @@ Design:
 - Metric: `ais_gateway_browser_mcp_requests_total{method,outcome}`. The labels come from fixed sets (see `src/gateway/metrics.ts`).
 
 Session description (request headers, set at launch and validated by the gateway):
-- `X-AIS-Session-Id`: for Claude, the `--session-id` or `--resume` value of the launch. Else the gateway uses `Mcp-Session-Id`. A client with neither gets one: the `initialize` reply carries a new `Mcp-Session-Id`, and the client sends it back. A `tools/call` with no session id is a tool error.
+- `X-AIS-Session-Id`: optional, and `ais browser headers` does not send it. When absent, the gateway uses `Mcp-Session-Id`. A client with neither gets one: the `initialize` reply carries a new `Mcp-Session-Id`, and the client sends it back. A `tools/call` with no session id is a tool error.
 - `X-AIS-Session-Label`: a readable name, percent-encoded, cleaned and capped at 80 characters. It names the tab group.
 - `X-AIS-Pool`: the pool name for a pool launch. The gateway checks that the token's identity is a live allowed member of that pool, as `/browser/call` does for a pool binding. A non-member gets a tool error (`DELETE`: 403). Tab ownership stays per pool, as described under Agent tokens.
 - A bad id, pool name or label gets `400`.
 
-Launch wiring (`browserMcpArgs`, `browserLaunchWiring`, `run-wrapper`):
-- When the gateway URL is known (`AIS_GATEWAY_PROXY_URL`, env or `~/.secrets`) and a token file is readable, the launch wires the HTTP form to `<gateway>/browser/mcp`. The token is the identity's token. For a pool it is the active member's token, else the token of any allowed member.
-- Claude: `--mcp-config` with `type: http` and headers. `Authorization` is `Bearer ${AIS_BROWSER_AGENT_TOKEN}`: Claude Code expands the variable. Codex 0.167: `url`, `bearer_token_env_var="AIS_BROWSER_AGENT_TOKEN"`, `http_headers` and `tool_timeout_sec=135`.
-- The token is set only in the environment of the launched tool, never in argv. `MCP_TOOL_TIMEOUT` stays for Claude (see Tool timeout).
-- The session label is the T3 thread title (read-only lookup, `src/browser/t3-thread-title.ts`). The lookup is synchronous, so the bound on a launch delay is the 150 ms SQLite busy timeout plus the open time, not a timer. It runs only when a token exists.
-- The token is fixed when the session starts. It still works across pool swaps while the launch member stays an allowed pool member. If that member is removed, retired or gets a new token, calls fail with a tool error that says to restart the session to pick up the new token.
-- The launch starts no process and probes nothing. Without a gateway URL or a token it uses the stdio form `ais browser mcp`, as before.
-- `ais browser wiring` prints `mode: http` or `mode: stdio` (`--json` adds `mode` to each row).
-- A session that started before a change keeps its old wiring until you resume it.
+Client wiring (owner decision, 20 Nov 2026: the server entry comes from `.ais`, not from the AIS launcher):
+- Claude: the shared-skills plugin (repository `.ais`, folder `skills-shared`) ships `.mcp.json` with the `ais-browser` server: `type: http`, the gateway URL `<gateway>/browser/mcp` and `headersHelper: "ais browser headers --tool=claude"` and `timeout: 135000`. Claude Code runs the helper when it connects and reads the JSON it prints as request headers. The plugin never holds a token. Claude names the plugin tools `mcp__plugin_shared-skills_ais-browser__<tool>`.
+- Codex 0.167 has no plugin `.mcp.json` path that fits, so `ais browser codex-config [<codex home>...]` writes a managed block in each Codex folder's `config.toml`: `[mcp_servers.ais-browser]` with `url`, `http_headers_helper` and `tool_timeout_sec = 135`. Without folders it manages every non-retired Codex identity folder and every `t3-codex-*` folder in `<T3CODE_HOME>/gateway`. It includes pool folders. It skips Kimi and Z.ai folders, a folder that does not exist or holds no Codex file (`config.toml`, `auth.json`, `sessions`), and a folder with its own `ais-browser` entry in any TOML spelling. It never creates `config.toml` in a non-Codex folder, keeps the file mode, shell-quotes the helper command, and goes on with the other folders. `--check` reports only. `--remove` deletes the block. The URL comes from `AIS_GATEWAY_PROXY_URL` (env or `~/.secrets`) and is written to the user's own config, never to this repository.
+- `ais browser headers` prints one JSON object on stdout and always exits 0. For an identity it holds `Authorization: Bearer <token>` (the token file in the identity's folder), `X-AIS-Session-Label` (the T3 thread title, else `<Tool> in <folder>`) and, for a pool, `X-AIS-Pool` and the active member's token. It prints `{}` when the folder maps to no identity, is a Kimi or Z.ai folder, or has no token: the endpoint then refuses the call and the session has no browser. The token goes to stdout only and is never logged.
+- Claude starts the helper with the session environment (`CLAUDE_CONFIG_DIR`, `T3CODE_THREAD_ID`). Codex starts it with a bare environment (`HOME`, `PATH` and a few others, no `CODEX_HOME`, no `T3CODE_*`). The Codex config line therefore names the folder: `ais browser headers --tool=codex --config-dir=<folder>`. The helper sends no `X-AIS-Session-Id`: Claude does not reliably set `CLAUDE_CODE_SESSION_ID` for the helper, and a `claude -p` started from another session's shell would inherit that session's id and fight over its tab group. The gateway issues `Mcp-Session-Id` on `initialize`, and that id keys the session. Its label is the T3 thread title, else `<Tool> in <folder>`. `--tool=claude` reads only `CLAUDE_CONFIG_DIR`, never `CODEX_HOME`.
+- The helper runs when the client connects. A pool swap during a session is not seen until the client reconnects. The token of the member that was active at connect time keeps working while that member stays an allowed pool member.
+- The AIS launcher (`run-wrapper`) adds no `--mcp-config` and no `-c mcp_servers.*` argument. `MCP_TOOL_TIMEOUT` is no longer set by AIS: The plugin entry sets `timeout: 135000` (a per-server timeout, Claude Code 2.1.159 and later). Without it Claude cuts an HTTP call at 60 s, and a `wait` of 61 to 125 s would fail, because the gateway answers only when the call ends.
+- A session that started before a change keeps its old servers until you resume it.
 
 Local proxy: Claude sessions run with `HTTPS_PROXY` set to the local gateway proxy and `NODE_EXTRA_CA_CERTS`. That proxy (`src/gateway/connect-relay.ts`, `src/gateway/usage-proxy.ts`) pipes every CONNECT as plain TCP bytes. It reads TLS only for `api.anthropic.com`, `opencode.ai` and `cli-chat-proxy.grok.com` on port 443. A request to the gateway's own `/browser/mcp` passes unchanged, with its `Authorization` header, and an open tunnel has no timeout, so a 135 s call is fine. No `NO_PROXY` entry is needed.
 
@@ -143,7 +140,7 @@ Limits: at most 10 files and 10 MiB in total per call (checked by the MCP server
 
 ## Tool timeout
 
-The relay allows up to 125 s per call (`wait`). Codex is wired with `mcp_servers.ais-browser.tool_timeout_sec=135`. Claude Code's MCP config has no per-server timeout field; its `MCP_TOOL_TIMEOUT` env (ms) must be at least 135000. AIS sets `MCP_TOOL_TIMEOUT=135000` for the claude launch only when it is not already set.
+The relay allows up to 125 s per call (`wait`). The Codex config block sets `tool_timeout_sec = 135`. The Claude plugin entry sets `timeout: 135000`, which overrides `MCP_TOOL_TIMEOUT`. AIS no longer sets that variable.
 
 ## Limits
 
