@@ -1,4 +1,4 @@
-import { basename, join } from "node:path";
+import { basename, resolve } from "node:path";
 import { expandPath } from "../identities/match.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
@@ -14,7 +14,7 @@ export type BrowserTool = "claude" | "codex";
 export interface HeadersInput {
   env: NodeJS.ProcessEnv;
   cwd: string;
-  /** Tool override (`--tool`). Default: Claude when CLAUDE_CONFIG_DIR is set, else Codex when CODEX_HOME is set. */
+  /** Tool override (`--tool`). `claude` never reads CODEX_HOME and `codex` never reads CLAUDE_CONFIG_DIR. Default: Claude when CLAUDE_CONFIG_DIR is set, else Codex when CODEX_HOME is set. */
   tool?: BrowserTool | undefined;
   /** Folder override (`--config-dir`). Codex runs the helper without CODEX_HOME, so its config entry names the folder. */
   configDir?: string | undefined;
@@ -41,7 +41,7 @@ export async function browserHeaders(i: HeadersInput): Promise<Record<string, st
     const tool: BrowserTool | undefined = i.tool ?? (i.env.CLAUDE_CONFIG_DIR ? "claude" : i.env.CODEX_HOME ? "codex" : undefined);
     const configDir = i.configDir ?? (tool === "codex" ? i.env.CODEX_HOME : i.env.CLAUDE_CONFIG_DIR);
     if (!tool || !configDir) return {};
-    if (isOtherProviderName(basename(configDir.replace(/\/+$/, "")))) return {};
+    if (isOtherProviderName(basename(resolve(expandPath(configDir))))) return {};
     const file = await (i.loadFile ?? ((t) => loadIdentitiesFile((t === "claude" ? CLAUDE_CONFIG : CODEX_CONFIG).identitiesJsonPath)))(tool);
     const identity = identityForConfigDir(file, configDir, i.real, i.t3Gateway);
     if (!identity || isOtherProviderName(identity.name)) return {};
@@ -56,13 +56,9 @@ export async function browserHeaders(i: HeadersInput): Promise<Record<string, st
       token = await (i.readToken ?? readTokenFile)(expandPath(identity.configDir));
     }
     if (!token) return {};
-    const sessionId = tool === "claude" ? i.env.CLAUDE_CODE_SESSION_ID || undefined : undefined;
     const label = await (i.label ?? launchSessionLabel)(i.env, tool, i.cwd).catch(() => "");
-    return { Authorization: `Bearer ${token}`, ...launchHeaders({ sessionId, label, pool }) };
+    return { Authorization: `Bearer ${token}`, ...launchHeaders({ label, pool }) };
   } catch {
     return {};
   }
 }
-
-/** Where a Codex folder keeps its config, for `ais browser codex-config`. */
-export const codexConfigPath = (home: string): string => join(expandPath(home), "config.toml");

@@ -1,4 +1,4 @@
-import { readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isOtherProviderName } from "../../browser/headers.ts";
 import { expandPath } from "../../identities/match.ts";
@@ -24,6 +24,8 @@ export interface CodexConfigDeps {
 }
 
 const toml = (s: string): string => JSON.stringify(s);
+/** POSIX shell quoting: Codex runs the helper through `sh -c`. */
+const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
 /** The managed block of one Codex folder. The command carries the folder, because Codex starts the helper with a bare environment (no CODEX_HOME). */
 export function codexBlock(gateway: string, ais: string, home: string): string {
@@ -32,7 +34,7 @@ export function codexBlock(gateway: string, ais: string, home: string): string {
     BEGIN,
     "[mcp_servers.ais-browser]",
     `url = ${toml(url)}`,
-    `http_headers_helper = ${toml(`${ais} browser headers --tool=codex --config-dir=${home}`)}`,
+    `http_headers_helper = ${toml(`${shq(ais)} browser headers --tool=codex --config-dir=${shq(home)}`)}`,
     `tool_timeout_sec = ${TOOL_TIMEOUT_SEC}`,
     END,
     "",
@@ -48,18 +50,43 @@ export function stripBlock(text: string): string {
   return `${text.slice(0, a)}${text.slice(e + END.length).replace(/^\n/, "")}`.replace(/\n{3,}/g, "\n\n");
 }
 
-/** True when the config has its own `[mcp_servers.ais-browser]` table outside the managed block. */
-export const hasForeignEntry = (text: string): boolean => /^\s*\[mcp_servers\.(?:"?ais-browser"?)[\].]/m.test(stripBlock(text));
+/**
+ * True when the config has its own `ais-browser` server outside the managed block: a table header in any quoting
+ * (`[mcp_servers.ais-browser]`, `['ais-browser']`, `["ais-browser"]`, also sub-tables), an inline entry under `[mcp_servers]`,
+ * or a dotted key (`mcp_servers.ais-browser.url = ...`, `mcp_servers."ais-browser" = {...}`).
+ */
+export function hasForeignEntry(text: string): boolean {
+  const name = `(?:ais-browser|"ais-browser"|'ais-browser')`;
+  const header = new RegExp(`^\\s*\\[\\s*mcp_servers\\s*\\.\\s*${name}\\s*[\\].]`, "m");
+  const dotted = new RegExp(`^\\s*mcp_servers\\s*\\.\\s*${name}\\s*[.=]`, "m");
+  const rest = stripBlock(text);
+  if (header.test(rest) || dotted.test(rest)) return true;
+  // An inline entry inside a `[mcp_servers]` table.
+  let inServers = false;
+  for (const line of rest.split("\n")) {
+    const t = line.trim();
+    const h = /^\[\s*([^\]]*?)\s*\]\s*(?:#.*)?$/.exec(t);
+    if (h && !t.startsWith("[[")) inServers = h[1] === "mcp_servers";
+    else if (inServers && new RegExp(`^${name}\\s*(?:[.=])`).test(t)) return true;
+  }
+  return false;
+}
 
 export function applyBlock(text: string, block: string | undefined): string {
   const base = stripBlock(text).replace(/\n*$/, "\n");
   return block ? `${base === "\n" ? "" : `${base}\n`}${block}` : base === "\n" ? "" : base;
 }
 
+/** A Codex folder exists and holds a Codex file or folder. Never create config.toml elsewhere. */
+async function isCodexFolder(home: string): Promise<boolean> {
+  for (const f of ["config.toml", "auth.json", "sessions"]) if (await stat(join(home, f)).then(() => true, () => false)) return true;
+  return false;
+}
+
 async function defaultHomes(): Promise<string[]> {
   const homes: string[] = [];
   try {
-    for (const i of (await loadIdentitiesFile(CODEX_CONFIG.identitiesJsonPath)).identities) if (!i.retired && !i.swapPool) homes.push(expandPath(i.configDir));
+    for (const i of (await loadIdentitiesFile(CODEX_CONFIG.identitiesJsonPath)).identities) if (!i.retired) homes.push(expandPath(i.configDir));
   } catch { /* no registry */ }
   try {
     const dir = join(t3Paths().t3Home, "gateway");
@@ -91,11 +118,17 @@ export async function runCodexConfig(homesArg: string[], flags: ParsedArgs["flag
   const ais = d.aisBinary() ?? "ais";
   let ok = true;
   for (const home of homes) {
-    if (/\s/.test(home)) { d.out(`${home}  skipped: the path has white space`); ok = false; continue; }
+    if (!(await isCodexFolder(home))) { d.out(`${home}  skipped: not a Codex folder (missing, or no config.toml, auth.json or sessions)`); ok = false; continue; }
     const path = join(home, "config.toml");
     let text = "";
-    try { text = await readFile(path, "utf8"); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") { d.out(`${home}  skipped: cannot read config.toml`); ok = false; continue; } }
-    if (hasForeignEntry(text)) { d.out(`${home}  skipped: config.toml has its own [mcp_servers.ais-browser] entry`); ok = false; continue; }
+    let mode = 0o600;
+    try {
+      text = await readFile(path, "utf8");
+      mode = (await stat(path)).mode & 0o777;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") { d.out(`${home}  skipped: cannot read config.toml`); ok = false; continue; }
+    }
+    if (hasForeignEntry(text)) { d.out(`${home}  skipped: config.toml has its own ais-browser entry`); ok = false; continue; }
     const next = applyBlock(text, remove ? undefined : codexBlock(gateway!, ais, home));
     const same = next === text;
     if (check || same) {
@@ -103,10 +136,16 @@ export async function runCodexConfig(homesArg: string[], flags: ParsedArgs["flag
       if (check && !same) ok = false;
       continue;
     }
-    const tmp = `${path}.tmp.${process.pid}`;
-    await writeFile(tmp, next, { mode: 0o600 });
-    await rename(tmp, path);
-    d.out(`${home}  ${remove ? "removed" : "written"}`);
+    try {
+      const tmp = `${path}.tmp.${process.pid}`;
+      await writeFile(tmp, next, { mode });
+      await chmod(tmp, mode);
+      await rename(tmp, path);
+      d.out(`${home}  ${remove ? "removed" : "written"}`);
+    } catch {
+      d.out(`${home}  skipped: cannot write config.toml`);
+      ok = false;
+    }
   }
   return ok;
 }

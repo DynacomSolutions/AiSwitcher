@@ -21,10 +21,10 @@ const base = {
   label: async () => "Fix the login page",
 };
 
-test("claude identity: bearer token, session id, encoded label, no pool", async () => {
+test("claude identity: bearer token, encoded label, never a session id, no pool", async () => {
   const h = await browserHeaders({ ...base, env: { CLAUDE_CONFIG_DIR: "/ids/alpha", CLAUDE_CODE_SESSION_ID: "0b3b1a52-3c1e-4f7e-9d54-3a0f6d2a9c11" } });
   expect(h.Authorization).toBe(`Bearer ${TOKEN}`);
-  expect(h["X-AIS-Session-Id"]).toBe("0b3b1a52-3c1e-4f7e-9d54-3a0f6d2a9c11");
+  expect(h["X-AIS-Session-Id"]).toBeUndefined();
   expect(decodeURIComponent(h["X-AIS-Session-Label"]!)).toBe("Fix the login page");
   expect(h["X-AIS-Pool"]).toBeUndefined();
 });
@@ -66,4 +66,15 @@ test("a provider folder named like an identity is still refused", async () => {
 test("provider name check", () => {
   for (const n of ["t3-claude-kimi-alpha", "t3-claude-zai-pool", "kimi", "zai-x"]) expect(isOtherProviderName(n)).toBe(true);
   for (const n of ["t3-claude-alpha", "pool", "team"]) expect(isOtherProviderName(n)).toBe(false);
+});
+
+test("--tool=claude never reads CODEX_HOME", async () => {
+  expect(await browserHeaders({ ...base, tool: "claude", env: { CODEX_HOME: "/ids/alpha" } })).toEqual({});
+});
+
+test("a Kimi or Z.ai folder is refused with trailing slash, dot or dot-dot segments", async () => {
+  for (const d of ["/t3/gateway/t3-claude-kimi-pool/.", "/t3/gateway/t3-claude-kimi-pool/", "/t3/gateway/t3-claude-zai-pool//", "/t3/gateway/x/../t3-claude-kimi-pool/."]) {
+    const f: any = { version: 1, identities: [id("p", { configDir: d })] };
+    expect(await browserHeaders({ ...base, loadFile: async () => f, env: { CLAUDE_CONFIG_DIR: d } })).toEqual({});
+  }
 });
