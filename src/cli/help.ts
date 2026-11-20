@@ -125,7 +125,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   browser: {
-    usage: "ais browser approve|list|revoke|agent-token|extension|wiring|mcp|mcp-serve|mcp-service ...",
+    usage: "ais browser approve|list|revoke|agent-token|extension|wiring|mcp|upload ...",
     desc: "AIS Browser: bind Chrome extensions to an identity or swap pool; agent tokens",
     examples: ["ais browser approve ABCD2345 --identity=work --name=work-chrome"],
     subs: {
@@ -144,9 +144,11 @@ export const HELP: Record<string, HelpNode> = {
         "ais browser wiring [--check] [--json]",
         "For each enabled T3 Code claude/codex instance (from <T3 home>/userdata/settings.json), run the launch wiring steps and print its folder, mapped identity or pool, and wired or NOT wired with the reason. --check exits 1 when any instance is not wired; never prints tokens",
       ),
-      mcp: sub("ais browser mcp", "Stdio MCP server exposing the browser tools; started by Claude and Codex launches that have an agent token when the shared service is not installed (not for manual use)"),
-      "mcp-serve": sub("ais browser mcp-serve", "The shared MCP server for every agent session: Streamable HTTP on 127.0.0.1 (port 47150, or AIS_BROWSER_MCP_PORT), path /mcp, bearer key in ~/.ais/browser-mcp/key. Run by ais-browser-mcp.service (not for manual use)"),
-      "mcp-service": sub("ais browser mcp-service install|status|uninstall", "Manage the ais-browser-mcp.service user unit (Linux with systemd). While it is installed, launches use the shared server and start it on demand; without it they use the stdio server"),
+      upload: sub(
+        "ais browser upload --session <id> --tab <tabId> (--ref <ref> | --coordinate <x,y>) [--browser <name>] <paths...>",
+        "Upload files from this machine to a page's file input through the gateway. The gateway MCP server cannot read your files, so its upload_file tool error names this command with the session id. Limits: 10 files, 10 MiB in total",
+      ),
+      mcp: sub("ais browser mcp", "Stdio MCP server exposing the browser tools; started by Claude and Codex launches that have an agent token when the gateway address is not known (not for manual use). With a known gateway address, launches use its shared HTTP endpoint /browser/mcp instead"),
     },
   },
   swap: {
