@@ -202,6 +202,25 @@ describe("panel mapping", () => {
     expect(off).toMatchObject({ status: "unknown", summary: "Gateway not configured", rows: [] });
   });
 
+  test("no top-N cut and no Other bucket", async () => {
+    const pairs = Array.from({ length: 60 }, (_, i) => ({ app: `app-${i}`, provider: "claude", days: 7, tokens: 1000 + i }));
+    const usage = await panel("gateway-usage", sources({ gatewayUsage: async () => ({ configured: true, rows: pairs }) }));
+    expect(usage.rows).toHaveLength(60);
+
+    const many = Array.from({ length: 70 }, (_, i) => ({ tool: `tool-${i % 6}`, identity: `id-${i}`, startedAt: null }));
+    const agents = await panel("agents", sources({ processes: async () => ({ processes: many as never }) }));
+    expect(agents.rows).toHaveLength(70);
+    expect(agents.stats).toHaveLength(6);
+    expect(agents.stats.map((s) => s.label)).not.toContain("Other");
+    expect(agents.stats.reduce((sum, s) => sum + Number(s.value), 0)).toBe(70);
+
+    const spend = await panel(
+      "spend-guard",
+      sources({ spendGuard: () => ({ running: true, accounts: [{ accountId: "x", budgetLimitUsd: 100, effectiveUsd: 1, breached: false, degraded: false, identities: ["a", "b", "c", "d"] }] }) as never }),
+    );
+    expect(spend.rows[0]?.label).toBe("a, b, c, d");
+  });
+
   test("claude-swap and spend-guard: unknown rows stay unknown, no ids leave", async () => {
     const swap = await panel("claude-swap");
     expect(swap.rows.map((r) => [r.label, r.status, r.fraction])).toEqual([["shared / m1", "crit", 0.97], ["shared / m3", "crit", 1], ["shared / m2", "unknown", undefined]]);

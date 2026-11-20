@@ -425,7 +425,8 @@ An unknown id gives 404 `{ "error": "unknown panel" }`. A failing backend gives
 502 `{ "error": "<short reason>" }`. The server caches each panel for its
 `refreshSeconds` and runs one build for concurrent requests. Email-shaped and
 token-shaped strings are masked. Output holds no file paths, command lines or
-credential data.
+credential data. A panel never cuts its rows or stats and has no "Other"
+group: every row and every stat shows at its real size.
 
 | Panel id | Shows | refreshSeconds |
 |---|---|---|
