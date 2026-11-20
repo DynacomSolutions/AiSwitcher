@@ -3,7 +3,7 @@
 Track product work, bugs and acceptance evidence. Routine Git operations are not tasks.
 
 ## 1. Product work
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-21 18:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 1 | Preserve Grok's explicit memory control through the identity launcher | done | grok_memory_fix | | | | Exact-key forwarding and four real-subprocess regressions are source-reviewed. Focused QA completed successfully; full CI on `97ae2de` passed typecheck and 609 tests across 76 files with zero failures. Compiled launcher inspected live: both launcher and real Grok child receive `GROK_MEMORY=0`. Installed binary matches the tested candidate byte-for-byte, with a rollback copy; other launchers and shared memory settings are unchanged. Other session markers and explicit child overrides remain intact. |
@@ -125,7 +125,7 @@ ETA: 2026-11-07 18:00 ICT
 | 98 | Fix main CI: spend guard canary and Host app Browser smoke | done | claude-20261031-main-ci-red | main-ci-red | | 2026-10-31 23:30 ICT | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/319 (b9e97f3).<br>Canary tests now use the Bun binary as `codex`; @playwright/test 1.58.2 to 1.64.1 for ubuntu26.04.<br>All PR 319 checks green. |
 
 ## 4. AIS AI Gateway for cluster apps
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -179,7 +179,7 @@ ETA: 2026-11-15 23:00 ICT
 | 220 | Gateway: a revoked app stays revoked, its old tokens never work again | done | claude | gateway-revoke-revive | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/599 (41dfaf3), live on all 6 replicas.<br>Revoked name: add, rotate and admin PUT and mint give 409.<br>Leaked revoked tokens give 401 on every replica. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-20 14:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -224,7 +224,7 @@ ETA: 2026-11-20 14:00 ICT
 | 241 | Limit answers use the true reset of the full window | done | agent | gw-limit-true-reset | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/642 (ccecd57), Opus review fixed.<br>Live on all 6 cluster gateway pods (binary has fetchOpencodeUsage).<br>Not yet seen live: a real limit answer with the weekly reset. |
 | 244 | Release tests stop failing on the Kimi refresh and SIGTERM drain checks | in_progress | agent | fix-release-flaky-tests | | 2026-11-20 18:30 ICT | Kimi test failed when an earlier test file left the gateway owner role set.<br>Drain test failed when its probe connection was reset.<br>Both tests made deterministic. |
 ## 6. Browser control extension
-ETA: 2026-11-18 18:30 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -252,21 +252,21 @@ ETA: 2026-11-18 18:30 ICT
 | 240 | AIS Browser: one shared MCP service for every session, started on demand | in_review | claude | browser-mcp-gateway | | 2026-11-20 16:00 ICT | The shared MCP server is the gateway: `POST /browser/mcp`, stateless, bearer agent token.<br>No host daemon and no systemd unit (owner decisions 19 and 20 Nov 2026). The PR 635 host daemon is removed.<br>Launch headers carry session id, label and pool. DELETE ends the session. upload_file paths use `ais browser upload`.<br>Needs a gateway image rollout to go live. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 127 | One host-level profile-sync watcher instead of a scan per session sidecar | in_review | claude-20261105-sync-daemon | perf/host-profile-sync-daemon | | 2026-11-06 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/375<br>`ais __profile_sync_daemon`, 30 s poll; sidecars only register.<br>`ais update` and install:shims install and start the unit; not installed on any host yet.<br>Was 124. |
 
 ## 8. Gateway client under a base path
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 148 | Prove gateway clients keep a base path such as /gateway | in_progress | claude | gateway-url-path | | 2026-11-07 22:00 ICT | No built-in gateway host exists; URL comes from AIS_GATEWAY_PROXY_URL only<br>Tests for local proxy and browser shim; docs use example.com<br>Was 142. |
 
 ## 9. Console image security
-ETA: 2026-11-12 12:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -335,7 +335,7 @@ One refresher per login across replicas and hosts, early renewal, a dead grant n
 | 223 | WebUI Auth page shows the gateway renewal state, not a stale host stamp | done | claude | webui-gateway-renewal | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/607 (3f42f80).<br>Live API check: every gateway login shows its real last and next refresh. |
 | 224 | Watchdog rules: login not renewed within its lifetime, login revoked | done | claude | gateway-refresh-alerts-kimi | 15.221 | | Rules merged in .cluster PR 2646.<br>Kimi exception merged in .cluster PR 2657. |
 | 225 | Release, rollout to the host and the cluster, check no login lapses after one token lifetime | done | claude | | 15.221, 15.222, 15.223, 15.224 | | Host and all gateway pods on 0.5.76.<br>20 Nov check: 14 gateway logins, 0 revoked, 0 lapsed, 0 overdue.<br>No failed or dead refresh in 24 h. |
-| 240 | The gateway manages every live claude login; no "not managed" refusal for a login it serves | done | claude | gateway-manages-all-claude | 15.227 | | Fixes a regression from row 227 and a store prune (502 for one identity).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/621 (63593d2).<br>Live: the login renews in the gateway every 4 h, requests return 200. |
+| 245 | The gateway manages every live claude login; no "not managed" refusal for a login it serves | done | claude | gateway-manages-all-claude | 15.227 | | Was 240.<br>Fixes a regression from row 227 and a store prune (502 for one identity).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/621 (63593d2).<br>Live: the login renews in the gateway every 4 h, requests return 200. |
 | 231 | Kimi login has one refresher: the gateway usage poll no longer rotates it, pools hold no refresh token | done | claude | kimi-single-refresher | 15.221 | | Was 226 (id taken by 11.226).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/611 (00b8524), Opus review fixed.<br>Live: kimi journal chain continuous, one renewal per tick. |
 | 227 | Credential store holds only logins the gateway manages; WebUI ownership from the gateway list | done | claude | store-owned-matches-gateway | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/612 (375b818), Opus review fixed.<br>Prune removed 2 stale rows; live host copies kept. |
 
