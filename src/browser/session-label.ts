@@ -29,12 +29,12 @@ export function sessionName(env: NodeJS.ProcessEnv = process.env, tool?: "claude
   return t3ThreadTitle(env) || cleanLabel(env.AIS_SESSION_NAME) || fallbackLabel(tool, cwd);
 }
 
-/** Longest wait for the T3 thread title at launch. */
+/** Wait limit for the T3 thread title at launch. The lookup is synchronous, so this is a guard only: the real bound is the 150 ms SQLite busy timeout plus the time to open the file. */
 export const LAUNCH_LABEL_WAIT_MS = 200;
 
 /**
- * The session name a launch sends to the gateway: T3 thread title (read-only lookup, given at most 200 ms), else `<Tool> in <folder>`.
- * Never throws and never delays the launch by more than the wait. `lookup` is injectable for tests.
+ * The session name a launch sends to the gateway: T3 thread title (read-only lookup), else `<Tool> in <folder>`.
+ * Never throws. The lookup is synchronous and cannot be cut short: a locked database costs at most the 150 ms busy timeout plus the open time. `lookup` is injectable for tests.
  */
 export async function launchSessionLabel(env: NodeJS.ProcessEnv, tool: "claude" | "codex", cwd: string, lookup: (env: NodeJS.ProcessEnv) => string | undefined | Promise<string | undefined> = t3ThreadTitle, waitMs = LAUNCH_LABEL_WAIT_MS): Promise<string> {
   let timer: ReturnType<typeof setTimeout> | undefined;

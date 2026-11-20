@@ -190,7 +190,6 @@ export async function runWrapper(
     // to the registered one so a pool folder gets pool wiring instead of none.
     // With a known gateway URL and a token, the browser server is wired as the gateway's HTTP endpoint (no process starts here); otherwise as stdio.
     const browserTool = cfg.toolName === "claude" || cfg.toolName === "codex" ? cfg.toolName : undefined;
-    const sessionLabel = browserTool && gatewayUrl ? await launchSessionLabel(process.env, browserTool, process.cwd()) : undefined;
     const browserWiring = await browserLaunchWiring({
       toolName: cfg.toolName,
       configDirValue: resolved.configDirValue,
@@ -205,7 +204,8 @@ export async function runWrapper(
         ? {
             http: {
               ...(browserTool === "claude" && claudeSessionIdFromArgv(parsed.cleanedArgv) ? { sessionId: claudeSessionIdFromArgv(parsed.cleanedArgv)! } : {}),
-              ...(sessionLabel ? { label: sessionLabel } : {}),
+              // Looked up only when a token exists (see browserLaunchWiring).
+              label: () => launchSessionLabel(process.env, browserTool, process.cwd()),
             },
           }
         : {}),

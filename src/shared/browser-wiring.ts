@@ -214,7 +214,10 @@ export interface LaunchBrowserWiringInput {
   real?: (p: string) => string;
   t3Gateway?: string;
   /** Session description for the gateway MCP form. The form is used only when `gatewayUrl` is set and a token file is readable. */
-  http?: HttpWiring;
+  http?: Omit<HttpWiring, "label"> & {
+    /** A function is called only when the HTTP form is used, so no title lookup runs for a launch without a token. */
+    label?: string | (() => Promise<string>);
+  };
   /** Reads a token file (default: the real file system). Injectable for tests. */
   readToken?: (dir: string) => string | undefined;
 }
@@ -247,7 +250,12 @@ export async function browserLaunchWiring(i: LaunchBrowserWiringInput): Promise<
   const tokenDirs = pool ? pool.memberConfigDirs : [configDir];
   let token: string | undefined;
   if (i.http && i.gatewayUrl) for (const d of tokenDirs) if ((token = readToken(d))) break;
-  const http = i.http && i.gatewayUrl && token ? i.http : undefined;
+  let http: HttpWiring | undefined;
+  if (i.http && i.gatewayUrl && token) {
+    const { label: raw, ...rest } = i.http;
+    const label = typeof raw === "function" ? await raw().catch(() => "") : raw;
+    http = { ...rest, ...(label ? { label } : {}) };
+  }
   const args = browserMcpArgs(i.toolName, configDir, identity, i.aisBinary, {
     ...(identityName !== undefined ? { identityName } : {}),
     ...(i.gatewayUrl ? { gateway: i.gatewayUrl } : {}),

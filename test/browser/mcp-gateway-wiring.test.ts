@@ -70,6 +70,17 @@ test("browserLaunchWiring: http with the token in env only; stdio without gatewa
   expect(none.env).toEqual({});
 });
 
+test("the label function runs only when a token exists", async () => {
+  let runs = 0;
+  const label = async () => { runs++; return "Thread title"; };
+  const noToken = await browserLaunchWiring({ ...base, gatewayUrl: GW, http: { label }, readToken: () => undefined });
+  expect(noToken.mode).toBe("stdio");
+  expect(runs).toBe(0);
+  const withToken = await browserLaunchWiring({ ...base, gatewayUrl: GW, http: { label }, readToken: () => TOKEN });
+  expect(runs).toBe(1);
+  expect(decodeURIComponent(claudeCfg(withToken.args).headers["X-AIS-Session-Label"])).toBe("Thread title");
+});
+
 test("pool launch: the active member's token wins, else any allowed member's", async () => {
   const pool: any = {
     version: 1,
