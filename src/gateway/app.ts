@@ -5,7 +5,7 @@ import { BodyBudget } from "./body-budget.ts";
 import type { BrowserHub } from "./browser/hub.ts";
 import { createPairRoutes } from "./browser/pair.ts";
 import { createMcpRoutes } from "./browser/mcp.ts";
-import { createCallRoutes } from "./browser/routing.ts";
+import { createCallRoutes, type CallHub } from "./browser/routing.ts";
 import { checkCaps, dayStartIct } from "./caps.ts";
 import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
 import { providerError } from "./errors.ts";
@@ -50,7 +50,7 @@ export interface GatewayDeps {
   browserPoolMembers?(pool: string): Promise<string[] | undefined>;
   browserIdentityExists?(identity: string): Promise<string | undefined>;
   /** Browser relay; the agent call routes are only mounted when present. */
-  browserHub?: Pick<BrowserHub, "connected" | "call" | "abort" | "revoke" | "extensionVersion">;
+  browserHub?: CallHub;
   /** Most request-body bytes held for replay at once across all requests. Defaults to AIS_GATEWAY_BODY_BUDGET_MB, else BODY_BUDGET_BYTES. */
   bodyBudgetBytes?: number;
   /** Side and served requests (lists, search, speech, pool-served routes) an app may make per day. Defaults to AIS_GATEWAY_SIDE_DAILY_LIMIT, else no limit (not counted at all). */

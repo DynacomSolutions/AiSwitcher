@@ -33,8 +33,16 @@ export function forwardedSession(b: BrowserBinding, identity: string, id: string
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 
+/** The hub surface the call routes need. The cluster hub adds cancel fan-out between replicas. */
+export type CallHub = Pick<BrowserHub, "connected" | "call" | "abort" | "revoke" | "extensionVersion"> & {
+  /** Tells the other replicas to abort the in-flight MCP call with this key (the call may run on any replica). */
+  broadcastCancel?(key: string): void;
+  /** Registers the handler for cancels that arrive from other replicas. */
+  onCancel?(handler: (key: string) => void): void;
+};
+
 export interface CallDeps extends BrowserDeps {
-  hub: Pick<BrowserHub, "connected" | "call" | "abort" | "revoke" | "extensionVersion">;
+  hub: CallHub;
   metrics?: GatewayMetrics;
 }
 

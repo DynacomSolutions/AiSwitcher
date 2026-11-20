@@ -104,8 +104,11 @@ describe("stateless registration", () => {
   test("initialize without a session id issues Mcp-Session-Id, and keeps a given one", async () => {
     const res = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize" });
     expect(res.headers.get("mcp-session-id")).toMatch(/^[0-9a-f-]{36}$/);
+    // A client that sends its own id (Claude) gets that same id back, so its DELETE ends the right session.
     const own = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize" }, { "X-AIS-Session-Id": "mine" });
-    expect(own.headers.get("mcp-session-id")).toBeNull();
+    expect(own.headers.get("mcp-session-id")).toBe("mine");
+    const ping = await rpc({ jsonrpc: "2.0", id: 1, method: "ping" });
+    expect(ping.headers.get("mcp-session-id")).toBeNull();
   });
 
   test("a notification gets 202", async () => {
@@ -242,6 +245,20 @@ describe("DELETE ends the session", () => {
     expect(seen).toEqual([{ tool: "session_end", id: "sess-end" }]);
   });
 
+  test("Claude style: initialize with X-AIS-Session-Id returns it, and a DELETE with only that Mcp-Session-Id ends the session", async () => {
+    const ws = await connect(binding("w", { kind: "identity", identity: "id1" }));
+    const seen: Array<{ tool: string; id: string }> = [];
+    const orig = ws.send.bind(ws);
+    ws.send = (d: string) => { const r = (JSON.parse(d) as { req: { tool: string; session: { id: string } } }).req; seen.push({ tool: r.tool, id: r.session.id }); orig(d); };
+    const stop = answerAll(ws);
+    const init = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize" }, { "X-AIS-Session-Id": "claude-sess" });
+    const sid = init.headers.get("mcp-session-id")!;
+    expect(sid).toBe("claude-sess");
+    expect((await rpc(null, { "Mcp-Session-Id": sid }, token, "DELETE")).status).toBe(204);
+    stop();
+    expect(seen).toEqual([{ tool: "session_end", id: "claude-sess" }]);
+  });
+
   test("needs a session id and, with a pool header, pool membership", async () => {
     expect((await rpc(null, {}, token, "DELETE")).status).toBe(400);
     expect((await rpc(null, { "X-AIS-Session-Id": "s", "X-AIS-Pool": "nope" }, token, "DELETE")).status).toBe(403);
@@ -264,6 +281,95 @@ describe("metrics", () => {
   test("unknown labels collapse to fixed values", () => {
     metrics.browserMcpRequest("evil/method", "weird");
     return expect(metricLine('method="other",outcome="error"')).resolves.toContain("1");
+  });
+});
+
+describe("cancel", () => {
+  /** A fake replica: its hub holds a call until it is aborted. Cancels fan out over a shared bus, as the cluster hub does with NOTIFY. */
+  function replica(bus: Set<(key: string) => void>, innerStore: MemoryGatewayStore) {
+    const aborted: string[] = [];
+    const waiting = new Map<string, (r: unknown) => void>();
+    let handler: ((key: string) => void) | undefined;
+    const fakeHub = {
+      connected: () => [binding("w", { kind: "identity", identity: "id1" }), binding("w2", { kind: "identity", identity: "id2" })],
+      call: (_name: string, req: { id: string }) => new Promise((resolve) => { waiting.set(req.id, resolve); }),
+      abort: (id: string) => { aborted.push(id); waiting.get(id)?.({ id, ok: false, error: "internal", message: "cancelled" }); },
+      revoke() {},
+      extensionVersion: () => undefined,
+      onCancel: (h: (key: string) => void) => { handler = h; bus.add(h); },
+      broadcastCancel: (key: string) => { for (const h of bus) if (h !== handler) h(key); },
+    };
+    const a = createGatewayApp({ store: innerStore, now: () => new Date(), browserPoolMembers: async (p: string) => members[p], metrics, browserHub: fakeHub } as never);
+    return { app: a, aborted };
+  }
+  const post = (a: ReturnType<typeof createGatewayApp>, tok: string, body: unknown) =>
+    a.request("http://gw.test/browser/mcp", { method: "POST", headers: { authorization: `Bearer ${tok}`, "content-type": "application/json", "X-AIS-Session-Id": "sess-c" }, body: JSON.stringify(body) });
+  const callMsg = { jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "tabs_context", arguments: {} } };
+  const cancelMsg = { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 9 } };
+  const tick = () => new Promise((r) => setTimeout(r, 20));
+
+  async function tokenFor(identity: string): Promise<string> {
+    const t = generateToken();
+    await (store as unknown as MemoryGatewayStore).addAgentToken({ identity, prefix: t.prefix, hash: t.hash, createdAt: "2026-11-04T00:00:00.000Z" });
+    return t.token;
+  }
+
+  test("a cancel on the same replica aborts the running call", async () => {
+    const bus = new Set<(k: string) => void>();
+    const r = replica(bus, store as unknown as MemoryGatewayStore);
+    const running = post(r.app, token, callMsg);
+    await tick();
+    expect((await post(r.app, token, cancelMsg)).status).toBe(202);
+    const body = (await (await running).json()) as { result: { isError: boolean } };
+    expect(r.aborted).toHaveLength(1);
+    expect(body.result.isError).toBe(true);
+  });
+
+  test("a cancel that lands on another replica aborts the call there", async () => {
+    const bus = new Set<(k: string) => void>();
+    const a = replica(bus, store as unknown as MemoryGatewayStore);
+    const b = replica(bus, store as unknown as MemoryGatewayStore);
+    const running = post(a.app, token, callMsg);
+    await tick();
+    await post(b.app, token, cancelMsg);
+    await running;
+    expect(a.aborted).toHaveLength(1);
+    expect(b.aborted).toHaveLength(0);
+  });
+
+  test("a cancel from another identity never aborts the call", async () => {
+    const bus = new Set<(k: string) => void>();
+    const a = replica(bus, store as unknown as MemoryGatewayStore);
+    const b = replica(bus, store as unknown as MemoryGatewayStore);
+    const other = await tokenFor("id2");
+    const running = post(a.app, token, callMsg);
+    await tick();
+    await post(a.app, other, cancelMsg);
+    await post(b.app, other, cancelMsg);
+    await tick();
+    expect(a.aborted).toHaveLength(0);
+    await post(a.app, token, cancelMsg);
+    await running;
+    expect(a.aborted).toHaveLength(1);
+  });
+});
+
+describe("hardening", () => {
+  test("a 401 and a pool refusal tell the agent to restart the session", async () => {
+    const res = await rpc({ jsonrpc: "2.0", id: 1, method: "ping" }, {}, "aisg_nope_nope");
+    expect(((await res.json()) as { error: string }).error).toContain("Restart the session");
+    const out = (await (await call("tabs_context", {}, { "X-AIS-Session-Id": "s", "X-AIS-Pool": "other" })).json()) as { result: { content: Array<{ text: string }> } };
+    expect(out.result.content[0]!.text).toContain("restart the session to pick up the new token");
+  });
+
+  test("a declared body over the limit is refused before reading, and bytes are counted", async () => {
+    const big = await app.request("http://gw.test/browser/mcp", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-length": String(17 * 1024 * 1024) }, body: "{}" });
+    expect(big.status).toBe(413);
+  });
+
+  test("the upload error carries the session label", async () => {
+    const out = (await (await call("upload_file", { tabId: 1, ref: "r", paths: ["/a"] }, { "X-AIS-Session-Id": "s9", "X-AIS-Session-Label": encodeURIComponent("My chat") })).json()) as { result: { content: Array<{ text: string }> } };
+    expect(out.result.content[0]!.text).toContain("--session s9 --label 'My chat' --tab 1");
   });
 });
 
