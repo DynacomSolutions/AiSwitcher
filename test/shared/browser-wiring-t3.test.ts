@@ -84,3 +84,12 @@ test("a preset config dir maps back to its registered pool and plain identity; r
   expect(identityForConfigDir(file, "/ids/old")).toBeUndefined();
   expect(identityForConfigDir(file, "/elsewhere")).toBeUndefined();
 });
+
+test("a claude-<name> folder maps by name without the claude- prefix", () => {
+  expect(map(join(gw, "claude-team-pool"))).toBe("team-pool");
+});
+
+test("a t3-claude-<name> folder name wins over a projects link to another identity", () => {
+  const linked = (p: string): string => (p.endsWith("/projects") ? "/ids/beta/projects" : noLinks(p));
+  expect(identityForConfigDir(file, join(gw, "t3-claude-alpha"), linked, gw)?.name).toBe("alpha");
+});
