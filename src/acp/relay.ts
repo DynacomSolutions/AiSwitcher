@@ -63,6 +63,11 @@ export interface RelayOptions {
   now?: () => number;
   /** Snoozes and resumes a thread whose turn failed on a usage limit (limit-snooze.ts). */
   limit?: LimitSnoozer;
+  /**
+   * Whether a permission request while no prompt is open is answered here (the Kimi rule above). Default true. Off for
+   * agents where it was not measured, so their own wake turns and approval mode reach the client unchanged.
+   */
+  answerIdlePermissions?: boolean;
 }
 
 /** JSON-RPC "internal error": the code agents use for a failed provider call. */
@@ -152,6 +157,8 @@ export class AcpRelay {
   /** Sessions that sent output while none of their prompts was open, and have not had a prompt with output since. */
   private readonly busyAlone = new Set<string>();
   /** The T3 MCP endpoint of a `session/new` request, until its answer gives the session id. */
+  /** The latest `Resets at <ISO>Z` text seen in a session's message chunks (Grok shows its limit text there). */
+  private readonly lastResetText = new Map<string, string>();
   private readonly newSessions = new Map<string, McpEndpoint>();
 
   constructor(private readonly opts: RelayOptions = {}) {}
@@ -212,6 +219,25 @@ export class AcpRelay {
     }
   }
 
+  /**
+   * Native Grok ends a limited turn with an `_x.ai/session/prompt_complete` notification (or a session update of that
+   * kind) whose stop reason is `rate_limit`; T3 turns it into error -32003. The reset time is in `agentResult`, or in the
+   * last message chunk of the session.
+   */
+  private xaiPromptComplete(msg: Json): void {
+    const params = obj(msg.params);
+    const update = obj(params?.update);
+    if (msg.method === "session/update" && update?.sessionUpdate !== "prompt_complete") return;
+    const stop = str(params?.stopReason) ?? str(update?.stopReason) ?? str(update?.stop_reason);
+    const sessionId = str(params?.sessionId);
+    if (sessionId === undefined) return;
+    if (stop === "rate_limit") {
+      const result = params?.agentResult ?? update?.agent_result;
+      const own = typeof result === "string" ? result : result === undefined || result === null ? "" : JSON.stringify(result);
+      this.limitFailure(sessionId, `${own} ${this.lastResetText.get(sessionId) ?? ""}`.trim(), undefined, "-32003");
+    } else if (stop === "end_turn") this.opts.limit?.onSuccess(sessionId);
+  }
+
   /** A failed prompt: a usage limit with a reset time snoozes the thread. Fire and forget. */
   private limitFailure(sessionId: string, text: string, status?: number, code?: string): void {
     this.opts.limit?.onFailure(sessionId, { text, ...(status !== undefined ? { status } : {}), ...(code !== undefined ? { code } : {}) });
@@ -219,7 +245,7 @@ export class AcpRelay {
 
   /** A line the agent sent. Returns the lines the client gets: the same line, or the changed answer to a prompt. */
   async fromAgent(line: string): Promise<string[]> {
-    if (this.prompts.size === 0 && this.newSessions.size === 0 && !line.includes('"session/')) return [line];
+    if (this.prompts.size === 0 && this.newSessions.size === 0 && !line.includes('session/')) return [line];
     let msg: Json | undefined;
     try {
       msg = obj(JSON.parse(line));
@@ -231,6 +257,11 @@ export class AcpRelay {
       const params = obj(msg.params);
       const kind = obj(params?.update)?.sessionUpdate;
       const sessionId = str(params?.sessionId);
+      if (this.opts.limit && sessionId !== undefined && kind === "agent_message_chunk") {
+        const text = str(obj(obj(params?.update)?.content)?.text);
+        const found = text !== undefined ? /Resets at \d{4}-\d{2}-\d{2}T[\d:.]+Z/.exec(text)?.[0] : undefined;
+        if (found !== undefined) this.lastResetText.set(sessionId, found);
+      }
       if (sessionId !== undefined && typeof kind === "string" && OUTPUT_UPDATES.has(kind)) {
         if (this.promptOpen(sessionId)) this.output.set(sessionId, (this.output.get(sessionId) ?? 0) + 1);
         else if (!this.busyAlone.has(sessionId)) {
@@ -240,6 +271,7 @@ export class AcpRelay {
       }
       return [line];
     }
+    if (typeof msg.method === "string" && /(^|\/)session\/prompt_complete$|session_notification$|session\/update$/.test(msg.method) && this.opts.limit) this.xaiPromptComplete(msg);
     if (msg.method === "session/request_permission") return this.permissionRequest(msg, line);
     if (msg.method !== undefined) return [line];
     const key = idKey(msg.id);
@@ -274,7 +306,10 @@ export class AcpRelay {
     } catch {
       outcome = undefined;
     }
-    if (outcome === "ok") return [line];
+    if (outcome === "ok") {
+      this.opts.limit?.onSuccess(prompt.sessionId);
+      return [line];
+    }
     const failure = outcome;
     if (failure) {
       this.limitFailure(prompt.sessionId, failure.message, failure.status, failure.code);
@@ -289,6 +324,7 @@ export class AcpRelay {
       const notice = { jsonrpc: "2.0", method: "session/update", params: { sessionId: prompt.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } };
       return [JSON.stringify(notice), line];
     }
+    this.opts.limit?.onSuccess(prompt.sessionId);
     return [line];
   }
 
@@ -299,7 +335,7 @@ export class AcpRelay {
     const key = idKey(msg.id);
     if (sessionId === undefined || key === undefined) return [line];
     const kinds = optionKinds(params);
-    if (this.promptOpen(sessionId) || !this.opts.toAgent) {
+    if (this.promptOpen(sessionId) || !this.opts.toAgent || this.opts.answerIdlePermissions === false) {
       this.asked.set(key, { sessionId, kinds, at: this.now() });
       return [line];
     }

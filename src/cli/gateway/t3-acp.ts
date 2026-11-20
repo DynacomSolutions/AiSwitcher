@@ -55,6 +55,7 @@ export async function runT3AcpCommand(args: string[], flags: ParsedArgs["flags"]
 export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions = {}): Promise<number> {
   const [agentId, ...rest] = argv;
   if (agentId === "--supported") return 0;
+  if (agentId === "--supported=binary") return 0; // old builds know no `--binary=`: they fail this probe
   if (!agentId) {
     process.stderr.write("ais __acp_relay: an agent id is required\n");
     return 2;
@@ -73,5 +74,6 @@ export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions =
   const env = { ...process.env };
   if (install.binDirectory) env.PATH = `${install.binDirectory}${process.platform === "win32" ? ";" : ":"}${env.PATH ?? ""}`;
   const adapter = adapterFor(agentId, env);
-  return runAcpRelay({ command: install.executable, args: agentArgs, env, ...(adapter ? { adapter } : {}) });
+  // The idle-permission answer was measured with kimi-code only; other agents keep their own wake turns and approval mode.
+  return runAcpRelay({ command: install.executable, args: agentArgs, env, ...(adapter ? { adapter } : {}), ...(agentId === "kimi-code" ? {} : { answerIdlePermissions: false }) });
 }

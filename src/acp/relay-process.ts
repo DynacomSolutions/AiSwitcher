@@ -57,6 +57,8 @@ export interface RelayProcessOptions {
   log?: (line: string) => void;
   /** Snooze and resume on a usage limit through the T3 MCP server of each session. On by default. */
   limit?: LimitSnoozer | false;
+  /** See RelayOptions.answerIdlePermissions. */
+  answerIdlePermissions?: boolean;
 }
 
 /** Starts the agent and relays until it exits. Resolves with the exit code this process should end with. */
@@ -78,7 +80,7 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     flushHeld();
   };
   const limit = opts.limit === false ? undefined : (opts.limit ?? new LimitSnoozer({ log }));
-  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log, toAgent, ...(limit ? { limit } : {}) });
+  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log, toAgent, ...(limit ? { limit } : {}), ...(opts.answerIdlePermissions === false ? { answerIdlePermissions: false } : {}) });
 
   return new Promise<number>((resolve) => {
     let done = false;
