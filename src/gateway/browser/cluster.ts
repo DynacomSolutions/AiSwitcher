@@ -3,6 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { CallRequest, CallResult } from "../../browser/protocol.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import { sanitiseResult, type BrowserHub, type HubSocket } from "./hub.ts";
+import type { PgListener } from "../pg-listen.ts";
 import { pgPoolOptions } from "../pg-pool.ts";
 
 export const BROWSER_CHANNEL = "ais_gateway_browser";
@@ -23,6 +24,10 @@ export interface ClusterOptions {
   presenceMs?: number;
   /** A presence row not refreshed for this long belongs to a dead replica and is ignored. Default 20000. */
   staleMs?: number;
+  /** The process-wide pool. The hub then never closes it. Without it, the hub opens and owns a small pool. */
+  sql?: SQL;
+  /** The process-wide LISTEN connection. Without it, the hub listens on its own pool. */
+  listener?: PgListener;
 }
 
 interface Remote {
@@ -67,6 +72,8 @@ export class ClusterBrowserHub {
   private readonly forwarded = new Map<string, AbortController>();
   private remote = new Map<string, Remote>();
   private sql?: SQL;
+  private ownsSql = false;
+  private unlisten?: () => Promise<void>;
   private timer?: ReturnType<typeof setInterval>;
   private listening = false;
   private stopped = true;
@@ -90,12 +97,15 @@ export class ClusterBrowserHub {
   async start(): Promise<void> {
     if (!this.stopped) return;
     this.stopped = false;
-    this.sql = new SQL(
-      this.opts.databaseUrl,
-      // LISTEN needs one connection that stays open. Bun may run it with this pool's options, and an idle timeout
-      // could then close the listener without a sound. So this pool gets no idle timeout, only a small size cap.
-      pgPoolOptions({ maxCap: 2, idle: false }),
-    );
+    this.ownsSql = !this.opts.sql;
+    this.sql =
+      this.opts.sql ??
+      new SQL(
+        this.opts.databaseUrl,
+        // LISTEN needs one connection that stays open. Bun may run it with this pool's options, and an idle timeout
+        // could then close the listener without a sound. So this pool gets no idle timeout, only a small size cap.
+        pgPoolOptions({ maxCap: 2, idle: false }),
+      );
     await this.listen();
     await this.sync(true);
     this.timer = setInterval(() => {
@@ -118,8 +128,11 @@ export class ClusterBrowserHub {
       } catch {
         // rows go stale on their own
       }
-      await Promise.race([sql.close().catch(() => undefined), new Promise((r) => setTimeout(r, 2_000))]);
+      if (this.ownsSql) await Promise.race([sql.close().catch(() => undefined), new Promise((r) => setTimeout(r, 2_000))]);
     }
+    const unlisten = this.unlisten;
+    this.unlisten = undefined;
+    await unlisten?.().catch(() => undefined);
     this.listening = false;
     this.remote = new Map();
   }
@@ -370,6 +383,11 @@ export class ClusterBrowserHub {
     const sql = this.sql;
     if (!sql || this.listening || this.stopped) return;
     try {
+      if (this.opts.listener) {
+        this.unlisten = await this.opts.listener.listen(BROWSER_CHANNEL, (payload) => this.onNotify(payload));
+        this.listening = true;
+        return;
+      }
       // Bun implements listen on SQL; its published types lag behind.
       await (sql as unknown as { listen(channel: string, cb: (payload: string) => void): Promise<unknown> }).listen(BROWSER_CHANNEL, (payload) => this.onNotify(payload));
       this.listening = true;

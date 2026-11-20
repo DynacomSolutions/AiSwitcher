@@ -7,13 +7,16 @@ const POLL_MS = 100;
 /** Pause before the next attempt on a fresh connection after a slow or failed lock call. */
 const RETRY_PAUSE_MS = 250;
 /**
- * Connections in the backend's own pool. The size stays at 10 so that up to 8 refresh locks can be held at once.
- * The idle timeout closes connections that no lock holder uses, so idle replicas do not pin server connections.
+ * Size of the backend's own pool, used only when no shared pool is given (the short-lived CLI commands). The size is 10
+ * so that up to 8 refresh locks can be held at once. The idle timeout closes connections that no lock holder uses.
  */
-const POOL_MAX = 10;
-const POOL = { ...pgPoolOptions(), max: POOL_MAX };
-/** Concurrent lock holders: each pins one reserved connection, so two stay free for retention and for any queries that need the pool. */
-const MAX_HOLDERS = POOL_MAX - 2;
+const OWN_POOL_MAX = 10;
+const OWN_POOL = { ...pgPoolOptions(), max: OWN_POOL_MAX };
+/** Free connections kept in the pool for retention and for any queries that need the pool. */
+const FREE_CONNECTIONS = 2;
+
+/** Concurrent lock holders for a pool of `poolMax` connections: each pins one reserved connection, and two stay free. */
+export const maxHoldersFor = (poolMax: number): number => Math.max(1, poolMax - FREE_CONNECTIONS);
 
 const lockName = (a: RefreshAccount): string => `ais-gateway-refresh:${a.provider}/${a.identity}`;
 const iso = (v: unknown): string => (v instanceof Date ? v.toISOString() : new Date(v as string).toISOString());
@@ -35,26 +38,34 @@ const toEntry = (r: any): JournalEntry => ({
  * Refresh lock and journal in the gateway's PostgreSQL. The lock is a session-level advisory lock on a reserved
  * connection: it is exclusive across every replica and process, and the database drops it if the holder dies.
  * The journal queries run on that same reserved connection, so a holder never needs a second pool connection (no
- * pool deadlock), and at most MAX_HOLDERS locks are held at once. Every call is bounded in time on the client; no startup
+ * pool deadlock), and at most `maxHolders` locks are held at once. Every call is bounded in time on the client; no startup
  * parameter is sent (a connection pooler such as PgBouncer rejects unknown ones, which left every refresh unguarded), and the
  * server-side statement_timeout is only set best-effort with SET on the reserved connection.
  */
 export class PgRefreshBackend implements RefreshGuardBackend {
   private readonly sql: SQL;
+  private readonly ownsSql: boolean;
+  private readonly maxHolders: number;
   private holders = 0;
   private readonly waiters: Array<() => void> = [];
 
-  /** `sql` replaces the driver pool (tests only). */
-  constructor(url: string, private readonly callMs = BACKEND_CALL_TIMEOUT_MS, sql?: SQL) {
-    this.sql = sql ?? new SQL(url, POOL);
+  /**
+   * `sql` is the process-wide pool. The backend then never closes it, and `poolMax` (its size, default from the
+   * environment) sets how many locks can be held at once. Without `sql` the backend opens and owns its own pool.
+   */
+  constructor(url: string, private readonly callMs = BACKEND_CALL_TIMEOUT_MS, sql?: SQL, poolMax: number = pgPoolOptions().max) {
+    this.ownsSql = !sql;
+    this.sql = sql ?? new SQL(url, OWN_POOL);
+    this.maxHolders = maxHoldersFor(sql ? poolMax : OWN_POOL_MAX);
   }
 
+  /** Closes the backend's own pool. A shared pool stays open. */
   async close(): Promise<void> {
-    await this.sql.close();
+    if (this.ownsSql) await this.sql.close();
   }
 
   private async takeSlot(deadline: number, account: RefreshAccount): Promise<void> {
-    if (this.holders < MAX_HOLDERS) {
+    if (this.holders < this.maxHolders) {
       this.holders += 1;
       return;
     }
@@ -85,7 +96,7 @@ export class PgRefreshBackend implements RefreshGuardBackend {
     const deadline = started + timeoutMs;
     await this.takeSlot(deadline, account);
     let conn: Awaited<ReturnType<SQL["reserve"]>> | undefined;
-    let contended = this.holders >= MAX_HOLDERS && Date.now() - started > 0;
+    let contended = this.holders >= this.maxHolders && Date.now() - started > 0;
     const timedOut = (): SwapLockError => new SwapLockError(`refresh lock for ${account.provider}/${account.identity} busy for ${timeoutMs} ms`, name, true);
     /** Ends a connection that may still hold the lock (or hang): it is never returned to the pool. */
     const endConn = async (dead: typeof conn): Promise<void> => {

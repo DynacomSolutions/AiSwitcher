@@ -3,13 +3,14 @@ import { parseToken, verifyToken } from "./tokens.ts";
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { DEAD_REFRESH_CODES, DEFAULT_ACCESS_TOKEN_LIFETIME_S, effectiveGrantPaths, GATEWAY_RENEW_FRACTION, KIMI_RENEW_BELOW_S, OAuthRefreshError, type IdentityGrantRefresh, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
-import { SQL } from "bun";
 import { readFile } from "node:fs/promises";
 import { ClusterBrowserHub, RELAY_PATH } from "./browser/cluster.ts";
 import { HomeMirror } from "./home-mirror.ts";
 import { importHome, STORE_META_PATH } from "./home-import.ts";
 import { PgHomeStore } from "./home-store.ts";
 import { PgLeader } from "./pg-leader.ts";
+import { getGatewayListener, releaseGatewayListener } from "./pg-listen.ts";
+import { getGatewaySql, releaseGatewaySql } from "./pg-pool.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { PgRefreshBackend } from "./pg-refresh-backend.ts";
 import { bounded, guardRefresh, JOURNAL_RETENTION_MS, RefreshGuardRetryable, RefreshRefused, type RefreshGuardBackend } from "./refresh-guard.ts";
@@ -487,7 +488,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const backoff = hooks.warmBackoff ?? { initialMs: 1_000, maxMs: 30_000 };
   const exit = hooks.exit ?? ((code: number) => process.exit(code));
 
-  const inner = (hooks.openStore ?? ((url: string) => new PgGatewayStore(url)))(opts.databaseUrl);
+  // One pool and one LISTEN connection for the whole process. Components borrow them and never close them.
+  const sharedSql = getGatewaySql(opts.databaseUrl);
+  const sharedListener = getGatewayListener(opts.databaseUrl);
+  const inner = (hooks.openStore ?? ((url: string) => new PgGatewayStore(url, { sql: sharedSql, listener: sharedListener })))(opts.databaseUrl);
   const store = new CachedGatewayStore(inner);
   const publicHosts = hooks.publicHosts ?? publicHostsFromEnv();
   const ledger = new LedgerBuffer(store, hooks.ledger ?? { max: 50_000, flushMs: 2_000 });
@@ -497,10 +501,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   if (publicHosts.length === 0) console.warn("gateway: AIS_GATEWAY_PUBLIC_HOSTS is empty, so /metrics, /healthz, /readyz and /browser/pair answer on every host, including a public tunnel; set it to the public host names");
   const alerter = createAlerter(hooks.notify ?? stderrNotifier);
   const failedTokens = new Map<string, string>();
-  const refreshBackend = hooks.refreshBackend ?? new PgRefreshBackend(opts.databaseUrl);
+  const refreshBackend = hooks.refreshBackend ?? new PgRefreshBackend(opts.databaseUrl, undefined, sharedSql);
   // PostgreSQL credential store: this replica's HOME follows the store; refreshes pull and push under the account lock.
   const pgCreds = opts.credentialStore;
-  const homeStore = pgCreds ? new PgHomeStore(opts.databaseUrl, pgCreds.key) : undefined;
+  const homeStore = pgCreds ? new PgHomeStore(opts.databaseUrl, pgCreds.key, undefined, undefined, { sql: sharedSql, listener: sharedListener }) : undefined;
   const mirror = homeStore ? new HomeMirror(homeStore, { ...(hooks.home ? { home: hooks.home } : {}), fileStore: pgCreds?.fileStore === true }) : undefined;
   const leader = pgCreds ? new PgLeader(opts.databaseUrl, hooks.leaderTryMs ?? 10_000) : undefined;
   if (mirror) setLocalWriteHook(async (abs, kind, account) => mirror.push([abs], account, kind));
@@ -638,7 +642,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const canonical = hooks.canonical ?? canonicalResolver();
   // No startup parameters here: the database pooler refuses them ("unsupported startup parameter: statement_timeout").
   // The usage source bounds every shared call itself.
-  const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : new SQL(opts.databaseUrl, { max: 2 });
+  const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : sharedSql;
   const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
   const usage = createUsageSource({
     fetchUsage: hooks.fetchUsage ?? withOpencodeUsage(creds, fetchPoolUsage),
@@ -663,7 +667,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     metrics });
   // Several replicas: a call for a browser whose socket another replica holds is forwarded there (browser/cluster.ts).
   const relay = opts.replicaUrl
-    ? new ClusterBrowserHub({ hub, databaseUrl: opts.databaseUrl, replicaId: `${process.env.HOSTNAME ?? "gateway"}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`, replicaUrl: opts.replicaUrl, adminToken: opts.adminToken })
+    ? new ClusterBrowserHub({ hub, databaseUrl: opts.databaseUrl, replicaId: `${process.env.HOSTNAME ?? "gateway"}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`, replicaUrl: opts.replicaUrl, adminToken: opts.adminToken, sql: sharedSql, listener: sharedListener })
     : undefined;
   const browser = relay ?? hub;
   metrics.browserGauges = { connected: () => hub.connected().length, sessions: () => hub.activeSessions() };
@@ -733,7 +737,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   let dbOkAt = 0;
   let dbDownLogged = false;
   const pingMs = hooks.pingMs ?? 5_000;
-  const pingSql = hooks.ping || hooks.openStore ? undefined : new SQL(opts.databaseUrl, { max: 1 });
+  const pingSql = hooks.ping || hooks.openStore ? undefined : sharedSql;
   const ping = hooks.ping ?? (pingSql ? async () => void (await pingSql`SELECT 1`) : async () => undefined);
   const checkDb = async (): Promise<void> => {
     try {
@@ -1147,11 +1151,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       if (mirror) setLocalWriteHook(undefined);
       // Last pushes (a heartbeat written during the pass) need the store open until here.
       await homeStore?.close().catch(() => undefined);
-      await pingSql?.close().catch(() => undefined);
       if (readingsSql) await bounded(usage.idle(), 2_000, "usage reads").catch(() => undefined);
-      await readingsSql?.close().catch(() => undefined);
       await inner.close?.();
       await refreshBackend.close?.();
+      // The shared pool and listener close once, after every component that used them.
+      await releaseGatewayListener(opts.databaseUrl);
+      await releaseGatewaySql(opts.databaseUrl);
     })();
     return stopping;
   };
