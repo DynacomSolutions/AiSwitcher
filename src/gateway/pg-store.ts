@@ -5,6 +5,7 @@ import { errorTag } from "./ledger-buffer.ts";
 import { AppRevokedError, type GatewayStore } from "./store.ts";
 import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
+import { planRollupRange, rollupAggregateSql, rollupSource } from "./usage-rollup.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
 import refreshJournal0003 from "./migrations/0003_refresh_journal.sql" with { type: "text" };
@@ -13,6 +14,9 @@ import homeFiles0005 from "./migrations/0005_home_files.sql" with { type: "text"
 import browserPresence0006 from "./migrations/0006_browser_presence.sql" with { type: "text" };
 import refreshJournalCode0007 from "./migrations/0007_refresh_journal_code.sql" with { type: "text" };
 import usageHistory0008 from "./migrations/0008_usage_history.sql" with { type: "text" };
+import usageRollup0009 from "./migrations/0009_usage_rollup.sql" with { type: "text" };
+
+const USAGE_ROLLUP_VERSION = "0009_usage_rollup";
 
 const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0001_init", sql: init0001 },
@@ -23,6 +27,7 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0006_browser_presence", sql: browserPresence0006 },
   { version: "0007_refresh_journal_code", sql: refreshJournalCode0007 },
   { version: "0008_usage_history", sql: usageHistory0008 },
+  { version: USAGE_ROLLUP_VERSION, sql: usageRollup0009 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
@@ -65,7 +70,11 @@ async function migrateOnce(url: string, lockTimeoutMs: number): Promise<void> {
       for (const m of MIGRATIONS) {
         if (done.has(m.version)) continue;
         await tx.unsafe(`SET LOCAL lock_timeout = ${Math.trunc(lockTimeoutMs)}`);
-        await tx.unsafe(m.sql);
+        if (m.version === USAGE_ROLLUP_VERSION) {
+          if (!(await tryUsageRollup(tx, m.sql))) continue;
+        } else {
+          await tx.unsafe(m.sql);
+        }
         if (m.version === "0001_init") await tryHypertable(tx);
         await tx`INSERT INTO schema_migrations (version) VALUES (${m.version})`;
       }
@@ -86,6 +95,34 @@ async function tryHypertable(tx: TransactionSQL): Promise<void> {
     console.warn(
       `gateway: TimescaleDB unavailable, gateway_usage stays a plain table (${errorTag(err)})`,
     );
+  }
+}
+
+/**
+ * Creates the usage rollup when gateway_usage is a hypertable. Without TimescaleDB it warns once and returns true,
+ * so the version is recorded and the store reads the raw ledger. Returns false after a failed create:
+ * the version stays pending and the next start tries again. A lock timeout is rethrown for the caller's retry.
+ */
+async function tryUsageRollup(tx: TransactionSQL, ddl: string): Promise<boolean> {
+  try {
+    const view = await tx`SELECT to_regclass('timescaledb_information.hypertables') IS NOT NULL AS present`;
+    let hypertable = false;
+    if (view[0]?.present === true) {
+      const rows = await tx`SELECT 1 AS x FROM timescaledb_information.hypertables WHERE hypertable_schema = current_schema() AND hypertable_name = 'gateway_usage'`;
+      hypertable = rows.length > 0;
+    }
+    if (!hypertable) {
+      console.warn("gateway: gateway_usage is not a hypertable, so the usage rollup is skipped and usage reads scan the raw ledger");
+      return true;
+    }
+    await tx.savepoint(async (sp) => {
+      await sp.unsafe(ddl);
+    });
+    return true;
+  } catch (err) {
+    if ((err as { errno?: unknown } | null)?.errno === "55P03") throw err;
+    console.warn(`gateway: usage rollup not created, usage reads scan the raw ledger and the next start retries (${errorTag(err)})`);
+    return false;
   }
 }
 
@@ -131,11 +168,52 @@ function toBinding(r: Row): BrowserBinding {
 /** NOTIFY channel carrying the name of an app that changed, so other replicas re-read it at once. */
 const APPS_CHANNEL = "gateway_apps_changed";
 
+export interface PgGatewayStoreOptions {
+  /** "auto" (default) reads wide usage ranges from the gateway_usage_15m rollup when it exists. "off" always reads the raw ledger. */
+  usageRollup?: "auto" | "off";
+}
+
+/** How long a missing or failing rollup is left alone before the next check. */
+const ROLLUP_RECHECK_MS = 60_000;
+
 export class PgGatewayStore implements GatewayStore {
   private readonly sql: SQL;
+  private readonly rollupMode: "auto" | "off";
+  private rollupReady = false;
+  private rollupRetryAt = 0;
 
-  constructor(url: string) {
+  constructor(url: string, opts: PgGatewayStoreOptions = {}) {
     this.sql = new SQL(url);
+    this.rollupMode = opts.usageRollup ?? "auto";
+  }
+
+  /** True when usage reads use the rollup: the mode is "auto" and gateway_usage_15m exists. A success is cached. */
+  async usesUsageRollup(): Promise<boolean> {
+    if (this.rollupMode === "off") return false;
+    if (this.rollupReady) return true;
+    if (Date.now() < this.rollupRetryAt) return false;
+    try {
+      const rows = await this.sql`SELECT to_regclass('gateway_usage_15m') IS NOT NULL AS present`;
+      this.rollupReady = rows[0]?.present === true;
+    } catch {
+      this.rollupReady = false;
+    }
+    if (!this.rollupReady) this.rollupRetryAt = Date.now() + ROLLUP_RECHECK_MS;
+    return this.rollupReady;
+  }
+
+  /** Runs a rollup read. Returns undefined when the rollup cannot serve the range, so the caller reads the raw ledger. */
+  private async viaRollup<T>(since: Date, until: Date | undefined, read: (plan: NonNullable<ReturnType<typeof planRollupRange>>) => Promise<T>): Promise<T | undefined> {
+    const plan = planRollupRange(since, until);
+    if (!plan || !(await this.usesUsageRollup())) return undefined;
+    try {
+      return await read(plan);
+    } catch (err) {
+      console.warn(`gateway: usage rollup read failed, reading the raw ledger (${errorTag(err)})`);
+      this.rollupReady = false;
+      this.rollupRetryAt = Date.now() + ROLLUP_RECHECK_MS;
+      return undefined;
+    }
   }
 
   async close(): Promise<void> {
@@ -270,6 +348,57 @@ export class PgGatewayStore implements GatewayStore {
   }
 
   async usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {
+    const viaRollup = await this.viaRollup(since, until, async (plan) => {
+      const q = rollupAggregateSql(rollupSource(plan), "provider, identity, app, model", "provider, identity, app, model");
+      // One row per model, in (provider, identity, app) order, so each (provider, identity, app) group is contiguous.
+      const rows = (await this.sql.unsafe(q.text, q.params)) as Record<string, unknown>[];
+      const out = new Map<string, IdentityUsageRow>();
+      for (const r of rows) {
+        const k = `${String(r.provider)}\u0000${String(r.identity)}\u0000${String(r.app)}`;
+        let row = out.get(k);
+        if (!row) {
+          row = {
+            provider: String(r.provider),
+            identity: String(r.identity),
+            app: String(r.app),
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            estCostUsd: 0,
+            unpricedRequests: 0,
+            requests: 0,
+          };
+          out.set(k, row);
+        }
+        row.inputTokens += Number(r.input_tokens);
+        row.outputTokens += Number(r.output_tokens);
+        row.cacheReadTokens += Number(r.cache_read_tokens);
+        row.cacheWriteTokens += Number(r.cache_write_tokens);
+        row.requests += Number(r.requests);
+        row.estCostUsd += Number(r.est_cost_usd);
+        if (Number(r.n_requests) > 0) {
+          const priced = priceNullCostGroup({
+            provider: String(r.provider) as GatewayProvider,
+            identity: String(r.identity),
+            app: String(r.app),
+            model: r.model === null || r.model === undefined ? null : String(r.model),
+            inputTokens: Number(r.n_input),
+            outputTokens: Number(r.n_output),
+            cacheReadTokens: Number(r.n_cache_read),
+            cacheWriteTokens: Number(r.n_cache_write),
+            requests: Number(r.n_requests),
+          });
+          row.estCostUsd += priced.cost;
+          row.unpricedRequests += priced.unpriced;
+        }
+      }
+      return [...out.values()];
+    });
+    return viaRollup ?? this.usageByIdentityRaw(since, until);
+  }
+
+  private async usageByIdentityRaw(since: Date, until?: Date): Promise<IdentityUsageRow[]> {
     const to = until ? until.toISOString() : null;
     const rows = await this.sql`
       SELECT provider, identity, app,
@@ -326,6 +455,44 @@ export class PgGatewayStore implements GatewayStore {
   }
 
   async usageByModel(since: Date, until?: Date): Promise<ModelUsageRow[]> {
+    const viaRollup = await this.viaRollup(since, until, async (plan) => {
+      const q = rollupAggregateSql(rollupSource(plan), "provider, identity, app, model", "provider, identity, app, model");
+      const rows = (await this.sql.unsafe(q.text, q.params)) as Record<string, unknown>[];
+      return rows.map((r): ModelUsageRow => {
+        const priced = Number(r.n_requests) > 0
+          ? priceNullCostGroup({
+              provider: String(r.provider) as GatewayProvider,
+              identity: String(r.identity),
+              app: String(r.app),
+              model: r.model === null || r.model === undefined ? null : String(r.model),
+              inputTokens: Number(r.n_input),
+              outputTokens: Number(r.n_output),
+              cacheReadTokens: Number(r.n_cache_read),
+              cacheWriteTokens: Number(r.n_cache_write),
+              requests: Number(r.n_requests),
+            })
+          : { cost: 0, unpriced: 0 };
+        return {
+          provider: String(r.provider),
+          identity: String(r.identity),
+          app: String(r.app),
+          model: r.model === null || r.model === undefined ? null : String(r.model),
+          inputTokens: Number(r.input_tokens),
+          outputTokens: Number(r.output_tokens),
+          cacheReadTokens: Number(r.cache_read_tokens),
+          cacheWriteTokens: Number(r.cache_write_tokens),
+          estCostUsd: Number(r.est_cost_usd) + priced.cost,
+          unpricedRequests: priced.unpriced,
+          requests: Number(r.requests),
+          firstTs: iso(r.first_ts),
+          lastTs: iso(r.last_ts),
+        };
+      });
+    });
+    return viaRollup ?? this.usageByModelRaw(since, until);
+  }
+
+  private async usageByModelRaw(since: Date, until?: Date): Promise<ModelUsageRow[]> {
     const to = until ? until.toISOString() : null;
     const rows = await this.sql`
       SELECT provider, identity, app, model,
@@ -444,24 +611,37 @@ export class PgGatewayStore implements GatewayStore {
   }
 
   async usageByModelDaily(since: Date, until: Date | undefined, tz: string): Promise<ModelDailyUsageRow[]> {
-    const to = until ? until.toISOString() : null;
-    // One pass over the ts range: rows with a cost sum it, rows without one are priced from their tokens below.
-    const rows = await this.sql`
-      SELECT to_char(ts AT TIME ZONE ${tz}, 'YYYY-MM-DD') AS day, provider, identity, model,
-        COALESCE(SUM(input_tokens), 0) AS input_tokens,
-        COALESCE(SUM(output_tokens), 0) AS output_tokens,
-        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
-        COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd,
-        COUNT(*) AS requests,
-        COALESCE(SUM(input_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_input,
-        COALESCE(SUM(output_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_output,
-        COALESCE(SUM(cache_read_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_cache_read,
-        COALESCE(SUM(cache_write_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_cache_write,
-        COUNT(*) FILTER (WHERE est_cost_usd IS NULL) AS n_requests
-      FROM gateway_usage WHERE ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
-      GROUP BY 1, provider, identity, model ORDER BY 1, provider, identity, model`;
-    return rows.map((r: Record<string, unknown>) => {
+    const viaRollup = await this.viaRollup(since, until, async (plan) => {
+      // A 15-minute bucket sits in one local day only when the zone's offset is a whole number of 15 minutes.
+      if (!(await this.zoneFitsBuckets(tz, since, until))) return undefined;
+      const q = rollupAggregateSql(rollupSource(plan, tz), "day, provider, identity, model", "day, provider, identity, model");
+      return this.dailyRows((await this.sql.unsafe(q.text, q.params)) as Record<string, unknown>[]);
+    });
+    return viaRollup ?? this.usageByModelDailyRaw(since, until, tz);
+  }
+
+  /**
+   * True when every UTC offset of `tz` across the stored data inside [since, until) is a multiple of 900 s.
+   * Samples one instant a day between the first and the last stored row, so the series stays short.
+   * An unknown zone answers false: the raw query then raises its usual error.
+   */
+  private async zoneFitsBuckets(tz: string, since: Date, until: Date | undefined): Promise<boolean> {
+    try {
+      const rows = await this.sql`
+        WITH bounds AS (
+          SELECT greatest(${since.toISOString()}::timestamptz, (SELECT min(ts) FROM gateway_usage)) AS lo,
+                 least(coalesce(${until ? until.toISOString() : null}::timestamptz, 'infinity'::timestamptz), (SELECT max(ts) FROM gateway_usage)) AS hi
+        )
+        SELECT coalesce(bool_and(mod(EXTRACT(epoch FROM (g AT TIME ZONE ${tz}::text) - (g AT TIME ZONE 'UTC'))::int, 900) = 0), true) AS ok
+        FROM bounds, generate_series(bounds.lo, bounds.hi + interval '1 day', interval '1 day') g`;
+      return rows[0]?.ok === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private dailyRows(rows: Record<string, unknown>[]): ModelDailyUsageRow[] {
+    return rows.map((r) => {
       const nullRequests = Number(r.n_requests);
       const priced = nullRequests > 0
         ? priceNullCostGroup({
@@ -490,6 +670,27 @@ export class PgGatewayStore implements GatewayStore {
         requests: Number(r.requests),
       };
     });
+  }
+
+  private async usageByModelDailyRaw(since: Date, until: Date | undefined, tz: string): Promise<ModelDailyUsageRow[]> {
+    const to = until ? until.toISOString() : null;
+    // One pass over the ts range: rows with a cost sum it, rows without one are priced from their tokens below.
+    const rows = await this.sql`
+      SELECT to_char(ts AT TIME ZONE ${tz}, 'YYYY-MM-DD') AS day, provider, identity, model,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd,
+        COUNT(*) AS requests,
+        COALESCE(SUM(input_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_input,
+        COALESCE(SUM(output_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_output,
+        COALESCE(SUM(cache_read_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_cache_read,
+        COALESCE(SUM(cache_write_tokens) FILTER (WHERE est_cost_usd IS NULL), 0) AS n_cache_write,
+        COUNT(*) FILTER (WHERE est_cost_usd IS NULL) AS n_requests
+      FROM gateway_usage WHERE ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+      GROUP BY 1, provider, identity, model ORDER BY 1, provider, identity, model`;
+    return this.dailyRows(rows);
   }
 
   async putBrowserBinding(b: BrowserBinding): Promise<void> {
