@@ -83,3 +83,12 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 12
   VAPID; a test pins the RFC 8291 Appendix A vector), no web-push dependency. The daemon checks hourly through the shared
   limits scan, only while a subscription exists, and records each grant's sent stage (7d, 3d, 24h) only after a device
   accepted it, so a push service outage retries. Pool rows are skipped. Contract in `docs/API.md` (Push notifications).
+- The widgets listener (`AIS_WIDGETS_PORT`, `src/server/widgets.ts`) has no auth on purpose. It serves only `GET` and `HEAD`
+  for the widget panel routes. Every panel is a masked read-only summary. No public route points at the port. In the
+  cluster, any pod can reach `podIP:port`. The main console port is already reachable the same way. A Host check stops DNS
+  rebinding: it accepts only an IP literal, a loopback name or an `AIS_WEB_ALLOWED_HOSTS` vhost, and answers 403 for any
+  other Host. Kubernetes RBAC on `services/proxy` guards Headlamp access through the API server. The listener sends no CORS
+  headers and is off unless the variable is set. The main-listener routes keep the full console guard. Both listeners share
+  one `WidgetService` cache, built in `serve.ts`. A failed build is remembered for up to 60 seconds, and the last good model
+  is served while a refresh fails. Panel `link` values are empty unless `AIS_WIDGETS_LINK_BASE` is set. Headlamp cannot resolve
+  console-relative paths. Contract: docs/API.md (Widget panels).

@@ -108,7 +108,8 @@ export class TabManager {
     this.lastSeen.set(ref.id, this.now());
     const before = this.sessions.get(ref.id)?.label;
     this.session(ref);
-    const renamed = before !== undefined && before !== ref.label;
+    // An empty label (a caller that does not know the name) never renames the group.
+    const renamed = before !== undefined && ref.label !== "" && before !== ref.label;
     if (renamed) void this.retitle(ref).catch(() => {});
     return renamed;
   }
@@ -220,13 +221,13 @@ export class TabManager {
       s = { groupId: -1, tabIds: new Set(), adopted: new Set(), identity: ref.identity, label: ref.label };
       this.sessions.set(ref.id, s);
     }
-    s.label = ref.label;
+    if (ref.label !== "") s.label = ref.label;
     return s;
   }
 
   private async newGroup(ref: SessionRef, s: SessionTabs, tabId: number): Promise<void> {
     s.groupId = await this.api.tabs.group([tabId]);
-    await this.api.tabGroups.update(s.groupId, { title: ref.label, color: colorForIdentity(ref.identity) });
+    await this.api.tabGroups.update(s.groupId, { title: ref.label || s.label, color: colorForIdentity(ref.identity) });
   }
 
   /** One queue per session id: group creation for a session is strictly serial, so concurrent first calls cannot make two groups. */

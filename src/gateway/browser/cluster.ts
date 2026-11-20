@@ -189,6 +189,18 @@ export class ClusterBrowserHub {
     this.hub.abort(id);
   }
 
+  private cancelHandler?: (key: string) => void;
+
+  /** Registers the handler for MCP call cancels that other replicas publish. */
+  onCancel(handler: (key: string) => void): void {
+    this.cancelHandler = handler;
+  }
+
+  /** Tells every other replica to abort the in-flight MCP call with this key. The key is a hash: it carries no identity or session text. */
+  broadcastCancel(key: string): void {
+    void this.notify({ t: "cancel", key });
+  }
+
   /** Revokes locally and tells every replica to drop its socket for the binding. */
   revoke(binding: string): void {
     this.hub.revoke(binding);
@@ -338,7 +350,7 @@ export class ClusterBrowserHub {
     console.error(`browser cluster: database unavailable, serving local browsers only${typeof code === "string" ? ` (${code})` : ""}`);
   }
 
-  private async notify(payload: { t: "presence" } | { t: "revoke"; binding: string }): Promise<void> {
+  private async notify(payload: { t: "presence" } | { t: "revoke"; binding: string } | { t: "cancel"; key: string }): Promise<void> {
     const sql = this.sql;
     if (!sql) return;
     try {
@@ -361,7 +373,7 @@ export class ClusterBrowserHub {
   }
 
   private onNotify(payload: string): void {
-    let msg: { t?: unknown; binding?: unknown };
+    let msg: { t?: unknown; binding?: unknown; key?: unknown };
     try {
       msg = JSON.parse(payload);
     } catch {
@@ -370,6 +382,7 @@ export class ClusterBrowserHub {
     if (msg.t === "revoke" && typeof msg.binding === "string") {
       this.hub.closeBinding(msg.binding, 4401, "binding revoked");
       this.remote.delete(msg.binding);
-    } else if (msg.t === "presence") void this.sync(false);
+    } else if (msg.t === "cancel" && typeof msg.key === "string") this.cancelHandler?.(msg.key);
+    else if (msg.t === "presence") void this.sync(false);
   }
 }
