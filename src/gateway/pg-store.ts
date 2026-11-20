@@ -16,6 +16,7 @@ import refreshJournalCode0007 from "./migrations/0007_refresh_journal_code.sql" 
 import usageHistory0008 from "./migrations/0008_usage_history.sql" with { type: "text" };
 import usageRollup0009 from "./migrations/0009_usage_rollup.sql" with { type: "text" };
 import usageReadings0010 from "./migrations/0010_usage_readings.sql" with { type: "text" };
+import { pgPoolOptions } from "./pg-pool.ts";
 
 const USAGE_ROLLUP_VERSION = "0009_usage_rollup";
 
@@ -187,7 +188,7 @@ export class PgGatewayStore implements GatewayStore {
   private rollupRetryAt = 0;
 
   constructor(url: string, opts: PgGatewayStoreOptions = {}) {
-    this.sql = new SQL(url);
+    this.sql = new SQL(url, pgPoolOptions());
     this.rollupMode = opts.usageRollup ?? "auto";
   }
 

@@ -1,12 +1,17 @@
 import { SQL } from "bun";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
+import { pgPoolOptions } from "./pg-pool.ts";
 import { bounded, BACKEND_CALL_TIMEOUT_MS, EVIDENCE_RETENTION_FACTOR, JOURNAL_KEEP_PER_ACCOUNT, type JournalEntry, type JournalOutcome, type RefreshAccount, type RefreshGuardBackend, type RefreshLockHandle, type RefreshSummaryRow } from "./refresh-guard.ts";
 
 const POLL_MS = 100;
 /** Pause before the next attempt on a fresh connection after a slow or failed lock call. */
 const RETRY_PAUSE_MS = 250;
-/** Connections in the backend's own pool. */
+/**
+ * Connections in the backend's own pool. The size stays at 10 so that up to 8 refresh locks can be held at once.
+ * The idle timeout closes connections that no lock holder uses, so idle replicas do not pin server connections.
+ */
 const POOL_MAX = 10;
+const POOL = { ...pgPoolOptions(), max: POOL_MAX };
 /** Concurrent lock holders: each pins one reserved connection, so two stay free for retention and for any queries that need the pool. */
 const MAX_HOLDERS = POOL_MAX - 2;
 
@@ -41,7 +46,7 @@ export class PgRefreshBackend implements RefreshGuardBackend {
 
   /** `sql` replaces the driver pool (tests only). */
   constructor(url: string, private readonly callMs = BACKEND_CALL_TIMEOUT_MS, sql?: SQL) {
-    this.sql = sql ?? new SQL(url, { max: POOL_MAX });
+    this.sql = sql ?? new SQL(url, POOL);
   }
 
   async close(): Promise<void> {
