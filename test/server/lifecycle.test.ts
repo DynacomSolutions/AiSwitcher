@@ -281,7 +281,9 @@ describe("ServerLifecycle", () => {
         const probe = connect(port, "127.0.0.1");
         let probeResponse = "";
         probe.on("error", (error: NodeJS.ErrnoException) => {
-          if (error.code === "ECONNREFUSED") resolveProbe("REFUSED");
+          // A listener that closes while the probe sits in its accept queue resets the probe (ECONNRESET, or EPIPE on the
+          // request write). That is a refusal too: the stopping server answered nothing. Which one happens depends on timing.
+          if (error.code === "ECONNREFUSED" || error.code === "ECONNRESET" || error.code === "EPIPE") resolveProbe("REFUSED");
           else rejectProbe(error);
         });
         probe.on("connect", () => probe.write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"));
