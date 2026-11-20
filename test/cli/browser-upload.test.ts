@@ -50,6 +50,15 @@ test("posts one upload_file call with file content and the session id", async ()
   expect(seen[0]!.body.args.paths).toBeUndefined();
 });
 
+test("--label is sent as the session label, and without it the label is empty", async () => {
+  const seen: Seen[] = [];
+  const { d } = deps(seen);
+  await runBrowserUpload(["--session", "s", "--label", "My chat", "--tab", "1", "--ref", "r", join(root, "a.txt")], d);
+  await runBrowserUpload(["--session", "s", "--tab", "1", "--ref", "r", join(root, "a.txt")], d);
+  expect(seen[0]!.body.session.label).toBe("My chat");
+  expect(seen[1]!.body.session.label).toBe("");
+});
+
 test("coordinate form, and a tool failure returns false", async () => {
   const seen: Seen[] = [];
   const { d, out } = deps(seen, { id: "1", ok: false, error: "forbidden_tab", message: "not yours" });

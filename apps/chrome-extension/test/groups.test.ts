@@ -97,6 +97,17 @@ describe("user-granted tab groups", () => {
     expect(t.api.groups.get(t.userGroup)?.color).toBe("orange");
   });
 
+  test("an empty label never renames the group", async () => {
+    const api = new FakeChrome();
+    const tabs = new TabManager(api);
+    const made = await tabs.create(ref(), "https://a.example.com/");
+    const gid = api.tabList.get(made.id)!.groupId;
+    expect(tabs.touch({ id: "s1", identity: "alice", label: "" })).toBe(false);
+    await new Promise(r => setTimeout(r, 10));
+    expect(api.groups.get(gid)?.title).toBe("refactor login");
+    expect(tabs.touch(ref("s1", "new name"))).toBe(true);
+  });
+
   test("without a grant the session cannot touch the user's group", async () => {
     const t = await setup();
     await t.call("tabs_context", {});

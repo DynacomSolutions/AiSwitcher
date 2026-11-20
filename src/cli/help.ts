@@ -145,7 +145,7 @@ export const HELP: Record<string, HelpNode> = {
         "For each enabled T3 Code claude/codex instance (from <T3 home>/userdata/settings.json), run the launch wiring steps and print its folder, mapped identity or pool, and wired or NOT wired with the reason. --check exits 1 when any instance is not wired; never prints tokens",
       ),
       upload: sub(
-        "ais browser upload --session <id> --tab <tabId> (--ref <ref> | --coordinate <x,y>) [--browser <name>] <paths...>",
+        "ais browser upload --session <id> [--label <name>] --tab <tabId> (--ref <ref> | --coordinate <x,y>) [--browser <name>] <paths...>",
         "Upload files from this machine to a page's file input through the gateway. The gateway MCP server cannot read your files, so its upload_file tool error names this command with the session id. Limits: 10 files, 10 MiB in total",
       ),
       mcp: sub("ais browser mcp", "Stdio MCP server exposing the browser tools; started by Claude and Codex launches that have an agent token when the gateway address is not known (not for manual use). With a known gateway address, launches use its shared HTTP endpoint /browser/mcp instead"),

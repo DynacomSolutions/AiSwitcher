@@ -12,7 +12,7 @@ import { CliUsageError } from "../errors.ts";
 import { readSecretsKey } from "../gateway/secrets-file.ts";
 
 const TOKEN_FILE = "ais-browser-token";
-const VALUED = ["session", "tab", "ref", "coordinate", "browser", "tool", "identity", "pool", "gateway"] as const;
+const VALUED = ["session", "tab", "ref", "coordinate", "label", "browser", "tool", "identity", "pool", "gateway"] as const;
 /** The gateway allows an upload 120 s to reach the extension. */
 const UPLOAD_TIMEOUT_MS = 130_000;
 
@@ -107,7 +107,8 @@ export async function runBrowserUpload(argv: string[], overrides: Partial<Upload
     signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
     body: JSON.stringify({
       ...(browser ? { browser } : {}),
-      session: { id: session, identity, label: "" },
+      // The label keeps the tab group name. Without it the label is empty and the extension keeps the current name.
+      session: { id: session, identity, label: (stringFlag(flags, "label") ?? "").slice(0, 80) },
       tool: "upload_file",
       args: { tabId, ...(ref !== undefined ? { ref } : { coordinate }), files },
     }),
