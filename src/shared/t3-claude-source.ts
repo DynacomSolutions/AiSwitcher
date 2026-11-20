@@ -5,7 +5,7 @@ import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
 import { expandPath } from "../identities/match.ts";
 import { CLAUDE_CONFIG } from "../identities/tool-configs.ts";
-import { loadIdentitiesFile } from "../identities/store.ts";
+import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import { t3Paths } from "../identities/t3-anthropic-proxy.ts";
 import type { IdentitiesFile } from "../identities/types.ts";
 import { identityForConfigDir } from "./browser-wiring.ts";
@@ -54,7 +54,14 @@ export function t3ClaudeSource(file: IdentitiesFile, folder: string, t3Home: str
     const pools = file.identities.filter((i) => !isRetired(i) && isSwapPool(i));
     if (pools.length !== 1) return undefined;
     const pool = pools[0]!;
-    return { name: pool.name, dir: expandPath(pool.configDir), noThirdParty: isNoThirdParty(pool, restricted), modelHome: true };
+    // The home is restricted when the source OR the home's own identity is on the list. The own identity is the part after
+    // `claude-kimi-` or `claude-zai-` (it may not be in the registry), or the identity its `projects` link points to.
+    const ownName = basename(folder).replace(/^(?:t3-)?claude-(?:kimi|zai)-?/, "").toLowerCase();
+    const list = restricted.map((n) => n.toLowerCase());
+    const named = ownName ? findIdentityByNameOrAlias(file.identities.filter((i) => !isRetired(i)), ownName) : undefined;
+    const linked = identityForConfigDir(file, folder, undefined, join(t3Home, "gateway"));
+    const own = (ownName !== "" && list.includes(ownName)) || [named, linked].some((i) => i !== undefined && isNoThirdParty(i, restricted));
+    return { name: pool.name, dir: expandPath(pool.configDir), noThirdParty: isNoThirdParty(pool, restricted) || own, modelHome: true };
   }
   const identity = identityForConfigDir(file, folder, undefined, join(t3Home, "gateway"));
   return identity ? { name: identity.name, dir: expandPath(identity.configDir), noThirdParty: isNoThirdParty(identity, restricted) } : undefined;
