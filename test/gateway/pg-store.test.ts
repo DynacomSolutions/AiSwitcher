@@ -111,7 +111,7 @@ if (!url && process.env.CI && !optOut) {
       const sql = new SQL(url);
       try {
         const rows = await sql`SELECT version FROM schema_migrations`;
-        expect(rows.length).toBe(9);
+        expect(rows.length).toBe(10);
         const t = await sql`SELECT to_regclass('gateway_usage') AS r`;
         expect(t[0].r).toBe("gateway_usage");
         const ext = await sql`SELECT 1 AS x FROM pg_extension WHERE extname = 'timescaledb'`;
@@ -335,7 +335,9 @@ if (!url && process.env.CI && !optOut) {
         await r.save("claude", "id1", u(20), 0);
         expect((await r.load("claude", "id1"))?.reading.maxUtilization).toBe(20);
         // A row dated in the future is replaced by any later save.
-        await r.save("claude", "id2", u(1), -60_000);
+        // save() never dates a row ahead, so set one directly, as a replica with a fast clock once could.
+        await r.save("claude", "id2", u(1), 0);
+        await sql`UPDATE usage_readings SET read_at = now() + interval '1 minute' WHERE provider = 'claude' AND identity = 'id2'`;
         expect((await r.load("claude", "id2"))?.ageMs).toBeLessThan(0);
         await r.save("claude", "id2", u(2), 0);
         expect((await r.load("claude", "id2"))?.reading.maxUtilization).toBe(2);
