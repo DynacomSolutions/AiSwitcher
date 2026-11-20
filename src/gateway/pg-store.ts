@@ -16,6 +16,7 @@ import refreshJournalCode0007 from "./migrations/0007_refresh_journal_code.sql" 
 import usageHistory0008 from "./migrations/0008_usage_history.sql" with { type: "text" };
 import usageRollup0009 from "./migrations/0009_usage_rollup.sql" with { type: "text" };
 import usageReadings0010 from "./migrations/0010_usage_readings.sql" with { type: "text" };
+import type { PgListener } from "./pg-listen.ts";
 import { pgPoolOptions } from "./pg-pool.ts";
 
 const USAGE_ROLLUP_VERSION = "0009_usage_rollup";
@@ -176,6 +177,10 @@ const APPS_CHANNEL = "gateway_apps_changed";
 export interface PgGatewayStoreOptions {
   /** "auto" (default) reads wide usage ranges from the gateway_usage_15m rollup when it exists. "off" always reads the raw ledger. */
   usageRollup?: "auto" | "off";
+  /** The process-wide pool. The store then never closes it. Without it, the store opens and owns its own pool. */
+  sql?: SQL;
+  /** The process-wide LISTEN connection. Without it, app-change notices use the store's own pool. */
+  listener?: PgListener;
 }
 
 /** How long a missing or failing rollup is left alone before the next check. */
@@ -183,12 +188,16 @@ const ROLLUP_RECHECK_MS = 60_000;
 
 export class PgGatewayStore implements GatewayStore {
   private readonly sql: SQL;
+  private readonly ownsSql: boolean;
+  private readonly listener: PgListener | undefined;
   private readonly rollupMode: "auto" | "off";
   private rollupReady = false;
   private rollupRetryAt = 0;
 
   constructor(url: string, opts: PgGatewayStoreOptions = {}) {
-    this.sql = new SQL(url, pgPoolOptions());
+    this.ownsSql = !opts.sql;
+    this.sql = opts.sql ?? new SQL(url, pgPoolOptions());
+    this.listener = opts.listener;
     this.rollupMode = opts.usageRollup ?? "auto";
   }
 
@@ -221,8 +230,9 @@ export class PgGatewayStore implements GatewayStore {
     }
   }
 
+  /** Closes the store's own pool. A shared pool stays open. */
   async close(): Promise<void> {
-    await this.sql.close();
+    if (this.ownsSql) await this.sql.close();
   }
 
   async getApp(name: string): Promise<GatewayApp | undefined> {
@@ -242,6 +252,7 @@ export class PgGatewayStore implements GatewayStore {
 
   /** Calls `onApp` for every app-change NOTIFY. Resolves once listening; returns an unlisten function. */
   async listenAppChanges(onApp: (name: string) => void): Promise<() => Promise<void>> {
+    if (this.listener) return this.listener.listen(APPS_CHANNEL, onApp);
     // biome-ignore lint/suspicious/noExplicitAny: Bun's SQL listen is not in the published types yet
     const handle: any = await (this.sql as any).listen(APPS_CHANNEL, (payload: string) => onApp(payload));
     return async () => {
