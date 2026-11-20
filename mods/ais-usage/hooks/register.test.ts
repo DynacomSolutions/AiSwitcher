@@ -38,10 +38,13 @@ test('PromptHint shows the toggles row, then the hint, in a pool', async ($, on)
 
 test('nothing renders for AbovePrompt', async ($, on) => {
   await mountBand($, on, poolLimits, dir)
-  await expect(
-    $.ui.mount({ plugin: 'ais-usage', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 80 } } as never),
-  ).rejects.toThrow(/no implementation for ui.render/)
+  const ui = await $.ui.mount({ plugin: 'ais-usage', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 80 } } as never)
+  // Passing through draws only the engine's own node, nothing from this mod.
+  expect(await ui.findAll({})).toEqual([ENGINE_ONLY])
 })
+
+/** What the test engine draws when a mod passes through to it. */
+const ENGINE_ONLY = { type: 'engine', props: {}, text: '', children: [] }
 
 const writes: { path: string; text: string }[] = []
 const lastWrite = () => JSON.parse(writes[writes.length - 1]!.text)
@@ -93,15 +96,14 @@ test('PromptHint passes through when there are no rows', async ($, on) => {
   })
   await $.session.start?.({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
   await clock.advance(1)
-  // Passing through reaches the engine, which this harness does not implement.
-  await expect(
-    $.ui.mount({
-      plugin: 'ais-usage',
-      surface: 'terminal',
-      component: 'AbovePrompt',
-      props: { hasSurvey: false, bodyColumns: 80 },
-    } as never),
-  ).rejects.toThrow(/no implementation for ui.render/)
+  // Passing through draws only the engine's own node, nothing from this mod.
+  const ui = await $.ui.mount({
+    plugin: 'ais-usage',
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, bodyColumns: 80 },
+  } as never)
+  expect(await ui.findAll({})).toEqual([ENGINE_ONLY])
 })
 
 test('pressing Other providers writes the snapshot with open others', async ($, on) => {
