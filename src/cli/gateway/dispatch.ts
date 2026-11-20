@@ -35,6 +35,10 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     const { runClaudeProxyCommand } = await import("./claude-proxy.ts");
     return runClaudeProxyCommand(rest, flags, merged);
   }
+  if (sub === "claude-preload") {
+    const { runClaudePreloadCommand } = await import("./claude-preload.ts");
+    return runClaudePreloadCommand(flags, merged);
+  }
   if (sub === "t3-proxy") {
     const { runT3ProxyCommand } = await import("./t3-proxy.ts");
     return runT3ProxyCommand(rest, flags, merged);
@@ -65,7 +69,7 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     const { runCodexHomeCommand } = await import("./codex-home.ts");
     return runCodexHomeCommand(rest, flags, merged);
   }
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|codex-home ...  (ais gateway --help)");
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|codex-home ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");

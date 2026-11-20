@@ -38,8 +38,13 @@ describe("withDirectGateway", () => {
   test("accepts loopback HTTP for local operation", () => {
     expect(withDirectGateway({}, LOCAL).env).toMatchObject({ ANTHROPIC_BASE_URL: LOCAL });
   });
+  test("accepts plain HTTP on a cluster service host", () => {
+    for (const value of ["http://ais-gateway.dev.svc.cluster.local:47130/agent-app", "http://ais-gateway.dev.svc:47130/app"]) {
+      expect(withDirectGateway({}, value).env).toMatchObject({ ANTHROPIC_BASE_URL: value });
+    }
+  });
   test("rejects insecure remote and credential-bearing gateway URLs", () => {
-    for (const value of ["http://gateway.example.test/app", "https://user:pass@gateway.example.test/app", "https://gateway.example.test/app#fragment"]) {
+    for (const value of ["http://svc.cluster.local.example.test/app", "http://gateway.svc.example.test/app", "http://gateway.example.test/app", "https://user:pass@gateway.example.test/app", "https://gateway.example.test/app#fragment"]) {
       expect(() => withDirectGateway({}, value)).toThrow();
     }
   });

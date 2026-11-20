@@ -276,8 +276,10 @@ speech call is not a model call); the daily token cap does.
 
 ### Claude limits for gateway-routed Claude Code
 
-Claude Code sends model traffic directly to the configured `ANTHROPIC_BASE_URL`. The gateway URL must be HTTPS, or
-loopback HTTP for an explicit local setup. Claude Code reads plan limits from the fixed host
+Claude Code sends model traffic directly to the configured `ANTHROPIC_BASE_URL`. The gateway URL must be HTTPS,
+loopback HTTP for an explicit local setup, or plain HTTP on a cluster service host (a name that ends in `.svc` or
+`.svc.cluster.local`, for example `http://ais-gateway.dev.svc.cluster.local:47130/<app>`). Any other plain HTTP host
+is rejected. Claude Code reads plan limits from the fixed host
 (`https://api.anthropic.com/api/oauth/usage`) and needs the `user:profile` scope.
 
 The AIS Claude shim adds a process-local Bun preload for gateway entries. The preload rewrites only authenticated `GET`
@@ -288,6 +290,21 @@ All other requests keep the native transport and destination. Cross-origin redir
 The shim passes both `user:inference` and `user:profile` in the gateway entry. Normal Claude accounts keep their existing
 settings and transport. The preload is enabled only for that Claude process, and removes its own Bun option before child
 processes start. It also removes generic proxy variables from the Claude launch environment.
+
+#### Preload in a cluster agent pod
+
+A pod does not start Claude with the ais launcher, so it sets the preload itself. The preload does the same work as
+with the launcher. It redirects only the profile and plan-usage reads to the gateway app, and no other request.
+
+1. Get the file. Run `ais gateway claude-preload --install=<path>` to write it, or `ais gateway claude-preload --print`
+   to print it. The usual pod path is `/home/<user>/.ais/claude/account-preload.cjs`. Without `=<path>`, `--install`
+   writes `~/.ais/claude/account-preload.cjs`. The agent image can also bake the file in at build time.
+2. Set `BUN_OPTIONS=--preload <path>` and `AIS_CLAUDE_ACCOUNT_PRELOAD=1` in the Claude process environment.
+3. Claude must have `ANTHROPIC_BASE_URL` (environment or the folder `settings.json`) set to the in-cluster gateway app
+   URL, and `CLAUDE_CONFIG_DIR/.credentials.json` must hold the `aisg_` app token as `claudeAiOauth.accessToken`.
+
+The preload does nothing when `AIS_CLAUDE_ACCOUNT_PRELOAD` is not `1`, when the base URL is not accepted, or when the
+stored token does not start with `aisg_`. It removes its own marker and its own Bun option before child processes start.
 
 `ais gateway claude-proxy <dir>...` writes the direct gateway app URL to `ANTHROPIC_BASE_URL`, removes generic proxy
 settings and preserves the CA and bypass configuration. It also adds `user:profile` to a gateway credentials entry.

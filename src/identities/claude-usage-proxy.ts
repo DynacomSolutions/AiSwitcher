@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isClusterInternalHost } from "./claude-account-preload.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
 
 export const CLAUDE_PROXY_ENV_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] as const;
@@ -22,8 +23,8 @@ function secureGatewayUrl(raw: string): string {
   }
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   const loopback = host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
-  if (url.username || url.password || url.hash || url.search || (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))) {
-    throw new Error("gateway URL must be an HTTPS URL or loopback HTTP URL without credentials, a query or a fragment");
+  if (url.username || url.password || url.hash || url.search || (url.protocol !== "https:" && !(url.protocol === "http:" && (loopback || isClusterInternalHost(host))))) {
+    throw new Error("gateway URL must be an HTTPS URL, a loopback HTTP URL or a cluster service HTTP URL without credentials, a query or a fragment");
   }
   return url.toString().replace(/\/$/, "");
 }

@@ -3,7 +3,10 @@ import { createServer } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installClaudeAccountPreload } from "../../src/identities/claude-account-preload.ts";
+import { installClaudeAccountPreload, isClusterInternalHost } from "../../src/identities/claude-account-preload.ts";
+
+// The preload prefers ANTHROPIC_BASE_URL from the environment: agent shells set it, so tests must start without it.
+delete process.env.ANTHROPIC_BASE_URL;
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -222,4 +225,109 @@ test("removes the AIS bearer before a cross-origin fetch redirect", async () => 
     await new Promise<void>((resolve) => gatewayServer.close(() => resolve()));
     await new Promise<void>((resolve) => redirectServer.close(() => resolve()));
   }
+});
+
+interface SeenRequest { method: string; url: string; host?: string; auth?: string }
+
+/**
+ * Runs account, model and other calls through the preload with the given base URL.
+ * Every request is wired to one local server (createConnection), so the Host header shows where the call was aimed.
+ */
+async function runBaseCase(baseUrl: string): Promise<SeenRequest[]> {
+  const requests: SeenRequest[] = [];
+  const server = createServer((request, response) => {
+    requests.push({ method: request.method ?? "", url: request.url ?? "", host: request.headers.host?.replace(/:80$/, ""), auth: request.headers.authorization });
+    response.writeHead(200);
+    response.end("ok");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not expose a port");
+    const root = await mkdtemp(join(tmpdir(), "ais-claude-preload-"));
+    roots.push(root);
+    const config = join(root, "claude");
+    await mkdir(config, { recursive: true });
+    await writeFile(join(config, "settings.json"), JSON.stringify({ env: { ANTHROPIC_BASE_URL: baseUrl } }));
+    await writeFile(join(config, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE" } }));
+    const preload = await installClaudeAccountPreload(root);
+    const script = [
+      "const http = require('node:http'); const net = require('node:net');",
+      `const createConnection = () => net.connect(${address.port}, '127.0.0.1');`,
+      "const call = (transport, options) => new Promise((resolve) => { const req = transport.request({ ...options, createConnection, method: 'GET' }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); }); req.on('error', () => resolve(0)); req.end(); });",
+      "const auth = { authorization: 'Bearer aisg_SYNTHETIC_FIXTURE' };",
+      "(async () => {",
+      "  await call(http, { hostname: 'api.anthropic.com', path: '/api/oauth/profile?x=1', headers: auth });",
+      "  await call(http, { hostname: 'api.anthropic.com', path: '/api/oauth/usage', headers: auth });",
+      "  await call(http, { hostname: 'api.anthropic.com', path: '/v1/messages', headers: auth });",
+      "  await call(http, { hostname: 'other.example.test', path: '/api/oauth/profile', headers: auth });",
+      "})().catch((error) => { console.error(error); process.exitCode = 1; });",
+    ].join("\n");
+    const child = Bun.spawn([process.execPath, "--preload", preload, "-e", script], {
+      env: { ...process.env, CLAUDE_CONFIG_DIR: config, AIS_CLAUDE_ACCOUNT_PRELOAD: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([child.stdout.text(), child.stderr.text(), child.exited]);
+    expect(exitCode, `${stderr}\n${stdout}`).toBe(0);
+    return requests;
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+test("accepts plain HTTP on a cluster service host and redirects only the account paths", async () => {
+  for (const [base, host] of [
+    ["http://ais-gateway.dev.svc.cluster.local:47130/agent-app", "ais-gateway.dev.svc.cluster.local:47130"],
+    ["http://ais-gateway.dev.svc:47130/agent-app", "ais-gateway.dev.svc:47130"],
+  ] as const) {
+    const requests = await runBaseCase(base);
+    expect(requests).toEqual([
+      { method: "GET", url: "/agent-app/api/oauth/profile?x=1", host, auth: "Bearer aisg_SYNTHETIC_FIXTURE" },
+      { method: "GET", url: "/agent-app/api/oauth/usage", host, auth: "Bearer aisg_SYNTHETIC_FIXTURE" },
+      { method: "GET", url: "/v1/messages", host: "api.anthropic.com", auth: "Bearer aisg_SYNTHETIC_FIXTURE" },
+      { method: "GET", url: "/api/oauth/profile", host: "other.example.test", auth: "Bearer aisg_SYNTHETIC_FIXTURE" },
+    ]);
+  }
+});
+
+test("rejects plain HTTP on any other host, so the account calls stay native", async () => {
+  for (const base of [
+    "http://gateway.example.test:47130/app",
+    "http://svc.cluster.local.example.test/app",
+    "http://ais-gateway.dev.svc.example.test/app",
+    "http://evil-svc.cluster.local/app",
+  ]) {
+    const requests = await runBaseCase(base);
+    expect(requests.map((request) => request.host), base).toEqual(["api.anthropic.com", "api.anthropic.com", "api.anthropic.com", "other.example.test"]);
+    expect(requests.map((request) => request.url), base).toEqual(["/api/oauth/profile?x=1", "/api/oauth/usage", "/v1/messages", "/api/oauth/profile"]);
+  }
+});
+
+test("keeps https gateways working", async () => {
+  // The test wires every socket to the plain local server, so the Host header shows the aimed origin.
+  const requests = await runBaseCase("https://gateway.invalid/app");
+  expect(requests.map((request) => `${request.host}${request.url}`)).toEqual([
+    "gateway.invalid:443/app/api/oauth/profile?x=1",
+    "gateway.invalid:443/app/api/oauth/usage",
+    "api.anthropic.com/v1/messages",
+    "other.example.test/api/oauth/profile",
+  ]);
+});
+
+test("keeps loopback http gateways working", async () => {
+  const requests = await runBaseCase("http://127.0.0.1:47140/app");
+  expect(requests.map((request) => request.url)).toEqual(["/app/api/oauth/profile?x=1", "/app/api/oauth/usage", "/v1/messages", "/api/oauth/profile"]);
+  expect(requests.map((request) => request.host)).toEqual(["127.0.0.1:47140", "127.0.0.1:47140", "api.anthropic.com", "other.example.test"]);
+});
+
+test("isClusterInternalHost matches only Kubernetes service names", () => {
+  expect(isClusterInternalHost("ais-gateway.dev.svc.cluster.local")).toBe(true);
+  expect(isClusterInternalHost("ais-gateway.dev.svc")).toBe(true);
+  expect(isClusterInternalHost("AIS-Gateway.Dev.SVC.cluster.local.")).toBe(true);
+  expect(isClusterInternalHost("svc.cluster.local")).toBe(false);
+  expect(isClusterInternalHost("x.svc.cluster.local.evil.test")).toBe(false);
+  expect(isClusterInternalHost("x.svc.evil.test")).toBe(false);
+  expect(isClusterInternalHost("localhost")).toBe(false);
+  expect(isClusterInternalHost("a b.svc")).toBe(false);
 });
