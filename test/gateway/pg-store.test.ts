@@ -120,7 +120,10 @@ if (!url && process.env.CI && !optOut) {
           expect(h.map((r: { hypertable_name: string }) => r.hypertable_name)).toContain("gateway_usage");
           const agg = await sql`SELECT view_name FROM timescaledb_information.continuous_aggregates WHERE view_name = 'gateway_usage_15m'`;
           expect(agg.length).toBe(1);
-          const jobs = await sql`SELECT 1 AS x FROM timescaledb_information.jobs WHERE hypertable_name = 'gateway_usage_15m' AND proc_name = 'policy_refresh_continuous_aggregate'`;
+          // A cagg policy job names the materialization hypertable, not the view.
+          const jobs = await sql`SELECT 1 AS x FROM timescaledb_information.jobs j
+            JOIN timescaledb_information.continuous_aggregates c ON j.hypertable_name = c.materialization_hypertable_name
+            WHERE c.view_name = 'gateway_usage_15m' AND j.proc_name = 'policy_refresh_continuous_aggregate'`;
           expect(jobs.length).toBe(1);
         } else {
           // Without TimescaleDB the plain table stays, the rollup is skipped and the version is still recorded.
