@@ -22,6 +22,9 @@ const SIG_SETMASK = 2;
 const F_GETFD = 1;
 const F_SETFD = 2;
 const FD_CLOEXEC = 1;
+const F_GETFL = 3;
+const F_SETFL = 4;
+const O_NONBLOCK = 0o4000; // Linux, same value on x86-64 and arm64
 
 export interface ExecBlock {
   /** Backing memory: pointer tables first, then every NUL-terminated string. */
@@ -195,6 +198,49 @@ function openLibc() {
 }
 
 /**
+ * Clears O_NONBLOCK on fds 0, 1 and 2 (Linux only) and returns the flags it
+ * changed so a failed exec can put them back.
+ *
+ * Why: Bun sets O_NONBLOCK on an inherited stdout socket or pipe and never
+ * clears it. The flag lives on the open file description, so the real tool
+ * inherits it. A tool that expects blocking stdio then gets EAGAIN on a large
+ * write to a slow reader. `codex app-server` ends its stdout writer thread on
+ * that error and silently drops every later message. EBADF (closed fd) and
+ * every other fcntl failure are ignored.
+ *
+ * The `spawnReal` fallback needs no call: Bun.spawn already gives its child blocking stdio.
+ *
+ * Linux only: `fcntl` is variadic, and on Apple arm64 a `bun:ffi` call would
+ * pass F_SETFL's argument in the wrong place. Linux passes the same way for
+ * variadic and fixed arguments, so the call is safe there.
+ */
+function clearStdioNonblock(): Array<[fd: number, flags: number]> {
+  const changed: Array<[number, number]> = [];
+  if (process.platform !== "linux") return changed;
+  try {
+    const lib = openLibc();
+    for (const fd of [0, 1, 2]) {
+      const flags = lib.symbols.fcntl(fd, F_GETFL, 0);
+      if (flags < 0 || (flags & O_NONBLOCK) === 0) continue;
+      if (lib.symbols.fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) >= 0) changed.push([fd, flags]);
+    }
+  } catch {
+    // libc unavailable: leave the descriptors as they are.
+  }
+  return changed;
+}
+
+function restoreStdioFlags(changed: ReadonlyArray<[number, number]>): void {
+  if (changed.length === 0) return;
+  try {
+    const lib = openLibc();
+    for (const [fd, flags] of changed) lib.symbols.fcntl(fd, F_SETFL, flags);
+  } catch {
+    // Nothing to restore with.
+  }
+}
+
+/**
  * Replaces this process with `path`. Never returns on success; when exec is
  * unavailable or fails it returns the reason (process untouched, or
  * restored). `argv` includes argv[0].
@@ -231,10 +277,12 @@ export function tryExecve(path: string, argv: readonly string[], env: Record<str
     for (const sig of ignored) lib.symbols.signal(sig, SIG_DFL);
     if (blocked) lib.symbols.sigprocmask(SIG_SETMASK, BigInt(ptr(sigset)), BigInt(ptr(oldset)));
 
+    const stdioFlags = clearStdioNonblock();
     keepAlive = block; // the GC must not free the block while the syscall reads it
     lib.symbols.execve(block.pathAddr, block.argvAddr, block.envpAddr);
 
     // Only reached when execve failed: put back what we changed.
+    restoreStdioFlags(stdioFlags);
     for (const sig of ignored) lib.symbols.signal(sig, SIG_IGN);
     if (blocked) lib.symbols.sigprocmask(SIG_SETMASK, BigInt(ptr(oldset)), 0n);
     return `execve(${path}) failed`;
