@@ -48,11 +48,18 @@ const sendsThirdParty = (v: unknown): boolean => isThirdPartySender(typeof v ===
 const hookText = (h: unknown): string => `${obj(h)?.command ?? ""} ${obj(h)?.url ?? ""}`;
 const isAisGatewayUrl = (v: unknown): boolean => typeof v === "string" && /\/gateway\//.test(v);
 
+/** Top-level settings keys that choose the model. A home that routes to another model keeps its own and never copies the source's. */
+export const MODEL_SETTINGS_KEYS: readonly string[] = ["model", "modelSettings", "effortLevel", "switchModelsOnFlag"];
+/** Env keys that choose the model or its effort. */
+export const isModelEnvKey = (key: string): boolean => /MODEL/.test(key) || key === "CLAUDE_CODE_EFFORT_LEVEL";
+
 const SWAP_HOOK = /\bais\s+claude-swap\b/;
 
 export interface T3ClaudeConfigOptions {
   /** Source identity is a restricted identity: nothing that sends to a third party is copied. */
   noThirdParty?: boolean;
+  /** The home routes to other models (Kimi, Z.ai): its own model keys stay and the source's model keys are never copied. */
+  modelHome?: boolean;
 }
 
 const clone = <T>(v: T): T => structuredClone(v);
@@ -138,6 +145,14 @@ export function composeT3ClaudeSettings(source: Json, own: Json, opts: T3ClaudeC
   // Source auth and routing keys are never copied. The home keeps its own values of every allowed key.
   for (const key of Object.keys(env)) if (isAuthEnvKey(key)) delete env[key];
   for (const key of Object.keys(ownEnv)) if (isAllowedEnvKey(key)) env[key] = ownEnv[key];
+  if (opts.modelHome) {
+    for (const key of Object.keys(env)) if (isModelEnvKey(key)) delete env[key];
+    for (const key of Object.keys(ownEnv)) if (isModelEnvKey(key)) env[key] = ownEnv[key];
+    for (const key of MODEL_SETTINGS_KEYS) {
+      delete out[key];
+      if (key in own) out[key] = own[key];
+    }
+  }
   out.env = env;
   for (const key of AUTH_SETTINGS_KEYS) {
     delete out[key];
@@ -166,6 +181,47 @@ export function composeT3ClaudeSettings(source: Json, own: Json, opts: T3ClaudeC
   return out;
 }
 
+/** The version of an installed plugin entry (`installed_plugins.json` holds a list of installs per plugin id). */
+export function pluginVersion(entry: unknown): string | undefined {
+  const list = Array.isArray(entry) ? entry : [entry];
+  for (const e of list) {
+    const v = obj(e)?.version;
+    if (typeof v === "string" && v !== "") return v;
+  }
+  return undefined;
+}
+
+/** Negative when `a` is older than `b`, zero when equal, positive when newer. Versions that are not dotted numbers and differ count as older. */
+export function compareVersions(a: string, b: string): number {
+  if (a === b) return 0;
+  const num = (v: string) => (/^v?\d+(?:\.\d+)*(?:[-+].*)?$/.test(v) ? v.replace(/^v/, "").split(/[-+]/)[0]!.split(".").map(Number) : undefined);
+  const x = num(a);
+  const y = num(b);
+  if (!x || !y) return -1;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] ?? 0) - (y[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/** Plugins where the home runs an older version than the source (the repair installs the source version), and where the source is behind. */
+function pluginVersionGaps(expected: Json | undefined, home: Json | undefined): { older: string[]; sourceBehind: string[] } {
+  const older: string[] = [];
+  const sourceBehind: string[] = [];
+  const e = obj(expected?.plugins) ?? {};
+  const h = obj(home?.plugins) ?? {};
+  for (const [id, entry] of Object.entries(e)) {
+    const want = pluginVersion(entry);
+    const have = pluginVersion(h[id]);
+    if (!want || !have) continue;
+    const c = compareVersions(have, want);
+    if (c < 0) older.push(`${id} ${have} -> ${want}`);
+    else if (c > 0) sourceBehind.push(`${id}: home ${have} is ahead of source ${want}, the source needs an update`);
+  }
+  return { older, sourceBehind };
+}
+
 /**
  * The expected plugin JSON files. A plugin the home already has keeps its own entry (own install path, own cache), so a
  * home with its own plugin cache is in step. Missing plugins and marketplaces come from the source. Pure.
@@ -177,7 +233,13 @@ export function composeT3ClaudePluginFiles(installed: Json | undefined, marketpl
     let plugins = obj(copy.plugins) ?? {};
     if (opts.noThirdParty) plugins = filterKeys(plugins, isThirdPartySender) as Json;
     const ownPlugins = obj(own.installed?.plugins) ?? {};
-    const merged = Object.fromEntries(Object.entries(plugins).map(([id, v]) => [id, id in ownPlugins ? ownPlugins[id] : v]));
+    // A plugin whose home version is older than the source version takes the source entry (the source version is installed).
+    const merged = Object.fromEntries(Object.entries(plugins).map(([id, v]) => {
+      if (!(id in ownPlugins)) return [id, v];
+      const want = pluginVersion(v);
+      const have = pluginVersion(ownPlugins[id]);
+      return [id, want && have && compareVersions(have, want) < 0 ? v : ownPlugins[id]];
+    }));
     // Plugins only the home has stay, except third-party senders in a restricted home.
     for (const [id, v] of Object.entries(ownPlugins)) if (!(id in merged) && !(opts.noThirdParty && isThirdPartySender(id))) merged[id] = v;
     copy.plugins = merged;
@@ -228,17 +290,20 @@ export interface T3ClaudeFile {
   diffs: string[];
   /** Info lines, for example a source marketplace skipped because its directory is missing. */
   notes: string[];
+  /** Plugins where the home is ahead of the source. A repair cannot fix these: the source needs an update. */
+  sourceBehind?: string[];
 }
 
 const keysOf = (v: unknown): string[] => Object.keys(obj(v) ?? {});
 
 const MAP_KEYS = ["enabledPlugins", "pluginConfigs", "extraKnownMarketplaces"];
 
-function diffSettings(expected: Json, actual: Json, restricted: boolean): string[] {
+function diffSettings(expected: Json, actual: Json, restricted: boolean, modelHome = false): string[] {
   const bad: string[] = [];
   for (const k of new Set([...Object.keys(expected), ...Object.keys(actual)])) {
+    if (modelHome && MODEL_SETTINGS_KEYS.includes(k)) continue;
     if (k === "env") {
-      const strip = (e: unknown) => Object.fromEntries(Object.entries(obj(e) ?? {}).filter(([n]) => !isAllowedEnvKey(n)));
+      const strip = (e: unknown) => Object.fromEntries(Object.entries(obj(e) ?? {}).filter(([n]) => !isAllowedEnvKey(n) && !(modelHome && isModelEnvKey(n))));
       const actualEnv = obj(actual.env) ?? {};
       if (stable(strip(expected.env)) !== stable(strip(actual.env))) bad.push("env");
       else if (restricted && Object.entries(actualEnv).some(([n, v]) => isThirdPartySender(n) || sendsThirdParty(v))) bad.push("env");
@@ -260,7 +325,7 @@ function diffSettings(expected: Json, actual: Json, restricted: boolean): string
 function diffInstalled(expected: Json, actual: Json, noThirdParty: boolean): string[] {
   const a = keysOf(actual.plugins);
   const e = keysOf(expected.plugins);
-  return [...e.filter((id) => !a.includes(id)).map((id) => `missing ${id}`), ...a.filter((id) => !e.includes(id) && noThirdParty && isThirdPartySender(id)).map((id) => `extra ${id}`)].sort();
+  return [...pluginVersionGaps(expected, actual).older.map((v) => `version ${v}`), ...e.filter((id) => !a.includes(id)).map((id) => `missing ${id}`), ...a.filter((id) => !e.includes(id) && noThirdParty && isThirdPartySender(id)).map((id) => `extra ${id}`)].sort();
 }
 
 function diffMarketplaces(expected: Json, actual: Json, noThirdParty: boolean): string[] {
@@ -283,11 +348,15 @@ export async function planT3ClaudeHome(folder: string, sourceDir: string, opts: 
   const actualSettings = await readJson(join(folder, "settings.json"));
   const own = ownOverride ?? actualSettings ?? {};
   const settings = composeT3ClaudeSettings(source, own, opts);
-  const files: T3ClaudeFile[] = [{ path: join(folder, "settings.json"), content: settings, label: "settings.json", diffs: actualSettings ? diffSettings(settings, actualSettings, opts.noThirdParty === true) : ["missing"], notes: [] }];
+  const files: T3ClaudeFile[] = [{ path: join(folder, "settings.json"), content: settings, label: "settings.json", diffs: actualSettings ? diffSettings(settings, actualSettings, opts.noThirdParty === true, opts.modelHome === true) : ["missing"], notes: [] }];
   const ownInstalled = await readJson(join(folder, "plugins", "installed_plugins.json"));
   const ownMarkets = await readJson(join(folder, "plugins", "known_marketplaces.json"));
   const plugins = composeT3ClaudePluginFiles(await readJson(join(sourceDir, "plugins", "installed_plugins.json")), await readJson(join(sourceDir, "plugins", "known_marketplaces.json")), opts, { installed: ownInstalled, marketplaces: ownMarkets });
-  if (plugins.installed) files.push({ path: join(folder, "plugins", "installed_plugins.json"), content: plugins.installed, label: "plugins/installed_plugins.json", diffs: ownInstalled ? diffInstalled(plugins.installed, ownInstalled, opts.noThirdParty === true) : ["missing"], notes: [] });
+  if (plugins.installed) {
+    const sourceInstalled = await readJson(join(sourceDir, "plugins", "installed_plugins.json"));
+    const sourceBehind = ownInstalled ? pluginVersionGaps(sourceInstalled, ownInstalled).sourceBehind.filter((l) => !(opts.noThirdParty && isThirdPartySender(l))) : [];
+    files.push({ path: join(folder, "plugins", "installed_plugins.json"), content: plugins.installed, label: "plugins/installed_plugins.json", diffs: ownInstalled ? diffInstalled(plugins.installed, ownInstalled, opts.noThirdParty === true) : ["missing"], notes: [], ...(sourceBehind.length > 0 ? { sourceBehind } : {}) });
+  }
   if (plugins.marketplaces) files.push({ path: join(folder, "plugins", "known_marketplaces.json"), content: plugins.marketplaces, label: "plugins/known_marketplaces.json", diffs: ownMarkets ? diffMarketplaces(plugins.marketplaces, ownMarkets, opts.noThirdParty === true) : ["missing"], notes: (plugins.skipped ?? []).map((n) => `source marketplace ${n} skipped: directory missing on this host`) });
   return files;
 }

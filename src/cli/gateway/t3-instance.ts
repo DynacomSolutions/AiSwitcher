@@ -77,8 +77,8 @@ export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["fl
     else if (given) {
       const identity = findIdentityByNameOrAlias(registry.identities, given);
       if (!identity) throw new CliUsageError(`--source ${given} is not a Claude identity`);
-      base.source = { dir: expandPath(identity.configDir), noThirdParty: isNoThirdParty(identity, restricted) || target?.noThirdParty === true };
-    } else if (target) base.source = { dir: target.dir, noThirdParty: target.noThirdParty };
+      base.source = { dir: expandPath(identity.configDir), noThirdParty: isNoThirdParty(identity, restricted) || target?.noThirdParty === true, ...(target?.modelHome ? { modelHome: true } : {}) };
+    } else if (target) base.source = { dir: target.dir, noThirdParty: target.noThirdParty, ...(target.modelHome ? { modelHome: true } : {}) };
   }
   const r = await applyT3Instance(base);
   const detail = r.changes.length > 0 ? `${check ? " (differs" : " (changed"}: ${r.changes.join(", ")})` : "";

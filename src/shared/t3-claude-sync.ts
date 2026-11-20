@@ -15,7 +15,7 @@ export interface T3ClaudeSyncOptions {
 
 export interface T3ClaudeSyncResult {
   folder: string;
-  /** Source identity name, or undefined when the home maps to no identity (kimi, zai: skipped). */
+  /** Source identity name, or undefined when the home maps to no identity (skipped). */
   source?: string;
   status: "current" | "drift" | "updated" | "skipped" | "failed";
   /** Differences found (check) or files written (apply). */
@@ -41,10 +41,12 @@ export async function syncT3ClaudeHomes(opts: T3ClaudeSyncOptions = {}): Promise
       continue;
     }
     try {
-      const plan = await planT3ClaudeHome(folder, source.dir, { noThirdParty: source.noThirdParty });
+      const plan = await planT3ClaudeHome(folder, source.dir, { noThirdParty: source.noThirdParty, ...(source.modelHome ? { modelHome: true } : {}) });
       const diffs = plan.filter((f) => f.diffs.length > 0).map((f) => `${f.label}: ${f.diffs.join(", ")}`);
-      const notes = plan.flatMap((f) => f.notes);
-      if (diffs.length === 0) results.push({ folder, source: source.name, status: "current", changes: [], notes });
+      const behind = plan.flatMap((f) => f.sourceBehind ?? []);
+      const notes = [...plan.flatMap((f) => f.notes), ...behind.map((b) => `source behind: ${b}`)];
+      if (opts.check && diffs.length === 0 && behind.length > 0) results.push({ folder, source: source.name, status: "drift", changes: behind, notes });
+      else if (diffs.length === 0) results.push({ folder, source: source.name, status: "current", changes: [], notes });
       else if (opts.check) results.push({ folder, source: source.name, status: "drift", changes: diffs, notes });
       else results.push({ folder, source: source.name, status: "updated", changes: await writeT3ClaudeHome(plan), notes });
     } catch (err) {

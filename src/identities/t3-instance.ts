@@ -33,7 +33,7 @@ export interface T3InstanceOptions {
    * Claude only: the source identity folder whose full config (settings, plugins, hooks) the home copies, and whether it is
    * a restricted identity (no third-party sending plugins or hooks). `"none"` copies nothing (kimi, zai and other homes that are not a Claude identity).
    */
-  source?: { dir: string; noThirdParty: boolean } | "none";
+  source?: { dir: string; noThirdParty: boolean; modelHome?: boolean } | "none";
   binary?: string;
   /** Legacy CONNECT proxy URL. It is ignored for Claude instances. */
   proxyUrl?: string;
@@ -299,7 +299,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     } else {
       // Full copy of the source identity config; only the gateway env keys and the attribution keys come from the home.
       // settings.json is always planned (it holds the gateway URL and models); the plugin files only when they drift.
-      for (const f of await planT3ClaudeHome(folder, opts.source.dir, { noThirdParty: opts.source.noThirdParty }, own)) {
+      for (const f of await planT3ClaudeHome(folder, opts.source.dir, { noThirdParty: opts.source.noThirdParty, ...(opts.source.modelHome ? { modelHome: true } : {}) }, own)) {
         if (f.label !== "settings.json" && f.diffs.length === 0) continue;
         plans.push({ path: f.path, content: `${JSON.stringify(f.content, null, 2)}\n`, mode: f.label === "settings.json" ? 0o600 : 0o644, label: `${f.label} (folder)` });
       }

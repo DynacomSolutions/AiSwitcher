@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyT3Instance } from "../../src/identities/t3-instance.ts";
 import { composeT3ClaudePluginFiles, composeT3ClaudeSettings, diffT3ClaudeHome, hookKeys, isThirdPartySender, planT3ClaudeHome } from "../../src/identities/t3-claude-home.ts";
-import { isNoThirdParty, noThirdPartyNames } from "../../src/shared/t3-claude-source.ts";
+import { isNoThirdParty, noThirdPartyNames, t3ClaudeSource } from "../../src/shared/t3-claude-source.ts";
+import { createClaudeCliRunner, localisePluginPaths, updateAllClaudePlugins, type ClaudeCliRunner } from "../../src/shared/claude-plugin-update.ts";
 import { syncT3ClaudeHomes } from "../../src/shared/t3-claude-sync.ts";
 import { runT3InstanceCommand } from "../../src/cli/gateway/t3-instance.ts";
 import { createT3ClaudeTicker } from "../../src/sync/t3-claude-ticker.ts";
@@ -46,7 +47,7 @@ beforeEach(async () => {
 });
 afterEach(() => rm(home, { recursive: true, force: true }));
 
-const run = (id: string, src: { dir: string; noThirdParty: boolean } | "none", extra: object = {}) =>
+const run = (id: string, src: { dir: string; noThirdParty: boolean; modelHome?: boolean } | "none", extra: object = {}) =>
   applyT3Instance({ id, driver: "claude", app: "agents-claude", gatewayUrl: GW, home, env: {}, secretsPath: secrets, source: src, models: ["m1", "m2"], ...extra });
 const read = async (p: string) => JSON.parse(await readFile(p, "utf8"));
 
@@ -120,13 +121,13 @@ test("drift check reports a plugin, a setting and a missing file, and ignores ga
 
 test("sync maps homes to identities, repairs drift and skips unmapped homes", async () => {
   await run("claude-team-pool", { dir: source, noThirdParty: false });
-  await run("t3-claude-kimi-pool", "none");
+  await run("t3-claude-other-pool", "none");
   const registry = join(home, "identities.json");
   await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "swap", label: "swap", aliases: ["team-pool"], configDir: source, swapPool: { accounts: [], active: undefined } }] }));
   const folder = join(home, ".t3", "gateway", "claude-team-pool");
   await writeFile(join(source, "settings.json"), JSON.stringify({ ...SOURCE_SETTINGS, theme: "light" }));
   const checked = await syncT3ClaudeHomes({ home, env: {}, registryPath: registry, check: true });
-  expect(checked.map((r) => [r.folder.split("/").pop(), r.status])).toEqual([["claude-team-pool", "drift"], ["t3-claude-kimi-pool", "skipped"]]);
+  expect(checked.map((r) => [r.folder.split("/").pop(), r.status])).toEqual([["claude-team-pool", "drift"], ["t3-claude-other-pool", "skipped"]]);
   const fixed = await syncT3ClaudeHomes({ home, env: {}, registryPath: registry });
   expect(fixed[0]!.status).toBe("updated");
   expect((await read(join(folder, "settings.json"))).theme).toBe("light");
@@ -346,4 +347,163 @@ test("--source=<other identity> on a restricted home still restricts it", async 
   await runT3InstanceCommand(["t3-claude-restricted"], { driver: "claude", app: "agents-claude", source: "dyn" } as never, { out: (l: string) => lines.push(l), secretsPath: secrets } as never, { home, env: { AIS_NO_THIRD_PARTY_IDENTITIES: "restricted", AIS_GATEWAY_PROXY_URL: "https://gw.example/gateway" } }, { exists: () => false, log: () => {} });
   const s = await read(join(home, ".t3", "gateway", "t3-claude-restricted", "settings.json"));
   expect(Object.keys(s.enabledPlugins).sort()).toEqual(["superpowers@official", "tasks-board@ai-tools"]);
+});
+
+const registryWith = async (extra: object[] = []) => {
+  const registry = join(home, "identities.json");
+  await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "swap", label: "swap", aliases: ["team-pool"], configDir: source, swapPool: { accounts: [], active: undefined } }, ...extra] }));
+  return registry;
+};
+
+test("kimi and zai homes map to the swap pool and keep their own model keys", async () => {
+  await writeFile(join(source, "settings.json"), JSON.stringify({ ...SOURCE_SETTINGS, model: "opus", effortLevel: "high", modelSettings: { a: 1 }, env: { ...SOURCE_SETTINGS.env, ANTHROPIC_MODEL: "src-model", CLAUDE_CODE_SUBAGENT_MODEL: "src-sub" } }));
+  const registry = await registryWith();
+  for (const id of ["t3-claude-kimi-pool", "t3-claude-zai-pool"]) {
+    await run(id, { dir: source, noThirdParty: false, modelHome: true });
+    const folder = join(home, ".t3", "gateway", id);
+    const s = await read(join(folder, "settings.json"));
+    expect(s.env.ANTHROPIC_MODEL).toBe("m1");
+    expect(s.env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("m1");
+    expect(s.model).toBeUndefined();
+    expect(s.effortLevel).toBeUndefined();
+    expect(s.enabledPlugins).toEqual(SOURCE_SETTINGS.enabledPlugins);
+    // the home's own model keys are allowed differences
+    s.model = "kimi-k2";
+    s.effortLevel = "low";
+    s.switchModelsOnFlag = true;
+    await writeFile(join(folder, "settings.json"), JSON.stringify(s));
+  }
+  const checked = await syncT3ClaudeHomes({ home, env: {}, registryPath: registry, check: true });
+  expect(checked.map((r) => [r.folder.split("/").pop(), r.source, r.status])).toEqual([["t3-claude-kimi-pool", "swap", "current"], ["t3-claude-zai-pool", "swap", "current"]]);
+  // other drift still shows, and the repair never copies the source model keys
+  await writeFile(join(source, "settings.json"), JSON.stringify({ ...SOURCE_SETTINGS, model: "opus", theme: "light" }));
+  expect((await syncT3ClaudeHomes({ home, env: {}, registryPath: registry, check: true })).map((r) => r.status)).toEqual(["drift", "drift"]);
+  await syncT3ClaudeHomes({ home, env: {}, registryPath: registry });
+  const fixed = await read(join(home, ".t3", "gateway", "t3-claude-kimi-pool", "settings.json"));
+  expect(fixed.theme).toBe("light");
+  expect(fixed.model).toBe("kimi-k2");
+  expect(fixed.effortLevel).toBe("low");
+});
+
+test("without exactly one swap pool a kimi home stays unmapped", async () => {
+  await run("t3-claude-kimi-pool", "none");
+  const registry = join(home, "identities.json");
+  await writeFile(registry, JSON.stringify({ version: 1, identities: [] }));
+  expect((await syncT3ClaudeHomes({ home, env: {}, registryPath: registry, check: true }))[0]!.status).toBe("skipped");
+});
+
+const setVersions = async (dir: string, versions: Record<string, string>) => {
+  const plugins = Object.fromEntries(Object.entries(versions).map(([id, version]) => [id, [{ installPath: `${dir}/cache/${id}`, version }]]));
+  await writeFile(join(dir, "plugins", "installed_plugins.json"), JSON.stringify({ version: 2, plugins }));
+};
+
+test("a plugin version that differs from the source is drift: older is repaired, newer says the source needs an update", async () => {
+  const registry = await registryWith();
+  await run("claude-team-pool", { dir: source, noThirdParty: false });
+  const folder = join(home, ".t3", "gateway", "claude-team-pool");
+  await setVersions(source, { "tasks-board@ai-tools": "1.2.0", "other@ai-tools": "2.0.0" });
+  await setVersions(folder, { "tasks-board@ai-tools": "1.1.0", "other@ai-tools": "2.0.0" });
+  const checked = await syncT3ClaudeHomes({ home, env: {}, registryPath: registry, check: true });
+  expect(checked[0]!.status).toBe("drift");
+  expect(checked[0]!.changes.join()).toContain("version tasks-board@ai-tools 1.1.0 -> 1.2.0");
+  expect((await syncT3ClaudeHomes({ home, env: {}, registryPath: registry }))[0]!.status).toBe("updated");
+  expect((await read(join(folder, "plugins", "installed_plugins.json"))).plugins["tasks-board@ai-tools"][0].version).toBe("1.2.0");
+  expect((await syncT3ClaudeHomes({ home, env: {}, registryPath: registry, check: true }))[0]!.status).toBe("current");
+  // the home is now ahead of the source
+  await setVersions(folder, { "tasks-board@ai-tools": "1.3.0", "other@ai-tools": "2.0.0" });
+  const ahead = await syncT3ClaudeHomes({ home, env: {}, registryPath: registry, check: true });
+  expect(ahead[0]!.status).toBe("drift");
+  expect(ahead[0]!.changes.join()).toContain("the source needs an update");
+  const repaired = await syncT3ClaudeHomes({ home, env: {}, registryPath: registry });
+  expect(repaired[0]!.status).toBe("current");
+  expect(repaired[0]!.notes?.join()).toContain("source behind");
+  expect((await read(join(folder, "plugins", "installed_plugins.json"))).plugins["tasks-board@ai-tools"][0].version).toBe("1.3.0");
+});
+
+const LOCAL_MARKETS = { "ai-tools": {}, "typesafe-ai": {} };
+const LOCAL_INSTALLED = { version: 2, plugins: { "tasks-board@ai-tools": [], "jev-skills@ai-tools": [] } };
+
+test("update runs marketplaces then plugins in every identity folder and T3 home, and skips third-party senders in a restricted one", async () => {
+  const plain = join(home, "ids", "plain");
+  const strict = join(home, "ids", "strict");
+  for (const dir of [plain, strict]) {
+    await mkdir(join(dir, "plugins"), { recursive: true });
+    await writeFile(join(dir, "plugins", "known_marketplaces.json"), JSON.stringify(LOCAL_MARKETS));
+    await writeFile(join(dir, "plugins", "installed_plugins.json"), JSON.stringify(LOCAL_INSTALLED));
+  }
+  const registry = await registryWith([{ name: "plain", label: "plain", configDir: plain }, { name: "strict", label: "strict", configDir: strict }]);
+  await writeFile(join(source, "plugins", "known_marketplaces.json"), JSON.stringify({ "ai-tools": {} }));
+  await writeFile(join(source, "plugins", "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "tasks-board@ai-tools": [] } }));
+  await run("t3-claude-kimi-pool", { dir: source, noThirdParty: false, modelHome: true });
+  await mkdir(join(home, ".t3", "gateway", "t3-claude-strict", "plugins"), { recursive: true });
+  await writeFile(join(home, ".t3", "gateway", "t3-claude-strict", "plugins", "installed_plugins.json"), JSON.stringify(LOCAL_INSTALLED));
+  const calls: string[] = [];
+  const runner: ClaudeCliRunner = async (args, dir) => {
+    calls.push(`${dir.replace(home, "~")} ${args.join(" ")}`);
+    return args.includes("tasks-board@ai-tools") && dir === plain ? { code: 1, output: "boom" } : { code: 0, output: "" };
+  };
+  const results = await updateAllClaudePlugins({ home, env: { AIS_NO_THIRD_PARTY_IDENTITIES: "strict" }, registryPath: registry, run: runner });
+  expect(calls).toContain("~/ids/plain plugin marketplace update typesafe-ai");
+  expect(calls.indexOf("~/ids/plain plugin marketplace update ai-tools")).toBeLessThan(calls.indexOf("~/ids/plain plugin update tasks-board@ai-tools"));
+  expect(calls.filter((c) => c.startsWith("~/ids/strict")).join("\n")).not.toMatch(/typesafe|jev/);
+  expect(calls.filter((c) => c.startsWith("~/ids/strict")).join("\n")).toContain("plugin update tasks-board@ai-tools");
+  // the unmapped-by-name restricted T3 home fails closed, the kimi home follows the swap pool
+  expect(calls.some((c) => c.includes("t3-claude-strict") && /jev/.test(c))).toBe(false);
+  expect(calls.some((c) => c.includes("t3-claude-kimi-pool"))).toBe(true);
+  expect(results.find((r) => r.folder === plain)!.failures[0]).toContain("tasks-board@ai-tools: boom");
+  expect(results.find((r) => r.folder === strict)!.skipped).toEqual(expect.arrayContaining(["typesafe-ai", "jev-skills@ai-tools"]));
+});
+
+test("the plugin runner uses the real claude binary and fails without one", async () => {
+  const seen: { file: string; dir?: string }[] = [];
+  const exec = (file: string, _args: string[], env: NodeJS.ProcessEnv, cb: (e: Error | null, o: string, s: string) => void) => {
+    seen.push({ file, ...(env.CLAUDE_CONFIG_DIR ? { dir: env.CLAUDE_CONFIG_DIR } : {}) });
+    cb(null, "ok", "");
+  };
+  const ok = await createClaudeCliRunner(() => "/real/bin/claude", exec)(["plugin", "update", "x"], "/cfg");
+  expect(ok.code).toBe(0);
+  expect(seen).toEqual([{ file: "/real/bin/claude", dir: "/cfg" }]);
+  const none = await createClaudeCliRunner(() => { throw new Error("not found"); }, exec)(["plugin", "update", "x"], "/cfg");
+  expect(none.code).not.toBe(0);
+  expect(none.output).toContain("no real claude binary");
+  expect(seen.length).toBe(1);
+});
+
+test("a kimi or zai home is restricted when its own identity is on the list, not only the source", async () => {
+  const registry = JSON.parse(JSON.stringify({ version: 1, identities: [{ name: "swap", label: "swap", configDir: source, swapPool: { accounts: [], active: undefined } }, { name: "acme-corp", label: "p", aliases: ["acme"], configDir: join(home, "ids", "acme") }] }));
+  const gw = join(home, ".t3");
+  for (const folder of ["t3-claude-kimi-acme", "t3-claude-zai-acme-corp", "t3-claude-kimi-unregistered"]) {
+    const list = folder.endsWith("unregistered") ? ["unregistered"] : ["acme"];
+    expect(t3ClaudeSource(registry, join(gw, "gateway", folder), gw, list)?.noThirdParty).toBe(true);
+  }
+  expect(t3ClaudeSource(registry, join(gw, "gateway", "t3-claude-kimi-other"), gw, ["acme"])?.noThirdParty).toBe(false);
+  // through the repair and the update
+  await run("t3-claude-kimi-acme", { dir: source, noThirdParty: true, modelHome: true });
+  const reg = await registryWith([{ name: "acme-corp", label: "p", aliases: ["acme"], configDir: join(home, "ids", "acme") }]);
+  const folder = join(home, ".t3", "gateway", "t3-claude-kimi-acme");
+  expect(Object.keys((await read(join(folder, "settings.json"))).enabledPlugins)).not.toContain("jev-compaction@ai-tools");
+  expect((await syncT3ClaudeHomes({ home, env: { AIS_NO_THIRD_PARTY_IDENTITIES: "acme" }, registryPath: reg, check: true }))[0]!.status).toBe("current");
+  await writeFile(join(folder, "plugins", "known_marketplaces.json"), JSON.stringify(LOCAL_MARKETS));
+  await writeFile(join(folder, "plugins", "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "jev-skills@ai-tools": [], "tasks-board@ai-tools": [] } }));
+  const calls: string[] = [];
+  await updateAllClaudePlugins({ home, env: { AIS_NO_THIRD_PARTY_IDENTITIES: "acme" }, registryPath: reg, run: async (a, d) => (d === folder && calls.push(a.join(" ")), { code: 0, output: "" }) });
+  expect(calls.join("\n")).not.toMatch(/typesafe|jev/);
+  expect(calls.join("\n")).toContain("marketplace update ai-tools");
+});
+
+test("update never touches a plugin cache outside the home: it copies it in first, or skips the plugin", async () => {
+  const folder = join(home, ".t3", "gateway", "t3-claude-kimi-pool");
+  await mkdir(join(folder, "plugins"), { recursive: true });
+  const shared = join(source, "plugins", "cache", "ai-tools", "tasks-board", "1.0.0");
+  await mkdir(shared, { recursive: true });
+  await writeFile(join(shared, "plugin.json"), "{}");
+  await writeFile(join(folder, "plugins", "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "tasks-board@ai-tools": [{ installPath: shared, version: "1.0.0" }], "gone@ai-tools": [{ installPath: join(source, "plugins", "cache", "missing"), version: "1" }] } }));
+  const blocked = await localisePluginPaths(folder);
+  const after = (await read(join(folder, "plugins", "installed_plugins.json"))).plugins;
+  expect(after["tasks-board@ai-tools"][0].installPath).toBe(join(folder, "plugins", "cache", "ai-tools", "tasks-board", "1.0.0"));
+  expect(await readFile(join(after["tasks-board@ai-tools"][0].installPath, "plugin.json"), "utf8")).toBe("{}");
+  // the shared cache stays as it was
+  expect(await readFile(join(shared, "plugin.json"), "utf8")).toBe("{}");
+  expect(blocked.get("gone@ai-tools")).toContain("not updated");
+  expect(blocked.has("tasks-board@ai-tools")).toBe(false);
 });
