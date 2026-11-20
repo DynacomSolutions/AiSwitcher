@@ -25,7 +25,7 @@ const realOrNormal = (dir: string, real: (p: string) => string): string => {
 
 /** Folder-name candidates for a T3 gateway folder, in order of preference. */
 function t3GatewayCandidates(folderName: string): string[] {
-  const stem = folderName.replace(/^t3-(?:claude|codex)-/, "");
+  const stem = folderName.replace(/^t3-(?:claude|codex)-/, "").replace(/^claude-/, "");
   // No kimi-/zai- stripping: a Kimi or Z.ai backed session must never get a Claude identity's browser,
   // because it would send page content to another provider.
   return [...new Set([folderName, stem])];
@@ -63,6 +63,9 @@ export function identityForConfigDir(
   const target = normaliseDir(configDir);
   const direct = live.find((i) => normaliseDir(i.configDir) === target);
   if (direct) return direct;
+  // A folder directly in the T3 gateway folder maps by its name. The name wins over a transcript link that points to another identity.
+  const byName = identityForT3GatewayFolder(live, configDir, t3Gateway, real);
+  if (byName) return byName;
   for (const sub of TRANSCRIPT_LINKS) {
     let linked: string;
     try {

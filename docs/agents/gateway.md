@@ -358,6 +358,14 @@ Files keep their mode. The host profile-sync daemon (`ais __profile_sync_daemon`
 0.1.7 reads an ACP picker from the live config of the instance's latest session, so a new model shows after a new session
 of that instance starts.
 
+T3 Claude homes (`<T3 home>/gateway/pool-home`, `t3-claude-<id>`) are full copies of their source identity (the pool home maps
+to the swap pool, `t3-claude-<id>` to identity `<id>`): `settings.json` with all keys, enabled plugins, plugin configs, marketplaces,
+hooks and `cleanupPeriodDays`. Only the gateway auth and routing env keys, the attribution keys and the `ais claude-swap` hook differ.
+The two plugin JSON files keep the absolute paths of the source, so the home reads the source plugin trees. For a restricted identity no
+Jev, typesafe or telemetry plugin, marketplace, hook or env key is copied. `ais gateway t3-instance` builds the home this way
+(`--source=<identity>|none`; `--like` only gives the binary path). `ais gateway t3-claude-sync [--check]` repairs or reports all homes;
+the profile-sync daemon runs the check every 10 minutes and logs drift (`src/shared/t3-claude-sync.ts`).
+
 ### T3 Code ACP agents: a failed turn shows its error (`src/acp/`)
 
 T3 Code runs Kimi, Grok and Z.ai through ACP agents from its registry (`kimi-code`, `grok-build`, `glm-acp-agent`). It

@@ -5,8 +5,14 @@ import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { connect, type GatewayCliDeps } from "./apps.ts";
 import { readSecretsKey } from "./secrets-file.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { expandPath } from "../../identities/match.ts";
+import { findIdentityByNameOrAlias } from "../../identities/store.ts";
+import { t3Paths } from "../../identities/t3-anthropic-proxy.ts";
+import { isNoThirdParty, loadClaudeIdentities, noThirdPartyNames, t3ClaudeSource } from "../../shared/t3-claude-source.ts";
 
-const USAGE = "Usage: ais gateway t3-instance <instance-id> --driver=claude|grok|opencode|pi --app=<gateway app> [--name=<name>|--display-name=<name>] [--provider=<slug>] [--models=a,b] [--like=<claude instance id>] [--binary=<path>] [--check] [--remove]";
+const USAGE = "Usage: ais gateway t3-instance <instance-id> --driver=claude|grok|opencode|pi --app=<gateway app> [--name=<name>|--display-name=<name>] [--provider=<slug>] [--models=a,b] [--source=<identity>|none] [--like=<claude instance id, for the binary path only>] [--binary=<path>] [--check] [--remove]";
 
 /**
  * `ais gateway t3-instance`: creates or updates one T3 Code provider instance whose folder holds only the gateway app
@@ -58,6 +64,21 @@ export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["fl
         }
       }
     }
+  }
+  if (driver === "claude" && !remove) {
+    const home = opts.home ?? homedir();
+    const t3Home = t3Paths({ home, ...(opts.env ? { env: opts.env } : {}) }).t3Home;
+    const registry = await loadClaudeIdentities(join(home, ".claude", "identities.json"));
+    const given = stringFlag(flags, "source");
+    const restricted = noThirdPartyNames({ home, ...(opts.env ? { env: opts.env } : {}) });
+    // The target home's own identity counts as well as the source: either one in the list restricts the home.
+    const target = t3ClaudeSource(registry, join(t3Home, "gateway", id), t3Home, restricted);
+    if (given === "none") base.source = "none";
+    else if (given) {
+      const identity = findIdentityByNameOrAlias(registry.identities, given);
+      if (!identity) throw new CliUsageError(`--source ${given} is not a Claude identity`);
+      base.source = { dir: expandPath(identity.configDir), noThirdParty: isNoThirdParty(identity, restricted) || target?.noThirdParty === true };
+    } else if (target) base.source = { dir: target.dir, noThirdParty: target.noThirdParty };
   }
   const r = await applyT3Instance(base);
   const detail = r.changes.length > 0 ? `${check ? " (differs" : " (changed"}: ${r.changes.join(", ")})` : "";
