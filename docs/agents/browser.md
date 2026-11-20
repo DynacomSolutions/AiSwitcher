@@ -58,6 +58,7 @@ Design:
 - It is stateless. `initialize`, `ping` and `tools/list` do the token check and nothing else: no store, database or file work, so tool registration stays cheap under load. Any gateway replica can answer any request.
 - `tools/call` runs the `/browser/call` code in-process (`createBrowserCaller` in `src/gateway/browser/routing.ts`). It makes no HTTP call to itself.
 - Shared parts of the shim and the endpoint (`BROWSER_INSTRUCTIONS`, `mapCallResult`, protocol versions) live in `src/browser/mcp-core.ts`. It has no Node or file system code.
+- Cancel: a client cancels with a separate `notifications/cancelled` POST. The gateway keeps each running call under a hash of (identity, session id, request id) and aborts it. The cancel may reach another replica, so it also goes out as a NOTIFY on the browser channel (`cancel`), and every replica aborts a matching call. A cancel from another identity never matches.
 - Metric: `ais_gateway_browser_mcp_requests_total{method,outcome}`. The labels come from fixed sets (see `src/gateway/metrics.ts`).
 
 Session description (request headers, set at launch and validated by the gateway):
@@ -70,7 +71,8 @@ Launch wiring (`browserMcpArgs`, `browserLaunchWiring`, `run-wrapper`):
 - When the gateway URL is known (`AIS_GATEWAY_PROXY_URL`, env or `~/.secrets`) and a token file is readable, the launch wires the HTTP form to `<gateway>/browser/mcp`. The token is the identity's token. For a pool it is the active member's token, else the token of any allowed member.
 - Claude: `--mcp-config` with `type: http` and headers. `Authorization` is `Bearer ${AIS_BROWSER_AGENT_TOKEN}`: Claude Code expands the variable. Codex 0.167: `url`, `bearer_token_env_var="AIS_BROWSER_AGENT_TOKEN"`, `http_headers` and `tool_timeout_sec=135`.
 - The token is set only in the environment of the launched tool, never in argv. `MCP_TOOL_TIMEOUT` stays for Claude (see Tool timeout).
-- The session label is the T3 thread title (read-only lookup, `src/browser/t3-thread-title.ts`, 150 ms busy limit, 200 ms wait), else `<Tool> in <folder>`.
+- The session label is the T3 thread title (read-only lookup, `src/browser/t3-thread-title.ts`). The lookup is synchronous, so the bound on a launch delay is the 150 ms SQLite busy timeout plus the open time, not a timer. It runs only when a token exists.
+- The token is fixed when the session starts. It still works across pool swaps while the launch member stays an allowed pool member. If that member is removed, retired or gets a new token, calls fail with a tool error that says to restart the session to pick up the new token.
 - The launch starts no process and probes nothing. Without a gateway URL or a token it uses the stdio form `ais browser mcp`, as before.
 - `ais browser wiring` prints `mode: http` or `mode: stdio` (`--json` adds `mode` to each row).
 - A session that started before a change keeps its old wiring until you resume it.
@@ -78,7 +80,7 @@ Launch wiring (`browserMcpArgs`, `browserLaunchWiring`, `run-wrapper`):
 Local proxy: Claude sessions run with `HTTPS_PROXY` set to the local gateway proxy and `NODE_EXTRA_CA_CERTS`. That proxy (`src/gateway/connect-relay.ts`, `src/gateway/usage-proxy.ts`) pipes every CONNECT as plain TCP bytes. It reads TLS only for `api.anthropic.com`, `opencode.ai` and `cli-chat-proxy.grok.com` on port 443. A request to the gateway's own `/browser/mcp` passes unchanged, with its `Authorization` header, and an open tunnel has no timeout, so a 135 s call is fine. No `NO_PROXY` entry is needed.
 
 Session end:
-- `DELETE <gateway>/browser/mcp` (with `X-AIS-Session-Id` or `Mcp-Session-Id`) sends the session end notice, so the extension closes the tabs the session created.
+- The `initialize` reply always carries `Mcp-Session-Id` (the launch's session id, else a new one), so the client sends it back. `DELETE <gateway>/browser/mcp` (with `X-AIS-Session-Id` or `Mcp-Session-Id`) sends the session end notice, so the extension closes the tabs the session created.
 - There is no timer that closes tabs. A tab may wait for the owner (see "When to close a tab"). The stdio shim keeps its own end notice when the agent process ends.
 
 Deploy: the gateway image must contain this code. No new config is needed. The deploy requirements below (Mapping timeout, replicas) already cover `/browser/mcp`.
@@ -121,7 +123,7 @@ A page blocked by a JavaScript dialog (alert, confirm, prompt, or beforeunload "
 - A ref to the file input itself: the files are set on it directly.
 - Anything else (the button or drop area that opens the file dialog, also inside an iframe): the extension clicks it with file chooser interception on (`Page.setInterceptFileChooserDialog`), so no dialog opens in the owner's window, and sets the files on the input that asked for them. Interception is on for that call only; the owner's own file dialogs open as usual. A cross-origin iframe is its own debugger target, so the first upload in a tab attaches to the tab's iframes (`Target.setAutoAttach`, iframes only) to catch a chooser opened inside one.
 
-Gateway MCP server: it cannot read the agent's files, so `upload_file` with `paths` there answers a tool error. The error holds the command to run in the agent's shell, with the real session id: `ais browser upload --session <id> --tab <tabId> (--ref <ref> | --coordinate <x,y>) [--browser <name>] <paths...>`. The command reads the files locally with the same limits, finds the token as a launch does (the identity of `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, a pool's active member, or `--identity` and `--pool`), and posts one `upload_file` call with the content to `<gateway>/browser/call`. `upload_file` with `files` (content) works over the gateway as on the wire.
+Gateway MCP server: it cannot read the agent's files, so `upload_file` with `paths` there answers a tool error. The error holds the command to run in the agent's shell, with the real session id: `ais browser upload --session <id> [--label <name>] --tab <tabId> (--ref <ref> | --coordinate <x,y>) [--browser <name>] <paths...>`. The command reads the files locally with the same limits, finds the token as a launch does (the identity of `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, a pool's active member, or `--identity` and `--pool`), and posts one `upload_file` call with the content to `<gateway>/browser/call`. `upload_file` with `files` (content) works over the gateway as on the wire.
 
 Isolation: no tool reads a file from the disk of the machine that runs Chrome, so an agent cannot reach other identities' tokens or `~/.secrets` there. The gateway and the extension accept file content only: the wire schema has no path field, a name with a folder in it is refused, and the gateway answers 400 before any browser sees the call. The extension builds the `File` objects in the page from the content (`DataTransfer`) and never calls `DOM.setFileInputFiles`, the debugger command that takes host paths. Do not add a tool or argument that takes a path on the Chrome host.
 
