@@ -3,7 +3,7 @@
 Track product work, bugs and acceptance evidence. Routine Git operations are not tasks.
 
 ## 1. Product work
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-21 18:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 1 | Preserve Grok's explicit memory control through the identity launcher | done | grok_memory_fix | | | | Exact-key forwarding and four real-subprocess regressions are source-reviewed. Focused QA completed successfully; full CI on `97ae2de` passed typecheck and 609 tests across 76 files with zero failures. Compiled launcher inspected live: both launcher and real Grok child receive `GROK_MEMORY=0`. Installed binary matches the tested candidate byte-for-byte, with a rollback copy; other launchers and shared memory settings are unchanged. Other session markers and explicit child overrides remain intact. |
@@ -125,7 +125,7 @@ ETA: 2026-11-07 18:00 ICT
 | 98 | Fix main CI: spend guard canary and Host app Browser smoke | done | claude-20261031-main-ci-red | main-ci-red | | 2026-10-31 23:30 ICT | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/319 (b9e97f3).<br>Canary tests now use the Bun binary as `codex`; @playwright/test 1.58.2 to 1.64.1 for ubuntu26.04.<br>All PR 319 checks green. |
 
 ## 4. AIS AI Gateway for cluster apps
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -179,7 +179,7 @@ ETA: 2026-11-15 23:00 ICT
 | 220 | Gateway: a revoked app stays revoked, its old tokens never work again | done | claude | gateway-revoke-revive | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/599 (41dfaf3), live on all 6 replicas.<br>Revoked name: add, rotate and admin PUT and mint give 409.<br>Leaked revoked tokens give 401 on every replica. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-20 14:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -224,7 +224,7 @@ ETA: 2026-11-20 14:00 ICT
 | 241 | Limit answers use the true reset of the full window | done | agent | gw-limit-true-reset | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/642 (ccecd57), Opus review fixed.<br>Live on all 6 cluster gateway pods (binary has fetchOpencodeUsage).<br>Not yet seen live: a real limit answer with the weekly reset. |
 | 244 | Release tests stop failing on the Kimi refresh and SIGTERM drain checks | in_progress | agent | fix-release-flaky-tests | | 2026-11-20 18:30 ICT | Kimi test failed when an earlier test file left the gateway owner role set.<br>Drain test failed when its probe connection was reset.<br>Both tests made deterministic. |
 ## 6. Browser control extension
-ETA: 2026-11-18 18:30 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -245,28 +245,28 @@ ETA: 2026-11-18 18:30 ICT
 | 202 | AIS Browser: agents upload a file to a page (`upload_file`) without reading the host disk | done | claude | ais-browser-upload | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/544 (c2d2f01), released v0.5.55.<br>Shim reads the agent's paths on its own machine and sends content only; gateway answers 400 to a path or more than 10 MiB; extension sets files in the page (DataTransfer) and intercepts the file chooser, also in cross-origin iframes.<br>Real Chromium e2e: direct input, button, on-the-fly input, cross-origin iframe, 9 MiB SHA-256 checked. Follow-ups: read_page/find in iframes; full-resolution region screenshot. |
 | 203 | AIS Browser tools reach T3 per-account sessions: a preset config folder whose transcript link (`projects` / `sessions`) points into a registered identity's folder gets that identity's browser wiring | done | claude | | 6.194 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/549 (8611d95), released v0.5.56.<br>Owner request 2026-11-17 after 6.194: per-account T3 Claude/Codex providers use their own folders outside the registry, with no browser token, so they got no browser tools. |
 | 205 | AIS Browser extension uses the AIS icon (toolbar, chrome://extensions, side panel) | done | claude | | | | The manifest had no `icons`, so Chrome showed a placeholder. Icons are rendered from `apps/web/public/icon.svg`.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/555 (088b16e), released in v0.5.58. |
-| 207 | AIS Browser sees and answers JavaScript dialogs (alert, confirm, prompt, beforeunload) on agent tabs | done | claude | | | | Live report: close_tab on a page with unsaved changes hung on "Leave site?" until the 30 s timeout.<br>Extension tracks dialogs via CDP; calls on a tab with one fail at once with `dialog_open` (type, message); tabs_context shows it; new tool `handle_dialog {tabId, accept, promptText?}`. Never auto-accepts; beforeunload accept discards changes and the description says so.<br>A dialog opened before the attach (Chrome never reports it): calls fail in 5 s naming it, adopt_tab still adopts.<br>Real Chromium e2e: alert, prompt, confirm, beforeunload on close_tab and navigate, pre-attach.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/559 (8f94ed2) as row 6.206 (id taken by 5.206; renumbered), released v0.5.59. |
+| 246 | AIS Browser sees and answers JavaScript dialogs (alert, confirm, prompt, beforeunload) on agent tabs | done | claude | | | | Was 207.<br>Live report: close_tab on a page with unsaved changes hung on "Leave site?" until the 30 s timeout.<br>Extension tracks dialogs via CDP; calls on a tab with one fail at once with `dialog_open` (type, message); tabs_context shows it; new tool `handle_dialog {tabId, accept, promptText?}`. Never auto-accepts; beforeunload accept discards changes and the description says so.<br>A dialog opened before the attach (Chrome never reports it): calls fail in 5 s naming it, adopt_tab still adopts.<br>Real Chromium e2e: alert, prompt, confirm, beforeunload on close_tab and navigate, pre-attach.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/559 (8f94ed2) as row 6.206 (id taken by 5.206; renumbered), released v0.5.59. |
 | 216 | AIS Browser: `resize` emulates the viewport, never resizes the owner's window | done | claude | browser-no-window-resize | | | Was 215 (id taken by 5.215). Merged https://github.com/DynacomSolutions/AiSwitcher/pull/576 (20ded5a). Ships in v0.5.65 (PR #578).<br>`resize` sends CDP Emulation.setDeviceMetricsOverride to the tab. The extension has no windows API.<br>Real Chromium e2e: page sees 2400x1400 then 1280x800. |
-| 217 | AIS Browser guidance: keep a tab open while it waits for the owner | done | claude | browser-keep-tabs | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/577 (121e12e), ships in v0.5.66.<br>Owner request 2026-11-18: an agent closed its tab at a "Verify that it's you" page, then asked the owner to sign in there.<br>Rule is in docs/agents/browser.md, the `close_tab` and `tabs_create` descriptions and the MCP server instructions (new).<br>Sessions get it after `ais update` and a new session start. Was 215. |
+| 247 | AIS Browser guidance: keep a tab open while it waits for the owner | done | claude | browser-keep-tabs | | | Was 217.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/577 (121e12e), ships in v0.5.66.<br>Owner request 2026-11-18: an agent closed its tab at a "Verify that it's you" page, then asked the owner to sign in there.<br>Rule is in docs/agents/browser.md, the `close_tab` and `tabs_create` descriptions and the MCP server instructions (new).<br>Sessions get it after `ais update` and a new session start. Was 215. |
 | 228 | AIS Browser: T3 gateway folders get browser tools; tab groups show the thread title, never an id | done | claude | | | | Fix: [#616](https://github.com/DynacomSolutions/AiSwitcher/pull/616) (4745d07), release v0.5.76 [#619](https://github.com/DynacomSolutions/AiSwitcher/pull/619).<br>Proof: `ais browser wiring` shows the T3 pool folder wired, and a resumed T3 session lists all 22 browser tools.<br>Proof: owner saw the thread title on a new tab group (20 Nov).<br>MCP registration timeout under load: moved to the shared MCP service task. |
 | 240 | AIS Browser: one shared MCP service for every session, started on demand | in_review | claude | browser-mcp-gateway | | 2026-11-20 16:00 ICT | The shared MCP server is the gateway: `POST /browser/mcp`, stateless, bearer agent token.<br>No host daemon and no systemd unit (owner decisions 19 and 20 Nov 2026). The PR 635 host daemon is removed.<br>Launch headers carry session id, label and pool. DELETE ends the session. upload_file paths use `ais browser upload`.<br>Needs a gateway image rollout to go live. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 127 | One host-level profile-sync watcher instead of a scan per session sidecar | in_review | claude-20261105-sync-daemon | perf/host-profile-sync-daemon | | 2026-11-06 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/375<br>`ais __profile_sync_daemon`, 30 s poll; sidecars only register.<br>`ais update` and install:shims install and start the unit; not installed on any host yet.<br>Was 124. |
 
 ## 8. Gateway client under a base path
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 148 | Prove gateway clients keep a base path such as /gateway | in_progress | claude | gateway-url-path | | 2026-11-07 22:00 ICT | No built-in gateway host exists; URL comes from AIS_GATEWAY_PROXY_URL only<br>Tests for local proxy and browser shim; docs use example.com<br>Was 142. |
 
 ## 9. Console image security
-ETA: 2026-11-12 12:00 ICT
+ETA: 2026-11-21 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -311,7 +311,7 @@ Keep new codex releases working against the AIS gateway placeholder login.
 | 182 | Gateway answers codex 0.167 workspace routing discovery (`wham/accounts/check`) | done | claude | codex-accounts-check | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/498 (f1749d5); live on dev/ais-gateway.<br>codex 0.167 `account/read` now passes on all three T3 gateway Codex instances. |
 | 185 | Local gateway serves HTTPS for codex 0.167 (pool identity) | done | claude | codex-local-https | 13.182 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/501 (f0d6377); host updated, local gateway serves HTTPS on 47141.<br>Pool home moved to https://localhost:47141; codex 0.167 `account/read` and `model/list` pass; all four T3 Codex instances load. |
 | 186 | Backup keeps corrupt SQLite files as raw copies, without a warning every run | done | claude | backup-codex-quarantine | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/504 (ec3c38a); host updated.<br>Live codex backup: 66 snapshotted, 0 skipped, 3 kept as raw copies, no corruption warnings. |
-| 187 | Backup skips codex `.tmp/` scratch clones | done | claude | backup-codex-dot-tmp | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/507 (2f18716); host updated.<br>First run dropped 145,215 tracked `.tmp` files (one catch-up run with a longer budget).<br>Live codex backup: committed, 0 index errors, 0 warnings. |
+| 248 | Backup skips codex `.tmp/` scratch clones | done | claude | backup-codex-dot-tmp | | | Was 187.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/507 (2f18716); host updated.<br>First run dropped 145,215 tracked `.tmp` files (one catch-up run with a longer budget).<br>Live codex backup: committed, 0 index errors, 0 warnings. |
 
 ## 14. Gateway survives any node loss
 ETA: 2026-11-15 23:00 ICT
@@ -335,7 +335,7 @@ One refresher per login across replicas and hosts, early renewal, a dead grant n
 | 223 | WebUI Auth page shows the gateway renewal state, not a stale host stamp | done | claude | webui-gateway-renewal | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/607 (3f42f80).<br>Live API check: every gateway login shows its real last and next refresh. |
 | 224 | Watchdog rules: login not renewed within its lifetime, login revoked | done | claude | gateway-refresh-alerts-kimi | 15.221 | | Rules merged in .cluster PR 2646.<br>Kimi exception merged in .cluster PR 2657. |
 | 225 | Release, rollout to the host and the cluster, check no login lapses after one token lifetime | done | claude | | 15.221, 15.222, 15.223, 15.224 | | Host and all gateway pods on 0.5.76.<br>20 Nov check: 14 gateway logins, 0 revoked, 0 lapsed, 0 overdue.<br>No failed or dead refresh in 24 h. |
-| 240 | The gateway manages every live claude login; no "not managed" refusal for a login it serves | done | claude | gateway-manages-all-claude | 15.227 | | Fixes a regression from row 227 and a store prune (502 for one identity).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/621 (63593d2).<br>Live: the login renews in the gateway every 4 h, requests return 200. |
+| 245 | The gateway manages every live claude login; no "not managed" refusal for a login it serves | done | claude | gateway-manages-all-claude | 15.227 | | Was 240.<br>Fixes a regression from row 227 and a store prune (502 for one identity).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/621 (63593d2).<br>Live: the login renews in the gateway every 4 h, requests return 200. |
 | 231 | Kimi login has one refresher: the gateway usage poll no longer rotates it, pools hold no refresh token | done | claude | kimi-single-refresher | 15.221 | | Was 226 (id taken by 11.226).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/611 (00b8524), Opus review fixed.<br>Live: kimi journal chain continuous, one renewal per tick. |
 | 227 | Credential store holds only logins the gateway manages; WebUI ownership from the gateway list | done | claude | store-owned-matches-gateway | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/612 (375b818), Opus review fixed.<br>Prune removed 2 stale rows; live host copies kept. |
 
