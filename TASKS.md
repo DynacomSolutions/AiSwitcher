@@ -179,7 +179,7 @@ ETA: 2026-11-15 23:00 ICT
 | 220 | Gateway: a revoked app stays revoked, its old tokens never work again | done | claude | gateway-revoke-revive | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/599 (41dfaf3), live on all 6 replicas.<br>Revoked name: add, rotate and admin PUT and mint give 409.<br>Leaked revoked tokens give 401 on every replica. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-20 03:00 ICT
+ETA: 2026-11-20 14:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -208,6 +208,7 @@ ETA: 2026-11-20 03:00 ICT
 | 235 | Usage page: no duplicate gateway rows, no fake "-" identity | done | claude | usage-view-dupes | 5.232 | | Shipped in https://github.com/DynacomSolutions/AiSwitcher/pull/631 (b9ccdf3).<br>Live: 0 duplicate rows, "-" folded into "Gateway (no account)".<br>Also fixed route-all test exit code (Bun ignores exitCode=undefined). |
 | 236 | Import host usage history into the gateway database | done | claude | usage-history-import | 5.232 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/630 (00a1f79).<br>Imported 20 Nov: 822 rows, $195,191.91, host and gateway agree for every identity.<br>Backup first: HoardDB bucket ais-usage-archive, SHA-256 checked. |
 | 237 | Usage page: everything from the gateway, nothing from the host scan | done | claude | usage-gateway-only | 5.236 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/631 (b9ccdf3).<br>Live 20 Nov: all-time $210,699.66, pre-Nov $104,814 kept, no host scan (0.7 s).<br>Imported history stops at 20 Nov; later usage counts only via the gateway. |
+| 238 | Gateway usage reads stay fast as the ledger grows (15-minute rollup) | in_review | claude | usage-rollups | | 2026-11-20 14:00 ICT | Continuous aggregate `gateway_usage_15m`, real-time on, refresh every 5 min.<br>Wide ranges read the rollup, edges read the raw ledger.<br>Before: all-time daily 383 ms, by identity and by model about 80 ms each. |
 
 | 177 | Usage breakdown: tokens and cost per project, repo and GitHub org | done | claude | ais-webui-tabs-usage-breakdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/489 (4b3910f), released v0.5.47.<br>Breakdown collector records each session's cwd (Claude line cwd, Codex session_meta/turn_context) and maps it to git toplevel and origin owner/repo from .git files.<br>Shown on Usage tabs Projects, Repos, Orgs. |
 | 187 | Usage projects, repos and orgs from the usage store so totals match the Usage page | done | claude | usage-projects-native | | 2026-11-12 12:00 ICT | Was 186. Local org folders count toward their org.<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/502.<br>v0.5.47 tabs read transcripts: All time capped to 30 d ($3k vs $184k), deleted transcripts missing, Claude counted 1.7-3.5x.<br>Usage store messages carry workspace_key for 100% of $180k. |
