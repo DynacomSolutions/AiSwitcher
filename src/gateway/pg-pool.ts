@@ -1,3 +1,5 @@
+import { SQL } from "bun";
+
 /**
  * Shared Bun SQL pool options for the gateway.
  *
@@ -10,7 +12,11 @@ export interface PgPoolOptions {
   idleTimeout?: number;
 }
 
-export const DEFAULT_PG_POOL_MAX = 4;
+/**
+ * One pool serves the whole process: stores, readings, ping and refresh lock holders. Each lock holder pins one
+ * connection, and two stay free for normal queries (see PgRefreshBackend). A size of 6 gives four holders.
+ */
+export const DEFAULT_PG_POOL_MAX = 6;
 export const DEFAULT_PG_IDLE_TIMEOUT_S = 30;
 
 function positiveInt(raw: string | undefined, fallback: number): number {
@@ -29,4 +35,32 @@ export function pgPoolOptions(opts: { maxCap?: number; idle?: boolean } = {}, en
   if (opts.maxCap !== undefined) max = Math.min(max, opts.maxCap);
   if (opts.idle === false) return { max };
   return { max, idleTimeout: positiveInt(env.AIS_GATEWAY_PG_IDLE_TIMEOUT_S, DEFAULT_PG_IDLE_TIMEOUT_S) };
+}
+
+const shared = new Map<string, { sql: SQL; users: number }>();
+
+/**
+ * The process-wide pool for a database URL, created on first use. Components use it instead of opening their own pool,
+ * so one gateway process holds one pool (plus one LISTEN connection and one leader connection) on the pooler.
+ * Each caller counts as one user. A component must never close the pool itself: the user calls `releaseGatewaySql`
+ * once at shutdown, and the pool closes when the last user has released it (several gateways can share a process in tests).
+ */
+export function getGatewaySql(url: string): SQL {
+  let entry = shared.get(url);
+  if (!entry) {
+    entry = { sql: new SQL(url, pgPoolOptions()), users: 0 };
+    shared.set(url, entry);
+  }
+  entry.users += 1;
+  return entry.sql;
+}
+
+/** Gives a user's hold back. Closes the pool when no user is left. Safe to call for an unknown URL. */
+export async function releaseGatewaySql(url: string): Promise<void> {
+  const entry = shared.get(url);
+  if (!entry) return;
+  entry.users -= 1;
+  if (entry.users > 0) return;
+  shared.delete(url);
+  await entry.sql.close().catch(() => undefined);
 }

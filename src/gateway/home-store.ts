@@ -1,5 +1,6 @@
 import { SQL } from "bun";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import type { PgListener } from "./pg-listen.ts";
 import { pgPoolOptions } from "./pg-pool.ts";
 
 /**
@@ -106,17 +107,25 @@ export function assertRelPath(path: string): void {
 /** The table behind the store. One pool per process; every call bounded on the client. */
 export class PgHomeStore {
   readonly sql: SQL;
+  private readonly ownsSql: boolean;
   constructor(
     url: string,
     private readonly key: Buffer,
     readonly holder: string = `${process.env.HOSTNAME ?? "gateway"}:${process.pid}`,
     private readonly warn: (message: string) => void = (m) => console.warn(`gateway store: ${m}`),
+    /** The process-wide pool and LISTEN connection. The store never closes them. Without them it owns a pool. */
+    shared: { sql?: SQL; listener?: PgListener } = {},
   ) {
-    this.sql = new SQL(url, pgPoolOptions({ maxCap: 4 }));
+    this.ownsSql = !shared.sql;
+    this.sql = shared.sql ?? new SQL(url, pgPoolOptions({ maxCap: 4 }));
+    this.listener = shared.listener;
   }
 
+  private readonly listener: PgListener | undefined;
+
+  /** Closes the store's own pool. A shared pool stays open. */
   async close(): Promise<void> {
-    await this.sql.close();
+    if (this.ownsSql) await this.sql.close();
   }
 
   async ping(): Promise<void> {
@@ -257,6 +266,7 @@ export class PgHomeStore {
    * ends the handle that is current at that moment, and a subscriber that joins after that gets a fresh LISTEN.
    */
   async listen(onPath: (path: string) => void): Promise<() => Promise<void>> {
+    if (this.listener) return this.listener.listen(HOME_FILES_CHANNEL, onPath);
     const sub = { cb: onPath };
     await this.serial(async () => {
       this.listeners.add(sub);

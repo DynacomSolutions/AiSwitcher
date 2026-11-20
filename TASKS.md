@@ -354,12 +354,12 @@ The console serves the Headlamp widget panel API, so its identities, limits and 
 | 247 | Widgets: no row cap, no Other bucket | done | claude | widgets-no-cap | 16.242 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/654 (81eb879).<br>Live: agents 120 of 120 rows, gateway usage 83 of 83. |
 
 ## 17. Rollouts without cold limits
-ETA: 2026-11-21 00:30 ICT
+ETA: 2026-11-21 02:00 ICT
 A new gateway or console pod takes traffic only after its usage cache is warm, so limits views never go blank during a rollout.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 248 | Gateway readiness waits for the first usage poll of every identity (bounded) | done | claude | gateway-warm-readiness | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/662 (e23f077).<br>Live 14:40 UTC: 6 pods warm in 0.8 to 1.0 s, no timeouts; a pod waiting on the database stayed unready. |
 | 249 | Console readiness waits for its first limits read (bounded) | done | claude | gateway-warm-readiness | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/662 (e23f077).<br>.cluster https://github.com/DynacomSolutions/.cluster/pull/2836 (c07e147): preStop, 120 s ceiling, 5 s probe timeouts. |
-| 250 | Check the gateway and console rollout path, then verify a real rollout | blocked | claude | | 17.248, 17.249, 17.251 | 2026-11-21 01:30 ICT | Probes, drain and maxSurge/maxUnavailable checked (.cluster PR 2836).<br>First rollout check failed: usage 429s left 3 Anthropic rows without data. Waits on 17.251. |
-| 251 | Gateway replicas share usage readings in PostgreSQL | in_review | claude | gateway-readings-pooler | 17.248 | 2026-11-21 01:30 ICT | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/664 (887597e).<br>Live: pooler refused statement_timeout, so no shared reads; fix in gateway-readings-pooler. |
+| 250 | Check the gateway and console rollout path, then verify a real rollout | done | claude | ais-warm-readiness | 17.248, 17.249, 17.251 | | Probes, drain and maxSurge/maxUnavailable fixed in https://github.com/DynacomSolutions/.cluster/pull/2836.<br>Live 18:00, 18:21 and 18:32 UTC 21 Nov rollouts: 339 widget reads, 0 "No limit data". |
+| 251 | Gateway replicas share usage readings in PostgreSQL | done | claude | gateway-readings-pooler | 17.248 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/664 and https://github.com/DynacomSolutions/AiSwitcher/pull/670 (e32d8c2).<br>Live: about 80% of claude reads shared, 0 shared errors, 0 warm-up timeouts. |
