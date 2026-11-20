@@ -232,6 +232,43 @@ export async function resolvePoolAuth(poolName: string, tool: string, registryPa
   return { identity: name, token };
 }
 
+/** Everything one session context needs, from explicit values (the stdio shim reads them from its env, the shared daemon from request headers). */
+export interface ContextSpec {
+  /** Session key: sent to the gateway as `session.id`. */
+  id: string;
+  identity: string;
+  tool?: ChatTool;
+  /** Folder that holds the browser token (identity mode). */
+  configDir?: string;
+  /** Folders that may hold the transcript of the session, for the chat name. */
+  configDirs: string[];
+  gateway?: string;
+  /** Swap pool name: resolves the active member on each call. */
+  pool?: string;
+  /** Tool whose registry resolves the pool (default: `tool`, else claude). */
+  poolTool?: string;
+  registryPath?: string;
+  /** Transcript id, or a lookup for it, for the chat name. */
+  lookup?: string | (() => Promise<string | undefined>);
+  cwd?: string;
+  /** Env used for the token fallback, the gateway URL, the T3 title and the label (T3CODE_*, AIS_SESSION_NAME, CLAUDE_CONFIG_DIR, CODEX_HOME). */
+  env: NodeJS.ProcessEnv;
+  fetch?: typeof fetch;
+}
+
+export function contextFromSpec(spec: ContextSpec): ShimContext {
+  const { env, tool } = spec;
+  return {
+    chatName: chatNameResolver({ ...(tool && spec.lookup ? { tool, id: spec.lookup } : { tool }), configDirs: spec.configDirs, ...(spec.cwd ? { cwd: spec.cwd } : {}) }, env),
+    gatewayUrl: async () => spec.gateway || env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL")),
+    token: () => readToken(env, spec.configDir),
+    ...(spec.pool ? { resolveAuth: () => resolvePoolAuth(spec.pool!, spec.poolTool ?? tool ?? "claude", spec.registryPath) } : {}),
+    session: { id: spec.id, identity: spec.identity, label: sessionName(env, tool, spec.cwd) },
+    fetch: spec.fetch ?? fetch,
+    inflight: new Map(),
+  };
+}
+
 export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimOptions = {}): ShimContext {
   // Without a session id from the agent, key the session on the parent agent process: a respawned shim keeps the same session (and tab group) instead of starting a new one.
   const claudeId = env.CLAUDE_CODE_SESSION_ID || env.CLAUDE_SESSION_ID;
@@ -242,15 +279,19 @@ export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimO
   const configDirs = [...new Set([opts.configDir, tool === "codex" ? codexHome : env.CLAUDE_CONFIG_DIR].filter((d): d is string => !!d))];
   // The session key stays `agent-<ppid>` for Codex without an id in the env; only the NAME lookup finds the thread.
   const lookup = tool === "claude" && claudeId ? claudeId : tool === "codex" ? (env.CODEX_SESSION_ID || (() => findCodexThreadId(configDirs[0] ?? codexHome, process.ppid, process.cwd()))) : undefined;
-  return {
-    chatName: chatNameResolver({ ...(tool && lookup ? { tool, id: lookup } : { tool }), configDirs }, env),
-    gatewayUrl: async () => opts.gateway || env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL")),
-    token: () => readToken(env, opts.configDir),
-    ...(opts.pool ? { resolveAuth: () => resolvePoolAuth(opts.pool!, opts.tool ?? "claude", opts.registryPath) } : {}),
-    session: { id, identity, label: sessionName(env, tool) },
-    fetch,
-    inflight: new Map(),
-  };
+  return contextFromSpec({
+    id,
+    identity,
+    ...(tool ? { tool } : {}),
+    ...(opts.configDir ? { configDir: opts.configDir } : {}),
+    configDirs,
+    ...(opts.gateway ? { gateway: opts.gateway } : {}),
+    ...(opts.pool ? { pool: opts.pool } : {}),
+    ...(opts.tool ? { poolTool: opts.tool } : {}),
+    ...(opts.registryPath ? { registryPath: opts.registryPath } : {}),
+    ...(lookup ? { lookup } : {}),
+    env,
+  });
 }
 
 /** Stdio MCP server: newline-delimited JSON-RPC on stdin/stdout; resolves when stdin closes. */

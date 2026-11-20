@@ -9,6 +9,7 @@ import {
 } from "../src/cli/usage/collector-service.ts";
 import { ensureNativeTokscale, TOKSCALE_FORCE_REBUILD_ENV, type NativeTokscaleResult } from "../src/cli/usage/tokscale-build.ts";
 import { installLocalGatewayService } from "../src/cli/gateway/local-service.ts";
+import { installBrowserMcpService } from "../src/cli/browser/mcp-service.ts";
 import { describeProfileSyncServiceResult, installProfileSyncService } from "../src/sync/profile-sync-service.ts";
 
 // "open" (shadows macOS's /usr/bin/open) is a macOS-only concept — see
@@ -95,6 +96,15 @@ async function configureUsageCollectorService(aisBinaryChanged: boolean): Promis
       console.error(`install: gateway local service ${unit.action}: ${unit.path}`);
     } catch (err) {
       console.error(`install: gateway local service skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // The shared browser MCP server (Linux with systemd): one process for every agent session, started on demand.
+    if (process.platform === "linux") {
+      try {
+        const unit = await installBrowserMcpService({ restartIfActive: aisBinaryChanged, respectDisabled: true });
+        console.error(`install: browser mcp service ${unit.action}: ${unit.path}`);
+      } catch (err) {
+        console.error(`install: browser mcp service skipped: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 }
