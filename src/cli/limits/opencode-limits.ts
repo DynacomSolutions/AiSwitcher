@@ -206,6 +206,8 @@ function errorMessage(err: unknown): string {
 export interface OpencodeGoQuotaOutcome {
   windows?: LimitWindow[];
   error?: string;
+  /** The endpoint answered 200 but the key has no usable Go plan: no windows, or every window untouched with no reset. */
+  noPlan?: boolean;
 }
 
 /** The live Go-plan quota read for ONE OpenCode Go credential: a legacy
@@ -239,7 +241,11 @@ export async function fetchOpencodeGoQuotaForKey(apiKey: string): Promise<Openco
 
   const windows = windowsFromOpencodeGoUsage(payload);
   if (windows.length === 0) {
-    return { error: "OpenCode Go reported no quota windows" };
+    return { error: "OpenCode Go reported no quota windows", noPlan: true };
+  }
+  // A key with no plan may answer 200 with untouched windows that carry no reset: nothing there can ever serve.
+  if (windows.every((w) => w.usedPercent === 0 && w.resetsAtMs === undefined)) {
+    return { windows, noPlan: true };
   }
   return { windows };
 }

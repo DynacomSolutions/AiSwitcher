@@ -31,7 +31,7 @@ import { errorTag, LedgerBuffer } from "./ledger-buffer.ts";
 import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
-import { createUsageSource, fetchOpencodeUsage, fetchPoolUsage, type FetchUsage } from "./usage-source.ts";
+import { createUsageSource, fetchPoolUsage, withOpencodeUsage, type FetchUsage } from "./usage-source.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
@@ -630,11 +630,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       : undefined,
   );
   const canonical = hooks.canonical ?? canonicalResolver();
-  const usage = createUsageSource({
-    fetchUsage:
-      hooks.fetchUsage ??
-      ((provider, identity, opts) => (provider === "opencode" ? creds.get(provider, identity).then((c) => fetchOpencodeUsage(c.accessToken)) : fetchPoolUsage(provider, identity, opts))),
-  });
+  const usage = createUsageSource({ fetchUsage: hooks.fetchUsage ?? withOpencodeUsage(creds, fetchPoolUsage) });
   // An unrestricted pool app uses real logins only, and of those only the ones the gateway manages.
   const poolMembers =
     hooks.poolMembers ??

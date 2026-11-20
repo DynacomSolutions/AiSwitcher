@@ -51,7 +51,7 @@ function parseReset(v: string | undefined): number | undefined {
 }
 
 /** One member's windows, in the shapes the native answers need. */
-function windowsOf(usage: PoolUsage | undefined): LimitWindow[] {
+function windowsOf(usage: PoolUsage | undefined, reservePercent = 100): LimitWindow[] {
   const out: LimitWindow[] = [];
   for (const w of usage?.windows ?? []) {
     const slot = slotOf(w.label) ?? (out.some((o) => o.slot === "short") ? "long" : "short");
@@ -62,8 +62,9 @@ function windowsOf(usage: PoolUsage | undefined): LimitWindow[] {
     if (at >= 0) {
       const have = out[at] as LimitWindow;
       // Two plain windows in one slot (a weekly and a monthly): the fuller one stands, and of two full ones the later reset.
-      const fuller = w.utilization > have.utilization || (w.utilization === have.utilization && (reset ?? 0) > (have.resetsAtSec ?? 0));
-      if (fuller && (w.model !== undefined || w.utilization >= 100 || have.utilization < 100)) out[at] = entry;
+      const later = (reset ?? 0) > (have.resetsAtSec ?? 0);
+      const bothFull = w.utilization >= reservePercent && have.utilization >= reservePercent;
+      if (w.model !== undefined ? w.utilization > have.utilization : bothFull ? later : w.utilization > have.utilization && have.utilization < reservePercent) out[at] = entry;
       continue;
     }
     out.push(entry);
@@ -76,7 +77,7 @@ function windowsOf(usage: PoolUsage | undefined): LimitWindow[] {
  * `reservePercent` has reset (the latest of those resets); with no window over the reserve, the busiest window decides.
  */
 function memberRecovery(usage: PoolUsage | undefined, reservePercent: number): { resetAtSec: number; claim: LimitSlot; windows: LimitWindow[] } | undefined {
-  const windows = windowsOf(usage);
+  const windows = windowsOf(usage, reservePercent);
   if (windows.length === 0) return undefined;
   let blocking = windows.filter((w) => w.utilization >= reservePercent);
   if (blocking.length === 0) blocking = [windows.reduce((a, b) => (b.utilization > a.utilization ? b : a))];
@@ -206,7 +207,8 @@ export function nativeLimitResponse(provider: GatewayProvider, usages: Array<Poo
  */
 export function fullWindowReset(usages: Array<PoolUsage | undefined>, reservePercent: number, now: Date): number | undefined {
   const nowSec = Math.floor(now.getTime() / 1000);
-  const full = usages.filter((u) => windowsOf(u).some((w) => w.utilization >= reservePercent));
+  // A stale figure may predate a reset: it never sets a reset here.
+  const full = usages.filter((u) => u && !u.stale && !u.noPlan && windowsOf(u, reservePercent).some((w) => w.utilization >= reservePercent));
   const info = summariseLimit(full, reservePercent, now);
   return info.guessed || full.length === 0 ? undefined : Math.max(info.resetAtSec, nowSec + 1);
 }

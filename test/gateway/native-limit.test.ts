@@ -169,7 +169,7 @@ describe("true reset at full capacity (OpenCode Go shapes)", () => {
     expect(info).toMatchObject({ resetAtSec: 1793869200, claim: "long", guessed: false });
   });
 
-  test("a short quota hold candidate later than nothing does not beat the weekly reading", () => {
+  test("the full-window reset is the weekly reset when other members have no reading", () => {
     expect(fullWindowReset([go(51, 100, T_WEEK), undefined, undefined, undefined], 100, NOW)).toBe(1793869200);
   });
 
@@ -186,5 +186,18 @@ describe("true reset at full capacity (OpenCode Go shapes)", () => {
     const x = go(100, 100, T_WEEK); // 5h and week full: latest is the week
     const y = go(100, 100, "2026-11-08T09:00:00.000Z");
     expect(summariseLimit([y, x], 100, NOW).resetAtSec).toBe(1793869200);
+  });
+
+  test("a stale figure never sets a full-window reset", () => {
+    expect(fullWindowReset([{ ...go(51, 100, T_WEEK), stale: true }], 100, NOW)).toBeUndefined();
+  });
+
+  test("a no-plan reading sets no reset", () => {
+    expect(fullWindowReset([{ status: "unavailable", noPlan: true, capturedAt: NOW.toISOString() }], 100, NOW)).toBeUndefined();
+  });
+
+  test("two full windows in one slot keep the later reset", () => {
+    const m: PoolUsage = { status: "rate-limited", capturedAt: NOW.toISOString(), windows: [{ label: "week", utilization: 100, resetsAt: T_WEEK }, { label: "month", utilization: 90, resetsAt: "2026-12-01T00:00:00.000Z" }] };
+    expect(summariseLimit([m], 90, NOW).resetAtSec).toBe(Date.parse("2026-12-01T00:00:00.000Z") / 1000);
   });
 });

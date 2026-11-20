@@ -1815,12 +1815,44 @@ describe("native limit answers", () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pool" } }));
     // One member has a full weekly window (3 days away) and a half-used 5-hour one. The other has no plan, no windows.
     usage.a = { status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "session (5h)", utilization: 51, resetsAt: "2026-11-02T15:00:00.000Z" }, { label: "week", utilization: 100, resetsAt: "2026-11-05T09:00:00.000Z" }] };
+    usage.b = { status: "unavailable", noPlan: true, capturedAt: NOW.toISOString() };
     handler = () => new Response('{"error":{"message":"quota used up","type":"rate_limit_error"}}', { status: 429, headers: { "content-type": "application/json" } });
     const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
     const message = ((await res.json()) as { error: { message: string } }).error.message;
     expect(message).toContain("Resets at 2026-11-05T09:00:00.000Z.");
     expect(res.headers.get("retry-after")).toBe(String((Date.parse("2026-11-05T09:00:00.000Z") - NOW.getTime()) / 1000));
+  });
+
+  test("a pool with another member free keeps the served member's short hold, not another member's full window", async () => {
+    const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pool" } }));
+    usage.a = { status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "week", utilization: 100, resetsAt: "2026-11-05T09:00:00.000Z" }] };
+    usage.b = live(10);
+    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response('{"error":{"message":"slow down","type":"rate_limit_error"}}', { status: 429 }) : new Response('{"error":{"message":"busy","type":"rate_limit_error"}}', { status: 429 }));
+    const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(3600);
+  });
+
+  test("a stale full figure does not turn a burst 429 into a multi-day reset", async () => {
+    const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pool" } }));
+    usage.a = { status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), stale: true, windows: [{ label: "week", utilization: 100, resetsAt: "2026-11-05T09:00:00.000Z" }] };
+    usage.b = undefined;
+    handler = () => new Response('{"error":{"message":"burst","type":"rate_limit_error"}}', { status: 429 });
+    const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(3600);
+  });
+
+  test("a cold-cache member in a real burst answers short (at most 60 s)", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = { status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "seven-day", utilization: 100, resetsAt: "2026-11-05T09:00:00.000Z" }] };
+    usage.b = undefined; // cold cache: no figure yet, not a no-plan signal
+    handler = () => new Response("{}", { status: 429 });
+    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(60);
   });
 
   test("an upstream 429 whose text already ends in a reset time passes through byte for byte", async () => {
