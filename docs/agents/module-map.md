@@ -239,10 +239,11 @@ src/
     browser/                  `ais browser ...`: admin.ts (approve/list/revoke/agent-token), extension.ts
                              (`extension path|update [--from=<zip>]`: atomic install of the release asset
                              ais-browser-extension.zip into ~/.ais/browser-extension), dispatch.ts,
-                             wiring.ts (`wiring [--check] [--json]`), mcp-service.ts and
-                             mcp-service-cli.ts (`mcp-service install|status|uninstall`: the systemd
-                             user unit of the shared MCP server). The server itself (`mcp-serve`) is
-                             src/browser/mcp-http.ts, its config and launch headers mcp-http-config.ts.
+                             wiring.ts (`wiring [--check] [--json]`), upload.ts (`upload`: files from
+                             the agent's machine, posted to /browser/call). The shared MCP server is
+                             the gateway: src/gateway/browser/mcp.ts (`POST|DELETE /browser/mcp`),
+                             call path in gateway/browser/routing.ts; shared parts in
+                             src/browser/mcp-core.ts, launch headers in src/browser/mcp-launch.ts.
                              Feature guide: docs/agents/browser.md
     version.ts               `ais version` (reads package.json)
     help.ts                   `ais help` / bare `ais` / `--help`/`-h`

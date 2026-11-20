@@ -3,9 +3,8 @@ import { join } from "node:path";
 import { loadIdentitiesFile } from "../../identities/store.ts";
 import { t3Paths } from "../../identities/t3-anthropic-proxy.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG } from "../../identities/tool-configs.ts";
-import { mcpPort, mcpUnitInstalled } from "../../browser/mcp-http-config.ts";
 import { browserLaunchWiring } from "../../shared/browser-wiring.ts";
-import { mcpDaemonHealthy } from "./mcp-service.ts";
+import { readSecretsKey } from "../gateway/secrets-file.ts";
 import { resolveInstalledAisBinary } from "../../sync/background.ts";
 import { boolFlag, type ParsedArgs } from "../args.ts";
 
@@ -17,7 +16,7 @@ export interface WiringRow {
   target: string | null;
   wired: boolean;
   reason?: string;
-  /** How the launch registers the server: the shared HTTP service or one stdio process per session. */
+  /** How the launch registers the server: the gateway HTTP endpoint or one stdio process per session. */
   mode: "http" | "stdio";
 }
 
@@ -27,14 +26,16 @@ export interface WiringDeps {
   registryPath: (tool: "claude" | "codex") => string;
   exists?: (p: string) => boolean;
   real?: (p: string) => string;
-  /** True when the shared MCP service unit is installed (the HTTP form). Default: the unit file exists on Linux. */
-  serviceInstalled?: () => boolean;
-  /** True when the shared daemon answers `GET /healthz`. */
-  daemonHealthy?: (port: number) => Promise<boolean>;
+  /** The gateway root URL a launch would use. Undefined: launches use the stdio form. Default: `AIS_GATEWAY_PROXY_URL` from the env or ~/.secrets. */
+  gatewayUrl?: () => Promise<string | undefined>;
+  /** Reads a token file. Injectable for tests. */
+  readToken?: (dir: string) => string | undefined;
   out: (line: string) => void;
 }
 
 const DRIVER_TOOL: Record<string, "claude" | "codex"> = { claudeAgent: "claude", codex: "codex" };
+
+const defaultGatewayUrl = async (): Promise<string | undefined> => process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
 
 const defaultDeps = (): WiringDeps => ({
   t3Home: t3Paths().t3Home,
@@ -66,24 +67,24 @@ async function readInstances(t3Home: string): Promise<Array<{ id: string; tool: 
 /** Runs the same wiring steps a T3 launch runs (browserLaunchWiring) for every enabled claude/codex instance. Never prints tokens. */
 export async function checkBrowserWiring(deps: WiringDeps = defaultDeps()): Promise<WiringRow[]> {
   const rows: WiringRow[] = [];
-  const key = (deps.serviceInstalled ?? (() => mcpUnitInstalled()))() ? "0".repeat(64) /* placeholder: the check never needs the real key */ : undefined;
-  const mode = key ? "http" : "stdio";
+  const gatewayUrl = await (deps.gatewayUrl ?? defaultGatewayUrl)();
   for (const inst of await readInstances(deps.t3Home)) {
     const w = await browserLaunchWiring({
       toolName: inst.tool,
       configDirValue: inst.folder,
       fromEnv: true,
       aisBinary: deps.aisBinary,
+      ...(gatewayUrl ? { gatewayUrl, http: {} } : {}),
       loadFile: () => loadIdentitiesFile(deps.registryPath(inst.tool)),
       ...(deps.exists ? { exists: deps.exists } : {}),
       ...(deps.real ? { real: deps.real } : {}),
+      ...(deps.readToken ? { readToken: deps.readToken } : {}),
       t3Gateway: join(deps.t3Home, "gateway"),
-      ...(key ? { http: { port: mcpPort(), ownerPid: process.pid, cwd: process.cwd(), key } } : {}),
     });
     const target = w.identity ? (w.pool ? `pool:${w.pool.name}` : w.identity.name) : null;
     const wired = w.args.length > 0;
-    const reason = wired ? undefined : !w.identity ? "no identity" : deps.aisBinary === undefined ? "ais binary not installed" : "no token";
-    rows.push({ instance: inst.id, tool: inst.tool, folder: inst.folder, target, wired, mode, ...(reason ? { reason } : {}) });
+    const reason = wired ? undefined : !w.identity ? "no identity" : deps.aisBinary === undefined && w.mode === "stdio" ? "ais binary not installed" : "no token";
+    rows.push({ instance: inst.id, tool: inst.tool, folder: inst.folder, target, wired, mode: w.mode, ...(reason ? { reason } : {}) });
   }
   return rows;
 }
@@ -91,13 +92,11 @@ export async function checkBrowserWiring(deps: WiringDeps = defaultDeps()): Prom
 export async function runBrowserWiring(flags: ParsedArgs["flags"], deps: Partial<WiringDeps> = {}): Promise<{ rows: WiringRow[]; ok: boolean }> {
   const d = { ...defaultDeps(), ...deps };
   const rows = await checkBrowserWiring(d);
-  const port = mcpPort();
-  const mode = rows[0]?.mode ?? ((d.serviceInstalled ?? (() => mcpUnitInstalled()))() ? "http" : "stdio");
-  const daemon = mode === "http" ? await (d.daemonHealthy ?? ((p) => mcpDaemonHealthy(p)))(port) : undefined;
-  if (boolFlag(flags, "json")) d.out(JSON.stringify(rows.map((r) => ({ ...r, daemonAnswering: daemon ?? null })), null, 2));
+  const mode = rows.some((r) => r.mode === "http") ? "http" : "stdio";
+  if (boolFlag(flags, "json")) d.out(JSON.stringify(rows, null, 2));
   else {
-    d.out(mode === "http" ? `mode: http (shared service on 127.0.0.1:${port}, ${daemon ? "answering" : "NOT answering: launches start it on demand"})` : "mode: stdio (one process per session; run `ais browser mcp-service install` for the shared service)");
-    for (const r of rows) d.out(`${r.instance}  ${r.folder}  ${r.target ?? "-"}  ${r.wired ? "wired" : `NOT wired: ${r.reason}`}`);
+    d.out(mode === "http" ? "mode: http (the gateway's shared endpoint /browser/mcp)" : "mode: stdio (one process per session: AIS_GATEWAY_PROXY_URL is not set)");
+    for (const r of rows) d.out(`${r.instance}  ${r.folder}  ${r.target ?? "-"}  ${r.wired ? `wired (${r.mode})` : `NOT wired: ${r.reason}`}`);
   }
   return { rows, ok: rows.every((r) => r.wired) };
 }

@@ -161,6 +161,12 @@ export async function runCli(argv: string[]): Promise<void> {
         await runGatewayCommand(rest, flags);
         break;
       case "browser":
+        if (rest[0] === "upload") {
+          // Raw argv: its valued flags take the space form, and file names may start with "-".
+          const { runBrowserUpload } = await import("./browser/upload.ts");
+          if (!(await runBrowserUpload(argv.slice(2)))) process.exitCode = 1;
+          break;
+        }
         await runBrowserCommand(rest, flags);
         break;
       case "claude-swap":
