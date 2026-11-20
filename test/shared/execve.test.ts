@@ -133,3 +133,66 @@ describe("tryExecve", () => {
     }
   });
 });
+
+describe("O_NONBLOCK on stdio", () => {
+  // Bun leaves O_NONBLOCK on an inherited stdout and the real tool inherits it
+  // (codex app-server then dies on EAGAIN). The probe sets the flag the way Bun
+  // does, hands over to `sh`, and `sh` prints the octal `flags:` of its own fd 1.
+  const linuxOnly = process.platform === "linux";
+  const execveModule = JSON.stringify(new URL("../../src/shared/execve.ts", import.meta.url).pathname);
+  const execModule = JSON.stringify(new URL("../../src/shared/exec.ts", import.meta.url).pathname);
+  const O_NONBLOCK = 0o4000;
+  const setNonblock = `
+    import { dlopen, FFIType } from "bun:ffi";
+    const libc = dlopen(["libc", "so", "6"].join("."), { fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 } });
+    for (const fd of [0, 1, 2]) {
+      const flags = libc.symbols.fcntl(fd, 3, 0);
+      if (flags >= 0) libc.symbols.fcntl(fd, 4, flags | ${O_NONBLOCK});
+    }
+  `;
+  const report = `for fd in 0 1 2; do echo "fd$fd=$(sed -n 's/^flags:[[:space:]]*//p' /proc/$$/fdinfo/$fd)"; done`;
+  const flagsOf = (stdout: string, fd: number): number => {
+    const value = new RegExp(`^fd${fd}=([0-7]+)$`, "m").exec(stdout)?.[1];
+    if (!value) throw new Error(`no flags for fd ${fd}: ${stdout}`);
+    return parseInt(value, 8);
+  };
+  // stdin is a pipe too, so all three descriptors carry the flag before the hand-over.
+  const run = (body: string) =>
+    Bun.spawnSync([process.execPath, "-e", `${setNonblock}\n${body}`], {
+      env: { PATH: process.env.PATH ?? "" },
+      stdin: new Blob(["x"]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+  test.skipIf(!linuxOnly)("tryExecve clears it on fds 0, 1 and 2 before the real tool starts", () => {
+    const proc = run(`
+      import { tryExecve } from ${execveModule};
+      tryExecve("/bin/sh", ["sh", "-c", ${JSON.stringify(report)}], {});
+      process.exit(99);
+    `);
+    expect(proc.exitCode).toBe(0);
+    const out = proc.stdout.toString();
+    for (const fd of [0, 1, 2]) expect(flagsOf(out, fd) & O_NONBLOCK).toBe(0);
+  });
+
+  test.skipIf(!linuxOnly)("the spawnReal fallback also hands its child blocking stdio (Bun.spawn resets the flag itself)", async () => {
+    const proc = run(`
+      import { spawnReal } from ${execModule};
+      process.exit(await spawnReal("/bin/sh", ["-c", ${JSON.stringify(report)}], {}));
+    `);
+    expect(proc.exitCode).toBe(0);
+    const out = proc.stdout.toString();
+    for (const fd of [0, 1, 2]) expect(flagsOf(out, fd) & O_NONBLOCK).toBe(0);
+  });
+
+  test.skipIf(!linuxOnly)("a closed descriptor is ignored (EBADF)", () => {
+    const script = `
+      import { tryExecve } from ${execveModule};
+      tryExecve("/bin/sh", ["sh", "-c", "echo ran"], {});
+      process.exit(99);
+    `;
+    const proc = Bun.spawnSync(["sh", "-c", `"$0" -e "$1" <&-`, process.execPath, script], { env: { PATH: process.env.PATH ?? "" } });
+    expect(proc.stdout.toString().trim()).toBe("ran");
+  });
+});
