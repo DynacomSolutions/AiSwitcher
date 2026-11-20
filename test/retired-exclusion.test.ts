@@ -287,8 +287,14 @@ describe("oauth reconcile and pi credential sync", () => {
   }
 
   test("a retired pi identity has no pairings, though a same-named native identity exists", async () => {
+    // The control is an active pair: the gateway manages every live claude identity, so only the gateway process pairs it.
+    const savedRole = process.env.AIS_GATEWAY_OWNER;
+    process.env.AIS_GATEWAY_OWNER = "1";
     const control = await reconcileFixture(false);
-    const active = await reconcilePiOAuthStores(control.piIdentity, { registryPaths: control.registryPaths });
+    const active = await reconcilePiOAuthStores(control.piIdentity, { registryPaths: control.registryPaths }).finally(() => {
+      if (savedRole === undefined) delete process.env.AIS_GATEWAY_OWNER;
+      else process.env.AIS_GATEWAY_OWNER = savedRole;
+    });
     expect(active.entries.length).toBeGreaterThan(0);
 
     const retired = await reconcileFixture(true);

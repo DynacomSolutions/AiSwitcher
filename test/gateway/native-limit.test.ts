@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { FALLBACK_RESET_SECONDS, nativeLimitResponse, summariseLimit } from "../../src/gateway/native-limit.ts";
+import { FALLBACK_RESET_SECONDS, genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit } from "../../src/gateway/native-limit.ts";
 
 /**
  * Fixtures are synthetic and scrubbed. Their shapes come from the provider-native limit answers the CLIs parse:
@@ -24,6 +24,15 @@ const claudeMember = (five: number, fiveReset: string, seven: number, sevenReset
 
 const a = claudeMember(100, T_1400, 40, T_NOV5);
 const b = claudeMember(95, T_1230, 30, T_NOV5);
+
+/** The two patterns T3 Code 0.1.7 uses to snooze a limited OpenCode thread and wake it again. */
+export const T3_DETECT = /^You've hit your [^\n]*\blimit\b/;
+export const T3_RESET = /\bResets at (\d{4}-\d\d-\d\dT[\d:.]+Z)\.?\s*$/;
+
+const expectT3 = (message: string, resetAtSec: number): void => {
+  expect(T3_DETECT.test(message)).toBe(true);
+  expect(T3_RESET.exec(message)?.[1]).toBe(new Date(resetAtSec * 1000).toISOString());
+};
 
 describe("summariseLimit", () => {
   test("picks the earliest reset across the members", () => {
@@ -54,7 +63,7 @@ describe("nativeLimitResponse for claude", () => {
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({
       type: "error",
-      error: { type: "rate_limit_error", message: "This request would exceed your account's rate limit. Please try again later." },
+      error: { type: "rate_limit_error", message: "You've hit your 5-hour limit (resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z." },
     });
     expect(Object.fromEntries(res.headers)).toEqual({
       "content-type": "application/json",
@@ -105,7 +114,7 @@ describe("nativeLimitResponse for codex", () => {
     const res = nativeLimitResponse("codex", [codexMember(100, T_1400, 20, T_NOV5), codexMember(100, T_1230, 25, T_NOV5)], 100, NOW)!;
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({
-      error: { type: "usage_limit_reached", message: "The usage limit has been reached", resets_at: 1793622600, resets_in_seconds: 9000 },
+      error: { type: "usage_limit_reached", message: "You've hit your 5-hour limit (resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z.", resets_at: 1793622600, resets_in_seconds: 9000 },
     });
     expect(Object.fromEntries(res.headers)).toEqual({
       "content-type": "application/json",
@@ -120,5 +129,24 @@ describe("nativeLimitResponse for codex", () => {
 
   test("providers without a native shape get no synthetic answer", () => {
     expect(nativeLimitResponse("kimi", [a], 80, NOW)).toBeUndefined();
+  });
+
+  test("every limit message matches both T3 patterns", async () => {
+    const claude = nativeLimitResponse("claude", [a, b], 80, NOW)!;
+    expectT3(((await claude.json()) as { error: { message: string } }).error.message, 1793622600);
+    const codex = nativeLimitResponse("codex", [codexMember(100, T_1400, 20, T_NOV5)], 100, NOW)!;
+    expectT3(((await codex.json()) as { error: { message: string } }).error.message, 1793628000);
+    expectT3(limitMessage("usage", 1793622600, "identity is at its usage reserve"), 1793622600);
+  });
+
+  test("generic limit answer keeps the provider style and carries retry-after", async () => {
+    const res = genericLimitResponse("openai", 1793622600, NOW, "identity is at its usage reserve");
+    expect(res.status).toBe(429);
+    expect(res.headers.get("retry-after")).toBe("9000");
+    const body = (await res.json()) as { error: { message: string; type: string } };
+    expect(body.error.type).toBe("rate_limit_error");
+    expect(body.error.message).toBe("You've hit your usage limit (identity is at its usage reserve; resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z.");
+    expectT3(body.error.message, 1793622600);
+    expect(genericLimitResponse("anthropic", 1, NOW, "x").headers.get("retry-after")).toBe("1");
   });
 });

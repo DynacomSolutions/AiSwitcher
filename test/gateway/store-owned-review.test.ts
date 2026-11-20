@@ -29,8 +29,8 @@ const put = async (home: string, rel: string, text: string): Promise<void> => {
 const login = (tag: string, expiresAt = 2_000_000_000_000): string => JSON.stringify({ claudeAiOauth: { accessToken: `at-${tag}`, refreshToken: `rt-${tag}`, expiresAt } });
 const entry = (token: string): string => JSON.stringify({ claudeAiOauth: { accessToken: token, scopes: ["user:inference"] } });
 const GATEWAY_ENTRY = entry("aisg_fixture_token_value");
-const idFile = (home: string, ids: Array<{ name: string; swapPool?: { accounts: string[]; active: string } }>): string =>
-  JSON.stringify({ version: 1, identities: ids.map((i) => ({ name: i.name, label: i.name, configDir: join(home, ".claude/identities", i.name), ...(i.swapPool ? { swapPool: i.swapPool } : {}) })) });
+const idFile = (home: string, ids: Array<{ name: string; swapPool?: { accounts: string[]; active: string }; retired?: boolean }>): string =>
+  JSON.stringify({ version: 1, identities: ids.map((i) => ({ name: i.name, label: i.name, configDir: join(home, ".claude/identities", i.name), ...(i.swapPool ? { swapPool: i.swapPool } : {}), ...(i.retired ? { retired: true } : {}) })) });
 const FOLDER = (n: string): string => `.claude/identities/${n}/.credentials.json`;
 
 /** Lists the import entries in a child process whose HOME is the fixture (tool configs read HOME when they load). */
@@ -114,7 +114,7 @@ describe("4. an unreadable registry never reads as complete or as unmanaged", ()
     expect(await check("claude", "stray")).toBeUndefined();
     await mkdir(join(home, "pool"), { recursive: true });
     await writeFile(join(home, "pool/.credentials.json"), GATEWAY_ENTRY);
-    await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "m1", label: "m1", configDir: join(home, "m1") }, { name: "stray", label: "stray", configDir: join(home, "stray") }, { name: "pool", label: "pool", configDir: join(home, "pool"), swapPool: { accounts: ["m1"], active: "m1" } }] }));
+    await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "m1", label: "m1", configDir: join(home, "m1") }, { name: "stray", label: "stray", retired: true, configDir: join(home, "stray") }, { name: "pool", label: "pool", configDir: join(home, "pool"), swapPool: { accounts: ["m1"], active: "m1" } }] }));
     expect(await check("claude", "m1")).toBe(true);
     expect(await check("claude", "stray")).toBe(false);
     expect(await check("claude", "pool")).toBe(true);
@@ -150,7 +150,7 @@ describe("5. pi's copy of a host-owned login", () => {
 
   test("host sync never pushes pi's copy of an unmanaged claude login, and still pushes one for a managed login", async () => {
     const home = await tmp();
-    await put(home, ".claude/identities.json", idFile(home, [{ name: "hostwise" }, { name: "held" }]));
+    await put(home, ".claude/identities.json", idFile(home, [{ name: "hostwise", retired: true }, { name: "held" }]));
     await put(home, ".pi/identities.json", piRegistry(home, ["hostwise", "held", "pi-only"]));
     await recordManaged(home, ["held"]);
     await put(home, PI("hostwise"), piFile("host"));
@@ -166,7 +166,7 @@ describe("5. pi's copy of a host-owned login", () => {
 
   test("prune removes pi's stale copy of an unmanaged login, with the same checks", async () => {
     const home = await tmp();
-    await put(home, ".claude/identities.json", idFile(home, [{ name: "stale" }, { name: "held" }]));
+    await put(home, ".claude/identities.json", idFile(home, [{ name: "stale", retired: true }, { name: "held" }]));
     await put(home, ".pi/identities.json", piRegistry(home, ["stale", "held", "pi-only"]));
     await recordManaged(home, ["held"]);
     const store = new FakeStore();

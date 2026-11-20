@@ -8,8 +8,8 @@ import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { pruneUnmanagedLogins } from "../../src/gateway/store-prune.ts";
 import { recordOwned } from "../../src/identities/gateway-owned.ts";
 
-// A host-owned claude login (an identity the gateway does not manage) never goes into the credential store, and no store row lands on
-// it. A managed login still travels. An in-memory store stands in for the database; every name and value is fake.
+// A host-owned claude login (a retired identity: the gateway manages every live claude identity) never goes into the credential store, and no store row lands on
+// it. A managed login, including a live identity whose login is only in its host folder, still travels. An in-memory store stands in for the database; every name and value is fake.
 
 class FakeStore {
   rows = new Map<string, HomeFileRow>();
@@ -56,7 +56,7 @@ const put = async (home: string, rel: string, text: string): Promise<void> => {
   await writeFile(join(home, rel), text);
 };
 const login = (tag: string, expiresAt = 2_000_000_000_000): string => JSON.stringify({ claudeAiOauth: { accessToken: `at-${tag}`, refreshToken: `rt-${tag}`, expiresAt } });
-const registry = (home: string, names: string[]): string => JSON.stringify({ version: 1, identities: names.map((n) => ({ name: n, label: n, configDir: join(home, ".claude/identities", n) })) });
+const registry = (home: string, names: string[], retired: string[] = []): string => JSON.stringify({ version: 1, identities: names.map((n) => ({ name: n, label: n, configDir: join(home, ".claude/identities", n), ...(retired.includes(n) ? { retired: true } : {}) })) });
 const FOLDER = (n: string): string => `.claude/identities/${n}/.credentials.json`;
 const asStore = (s: FakeStore) => s as unknown as PgHomeStore;
 const sync = (home: string, store: FakeStore) => hostSyncOnce(undefined, { home, store: asStore(store), lock: new MemoryRefreshBackend(), importEntries: async () => [] });
@@ -64,7 +64,7 @@ const sync = (home: string, store: FakeStore) => hostSyncOnce(undefined, { home,
 describe("host store sync keeps a host-owned login out of the store", () => {
   test("a login file that is new or that a real CLI keeps rotating is never pushed, and a stale row never lands on it", async () => {
     const home = await tmp();
-    await put(home, ".claude/identities.json", registry(home, ["hostwise", "fresh"]));
+    await put(home, ".claude/identities.json", registry(home, ["hostwise", "fresh"], ["hostwise", "fresh"]));
     await put(home, FOLDER("hostwise"), login("host-newer", 2_100_000_000_000));
     await put(home, FOLDER("fresh"), login("fresh-host"));
     const store = new FakeStore();
@@ -82,6 +82,16 @@ describe("host store sync keeps a host-owned login out of the store", () => {
     expect(store.puts).toEqual([]);
   });
 
+  test("a live identity whose login is only in its host folder is managed: it travels to the store like any other", async () => {
+    const home = await tmp();
+    await put(home, ".claude/identities.json", registry(home, ["folderonly"]));
+    await put(home, FOLDER("folderonly"), login("folder-only", 2_100_000_000_000));
+    const store = new FakeStore();
+    store.seed(FOLDER("folderonly"), login("old-row", 1_900_000_000_000), "claude/folderonly", "login");
+    await sync(home, store);
+    expect(store.rows.get(FOLDER("folderonly"))?.content.toString()).toContain("rt-folder-only");
+  });
+
   test("a login the gateway owns on this host still travels to the store", async () => {
     const home = await tmp();
     await put(home, ".claude/identities.json", registry(home, ["held"]));
@@ -97,7 +107,7 @@ describe("host store sync keeps a host-owned login out of the store", () => {
 describe("the import leaves a host-owned login out", () => {
   test("collectImportEntries names the managed login, never an unmanaged folder login or pi's copy of it", async () => {
     const home = await tmp();
-    await put(home, ".claude/identities.json", registry(home, ["plain", "held"]));
+    await put(home, ".claude/identities.json", registry(home, ["plain", "held"], ["plain"]));
     await put(home, FOLDER("plain"), login("plain"));
     await put(home, FOLDER("held"), login("held"));
     await put(home, ".ais/gateway-members/claude/held/.credentials.json", login("held-member"));
@@ -118,7 +128,7 @@ describe("the import leaves a host-owned login out", () => {
 describe("pruning the stale store copy of a host-owned login", () => {
   const setup = async (): Promise<{ home: string; store: FakeStore }> => {
     const home = await tmp();
-    await put(home, ".claude/identities.json", registry(home, ["stale", "held", "listed"]));
+    await put(home, ".claude/identities.json", registry(home, ["stale", "held", "listed"], ["stale"]));
     await recordOwned(["claude/held"], "2026-01-01T00:00:00.000Z", join(home, ".ais", "gateway-owned.json"));
     const store = new FakeStore();
     for (const n of ["stale", "held", "listed"]) store.seed(FOLDER(n), login(n), `claude/${n}`, "login");
@@ -128,7 +138,7 @@ describe("pruning the stale store copy of a host-owned login", () => {
   };
   const gateway = (...names: string[]) => async () => new Set(names);
 
-  test("removes only the folder login row of an identity that neither this host nor the gateway manages", async () => {
+  test("removes only the folder login row of a retired identity; every live identity keeps its row, even one the gateway list lacks", async () => {
     const { home, store } = await setup();
     const r = await pruneUnmanagedLogins(asStore(store), { home, gatewayLogins: gateway("claude/listed") });
     expect(r.removed).toEqual([FOLDER("stale")]);

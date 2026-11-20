@@ -18,6 +18,16 @@ export async function runBrowserCommand(positionals: string[], flags: ParsedArgs
     await runMcpShim();
     return;
   }
+  if (sub === "mcp-serve") {
+    const { runMcpServe } = await import("../../browser/mcp-http.ts");
+    await runMcpServe();
+    return;
+  }
+  if (sub === "mcp-service") {
+    const { runMcpServiceCommand } = await import("./mcp-service-cli.ts");
+    await runMcpServiceCommand(rest, deps.out ?? ((line) => console.info(line)));
+    return;
+  }
   if (sub === "wiring") {
     const { runBrowserWiring } = await import("./wiring.ts");
     const { ok } = await runBrowserWiring(flags, deps.out ? { out: deps.out } : {});

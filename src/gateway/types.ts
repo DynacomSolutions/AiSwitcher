@@ -43,6 +43,31 @@ export interface IdentityUsageRow {
   requests: number;
 }
 
+/** Ledger totals for one provider, identity, app and model over a window (the admin `GET /usage/models` row). */
+export interface ModelUsageRow extends IdentityUsageRow {
+  /** The model the requests used; null when the proxy recorded no model. Never dropped: its tokens still count. */
+  model: string | null;
+  /** Earliest and latest ledger timestamp in the group (ISO instants), for the report's date span. */
+  firstTs?: string;
+  lastTs?: string;
+}
+
+/** Ledger totals for one day, provider, identity and model (the admin `GET /usage/models/daily` row). Apps are summed. */
+export interface ModelDailyUsageRow {
+  /** Calendar day "YYYY-MM-DD" in the zone the request named. */
+  day: string;
+  provider: string;
+  identity: string;
+  model: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  estCostUsd: number;
+  unpricedRequests: number;
+  requests: number;
+}
+
 export interface UsageRow {
   ts: string;
   app: string;
@@ -58,4 +83,41 @@ export interface UsageRow {
   httpStatus: number;
   latencyMs: number;
   streamed: boolean;
+}
+
+/** One imported history figure. A null `day` is an all-time figure; a null `model` covers every model of the day. */
+export interface UsageHistoryRow {
+  /** Where the figures came from, for example "host-snapshot-models". Part of the key, so two sources never overwrite each other. Never add the figures of two sources together. */
+  source: string;
+  /** The import generation as an ISO instant (the snapshot's generation time). Part of the key: a new generation adds rows, the same generation replaces its own rows. */
+  generation: string;
+  provider: string;
+  identity: string;
+  /** Calendar day "YYYY-MM-DD", or null for an all-time figure. */
+  day: string | null;
+  model: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  messages: number;
+  estCostUsd: number;
+  /** First and last day (YYYY-MM-DD, in `zone`) the imported result covers, so a reader can trim the overlap with the ledger. Null when unknown. */
+  firstDay: string | null;
+  lastDay: string | null;
+  /** The IANA zone the days of the host figures are bucketed in. */
+  zone: string;
+}
+
+/** Which history rows to read. `generation` is "latest" (the newest generation of each source, the default) or one exact generation instant. */
+export interface UsageHistoryFilter {
+  source?: string;
+  provider?: string;
+  identity?: string;
+  generation?: string;
+}
+
+/** A stored history row, with the time of its latest import. */
+export interface UsageHistoryStored extends UsageHistoryRow {
+  importedAt: string;
 }

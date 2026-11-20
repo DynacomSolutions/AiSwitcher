@@ -80,7 +80,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|store|release|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -93,6 +93,7 @@ export const HELP: Record<string, HelpNode> = {
         "Manage gateway apps; add and rotate write Secret ais-gateway-<app> and ~/.secrets (admin: AIS_GATEWAY_ADMIN_URL, AIS_GATEWAY_ADMIN_TOKEN, AIS_GATEWAY_PROXY_URL in ~/.secrets). Tokens: add makes a new app only and is refused on any existing name, a revoked one included; update changes no token; rotate mints a new token and the old tokens keep working for the overlap (default 24 h; admin API overlapHours 0 to 720, 0 cuts them off at once) and is refused on a revoked app; revoke is final, every token stops at once on every replica and the name can never be used again",
       ),
       usage: sub("ais gateway usage [--app=] [--provider=] [--days=7] [--json]", "Tokens used per app"),
+      "usage-history": sub("ais gateway usage-history import [--snapshot=<path>] [--zone=<IANA zone>] [--batch-size=500] [--dry-run] [--verify-only]", "Import the host usage history (per model all time, per day, per day tokens only) into the gateway database under the snapshot generation, skipping ais-gateway results, then print host against gateway per provider and identity; exits non-zero when a cost differs by more than $1 or tokens differ. Same generation is idempotent, a newer one adds rows, nothing is deleted. --dry-run prints the host figures only; --verify-only skips the import"),
       "claude-proxy": sub(
         "ais gateway claude-proxy <claude config dir>... [--proxy=<url>] [--ca=<path>] [--check]",
         "Point Claude folders at the gateway usage proxy (HTTPS_PROXY, NODE_EXTRA_CA_CERTS, always with a loopback NO_PROXY); --check only reports folders whose proxy would break a loopback base URL (proxy: AIS_GATEWAY_CONNECT_PROXY_URL in ~/.secrets or env; CA default ~/.ais/gateway-connect-ca.pem)",
@@ -124,7 +125,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   browser: {
-    usage: "ais browser approve|list|revoke|agent-token|extension|wiring|mcp ...",
+    usage: "ais browser approve|list|revoke|agent-token|extension|wiring|mcp|mcp-serve|mcp-service ...",
     desc: "AIS Browser: bind Chrome extensions to an identity or swap pool; agent tokens",
     examples: ["ais browser approve ABCD2345 --identity=work --name=work-chrome"],
     subs: {
@@ -143,7 +144,9 @@ export const HELP: Record<string, HelpNode> = {
         "ais browser wiring [--check] [--json]",
         "For each enabled T3 Code claude/codex instance (from <T3 home>/userdata/settings.json), run the launch wiring steps and print its folder, mapped identity or pool, and wired or NOT wired with the reason. --check exits 1 when any instance is not wired; never prints tokens",
       ),
-      mcp: sub("ais browser mcp", "Stdio MCP server exposing the browser tools; started by Claude and Codex launches that have an agent token (not for manual use)"),
+      mcp: sub("ais browser mcp", "Stdio MCP server exposing the browser tools; started by Claude and Codex launches that have an agent token when the shared service is not installed (not for manual use)"),
+      "mcp-serve": sub("ais browser mcp-serve", "The shared MCP server for every agent session: Streamable HTTP on 127.0.0.1 (port 47150, or AIS_BROWSER_MCP_PORT), path /mcp, bearer key in ~/.ais/browser-mcp/key. Run by ais-browser-mcp.service (not for manual use)"),
+      "mcp-service": sub("ais browser mcp-service install|status|uninstall", "Manage the ais-browser-mcp.service user unit (Linux with systemd). While it is installed, launches use the shared server and start it on demand; without it they use the stdio server"),
     },
   },
   swap: {

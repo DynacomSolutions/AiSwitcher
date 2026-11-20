@@ -5,13 +5,17 @@ import { registerBrowserAdmin } from "./browser/admin.ts";
 import type { LoginRenewal } from "./renewal.ts";
 import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
-import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord } from "./types.ts";
+import type { PoolUsage } from "../identities/pool/adapter.ts";
+import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord, UsageHistoryRow } from "./types.ts";
+import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
 
 export const DEFAULT_OVERLAP_MS = 24 * 3600_000;
 const MAX_OVERLAP_HOURS = 24 * 30;
 const MAX_USAGE_DAYS = 90;
 
 const PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"];
+/** Providers whose subscription usage the usage source can read (GET /limits). The others have no account windows. */
+const LIMITS_PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "zai"];
 const STYLES: readonly ApiStyle[] = ["anthropic", "openai"];
 /** Paths the proxy port answers itself; an app of this name could never be reached. */
 const RESERVED_NAMES = new Set(["healthz", "readyz", "metrics", "browser"]);
@@ -37,7 +41,18 @@ export interface AdminDeps {
   browserHub?: { revoke(binding: string): void };
   /** Who renews each gateway login and when (GET /logins/renewal); absent when the gateway has no refresh journal. */
   renewal?(): Promise<LoginRenewal[]>;
+  /** One identity's cached subscription usage (GET /limits); absent when the gateway has no usage source. */
+  usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
+  /** The member accounts of every swap pool of one provider (GET /limits). */
+  poolMembers?(provider: GatewayProvider): Promise<string[]>;
+  /** Resolves an alias to the identity's canonical name (GET /limits). */
+  canonical?(provider: GatewayProvider, identity: string): Promise<string>;
+  /** Spends one Claude reset grant of a managed identity with the store's member credential (POST /limits/claude/:identity/resets/:grant); absent when the gateway cannot. Throws an error with a numeric `status` and a short message to refuse. */
+  spendReset?(identity: string, grantId: string): Promise<unknown>;
 }
+
+/** One GET /limits row: a managed identity plus the usage source's reading of it (no reading yet: unavailable). */
+type AdminLimitRow = { provider: GatewayProvider; identity: string } & Omit<PoolUsage, "capturedAt"> & { capturedAt?: string };
 
 /** Constant-time comparison: both sides are hashed first so lengths never leak. */
 function sameSecret(given: string, expected: string): boolean {
@@ -109,6 +124,84 @@ async function jsonBody(req: Request): Promise<unknown> {
   return JSON.parse(text);
 }
 
+/**
+ * Validates the ledger usage window shared by `GET /usage/identities` and `GET /usage/models`.
+ * `since` (ISO instant, optional `until`) wins over `days`; both are bounded by MAX_USAGE_DAYS.
+ * Returns the window, or a message naming the problem.
+ */
+function usageWindow(query: (name: string) => string | undefined, now: Date): { since: Date; until?: Date } | string {
+  const sinceRaw = query("since");
+  let since: Date;
+  if (sinceRaw !== undefined) {
+    since = new Date(sinceRaw);
+    if (Number.isNaN(since.getTime())) return "since must be an ISO date-time";
+  } else {
+    const days = query("days") === undefined ? 1 : Number(query("days"));
+    if (!Number.isInteger(days) || days < 1 || days > MAX_USAGE_DAYS) return `days must be a whole number from 1 to ${MAX_USAGE_DAYS}`;
+    since = new Date(now.getTime() - days * 86400_000);
+  }
+  if (now.getTime() - since.getTime() > MAX_USAGE_DAYS * 86400_000) return `since must be within ${MAX_USAGE_DAYS} days`;
+  const untilRaw = query("until");
+  if (untilRaw === undefined) return { since };
+  const until = new Date(untilRaw);
+  if (Number.isNaN(until.getTime())) return "until must be an ISO date-time";
+  return { since, until };
+}
+
+/** The largest history batch one POST accepts. */
+export const MAX_HISTORY_BATCH = 2000;
+const HISTORY_DAY = /^\d{4}-\d{2}-\d{2}$/;
+const HISTORY_SOURCE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+const validInstant = (v: string): boolean => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(v) && !Number.isNaN(Date.parse(v));
+const validZone = (v: string): boolean => {
+  try {
+    new Intl.DateTimeFormat("en-GB", { timeZone: v });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const validDay = (v: string): boolean => HISTORY_DAY.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`)) && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v);
+
+/** Validates a history import body into rows, or a message naming the first problem. */
+export function parseHistoryBody(raw: unknown): UsageHistoryRow[] | string {
+  const list = isObj(raw) ? raw.rows : undefined;
+  if (!Array.isArray(list)) return "rows must be a list";
+  if (list.length === 0) return "rows must not be empty";
+  if (list.length > MAX_HISTORY_BATCH) return `rows must hold at most ${MAX_HISTORY_BATCH} entries`;
+  const out: UsageHistoryRow[] = [];
+  for (const [i, r] of list.entries()) {
+    if (!isObj(r)) return `rows[${i}] must be an object`;
+    if (typeof r.source !== "string" || !HISTORY_SOURCE.test(r.source)) return `rows[${i}].source must be 1 to 64 lowercase letters, digits, . _ or -`;
+    if (typeof r.provider !== "string" || r.provider === "" || r.provider.length > 120) return `rows[${i}].provider is required`;
+    if (typeof r.identity !== "string" || r.identity === "" || r.identity.length > 200) return `rows[${i}].identity is required`;
+    if (typeof r.generation !== "string" || !validInstant(r.generation)) return `rows[${i}].generation must be an ISO instant ending in Z`;
+    if (typeof r.zone !== "string" || !validZone(r.zone)) return `rows[${i}].zone must be an IANA time zone`;
+    const day = r.day === undefined ? null : r.day;
+    if (day !== null && (typeof day !== "string" || !validDay(day))) return `rows[${i}].day must be YYYY-MM-DD or null`;
+    const span: Record<string, string | null> = {};
+    for (const k of ["firstDay", "lastDay"] as const) {
+      const v = r[k] === undefined ? null : r[k];
+      if (v !== null && (typeof v !== "string" || !validDay(v))) return `rows[${i}].${k} must be YYYY-MM-DD or null`;
+      span[k] = v;
+    }
+    const model = r.model === undefined || r.model === "" ? null : r.model;
+    if (model !== null && (typeof model !== "string" || model.length > 300)) return `rows[${i}].model must be a text or null`;
+    const nums: Record<string, number> = {};
+    for (const k of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "messages"] as const) {
+      const v = r[k] === undefined ? 0 : r[k];
+      if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) return `rows[${i}].${k} must be a whole number of 0 or more`;
+      nums[k] = v;
+    }
+    const cost = r.estCostUsd === undefined ? 0 : r.estCostUsd;
+    if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) return `rows[${i}].estCostUsd must be a number of 0 or more`;
+    out.push({ source: r.source, generation: new Date(r.generation).toISOString(), zone: r.zone, firstDay: span.firstDay!, lastDay: span.lastDay!, provider: r.provider, identity: r.identity, day, model, inputTokens: nums.inputTokens!, outputTokens: nums.outputTokens!, cacheReadTokens: nums.cacheReadTokens!, cacheWriteTokens: nums.cacheWriteTokens!, messages: nums.messages!, estCostUsd: cost });
+  }
+  return out;
+}
+
 export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
   const read = deps.readStore ?? store;
@@ -126,6 +219,49 @@ export function createAdminApp(deps: AdminDeps): Hono {
   hono.get("/logins/renewal", async (c) => {
     if (!deps.renewal) return err(404, "renewal data is not available");
     return c.json({ logins: await deps.renewal() });
+  });
+
+  // Live subscription windows of every managed identity, from the same cached usage source the proxy selects on.
+  // A read never waits on a fresh fetch and never refreshes a token: a cold identity answers "unavailable" and fills in behind.
+  hono.get("/limits", async (c) => {
+    if (!deps.usageFor) return err(404, "limits data is not available");
+    const providerFilter = c.req.query("provider");
+    if (providerFilter !== undefined && !PROVIDERS.includes(providerFilter as GatewayProvider)) return err(400, "unknown provider");
+    const identityFilter = c.req.query("identity");
+    const apps = await read.listApps();
+    const limits: AdminLimitRow[] = [];
+    for (const provider of LIMITS_PROVIDERS) {
+      if (providerFilter !== undefined && provider !== providerFilter) continue;
+      const names = new Set<string>();
+      // One unreadable registry must not blank the other providers: keep this provider's pinned identities.
+      const members = deps.poolMembers ? await deps.poolMembers(provider).catch(() => [] as string[]) : [];
+      for (const member of members) names.add((await deps.canonical?.(provider, member)) ?? member);
+      for (const app of apps) {
+        if (app.state === "active" && app.provider === provider && app.target.kind === "pin") {
+          names.add((await deps.canonical?.(provider, app.target.identity)) ?? app.target.identity);
+        }
+      }
+      for (const identity of [...names].sort()) {
+        if (identityFilter !== undefined && identity !== identityFilter) continue;
+        const usage = await deps.usageFor(provider, identity).catch(() => undefined);
+        limits.push({ provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }) });
+      }
+    }
+    return c.json({ limits });
+  });
+
+  // Spends one reset grant at the gateway, with the member credential from the store. The console never holds that credential.
+  hono.post("/limits/claude/:identity/resets/:grant", async (c) => {
+    if (!deps.spendReset) return err(404, "reset spending is not available");
+    const requested = decodeURIComponent(c.req.param("identity"));
+    const identity = (await deps.canonical?.("claude", requested).catch(() => requested)) ?? requested;
+    try {
+      return c.json(await deps.spendReset(identity, decodeURIComponent(c.req.param("grant"))));
+    } catch (e) {
+      const status = (e as { status?: unknown }).status;
+      const known = status === 400 || status === 404 || status === 409 || status === 429 ? status : 502;
+      return Response.json({ error: e instanceof Error ? e.message.slice(0, 300) : "reset failed" }, { status: known });
+    }
   });
 
   hono.get("/apps", async (c) => {
@@ -237,28 +373,73 @@ export function createAdminApp(deps: AdminDeps): Hono {
   // Ledger totals per provider and identity, so the console can sum a pool's members.
   // `since` (ISO instant, optional `until`) wins over `days`; both are bounded by MAX_USAGE_DAYS.
   hono.get("/usage/identities", async (c) => {
-    const now = deps.now();
-    const sinceRaw = c.req.query("since");
-    const untilRaw = c.req.query("until");
-    let since: Date;
-    if (sinceRaw !== undefined) {
-      since = new Date(sinceRaw);
-      if (Number.isNaN(since.getTime())) return err(400, "since must be an ISO date-time");
-    } else {
-      const days = c.req.query("days") === undefined ? 1 : Number(c.req.query("days"));
-      if (!Number.isInteger(days) || days < 1 || days > MAX_USAGE_DAYS) return err(400, `days must be a whole number from 1 to ${MAX_USAGE_DAYS}`);
-      since = new Date(now.getTime() - days * 86400_000);
-    }
-    if (now.getTime() - since.getTime() > MAX_USAGE_DAYS * 86400_000) return err(400, `since must be within ${MAX_USAGE_DAYS} days`);
-    let until: Date | undefined;
-    if (untilRaw !== undefined) {
-      until = new Date(untilRaw);
-      if (Number.isNaN(until.getTime())) return err(400, "until must be an ISO date-time");
-    }
+    const win = usageWindow((n) => c.req.query(n), deps.now());
+    if (typeof win === "string") return err(400, win);
     const provider = c.req.query("provider");
     if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
-    const rows = (await store.usageByIdentity(since, until)).filter((r) => provider === undefined || r.provider === provider);
-    return c.json({ since: since.toISOString(), ...(until ? { until: until.toISOString() } : {}), identities: rows });
+    const rows = (await store.usageByIdentity(win.since, win.until)).filter((r) => provider === undefined || r.provider === provider);
+    return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), identities: rows });
+  });
+
+  // Ledger totals per provider, identity, app and model, so the console can show per-model usage.
+  // Same window rules as /usage/identities.
+  hono.get("/usage/models", async (c) => {
+    const win = usageWindow((n) => c.req.query(n), deps.now());
+    if (typeof win === "string") return err(400, win);
+    const provider = c.req.query("provider");
+    if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
+    const rows = (await store.usageByModel(win.since, win.until)).filter((r) => provider === undefined || r.provider === provider);
+    return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), models: rows });
+  });
+
+  // Per-day split of the same ledger (apps summed), bucketed in the IANA zone `tz` (default UTC), so the console can chart days.
+  // Same window rules as /usage/models; one GROUP BY over the ts range.
+  hono.get("/usage/models/daily", async (c) => {
+    const win = usageWindow((n) => c.req.query(n), deps.now());
+    if (typeof win === "string") return err(400, win);
+    const provider = c.req.query("provider");
+    if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
+    const tz = c.req.query("tz") ?? "UTC";
+    if (!TOKSCALE_TIME_ZONE_NAMES.has(tz) && tz !== "UTC") return err(400, "tz must be an IANA time zone name");
+    const rows = (await store.usageByModelDaily(win.since, win.until, tz)).filter((r) => provider === undefined || r.provider === provider);
+    return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), tz, days: rows });
+  });
+
+  // Imports a batch of host usage history. Rows of one generation replace each other exactly (idempotent); a new generation adds rows. Never a delete.
+  hono.post("/usage/history", async (c) => {
+    let raw: unknown;
+    try {
+      raw = await jsonBody(c.req.raw);
+    } catch {
+      return err(400, "body is not valid JSON");
+    }
+    const rows = parseHistoryBody(raw);
+    if (typeof rows === "string") return err(400, rows);
+    await store.upsertUsageHistory(rows);
+    return c.json({ imported: rows.length }, 200);
+  });
+
+  // Imported history of ONE source (required: sources are different cuts of the same usage and must never be summed together).
+  // `generation` is "latest" (default, the newest generation of the source) or one exact ISO instant.
+  // `since` and `until` are inclusive days (YYYY-MM-DD, in the zone each row carries); a window leaves out all-time rows (no day). Filters: provider, identity.
+  hono.get("/usage/history", async (c) => {
+    const source = c.req.query("source");
+    if (source === undefined || !HISTORY_SOURCE.test(source)) return err(400, "source is required: one of host-snapshot-models, host-snapshot-daily or host-snapshot-daily-tokens (sources must never be summed together)");
+    const day = (name: string): string | undefined | null => {
+      const v = c.req.query(name);
+      if (v === undefined) return undefined;
+      return validDay(v) ? v : null;
+    };
+    const since = day("since");
+    const until = day("until");
+    if (since === null) return err(400, "since must be a day, YYYY-MM-DD");
+    if (until === null) return err(400, "until must be a day, YYYY-MM-DD (inclusive)");
+    const generation = c.req.query("generation") ?? "latest";
+    if (generation !== "latest" && !validInstant(generation)) return err(400, "generation must be latest or an ISO instant ending in Z");
+    const filter = { source, generation, ...(c.req.query("provider") !== undefined ? { provider: c.req.query("provider") as string } : {}), ...(c.req.query("identity") !== undefined ? { identity: c.req.query("identity") as string } : {}) };
+    let rows = await read.usageHistory(filter);
+    if (since !== undefined || until !== undefined) rows = rows.filter((r) => r.day !== null && (since === undefined || r.day >= since) && (until === undefined || r.day <= until));
+    return c.json({ source, generation, ...(since !== undefined ? { since } : {}), ...(until !== undefined ? { until } : {}), history: rows });
   });
 
   return hono;

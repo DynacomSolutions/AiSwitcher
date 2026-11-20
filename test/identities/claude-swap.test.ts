@@ -52,7 +52,11 @@ async function writeRegistry(poolExtra: Record<string, unknown> = {}) {
 
 const read = async (p: string) => JSON.parse(await readFile(p, "utf8"));
 
+
+// The gateway manages every live claude login, so a host process never refreshes one: these tests run the refresh machinery as the gateway process.
+const savedOwnerRole = process.env.AIS_GATEWAY_OWNER;
 beforeEach(async () => {
+  process.env.AIS_GATEWAY_OWNER = "1";
   root = await mkdtemp(join(tmpdir(), "ais-claude-swap-"));
   tempDirs.push(root);
   registry = join(root, "identities.json");
@@ -65,6 +69,8 @@ beforeEach(async () => {
   await writeFile(join(root, "pool", ".claude.json"), claudeJson("uuid-a", { theme: "dark", projects: { p: 1 } }));
 });
 afterEach(async () => {
+  if (savedOwnerRole === undefined) delete process.env.AIS_GATEWAY_OWNER;
+  else process.env.AIS_GATEWAY_OWNER = savedOwnerRole;
   await Promise.all(tempDirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
 });
 

@@ -12,10 +12,10 @@ const FABLE_ID = "launch-2610-fable-SYNTHETIC_FIXTURE";
 const OLD_ID = "promo-reset-SYNTHETIC_FIXTURE";
 const CEDAR = {
   eligible: true,
-  exhausted: [{ id: OLD_ID, label: "Earlier usage-limit reset", resets_left: 0, usable_now: false, paused: false, ends_at: "2026-12-01T00:00:00Z" }],
+  exhausted: [{ id: OLD_ID, label: "Earlier usage-limit reset", resets_left: 0, usable_now: false, paused: false, ends_at: "2099-12-01T00:00:00Z" }],
   grants: [
-    { id: FULL_ID, label: "One full limit reset (November 2026)", resets_left: 1, usable_now: true, paused: false, ends_at: "2026-11-30T23:59:59Z" },
-    { id: FABLE_ID, label: "New model launch: one Fable reset", resets_left: 1, usable_now: true, paused: false, ends_at: "2026-11-20T00:00:00Z" },
+    { id: FULL_ID, label: "One full limit reset (November 2026)", resets_left: 1, usable_now: true, paused: false, ends_at: "2099-11-30T23:59:59Z" },
+    { id: FABLE_ID, label: "New model launch: one Fable reset", resets_left: 1, usable_now: true, paused: false, ends_at: "2099-11-20T00:00:00Z" },
   ],
   next_grant_id: FULL_ID,
   weekly_resets_at: "2026-11-15T00:00:00Z",
@@ -33,9 +33,9 @@ describe("cedar_ember grants", () => {
     expect(info.availableCount).toBe(2);
     expect(info.label).toBe("One full limit reset (November 2026)");
     expect(info.grants).toEqual([
-      { id: FULL_ID, label: "One full limit reset (November 2026)", kind: "full", resetsLeft: 1, usableNow: true, paused: false, endsAt: "2026-11-30T23:59:59.000Z" },
-      { id: FABLE_ID, label: "New model launch: one Fable reset", kind: "fable", resetsLeft: 1, usableNow: true, paused: false, endsAt: "2026-11-20T00:00:00.000Z" },
-      { id: OLD_ID, label: "Earlier usage-limit reset", kind: "other", resetsLeft: 0, usableNow: false, paused: false, endsAt: "2026-12-01T00:00:00.000Z" },
+      { id: FULL_ID, label: "One full limit reset (November 2026)", kind: "full", resetsLeft: 1, usableNow: true, paused: false, endsAt: "2099-11-30T23:59:59.000Z" },
+      { id: FABLE_ID, label: "New model launch: one Fable reset", kind: "fable", resetsLeft: 1, usableNow: true, paused: false, endsAt: "2099-11-20T00:00:00.000Z" },
+      { id: OLD_ID, label: "Earlier usage-limit reset", kind: "other", resetsLeft: 0, usableNow: false, paused: false, endsAt: "2099-12-01T00:00:00.000Z" },
     ]);
     expect(info.grantsCapturedAt).toBe(new Date(NOW).toISOString());
     expect(info.cooldownUntil).toBeUndefined();
@@ -58,7 +58,7 @@ describe("cedar_ember grants", () => {
 
   test("a carried list is marked stale, drops ended grants and keeps its capture time", () => {
     const seen = manualResetFromCedarEmber(CEDAR, NOW)!;
-    const later = NOW + 10 * 86400_000; // past the Fable grant's end
+    const later = Date.parse("2099-11-25T00:00:00Z"); // past the Fable grant end, before the full grant end
     const carried = carriedManualReset(seen, later)!;
     expect(carried.stale).toBe(true);
     expect(carried.availableCount).toBe(0);

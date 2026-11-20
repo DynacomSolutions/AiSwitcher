@@ -20,7 +20,24 @@ let poolRegistry = "";
 const NOW = 1_789_200_000;
 const identityIn = (dir: string): Identity => ({ name: NAME, label: "Acme", configDir: dir });
 
+/**
+ * The gateway manages every live claude login, so a host process never refreshes one. These tests exercise the refresh
+ * machinery itself, which only the gateway (the owner process) runs.
+ */
+const ownerRole = {
+  saved: undefined as string | undefined,
+  on(): void {
+    this.saved = process.env.AIS_GATEWAY_OWNER;
+    process.env.AIS_GATEWAY_OWNER = "1";
+  },
+  off(): void {
+    if (this.saved === undefined) delete process.env.AIS_GATEWAY_OWNER;
+    else process.env.AIS_GATEWAY_OWNER = this.saved;
+  },
+};
+
 beforeEach(async () => {
+  ownerRole.on();
   root = await mkdtemp(join(tmpdir(), "ais-read-errors-"));
   claudeDir = join(root, "claude", NAME);
   codexDir = join(root, "codex", NAME);
@@ -46,6 +63,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  ownerRole.off();
   (CLAUDE_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved.claude!;
   (CODEX_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved.codex!;
   (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved.pi!;
