@@ -224,7 +224,7 @@ ETA: 2026-11-20 14:00 ICT
 | 239 | OpenCode homes get each gateway model's context and output limits | done | claude | opencode-model-limits | | | T3 showed 200,000 tokens for Kimi K3.1 Pro on the OpenCode pool. The model has 1,048,576.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/634 (3993341).<br>Live after release v0.5.77 and the host update. |
 | 241 | Limit answers use the true reset of the full window | done | agent | gw-limit-true-reset | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/642 (ccecd57), Opus review fixed.<br>Live on all 6 cluster gateway pods (binary has fetchOpencodeUsage).<br>Not yet seen live: a real limit answer with the weekly reset. |
 | 244 | Release tests stop failing on the Kimi refresh and SIGTERM drain checks | done | agent | fix-release-flaky-tests | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/648 (9e41445). |
-| 246 | Kimi and Grok threads snooze at a usage limit and resume at the reset | in_progress | agent | acp-limit-snooze | 5.229 | 2026-11-21 01:00 ICT | T3 Kimi and Grok drivers never read a reset time from a failure.<br>The AIS relay snoozes the thread and schedules the resume through T3 MCP tools. |
+| 246 | Kimi and Grok threads snooze at a usage limit and resume at the reset | in_progress | agent | acp-limit-snooze | 5.229 | 2026-11-21 00:30 ICT | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/657 (8141866), Opus review fixed.<br>Stub 429 runs proved snooze, schedule and thread read for Kimi and Grok.<br>Due: v0.5.81 on the host, Grok instances re-applied, first real limit. |
 ## 6. Browser control extension
 ETA: 2026-11-18 18:30 ICT
 
