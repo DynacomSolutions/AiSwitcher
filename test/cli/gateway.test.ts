@@ -354,3 +354,21 @@ describe("codex homes", () => {
     expect(out.join("\n")).toContain("codex homes: not updated");
   });
 });
+
+describe("claude-preload", () => {
+  test("--print writes the preload source to the output", async () => {
+    const { CLAUDE_ACCOUNT_PRELOAD_SOURCE } = await import("../../src/identities/claude-account-preload.ts");
+    await run("gateway claude-preload --print");
+    expect(out.join("\n")).toBe(CLAUDE_ACCOUNT_PRELOAD_SOURCE.replace(/\n$/, ""));
+  });
+  test("--install=<path> writes the file there and prints the path", async () => {
+    const { CLAUDE_ACCOUNT_PRELOAD_SOURCE } = await import("../../src/identities/claude-account-preload.ts");
+    const target = join(dir, "pod", "ais", "account-preload.cjs");
+    await run(`gateway claude-preload --install=${target}`);
+    expect(out).toEqual([target]);
+    expect(readFileSync(target, "utf8")).toBe(CLAUDE_ACCOUNT_PRELOAD_SOURCE);
+  });
+  test("needs --print or --install", async () => {
+    await expect(run("gateway claude-preload")).rejects.toThrow("Usage: ais gateway claude-preload");
+  });
+});

@@ -1,6 +1,6 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { writeFileAtomic } from "./pool/fs.ts";
 
 /** Environment marker passed only to the Claude process that needs the account preload. */
@@ -77,6 +77,12 @@ function loopback(host) {
   return value === "localhost" || value === "::1" || /^127(?:\.\d{1,3}){3}$/.test(value);
 }
 
+// A plain-HTTP gateway is allowed only on loopback or on a Kubernetes service name (cluster-internal DNS).
+function clusterInternal(host) {
+  const value = String(host || "").toLowerCase().replace(/\.$/, "");
+  return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.svc(?:\.cluster\.local)?$/.test(value);
+}
+
 function configuredBase() {
   const folder = process.env.CLAUDE_CONFIG_DIR;
   if (!folder) return undefined;
@@ -86,7 +92,7 @@ function configuredBase() {
   try {
     const base = new URL(raw);
     if (base.username || base.password || base.hash) return undefined;
-    if (base.protocol !== "https:" && !(base.protocol === "http:" && loopback(base.hostname))) return undefined;
+    if (base.protocol !== "https:" && !(base.protocol === "http:" && (loopback(base.hostname) || clusterInternal(base.hostname)))) return undefined;
     return base;
   } catch { return undefined; }
 }
@@ -240,6 +246,12 @@ if (typeof nativeFetch === "function") {
 }
 `;
 
+/** Same host rule as the preload source: plain HTTP is allowed only for a Kubernetes service name. */
+export function isClusterInternalHost(host: string): boolean {
+  const value = host.toLowerCase().replace(/\.$/, "");
+  return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.svc(?:\.cluster\.local)?$/.test(value);
+}
+
 export function addClaudeAccountPreload(existing: string | undefined, preloadPath: string): string {
   const pathValue = preloadPath.trim();
   if (pathValue === "") throw new Error("Claude account preload path is required");
@@ -286,8 +298,12 @@ function quoteBunOption(value: string): string {
 }
 
 export async function installClaudeAccountPreload(home = homedir()): Promise<string> {
-  const path = CLAUDE_ACCOUNT_PRELOAD_PATH(home);
-  await mkdir(join(home, ".ais", "claude"), { recursive: true, mode: 0o700 });
+  return installClaudeAccountPreloadAt(CLAUDE_ACCOUNT_PRELOAD_PATH(home));
+}
+
+/** Writes the preload to an exact file path (for a pod that runs Claude without the ais launcher). */
+export async function installClaudeAccountPreloadAt(path: string): Promise<string> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   let current: string | undefined;
   try {
     current = await readFile(path, "utf8");

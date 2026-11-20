@@ -80,7 +80,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-usage|t3-acp|t3-instance|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -97,6 +97,10 @@ export const HELP: Record<string, HelpNode> = {
       "claude-proxy": sub(
         "ais gateway claude-proxy <claude config dir>... [--url=<gateway-app-url>] [--check]",
         "Point Claude folders at the direct AIS gateway app, remove generic proxy settings and preserve user:profile; --check reports legacy proxy settings",
+      ),
+      "claude-preload": sub(
+        "ais gateway claude-preload --print | --install[=<path>]",
+        "Print the Claude account preload (.cjs), or write it to <path> (default ~/.ais/claude/account-preload.cjs), for a Claude process that runs without the ais launcher, such as a cluster agent pod; it redirects only the Claude profile and plan-usage reads to the gateway app",
       ),
       "t3-proxy": sub(
         "ais gateway t3-proxy [--proxy=<url>] [--ca=<path>] [--check] [--remove]",
