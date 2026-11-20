@@ -69,6 +69,8 @@ export interface PoolUsage {
   capturedAt: string;
   /** Gateway only: the last good figure, kept because the latest refresh failed or had no figure. Shown, never used to refuse. */
   stale?: boolean;
+  /** Gateway only: the source answered and the member has no plan that can serve (no windows, or only untouched ones). It never blocks, never sets a reset and can never serve. */
+  noPlan?: boolean;
 }
 
 export interface SwapCredentialsInput {
