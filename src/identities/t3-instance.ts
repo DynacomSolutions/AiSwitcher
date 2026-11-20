@@ -3,8 +3,8 @@ import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { appTokenKey, readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import { GATEWAY_ENTRY_SCOPES_WITH_USAGE_PROXY, GATEWAY_TOKEN_PREFIX, gatewayEntryText } from "./claude-gateway-entry.ts";
-import { withLoopbackNoProxy } from "./claude-usage-proxy.ts";
+import { GATEWAY_ENTRY_SCOPES, GATEWAY_TOKEN_PREFIX, gatewayEntryText } from "./claude-gateway-entry.ts";
+import { withDirectGateway } from "./claude-usage-proxy.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
 import { t3Paths } from "./t3-anthropic-proxy.ts";
 import { syncT3UsageCredentials, type UsageResult } from "./t3-usage-credentials.ts";
@@ -28,9 +28,9 @@ export interface T3InstanceOptions {
   provider?: string;
   like?: string;
   binary?: string;
-  /** CONNECT proxy URL (claude only). */
+  /** Legacy CONNECT proxy URL. It is ignored for Claude instances. */
   proxyUrl?: string;
-  /** CA file for the CONNECT proxy (claude only). */
+  /** Legacy CONNECT proxy CA path. It is ignored for Claude instances. */
   caPath?: string;
   home?: string;
   env?: Record<string, string | undefined>;
@@ -261,7 +261,6 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
   let entry: Json;
 
   if (opts.driver === "claude") {
-    if (!opts.proxyUrl) throw new Error("The CONNECT proxy URL is unknown");
     let like: Json | undefined;
     if (opts.like) {
       like = obj(instances[opts.like]);
@@ -275,12 +274,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     entry = { ...existing, driver: "claudeAgent", displayName, enabled: true, config };
 
     const own = (await readJsonObject(join(folder, "settings.json"))) ?? {};
-    const env: Json = { ...obj(own.env) };
-    env.ANTHROPIC_BASE_URL = opts.gatewayUrl;
-    env.HTTPS_PROXY = opts.proxyUrl;
-    if (opts.caPath) env.NODE_EXTRA_CA_CERTS = opts.caPath;
-    env.NO_PROXY = withLoopbackNoProxy(env.NO_PROXY ?? env.no_proxy);
-    delete env.no_proxy;
+    const env = withDirectGateway(own, opts.gatewayUrl).env as Json;
     if (models.length > 0) {
       const first = models[0]!;
       Object.assign(env, {
@@ -298,7 +292,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
       if (hooks !== undefined) own.hooks = hooks;
     }
     plans.push({ path: join(folder, "settings.json"), content: `${JSON.stringify(own, null, 2)}\n`, mode: 0o600, label: "settings.json (folder)" });
-    plans.push({ path: join(folder, ".credentials.json"), content: gatewayEntryText(token, GATEWAY_ENTRY_SCOPES_WITH_USAGE_PROXY), mode: 0o600, label: ".credentials.json" });
+    plans.push({ path: join(folder, ".credentials.json"), content: gatewayEntryText(token, GATEWAY_ENTRY_SCOPES), mode: 0o600, label: ".credentials.json" });
     plans.push({ path: join(folder, ".claude.json"), content: `${JSON.stringify({ hasCompletedOnboarding: true })}\n`, mode: 0o600, label: ".claude.json", onlyIfMissing: true });
   } else if (opts.driver === "pi") {
     if (models.length === 0) throw new Error("--models=a,b is required for the pi driver");

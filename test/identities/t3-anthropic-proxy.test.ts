@@ -2,12 +2,11 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runT3ProxyCommand } from "../../src/cli/gateway/t3-proxy.ts";
+import { deriveT3ConnectProxyUrl, runT3ProxyCommand } from "../../src/cli/gateway/t3-proxy.ts";
 import {
   PRELOAD_SOURCE,
   checkT3Proxy,
   installT3Proxy,
-  proxyFromT3Folders,
   removeFromServiceEnv,
   t3Paths,
   t3ProxyDoctorProblems,
@@ -112,25 +111,32 @@ test("removeFromServiceEnv drops the NODE_OPTIONS line when only our --require w
   expect(removeFromServiceEnv(text, input.preloadPath)).toBe("K=1\n");
 });
 
-test("CLI: install, --check exit and --remove, with proxy from a T3 gateway folder", async () => {
+test("derives the T3 endpoint from the configured gateway host and port", () => {
+  expect(deriveT3ConnectProxyUrl("https://gateway.example.test/gateway/agents-claude", 47132)).toBe("http://gateway.example.test:47132");
+  expect(deriveT3ConnectProxyUrl("http://gateway.example.test/base", 47133)).toBe("http://gateway.example.test:47133");
+});
+
+test("CLI: install, --check exit and --remove, with a derived remote endpoint", async () => {
   const s = await scratch("T3CODE_LAN=1\n");
-  await mkdir(join(s.home, ".t3", "gateway", "t3-claude-a"), { recursive: true });
-  await writeFile(join(s.home, ".t3", "gateway", "t3-claude-a", "settings.json"), JSON.stringify({ env: { HTTPS_PROXY: "https://folder.example.test:1" } }));
-  expect(await proxyFromT3Folders(s.opts)).toBe("https://folder.example.test:1");
   const lines: string[] = [];
   const deps = { out: (l: string) => lines.push(l), secretsPath: join(s.home, "no-secrets") } as never;
   const saved = process.env.AIS_GATEWAY_CONNECT_PROXY_URL;
+  const savedGateway = process.env.AIS_GATEWAY_PROXY_URL;
   delete process.env.AIS_GATEWAY_CONNECT_PROXY_URL;
+  process.env.AIS_GATEWAY_PROXY_URL = "https://gateway.example.test/gateway/agents-claude";
   try {
     await expect(runT3ProxyCommand([], { check: true }, deps, s.opts)).rejects.toThrow("problem");
-    await runT3ProxyCommand([], { ca: "/tmp/ca.pem" }, deps, s.opts);
-    expect(await readFile(s.envFile, "utf8")).toContain("AIS_T3_ANTHROPIC_PROXY=https://folder.example.test:1");
+    await runT3ProxyCommand([], { ca: "/tmp/ca.pem", port: "47133" }, deps, s.opts);
+    expect(await readFile(s.envFile, "utf8")).toContain("AIS_T3_ANTHROPIC_PROXY=http://gateway.example.test:47133");
     expect(lines.join("\n")).toContain("Restart T3 Code");
     await runT3ProxyCommand([], { check: true }, deps, s.opts);
     await runT3ProxyCommand([], { remove: true }, deps, s.opts);
     expect(await readFile(s.envFile, "utf8")).toBe("T3CODE_LAN=1\n");
   } finally {
     if (saved !== undefined) process.env.AIS_GATEWAY_CONNECT_PROXY_URL = saved;
+    else delete process.env.AIS_GATEWAY_CONNECT_PROXY_URL;
+    if (savedGateway !== undefined) process.env.AIS_GATEWAY_PROXY_URL = savedGateway;
+    else delete process.env.AIS_GATEWAY_PROXY_URL;
   }
 });
 

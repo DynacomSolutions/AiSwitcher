@@ -26,6 +26,9 @@ import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
+import { addClaudeAccountPreload, CLAUDE_ACCOUNT_PRELOAD_MARKER, installClaudeAccountPreload } from "../identities/claude-account-preload.ts";
+import { isGatewayAccessToken, storedAccessToken } from "../identities/claude-gateway-entry.ts";
+import { CLAUDE_PROXY_ENV_KEYS } from "../identities/claude-usage-proxy.ts";
 
 export function herdrTitleForLaunch(
   tool: string,
@@ -179,6 +182,13 @@ export async function runWrapper(
       resolved.configDirValue,
       sharedConfigArgs,
     );
+    const claudeAccountPreloadEnv: Record<string, string | undefined> = {};
+    if (cfg.toolName === "claude" && isGatewayAccessToken(await storedAccessToken(resolved.configDirValue))) {
+      const preloadPath = await installClaudeAccountPreload();
+      claudeAccountPreloadEnv[CLAUDE_ACCOUNT_PRELOAD_MARKER] = "1";
+      claudeAccountPreloadEnv.BUN_OPTIONS = addClaudeAccountPreload(process.env.BUN_OPTIONS, preloadPath);
+      for (const key of CLAUDE_PROXY_ENV_KEYS) claudeAccountPreloadEnv[key] = undefined;
+    }
     const launchArgs = cfg.toolName === "codex"
       ? codexSubcommandConfigArgs([...memoryProjection.argv])
       : [...gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd())];
@@ -226,6 +236,7 @@ export async function runWrapper(
           ...extraEnv,
           ...memoryProjection.env,
           ...(cfg.toolName === "codex" ? await codexLocalGatewayEnv(resolved.configDirValue) : {}),
+          ...claudeAccountPreloadEnv,
           ...(titleOwnerPid !== undefined ? { AIS_HERDR_TITLE_OWNER_PID: titleOwnerPid } : {}),
           ...(activeIdentity !== undefined ? { [IDENTITY_SESSION_MARKER]: activeIdentity } : {}),
         },

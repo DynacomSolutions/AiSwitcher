@@ -8,7 +8,6 @@ import {
   USAGE_COLLECTOR_IO_CAP,
 } from "../src/cli/usage/collector-service.ts";
 import { ensureNativeTokscale, TOKSCALE_FORCE_REBUILD_ENV, type NativeTokscaleResult } from "../src/cli/usage/tokscale-build.ts";
-import { installLocalGatewayService } from "../src/cli/gateway/local-service.ts";
 import { describeProfileSyncServiceResult, installProfileSyncService } from "../src/sync/profile-sync-service.ts";
 
 // "open" (shadows macOS's /usr/bin/open) is a macOS-only concept — see
@@ -87,15 +86,6 @@ async function configureUsageCollectorService(aisBinaryChanged: boolean): Promis
         : `install: warning: usage collector disk cap kept at ${result.ioCap}/s: the installed Tokscale does not checkpoint its cache.`,
     );
     console.error("install: usage collector service is enabled and active.");
-  }
-  // The local gateway failover proxy rides the same binary: restart it when the binary changed, install it when missing.
-  if (result.status === "installed" || result.status === "verified") {
-    try {
-      const unit = await installLocalGatewayService({ restartIfActive: aisBinaryChanged, respectDisabled: true });
-      console.error(`install: gateway local service ${unit.action}: ${unit.path}`);
-    } catch (err) {
-      console.error(`install: gateway local service skipped: ${err instanceof Error ? err.message : String(err)}`);
-    }
   }
 }
 

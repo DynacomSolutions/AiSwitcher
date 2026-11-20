@@ -13,6 +13,6 @@ test("a folder whose proxy would catch its loopback base URL is degraded, with n
   const r = await probeClaudeDoctor({ name: "swap", label: "swap", configDir });
   expect(r.status).toBe("degraded");
   expect(r.statusWord).toBe("proxy misconfigured");
-  expect(r.detail).toContain("NO_PROXY=127.0.0.1,localhost,::1");
+  expect(r.detail).toBe("HTTPS_PROXY is set; direct Claude gateway traffic must not use a generic proxy");
   expect(r.elapsedMs).toBeUndefined();
 });

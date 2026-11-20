@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -339,23 +339,4 @@ export async function t3ProxyDoctorProblems(opts: T3Options = {}): Promise<strin
   const preload = await readOptional(paths.preload).catch(() => undefined);
   if (preload !== undefined && preload !== PRELOAD_SOURCE) problems.push(`T3 preload ${paths.preload} is out of date; run ais gateway t3-proxy, then restart T3`);
   return problems;
-}
-
-/** HTTPS_PROXY of any <t3Home>/gateway/t3-claude-*\/settings.json env (the gateway folders already set up for T3). */
-export async function proxyFromT3Folders(opts: T3Options = {}): Promise<string | undefined> {
-  const dir = join(t3Paths(opts).t3Home, "gateway");
-  let names: string[];
-  try {
-    names = (await readdir(dir)).filter((n) => n.startsWith("t3-claude-")).sort();
-  } catch {
-    return undefined;
-  }
-  for (const name of names) {
-    try {
-      const parsed = JSON.parse(await readFile(join(dir, name, "settings.json"), "utf8")) as { env?: Record<string, unknown> };
-      const v = parsed.env?.HTTPS_PROXY;
-      if (typeof v === "string" && v.trim() !== "") return v.trim();
-    } catch {}
-  }
-  return undefined;
 }

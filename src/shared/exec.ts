@@ -93,7 +93,7 @@ const SESSION_MARKER_PATTERN = /^(CLAUDE|CODEX|GROK|AI_AGENT|CRUSH|ALI|OPENCODE_
 export const IDENTITY_SESSION_MARKER = "AI_PROFILE_SWITCHER_SESSION";
 export const IDENTITY_SESSION_TOOL_MARKER = "AI_PROFILE_SWITCHER_TOOL";
 
-export function buildChildEnv(extraEnv: Record<string, string>): Record<string, string | undefined> {
+export function buildChildEnv(extraEnv: Record<string, string | undefined>): Record<string, string | undefined> {
   const cleaned: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(process.env)) {
     // GROK_MEMORY is the one intentional exception. Keep the exact key
@@ -124,7 +124,7 @@ export function buildChildEnv(extraEnv: Record<string, string>): Record<string, 
 export async function spawnReal(
   cmdPath: string,
   args: string[],
-  extraEnv: Record<string, string>,
+  extraEnv: Record<string, string | undefined>,
 ): Promise<number> {
   const child = Bun.spawn([cmdPath, ...args], {
     stdio: ["inherit", "inherit", "inherit"],
@@ -169,7 +169,7 @@ export async function spawnReal(
  * falls back to `spawnReal`. Environment is built exactly as `spawnReal`
  * builds it.
  */
-export function execveReal(cmdPath: string, args: string[], extraEnv: Record<string, string>): string {
+export function execveReal(cmdPath: string, args: string[], extraEnv: Record<string, string | undefined>): string {
   return tryExecve(cmdPath, [cmdPath, ...args], buildChildEnv(extraEnv));
 }
 
@@ -181,7 +181,7 @@ export function execveReal(cmdPath: string, args: string[], extraEnv: Record<str
 export async function execReal(
   cmdPath: string,
   args: string[],
-  extraEnv: Record<string, string>,
+  extraEnv: Record<string, string | undefined>,
 ): Promise<never> {
   execveReal(cmdPath, args, extraEnv);
   const exitCode = await spawnReal(cmdPath, args, extraEnv);

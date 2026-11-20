@@ -8,8 +8,8 @@ import { writeFileAtomic } from "./pool/fs.ts";
  * Claude Code shows its native "continue automatically / stop and wait" limit handling only in OAuth (subscriber)
  * mode, never with an `apiKeyHelper`. Such an identity therefore holds a `claudeAiOauth` entry whose access token is the
  * gateway app token (never a member login). Findings from live runs of Claude Code 2.1.316:
- *   - `refreshToken: null` and the single scope `user:inference` keep it off the profile and refresh calls that go to the
- *     real Anthropic hosts (a gateway token is rejected there, and a failed refresh ends the session with "Login expired");
+ *   - `refreshToken: null` keeps Claude from trying to renew the AIS token through Anthropic.
+ *   - `user:profile` enables account reads. The AIS launcher sends those reads to the configured gateway app.
  *   - `subscriptionType: "max"` gives the "Claude Max" banner and the limit menu.
  */
 
@@ -19,27 +19,13 @@ export const GATEWAY_CLAUDE_APP = "agents-claude";
 export const GATEWAY_TOKEN_PREFIX = "aisg_";
 /** 2100-01-01T00:00:00Z in ms: Claude Code never tries to refresh the entry. */
 export const GATEWAY_ENTRY_EXPIRES_AT_MS = 4_102_444_800_000;
-export const GATEWAY_ENTRY_SCOPES = ["user:inference"];
-/**
- * Scopes for a folder that uses the gateway usage proxy (HTTPS_PROXY): Claude Code reads plan limits only with
- * `user:profile`, and the proxy answers that read from the gateway. Without the proxy the read would go to Anthropic with
- * the gateway token, so the scope is only added when the proxy is set (see claude-usage-proxy.ts).
- */
-export const GATEWAY_ENTRY_SCOPES_WITH_USAGE_PROXY = ["user:inference", "user:profile"];
-const PROXY_ENV_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+export const GATEWAY_ENTRY_SCOPES = ["user:inference", "user:profile"];
 
 export const isGatewayAccessToken = (token: unknown): boolean => typeof token === "string" && token.startsWith(GATEWAY_TOKEN_PREFIX);
 
 /** The `.credentials.json` text for the gateway entry. */
 export function gatewayEntryText(token: string, scopes: readonly string[] = GATEWAY_ENTRY_SCOPES): string {
   return `${JSON.stringify({ claudeAiOauth: { accessToken: token, refreshToken: null, expiresAt: GATEWAY_ENTRY_EXPIRES_AT_MS, scopes: [...scopes], subscriptionType: "max" } })}\n`;
-}
-
-/** The scopes the gateway entry in this folder must carry: `user:profile` too when its settings use the usage proxy. */
-export async function gatewayEntryScopesFor(configDir: string): Promise<readonly string[]> {
-  const env = (await readJson(join(configDir, "settings.json")))?.env as Record<string, unknown> | undefined;
-  const proxied = PROXY_ENV_KEYS.some((k) => typeof env?.[k] === "string" && (env[k] as string).trim() !== "");
-  return proxied ? GATEWAY_ENTRY_SCOPES_WITH_USAGE_PROXY : GATEWAY_ENTRY_SCOPES;
 }
 
 /** The agents-claude gateway token from the secrets file (the one the key helpers print), or undefined. */
@@ -87,9 +73,9 @@ async function readJson(path: string): Promise<Record<string, unknown> | undefin
 export async function isIntactGatewayEntry(configDir: string, token: string): Promise<boolean> {
   const oauth = (await readJson(join(configDir, ".credentials.json")))?.claudeAiOauth as { accessToken?: unknown; refreshToken?: unknown; scopes?: unknown } | undefined;
   if (oauth?.accessToken !== token || !(oauth.refreshToken === null || oauth.refreshToken === undefined || oauth.refreshToken === "")) return false;
-  // An entry missing a scope the folder needs (user:profile with the usage proxy) is repaired, never left to lose the limits.
+  // An entry missing a required scope is repaired, never left without plan limits.
   const have = new Set(Array.isArray(oauth.scopes) ? oauth.scopes : []);
-  return (await gatewayEntryScopesFor(configDir)).every((s) => have.has(s));
+  return GATEWAY_ENTRY_SCOPES.every((scope) => have.has(scope));
 }
 
 /** The access token in the identity's `.credentials.json`, if any. */
@@ -110,7 +96,7 @@ export async function isGatewayRoutedDir(configDir: string, opts: { localPort?: 
 
 /** Writes the gateway entry atomically with mode 0600. */
 export async function writeGatewayEntry(configDir: string, token: string): Promise<void> {
-  await writeFileAtomic(join(configDir, ".credentials.json"), gatewayEntryText(token, await gatewayEntryScopesFor(configDir)));
+  await writeFileAtomic(join(configDir, ".credentials.json"), gatewayEntryText(token));
 }
 
 /** Removes `apiKeyHelper` from the folder's settings.json (it would switch Claude Code out of subscriber mode). Other keys

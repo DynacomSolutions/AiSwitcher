@@ -1,14 +1,9 @@
-import { homedir } from "node:os";
-import { resolve } from "node:path";
-import { expandPath } from "../../identities/match.ts";
-import { proxyFromT3Folders } from "../../identities/t3-anthropic-proxy.ts";
 import { installAgentGuardForHome, type AgentGuardDeps } from "../../identities/agent-guard-install.ts";
 import { applyT3Instance, type InstanceDriver, type T3InstanceOptions } from "../../identities/t3-instance.ts";
 import { isUsageTrouble, describeUsageResult } from "../../identities/t3-usage-credentials.ts";
 import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { connect, type GatewayCliDeps } from "./apps.ts";
-import { DEFAULT_CONNECT_CA } from "./claude-proxy.ts";
 import { readSecretsKey } from "./secrets-file.ts";
 
 const USAGE = "Usage: ais gateway t3-instance <instance-id> --driver=claude|grok|opencode|pi --app=<gateway app> [--name=<name>|--display-name=<name>] [--provider=<slug>] [--models=a,b] [--like=<claude instance id>] [--binary=<path>] [--check] [--remove]";
@@ -62,16 +57,6 @@ export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["fl
           // keep the fallback
         }
       }
-    }
-    if (driver === "claude") {
-      const proxyUrl =
-        stringFlag(flags, "proxy") ??
-        (await readSecretsKey("AIS_GATEWAY_CONNECT_PROXY_URL", deps.secretsPath)) ??
-        process.env.AIS_GATEWAY_CONNECT_PROXY_URL ??
-        (await proxyFromT3Folders({ home: homedir(), ...opts }));
-      if (!proxyUrl) throw new CliUsageError("Proxy URL unknown: pass --proxy=http://<host>:<port> or set AIS_GATEWAY_CONNECT_PROXY_URL in ~/.secrets");
-      base.proxyUrl = proxyUrl;
-      base.caPath = resolve(expandPath(DEFAULT_CONNECT_CA()));
     }
   }
   const r = await applyT3Instance(base);
