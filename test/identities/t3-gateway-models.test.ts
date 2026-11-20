@@ -136,7 +136,7 @@ test("sync: kimi and opencode folders follow the gateway; mode kept; key never s
   const doFetch = fakeFetch(
     {
       "https://gw.example.test/gateway/t3-kimi/v1/models": { body: { data: [kimiModel("k3"), kimiModel("k3-256k")] } },
-      "https://gw.example.test/gateway/t3-opencode/models": { body: { object: "list", data: [{ id: "stay-2", name: "Stay Two" }, { id: "new-3" }] } },
+      "https://gw.example.test/gateway/t3-opencode/models": { body: { object: "list", data: [{ id: "stay-2", name: "Stay Two" }, { id: "new-3" }, { id: "big-4", context_length: 1048576 }, { id: "cap-5", limit: { context: 200000, output: 64000 } }] } },
     },
     seen,
   );
@@ -151,7 +151,12 @@ test("sync: kimi and opencode folders follow the gateway; mode kept; key never s
   expect((await stat(kimiFile)).mode & 0o777).toBe(0o600);
 
   const oc = JSON.parse(await readFile(ocFile, "utf8"));
-  expect(oc.provider.gateway.models).toEqual({ "stay-2": { name: "Stay Two", limit: { context: 5 } }, "new-3": { name: "new-3" } });
+  expect(oc.provider.gateway.models).toEqual({
+    "stay-2": { name: "Stay Two", limit: { context: 5 } },
+    "new-3": { name: "new-3" },
+    "big-4": { name: "big-4", limit: { context: 1048576, output: 32768 } },
+    "cap-5": { name: "cap-5", limit: { context: 200000, output: 64000 } },
+  });
   expect(oc.provider.gateway.options.apiKey).toBe("{file:./token}");
   expect(oc.permission).toEqual({ "*": "allow" });
 
