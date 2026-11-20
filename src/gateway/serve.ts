@@ -19,7 +19,8 @@ import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { isOperationalPath, publicHostsFromEnv, viaPublicHost } from "./public-host.ts";
 import { aliSessionOnce, aliSetupSelfTest, listAliAccounts, type AliSetupDeps } from "./ali-session.ts";
-import { createAdminApp, type IdentityState } from "./admin.ts";
+import { createAdminApp, limitsIdentities, LIMITS_PROVIDERS, type IdentityState } from "./admin.ts";
+import { createWarmGate, positiveIntEnv } from "../shared/warm-gate.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
 import { createGatewayApp, markGatewayResponse, styleForPath, type GatewayDeps } from "./app.ts";
 import { authBrowserToken } from "./browser/auth.ts";
@@ -121,6 +122,8 @@ export interface GatewayHooks {
   noHeartbeat?: boolean;
   /** Replica HOME for the credential store mirror (default the process home). */
   home?: string;
+  /** Longest /readyz waits for the usage cache to warm (default 90 s, or AIS_GATEWAY_USAGE_WARM_TIMEOUT_MS). */
+  usageWarmTimeoutMs?: number;
   /** Database reachability check behind /readyz (default SELECT 1 on the gateway database; a no-op when openStore is replaced). */
   ping?(): Promise<void>;
   pingMs?: number;
@@ -704,6 +707,13 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
 
   let warmed = false;
   let draining = false;
+  // Readiness also waits for the usage cache, so GET /limits never answers "unavailable" right after a rollout.
+  const usageGate = createWarmGate({ timeoutMs: hooks.usageWarmTimeoutMs ?? positiveIntEnv("AIS_GATEWAY_USAGE_WARM_TIMEOUT_MS", 90_000) });
+  let usageWarmupTimeouts = 0;
+  let usageWarmupCold = 0;
+  const isReady = (): boolean => warmed && !draining && usageGate.isReady();
+  metrics.readiness = () => ({ ready: isReady(), state: usageGate.state() });
+  metrics.usageWarmup = () => ({ seconds: (usageGate.result()?.durationMs ?? 0) / 1000, timeouts: usageWarmupTimeouts, cold: usageWarmupCold });
   let storeSynced = false;
   let relayStarted = false;
   let importTimer: ReturnType<typeof setInterval> | undefined;
@@ -782,6 +792,36 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     }
   }
 
+  /**
+   * Fills the usage cache for exactly the identities GET /limits lists, in parallel. The timeout covers reading the set too.
+   * The set comes from the warm cached store. GET /limits reads the database, which agrees for active pinned apps
+   * (the cache follows the database by change notices and a timed refresh).
+   */
+  async function warmUsage(): Promise<void> {
+    const keys = async (): Promise<string[]> => {
+      if (hooks.usageFor) return [];
+      const apps = await store.listApps();
+      const out: string[] = [];
+      for (const provider of LIMITS_PROVIDERS) {
+        for (const identity of await limitsIdentities({ poolMembers, canonical }, apps, provider)) out.push(`${provider}/${identity}`);
+      }
+      return out;
+    };
+    const result = await usageGate.run(keys, (key) => {
+      const slash = key.indexOf("/");
+      return usage.prefill(key.slice(0, slash) as GatewayProvider, key.slice(slash + 1));
+    });
+    // A drain ends the run early. That is neither a timeout nor a reason to warn.
+    if (result.outcome === "draining") return;
+    if (result.outcome === "timeout") {
+      usageWarmupTimeouts += 1;
+      usageWarmupCold = result.cold.length;
+      console.warn(`gateway: usage cache still cold after ${result.durationMs} ms for ${result.cold.join(", ")}; ready anyway`);
+    } else {
+      console.info(`gateway: usage cache warm in ${result.durationMs} ms, ready for traffic`);
+    }
+  }
+
   /** Retries with backoff until warm: a database that is down at start leaves the gateway unready, never crashed. */
   async function warmUp(): Promise<void> {
     let delay = backoff.initialMs;
@@ -818,12 +858,14 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         await store.warm();
         if (draining) return;
         warmed = true;
+        // Starts before the listener below, so the timeout covers every step after the store is warm.
+        void warmUsage().catch(() => undefined);
         void gaugeTick();
         pruneJournal();
         store.startRefresh(hooks.refreshIntervalMs ?? 15_000);
         // Other replicas' changes (a revoke above all) arrive at once; the timed refresh stays as the fallback.
         await store.startListening().catch((err) => console.warn(`gateway: app change notices unavailable (${describe(err)}); the ${(hooks.refreshIntervalMs ?? 15_000) / 1000} s refresh still applies`));
-        console.info("gateway: warm, ready for traffic");
+        console.info("gateway: store warm, usage cache warm-up started");
         void probeIdentities().catch(() => undefined);
         if (aliList && selfTestEnabled) void aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).then((p) => void (aliSetupOk = p.length === 0), () => undefined);
         return;
@@ -877,6 +919,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     if (path === "/readyz") {
       if (draining) return new Response("draining\n", { status: 503 });
       if (!warmed) return new Response("warming\n", { status: 503 });
+      if (!usageGate.isReady()) return new Response("warming usage cache\n", { status: 503 });
       // A warm replica serves from its loaded logins; ledger rows queue and the store sync retries until the database is back.
       // Taking it out of the rotation would leave no gateway at all while the database primary is down.
       return new Response(dbOk() ? "ready\n" : "ready, database unreachable\n");
@@ -1063,6 +1106,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       draining = true;
+      usageGate.drain();
       hub.closeAll(1012);
       wake?.();
       clearInterval(alertTimer);
@@ -1138,6 +1182,6 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     port: server.port as number,
     adminPort: adminServer.port as number,
     ...(connectProxy ? { connectPort: connectProxy.port } : {}),
-    ready: () => warmed && !draining,
+    ready: isReady,
   };
 }

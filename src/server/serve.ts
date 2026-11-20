@@ -17,6 +17,7 @@ import type { ConsoleAppDeps } from "./app.ts";
 import { runScanIsolated, stopScanWorkers, stopUsageSnapshotSampler, warmUsageCaches } from "./workers.ts";
 import type { ResetExpiryNotifier } from "./reset-expiry-push.ts";
 import { isAisLive, isLiveImageUser, noteLiveFeatureDisabled } from "../shared/live-mode.ts";
+import { warmLimitsThenReady } from "./limits-warm.ts";
 import { ServerLifecycle, stopServerAfterDrain, trackResponseBody } from "./lifecycle.ts";
 
 export interface ServeOptions {
@@ -238,7 +239,8 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   } else {
     await warmResponse.arrayBuffer();
   }
-  lifecycle.markReady();
+  // Readiness also waits for the first limits panel build (see warmLimitsThenReady). That build reads the host scan and the gateway.
+  // A failed gateway read does not stop it: the panel is built without that part and is kept for a short time only.
 
   const server = Bun.serve({
     port,
@@ -272,6 +274,12 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
 
   // Optional read-only widgets listener (AIS_WIDGETS_PORT). Off by default. No auth: see docs/agents/console-web.md.
   const widgetsServer = startWidgetsListener(process.env.AIS_WIDGETS_PORT, port, host, deps.widgets, lifecycle, console.error, deps.allowedHosts);
+
+  // Not awaited: the listeners already run and /api/ready answers 503 until the first limits read ends (or times out).
+  void warmLimitsThenReady(lifecycle, deps.widgets).catch((error) => {
+    console.error(`console: limits warm-up failed: ${error instanceof Error ? error.message : String(error)}`);
+    lifecycle.markReady();
+  });
 
   if (options.managed !== false) {
     warmUsageCaches();

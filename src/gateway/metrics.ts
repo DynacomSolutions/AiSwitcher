@@ -117,6 +117,9 @@ export class PrometheusMetrics implements GatewayMetrics {
   browserGauges: { connected(): number; sessions(): number } = { connected: () => 0, sessions: () => 0 };
   /** 1 while this replica's app-change notice subscription is up. Set in serve.ts. */
   appNoticesUp: () => number = () => 0;
+  /** Readiness and usage warm-up state, set in serve.ts. */
+  readiness: () => { ready: boolean; state: string } = () => ({ ready: false, state: "cold" });
+  usageWarmup: () => { seconds: number; timeouts: number; cold: number } = () => ({ seconds: 0, timeouts: 0, cold: 0 });
   private publicHostCount = 0;
   private budgetWaiting = 0;
   private readonly budgetBucketCounts = BUCKETS.map(() => 0);
@@ -266,6 +269,14 @@ export class PrometheusMetrics implements GatewayMetrics {
     out.push("# HELP ais_gateway_browser_sessions_active Agent browser sessions active in the last ten minutes.", "# TYPE ais_gateway_browser_sessions_active gauge", `ais_gateway_browser_sessions_active ${this.browserGauges.sessions()}`);
     out.push("# HELP ais_gateway_public_hosts_configured Public host names configured (AIS_GATEWAY_PUBLIC_HOSTS); 0 means operational endpoints answer on every host.", "# TYPE ais_gateway_public_hosts_configured gauge", `ais_gateway_public_hosts_configured ${this.publicHostCount}`);
     out.push("# HELP ais_gateway_app_notices_up 1 while this replica receives app change notices (revokes reach it at once), 0 while it relies on the timed refresh.", "# TYPE ais_gateway_app_notices_up gauge", `ais_gateway_app_notices_up ${this.appNoticesUp()}`);
+    const rd = this.readiness();
+    out.push("# HELP ais_gateway_ready 1 while /readyz answers 200, else 0.", "# TYPE ais_gateway_ready gauge", `ais_gateway_ready ${rd.ready ? 1 : 0}`);
+    out.push("# HELP ais_gateway_readiness_state 1 for the current readiness state (cold, warm, timeout, draining), 0 for the others.", "# TYPE ais_gateway_readiness_state gauge");
+    for (const st of ["cold", "warm", "timeout", "draining"]) out.push(`ais_gateway_readiness_state{state="${st}"} ${rd.state === st ? 1 : 0}`);
+    const uw = this.usageWarmup();
+    out.push("# HELP ais_gateway_usage_warmup_seconds Duration of the usage cache warm-up (0 until it ends).", "# TYPE ais_gateway_usage_warmup_seconds gauge", `ais_gateway_usage_warmup_seconds ${uw.seconds}`);
+    out.push("# HELP ais_gateway_usage_warmup_timeouts_total Usage warm-ups that hit the timeout with identities still cold.", "# TYPE ais_gateway_usage_warmup_timeouts_total counter", `ais_gateway_usage_warmup_timeouts_total ${uw.timeouts}`);
+    out.push("# HELP ais_gateway_usage_warmup_cold_identities Identities still cold when the warm-up timeout fired (0 otherwise).", "# TYPE ais_gateway_usage_warmup_cold_identities gauge", `ais_gateway_usage_warmup_cold_identities ${uw.cold}`);
     out.push("# HELP ais_gateway_ledger_buffer_depth Usage rows waiting to be written.", "# TYPE ais_gateway_ledger_buffer_depth gauge", `ais_gateway_ledger_buffer_depth ${this.gauges.ledgerDepth()}`);
     out.push("# HELP ais_gateway_ledger_dropped_total Usage rows lost.", "# TYPE ais_gateway_ledger_dropped_total counter", `ais_gateway_ledger_dropped_total ${this.gauges.ledgerDropped()}`);
     return `${out.join("\n")}\n`;

@@ -352,3 +352,13 @@ The console serves the Headlamp widget panel API, so its identities, limits and 
 | 243 | Cluster: widgets Service port and AIS_WIDGETS_PORT on the console | done | claude | ais-widgets-port | 16.242 | | Merged .cluster PR 2788 (4516e7c).<br>Role headlamp-ais-widgets, widgets port only. |
 | 246 | Claude swap widget: member usage from the gateway limits | done | claude | widgets-swap-usage | 16.242 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/651 (28d0149).<br>Live: 8 of 8 members with data. |
 | 247 | Widgets: no row cap, no Other bucket | done | claude | widgets-no-cap | 16.242 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/654 (81eb879).<br>Live: agents 120 of 120 rows, gateway usage 83 of 83. |
+
+## 17. Rollouts without cold limits
+ETA: 2026-11-21 00:30 ICT
+A new gateway or console pod takes traffic only after its usage cache is warm, so limits views never go blank during a rollout.
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 248 | Gateway readiness waits for the first usage poll of every identity (bounded) | in_review | claude | gateway-warm-readiness | | 2026-11-20 23:30 ICT | 20 Nov 13:01 UTC rollout: all 6 pods ready cold, limits blank for 2 min.<br>Timeout, warning and metrics included. |
+| 249 | Console readiness waits for its first limits read (bounded) | in_review | claude | gateway-warm-readiness | | 2026-11-20 23:30 ICT | Same timeout and metrics as 17.248. |
+| 250 | Check the gateway and console rollout path, then verify a real rollout | todo | claude | | 17.248, 17.249 | 2026-11-21 00:30 ICT | Probes, SIGTERM drain, liveness, maxSurge/maxUnavailable.<br>Check /api/widgets/limits during the rollout. |

@@ -59,12 +59,17 @@ export interface PanelInfo {
 /** A backend failed. The message is short and safe to show. */
 export class PanelError extends Error {}
 
+/** How long a panel built from a failed gateway read is kept. */
+export const DEGRADED_PANEL_TTL_MS = 30_000;
+
 export const PLUGIN_NAME = "AIS Console";
 
 /** What the panels read. Each source is the same engine call as the matching `/api/*` route. */
 export interface WidgetSources {
   /** The `/api/limits` payload (`{ results: ToolLimitResult[] }`). */
   limits(): Promise<unknown>;
+  /** True when the last limits read had no gateway part because the gateway failed. The panel is then cached for a short time only. */
+  limitsDegraded?(): boolean;
   /** The `/api/auth` payload (`{ entries }`). */
   auth(): Promise<{ entries: AuthEntryLike[] }>;
   /** The `/api/processes` payload. */
@@ -458,7 +463,9 @@ export class WidgetService {
     const failure = this.failures.get(def.id);
     if (failure && Date.now() - failure.at < Math.min(def.refreshSeconds, 60) * 1000) return this.fallback(def.id, failure.message);
     try {
-      const { value } = await this.cache.get(def.id, () => this.build(def), def.refreshSeconds * 1000);
+      // A limits panel built without the gateway part must not stay for the whole refresh period.
+      const degraded = def.id === "limits" && this.sources.limitsDegraded?.() === true;
+      const { value } = await this.cache.get(def.id, () => this.build(def), degraded ? DEGRADED_PANEL_TTL_MS : def.refreshSeconds * 1000);
       this.lastGood.set(def.id, value);
       this.failures.delete(def.id);
       return { status: 200, body: value };
@@ -469,6 +476,11 @@ export class WidgetService {
       this.failures.set(def.id, { at: Date.now(), message });
       return this.fallback(def.id, message);
     }
+  }
+
+  /** Fills the cache entry a later `get(id)` reads. A failed build counts as warmed: it is remembered like any failure. */
+  async warm(id: string): Promise<void> {
+    await this.get(id);
   }
 
   private fallback(id: string, message: string): WidgetResult {
