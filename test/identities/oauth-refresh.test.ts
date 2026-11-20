@@ -809,6 +809,16 @@ describe("cross-process serialisation", () => {
       return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
     }) as typeof fetch;
     const realFetch = globalThis.fetch;
+    // This is a host process. An earlier test file in the same run may have started the gateway server, which sets the
+    // module-level owner flag for the whole process. The owner never refreshes from a usage read, so no POST would happen.
+    // AIS_GATEWAY_OWNER=0 beats that flag. The gateway state files also point at empty paths in this test's own folder.
+    const envKeys = ["AIS_GATEWAY_OWNER", "AIS_GATEWAY_HEARTBEAT", "AIS_GATEWAY_OWNED", "AIS_GATEWAY_MEMBERS_DIR"] as const;
+    const savedEnv = envKeys.map((k) => process.env[k]);
+    const state = join(dirs.kimi, "..", "gateway-state");
+    process.env.AIS_GATEWAY_OWNER = "0";
+    process.env.AIS_GATEWAY_HEARTBEAT = join(state, "heartbeat.json");
+    process.env.AIS_GATEWAY_OWNED = join(state, "owned.json");
+    process.env.AIS_GATEWAY_MEMBERS_DIR = join(state, "members");
     globalThis.fetch = mock;
     try {
       const { fetchKimiLimits } = await import("../../src/cli/limits/kimi-limits.ts");
@@ -818,6 +828,10 @@ describe("cross-process serialisation", () => {
       ]);
     } finally {
       globalThis.fetch = realFetch;
+      envKeys.forEach((k, i) => {
+        if (savedEnv[i] === undefined) delete process.env[k];
+        else process.env[k] = savedEnv[i];
+      });
     }
     expect(urls.filter((u) => u.includes("oauth/token"))).toHaveLength(1);
   });
