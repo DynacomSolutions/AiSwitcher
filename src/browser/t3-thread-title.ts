@@ -19,6 +19,8 @@ export function t3ThreadTitle(env: NodeJS.ProcessEnv = process.env, dbPath: stri
   let db: Database | undefined;
   try {
     db = new Database(dbPath, { readonly: true });
+    // A locked database must not hold a launch up: give up after 150 ms.
+    db.exec("PRAGMA busy_timeout = 150");
     const row = db.query("SELECT title, deleted_at FROM orchestration_v2_projection_threads WHERE thread_id = ?").get(threadId) as
       | { title?: unknown; deleted_at?: unknown }
       | null;

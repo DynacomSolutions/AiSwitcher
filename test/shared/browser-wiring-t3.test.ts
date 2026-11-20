@@ -78,7 +78,7 @@ test("wiring check: wired and unwired instances", async () => {
     },
   }));
   const lines: string[] = [];
-  const res = await runBrowserWiring({ check: true }, { t3Home: t3, aisBinary: "/bin/ais", registryPath: () => reg, serviceInstalled: () => false, out: (l) => lines.push(l) });
+  const res = await runBrowserWiring({ check: true }, { t3Home: t3, aisBinary: "/bin/ais", registryPath: () => reg, gatewayUrl: async () => undefined, out: (l) => lines.push(l) });
   expect(res.ok).toBe(false);
   expect(res.rows.map((r) => [r.instance, r.target, r.wired, r.reason])).toEqual([
     ["shared-pool", "pool:team-pool", true, undefined],
@@ -87,11 +87,11 @@ test("wiring check: wired and unwired instances", async () => {
   expect(lines.join("\n")).toContain("NOT wired: no identity");
   expect(lines.join("\n")).not.toContain("SYNTHETIC_FIXTURE");
   const json: string[] = [];
-  await runBrowserWiring({ json: true }, { t3Home: t3, aisBinary: "/bin/ais", registryPath: () => reg, serviceInstalled: () => false, out: (l) => json.push(l) });
+  await runBrowserWiring({ json: true }, { t3Home: t3, aisBinary: "/bin/ais", registryPath: () => reg, gatewayUrl: async () => undefined, out: (l) => json.push(l) });
   expect(JSON.parse(json[0]!)).toHaveLength(2);
-  const none = await runBrowserWiring({}, { t3Home: t3, aisBinary: undefined, registryPath: () => reg, serviceInstalled: () => false, out: () => {} });
+  const none = await runBrowserWiring({}, { t3Home: t3, aisBinary: undefined, registryPath: () => reg, gatewayUrl: async () => undefined, out: () => {} });
   expect(none.rows[0]!.reason).toBe("ais binary not installed");
   rmSync(join(poolDir, "ais-browser-token"));
-  const noTok = await runBrowserWiring({}, { t3Home: t3, aisBinary: "/bin/ais", registryPath: () => reg, serviceInstalled: () => false, out: () => {} });
+  const noTok = await runBrowserWiring({}, { t3Home: t3, aisBinary: "/bin/ais", registryPath: () => reg, gatewayUrl: async () => undefined, out: () => {} });
   expect(noTok.rows[0]!.reason).toBe("no token");
 });

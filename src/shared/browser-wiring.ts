@@ -1,11 +1,11 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { expandPath } from "../identities/match.ts";
 import { allowedAccounts, isSwapPool, type PoolIdentity } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { t3Paths } from "../identities/t3-anthropic-proxy.ts";
-import { MCP_KEY_ENV, launchHeaders, mcpUrl } from "../browser/mcp-http-config.ts";
+import { MCP_TOKEN_ENV, gatewayMcpUrl, launchHeaders } from "../browser/mcp-launch.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 
 /** Longest relay call (wait: 120 s) plus margin; the MCP client must not give up first. */
@@ -28,32 +28,29 @@ export interface BrowserWiring {
    */
   pool?: { name: string; memberConfigDirs: string[] };
   /**
-   * Shared MCP service form (set when the service unit is installed): the launch gets an HTTP server entry
-   * instead of a stdio one. The key is never part of the args: the tool reads it from the MCP_KEY_ENV variable.
+   * Gateway MCP form (set when the gateway URL is known and a token exists): the launch gets an HTTP server entry
+   * for `<gateway>/browser/mcp` instead of a stdio one. The token is never part of the args: the tool reads it from the MCP_TOKEN_ENV variable.
    */
   http?: HttpWiring;
 }
 
 export interface HttpWiring {
-  port: number;
-  /** The launcher's own pid. The real tool replaces it (execve), so it is the agent's pid. */
-  ownerPid: number;
-  cwd?: string;
-  /** The launch's own CLAUDE_CONFIG_DIR / CODEX_HOME, where the transcript lives. */
-  home?: string;
-  /** Claude transcript id from `--session-id` / `--resume`, when the launch names one. */
+  /** Claude transcript id from `--session-id` / `--resume`, when the launch names one. Codex and others: the gateway issues the id. */
   sessionId?: string;
-  t3Thread?: string;
-  t3Home?: string;
+  /** Readable session name (T3 thread title, else `<Tool> in <folder>`). */
+  label?: string;
 }
 
 /** TOML inline table with quoted keys. JSON string escapes are valid TOML basic-string escapes. */
 const tomlInlineTable = (entries: Record<string, string>): string => `{${Object.entries(entries).map(([k, v]) => `${JSON.stringify(k)}=${JSON.stringify(v)}`).join(",")}}`;
 
-/** Config dirs of the allowed, non-retired members of `pool` (retired identities are never wired). */
+/** Config dirs of the allowed, non-retired members of `pool`, the active member first (retired identities are never wired). */
 export function poolMemberConfigDirs(file: IdentitiesFile, pool: PoolIdentity): string[] {
   const dirs: string[] = [];
-  for (const name of allowedAccounts(pool)) {
+  const active = pool.swapPool.active;
+  // The active member comes first: its token is the one a launch uses.
+  const names = allowedAccounts(pool);
+  for (const name of active && names.includes(active) ? [active, ...names.filter((n) => n !== active)] : names) {
     const member = findIdentityByNameOrAlias(file.identities, name);
     if (member && !isRetired(member)) dirs.push(expandPath(member.configDir));
   }
@@ -151,37 +148,31 @@ export async function browserPoolWiring(toolName: string, identity: Identity | u
  */
 export function browserMcpArgs(tool: string, configDir: string, identity: Pick<Identity, "retired"> | undefined, aisBinary: string | undefined, w: BrowserWiring = {}): string[] {
   if (tool !== "claude" && tool !== "codex") return [];
-  if (aisBinary === undefined) return []; // never fall back to the running executable (it may be bun, not ais)
   if (identity && isRetired(identity)) return [];
   const exists = w.exists ?? existsSync;
   if (w.pool) {
     if (!w.pool.memberConfigDirs.some((d) => exists(join(d, TOKEN_FILE)))) return [];
   } else if (!exists(join(configDir, TOKEN_FILE))) return [];
   if (tool === "claude" && w.firstArg !== undefined && CLAUDE_SUBCOMMANDS.has(w.firstArg)) return [];
-  if (w.http) {
+  if (w.http && w.gateway) {
     const headers = launchHeaders({
-      tool,
-      ...(w.pool ? { pool: w.pool.name } : { identity: w.identityName, configDir }),
-      home: w.http.home,
-      gateway: w.gateway,
       sessionId: tool === "claude" ? w.http.sessionId : undefined,
-      t3Thread: w.http.t3Thread,
-      t3Home: w.http.t3Home,
-      cwd: w.http.cwd,
-      ownerPid: w.http.ownerPid,
+      label: w.http.label,
+      pool: w.pool?.name,
     });
-    const url = mcpUrl(w.http.port);
+    const url = gatewayMcpUrl(w.gateway);
     if (tool === "claude") {
-      // Claude Code expands ${VAR} in server headers: the key stays out of argv and the process list.
-      return [`--mcp-config=${JSON.stringify({ mcpServers: { "ais-browser": { type: "http", url, headers: { ...headers, Authorization: `Bearer \${${MCP_KEY_ENV}}` } } } })}`];
+      // Claude Code expands ${VAR} in server headers: the token stays out of argv and the process list.
+      return [`--mcp-config=${JSON.stringify({ mcpServers: { "ais-browser": { type: "http", url, headers: { ...headers, Authorization: `Bearer \${${MCP_TOKEN_ENV}}` } } } })}`];
     }
     return [
       "-c", `mcp_servers.ais-browser.url=${JSON.stringify(url)}`,
-      "-c", `mcp_servers.ais-browser.bearer_token_env_var=${JSON.stringify(MCP_KEY_ENV)}`,
-      "-c", `mcp_servers.ais-browser.http_headers=${tomlInlineTable(headers)}`,
+      "-c", `mcp_servers.ais-browser.bearer_token_env_var=${JSON.stringify(MCP_TOKEN_ENV)}`,
+      ...(Object.keys(headers).length > 0 ? ["-c", `mcp_servers.ais-browser.http_headers=${tomlInlineTable(headers)}`] : []),
       "-c", `mcp_servers.ais-browser.tool_timeout_sec=${TOOL_TIMEOUT_SEC}`,
     ];
   }
+  if (aisBinary === undefined) return []; // the stdio form never falls back to the running executable (it may be bun, not ais)
   const target = w.pool
     ? ["--pool", w.pool.name, "--tool", tool]
     : ["--config-dir", configDir, ...(w.identityName ? ["--identity", w.identityName] : [])];
@@ -222,8 +213,10 @@ export interface LaunchBrowserWiringInput {
   exists?: (p: string) => boolean;
   real?: (p: string) => string;
   t3Gateway?: string;
-  /** Shared service form of the wiring. Absent: the stdio form. `key` goes to the launch env only. */
-  http?: HttpWiring & { key: string };
+  /** Session description for the gateway MCP form. The form is used only when `gatewayUrl` is set and a token file is readable. */
+  http?: HttpWiring;
+  /** Reads a token file (default: the real file system). Injectable for tests. */
+  readToken?: (dir: string) => string | undefined;
 }
 
 export interface LaunchBrowserWiring {
@@ -233,8 +226,10 @@ export interface LaunchBrowserWiring {
   /** Folder that holds the browser token (the identity's own, not a launcher's folder). */
   configDir: string;
   args: string[];
-  /** Env the launch needs for these args (the service key for the HTTP form). */
+  /** Env the launch needs for these args (the agent token for the HTTP form). */
   env: Record<string, string>;
+  /** How the launch registers the server: the gateway HTTP endpoint, or one stdio process. */
+  mode: "http" | "stdio";
 }
 
 /**
@@ -247,13 +242,28 @@ export async function browserLaunchWiring(i: LaunchBrowserWiringInput): Promise<
   const identityName = identity?.name ?? i.activeIdentity;
   // The token lives in the identity's folder, not in a launcher's own folder that only links to it.
   const configDir = identity && !i.resolvedIdentity ? expandPath(identity.configDir) : i.configDirValue;
+  // The token comes from the identity's file, or for a pool from the active member's file, else any allowed member's file.
+  const readToken = i.readToken ?? readTokenFile;
+  const tokenDirs = pool ? pool.memberConfigDirs : [configDir];
+  let token: string | undefined;
+  if (i.http && i.gatewayUrl) for (const d of tokenDirs) if ((token = readToken(d))) break;
+  const http = i.http && i.gatewayUrl && token ? i.http : undefined;
   const args = browserMcpArgs(i.toolName, configDir, identity, i.aisBinary, {
     ...(identityName !== undefined ? { identityName } : {}),
     ...(i.gatewayUrl ? { gateway: i.gatewayUrl } : {}),
     ...(pool ? { pool } : {}),
     ...(i.firstArg !== undefined ? { firstArg: i.firstArg } : {}),
     ...(i.exists ? { exists: i.exists } : {}),
-    ...(i.http ? { http: { ...i.http, home: i.http.home ?? i.configDirValue } } : {}),
+    ...(http ? { http } : {}),
   });
-  return { identity, pool, identityName, configDir, args, env: i.http && args.length > 0 ? { [MCP_KEY_ENV]: i.http.key } : {} };
+  const useHttp = http !== undefined && args.length > 0;
+  return { identity, pool, identityName, configDir, args, env: useHttp && token ? { [MCP_TOKEN_ENV]: token } : {}, mode: useHttp ? "http" : "stdio" };
+}
+
+function readTokenFile(dir: string): string | undefined {
+  try {
+    return readFileSync(join(dir, TOKEN_FILE), "utf8").trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }

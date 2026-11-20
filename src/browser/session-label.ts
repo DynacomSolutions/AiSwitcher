@@ -28,3 +28,21 @@ export function fallbackLabel(tool: "claude" | "codex" | undefined, cwd: string 
 export function sessionName(env: NodeJS.ProcessEnv = process.env, tool?: "claude" | "codex", cwd?: string): string {
   return t3ThreadTitle(env) || cleanLabel(env.AIS_SESSION_NAME) || fallbackLabel(tool, cwd);
 }
+
+/** Longest wait for the T3 thread title at launch. */
+export const LAUNCH_LABEL_WAIT_MS = 200;
+
+/**
+ * The session name a launch sends to the gateway: T3 thread title (read-only lookup, given at most 200 ms), else `<Tool> in <folder>`.
+ * Never throws and never delays the launch by more than the wait. `lookup` is injectable for tests.
+ */
+export async function launchSessionLabel(env: NodeJS.ProcessEnv, tool: "claude" | "codex", cwd: string, lookup: (env: NodeJS.ProcessEnv) => string | undefined | Promise<string | undefined> = t3ThreadTitle, waitMs = LAUNCH_LABEL_WAIT_MS): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const slow = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), waitMs); timer.unref?.(); });
+  try {
+    const title = await Promise.race([Promise.resolve().then(() => lookup(env)).catch(() => undefined), slow]);
+    return cleanLabel(title) || cleanLabel(env.AIS_SESSION_NAME) || fallbackLabel(tool, cwd);
+  } finally {
+    clearTimeout(timer);
+  }
+}

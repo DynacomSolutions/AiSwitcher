@@ -28,7 +28,8 @@ import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { browserLaunchEnv, browserLaunchWiring } from "./browser-wiring.ts";
-import { claudeSessionIdFromArgv, ensureMcpDaemonStarted, ensureMcpKey, mcpPort, mcpUnitInstalled } from "../browser/mcp-http-config.ts";
+import { claudeSessionIdFromArgv } from "../browser/mcp-launch.ts";
+import { launchSessionLabel } from "../browser/session-label.ts";
 import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
 
@@ -187,16 +188,9 @@ export async function runWrapper(
     const gatewayUrl = cfg.toolName !== "claude" && cfg.toolName !== "codex" ? undefined : process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
     // A preset config dir (T3 Code sets CLAUDE_CONFIG_DIR) resolves no identity; map it back
     // to the registered one so a pool folder gets pool wiring instead of none.
-    // While the shared MCP service is installed (Linux), the server is wired as HTTP and started on demand; otherwise as stdio.
-    const mcpPortNumber = mcpPort();
-    let mcpKey: string | undefined;
-    if ((cfg.toolName === "claude" || cfg.toolName === "codex") && mcpUnitInstalled()) {
-      try {
-        mcpKey = ensureMcpKey();
-      } catch {
-        mcpKey = undefined; // no usable key: keep the stdio form
-      }
-    }
+    // With a known gateway URL and a token, the browser server is wired as the gateway's HTTP endpoint (no process starts here); otherwise as stdio.
+    const browserTool = cfg.toolName === "claude" || cfg.toolName === "codex" ? cfg.toolName : undefined;
+    const sessionLabel = browserTool && gatewayUrl ? await launchSessionLabel(process.env, browserTool, process.cwd()) : undefined;
     const browserWiring = await browserLaunchWiring({
       toolName: cfg.toolName,
       configDirValue: resolved.configDirValue,
@@ -207,23 +201,16 @@ export async function runWrapper(
       firstArg: parsed.cleanedArgv[0],
       aisBinary: resolveInstalledAisBinary(),
       loadFile: () => loadIdentitiesFile(cfg.identitiesJsonPath),
-      ...(mcpKey
+      ...(gatewayUrl && browserTool
         ? {
             http: {
-              port: mcpPortNumber,
-              key: mcpKey,
-              ownerPid: process.pid,
-              cwd: process.cwd(),
-              home: resolved.configDirValue,
-              ...(cfg.toolName === "claude" && claudeSessionIdFromArgv(parsed.cleanedArgv) ? { sessionId: claudeSessionIdFromArgv(parsed.cleanedArgv)! } : {}),
-              ...(process.env.T3CODE_THREAD_ID ? { t3Thread: process.env.T3CODE_THREAD_ID } : {}),
-              ...(process.env.T3CODE_HOME ? { t3Home: process.env.T3CODE_HOME } : {}),
+              ...(browserTool === "claude" && claudeSessionIdFromArgv(parsed.cleanedArgv) ? { sessionId: claudeSessionIdFromArgv(parsed.cleanedArgv)! } : {}),
+              ...(sessionLabel ? { label: sessionLabel } : {}),
             },
           }
         : {}),
     });
     const browserArgs = browserWiring.args;
-    if (mcpKey && browserArgs.length > 0) await ensureMcpDaemonStarted(mcpPortNumber);
     const launchArgs = cfg.toolName === "codex"
       ? codexSubcommandConfigArgs([...browserArgs, ...memoryProjection.argv])
       : [...browserArgs, ...gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd())];
