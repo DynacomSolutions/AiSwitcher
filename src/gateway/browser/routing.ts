@@ -38,23 +38,90 @@ export interface CallDeps extends BrowserDeps {
   metrics?: GatewayMetrics;
 }
 
+/** An HTTP-shaped answer: `/browser/call` returns it as is, the MCP endpoint reads the `CallResult` out of it. */
+export interface CallOutcome { status: number; body: CallResult | { error: string } }
+
+/** The identity behind `Authorization: Bearer <agent token>`, or undefined. Shared by `/browser/call` and `/browser/mcp`. */
+export async function agentFromRequest(deps: Pick<BrowserDeps, "store">, req: Request): Promise<{ identity: string } | undefined> {
+  const m = /^Bearer (.+)$/i.exec(req.headers.get("authorization") ?? "");
+  return m?.[1] ? authAgentToken(deps.store, m[1].trim()) : undefined;
+}
+
+/**
+ * The call path behind `POST /browser/call`, as a function: the MCP endpoint runs the same code in-process.
+ * `body` is the untrusted `{browser?, session, tool, args}` object. Tool-level failures are status 200 with `ok:false`.
+ */
+export function createBrowserCaller(deps: CallDeps): (identity: string, body: unknown, signal?: AbortSignal) => Promise<CallOutcome> {
+  const fail = (id: string, tool: string, error: BrowserErrorCode, message: string): CallOutcome => {
+    deps.metrics?.browserCall(tool, error, 0);
+    return { status: 200, body: { id, ok: false, error, message } };
+  };
+  const reject = (status: number, error: string): CallOutcome => ({ status, body: { error } });
+  const poolMembers = async (pool: string): Promise<string[]> => (await deps.browserPoolMembers?.(pool)) ?? [];
+
+  return async (identity, body, signal) => {
+    if (!isObj(body) || !isObj(body.session) || typeof body.session.id !== "string" || body.session.id === "" || body.session.id.length > 128) return reject(400, "session.id is required");
+    const tool = body.tool;
+    if (typeof tool !== "string" || (tool !== SESSION_END_TOOL && !(BROWSER_TOOLS as readonly string[]).includes(tool))) return reject(400, "unknown tool");
+    if (body.args !== undefined && !isObj(body.args)) return reject(400, "args must be an object");
+    if (body.browser !== undefined && typeof body.browser !== "string") return reject(400, "browser must be a string");
+    const id = crypto.randomUUID();
+    const args = (body.args ?? {}) as Record<string, unknown>;
+    // An upload carries file content only. A path (or anything else outside the schema) and an oversized upload stop here, before any browser sees them.
+    if (tool === "upload_file") {
+      const invalid = validateToolArgs("upload_file", args);
+      if (invalid) return reject(400, invalid);
+    }
+    const label = typeof body.session.label === "string" ? body.session.label.slice(0, 80) : "";
+
+    const connected = deps.hub.connected();
+    const allowed = await allowedBindings(identity, connected, poolMembers);
+    if (tool === "list_browsers") {
+      deps.metrics?.browserCall(tool, "ok", 0);
+      return { status: 200, body: { id, ok: true, content: [{ type: "text", text: JSON.stringify(allowed.map(summary)) }] } satisfies CallResult };
+    }
+    if (tool === SESSION_END_TOOL) {
+      const sessionId = body.session.id;
+      // Best-effort notice: tell the named browser, else every browser this identity may drive (the caller cannot know which one holds the session's tabs).
+      const targets = typeof body.browser === "string" ? allowed.filter((b) => b.name === body.browser) : allowed;
+      await Promise.all(targets.map((b) => deps.hub.call(b.name, { id: crypto.randomUUID(), session: forwardedSession(b, identity, sessionId, label), tool: SESSION_END_TOOL, args }, 5_000).catch(() => undefined)));
+      deps.metrics?.browserCall(tool, "ok", 0);
+      return { status: 200, body: { id, ok: true, content: [{ type: "text", text: "ok" }] } satisfies CallResult };
+    }
+    let chosen: BrowserBinding | undefined;
+    if (typeof body.browser === "string") {
+      chosen = allowed.find((b) => b.name === body.browser);
+      if (!chosen) {
+        if (connected.some((b) => b.name === body.browser)) return reject(403, "browser not available to this identity");
+        return fail(id, tool, "no_browser", "That browser is not connected.");
+      }
+    } else if (allowed.length === 0) {
+      return fail(id, tool, "no_browser", "No browser is bound to this identity and connected.");
+    } else if (allowed.length > 1) {
+      return fail(id, tool, "ambiguous_browser", `Several browsers are connected (${allowed.map((b) => b.name).join(", ")}); pass \`browser\`.`);
+    } else chosen = allowed[0];
+    if (!chosen) return fail(id, tool, "no_browser", "No browser is bound to this identity and connected.");
+
+    const onAbort = (): void => deps.hub.abort(id);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const result = await deps.hub.call(
+      chosen.name,
+      { id, session: forwardedSession(chosen, identity, body.session.id, label), tool: tool as BrowserTool, args },
+      tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : tool === "upload_file" ? UPLOAD_CALL_TIMEOUT_MS : DEFAULT_CALL_TIMEOUT_MS,
+    );
+    signal?.removeEventListener("abort", onAbort);
+    return { status: 200, body: result };
+  };
+}
+
+const summary = (b: BrowserBinding) => ({ name: b.name, profileLabel: b.profileLabel, target: b.target });
+
 /** Agent routes, mounted at /browser. Tool-level failures are 200 with `ok:false`; HTTP errors are for auth and malformed requests. */
 export function createCallRoutes(deps: CallDeps): Hono {
   const hono = new Hono();
-  const fail = (id: string, tool: string, error: BrowserErrorCode, message: string): CallResult => {
-    deps.metrics?.browserCall(tool, error, 0);
-    return { id, ok: false, error, message };
-  };
-  const poolMembers = async (pool: string): Promise<string[]> => (await deps.browserPoolMembers?.(pool)) ?? [];
-
-  async function agent(req: Request): Promise<{ identity: string } | undefined> {
-    const m = /^Bearer (.+)$/i.exec(req.headers.get("authorization") ?? "");
-    return m?.[1] ? authAgentToken(deps.store, m[1].trim()) : undefined;
-  }
-  const summary = (b: BrowserBinding) => ({ name: b.name, profileLabel: b.profileLabel, target: b.target });
-
+  const caller = createBrowserCaller(deps);
   hono.post("/call", async (c) => {
-    const a = await agent(c.req.raw);
+    const a = await agentFromRequest(deps, c.req.raw);
     if (!a) return c.json({ error: "unauthorised" }, 401);
     let body: unknown;
     try {
@@ -62,58 +129,8 @@ export function createCallRoutes(deps: CallDeps): Hono {
     } catch {
       return c.json({ error: "invalid JSON" }, 400);
     }
-    if (!isObj(body) || !isObj(body.session) || typeof body.session.id !== "string" || body.session.id === "" || body.session.id.length > 128) return c.json({ error: "session.id is required" }, 400);
-    const tool = body.tool;
-    if (typeof tool !== "string" || (tool !== SESSION_END_TOOL && !(BROWSER_TOOLS as readonly string[]).includes(tool))) return c.json({ error: "unknown tool" }, 400);
-    if (body.args !== undefined && !isObj(body.args)) return c.json({ error: "args must be an object" }, 400);
-    if (body.browser !== undefined && typeof body.browser !== "string") return c.json({ error: "browser must be a string" }, 400);
-    const id = crypto.randomUUID();
-    const args = (body.args ?? {}) as Record<string, unknown>;
-    // An upload carries file content only. A path (or anything else outside the schema) and an oversized upload stop here, before any browser sees them.
-    if (tool === "upload_file") {
-      const invalid = validateToolArgs("upload_file", args);
-      if (invalid) return c.json({ error: invalid }, 400);
-    }
-    const label = typeof body.session.label === "string" ? body.session.label.slice(0, 80) : "";
-
-    const connected = deps.hub.connected();
-    const allowed = await allowedBindings(a.identity, connected, poolMembers);
-    if (tool === "list_browsers") {
-      deps.metrics?.browserCall(tool, "ok", 0);
-      return c.json({ id, ok: true, content: [{ type: "text", text: JSON.stringify(allowed.map(summary)) }] } satisfies CallResult);
-    }
-    if (tool === SESSION_END_TOOL) {
-      const sessionId = body.session.id;
-      // Best-effort notice: tell the named browser, else every browser this identity may drive (the shim cannot know which one holds the session's tabs).
-      const targets = typeof body.browser === "string" ? allowed.filter((b) => b.name === body.browser) : allowed;
-      await Promise.all(targets.map((b) => deps.hub.call(b.name, { id: crypto.randomUUID(), session: forwardedSession(b, a.identity, sessionId, label), tool: SESSION_END_TOOL, args }, 5_000).catch(() => undefined)));
-      deps.metrics?.browserCall(tool, "ok", 0);
-      return c.json({ id, ok: true, content: [{ type: "text", text: "ok" }] } satisfies CallResult);
-    }
-    let chosen: BrowserBinding | undefined;
-    if (typeof body.browser === "string") {
-      chosen = allowed.find((b) => b.name === body.browser);
-      if (!chosen) {
-        if (connected.some((b) => b.name === body.browser)) return c.json({ error: "browser not available to this identity" }, 403);
-        return c.json(fail(id, tool, "no_browser", "That browser is not connected."));
-      }
-    } else if (allowed.length === 0) {
-      return c.json(fail(id, tool, "no_browser", "No browser is bound to this identity and connected."));
-    } else if (allowed.length > 1) {
-      return c.json(fail(id, tool, "ambiguous_browser", `Several browsers are connected (${allowed.map((b) => b.name).join(", ")}); pass \`browser\`.`));
-    } else chosen = allowed[0];
-    if (!chosen) return c.json(fail(id, tool, "no_browser", "No browser is bound to this identity and connected."));
-
-    const onAbort = (): void => deps.hub.abort(id);
-    c.req.raw.signal.addEventListener("abort", onAbort, { once: true });
-    const result = await deps.hub.call(
-      chosen.name,
-      { id, session: forwardedSession(chosen, a.identity, body.session.id, label), tool: tool as BrowserTool, args },
-      tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : tool === "upload_file" ? UPLOAD_CALL_TIMEOUT_MS : DEFAULT_CALL_TIMEOUT_MS,
-    );
-    c.req.raw.signal.removeEventListener("abort", onAbort);
-    return c.json(result);
+    const out = await caller(a.identity, body, c.req.raw.signal);
+    return c.json(out.body, out.status as 200);
   });
-
   return hono;
 }

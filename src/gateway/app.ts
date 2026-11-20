@@ -4,6 +4,7 @@ import { extractToken } from "./auth.ts";
 import { BodyBudget } from "./body-budget.ts";
 import type { BrowserHub } from "./browser/hub.ts";
 import { createPairRoutes } from "./browser/pair.ts";
+import { createMcpRoutes } from "./browser/mcp.ts";
 import { createCallRoutes } from "./browser/routing.ts";
 import { checkCaps, dayStartIct } from "./caps.ts";
 import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
@@ -447,7 +448,10 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
-  if (deps.browserHub) hono.route("/browser", createCallRoutes({ ...browserDeps, hub: deps.browserHub }));
+  if (deps.browserHub) {
+    hono.route("/browser", createCallRoutes({ ...browserDeps, hub: deps.browserHub }));
+    hono.route("/browser", createMcpRoutes({ ...browserDeps, hub: deps.browserHub }));
+  }
   hono.all("/:app", (c) => handle(c.req.raw));
   hono.all("/:app/*", (c) => handle(c.req.raw));
   return hono;

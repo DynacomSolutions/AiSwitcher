@@ -1,4 +1,8 @@
 import { BROWSER_ERROR_CODES, BROWSER_TOOLS } from "../browser/protocol.ts";
+
+/** Fixed label sets of ais_gateway_browser_mcp_requests_total. */
+export const MCP_METHOD_LABELS = ["initialize", "ping", "tools/list", "tools/call", "notification", "delete", "get", "other"] as const;
+export const MCP_OUTCOME_LABELS = ["ok", "tool_error", "unauthorised", "bad_request", "forbidden", "error"] as const;
 /** Counters the proxy reports. `PrometheusMetrics` is the production implementation. */
 export interface GatewayMetrics {
   request(e: {
@@ -19,6 +23,8 @@ export interface GatewayMetrics {
   failOpen(app: string, reason: "cap_check_failed" | "side_count_failed"): void;
   /** One browser tool call: `outcome` is "ok" or a browser error code. Tool is from a fixed set. */
   browserCall(tool: string, outcome: string, seconds: number): void;
+  /** One request to the browser MCP endpoint. Both labels come from fixed sets (see MCP_METHOD_LABELS and MCP_OUTCOME_LABELS). */
+  browserMcpRequest(method: string, outcome: string): void;
   /** A browser pairing completed (token delivered). */
   browserPairing(): void;
   /** Media parts replaced by a text note because the provider refused the file they name (media-recovery.ts). */
@@ -36,6 +42,7 @@ export const noopMetrics: GatewayMetrics = {
   failover() {},
   failOpen() {},
   browserCall() {},
+  browserMcpRequest() {},
   browserPairing() {},
 };
 
@@ -101,6 +108,7 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly mediaRemovals = new Counter("ais_gateway_media_removed_total", "Media parts replaced by a text note because the provider refused the file they name.");
   private readonly unreadable = new Counter("ais_gateway_credential_unreadable_total", "Credential reads that failed at warm-up, per app identity.");
   private readonly browserCalls = new Counter("ais_gateway_browser_calls_total", "Browser tool calls by tool and outcome.");
+  private readonly browserMcpRequests = new Counter("ais_gateway_browser_mcp_requests_total", "Browser MCP endpoint requests by JSON-RPC method and outcome.");
   private readonly browserPairings = new Counter("ais_gateway_browser_pairings_total", "Browser pairings completed.");
   private readonly callBucketCounts = BUCKETS.map(() => 0);
   private callCount = 0;
@@ -180,6 +188,11 @@ export class PrometheusMetrics implements GatewayMetrics {
     });
   }
 
+  browserMcpRequest(method: string, outcome: string): void {
+    const m = (MCP_METHOD_LABELS as readonly string[]).includes(method) ? method : "other";
+    const o = (MCP_OUTCOME_LABELS as readonly string[]).includes(outcome) ? outcome : "error";
+    this.browserMcpRequests.inc({ method: m, outcome: o });
+  }
   browserPairing(): void {
     this.browserPairings.inc({});
   }
@@ -237,7 +250,7 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings]) out.push(...c.render());
     for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
