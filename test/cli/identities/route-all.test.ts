@@ -119,6 +119,36 @@ describe("route-all-via-gateway: refuses what the gateway does not hold", () => 
 });
 
 describe("route-all-via-gateway: routing", () => {
+  test("uses AIS_GATEWAY_PROXY_URL when no local port is explicit", async () => {
+    const previous = process.env.AIS_GATEWAY_PROXY_URL;
+    process.env.AIS_GATEWAY_PROXY_URL = "https://gateway.example.test/cluster";
+    try {
+      await heartbeat(["claude/alpha"]);
+      const r = await routeAllViaGateway({ ...opts, only: { tool: "claude", identity: "alpha" }, port: undefined });
+      expect(claudeLine(r, "alpha")?.status).toBe("routed");
+      const settings = JSON.parse(await readFile(join(dirOf(".claude", "alpha"), "settings.json"), "utf8")) as { env: Record<string, string> };
+      expect(settings.env.ANTHROPIC_BASE_URL).toBe("https://gateway.example.test/cluster/agents-claude");
+    } finally {
+      if (previous === undefined) delete process.env.AIS_GATEWAY_PROXY_URL;
+      else process.env.AIS_GATEWAY_PROXY_URL = previous;
+    }
+  });
+
+  test("uses an explicit local port before AIS_GATEWAY_PROXY_URL", async () => {
+    const previous = process.env.AIS_GATEWAY_PROXY_URL;
+    process.env.AIS_GATEWAY_PROXY_URL = "https://gateway.example.test/cluster";
+    try {
+      await heartbeat(["claude/alpha"]);
+      const r = await routeAllViaGateway({ ...opts, only: { tool: "claude", identity: "alpha" }, port: 47999 });
+      expect(claudeLine(r, "alpha")?.status).toBe("routed");
+      const settings = JSON.parse(await readFile(join(dirOf(".claude", "alpha"), "settings.json"), "utf8")) as { env: Record<string, string> };
+      expect(settings.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:47999/claude");
+    } finally {
+      if (previous === undefined) delete process.env.AIS_GATEWAY_PROXY_URL;
+      else process.env.AIS_GATEWAY_PROXY_URL = previous;
+    }
+  });
+
   test("dry run reports and writes nothing", async () => {
     await heartbeat();
     const r = await routeAllViaGateway({ ...opts, dryRun: true });

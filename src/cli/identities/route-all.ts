@@ -3,7 +3,8 @@ import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { LOCAL_GATEWAY_ROUTES } from "../../gateway/local-routes.ts";
-import { GATEWAY_TOKEN_PREFIX, gatewayEntryScopesFor, gatewayEntryText, isGatewayAccessToken } from "../../identities/claude-gateway-entry.ts";
+import { GATEWAY_CLAUDE_APP, GATEWAY_TOKEN_PREFIX, gatewayEntryText, isGatewayAccessToken, isIntactGatewayEntry } from "../../identities/claude-gateway-entry.ts";
+import { directGatewayProblem, withDirectGateway } from "../../identities/claude-usage-proxy.ts";
 import { withOauthRefreshLock, withOauthRefreshLocks } from "../../identities/claude-swap-lock.ts";
 import { withPoolLock } from "../../identities/pool/lock.ts";
 import { HEARTBEAT_FRESH_MS, readHeartbeat, type GatewayHeartbeat } from "../../identities/gateway-heartbeat.ts";
@@ -453,23 +454,27 @@ async function readKey(app: string, opts: RouteAllOptions): Promise<string | und
   return opts.fallbackToken && opts.fallbackToken.startsWith(GATEWAY_TOKEN_PREFIX) ? opts.fallbackToken : undefined;
 }
 
-const gatewayBase = (tool: string, opts: RouteAllOptions): string => `http://127.0.0.1:${opts.port ?? (Number(process.env.AIS_GATEWAY_LOCAL_PORT) || LOCAL_PORT_DEFAULT)}/${tool}`;
+async function gatewayBase(tool: string, opts: RouteAllOptions): Promise<string> {
+  if (opts.port !== undefined) return `http://127.0.0.1:${opts.port}/${tool}`;
+  const configured = process.env.AIS_GATEWAY_PROXY_URL ?? (await readSecretsKey("AIS_GATEWAY_PROXY_URL", opts.secretsPath ?? defaultSecretsPath()));
+  if (configured && tool === "claude") return `${configured.replace(/\/+$/, "")}/${GATEWAY_CLAUDE_APP}`;
+  return `http://127.0.0.1:${Number(process.env.AIS_GATEWAY_LOCAL_PORT) || LOCAL_PORT_DEFAULT}/${tool}`;
+}
 
 /* claude */
 
 async function claudeRouted(dir: string, token: string, base: string): Promise<{ entry: boolean; settings: boolean; helper: boolean }> {
   const settings = parseJson(await readText(join(dir, "settings.json")));
   const env = settings?.env as Record<string, unknown> | undefined;
-  const oauth = parseJson(await readText(join(dir, ".credentials.json")))?.claudeAiOauth as { accessToken?: unknown; refreshToken?: unknown } | undefined;
   return {
-    entry: oauth?.accessToken === token && !nonEmpty(oauth?.refreshToken),
-    settings: env?.ANTHROPIC_BASE_URL === base,
+    entry: await isIntactGatewayEntry(dir, token),
+    settings: env?.ANTHROPIC_BASE_URL === base && !directGatewayProblem(env),
     helper: !(settings && "apiKeyHelper" in settings),
   };
 }
 
 /** The claude gateway entry text with the routing record (see gateway-routed.ts). */
-const claudeEntryText = async (dir: string, token: string, routing: GatewayRouting): Promise<string> => withRouting(gatewayEntryText(token, await gatewayEntryScopesFor(dir)), routing);
+const claudeEntryText = (token: string, routing: GatewayRouting): string => withRouting(gatewayEntryText(token), routing);
 
 async function applyClaude(dir: string, token: string, base: string, routing: GatewayRouting, now: () => number): Promise<string[]> {
   const notes: string[] = [];
@@ -477,14 +482,13 @@ async function applyClaude(dir: string, token: string, base: string, routing: Ga
   if (!state.entry) {
     const b = await backupUnique(join(dir, ".credentials.json"), now);
     if (b) notes.push(`login backed up to ${b}`);
-    await writeFileAtomic(join(dir, ".credentials.json"), await claudeEntryText(dir, token, routing));
+    await writeFileAtomic(join(dir, ".credentials.json"), claudeEntryText(token, routing));
   }
   if (!state.settings || !state.helper) {
     const path = join(dir, "settings.json");
-    const settings = parseJson(await readText(path)) ?? {};
+    const settings = withDirectGateway(parseJson(await readText(path)) ?? {}, base);
     const b = await backupUnique(path, now);
     if (b) notes.push(`settings backed up to ${b}`);
-    settings.env = { ...((settings.env as Record<string, unknown> | undefined) ?? {}), ANTHROPIC_BASE_URL: base };
     // An apiKeyHelper would take Claude Code out of subscriber mode (see claude-gateway-entry.ts).
     if ("apiKeyHelper" in settings) {
       delete settings.apiKeyHelper;
@@ -950,7 +954,7 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
     }
     const pools = accounts.filter((a) => a.swapPool);
     const membersOf = new Map(pools.map((p) => [p.name, (p.swapPool?.accounts ?? []).map((n) => accounts.find((a) => a.name === n && !a.swapPool)).filter((a): a is Identity => a !== undefined)]));
-    const ctx: ToolContext = { tool, token, base: gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts), host: opts.hostname ?? hostname(), routedPools: new Set(), membersOf };
+    const ctx: ToolContext = { tool, token, base: await gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts), host: opts.hostname ?? hostname(), routedPools: new Set(), membersOf };
     // Pools first: a routed pool no longer holds its members' logins, so they can be routed in the same run.
     for (const identity of [...pools, ...accounts.filter((a) => !a.swapPool)]) {
       if (opts.only && opts.only.identity !== identity.name) continue;

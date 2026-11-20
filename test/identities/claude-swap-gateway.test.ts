@@ -94,7 +94,7 @@ describe("swap into a gateway-routed pool", () => {
     expect(r.to).toBe("b");
     const file = join(poolDir(), ".credentials.json");
     expect(await read(file)).toEqual({
-      claudeAiOauth: { accessToken: GW, refreshToken: null, expiresAt: 4_102_444_800_000, scopes: ["user:inference"], subscriptionType: "max" },
+      claudeAiOauth: { accessToken: GW, refreshToken: null, expiresAt: 4_102_444_800_000, scopes: ["user:inference", "user:profile"], subscriptionType: "max" },
     });
     expect((await stat(file)).mode & 0o777).toBe(0o600);
     // member stores are untouched

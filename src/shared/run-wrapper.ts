@@ -30,6 +30,9 @@ import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { browserLaunchEnv, browserLaunchWiring } from "./browser-wiring.ts";
 import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
+import { addClaudeAccountPreload, CLAUDE_ACCOUNT_PRELOAD_MARKER, installClaudeAccountPreload } from "../identities/claude-account-preload.ts";
+import { isGatewayAccessToken, storedAccessToken } from "../identities/claude-gateway-entry.ts";
+import { CLAUDE_PROXY_ENV_KEYS } from "../identities/claude-usage-proxy.ts";
 
 export function herdrTitleForLaunch(
   tool: string,
@@ -184,6 +187,13 @@ export async function runWrapper(
       sharedConfigArgs,
     );
     const gatewayUrl = cfg.toolName !== "claude" && cfg.toolName !== "codex" ? undefined : process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
+    const claudeAccountPreloadEnv: Record<string, string | undefined> = {};
+    if (cfg.toolName === "claude" && isGatewayAccessToken(await storedAccessToken(resolved.configDirValue))) {
+      const preloadPath = await installClaudeAccountPreload();
+      claudeAccountPreloadEnv[CLAUDE_ACCOUNT_PRELOAD_MARKER] = "1";
+      claudeAccountPreloadEnv.BUN_OPTIONS = addClaudeAccountPreload(process.env.BUN_OPTIONS, preloadPath);
+      for (const key of CLAUDE_PROXY_ENV_KEYS) claudeAccountPreloadEnv[key] = undefined;
+    }
     // A preset config dir (T3 Code sets CLAUDE_CONFIG_DIR) resolves no identity; map it back
     // to the registered one so a pool folder gets pool wiring instead of none.
     const browserArgs = (await browserLaunchWiring({
@@ -245,6 +255,7 @@ export async function runWrapper(
           ...browserLaunchEnv(cfg.toolName, browserArgs, process.env),
           ...memoryProjection.env,
           ...(cfg.toolName === "codex" ? await codexLocalGatewayEnv(resolved.configDirValue) : {}),
+          ...claudeAccountPreloadEnv,
           ...(titleOwnerPid !== undefined ? { AIS_HERDR_TITLE_OWNER_PID: titleOwnerPid } : {}),
           ...(activeIdentity !== undefined ? { [IDENTITY_SESSION_MARKER]: activeIdentity } : {}),
         },

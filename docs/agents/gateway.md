@@ -274,53 +274,30 @@ speech call is not a model call); the daily token cap does.
 - Repeated slashes in any app path are collapsed before matching and before the path is sent upstream. Claude paths are
   matched after decoding, lower-casing and dropping `;params`.
 
-### Claude limits for gateway-routed Claude Code (CONNECT proxy)
+### Claude limits for gateway-routed Claude Code
 
-Claude Code reads its limits from a fixed host (`https://api.anthropic.com/api/oauth/usage`), never from
-`ANTHROPIC_BASE_URL`, and only when its login has the `user:profile` scope. `ais gateway serve` runs a CONNECT proxy
-for those clients when the deployment mounts a certificate for `api.anthropic.com` (`AIS_GATEWAY_CONNECT_TLS_DIR`,
-a cert-manager secret with `tls.crt`, `tls.key`, `ca.crt`; port `AIS_GATEWAY_CONNECT_PORT`, default 47132). The
-certificate and its CA are cluster-managed (.cluster); the gateway makes none. `AIS_GATEWAY_CONNECT_CA_PUBLISH` copies
-`ca.crt` to a host path for clients. Without the TLS dir the proxy is off; a proxy that cannot start never stops the gateway.
+Claude Code sends model traffic directly to the configured `ANTHROPIC_BASE_URL`. The gateway URL must be HTTPS, or
+loopback HTTP for an explicit local setup. Claude Code reads plan limits from the fixed host
+(`https://api.anthropic.com/api/oauth/usage`) and needs the `user:profile` scope.
 
-A client sets `HTTPS_PROXY` to the proxy and `NODE_EXTRA_CA_CERTS` to the published CA, and adds `user:profile` to the
-`scopes` of its gateway-token `.credentials.json` (the token is still the gateway app token, so the scope grants nothing
-upstream). AIS's own gateway entry keeps only `user:inference`: without the proxy, that scope would send the gateway
-token to the real host.
+The AIS Claude shim adds a process-local Bun preload for gateway entries. The preload rewrites only authenticated `GET`
+requests to `/api/oauth/usage` and `/api/oauth/profile` from `api.anthropic.com` to the configured gateway app URL.
+It supports native `node:https` and global `fetch`, preserves the query string, and requires the `aisg_` app token.
+All other requests keep the native transport and destination. Cross-origin redirects do not carry the app token.
 
-- Every CONNECT is a plain TCP tunnel except `api.anthropic.com:443`, whose TLS the proxy terminates.
-- On that host, any request with an `aisg_` bearer is handed to the route of the claude app the token belongs to, which
-  forwards account requests with the member's login (see "Account API" above). An `aisg_` token the gateway does not accept
-  gets 401 there and is never sent on. Requests with any other bearer are forwarded unchanged.
-- A kimi or zai app token (Claude Code on a `t3-claude-kimi-*` or `t3-claude-zai-*` app) gets only `GET /api/oauth/usage` and
-  `GET /api/oauth/profile` on that host, both answered by the gateway (no upstream call). Any other method or path is a
-  JSON 404 and is never sent to Anthropic or to the kimi or zai upstream. The usage answer is Claude's shape built from the
-  member's windows by length: `five_hour` is the shortest window of at most 6 h (kimi `session` or `~Nh`, zai `session`),
-  `seven_day` is the next window of at least 1 day (`week` first, else `month` or the longest `~Nd`; a month window shows
-  in the `seven_day` slot because Claude has no monthly slot). A missing window is null; no reading at all is 502 so the
-  client shows "unavailable". The profile is made up from the app name (stable uuids, "Kimi (AIS gateway)", `claude_max`).
-  The zai reading is the Z.ai quota `ais limits` uses, read with the member's key.
-- The proxy itself reads and sends no member login. A renewed certificate is picked up within 5 minutes.
+The shim passes both `user:inference` and `user:profile` in the gateway entry. Normal Claude accounts keep their existing
+settings and transport. The preload is enabled only for that Claude process, and removes its own Bun option before child
+processes start. It also removes generic proxy variables from the Claude launch environment.
 
-### Claude usage proxy on a folder
+`ais gateway claude-proxy <dir>...` writes the direct gateway app URL to `ANTHROPIC_BASE_URL`, removes generic proxy
+settings and preserves the CA and bypass configuration. It also adds `user:profile` to a gateway credentials entry.
+`--check` reports folders that still contain a generic proxy setting. Run a real `claude -p` turn on each folder after a
+change.
 
-`ais gateway claude-proxy <dir>...` sets `HTTPS_PROXY` (the CONNECT proxy) and `NODE_EXTRA_CA_CERTS` in a Claude folder's
-settings.json, and always adds `NO_PROXY=127.0.0.1,localhost,::1`. Never set `HTTPS_PROXY` on a Claude folder by
-hand: Claude Code sends every request through it, including a plain-HTTP loopback `ANTHROPIC_BASE_URL` (the
-`ais gateway local` proxy), and the CONNECT proxy answers those with 405, so every model call fails (incident
-10 Nov 2026, row 4.162). `--check` and `ais doctor` report a folder in that state. Run a real `claude -p` turn on each
-folder after a change: running sessions read settings.json at once.
+### CONNECT routing
 
-### CONNECT relay on the host (failover across nodes)
-
-`HTTPS_PROXY` and `AIS_T3_ANTHROPIC_PROXY` take one URL. A ClusterIP there works only while the host's own k3s runs,
-so a host with k3s down loses the proxy for every session even though replicas run on the other nodes. Set
-`AIS_GATEWAY_CONNECT_UPSTREAMS` (`~/.secrets` or env, `host:port` list) and `ais gateway local` also runs a TCP relay
-on `127.0.0.1:47132` (`AIS_GATEWAY_CONNECT_LOCAL_PORT`); point `AIS_GATEWAY_CONNECT_PROXY_URL` at it and rerun
-`ais gateway claude-proxy` and `ais gateway t3-proxy`. The relay pipes bytes unchanged to the first upstream that
-accepts within 1.5 s. A host name expands to all its addresses, this host's first, and the last good resolution is
-kept when DNS fails. An upstream that fails is skipped for 30 s. The upstreams must reach the gateway's port 47132 on
-each node (a `hostPort` in the deployment), and the network policy must admit the host's address.
+The cluster Service routes connections on TCP 47132 to ready gateway replicas. T3 Code can use the cluster hostname
+from a host. Cluster pods use the Service address. The host installer no longer creates the optional local gateway unit.
 
 ### T3 Code account API (resets)
 
@@ -333,7 +310,9 @@ every other process stays direct. Never put `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_
 env to every child and the CONNECT proxy refuses all hosts but `api.anthropic.com`, so git, gh, npm and codex would
 break in every thread. The command refuses to write them and fails when the file already has one; `--check` and
 `ais doctor` report that and an out-of-date preload. The proxy URL comes from `--proxy`, `AIS_GATEWAY_CONNECT_PROXY_URL`
-in `~/.secrets`, the environment, or the `HTTPS_PROXY` of a `~/.t3/gateway/t3-claude-*` folder. T3 must be restarted to
+in `~/.secrets`, the environment, or the hostname of `AIS_GATEWAY_PROXY_URL` with port `47132`. The command skips old
+loopback defaults. Set `--port` or
+`AIS_GATEWAY_CONNECT_PROXY_PORT` to change the derived port. An explicit proxy URL always wins. T3 must be restarted to
 apply a change; the command never restarts it.
 
 ### T3 Code model lists (Kimi ACP, OpenCode)
@@ -798,8 +777,8 @@ identity, under the account's refresh locks (the ones the gateway takes before i
    renamed to `<file>.rolled-back.<timestamp>.bak`, so the gateway reads the folder again. If the folder cannot be
    restored, the store copy stays active and is then the only holder (the folder's login is in its `.pre-gateway` backup);
 4. it backs up each local file it changes to `<file>.pre-gateway.<timestamp>.bak` (exclusive, 0600, flushed and read back,
-   never overwritten or deleted) and writes the entry: claude `.credentials.json` gateway entry, `ANTHROPIC_BASE_URL=http://127.0.0.1:47140/claude`
-   in `settings.json`, `apiKeyHelper` removed; codex `auth.json` as an API-key file holding the app key, `model_provider =
+   never overwritten or deleted) and writes the entry: claude `.credentials.json` gateway entry, `ANTHROPIC_BASE_URL=<configured
+   AIS_GATEWAY_PROXY_URL>/agents-claude` in `settings.json`, `apiKeyHelper` removed; codex `auth.json` as an API-key file holding the app key, `model_provider =
    "ais-gateway"` and its tables in `config.toml`, with the key printed by `~/.local/bin/ais-codex-gateway-key` (created if
    absent, an existing one is kept).
 
@@ -886,8 +865,8 @@ held, harmless to it):
   login, or another account): a host that has not seen the routing yet cannot undo it with its old copy, but a fresh
   sign-in, or the login restored on the routing host when un-routing, spreads like any login (newest wins after that).
 
-**Routed identities stop working on the other synced hosts.** After the next sync hq1's folder holds the gateway entry,
-pointing at `127.0.0.1:47140`, and hq1's gateway has no copy of the login (the member store is per host), so sessions there
+**Routed identities stop working on the other synced hosts.** After the next sync, the other host's folder holds the gateway entry,
+pointing at its configured AIS gateway URL, and that host's gateway has no copy of the login (the member store is per host), so sessions there
 fail, without refreshing anything. On hq1 `isGatewayManagedHere` treats an identity whose folder holds the pure gateway
 entry as the gateway's, so `ais serve` auth-refresh, `ais auth refresh` and the pi reconcile never refresh or reconcile it
 there. To use the identity on hq1 again, sign in again there (`/login`, `codex login`): that is a new login, the next sync

@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { configureUsageProxy, folderUsageProxyProblem } from "../../identities/claude-usage-proxy.ts";
+import { GATEWAY_CLAUDE_APP } from "../../identities/claude-gateway-entry.ts";
+import { configureDirectGateway, folderUsageProxyProblem } from "../../identities/claude-usage-proxy.ts";
 import { expandPath } from "../../identities/match.ts";
 import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
@@ -11,13 +12,12 @@ import { readSecretsKey } from "./secrets-file.ts";
 export const DEFAULT_CONNECT_CA = (): string => join(homedir(), ".ais", "gateway-connect-ca.pem");
 
 /**
- * `ais gateway claude-proxy <dir>...`: turns the gateway usage proxy on for Claude config folders (identities, the swap
- * pool, T3 gateway folders). HTTPS_PROXY is always written with a loopback NO_PROXY (see claude-usage-proxy.ts).
- * `--check` writes nothing and fails when a folder has a proxy that would break its loopback base URL.
+ * `ais gateway claude-proxy <dir>...`: points Claude config folders at the direct AIS gateway app.
+ * Legacy generic proxy variables are removed. `--check` reports folders that still contain them.
  * Each folder should get a real `claude -p` turn afterwards: running sessions pick the settings up at once.
  */
 export async function runClaudeProxyCommand(dirs: string[], flags: ParsedArgs["flags"], deps: GatewayCliDeps): Promise<void> {
-  if (dirs.length === 0) throw new CliUsageError("Usage: ais gateway claude-proxy <claude config dir>... [--proxy=<url>] [--ca=<path>] [--check]");
+  if (dirs.length === 0) throw new CliUsageError("Usage: ais gateway claude-proxy <claude config dir>... [--url=<gateway-app-url>] [--check]");
   const folders = dirs.map((d) => resolve(expandPath(d)));
   if (boolFlag(flags, "check")) {
     let bad = 0;
@@ -29,11 +29,12 @@ export async function runClaudeProxyCommand(dirs: string[], flags: ParsedArgs["f
     if (bad > 0) throw new Error(`${bad} folder(s) would send model calls to the proxy`);
     return;
   }
-  const proxyUrl = stringFlag(flags, "proxy") ?? (await readSecretsKey("AIS_GATEWAY_CONNECT_PROXY_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_CONNECT_PROXY_URL;
-  if (!proxyUrl) throw new CliUsageError("Proxy URL unknown: pass --proxy=http://<host>:<port> or set AIS_GATEWAY_CONNECT_PROXY_URL in ~/.secrets");
-  const caPath = resolve(expandPath(stringFlag(flags, "ca") ?? DEFAULT_CONNECT_CA()));
+  const explicitUrl = stringFlag(flags, "url") ?? stringFlag(flags, "gateway");
+  const root = (await readSecretsKey("AIS_GATEWAY_PROXY_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_PROXY_URL;
+  const gatewayUrl = explicitUrl ?? (root ? `${root.replace(/\/+$/, "")}/${GATEWAY_CLAUDE_APP}` : undefined);
+  if (!gatewayUrl) throw new CliUsageError("Gateway URL unknown: pass --url=https://<host>/<app> or set AIS_GATEWAY_PROXY_URL in ~/.secrets");
   for (const dir of folders) {
-    const env = await configureUsageProxy(dir, { proxyUrl, caPath });
-    deps.out(`${dir}: HTTPS_PROXY set, NO_PROXY=${String(env.NO_PROXY)}; run a real claude -p turn on it now`);
+    await configureDirectGateway(dir, gatewayUrl);
+    deps.out(`${dir}: AIS API URL configured and generic proxy settings removed`);
   }
 }

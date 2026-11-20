@@ -55,7 +55,7 @@ export interface SessionSpec {
 export interface RealLaunch {
   path: string;
   args: string[];
-  env: Record<string, string>;
+  env: Record<string, string | undefined>;
 }
 
 interface ProcStat {

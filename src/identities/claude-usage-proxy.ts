@@ -2,107 +2,39 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { writeFileAtomic } from "./pool/fs.ts";
 
-/**
- * Claude Code settings for the gateway's CONNECT usage proxy (`ais gateway serve`, row 4.161).
- *
- * Claude Code reads its plan usage from Anthropic's own host, not from ANTHROPIC_BASE_URL, so a gateway-routed folder
- * reaches the gateway's usage answer only through HTTPS_PROXY (the CONNECT proxy) with NODE_EXTRA_CA_CERTS trusting the
- * proxy's certificate. Claude Code sends EVERY request through that proxy, including a plain-HTTP loopback
- * ANTHROPIC_BASE_URL (the `ais gateway local` failover proxy). The CONNECT proxy cannot carry plain HTTP, so without a
- * loopback NO_PROXY every model call fails with 405 (incident 9 Nov 2026: the whole swap pool down for 4.5 min).
- * So HTTPS_PROXY is only ever written together with a NO_PROXY that covers loopback, and the doctor reports a folder
- * where that pairing is missing.
- */
-
-/** The loopback names a NO_PROXY must cover when a proxy is set. */
-export const LOOPBACK_NO_PROXY = ["127.0.0.1", "localhost", "::1"] as const;
-
-const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] as const;
-/**
- * Hosts that other tools use and that the gateway proxy also intercepts. Claude Code never calls them, so a tool
- * started from a Claude session (for example grok) must go direct. The doctor does not require these.
- */
-export const DIRECT_NO_PROXY = ["opencode.ai", "cli-chat-proxy.grok.com"] as const;
-
-/** Every name the written NO_PROXY must hold: loopback first, then the direct hosts. */
-export const GATEWAY_NO_PROXY = [...LOOPBACK_NO_PROXY, ...DIRECT_NO_PROXY] as const;
-
-const NO_PROXY_KEYS = ["NO_PROXY", "no_proxy"] as const;
+export const CLAUDE_PROXY_ENV_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] as const;
 
 type Env = Record<string, unknown>;
 
-const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() !== "" ? v.trim() : undefined);
-
-/** The NO_PROXY entries, lower-cased, ports and brackets dropped ("[::1]:80" is "::1"). */
-function noProxyEntries(env: Env): string[] {
-  const raw = NO_PROXY_KEYS.map((k) => str(env[k])).filter((v): v is string => v !== undefined).join(",");
-  return raw
-    .split(/[\s,]+/)
-    .map((e) => e.trim().toLowerCase())
-    .filter((e) => e !== "")
-    .map((e) => (e.startsWith("[") ? e.slice(1, e.indexOf("]") === -1 ? undefined : e.indexOf("]")) : /^[^:]+:\d+$/.test(e) ? e.slice(0, e.lastIndexOf(":")) : e));
-}
-
-function isLoopbackHost(host: string): boolean {
-  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
-  return h === "localhost" || h.endsWith(".localhost") || h === "::1" || /^127(?:\.\d{1,3}){3}$/.test(h);
-}
-
-/** Whether NO_PROXY makes the client skip the proxy for `host` ("*" covers all; "127.0.0.0/8" style CIDRs are not read). */
-function bypassed(env: Env, host: string): boolean {
-  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
-  return noProxyEntries(env).some((e) => e === "*" || e === h || (e.startsWith(".") ? h.endsWith(e) : h.endsWith(`.${e}`)));
-}
-
-/**
- * Why this settings `env` breaks Claude Code, or undefined when it is fine: a proxy is set, ANTHROPIC_BASE_URL is a
- * loopback address, and NO_PROXY does not exempt that host, so model calls go to the proxy and fail.
- */
-export function usageProxyProblem(env: Env | undefined): string | undefined {
+/** Why this Claude folder still has a generic forwarding proxy. */
+export function directGatewayProblem(env: Env | undefined): string | undefined {
   if (!env) return undefined;
-  const proxyKey = PROXY_KEYS.find((k) => str(env[k]) !== undefined);
-  if (!proxyKey) return undefined;
-  const base = str(env.ANTHROPIC_BASE_URL);
-  if (!base) return undefined;
-  let host: string;
+  const proxyKey = CLAUDE_PROXY_ENV_KEYS.find((key) => typeof env[key] === "string" && env[key].trim() !== "");
+  return proxyKey === undefined ? undefined : `${proxyKey} is set; direct Claude gateway traffic must not use a generic proxy`;
+}
+
+function secureGatewayUrl(raw: string): string {
+  let url: URL;
   try {
-    host = new URL(base).hostname;
+    url = new URL(raw);
   } catch {
-    return undefined;
+    throw new Error("gateway URL must be an HTTPS URL");
   }
-  if (!isLoopbackHost(host) || bypassed(env, host)) return undefined;
-  return `${proxyKey} is set but NO_PROXY does not cover the loopback ANTHROPIC_BASE_URL host ${host}: every model call goes to the proxy and fails (405 from the gateway CONNECT proxy). Set NO_PROXY=${LOOPBACK_NO_PROXY.join(",")}.`;
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const loopback = host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+  if (url.username || url.password || url.hash || url.search || (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))) {
+    throw new Error("gateway URL must be an HTTPS URL or loopback HTTP URL without credentials, a query or a fragment");
+  }
+  return url.toString().replace(/\/$/, "");
 }
 
-/** NO_PROXY with every loopback name and direct host added, keeping the existing entries and their order. */
-export function withLoopbackNoProxy(current: unknown): string {
-  const have = (str(current) ?? "").split(",").map((e) => e.trim()).filter((e) => e !== "");
-  const lower = new Set(have.map((e) => e.toLowerCase()));
-  return [...have, ...GATEWAY_NO_PROXY.filter((e) => !lower.has(e))].join(",");
-}
-
-export interface UsageProxyOptions {
-  /** The CONNECT proxy, e.g. "http://<gateway connect service>:47132". */
-  proxyUrl: string;
-  /** The proxy's CA certificate (the gateway publishes it to AIS_GATEWAY_CONNECT_CA_PUBLISH). */
-  caPath: string;
-}
-
-/** Settings with the usage proxy turned on. HTTPS_PROXY is never set without a loopback NO_PROXY. Other keys are kept. */
-export function withUsageProxy(settings: Record<string, unknown>, opts: UsageProxyOptions): Record<string, unknown> {
-  const proxy = str(opts.proxyUrl);
-  const ca = str(opts.caPath);
-  if (!proxy || !/^https?:\/\//i.test(proxy)) throw new Error(`usage proxy URL must be http(s)://host:port, got "${opts.proxyUrl}"`);
-  if (!ca) throw new Error("usage proxy CA path is required");
+/** Direct Claude settings. Legacy generic proxy variables are removed, but unrelated settings remain. */
+export function withDirectGateway(settings: Record<string, unknown>, gatewayUrl: string): Record<string, unknown> {
+  const base = secureGatewayUrl(gatewayUrl);
   const env: Env = typeof settings.env === "object" && settings.env !== null && !Array.isArray(settings.env) ? { ...(settings.env as Env) } : {};
-  const noProxy = withLoopbackNoProxy(env.NO_PROXY ?? env.no_proxy);
-  delete env.no_proxy;
-  env.HTTPS_PROXY = proxy;
-  env.NODE_EXTRA_CA_CERTS = ca;
-  env.NO_PROXY = noProxy;
+  for (const key of CLAUDE_PROXY_ENV_KEYS) delete env[key];
+  env.ANTHROPIC_BASE_URL = base;
   const out = { ...settings, env };
-  const problem = usageProxyProblem(env);
-  if (problem) throw new Error(problem); // unreachable by construction; refuses to write a broken folder
   return out;
 }
 
@@ -119,19 +51,16 @@ async function readSettings(path: string): Promise<Record<string, unknown>> {
   return parsed as Record<string, unknown>;
 }
 
-/** Turns the usage proxy on in a Claude config folder's settings.json (atomic, 0600). Returns the new env. */
-export async function configureUsageProxy(configDir: string, opts: UsageProxyOptions): Promise<Env> {
+/** Migrates a Claude folder to direct gateway model and account traffic. */
+export async function configureDirectGateway(configDir: string, gatewayUrl: string): Promise<Env> {
   const path = join(configDir, "settings.json");
-  const next = withUsageProxy(await readSettings(path), opts);
+  const next = withDirectGateway(await readSettings(path), gatewayUrl);
   await writeFileAtomic(path, `${JSON.stringify(next, null, 2)}\n`);
   await addProfileScopeToGatewayEntry(configDir);
   return next.env as Env;
 }
 
-/**
- * With the proxy on, a gateway entry (an `aisg_` access token, no refresh token) needs `user:profile` so Claude Code asks
- * for its limits. Only the scope list changes; a real login is never touched.
- */
+/** A gateway entry needs `user:profile` so Claude Code asks AIS for its plan limits. */
 async function addProfileScopeToGatewayEntry(configDir: string): Promise<void> {
   const path = join(configDir, ".credentials.json");
   let creds: Record<string, unknown>;
@@ -152,7 +81,7 @@ async function addProfileScopeToGatewayEntry(configDir: string): Promise<void> {
 export async function folderUsageProxyProblem(configDir: string): Promise<string | undefined> {
   try {
     const env = (await readSettings(join(configDir, "settings.json"))).env;
-    return usageProxyProblem(typeof env === "object" && env !== null ? (env as Env) : undefined);
+    return directGatewayProblem(typeof env === "object" && env !== null ? (env as Env) : undefined);
   } catch {
     return undefined;
   }
