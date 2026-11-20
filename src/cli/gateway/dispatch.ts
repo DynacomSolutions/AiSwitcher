@@ -117,13 +117,14 @@ async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): P
 }
 
 /**
- * The loopback CONNECT relay (src/gateway/connect-relay.ts), when AIS_GATEWAY_CONNECT_UPSTREAMS is set (shell env first,
- * then ~/.secrets). Port: AIS_GATEWAY_CONNECT_LOCAL_PORT, default 47132. A bad config or a busy port is logged and the
+ * The loopback CONNECT relay uses AIS_GATEWAY_CONNECT_UPSTREAMS from the environment or ~/.secrets.
+ * An empty environment value disables the relay. Port: AIS_GATEWAY_CONNECT_LOCAL_PORT, default 47132.
+ * A bad config or a busy port is logged and the
  * local gateway still starts: the relay only carries the CONNECT path, never the model calls.
  */
 async function startConfiguredConnectRelay(): Promise<ConnectRelay | undefined> {
   const { readSecretsKey } = await import("./secrets-file.ts");
-  const text = process.env.AIS_GATEWAY_CONNECT_UPSTREAMS || (await readSecretsKey("AIS_GATEWAY_CONNECT_UPSTREAMS"));
+  const text = process.env.AIS_GATEWAY_CONNECT_UPSTREAMS ?? (await readSecretsKey("AIS_GATEWAY_CONNECT_UPSTREAMS"));
   if (!text) return undefined;
   try {
     const port = portOf(undefined, process.env.AIS_GATEWAY_CONNECT_LOCAL_PORT, CONNECT_RELAY_DEFAULT_PORT, "AIS_GATEWAY_CONNECT_LOCAL_PORT");

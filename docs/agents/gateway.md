@@ -298,6 +298,8 @@ change.
 
 The cluster Service routes connections on TCP 47132 to ready gateway replicas. T3 Code can use the cluster hostname
 from a host. Cluster pods use the Service address. The host installer no longer creates the optional local gateway unit.
+If a host still needs the local model proxy, set `AIS_GATEWAY_CONNECT_UPSTREAMS=` in its unit environment to disable
+the separate CONNECT listener.
 
 ### T3 Code account API (resets)
 
