@@ -83,3 +83,8 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 12
   VAPID; a test pins the RFC 8291 Appendix A vector), no web-push dependency. The daemon checks hourly through the shared
   limits scan, only while a subscription exists, and records each grant's sent stage (7d, 3d, 24h) only after a device
   accepted it, so a push service outage retries. Pool rows are skipped. Contract in `docs/API.md` (Push notifications).
+- The widgets listener (`AIS_WIDGETS_PORT`, `src/server/widgets.ts`) has no auth on purpose. It serves only `GET` and `HEAD`
+  for the widget panel routes. Every panel is a masked read-only summary. In the cluster the only way to reach it is the
+  Kubernetes API server service proxy, so RBAC on `services/proxy` is the guard, and no public route points at it. It sends
+  no CORS headers and it is off unless the variable is set. The main-listener routes keep the full console guard. Both
+  listeners share one `WidgetService` cache, built in `serve.ts`. Contract: docs/API.md (Widget panels).

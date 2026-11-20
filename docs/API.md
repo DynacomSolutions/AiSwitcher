@@ -403,6 +403,62 @@ confirmation first.
 Codex `manualReset` also carries `creditExpiries[]` (`{ id, label?, endsAt }`,
 ISO) for each available reset credit.
 
+### Widget panels
+
+`GET /api/widgets` and `GET /api/widgets/<id>`
+
+Read-only summaries for dashboards (the Headlamp widget panel API). Each panel
+uses the same engine as the matching route in this file and adds no new data
+collection. The main listener serves both routes behind the normal console
+guard, like every other `/api` route.
+
+`GET /api/widgets` answers `{ "version": 1, "panels": PanelInfo[] }`. A
+`PanelInfo` is `{ id, title, description, plugin, link, refreshSeconds }`.
+`plugin` is always `"AIS Console"`. `link` is a relative console path or an
+empty string.
+
+`GET /api/widgets/<id>` answers one `PanelModel`: `{ version: 1, id, title,
+generatedAt, link, status, summary, stats[], rows[] }`. `status` is `ok`,
+`warn`, `crit` or `unknown`. A `stat` is `{ label, value, status }`. A `row` is
+`{ label, detail, value, fraction?, status, link? }`, where `fraction` is 0 to 1.
+An unknown id gives 404 `{ "error": "unknown panel" }`. A failing backend gives
+502 `{ "error": "<short reason>" }`. The server caches each panel for its
+`refreshSeconds` and runs one build for concurrent requests. Email-shaped and
+token-shaped strings are masked. Output holds no file paths, command lines or
+credential data.
+
+| Panel id | Shows | refreshSeconds |
+|---|---|---|
+| `limits` | 5-hour and weekly windows per provider and identity (from `/api/limits`). Warn at 0.8, crit at 0.95. A failed read is a row with status `unknown`. | 300 |
+| `identities` | Login state per identity (from `/api/auth`). Stats count logged in, expiring, expired and not logged in. Retired identities and swap pools are left out. | 300 |
+| `agents` | Running agent sessions (from `/api/processes`): a stat per tool, and a row per session with tool, identity and age. | 60 |
+| `gateway-usage` | Gateway tokens per app and provider over 7 days (from `/api/gateway/usage`). Status `unknown` when the gateway is not configured. There is no `series`, because the source has no daily points. | 300 |
+| `claude-swap` | Claude swap pool members with their highest window use (from `/api/claude-swap`). | 300 |
+| `spend-guard` | Budget use per account (from `/api/spend-guard`). Rows carry identity names only. Status `unknown` when the scheduler is not running. | 300 |
+
+There is no `errors` panel, because the console keeps no list of recent
+errors.
+
+#### Separate read-only listener
+
+Set `AIS_WIDGETS_PORT` to start a second listener. It is off by default, so
+`ais web` on a host does not change. It binds the same host as the main server
+(`AIS_WEB_HOST`, `0.0.0.0` in the cluster). It shares the panel cache with the
+main listener. It stops accepting requests when the main server drains or
+stops.
+
+- It serves `GET` and `HEAD` for `/api/widgets`, `/api/widgets/<id>` and
+  `/api/widgets-health` (`200 {"ok":true}`) only.
+- Every other path gives 404. Every other method gives 405.
+- It has no auth and sends no CORS headers.
+- The port must be a whole number from 1 to 65535 and must differ from the main
+  port. An invalid value logs an error and starts no widgets listener. The main
+  server still starts.
+
+In the cluster, no public route points at this port. Clients reach it through
+the Kubernetes API server service proxy:
+`/api/v1/namespaces/<ns>/services/<svc>:<port-name>/proxy/api/widgets`.
+
 ### Push notifications
 
 The installed PWA subscribes for reset-expiry reminders. The daemon sends one

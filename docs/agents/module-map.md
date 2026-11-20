@@ -189,6 +189,10 @@ src/
                             endpoints so BOTH frontends' live polling never hammers
                             upstream provider APIs; also maps query params onto the
                             ParsedArgs["flags"] shape the collectors already read
+    widgets.ts             Headlamp widget panel API: panel mapping over the existing engines,
+                            WidgetService (per-panel cache, via expensive.ts PollCache), the
+                            handler of the optional read-only widgets listener
+                            (AIS_WIDGETS_PORT) and strict port parsing
     processes.ts           /proc scan for running agent CLIs, attributed to identities via
                             IDENTITY_SESSION_MARKER in each process's environ
     registries.ts          registry listing + all mutations via cli/identities/actions.ts's
