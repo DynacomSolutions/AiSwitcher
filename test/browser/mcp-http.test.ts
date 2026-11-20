@@ -211,3 +211,20 @@ test("the key file: created 0600 in a 0700 folder, reused, and a loose mode is t
   ensureMcpKey(keyDir);
   expect((await stat(join(keyDir, "key"))).mode & 0o777).toBe(0o600);
 });
+
+test("initialize, ping and tools/list read no registry, no T3 database and no file; the session context is built only for a call", async () => {
+  const boom = (what: string) => (): never => { throw new Error(`${what} must not be read during registration`); };
+  const d = daemon({
+    readClaudeSessionId: boom("claude session file"),
+    findCodexThread: boom("codex rollout") as any,
+    makeContext: boom("session context (registry, T3 title)") as any,
+  });
+  const h = { "x-ais-pool": "p", "x-ais-owner-pid": "100", "x-ais-home": encodeURIComponent(dir), "x-ais-t3-thread": "thr-1", "x-ais-t3-home": encodeURIComponent(dir) };
+  for (const method of ["initialize", "ping", "tools/list"]) {
+    const res = await d.handle(post({ jsonrpc: "2.0", id: 1, method, params: {} }, h));
+    expect(res.status).toBe(200);
+  }
+  expect((await d.handle(post({ jsonrpc: "2.0", method: "notifications/initialized" }, h))).status).toBe(202);
+  expect(d.sessions.size).toBe(0);
+  expect(calls).toHaveLength(0);
+});

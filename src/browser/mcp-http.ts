@@ -49,6 +49,14 @@ export interface McpDaemon {
   readonly draining: boolean;
 }
 
+/** Context for the methods that never reach the gateway. Its readers are never called. */
+const STATIC_CONTEXT: ShimContext = {
+  gatewayUrl: async () => undefined,
+  token: async () => undefined,
+  session: { id: "", identity: "", label: "" },
+  fetch: (async () => { throw new Error("no gateway call without a session"); }) as unknown as typeof fetch,
+};
+
 const json = (status: number, body: unknown, headers: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 
@@ -178,7 +186,10 @@ export function createMcpDaemon(deps: DaemonDeps): McpDaemon {
     if (messages.length === 0 || messages.some((m) => typeof m !== "object" || m === null || Array.isArray(m))) {
       return json(400, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } });
     }
-    const { entry } = contextFor(headers);
+    // Registration (initialize, tools/list, ping) must stay cheap under load: no registry, T3 database or file read.
+    // The session context, which reads those lazily, is built only for a call or a cancel.
+    const needsContext = (messages as RpcMessage[]).some((m) => m.method === "tools/call" || m.method === "notifications/cancelled");
+    const entry: Entry = needsContext ? contextFor(headers).entry : { ctx: STATIC_CONTEXT, ownerPid: undefined, lastUsed: now() };
     const replies: object[] = [];
     await Promise.all((messages as RpcMessage[]).map(async (msg) => {
       // A client that drops the connection cancels its own call.
@@ -193,7 +204,7 @@ export function createMcpDaemon(deps: DaemonDeps): McpDaemon {
         req.signal.removeEventListener("abort", onAbort);
       }
     }));
-    entry.lastUsed = now();
+    if (needsContext) entry.lastUsed = now();
     if (replies.length === 0) return new Response(null, { status: 202 });
     return json(200, Array.isArray(body) ? replies : replies[0]);
   }
