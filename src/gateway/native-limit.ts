@@ -39,7 +39,7 @@ export interface LimitInfo {
 function slotOf(label: string): LimitSlot | undefined {
   const l = label.toLowerCase();
   if (/(five|5h|session|~[1-5]h|hour)/.test(l)) return "short";
-  if (/(seven|7d|week|day|~\d+d)/.test(l)) return "long";
+  if (/(seven|7d|week|month|day|~\d+d)/.test(l)) return "long";
   return undefined;
 }
 
@@ -60,7 +60,10 @@ function windowsOf(usage: PoolUsage | undefined): LimitWindow[] {
     const at = out.findIndex((o) => o.slot === slot);
     // A per-model weekly window (left in only for a request for that model) stands for the week when it is fuller.
     if (at >= 0) {
-      if (w.model !== undefined && w.utilization > (out[at] as LimitWindow).utilization) out[at] = entry;
+      const have = out[at] as LimitWindow;
+      // Two plain windows in one slot (a weekly and a monthly): the fuller one stands, and of two full ones the later reset.
+      const fuller = w.utilization > have.utilization || (w.utilization === have.utilization && (reset ?? 0) > (have.resetsAtSec ?? 0));
+      if (fuller && (w.model !== undefined || w.utilization >= 100 || have.utilization < 100)) out[at] = entry;
       continue;
     }
     out.push(entry);
@@ -195,4 +198,15 @@ export function nativeLimitResponse(provider: GatewayProvider, usages: Array<Poo
   if (provider !== "claude" && provider !== "codex") return undefined;
   const info = summariseLimit(usages, reservePercent, now, extra);
   return provider === "claude" ? anthropicLimitResponse(info, now) : codexLimitResponse(info, now);
+}
+
+/**
+ * The earliest time a member is usable again, only when some member is blocked by a full window (at or over the reserve)
+ * with a known reset. Undefined when no reading shows a full window, so callers keep a short hold for a real burst 429.
+ */
+export function fullWindowReset(usages: Array<PoolUsage | undefined>, reservePercent: number, now: Date): number | undefined {
+  const nowSec = Math.floor(now.getTime() / 1000);
+  const full = usages.filter((u) => windowsOf(u).some((w) => w.utilization >= reservePercent));
+  const info = summariseLimit(full, reservePercent, now);
+  return info.guessed || full.length === 0 ? undefined : Math.max(info.resetAtSec, nowSec + 1);
 }

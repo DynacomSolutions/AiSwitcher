@@ -3,6 +3,7 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
 import { adapterFor as poolAdapterFor } from "../identities/pool/registry.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { fetchZaiLimits } from "../cli/limits/zai-limits.ts";
+import { fetchOpencodeGoQuotaForKey } from "../cli/limits/opencode-limits.ts";
 import { usageFromLimits } from "../identities/pool/grant-file-adapter.ts";
 import type { GatewayProvider } from "./types.ts";
 
@@ -26,6 +27,16 @@ export const fetchPoolUsage: FetchUsage = async (provider, identity, opts) => {
   if (provider === "zai") return found ? zaiTokenUsage(await fetchZaiLimits(found)) : undefined;
   return found ? adapter!.fetchUsage(found, { noRefresh: true, ...(opts?.fresh ? { fresh: true } : {}) }) : undefined;
 };
+
+/**
+ * The OpenCode Go plan reading for one member, from its own key (rolling 5-hour, weekly and monthly dollar windows, each
+ * with its reset). A member with no Go plan, or a failed read, gives no figure, so it never blocks and never sets a reset.
+ */
+export async function fetchOpencodeUsage(apiKey: string): Promise<PoolUsage | undefined> {
+  const outcome = await fetchOpencodeGoQuotaForKey(apiKey);
+  if (outcome.error || !outcome.windows) return undefined;
+  return usageFromLimits([{ status: "live", windows: outcome.windows }]);
+}
 
 interface Entry {
   value: PoolUsage | undefined;

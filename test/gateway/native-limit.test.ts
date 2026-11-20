@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { FALLBACK_RESET_SECONDS, genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit } from "../../src/gateway/native-limit.ts";
+import { FALLBACK_RESET_SECONDS, fullWindowReset, genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit } from "../../src/gateway/native-limit.ts";
 
 /**
  * Fixtures are synthetic and scrubbed. Their shapes come from the provider-native limit answers the CLIs parse:
@@ -148,5 +148,43 @@ describe("nativeLimitResponse for codex", () => {
     expect(body.error.message).toBe("You've hit your usage limit (identity is at its usage reserve; resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z.");
     expectT3(body.error.message, 1793622600);
     expect(genericLimitResponse("anthropic", 1, NOW, "x").headers.get("retry-after")).toBe("1");
+  });
+});
+
+describe("true reset at full capacity (OpenCode Go shapes)", () => {
+  const go = (fiveUsed: number, weekUsed: number, weekReset: string): PoolUsage => ({
+    status: "rate-limited",
+    maxUtilization: Math.max(fiveUsed, weekUsed),
+    capturedAt: NOW.toISOString(),
+    windows: [
+      { label: "session (5h)", utilization: fiveUsed, resetsAt: T_1400 },
+      { label: "week", utilization: weekUsed, resetsAt: weekReset },
+      { label: "month", utilization: 20, resetsAt: "2026-12-01T00:00:00.000Z" },
+    ],
+  });
+  const T_WEEK = "2026-11-05T09:00:00.000Z"; // 1793869200
+
+  test("one member weekly 100%, 5h 51%, three members with no windows: the weekly reset", () => {
+    const info = summariseLimit([go(51, 100, T_WEEK), undefined, undefined, undefined], 100, NOW);
+    expect(info).toMatchObject({ resetAtSec: 1793869200, claim: "long", guessed: false });
+  });
+
+  test("a short quota hold candidate later than nothing does not beat the weekly reading", () => {
+    expect(fullWindowReset([go(51, 100, T_WEEK), undefined, undefined, undefined], 100, NOW)).toBe(1793869200);
+  });
+
+  test("no window over the reserve gives no full-window reset (a burst stays short)", () => {
+    expect(fullWindowReset([go(51, 40, T_WEEK), undefined], 100, NOW)).toBeUndefined();
+  });
+
+  test("a full monthly window counts in the long slot and sets the reset", () => {
+    const m: PoolUsage = { status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "session (5h)", utilization: 10, resetsAt: T_1400 }, { label: "week", utilization: 30, resetsAt: T_WEEK }, { label: "month", utilization: 100, resetsAt: "2026-12-01T00:00:00.000Z" }] };
+    expect(summariseLimit([m], 100, NOW)).toMatchObject({ resetAtSec: Date.parse("2026-12-01T00:00:00.000Z") / 1000, claim: "long" });
+  });
+
+  test("with two blocked members the earliest member time wins, each member at its latest full window", () => {
+    const x = go(100, 100, T_WEEK); // 5h and week full: latest is the week
+    const y = go(100, 100, "2026-11-08T09:00:00.000Z");
+    expect(summariseLimit([y, x], 100, NOW).resetAtSec).toBe(1793869200);
   });
 });

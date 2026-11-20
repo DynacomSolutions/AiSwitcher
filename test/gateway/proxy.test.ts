@@ -1811,6 +1811,18 @@ describe("native limit answers", () => {
     expect(resetMs - NOW.getTime()).toBe(Number(res.headers.get("retry-after")) * 1000);
   });
 
+  test("a pool at true capacity answers with the reset of the full weekly window, not a short hold", async () => {
+    const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pool" } }));
+    // One member has a full weekly window (3 days away) and a half-used 5-hour one. The other has no plan, no windows.
+    usage.a = { status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "session (5h)", utilization: 51, resetsAt: "2026-11-02T15:00:00.000Z" }, { label: "week", utilization: 100, resetsAt: "2026-11-05T09:00:00.000Z" }] };
+    handler = () => new Response('{"error":{"message":"quota used up","type":"rate_limit_error"}}', { status: 429, headers: { "content-type": "application/json" } });
+    const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    const message = ((await res.json()) as { error: { message: string } }).error.message;
+    expect(message).toContain("Resets at 2026-11-05T09:00:00.000Z.");
+    expect(res.headers.get("retry-after")).toBe(String((Date.parse("2026-11-05T09:00:00.000Z") - NOW.getTime()) / 1000));
+  });
+
   test("an upstream 429 whose text already ends in a reset time passes through byte for byte", async () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pin", identity: "id1" } }));
     usage.id1 = live(10);
