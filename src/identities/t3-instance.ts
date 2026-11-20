@@ -102,8 +102,10 @@ const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
  * The launcher picks the grok binary each time it starts, so a newer T3 install is used without a re-run.
  * An explicit binary always wins. Without one it uses the newest T3-managed grok from the ACP registry
  * install records, and then the fallback path.
+ * `grok agent ...` (the ACP session T3 starts) runs behind the AIS relay when `ais` has it, so a usage limit snoozes the
+ * thread and resumes it at the reset time (src/acp/limit-snooze.ts). Without `ais` the binary starts directly.
  */
-export function grokLauncherSource(opts: { binary?: string; t3Home: string; fallback: string }): string {
+export function grokLauncherSource(opts: { binary?: string; t3Home: string; fallback: string; ais?: string }): string {
   const resolve = opts.binary
     ? [`BIN=${shQuote(opts.binary)}`]
     : [
@@ -143,6 +145,14 @@ export function grokLauncherSource(opts: { binary?: string; t3Home: string; fall
     `  printf '%s\\n' "$OUT" | sed 's/^You are using XAI_API_KEY\\.\\{0,1\\}$/You are logged in (AIS gateway token)./'`,
     '  exit "$RC"',
     "fi",
+    ...(opts.ais
+      ? [
+          `AIS=${shQuote(opts.ais)}`,
+          'if [ "$1" = "agent" ] && [ -x "$AIS" ] && "$AIS" __acp_relay --supported >/dev/null 2>&1; then',
+          '  exec "$AIS" __acp_relay grok-build "--binary=$BIN" "$@"',
+          "fi",
+        ]
+      : []),
     'exec "$BIN" "$@"',
     "",
   ].join("\n");
@@ -359,7 +369,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
       ],
       config,
     };
-    plans.push({ path: launcher, content: grokLauncherSource({ ...(opts.binary ? { binary: opts.binary } : {}), t3Home, fallback: join(home, ".local", "bin", "grok") }), mode: 0o755, label: "launcher" });
+    plans.push({ path: launcher, content: grokLauncherSource({ ...(opts.binary ? { binary: opts.binary } : {}), t3Home, fallback: join(home, ".local", "bin", "grok"), ais: join(home, ".local", "bin", "ais") }), mode: 0o755, label: "launcher" });
   }
 
   const warnings: string[] = [];

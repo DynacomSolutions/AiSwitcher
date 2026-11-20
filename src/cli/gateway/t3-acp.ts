@@ -59,9 +59,12 @@ export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions =
     process.stderr.write("ais __acp_relay: an agent id is required\n");
     return 2;
   }
-  const fallback = rest[0]?.startsWith("--fallback=") ? rest[0].slice("--fallback=".length) : undefined;
-  const agentArgs = fallback !== undefined ? rest.slice(1) : rest;
-  const install = (await resolveAgentInstall(agentId, opts)) ?? (fallback ? { agentId, version: "0", executable: fallback } : undefined);
+  // `--binary=<path>` runs exactly that executable (the grok launcher has already chosen it); `--fallback=` is the last resort.
+  const first = rest[0] ?? "";
+  const binary = first.startsWith("--binary=") ? first.slice("--binary=".length) : undefined;
+  const fallback = first.startsWith("--fallback=") ? first.slice("--fallback=".length) : undefined;
+  const agentArgs = binary !== undefined || fallback !== undefined ? rest.slice(1) : rest;
+  const install = binary ? { agentId, version: "0", executable: binary } : ((await resolveAgentInstall(agentId, opts)) ?? (fallback ? { agentId, version: "0", executable: fallback } : undefined));
   if (!install) {
     process.stderr.write(`ais __acp_relay: T3 Code has no install of ${agentId}\n`);
     return 127;

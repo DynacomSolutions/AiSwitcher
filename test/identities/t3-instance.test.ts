@@ -200,6 +200,32 @@ describe("grok launcher binary resolution", () => {
   });
 });
 
+describe("grok launcher relay", () => {
+  test("agent runs behind the relay when ais has it, other commands stay direct", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "grok-relay-"));
+    try {
+      await mkdir(join(dir, "gh"), { recursive: true });
+      await writeFile(join(dir, "gh", "token"), "tok\n");
+      const fake = join(dir, "fakegrok");
+      await writeFile(fake, '#!/bin/sh\necho "direct $*"\n', { mode: 0o755 });
+      const ais = join(dir, "ais");
+      await writeFile(ais, '#!/bin/sh\n[ "$1" = "__acp_relay" ] && [ "$2" = "--supported" ] && exit 0\necho "relay $*"\n', { mode: 0o755 });
+      const l = join(dir, "launch");
+      await writeFile(l, grokLauncherSource({ binary: fake, t3Home: dir, fallback: "/fb/grok", ais }));
+      const go = async (...args: string[]) => {
+        const p = Bun.spawn(["sh", l, ...args], { env: { PATH: process.env.PATH ?? "", GROK_HOME: join(dir, "gh") }, stdout: "pipe" });
+        return (await new Response(p.stdout).text()).trim();
+      };
+      expect(await go("agent", "stdio")).toBe(`relay __acp_relay grok-build --binary=${fake} agent stdio`);
+      expect(await go("--version")).toBe("direct --version");
+      await writeFile(ais, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      expect(await go("agent", "stdio")).toBe("direct agent stdio");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("grok launcher models rewrite", () => {
   const runFake = async (args: string[], body: string): Promise<{ out: string; code: number }> => {
     const dir = await mkdtemp(join(tmpdir(), "grok-launcher-"));
