@@ -50,6 +50,7 @@ import {
   updateIdentityInRegistry,
 } from "./registries.ts";
 import { scanProcesses } from "./processes.ts";
+import { WidgetService } from "./widgets.ts";
 import * as filesApi from "./files.ts";
 import { buildPermissions } from "./permissions.ts";
 
@@ -66,6 +67,8 @@ async function defaultLocalModels(onlineCachePath?: string): Promise<LocalModels
 
 export interface ConsoleAppDeps extends GuardDeps {
   startedAt: number;
+  /** Shared widget panel service (one cache for every listener); createApp makes its own when absent. */
+  widgets?: WidgetService;
   /** apps/web/dist when present; the SPA plus its assets are served from here. */
   distDir?: string;
   /** Daemon-side credential renewal; absent in bare-app tests. */
@@ -141,6 +144,35 @@ async function registryPoolKeys(): Promise<Set<string>> {
   return keys;
 }
 
+/** The `/api/limits` answer: the host scan merged with the gateway limits, with accounts per row. */
+async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string; identity?: string }, maxAgeS: number): Promise<unknown> {
+  // The cluster gateway is the source of truth for the limits of the identities it manages; the host scan covers the rest.
+  // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
+  const [result, gateway] = await Promise.all([
+    runScanIsolated("limits", { ...filters, maxAgeS }, 45_000),
+    (deps.gatewayLimits ?? loadGatewayLimits)().catch(() => undefined),
+  ]);
+  if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "limits scan failed");
+  const payload = gateway ? await mergeGatewayLimits(result.payload, gateway, filters) : result.payload;
+  return withRowAccounts(payload);
+}
+
+/** The widget panel service over the same engines the `/api/*` routes use. serve.ts creates one and shares it with the widgets listener. */
+export function createWidgetService(deps: ConsoleAppDeps): WidgetService {
+  return new WidgetService({
+    limits: () => loadLimitsPayload(deps, {}, 45),
+    auth: async () => authApi.authStatus(Object.values(TOOL_CONFIGS), await freshRefreshStatus(deps.authRefresh)),
+    processes: () => scanProcesses(),
+    gatewayUsage: (days) => (deps.gatewayUsage ?? loadGatewayUsage)(days),
+    claudeSwap: async () => {
+      const pools = [...(await (deps.poolKeys ?? registryPoolKeys)())].filter((k) => k.startsWith("claude/")).map((k) => k.slice("claude/".length));
+      if (pools.length === 0) return undefined;
+      return Promise.all(pools.map(async (pool) => ({ pool, rows: (await poolStatus({}, pool, { usage: true })).rows })));
+    },
+    ...(deps.spendGuard ? { spendGuard: () => deps.spendGuard!.status() } : {}),
+  });
+}
+
 export function createApp(deps: ConsoleAppDeps): Hono {
   const app = new Hono();
 
@@ -164,6 +196,15 @@ export function createApp(deps: ConsoleAppDeps): Hono {
 
   // Extension sign-in page (outside /api: opened by launchWebAuthFlow, guarded by its own CSRF cookie).
   mountBrowserAuthorize(app, deps.browserAuth);
+
+  /* ----------------------------- widget panels ----------------------------- */
+  // Read-only panel summaries for dashboards. Mounted after the guard above, so they need the same access as every other /api route.
+  const widgets = deps.widgets ?? createWidgetService(deps);
+  app.get("/api/widgets", (c) => c.json(widgets.list()));
+  app.get("/api/widgets/:id", async (c) => {
+    const result = await widgets.get(decodeSegment(c.req.param("id")));
+    return c.json(result.body, result.status);
+  });
 
   /* --------------------------------- status -------------------------------- */
 
@@ -284,15 +325,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
     };
-    // The cluster gateway is the source of truth for the limits of the identities it manages; the host scan covers the rest.
-    // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
-    const [result, gateway] = await Promise.all([
-      runScanIsolated("limits", { ...filters, maxAgeS: numberQuery(c, "maxAge", 45) }, 45_000),
-      (deps.gatewayLimits ?? loadGatewayLimits)().catch(() => undefined),
-    ]);
-    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "limits scan failed");
-    const payload = gateway ? await mergeGatewayLimits(result.payload, gateway, filters) : result.payload;
-    return c.json(await withRowAccounts(payload));
+    return c.json(await loadLimitsPayload(deps, filters, numberQuery(c, "maxAge", 45)));
   });
   app.get("/api/usage", async (c) => {
     const filters = {
