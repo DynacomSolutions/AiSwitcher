@@ -232,7 +232,10 @@ describe("github output mode", () => {
   });
   test("pull request outputs agree with the engine on the same diff", () => {
     const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: ROOT }).stdout.toString().trim();
-    const base = Bun.spawnSync(["git", "rev-parse", "HEAD~1"], { cwd: ROOT }).stdout.toString().trim();
+    const parent = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", "HEAD~1^{commit}"], { cwd: ROOT });
+    // A shallow checkout (CI depth 1) has no parent commit, so there is no diff to compare.
+    if (parent.exitCode !== 0) return;
+    const base = parent.stdout.toString().trim();
     const dir = mkdtempSync(join(tmpdir(), "ci-affected-pr-"));
     try {
       const output = join(dir, "output");
