@@ -8,7 +8,7 @@ import { PgHomeStore } from "../../src/gateway/home-store.ts";
 import { describeHostSync, hostStoreConfig, hostSyncOnce, startHostSync } from "../../src/gateway/host-sync.ts";
 import { migrate } from "../../src/gateway/pg-store.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
-import { createStoreSyncSupervisor, storeSyncConfigured, type SupervisedChild } from "../../src/sync/store-sync-supervisor.ts";
+import { createStoreSyncSupervisor, storeSyncConfigured, storeSyncState, type SupervisedChild } from "../../src/sync/store-sync-supervisor.ts";
 
 const KEY = Buffer.alloc(32, 5);
 const grant = (refresh: string, expiresAtMs: number): string =>
@@ -37,24 +37,108 @@ describe("grant freshness ignores the refresh token's own expiry", () => {
 });
 
 describe("host store config", () => {
-  test("off without a database URL; env first, then ~/.secrets; the key may come from a file; errors never echo values", async () => {
+  const ADMIN = { AIS_GATEWAY_ADMIN_URL: "https://gw.example.test/admin/", AIS_GATEWAY_ADMIN_TOKEN: "SYNTHETIC_FIXTURE-admin-token" };
+
+  test("off without a key; env first, then ~/.secrets; the key may come from a file; errors never echo values", async () => {
     const d = await tmp();
     const secrets = join(d, "secrets");
     expect(await hostStoreConfig({}, secrets)).toBeUndefined();
+    expect(await hostStoreConfig(ADMIN, secrets)).toBeUndefined();
     expect(await storeSyncConfigured({}, secrets)).toBe(false);
-    const fromEnv = await hostStoreConfig({ AIS_GATEWAY_STORE_DATABASE_URL: "postgres://u@db.example.test/x", AIS_GATEWAY_STORE_KEY: KEY.toString("base64") }, secrets);
-    expect(fromEnv?.databaseUrl).toBe("postgres://u@db.example.test/x");
+    const fromEnv = await hostStoreConfig({ ...ADMIN, AIS_GATEWAY_STORE_KEY: KEY.toString("base64") }, secrets);
+    expect(fromEnv?.admin).toEqual({ url: "https://gw.example.test/admin", token: "SYNTHETIC_FIXTURE-admin-token" });
+    expect(fromEnv?.databaseUrl).toBeUndefined();
     expect(fromEnv?.key.equals(KEY)).toBe(true);
     await writeFile(join(d, "key.txt"), `${KEY.toString("base64")}\n`);
-    await writeFile(secrets, `export AIS_GATEWAY_STORE_DATABASE_URL="postgres://u@db.example.test/y"\nAIS_GATEWAY_STORE_KEY_FILE=${join(d, "key.txt")}\n`);
+    await writeFile(secrets, `export AIS_GATEWAY_ADMIN_URL="https://gw.example.test/y"\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE-t\nAIS_GATEWAY_STORE_KEY_FILE=${join(d, "key.txt")}\n`);
     expect(await storeSyncConfigured({}, secrets)).toBe(true);
     const fromFile = await hostStoreConfig({}, secrets);
-    expect(fromFile?.databaseUrl).toBe("postgres://u@db.example.test/y");
+    expect(fromFile?.admin?.url).toBe("https://gw.example.test/y");
     expect(fromFile?.key.equals(KEY)).toBe(true);
-    await writeFile(secrets, "AIS_GATEWAY_STORE_DATABASE_URL=postgres://u:SYNTHETIC_FIXTURE-pw@db.example.test/y\n");
-    const err = await hostStoreConfig({}, secrets).then(() => undefined, (e: Error) => e);
+    await writeFile(secrets, "AIS_GATEWAY_ADMIN_URL=https://gw.example.test/y\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE-t\nAIS_GATEWAY_STORE_KEY_FILE=/nonexistent\n");
+    const err = await hostStoreConfig({ AIS_GATEWAY_STORE_KEY_FILE: "/nonexistent" }, secrets).then(() => undefined, (e: Error) => e);
     expect(err?.message).toContain("AIS_GATEWAY_STORE_KEY is required");
     expect(err?.message).not.toContain("SYNTHETIC_FIXTURE");
+  });
+
+  test("a database URL alone never opens the direct path: it needs the explicit flag, and the host needs the admin API otherwise", async () => {
+    const d = await tmp();
+    const secrets = join(d, "secrets");
+    const base = { AIS_GATEWAY_STORE_KEY: KEY.toString("base64"), AIS_GATEWAY_STORE_DATABASE_URL: "postgres://u:SYNTHETIC_FIXTURE-pw@db.example.test/x" };
+    const missing = await hostStoreConfig(base, secrets).then(() => undefined, (e: Error) => e);
+    expect(missing?.message).toContain("AIS_GATEWAY_ADMIN_URL");
+    expect(missing?.message).not.toContain("SYNTHETIC_FIXTURE");
+    const withApi = await hostStoreConfig({ ...base, ...ADMIN }, secrets);
+    expect(withApi?.databaseUrl).toBeUndefined();
+    const direct = await hostStoreConfig({ ...base, AIS_GATEWAY_STORE_DIRECT: "1" }, secrets);
+    expect(direct?.databaseUrl).toBe("postgres://u:SYNTHETIC_FIXTURE-pw@db.example.test/x");
+    expect(direct?.admin).toBeUndefined();
+  });
+});
+
+describe("store sync gate", () => {
+  const KEYV = { AIS_GATEWAY_STORE_KEY: KEY.toString("base64") };
+  const API = { AIS_GATEWAY_ADMIN_URL: "https://gw.example.test", AIS_GATEWAY_ADMIN_TOKEN: "SYNTHETIC_FIXTURE-t" };
+  const DB = { AIS_GATEWAY_STORE_DATABASE_URL: "postgres://u:SYNTHETIC_FIXTURE-pw@db.example.test/x" };
+
+  test("starts only with the key and one transport; every other case is off or blocked with one clear line", async () => {
+    const secrets = join(await tmp(), "secrets");
+    const st = (env: Record<string, string>) => storeSyncState(env, secrets);
+    expect(await st({})).toEqual({ state: "off" });
+    expect(await st(API)).toEqual({ state: "off" }); // a console host: admin values, no key
+    expect(await st({ ...KEYV, ...API })).toEqual({ state: "ready" });
+    expect(await st({ AIS_GATEWAY_STORE_KEY_FILE: "/k", ...API })).toEqual({ state: "ready" });
+    expect(await st({ ...KEYV, ...DB, AIS_GATEWAY_STORE_DIRECT: "1" })).toEqual({ state: "ready" });
+    const keyOnly = await st(KEYV);
+    expect(keyOnly.state).toBe("blocked");
+    expect(keyOnly.state === "blocked" && keyOnly.reason).toContain("AIS_GATEWAY_ADMIN_URL");
+    const old = await st({ ...KEYV, ...DB }); // the old config: database URL and key, no admin values, no flag
+    expect(old.state).toBe("blocked");
+    expect(old.state === "blocked" && old.reason).toContain("AIS_GATEWAY_ADMIN_TOKEN");
+    expect(old.state === "blocked" && old.reason).not.toContain("SYNTHETIC_FIXTURE");
+    const noKey = await st(DB);
+    expect(noKey.state).toBe("blocked");
+    expect(noKey.state === "blocked" && noKey.reason).toContain("AIS_GATEWAY_STORE_KEY");
+    expect((await st({ ...DB, ...API, AIS_GATEWAY_STORE_DIRECT: "1" })).state).toBe("blocked"); // direct without a key
+    expect(await st({ ...KEYV, AIS_GATEWAY_ADMIN_URL: "https://gw.example.test" })).toMatchObject({ state: "blocked" }); // no token
+    expect(await storeSyncConfigured({ ...KEYV, ...API }, secrets)).toBe(true);
+    expect(await storeSyncConfigured({ ...KEYV, ...DB }, secrets)).toBe(false);
+  });
+
+  test("hostStoreConfig: a database URL without a key gives the key error; the old config gives the admin error", async () => {
+    const secrets = join(await tmp(), "secrets");
+    const noKey = await hostStoreConfig(DB, secrets).then(() => undefined, (e: Error) => e);
+    expect(noKey?.message).toContain("AIS_GATEWAY_STORE_KEY is required");
+    expect(noKey?.message).not.toContain("SYNTHETIC_FIXTURE");
+    const old = await hostStoreConfig({ ...KEYV, ...DB }, secrets).then(() => undefined, (e: Error) => e);
+    expect(old?.message).toContain("AIS_GATEWAY_ADMIN_URL");
+    expect(old?.message).toContain("AIS_GATEWAY_ADMIN_TOKEN");
+    expect((await hostStoreConfig({ ...KEYV, ...DB, AIS_GATEWAY_STORE_DIRECT: "1" }, secrets))?.databaseUrl).toBeDefined();
+  });
+
+  test("the supervisor does not start a blocked host, logs one line per reason, and starts once it is ready", async () => {
+    let t = 0;
+    let state: { state: "off" } | { state: "ready" } | { state: "blocked"; reason: string } = { state: "blocked", reason: "AIS_GATEWAY_ADMIN_URL and AIS_GATEWAY_ADMIN_TOKEN are missing" };
+    const logs: string[] = [];
+    let spawned = 0;
+    const sup = createStoreSyncSupervisor({
+      state: async () => state,
+      spawn: () => (spawned += 1, { exited: new Promise(() => undefined), kill: () => undefined }),
+      now: () => t,
+      log: (m) => logs.push(m),
+    });
+    for (let i = 0; i < 4; i++) {
+      t += 60_000;
+      await sup.tick();
+    }
+    expect(spawned).toBe(0);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("AIS_GATEWAY_ADMIN_URL");
+    state = { state: "ready" };
+    t += 60_000;
+    await sup.tick();
+    expect(spawned).toBe(1);
+    sup.stop();
   });
 });
 

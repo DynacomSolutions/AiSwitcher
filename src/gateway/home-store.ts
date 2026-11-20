@@ -39,6 +39,30 @@ export interface HomeFileRow extends HomeFileMeta {
 
 export type PutResult = { ok: true; version: number } | { ok: false; current?: HomeFileMeta };
 
+/** A row as stored: metadata plus the encrypted content (never decrypted by the holder of this value). */
+export interface HomeCipherRow extends HomeFileMeta {
+  cipher: Buffer;
+}
+
+/**
+ * What the host mirror and the import need from a store: PgHomeStore (direct database) and HttpHomeStore (the gateway's
+ * admin API, home-store-http.ts) both provide it. Content is plain here; each implementation encrypts and decrypts itself.
+ */
+export type HomeStoreClient = Pick<PgHomeStore, "list" | "get" | "getAccount" | "put" | "listen" | "close">;
+
+/**
+ * What the gateway's admin routes serve (admin-store.ts): rows stay encrypted, so the admin token alone never reads a
+ * credential. PgHomeStore provides it.
+ */
+export interface HomeStoreServer {
+  list(sinceVersion?: number): Promise<HomeFileMeta[]>;
+  getCipher(query: { paths?: string[]; account?: string; extraPaths?: string[] }): Promise<HomeCipherRow[]>;
+  putCipher(path: string, cipher: Buffer, sha256: string, opts: { account: string | null; kind: HomeFileKind; expectedVersion?: number | null }): Promise<PutResult>;
+  /** Decrypts a row's content, to check what a client pushed. Throws when it does not decrypt. */
+  decrypt(path: string, cipher: Buffer): Buffer;
+  listen(onPath: (path: string) => void): Promise<() => Promise<void>>;
+}
+
 export const sha256Hex = (b: Buffer | string): string => createHash("sha256").update(b).digest("hex");
 
 /** Parses the key: base64 (44 chars) or hex (64 digits) of exactly 32 bytes. Throws a message without the value. */
@@ -141,8 +165,20 @@ export class PgHomeStore {
    */
   async put(path: string, content: Buffer, opts: { account: string | null; kind: HomeFileKind; expectedVersion?: number | null }): Promise<PutResult> {
     assertRelPath(path);
-    const cipher = encryptFile(this.key, path, content);
-    const sha = sha256Hex(content);
+    return this.write(path, encryptFile(this.key, path, content), sha256Hex(content), opts);
+  }
+
+  /**
+   * Writes a row whose content a client already encrypted (the gateway's admin route). The cipher must decrypt with this
+   * key for this path, and its content must match `sha256`: a bad client can never store a row nobody can read.
+   */
+  async putCipher(path: string, cipher: Buffer, sha256: string, opts: { account: string | null; kind: HomeFileKind; expectedVersion?: number | null }): Promise<PutResult> {
+    assertRelPath(path);
+    if (sha256Hex(decryptFile(this.key, path, cipher)) !== sha256) throw new Error("gateway store: the checksum does not match the content");
+    return this.write(path, cipher, sha256, opts);
+  }
+
+  private async write(path: string, cipher: Buffer, sha: string, opts: { account: string | null; kind: HomeFileKind; expectedVersion?: number | null }): Promise<PutResult> {
     const exp = opts.expectedVersion;
     let rows: Array<{ version: unknown }>;
     if (exp === undefined) {
@@ -173,6 +209,22 @@ export class PgHomeStore {
     return { ok: true, version: Number(rows[0]!.version) };
   }
 
+  decrypt(path: string, cipher: Buffer): Buffer {
+    return decryptFile(this.key, path, cipher);
+  }
+
+  /** Encrypted rows for paths and/or an account (plus extra paths), for the gateway's admin route. */
+  async getCipher(query: { paths?: string[]; account?: string; extraPaths?: string[] }): Promise<HomeCipherRow[]> {
+    const toCipher = (rows: Array<Record<string, unknown>>): HomeCipherRow[] => rows.map((r) => ({ ...toMeta(r), cipher: toBuffer(r.cipher) }));
+    if (query.account !== undefined) {
+      const extra = query.extraPaths ?? [];
+      return toCipher(await this.sql`SELECT path, account, kind, sha256, version, cipher FROM gateway_home_files WHERE account = ${query.account} OR path IN ${this.sql(extra.length > 0 ? extra : [""])}`);
+    }
+    const paths = query.paths ?? [];
+    if (paths.length === 0) return [];
+    return toCipher(await this.sql`SELECT path, account, kind, sha256, version, cipher FROM gateway_home_files WHERE path IN ${this.sql(paths)}`);
+  }
+
   /** Removes a row, only while it is still at `expectedVersion` (compare-and-swap). True when a row went. */
   async delete(path: string, expectedVersion: number): Promise<boolean> {
     assertRelPath(path);
@@ -186,12 +238,45 @@ export class PgHomeStore {
     return new Set(rows.map((r: { account: string }) => r.account));
   }
 
-  /** Calls `onPath` for every change NOTIFY. Resolves once listening; returns an unlisten function. */
+  /** Subscribers of the shared LISTEN. One entry per `listen` call, so leaving twice is harmless. */
+  private readonly listeners = new Set<{ cb: (path: string) => void }>();
+  /** The live LISTEN, present while at least one subscriber is. Read and changed only inside `serial`. */
+  private handle: { unlisten?: () => unknown } | undefined;
+  private chain: Promise<void> = Promise.resolve();
+
+  /** Runs `fn` after every earlier start or stop of the shared LISTEN has finished. */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(fn);
+    this.chain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * Calls `onPath` for every change NOTIFY. Resolves once listening; returns an unlisten function. All callers share one
+   * database connection. Starts and stops run one at a time: the first subscriber starts the LISTEN, the last to leave
+   * ends the handle that is current at that moment, and a subscriber that joins after that gets a fresh LISTEN.
+   */
   async listen(onPath: (path: string) => void): Promise<() => Promise<void>> {
-    // biome-ignore lint/suspicious/noExplicitAny: Bun's SQL listen is not in the published types yet
-    const handle: any = await (this.sql as any).listen(HOME_FILES_CHANNEL, (payload: string) => onPath(payload));
-    return async () => {
-      await Promise.resolve(handle?.unlisten?.()).catch(() => undefined);
-    };
+    const sub = { cb: onPath };
+    await this.serial(async () => {
+      this.listeners.add(sub);
+      if (this.handle) return;
+      try {
+        // biome-ignore lint/suspicious/noExplicitAny: Bun's SQL listen is not in the published types yet
+        this.handle = await (this.sql as any).listen(HOME_FILES_CHANNEL, (payload: string) => {
+          for (const l of [...this.listeners]) l.cb(payload);
+        });
+      } catch (err) {
+        this.listeners.delete(sub);
+        throw err;
+      }
+    });
+    return () =>
+      this.serial(async () => {
+        if (!this.listeners.delete(sub) || this.listeners.size > 0) return;
+        const h = this.handle;
+        this.handle = undefined;
+        await Promise.resolve(h?.unlisten?.()).catch(() => undefined);
+      });
   }
 }

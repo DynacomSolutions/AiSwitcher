@@ -3,11 +3,12 @@ import { homedir, hostname } from "node:os";
 import { join, relative, sep } from "node:path";
 import { memberDir, memberLoginFile, type MemberStoreTool } from "../identities/gateway-members.ts";
 import { hostStoreConfig, type HostStoreConfig } from "./host-sync.ts";
-import { PgHomeStore, sha256Hex } from "./home-store.ts";
+import { HttpHomeStore } from "./home-store-http.ts";
+import { sha256Hex, type HomeStoreClient } from "./home-store.ts";
 import { REPLACED_MARKER_FILE } from "./home-mirror.ts";
 
 /**
- * Pushes a member-store login the owner just adopted into the PostgreSQL credential store, replacing the rows at once so
+ * Pushes a member-store login the owner just adopted into the credential store through the gateway admin API, replacing the rows at once so
  * cluster gateways serve the new account without waiting for the host sync. Each row is replaced by compare-and-swap on the
  * version just read (account key `<tool>/<identity>` unchanged). Never throws: the local write stands, and the host store
  * sync (`ais gateway store sync`) is the fallback.
@@ -17,7 +18,7 @@ export interface OwnerPushOptions {
   root: string;
   home?: string;
   /** Tests: an open store instead of one made from the config. */
-  store?: PgHomeStore;
+  store?: HomeStoreClient;
   /** Tests: a config instead of the environment and ~/.secrets. */
   config?: HostStoreConfig | undefined;
   env?: Record<string, string | undefined>;
@@ -34,7 +35,11 @@ export async function pushOwnerLogin(tool: MemberStoreTool, name: string, opts: 
     if (!store) {
       const cfg = "config" in opts ? opts.config : await hostStoreConfig(opts.env ?? process.env, opts.secretsPath);
       if (!cfg) return "no store config in this process, so the new login reaches the PostgreSQL store through the host sync (ais gateway store sync)";
-      store = new PgHomeStore(cfg.databaseUrl, cfg.key, `owner-adopt:${hostname()}:${process.pid}`);
+      if (cfg.databaseUrl) {
+        // The direct database path, only with AIS_GATEWAY_STORE_DIRECT=1 (host-sync.ts).
+        const { PgHomeStore } = await import("./home-store.ts");
+        store = new PgHomeStore(cfg.databaseUrl, cfg.key, `owner-adopt:${hostname()}:${process.pid}`);
+      } else store = new HttpHomeStore({ url: cfg.admin!.url, token: cfg.admin!.token, key: cfg.key });
       own = true;
     }
     const dir = memberDir(tool, name, opts.root);

@@ -5,13 +5,13 @@ import { defaultSecretsPath, readSecretsKey } from "../cli/gateway/secrets-file.
 import { readHeartbeat } from "../identities/gateway-heartbeat.ts";
 import { ownedPath, recordOwned } from "../identities/gateway-owned.ts";
 import { aisStateDir } from "../shared/ais-home.ts";
-import { STORE_DATABASE_URL_KEY } from "../sync/store-sync-supervisor.ts";
+import { STORE_ADMIN_TOKEN_KEY, STORE_ADMIN_URL_KEY, STORE_DATABASE_URL_KEY, STORE_DIRECT_KEY } from "../sync/store-sync-supervisor.ts";
 import { loadGatewayGuard, memberHere } from "../sync/gateway-guard.ts";
 import { importHome, type ImportEntry, type ImportReport } from "./home-import.ts";
 import { HomeMirror } from "./home-mirror.ts";
 import { hostOwnsFolderLogin } from "./host-login-gate.ts";
-import { parseStoreKey, PgHomeStore, STORE_KEY_ENV } from "./home-store.ts";
-import { PgRefreshBackend } from "./pg-refresh-backend.ts";
+import { HttpHomeStore, HttpRefreshBackend } from "./home-store-http.ts";
+import { parseStoreKey, STORE_KEY_ENV, type HomeStoreClient } from "./home-store.ts";
 import type { RefreshGuardBackend } from "./refresh-guard.ts";
 
 /**
@@ -24,9 +24,12 @@ import type { RefreshGuardBackend } from "./refresh-guard.ts";
  *   replaces a fresher one either way (newest token wins), and the import never uploads a token the journal shows rotated out.
  *
  * Runs as `ais gateway store sync`, supervised by the host profile-sync daemon (profile-sync-daemon.ts) whenever the store
- * is configured: AIS_GATEWAY_STORE_DATABASE_URL and AIS_GATEWAY_STORE_KEY (or AIS_GATEWAY_STORE_KEY_FILE), from the
- * environment or ~/.secrets (`ais gateway store setup` writes them). A separate process because the import switches on
- * the member-store view for the whole process, which the profile sync must never see.
+ * is configured: AIS_GATEWAY_STORE_KEY (or AIS_GATEWAY_STORE_KEY_FILE) plus the gateway admin address and token
+ * (AIS_GATEWAY_ADMIN_URL, AIS_GATEWAY_ADMIN_TOKEN), from the environment or ~/.secrets. The host reads and writes the store
+ * through the gateway's admin API (home-store-http.ts) and opens no database connection. The old direct path (a PostgreSQL
+ * URL in AIS_GATEWAY_STORE_DATABASE_URL) only runs when AIS_GATEWAY_STORE_DIRECT=1 is set too; it stays for one release as
+ * a fallback. A separate process because the import switches on the member-store view for the whole process, which the
+ * profile sync must never see.
  */
 
 export { STORE_DATABASE_URL_KEY };
@@ -35,24 +38,37 @@ export const HOST_SYNC_IMPORT_MS = 5 * 60_000;
 export const HOST_SYNC_POLL_MS = 5_000;
 
 export interface HostStoreConfig {
-  databaseUrl: string;
   key: Buffer;
+  /** The gateway's admin API: the way a host reaches the store. */
+  admin?: { url: string; token: string };
+  /** Direct database access, the fallback. Set only with AIS_GATEWAY_STORE_DIRECT=1. */
+  databaseUrl?: string;
 }
 
 /**
- * The host's store settings, environment first, then ~/.secrets. Undefined when no database URL is set (the store is not
- * used on this host). Throws when the URL is set but the key is missing or invalid; never includes a value in the error.
+ * The host's store settings, environment first, then ~/.secrets. Undefined when the store is not used on this host (no key).
+ * Throws when a key is set but neither the admin address and token nor the opted-in direct database URL is; throws when
+ * the key is invalid. Never includes a value in the error.
  */
 export async function hostStoreConfig(env: Record<string, string | undefined> = process.env, secretsPath = defaultSecretsPath()): Promise<HostStoreConfig | undefined> {
   const pick = async (name: string): Promise<string | undefined> => env[name]?.trim() || (await readSecretsKey(name, secretsPath))?.trim() || undefined;
-  const databaseUrl = await pick(STORE_DATABASE_URL_KEY);
-  if (!databaseUrl) return undefined;
   let raw = await pick(STORE_KEY_ENV);
+  const file = raw ? undefined : await pick(STORE_KEY_FILE_KEY);
   if (!raw) {
-    const file = await pick(STORE_KEY_FILE_KEY);
     if (file) raw = (await readFile(file.replace(/^~(?=\/)/, homedir()), "utf8").catch(() => undefined))?.trim();
   }
-  return { databaseUrl, key: parseStoreKey(raw) };
+  const adminUrl = await pick(STORE_ADMIN_URL_KEY);
+  const adminToken = await pick(STORE_ADMIN_TOKEN_KEY);
+  const databaseUrl = await pick(STORE_DATABASE_URL_KEY);
+  const direct = (await pick(STORE_DIRECT_KEY)) === "1";
+  // A database URL without a key is the old setup gone wrong: say so, as before. No key and no URL means the store is not used here.
+  if (!raw && !file && !databaseUrl) return undefined;
+  const key = parseStoreKey(raw);
+  const cfg: HostStoreConfig = { key };
+  if (adminUrl && adminToken) cfg.admin = { url: adminUrl.replace(/\/+$/, ""), token: adminToken };
+  if (direct && databaseUrl) cfg.databaseUrl = databaseUrl;
+  if (!cfg.admin && !cfg.databaseUrl) throw new Error(`host store sync: ${STORE_ADMIN_URL_KEY} and ${STORE_ADMIN_TOKEN_KEY} are required (the host reaches the store through the gateway API; the direct database path needs ${STORE_DIRECT_KEY}=1)`);
+  return cfg;
 }
 
 export const hostSyncLockPath = (): string => join(aisStateDir(), "gateway-store-sync.lock");
@@ -68,8 +84,8 @@ export interface HostSyncResult {
 export interface HostSyncOptions {
   home?: string;
   warn?: (message: string) => void;
-  /** Tests: injected store and lock instead of connections from the config. */
-  store?: PgHomeStore;
+  /** Tests: injected store and lock instead of the ones made from the config. */
+  store?: HomeStoreClient;
   lock?: RefreshGuardBackend;
   /** Tests: the files to import instead of the ones the host registries name. */
   importEntries?: () => Promise<ImportEntry[]>;
@@ -100,7 +116,7 @@ async function recordHeld(home: string, rel: string, warn?: (m: string) => void)
   }
 }
 
-function mirrorFor(store: PgHomeStore, home: string, warn?: (m: string) => void): CountingMirror {
+function mirrorFor(store: HomeStoreClient, home: string, warn?: (m: string) => void): CountingMirror {
   const counts = { m: undefined as CountingMirror | undefined };
   const m = new CountingMirror(store, {
     home,
@@ -137,10 +153,10 @@ export interface HostSync {
 }
 
 /** One import + full pull + push of changed host files. Connections are the caller's. */
-const runImport = async (store: PgHomeStore, lock: RefreshGuardBackend, home: string, opts: HostSyncOptions): Promise<ImportReport> =>
+const runImport = async (store: HomeStoreClient, lock: RefreshGuardBackend, home: string, opts: HostSyncOptions): Promise<ImportReport> =>
   importHome(store, { home, lock, ...(opts.importEntries ? { entries: await opts.importEntries() } : {}) });
 
-async function pass(mirror: CountingMirror, store: PgHomeStore, lock: RefreshGuardBackend, home: string, opts: HostSyncOptions): Promise<HostSyncResult> {
+async function pass(mirror: CountingMirror, store: HomeStoreClient, lock: RefreshGuardBackend, home: string, opts: HostSyncOptions): Promise<HostSyncResult> {
   const imported = await runImport(store, lock, home, opts);
   mirror.wrote = 0;
   mirror.pushed = 0;
@@ -150,16 +166,22 @@ async function pass(mirror: CountingMirror, store: PgHomeStore, lock: RefreshGua
   return { imported, wrote: mirror.wrote, pushed: mirror.pushed };
 }
 
-const open = (cfg: HostStoreConfig | undefined, opts: HostSyncOptions): { store: PgHomeStore; lock: RefreshGuardBackend; own: boolean } => {
+const open = async (cfg: HostStoreConfig | undefined, opts: HostSyncOptions, warn?: (m: string) => void): Promise<{ store: HomeStoreClient; lock: RefreshGuardBackend; own: boolean }> => {
   if (opts.store && opts.lock) return { store: opts.store, lock: opts.lock, own: false };
   if (!cfg) throw new Error("host store sync: no store configured");
-  return { store: new PgHomeStore(cfg.databaseUrl, cfg.key, `host-sync:${hostname()}:${process.pid}`), lock: new PgRefreshBackend(cfg.databaseUrl), own: true };
+  // The direct database path is the fallback: only AIS_GATEWAY_STORE_DIRECT=1 puts a databaseUrl in the config (hostStoreConfig).
+  if (cfg.databaseUrl) {
+    const [{ PgHomeStore }, { PgRefreshBackend }] = await Promise.all([import("./home-store.ts"), import("./pg-refresh-backend.ts")]);
+    return { store: new PgHomeStore(cfg.databaseUrl, cfg.key, `host-sync:${hostname()}:${process.pid}`), lock: new PgRefreshBackend(cfg.databaseUrl), own: true };
+  }
+  const api = { url: cfg.admin!.url, token: cfg.admin!.token };
+  return { store: new HttpHomeStore({ ...api, key: cfg.key, ...(warn ? { warn } : {}) }), lock: new HttpRefreshBackend(api), own: true };
 };
 
 /** `ais gateway store sync --once`: one pass, then closes its connections. */
 export async function hostSyncOnce(cfg: HostStoreConfig | undefined, opts: HostSyncOptions = {}): Promise<HostSyncResult> {
   const home = opts.home ?? homedir();
-  const { store, lock, own } = open(cfg, opts);
+  const { store, lock, own } = await open(cfg, opts, opts.warn);
   const mirror = mirrorFor(store, home, opts.warn);
   try {
     return await pass(mirror, store, lock, home, opts);
@@ -172,18 +194,18 @@ export async function hostSyncOnce(cfg: HostStoreConfig | undefined, opts: HostS
 }
 
 /**
- * `ais gateway store sync`: a first pass, then follows the store (NOTIFY plus a 5 s poll; host edits are pushed on the same
+ * `ais gateway store sync`: a first pass, then follows the store (a long poll on the gateway, or NOTIFY on the direct path, plus a 5 s poll; host edits are pushed on the same
  * pass) and re-runs the import every 5 minutes for new host files.
  */
 export function startHostSync(cfg: HostStoreConfig | undefined, opts: HostSyncOptions & { pollMs?: number; importMs?: number } = {}): HostSync {
   const home = opts.home ?? homedir();
   const warn = opts.warn ?? ((m: string) => console.warn(`ais gateway store sync: ${m}`));
-  const { store, lock, own } = open(cfg, opts);
-  const mirror = mirrorFor(store, home, warn);
+  const opened = open(cfg, opts, warn).then((o) => ({ ...o, mirror: mirrorFor(o.store, home, warn) }));
   let timer: ReturnType<typeof setInterval> | undefined;
   let importing: Promise<unknown> | undefined;
   let stopped = false;
   const ready = (async () => {
+    const { store, lock, mirror } = await opened;
     const r = await pass(mirror, store, lock, home, opts);
     if (stopped) return r;
     await mirror.start(opts.pollMs ?? HOST_SYNC_POLL_MS);
@@ -205,10 +227,12 @@ export function startHostSync(cfg: HostStoreConfig | undefined, opts: HostSyncOp
       if (timer) clearInterval(timer);
       await ready.catch(() => undefined);
       await importing;
-      await mirror.stop();
-      if (own) {
-        await store.close().catch(() => undefined);
-        await lock.close?.().catch(() => undefined);
+      const o = await opened.catch(() => undefined);
+      if (!o) return;
+      await o.mirror.stop();
+      if (o.own) {
+        await o.store.close().catch(() => undefined);
+        await o.lock.close?.().catch(() => undefined);
       }
     },
   };

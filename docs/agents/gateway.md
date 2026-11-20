@@ -691,8 +691,14 @@ Freshness is the grant's expiry (`grantFreshness`); a refresh token's own expiry
 counting it made a blanked file look fresher than the live grant.
 
 - Runs as a child of the host profile-sync daemon (`src/sync/store-sync-supervisor.ts`), no unit of its own, only when
-  `AIS_GATEWAY_STORE_DATABASE_URL` is set (environment or `~/.secrets`); the key is `AIS_GATEWAY_STORE_KEY` or a file named
-  by `AIS_GATEWAY_STORE_KEY_FILE`. The same variable makes the console stand down, so one setting covers both. Restarted
+  the host holds the key (`AIS_GATEWAY_STORE_KEY` or a file named by `AIS_GATEWAY_STORE_KEY_FILE`). The host opens no
+  database connection: it calls the gateway admin API (`AIS_GATEWAY_ADMIN_URL`, `AIS_GATEWAY_ADMIN_TOKEN`) at `/store/*`
+  (`src/gateway/admin-store.ts`, client `src/gateway/home-store-http.ts`). Rows travel encrypted: the host encrypts and
+  decrypts with its key (same AES-256-GCM, path as AAD), and the gateway only checks that a pushed row decrypts with its own
+  key and matches its checksum. A long poll (`GET /store/wait`, 25 s) replaces LISTEN; the 5 s poll stays as a fallback.
+  The import's journal check reads `GET /store/journal`. It holds no lock; its writes are compare-and-swap on the row
+  version. The old direct path runs only with `AIS_GATEWAY_STORE_DIRECT=1` and `AIS_GATEWAY_STORE_DATABASE_URL` (kept for one
+  release; `store prune` still needs it). `AIS_GATEWAY_STORE_DATABASE_URL` also makes the console stand down. Restarted
   with a backoff (10 s to 5 minutes); it exits when the daemon goes. One per host (lock `~/.ais/state/gateway-store-sync.lock`).
 - `ais gateway store setup --key-file=<path>` reads the database URL from stdin (never argv), proves the database answers
   and the key decrypts a row, writes both into `~/.secrets` (backup first, mode 0600) and restarts the daemon.
