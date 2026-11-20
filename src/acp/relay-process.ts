@@ -10,6 +10,7 @@
  */
 import { spawn } from "node:child_process";
 import { kimiAdapter, kimiHome } from "./kimi-turn.ts";
+import { LimitSnoozer } from "./limit-snooze.ts";
 import { AcpRelay, type RelayAdapter } from "./relay.ts";
 
 /** Splits a byte stream into lines, keeping each line's bytes. */
@@ -54,6 +55,10 @@ export interface RelayProcessOptions {
   stdout?: NodeJS.WritableStream;
   /** Where relay notes go (the agent's stderr stream by default). */
   log?: (line: string) => void;
+  /** Snooze and resume on a usage limit through the T3 MCP server of each session. On by default. */
+  limit?: LimitSnoozer | false;
+  /** See RelayOptions.answerIdlePermissions. */
+  answerIdlePermissions?: boolean;
 }
 
 /** Starts the agent and relays until it exits. Resolves with the exit code this process should end with. */
@@ -74,7 +79,8 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     held.push(line);
     flushHeld();
   };
-  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log, toAgent });
+  const limit = opts.limit === false ? undefined : (opts.limit ?? new LimitSnoozer({ log }));
+  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log, toAgent, ...(limit ? { limit } : {}), ...(opts.answerIdlePermissions === false ? { answerIdlePermissions: false } : {}) });
 
   return new Promise<number>((resolve) => {
     let done = false;
