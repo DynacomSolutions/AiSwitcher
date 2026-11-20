@@ -158,7 +158,7 @@ async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string;
 }
 
 /** The widget panel service over the same engines the `/api/*` routes use. serve.ts creates one and shares it with the widgets listener. */
-export function createWidgetService(deps: ConsoleAppDeps): WidgetService {
+export function createWidgetService(deps: ConsoleAppDeps, linkBase?: string): WidgetService {
   return new WidgetService({
     limits: () => loadLimitsPayload(deps, {}, 45),
     auth: async () => authApi.authStatus(Object.values(TOOL_CONFIGS), await freshRefreshStatus(deps.authRefresh)),
@@ -170,7 +170,7 @@ export function createWidgetService(deps: ConsoleAppDeps): WidgetService {
       return Promise.all(pools.map(async (pool) => ({ pool, rows: (await poolStatus({}, pool, { usage: true })).rows })));
     },
     ...(deps.spendGuard ? { spendGuard: () => deps.spendGuard!.status() } : {}),
-  });
+  }, () => new Date(), linkBase);
 }
 
 export function createApp(deps: ConsoleAppDeps): Hono {

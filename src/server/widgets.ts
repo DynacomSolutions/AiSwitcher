@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+import { usageProviderLabel } from "../cli/usage/providers.ts";
 import { PollCache } from "./expensive.ts";
 
 /** Widget panels: small, read-only summaries of console data for dashboards
@@ -192,7 +194,10 @@ async function limitsPanel(sources: WidgetSources): Promise<PanelBody> {
   const payload = (await sources.limits()) as Obj | undefined;
   const rows: Row[] = [];
   for (const result of asList(payload?.results)) {
-    const provider = asString(result.provider) || asString(result.toolName) || "unknown";
+    // Pools and retired identities hold no limits of their own (same filter as the reset-expiry push).
+    const owner = result.identity as Obj | undefined;
+    if (owner?.swapPool !== undefined || owner?.retired) continue;
+    const provider = usageProviderLabel(asString(result.provider) || asString(result.toolName) || "unknown");
     const identity = asString((result.identity as Obj | undefined)?.name) || "unknown";
     const label = `${provider} / ${identity}`;
     const windows = asList(result.windows);
@@ -206,11 +211,13 @@ async function limitsPanel(sources: WidgetSources): Promise<PanelBody> {
     };
     best("session", () => true, "5-hour");
     best("week", (w) => !w.model, "Weekly");
+    best("month", () => true, "Monthly");
     for (const w of windows) {
       const used = asNumber(w.usedPercent);
       if (w.category === "week" && typeof w.model === "string" && w.model !== "" && used !== undefined) {
         entries.push({ name: `Weekly (${w.model})`, used });
       }
+      if (w.category === "other" && used !== undefined) entries.push({ name: `Other (${asString(w.label).slice(0, 40)})`, used });
     }
     if (result.status === "unavailable" || entries.length === 0) {
       rows.push({ label, detail: "No limit data", value: "-", status: "unknown" });
@@ -225,13 +232,14 @@ async function limitsPanel(sources: WidgetSources): Promise<PanelBody> {
   const crit = count("crit");
   const warn = count("warn");
   const unknown = count("unknown");
+  const withData = rows.length - unknown;
   return {
     status: rows.length === 0 ? "unknown" : worst(rows.map((r) => r.status)),
     summary:
       rows.length === 0
         ? "No limit data"
-        : `${rows.length} windows: ${countLine([[crit, "critical"], [warn, "high"], [unknown, "unknown"], [count("ok"), "ok"]])}`,
-    stats: [stat("Windows", rows.length), stat("Critical", crit, crit ? "crit" : "ok"), stat("High", warn, warn ? "warn" : "ok"), stat("Unknown", unknown, unknown ? "unknown" : "ok")],
+        : `${withData} windows: ${countLine([[crit, "critical"], [warn, "high"], [count("ok"), "ok"]])}${unknown ? `, ${unknown} without data` : ""}`,
+    stats: [stat("Windows", withData), stat("Critical", crit, crit ? "crit" : "ok"), stat("High", warn, warn ? "warn" : "ok"), stat("Unknown", unknown, unknown ? "unknown" : "ok")],
     rows: [...rows].sort((a, b) => RANK[a.status] - RANK[b.status] || (b.fraction ?? -1) - (a.fraction ?? -1)),
   };
 }
@@ -246,7 +254,7 @@ const LOGIN_STATES: Record<string, { text: string; status: PanelStatus }> = {
   unknown: { text: "Unknown", status: "unknown" },
 };
 
-async function identitiesPanel(sources: WidgetSources): Promise<PanelBody> {
+async function identitiesPanel(sources: WidgetSources, now: Date): Promise<PanelBody> {
   const { entries } = await sources.auth();
   // Retired identities and swap pools (state "gateway") hold no login of their own.
   const live = entries.filter((e) => e.state !== "retired" && e.state !== "gateway");
@@ -254,7 +262,8 @@ async function identitiesPanel(sources: WidgetSources): Promise<PanelBody> {
     const state = LOGIN_STATES[e.state] ?? LOGIN_STATES.unknown!;
     return {
       label: `${e.toolName} / ${e.identity}`,
-      detail: e.expiresAt && (e.state === "ok" || e.state === "expiring") ? `Expires ${e.expiresAt}` : state.text,
+      // A past expiry on a logged-in identity means a self-refreshing login: show the state without the date.
+      detail: e.expiresAt && (e.state === "ok" || e.state === "expiring") && Date.parse(e.expiresAt) > now.getTime() ? `Expires ${e.expiresAt}` : state.text,
       value: state.text,
       status: state.status,
     };
@@ -309,7 +318,7 @@ async function gatewayUsagePanel(sources: WidgetSources): Promise<PanelBody> {
     .sort((a, b) => b.tokens - a.tokens)
     .map((r) => ({
       label: r.app,
-      detail: `${r.provider || "unknown"}, ${r.days || GATEWAY_DAYS} days`,
+      detail: `${r.provider ? usageProviderLabel(r.provider) : "unknown"}, ${r.days || GATEWAY_DAYS} days`,
       value: compactNumber(r.tokens),
       ...(total > 0 ? { fraction: clamp01(r.tokens / total) } : {}),
       status: "ok" as const,
@@ -333,7 +342,7 @@ async function claudeSwapPanel(sources: WidgetSources): Promise<PanelBody> {
       const label = `${pool.pool} / ${member.name}`;
       const role = member.active ? "Active" : member.allowed ? "Standby" : "Not allowed";
       const max = asNumber(member.usage?.maxUtilization);
-      if (member.usage?.status !== "live" || max === undefined) {
+      if (max === undefined) {
         rows.push({ label, detail: `${role}, no usage data`, value: "-", status: "unknown" });
         continue;
       }
@@ -388,8 +397,8 @@ const panel = (id: string, title: string, description: string, link: string, ref
 
 export const PANELS: readonly PanelDefinition[] = [
   panel("limits", "Limits", "5-hour and weekly usage windows per provider and identity", "/limits", 300, (s) => limitsPanel(s)),
-  panel("identities", "Identities", "Login state of each identity", "/auth", 300, (s) => identitiesPanel(s)),
-  panel("agents", "Agents", "Agent sessions running now", "/sessions", 60, (s, now) => agentsPanel(s, now)),
+  panel("identities", "Identities", "Login state of each identity", "/auth", 300, (s, now) => identitiesPanel(s, now)),
+  panel("agents", "Agents", "Agent sessions running now", "/dashboard", 60, (s, now) => agentsPanel(s, now)),
   panel("gateway-usage", "Gateway usage", "Gateway tokens per app and provider over 7 days", "/gateway", 300, (s) => gatewayUsagePanel(s)),
   panel("claude-swap", "Claude swap", "Claude swap pool members and their usage", "/limits", 300, (s) => claudeSwapPanel(s)),
   panel("spend-guard", "Spend guard", "Cloud budget use per account", "", 300, (s) => spendGuardPanel(s)),
@@ -400,52 +409,99 @@ export type WidgetResult = { status: 200; body: unknown } | { status: 404 | 502;
 /** Builds, caches and serves the panels. One instance serves every listener. */
 export class WidgetService {
   private readonly cache = new PollCache(60_000);
+  private readonly lastGood = new Map<string, PanelModel>();
+  private readonly failures = new Map<string, { at: number; message: string }>();
 
+  /** `linkBase`: absolute http(s) URL without a trailing slash. Without it every `link` is an empty string. */
   constructor(
     private readonly sources: WidgetSources,
     private readonly now: () => Date = () => new Date(),
+    private readonly linkBase?: string,
   ) {}
+
+  private linkFor(path: string): string {
+    return this.linkBase && path ? `${this.linkBase}${path}` : "";
+  }
 
   /** The panel list, in the same wrapper the agent API uses. */
   list(): { version: 1; panels: PanelInfo[] } {
-    return { version: 1, panels: PANELS.map(({ build: _build, ...info }) => info) };
+    return { version: 1, panels: PANELS.map(({ build: _build, ...info }) => ({ ...info, link: this.linkFor(info.link) })) };
   }
 
-  /** One panel model. Cached for the panel's refreshSeconds. Concurrent calls share one build. */
+  /** One panel model. Cached for the panel's refreshSeconds. Concurrent calls share one build.
+   * A failed build is remembered for min(refreshSeconds, 60) seconds. While it is, the last good model
+   * is served (stale). Without a good model the answer is 502. */
   async get(id: string): Promise<WidgetResult> {
     const def = PANELS.find((p) => p.id === id);
     if (!def) return { status: 404, body: { error: "unknown panel" } };
+    const failure = this.failures.get(def.id);
+    if (failure && Date.now() - failure.at < Math.min(def.refreshSeconds, 60) * 1000) return this.fallback(def.id, failure.message);
     try {
       const { value } = await this.cache.get(def.id, () => this.build(def), def.refreshSeconds * 1000);
+      this.lastGood.set(def.id, value);
+      this.failures.delete(def.id);
       return { status: 200, body: value };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return { status: 502, body: { error: maskDeep(message).slice(0, 200) } };
+      // Only the texts this module writes (PanelError) leave the server. Other messages stay in the log.
+      const message = error instanceof PanelError ? maskDeep(error.message).slice(0, 200) : `${def.id} backend unavailable`;
+      if (!(error instanceof PanelError)) console.error(`[ais] widget panel ${def.id} failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.failures.set(def.id, { at: Date.now(), message });
+      return this.fallback(def.id, message);
     }
+  }
+
+  private fallback(id: string, message: string): WidgetResult {
+    const good = this.lastGood.get(id);
+    return good ? { status: 200, body: good } : { status: 502, body: { error: message } };
   }
 
   private async build(def: PanelDefinition): Promise<PanelModel> {
     const now = this.now();
     const body = await def.build(this.sources, now);
+    const link = this.linkFor(def.link);
     return maskDeep({
       version: 1,
       id: def.id,
       title: def.title,
       generatedAt: now.toISOString(),
-      link: def.link,
+      link,
       status: body.status,
       summary: body.summary,
       stats: body.stats.slice(0, 4),
-      rows: body.rows.slice(0, MAX_ROWS).map((r) => ({ ...r, link: r.link ?? def.link })),
+      rows: body.rows.slice(0, MAX_ROWS).map((r) => ({ ...r, link })),
       ...(body.series?.length ? { series: body.series.slice(0, 2).map((s) => ({ label: s.label, points: s.points.slice(-48) })) } : {}),
     } satisfies PanelModel);
+  }
+}
+
+/** True when the Host header is an IP literal (v4, or bracketed v6) with an optional port, a loopback name or an allowed vhost.
+ * This stops DNS rebinding: a rebound hostname is none of these. */
+export function widgetsHostAllowed(hostHeader: string | null, extraHosts: ReadonlySet<string> = new Set()): boolean {
+  if (!hostHeader) return false;
+  const m = /^(?:\[([^\]]+)\]|([^:[\]]+))(?::(\d{1,5}))?$/.exec(hostHeader.trim().toLowerCase());
+  if (!m) return false;
+  if (m[1] !== undefined) return isIP(m[1]) === 6;
+  const bare = m[2]!;
+  return isIP(bare) === 4 || bare === "localhost" || extraHosts.has(bare);
+}
+
+/** Validates AIS_WIDGETS_LINK_BASE: an absolute http(s) URL. Returns it without a trailing slash, or an error text. */
+export function parseWidgetsLinkBase(raw: string | undefined): { base?: string; error?: string } {
+  if (raw === undefined || raw.trim() === "") return {};
+  try {
+    const url = new URL(raw.trim());
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password || url.search || url.hash) throw new Error("bad");
+    return { base: url.href.replace(/\/+$/, "") };
+  } catch {
+    return { error: "AIS_WIDGETS_LINK_BASE must be an absolute http or https URL without credentials, query or fragment" };
   }
 }
 
 /** Request handler of the separate read-only widgets listener. It serves
  * `GET`/`HEAD` on the widget routes and the health route only. No auth and no
  * CORS headers: see docs/agents/console-web.md. */
-export async function widgetsListenerFetch(service: WidgetService, req: Request): Promise<Response> {
+export async function widgetsListenerFetch(service: WidgetService, req: Request, allowedHosts: ReadonlySet<string> = new Set()): Promise<Response> {
+  if (!widgetsHostAllowed(req.headers.get("host"), allowedHosts)) return Response.json({ error: "host not allowed" }, { status: 403 });
   const pathname = new URL(req.url).pathname;
   const isWidgetRoute = pathname === "/api/widgets" || pathname === "/api/widgets-health" || /^\/api\/widgets\/[^/]+$/.test(pathname);
   if (!isWidgetRoute) return Response.json({ error: "not found" }, { status: 404 });

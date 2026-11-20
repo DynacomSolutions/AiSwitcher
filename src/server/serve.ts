@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { existsSync, statSync } from "node:fs";
 import { browserAuthFromEnv } from "./browser-authorize.ts";
 import { createApp, createWidgetService } from "./app.ts";
-import { parseWidgetsPort, widgetsListenerFetch } from "./widgets.ts";
+import { parseWidgetsLinkBase, parseWidgetsPort, widgetsListenerFetch } from "./widgets.ts";
 import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
 import { loadSpendGuardConfig, SpendGuardScheduler } from "./spend-guard.ts";
 import { loadHerdrBridgeConfig, HerdrBridgeScheduler } from "./herdr-bridge.ts";
@@ -212,7 +212,9 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
   // One widget panel service (one cache) for the main listener and the optional widgets listener.
-  deps.widgets = createWidgetService(deps);
+  const linkBase = parseWidgetsLinkBase(process.env.AIS_WIDGETS_LINK_BASE);
+  if (linkBase.error) console.error(`[ais] widget links stay empty: ${linkBase.error}`);
+  deps.widgets = createWidgetService(deps, linkBase.base);
   const app = createApp(deps);
   const lifecycle = new ServerLifecycle();
 
@@ -269,7 +271,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   });
 
   // Optional read-only widgets listener (AIS_WIDGETS_PORT). Off by default. No auth: see docs/agents/console-web.md.
-  const widgetsServer = startWidgetsListener(process.env.AIS_WIDGETS_PORT, port, host, deps.widgets, lifecycle);
+  const widgetsServer = startWidgetsListener(process.env.AIS_WIDGETS_PORT, port, host, deps.widgets, lifecycle, console.error, deps.allowedHosts);
 
   if (options.managed !== false) {
     warmUsageCaches();
@@ -333,6 +335,7 @@ export function startWidgetsListener(
   widgets: Parameters<typeof widgetsListenerFetch>[0],
   lifecycle: ServerLifecycle,
   log: (line: string) => void = console.error,
+  allowedHosts: ReadonlySet<string> = new Set(),
 ): { stop(closeActiveConnections?: boolean): Promise<void> } | undefined {
   const parsed = parseWidgetsPort(raw, mainPort);
   if (parsed.error) {
@@ -349,7 +352,7 @@ export function startWidgetsListener(
         const finishRequest = lifecycle.beginRequest();
         if (!finishRequest) return Response.json({ ok: false, draining: true }, { status: 503 });
         try {
-          return trackResponseBody(await widgetsListenerFetch(widgets, req), finishRequest);
+          return trackResponseBody(await widgetsListenerFetch(widgets, req, allowedHosts), finishRequest);
         } catch (error) {
           finishRequest();
           throw error;
