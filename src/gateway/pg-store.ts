@@ -15,6 +15,7 @@ import browserPresence0006 from "./migrations/0006_browser_presence.sql" with { 
 import refreshJournalCode0007 from "./migrations/0007_refresh_journal_code.sql" with { type: "text" };
 import usageHistory0008 from "./migrations/0008_usage_history.sql" with { type: "text" };
 import usageRollup0009 from "./migrations/0009_usage_rollup.sql" with { type: "text" };
+import usageReadings0010 from "./migrations/0010_usage_readings.sql" with { type: "text" };
 
 const USAGE_ROLLUP_VERSION = "0009_usage_rollup";
 
@@ -28,6 +29,7 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0007_refresh_journal_code", sql: refreshJournalCode0007 },
   { version: "0008_usage_history", sql: usageHistory0008 },
   { version: USAGE_ROLLUP_VERSION, sql: usageRollup0009 },
+  { version: "0010_usage_readings", sql: usageReadings0010 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */

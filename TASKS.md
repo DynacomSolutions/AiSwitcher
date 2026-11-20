@@ -359,6 +359,7 @@ A new gateway or console pod takes traffic only after its usage cache is warm, s
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 248 | Gateway readiness waits for the first usage poll of every identity (bounded) | in_review | claude | gateway-warm-readiness | | 2026-11-20 23:30 ICT | 20 Nov 13:01 UTC rollout: all 6 pods ready cold, limits blank for 2 min.<br>Timeout, warning and metrics included. |
-| 249 | Console readiness waits for its first limits read (bounded) | in_review | claude | gateway-warm-readiness | | 2026-11-20 23:30 ICT | Same timeout and metrics as 17.248. |
-| 250 | Check the gateway and console rollout path, then verify a real rollout | todo | claude | | 17.248, 17.249 | 2026-11-21 00:30 ICT | Probes, SIGTERM drain, liveness, maxSurge/maxUnavailable.<br>Check /api/widgets/limits during the rollout. |
+| 248 | Gateway readiness waits for the first usage poll of every identity (bounded) | done | claude | gateway-warm-readiness | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/662 (e23f077).<br>Live 14:40 UTC: 6 pods warm in 0.8 to 1.0 s, no timeouts; a pod waiting on the database stayed unready. |
+| 249 | Console readiness waits for its first limits read (bounded) | done | claude | gateway-warm-readiness | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/662 (e23f077).<br>.cluster https://github.com/DynacomSolutions/.cluster/pull/2836 (c07e147): preStop, 120 s ceiling, 5 s probe timeouts. |
+| 250 | Check the gateway and console rollout path, then verify a real rollout | blocked | claude | | 17.248, 17.249, 17.251 | 2026-11-21 01:30 ICT | Probes, drain and maxSurge/maxUnavailable checked (.cluster PR 2836).<br>First rollout check failed: usage 429s left 3 Anthropic rows without data. Waits on 17.251. |
+| 251 | Gateway replicas share usage readings in PostgreSQL | in_review | claude | gateway-shared-usage | 17.248 | 2026-11-21 01:00 ICT | Rollout check 14:40 UTC: gate held cold pods, but Anthropic usage 429s left new pods without a figure.<br>Shared last-good readings seed new pods and cut polls about 6x. |

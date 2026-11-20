@@ -9,6 +9,7 @@ import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { OAuthRefreshError } from "../../src/identities/oauth-refresh.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
+import { MemoryUsageReadings } from "../../src/gateway/usage-readings.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { generateToken } from "../../src/gateway/tokens.ts";
 import type { GatewayApp, UsageRow } from "../../src/gateway/types.ts";
@@ -1543,5 +1544,35 @@ describe("usage warm readiness", () => {
     expect([...new Set(fetched)].sort()).toEqual(["claude/id1", "claude/m1", "claude/m2"]);
     const listed = (await limits(g)).limits.map((l) => `${l.provider}/${l.identity}`).sort();
     expect(listed).toEqual([...new Set(fetched)].sort());
+  });
+
+  test("a replica seeded from shared readings shows figures right after ready, though upstream answers 429", async () => {
+    await seed();
+    const shared = new MemoryUsageReadings();
+    await shared.save("claude", "id1", LIVE, 600_000);
+    const g = await boot({
+      usageFor: undefined,
+      poolMembers: async () => [],
+      usageReadings: shared,
+      fetchUsage: async () => ({ status: "unavailable" as const, error: "429", capturedAt: "2026-11-20T00:00:00.000Z" }),
+    });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const row = (await limits(g)).limits.find((l) => l.identity === "id1");
+    expect(row?.status).not.toBe("unavailable");
+    expect(row?.maxUtilization).toBe(42);
+  });
+
+  test("an empty shared table and a no-figure upstream still turn ready, unavailable only for that identity", async () => {
+    await seed();
+    const g = await boot({
+      usageFor: undefined,
+      poolMembers: async (p) => (p === "claude" ? ["m1"] : []),
+      usageReadings: new MemoryUsageReadings(),
+      fetchUsage: async (_p, i) => (i === "m1" ? LIVE : { status: "unavailable" as const, capturedAt: "2026-11-20T00:00:00.000Z" }),
+    });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const rows = (await limits(g)).limits;
+    expect(rows.find((l) => l.identity === "m1")?.maxUtilization).toBe(42);
+    expect(rows.find((l) => l.identity === "id1")?.status).toBe("unavailable");
   });
 });

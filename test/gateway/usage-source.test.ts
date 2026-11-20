@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { pickIdentity } from "../../src/gateway/select.ts";
 import { createUsageSource, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
+import { MemoryUsageReadings, type UsageReadings } from "../../src/gateway/usage-readings.ts";
 import type { GatewayApp } from "../../src/gateway/types.ts";
 
 const live = (u: number): PoolUsage => ({ status: "live", maxUtilization: u, capturedAt: "2026-11-02T00:00:00.000Z" });
@@ -296,5 +297,206 @@ describe("opencode Go usage reading", () => {
     const src = createUsageSource({ fetchUsage: withOpencodeUsage({ get: async () => ({ accessToken: "K" }) }, async () => undefined) });
     await src.prefill("opencode", "m2");
     expect((await src.get("opencode", "m2"))?.noPlan).toBe(true);
+  });
+});
+
+describe("usage source with shared readings", () => {
+  const none: PoolUsage = { status: "unavailable", capturedAt: "2026-11-02T00:00:00.000Z" };
+  const clock = () => {
+    let t = 1_000_000;
+    return { now: () => t, advance: (ms: number) => void (t += ms) };
+  };
+  const mk = (c: ReturnType<typeof clock>) => new MemoryUsageReadings(c.now);
+
+  test("a young shared reading skips upstream", async () => {
+    const c = clock();
+    const shared = mk(c);
+    await shared.save("claude", "id1", live(30), 10_000);
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => (calls++, live(90)), shared, now: c.now });
+    await src.prefill("claude", "id1");
+    expect(calls).toBe(0);
+    expect((await src.get("claude", "id1"))?.maxUtilization).toBe(30);
+  });
+
+  test("an old shared reading is not used while upstream answers", async () => {
+    const c = clock();
+    const shared = mk(c);
+    await shared.save("claude", "id1", live(30), 100_000);
+    const src = createUsageSource({ fetchUsage: async () => live(90), shared, now: c.now });
+    await src.prefill("claude", "id1");
+    expect((await src.get("claude", "id1"))?.maxUtilization).toBe(90);
+  });
+
+  test("upstream with no figure and no local value falls back to the stale shared reading", async () => {
+    const c = clock();
+    const shared = mk(c);
+    await shared.save("claude", "id1", live(30), 100_000);
+    const src = createUsageSource({ fetchUsage: async () => none, shared, now: c.now });
+    await src.prefill("claude", "id1");
+    expect(await src.get("claude", "id1")).toMatchObject({ maxUtilization: 30, stale: true });
+  });
+
+  test("an upstream error with no local value also falls back", async () => {
+    const c = clock();
+    const shared = mk(c);
+    await shared.save("claude", "id1", live(30), 100_000);
+    const src = createUsageSource({ fetchUsage: async () => { throw new Error("boom"); }, shared, now: c.now });
+    await src.prefill("claude", "id1");
+    expect(await src.get("claude", "id1")).toMatchObject({ maxUtilization: 30, stale: true });
+  });
+
+  test("the fallback picks the newer of the local and the shared figure", async () => {
+    const c = clock();
+    const shared = mk(c);
+    let n = 0;
+    const src = createUsageSource({ fetchUsage: async () => (n++ === 0 ? { ...live(10), capturedAt: "2026-11-02T00:00:00.000Z" } : none), shared, now: c.now });
+    await src.prefill("claude", "id1");
+    c.advance(100_000);
+    await shared.save("claude", "id1", { ...live(70), capturedAt: "2026-11-03T00:00:00.000Z" }, 60_000);
+    await src.prefill("claude", "id1");
+    expect(await src.get("claude", "id1")).toMatchObject({ maxUtilization: 70, stale: true });
+  });
+
+  test("a good upstream read is saved, an empty one is not", async () => {
+    const c = clock();
+    const shared = mk(c);
+    const src = createUsageSource({ fetchUsage: async (_p, i) => (i === "a" ? live(55) : none), shared, now: c.now });
+    await src.prefill("claude", "a");
+    await src.prefill("claude", "b");
+    expect((await shared.load("claude", "a"))?.reading.maxUtilization).toBe(55);
+    expect((await shared.load("claude", "b"))?.reading.maxUtilization).toBeUndefined();
+  });
+
+  test("a claude rate-limited read with a figure is not saved, a codex one is", async () => {
+    const c = clock();
+    const shared = mk(c);
+    const limited: PoolUsage = { ...live(100), status: "rate-limited" };
+    const src = createUsageSource({ fetchUsage: async () => limited, shared, now: c.now });
+    await src.prefill("claude", "id1");
+    await src.prefill("codex", "id1");
+    expect((await shared.load("claude", "id1"))?.reading.maxUtilization).toBeUndefined();
+    expect((await shared.load("codex", "id1"))?.reading.maxUtilization).toBe(100);
+  });
+
+  test("a last-good read is saved with its own age, clamped to the ttl", async () => {
+    const c = clock();
+    const shared = mk(c);
+    const old: PoolUsage = { ...live(40), capturedAt: new Date(c.now() - 20_000).toISOString() };
+    const src = createUsageSource({ fetchUsage: async () => old, shared, now: c.now });
+    await src.prefill("claude", "id1");
+    expect((await shared.load("claude", "id1"))?.ageMs).toBe(20_000);
+  });
+
+  test("shared store errors never fail a read and are logged once", async () => {
+    const broken: UsageReadings = {
+      load: async () => { throw new Error("db down"); },
+      loadAll: async () => { throw new Error("db down"); },
+      save: async () => { throw new Error("db down"); },
+      claim: async () => { throw new Error("db down"); },
+      release: async () => { throw new Error("db down"); },
+    };
+    const logs: string[] = [];
+    let errors = 0;
+    const src = createUsageSource({ fetchUsage: async () => live(10), shared: broken, log: (l) => void logs.push(l), onSharedError: () => void errors++ });
+    await src.prefill("claude", "id1");
+    await src.refreshNow("claude", "id1");
+    expect((await src.get("claude", "id1"))?.maxUtilization).toBe(10);
+    expect(logs.length).toBe(1);
+    expect(errors).toBeGreaterThan(1);
+  });
+
+  test("a shared load that never resolves does not stop the upstream read", async () => {
+    const hung: UsageReadings = {
+      load: () => new Promise(() => {}),
+      loadAll: () => new Promise(() => {}),
+      save: () => new Promise(() => {}),
+      claim: () => new Promise(() => {}),
+      release: () => new Promise(() => {}),
+    };
+    const c = clock();
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => (calls++, live(10)), shared: hung, sharedTimeoutMs: 20, now: c.now, log: () => {} });
+    await src.prefill("claude", "id1");
+    expect(calls).toBe(1);
+    expect((await src.get("claude", "id1"))?.stale).toBeUndefined();
+    c.advance(50_000);
+    await src.get("claude", "id1");
+    await src.idle();
+    expect(calls).toBe(2);
+  });
+
+  test("a fresh read goes upstream even when the shared reading is young, and saves", async () => {
+    const c = clock();
+    const shared = mk(c);
+    await shared.save("claude", "id1", live(30), 1_000);
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => (calls++, live(100)), shared, now: c.now });
+    c.advance(1);
+    await src.refreshNow("claude", "id1");
+    expect(calls).toBe(1);
+    expect((await shared.load("claude", "id1"))?.reading.maxUtilization).toBe(100);
+  });
+
+  test("six replicas past the ttl poll upstream about once", async () => {
+    const c = clock();
+    const shared = mk(c);
+    let calls = 0;
+    const fetchUsage = async () => (calls++, await Bun.sleep(200), live(60));
+    const srcs = Array.from({ length: 6 }, () => createUsageSource({ fetchUsage, shared, now: c.now }));
+    await Promise.all(srcs.map((x) => x.prefill("claude", "id1")));
+    expect(calls).toBeLessThanOrEqual(2);
+    for (const x of srcs) expect((await x.get("claude", "id1"))?.maxUtilization).toBe(60);
+  });
+
+  test("an entry taken from the shared row gets per-replica jitter on its expiry", async () => {
+    const c = clock();
+    const shared = mk(c);
+    await shared.save("claude", "id1", live(30), 0);
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => (calls++, live(90)), shared, now: c.now, random: () => 1 });
+    await src.prefill("claude", "id1");
+    c.advance(50_000); // past the ttl (45 s) but inside ttl plus jitter (60 s)
+    await src.get("claude", "id1");
+    await src.idle();
+    expect(calls).toBe(0);
+    c.advance(15_000);
+    await src.get("claude", "id1");
+    await src.idle();
+    expect(calls).toBe(1);
+  });
+
+  test("a stored row dated in the future is overwritten by a later save and is not served as live", async () => {
+    const c = clock();
+    const shared = mk(c);
+    await shared.save("claude", "id1", live(1), -60_000); // dated one minute ahead
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => (calls++, live(77)), shared, now: c.now });
+    await src.prefill("claude", "id1");
+    expect(calls).toBe(1);
+    expect((await shared.load("claude", "id1"))?.reading.maxUtilization).toBe(77);
+  });
+
+  test("seed fills the cache without overwriting, and marks old readings stale", async () => {
+    const c = clock();
+    const src = createUsageSource({ fetchUsage: async () => none, now: c.now, random: () => 0 });
+    src.seed([
+      { provider: "claude", identity: "old", reading: live(20), ageMs: 100_000 },
+      { provider: "claude", identity: "new", reading: live(21), ageMs: 1_000 },
+    ]);
+    expect(await src.get("claude", "old")).toMatchObject({ maxUtilization: 20, stale: true });
+    expect((await src.get("claude", "new"))?.stale).toBeUndefined();
+  });
+
+  test("the metrics hook counts upstream and shared reads", async () => {
+    const c = clock();
+    const shared = mk(c);
+    const reads: string[] = [];
+    const src = createUsageSource({ fetchUsage: async () => live(1), shared, now: c.now, onRead: (p, s) => void reads.push(`${p}/${s}`) });
+    await src.prefill("claude", "id1");
+    expect(reads).toEqual(["claude/upstream"]);
+    await shared.save("claude", "id3", live(3), 0);
+    await src.prefill("claude", "id3");
+    expect(reads.at(-1)).toBe("claude/shared");
   });
 });
