@@ -6,6 +6,7 @@ import { appTokenKey, readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { GATEWAY_ENTRY_SCOPES, GATEWAY_TOKEN_PREFIX, gatewayEntryText } from "./claude-gateway-entry.ts";
 import { withDirectGateway } from "./claude-usage-proxy.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
+import { planT3ClaudeHome } from "./t3-claude-home.ts";
 import { t3Paths } from "./t3-anthropic-proxy.ts";
 import { syncT3UsageCredentials, type UsageResult } from "./t3-usage-credentials.ts";
 
@@ -26,7 +27,13 @@ export interface T3InstanceOptions {
   models?: string[];
   /** Upstream provider slug of the app (pi only). Falls back to the app name. */
   provider?: string;
+  /** Only for the binary path of the claude driver. The config comes from `source`. */
   like?: string;
+  /**
+   * Claude only: the source identity folder whose full config (settings, plugins, hooks) the home copies, and whether it is
+   * a restricted identity (no third-party sending plugins or hooks). `"none"` copies nothing (kimi, zai and other homes that are not a Claude identity).
+   */
+  source?: { dir: string; noThirdParty: boolean } | "none";
   binary?: string;
   /** Legacy CONNECT proxy URL. It is ignored for Claude instances. */
   proxyUrl?: string;
@@ -286,12 +293,15 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
       });
     }
     own.env = env;
-    if (like) {
-      const likeHome = typeof likeConfig?.homePath === "string" ? likeConfig.homePath : undefined;
-      const hooks = likeHome ? obj(await readJsonObject(join(likeHome, "settings.json")))?.hooks : undefined;
-      if (hooks !== undefined) own.hooks = hooks;
+    if (opts.source === undefined) throw new Error(`No source identity for ${opts.id}: pass --source=<identity> (or --source=none for a home that is not a Claude identity)`);
+    if (opts.source === "none") {
+      plans.push({ path: join(folder, "settings.json"), content: `${JSON.stringify(own, null, 2)}\n`, mode: 0o600, label: "settings.json (folder)" });
+    } else {
+      // Full copy of the source identity config; only the gateway env keys and the attribution keys come from the home.
+      for (const f of await planT3ClaudeHome(folder, opts.source.dir, { noThirdParty: opts.source.noThirdParty }, own)) {
+        plans.push({ path: f.path, content: `${JSON.stringify(f.content, null, 2)}\n`, mode: f.label === "settings.json" ? 0o600 : 0o644, label: `${f.label} (folder)` });
+      }
     }
-    plans.push({ path: join(folder, "settings.json"), content: `${JSON.stringify(own, null, 2)}\n`, mode: 0o600, label: "settings.json (folder)" });
     plans.push({ path: join(folder, ".credentials.json"), content: gatewayEntryText(token, GATEWAY_ENTRY_SCOPES), mode: 0o600, label: ".credentials.json" });
     plans.push({ path: join(folder, ".claude.json"), content: `${JSON.stringify({ hasCompletedOnboarding: true })}\n`, mode: 0o600, label: ".claude.json", onlyIfMissing: true });
   } else if (opts.driver === "pi") {

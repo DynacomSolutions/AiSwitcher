@@ -25,7 +25,7 @@ const realOrNormal = (dir: string, real: (p: string) => string): string => {
 
 /** Folder-name candidates for a T3 gateway folder, in order of preference. */
 function t3GatewayCandidates(folderName: string): string[] {
-  const stem = folderName.replace(/^t3-(?:claude|codex)-/, "");
+  const stem = folderName.replace(/^t3-(?:claude|codex)-/, "").replace(/^claude-/, "");
   // No kimi-/zai- stripping: a Kimi or Z.ai backed session must never get a Claude identity's browser,
   // because it would send page content to another provider.
   return [...new Set([folderName, stem])];

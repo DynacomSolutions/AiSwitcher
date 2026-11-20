@@ -30,6 +30,7 @@ const opts = (o: Partial<T3InstanceOptions>): T3InstanceOptions => ({
   home,
   env: {},
   secretsPath: secrets,
+  source: "none",
   now: () => (clock += 5000),
   ...o,
 });
@@ -55,7 +56,7 @@ test("claude create writes instance, folder files and keeps others", async () =>
   expect(fs.env).toMatchObject({ ANTHROPIC_BASE_URL: "https://gw.example/gateway/agents-claude", ANTHROPIC_MODEL: "m1", ANTHROPIC_DEFAULT_OPUS_MODEL: "m1", ANTHROPIC_DEFAULT_SONNET_MODEL: "m1", ANTHROPIC_DEFAULT_HAIKU_MODEL: "m3", CLAUDE_CODE_SUBAGENT_MODEL: "m1" });
   expect(Object.keys(fs.env).some((key) => /^(?:https?|all)_proxy$/i.test(key))).toBe(false);
   expect(fs.env.NODE_EXTRA_CA_CERTS).toBeUndefined();
-  expect(fs.hooks).toEqual({ Stop: [1] });
+  expect(fs.hooks).toBeUndefined(); // --like is no longer a config source
   expect(fs.other).toBeUndefined();
   const cred = JSON.parse(await readFile(join(folder, ".credentials.json"), "utf8"));
   expect(cred.claudeAiOauth.accessToken).toBe(TOKEN);
