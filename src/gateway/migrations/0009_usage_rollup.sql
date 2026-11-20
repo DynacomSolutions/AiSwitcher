@@ -30,8 +30,9 @@ FROM gateway_usage
 GROUP BY time_bucket(INTERVAL '15 minutes', ts), provider, identity, app, model
 WITH NO DATA;
 
--- end_offset keeps the last hour in the real-time tail: a long streamed request
--- is logged with a ts well before its insert time.
+-- end_offset keeps the last hour in the real-time tail, which is read from gateway_usage.
+-- A row replayed after a ledger outage can have a ts older than the watermark.
+-- It shows after the next policy run, at most 5 minutes later.
 SELECT add_continuous_aggregate_policy('gateway_usage_15m',
   start_offset => NULL,
   end_offset => INTERVAL '1 hour',

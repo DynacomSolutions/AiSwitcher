@@ -280,6 +280,24 @@ if (!url && process.env.CI && !optOut) {
       expectSameRows(await rollup.usageByModelDaily(since, undefined, odd), await raw.usageByModelDaily(since, undefined, odd), "odd offset");
     });
 
+    test("the zone guard answers at once on an empty table and for a range past the data", async () => {
+      const s = await fresh();
+      const guard = (since: Date, until: Date | undefined) =>
+        (s as unknown as { zoneFitsBuckets(tz: string, a: Date, b: Date | undefined): Promise<boolean> }).zoneFitsBuckets("Asia/Kathmandu", since, until);
+      const epoch = new Date("1970-01-01T00:00:00.000Z");
+      let t0 = Date.now();
+      expect(await guard(epoch, undefined)).toBe(true);
+      expect(await s.usageByModelDaily(epoch, undefined, "Asia/Kathmandu")).toEqual([]);
+      expect(Date.now() - t0).toBeLessThan(2_000);
+      await s.appendUsage(makeRows(start, start + DAY, 20, 5));
+      t0 = Date.now();
+      expect(await guard(new Date(start + 5 * DAY), undefined)).toBe(true);
+      expect(await guard(new Date(start + 5 * DAY), new Date(start + 6 * DAY))).toBe(true);
+      expect(await guard(epoch, new Date(start - DAY))).toBe(true);
+      expect(await guard(epoch, undefined)).toBe(true);
+      expect(Date.now() - t0).toBeLessThan(2_000);
+    });
+
     test("migrate succeeds again after the rollup is dropped and rebuilds it", async () => {
       const s = await fresh();
       if (!(await s.usesUsageRollup())) return;

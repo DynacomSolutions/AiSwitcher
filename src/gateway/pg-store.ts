@@ -105,19 +105,21 @@ async function tryHypertable(tx: TransactionSQL): Promise<void> {
  */
 async function tryUsageRollup(tx: TransactionSQL, ddl: string): Promise<boolean> {
   try {
-    const view = await tx`SELECT to_regclass('timescaledb_information.hypertables') IS NOT NULL AS present`;
-    let hypertable = false;
-    if (view[0]?.present === true) {
-      const rows = await tx`SELECT 1 AS x FROM timescaledb_information.hypertables WHERE hypertable_schema = current_schema() AND hypertable_name = 'gateway_usage'`;
-      hypertable = rows.length > 0;
-    }
-    if (!hypertable) {
-      console.warn("gateway: gateway_usage is not a hypertable, so the usage rollup is skipped and usage reads scan the raw ledger");
-      return true;
-    }
-    await tx.savepoint(async (sp) => {
+    // The checks run inside the savepoint too: a failure there must skip 0009 only, never abort the whole migration run.
+    const created = await tx.savepoint(async (sp) => {
+      const view = await sp`SELECT to_regclass('timescaledb_information.hypertables') IS NOT NULL AS present`;
+      let hypertable = false;
+      if (view[0]?.present === true) {
+        const rows = await sp`SELECT 1 AS x FROM timescaledb_information.hypertables WHERE hypertable_schema = current_schema() AND hypertable_name = 'gateway_usage'`;
+        hypertable = rows.length > 0;
+      }
+      if (!hypertable) return false;
       await sp.unsafe(ddl);
+      return true;
     });
+    if (!created) {
+      console.warn("gateway: gateway_usage is not a hypertable, so the usage rollup is skipped and usage reads scan the raw ledger");
+    }
     return true;
   } catch (err) {
     if ((err as { errno?: unknown } | null)?.errno === "55P03") throw err;
@@ -627,13 +629,16 @@ export class PgGatewayStore implements GatewayStore {
    */
   private async zoneFitsBuckets(tz: string, since: Date, until: Date | undefined): Promise<boolean> {
     try {
+      // No data in range (empty table, or since after the last row) gives an empty series, so the answer is true at once.
       const rows = await this.sql`
         WITH bounds AS (
-          SELECT greatest(${since.toISOString()}::timestamptz, (SELECT min(ts) FROM gateway_usage)) AS lo,
-                 least(coalesce(${until ? until.toISOString() : null}::timestamptz, 'infinity'::timestamptz), (SELECT max(ts) FROM gateway_usage)) AS hi
+          SELECT greatest(${since.toISOString()}::timestamptz, mn) AS lo,
+                 CASE WHEN mx IS NULL THEN NULL ELSE least(coalesce(${until ? until.toISOString() : null}::timestamptz, mx), mx) END AS hi
+          FROM (SELECT min(ts) AS mn, max(ts) AS mx FROM gateway_usage) m
         )
         SELECT coalesce(bool_and(mod(EXTRACT(epoch FROM (g AT TIME ZONE ${tz}::text) - (g AT TIME ZONE 'UTC'))::int, 900) = 0), true) AS ok
-        FROM bounds, generate_series(bounds.lo, bounds.hi + interval '1 day', interval '1 day') g`;
+        FROM bounds,
+          generate_series(bounds.lo, CASE WHEN bounds.lo > bounds.hi THEN bounds.lo - interval '1 day' ELSE bounds.hi + interval '1 day' END, interval '1 day') g`;
       return rows[0]?.ok === true;
     } catch {
       return false;
