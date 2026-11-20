@@ -70,15 +70,15 @@ export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["fl
     const t3Home = t3Paths({ home, ...(opts.env ? { env: opts.env } : {}) }).t3Home;
     const registry = await loadClaudeIdentities(join(home, ".claude", "identities.json"));
     const given = stringFlag(flags, "source");
+    const restricted = noThirdPartyNames({ home, ...(opts.env ? { env: opts.env } : {}) });
+    // The target home's own identity counts as well as the source: either one in the list restricts the home.
+    const target = t3ClaudeSource(registry, join(t3Home, "gateway", id), t3Home, restricted);
     if (given === "none") base.source = "none";
     else if (given) {
       const identity = findIdentityByNameOrAlias(registry.identities, given);
       if (!identity) throw new CliUsageError(`--source ${given} is not a Claude identity`);
-      base.source = { dir: expandPath(identity.configDir), noThirdParty: isNoThirdParty(identity, noThirdPartyNames({ home, ...(opts.env ? { env: opts.env } : {}) })) };
-    } else {
-      const found = t3ClaudeSource(registry, join(t3Home, "gateway", id), t3Home, noThirdPartyNames({ home, ...(opts.env ? { env: opts.env } : {}) }));
-      if (found) base.source = { dir: found.dir, noThirdParty: found.noThirdParty };
-    }
+      base.source = { dir: expandPath(identity.configDir), noThirdParty: isNoThirdParty(identity, restricted) || target?.noThirdParty === true };
+    } else if (target) base.source = { dir: target.dir, noThirdParty: target.noThirdParty };
   }
   const r = await applyT3Instance(base);
   const detail = r.changes.length > 0 ? `${check ? " (differs" : " (changed"}: ${r.changes.join(", ")})` : "";

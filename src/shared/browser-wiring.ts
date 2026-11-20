@@ -63,6 +63,9 @@ export function identityForConfigDir(
   const target = normaliseDir(configDir);
   const direct = live.find((i) => normaliseDir(i.configDir) === target);
   if (direct) return direct;
+  // A folder directly in the T3 gateway folder maps by its name. The name wins over a transcript link that points to another identity.
+  const byName = identityForT3GatewayFolder(live, configDir, t3Gateway, real);
+  if (byName) return byName;
   for (const sub of TRANSCRIPT_LINKS) {
     let linked: string;
     try {

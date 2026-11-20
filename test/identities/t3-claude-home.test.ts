@@ -3,9 +3,10 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyT3Instance } from "../../src/identities/t3-instance.ts";
-import { composeT3ClaudePluginFiles, composeT3ClaudeSettings, diffT3ClaudeHome, isThirdPartySender } from "../../src/identities/t3-claude-home.ts";
+import { composeT3ClaudePluginFiles, composeT3ClaudeSettings, diffT3ClaudeHome, hookKeys, isThirdPartySender, planT3ClaudeHome } from "../../src/identities/t3-claude-home.ts";
 import { isNoThirdParty, noThirdPartyNames } from "../../src/shared/t3-claude-source.ts";
 import { syncT3ClaudeHomes } from "../../src/shared/t3-claude-sync.ts";
+import { runT3InstanceCommand } from "../../src/cli/gateway/t3-instance.ts";
 import { createT3ClaudeTicker } from "../../src/sync/t3-claude-ticker.ts";
 
 let home: string;
@@ -249,4 +250,100 @@ test("target-only plugins and marketplaces are allowed, except third-party sende
     await writeFile(join(folder, "plugins", "known_marketplaces.json"), JSON.stringify(mk));
     expect(await diffT3ClaudeHome(folder, source, { noThirdParty: restricted })).toEqual(restricted ? ["plugins/installed_plugins.json: extra jev-extra@x", "plugins/known_marketplaces.json: jev-market"] : []);
   }
+});
+
+const RESTRICTED = { noThirdParty: true };
+const base = (extra: object) => ({ theme: "dark", ...extra });
+
+test("restricted filter checks env values, http hooks, status line and wide names", () => {
+  const out = composeT3ClaudeSettings(
+    base({
+      env: { OK: "1", SNEAK: "https://api.typesafe.example/x", OTEL_EXPORTER_OTLP_ENDPOINT: "https://x" },
+      hooks: { Stop: [{ hooks: [{ type: "http", url: "https://hook.jev.example/x" }, { type: "command", command: "/ok.sh" }] }] },
+      statusLine: { type: "command", command: "/bin/jev-status" },
+      enabledPlugins: { "myjev-compaction@m": true, "ok@m": true },
+    }),
+    {},
+    RESTRICTED,
+  );
+  expect(out.env).toEqual({ OK: "1" });
+  expect(hookKeys(out.hooks)).toEqual(["Stop\t\t/ok.sh"]);
+  expect(out.statusLine).toBeUndefined();
+  expect(Object.keys(out.enabledPlugins as object)).toEqual(["ok@m"]);
+  expect(isThirdPartySender("some-compaction-service")).toBe(true);
+});
+
+test("hookKeys includes http hooks, so the check sees them", () => {
+  expect(hookKeys({ Stop: [{ hooks: [{ type: "http", url: "https://h.example/x" }] }] })).toEqual(["Stop\t\thttps://h.example/x"]);
+});
+
+test("restricted drift: third-party env value, http hook and non-gateway base URL are flagged", async () => {
+  await run("t3-claude-restricted", { dir: source, noThirdParty: true });
+  const folder = join(home, ".t3", "gateway", "t3-claude-restricted");
+  expect(await diffT3ClaudeHome(folder, source, RESTRICTED)).toEqual([]);
+  const s = await read(join(folder, "settings.json"));
+  s.env.X = "https://t.typesafe.example";
+  s.hooks.Stop = [{ hooks: [{ type: "http", url: "https://x.jev.example" }] }];
+  s.env.ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+  await writeFile(join(folder, "settings.json"), JSON.stringify(s));
+  expect(await diffT3ClaudeHome(folder, source, RESTRICTED)).toEqual(["settings.json: env, hooks"]);
+});
+
+test("source auth keys are never copied and the home keeps its own", () => {
+  const out = composeT3ClaudeSettings(
+    { apiKeyHelper: "/src/key.sh", env: { CLAUDE_CODE_USE_BEDROCK: "1", CLAUDE_CODE_OAUTH_TOKEN: "x", ANTHROPIC_API_KEY: "k", AWS_PROFILE: "p", KEEP: "1" } },
+    { apiKeyHelper: "/own.sh", env: { ANTHROPIC_BASE_URL: "own" } },
+  );
+  expect(out.apiKeyHelper).toBe("/own.sh");
+  expect(out.env).toEqual({ KEEP: "1", ANTHROPIC_BASE_URL: "own" });
+});
+
+test("home-only enabledPlugins stay and are allowed, except third-party senders when restricted", async () => {
+  await run("claude-team-pool", { dir: source, noThirdParty: false });
+  const folder = join(home, ".t3", "gateway", "claude-team-pool");
+  const s = await read(join(folder, "settings.json"));
+  s.enabledPlugins["home-only@m"] = true;
+  await writeFile(join(folder, "settings.json"), JSON.stringify(s));
+  expect(await diffT3ClaudeHome(folder, source)).toEqual([]);
+  expect(composeT3ClaudeSettings({}, { enabledPlugins: { "home-only@m": true, "jev-x@m": true } }, RESTRICTED).enabledPlugins).toEqual({ "home-only@m": true });
+  await run("t3-claude-restricted", { dir: source, noThirdParty: true });
+  const rf = join(home, ".t3", "gateway", "t3-claude-restricted");
+  const r = await read(join(rf, "settings.json"));
+  r.enabledPlugins["home-only@m"] = true;
+  await writeFile(join(rf, "settings.json"), JSON.stringify(r));
+  expect(await diffT3ClaudeHome(rf, source, RESTRICTED)).toEqual([]);
+  r.enabledPlugins["jev-x@m"] = true;
+  await writeFile(join(rf, "settings.json"), JSON.stringify(r));
+  expect(await diffT3ClaudeHome(rf, source, RESTRICTED)).toEqual(["settings.json: enabledPlugins"]);
+});
+
+test("repair aborts on a broken home file or a missing source settings and writes nothing", async () => {
+  await run("claude-team-pool", { dir: source, noThirdParty: false });
+  const folder = join(home, ".t3", "gateway", "claude-team-pool");
+  await writeFile(join(folder, "settings.json"), "{ not json");
+  await expect(planT3ClaudeHome(folder, source)).rejects.toThrow();
+  expect(await readFile(join(folder, "settings.json"), "utf8")).toBe("{ not json");
+  await run("claude-team-pool", { dir: source, noThirdParty: false }).catch(() => undefined);
+  await rm(join(source, "settings.json"));
+  await expect(planT3ClaudeHome(folder, source)).rejects.toThrow(/source settings.json is missing/);
+});
+
+test("the restriction list fails closed and matches case-insensitively", async () => {
+  await mkdir(join(home, ".ais", "config"), { recursive: true });
+  expect(isNoThirdParty({ name: "Alpha" }, ["alpha"])).toBe(true);
+  expect(isNoThirdParty({ name: "x", aliases: ["BETA"] }, ["beta"])).toBe(true);
+  expect(noThirdPartyNames({ home, env: { AIS_NO_THIRD_PARTY_IDENTITIES: "Gamma" } })).toEqual(["gamma"]);
+  await mkdir(join(home, ".ais", "config", "no-third-party-identities")); // a directory: EISDIR, not ENOENT
+  expect(() => noThirdPartyNames({ home, env: {} })).toThrow(/cannot read/);
+});
+
+test("--source=<other identity> on a restricted home still restricts it", async () => {
+  const reg = join(home, ".claude", "identities.json");
+  await mkdir(join(home, ".claude"), { recursive: true });
+  await writeFile(reg, JSON.stringify({ version: 1, identities: [{ name: "dyn", label: "d", configDir: source }, { name: "restricted", label: "r", configDir: join(home, "ids", "r") }] }));
+  const lines: string[] = [];
+  await writeFile(secrets, "AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN=aisg_testtoken123\nAIS_GATEWAY_PROXY_URL=https://gw.example/gateway\n");
+  await runT3InstanceCommand(["t3-claude-restricted"], { driver: "claude", app: "agents-claude", source: "dyn" } as never, { out: (l: string) => lines.push(l), secretsPath: secrets } as never, { home, env: { AIS_NO_THIRD_PARTY_IDENTITIES: "restricted", AIS_GATEWAY_PROXY_URL: "https://gw.example/gateway" } }, { exists: () => false, log: () => {} });
+  const s = await read(join(home, ".t3", "gateway", "t3-claude-restricted", "settings.json"));
+  expect(Object.keys(s.enabledPlugins).sort()).toEqual(["superpowers@official", "tasks-board@ai-tools"]);
 });

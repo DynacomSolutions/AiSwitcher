@@ -25,14 +25,18 @@ export function noThirdPartyNames(opts: { home?: string; env?: Record<string, st
   let fileText = "";
   try {
     fileText = readFileSync(join(opts.home ?? homedir(), ".ais", "config", "no-third-party-identities"), "utf8");
-  } catch {
-    // no file: only the env list
+  } catch (err) {
+    // Fail closed: only a missing file means "no list". Any other error stops the command.
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`cannot read the no-third-party identity list: ${err instanceof Error ? err.message : String(err)}`);
   }
   const fromFile = fileText.split("\n").map((l) => l.replace(/#.*/, "").trim());
-  return [...(env.AIS_NO_THIRD_PARTY_IDENTITIES ?? "").split(","), ...fromFile].map((n) => n.trim()).filter(Boolean);
+  return [...(env.AIS_NO_THIRD_PARTY_IDENTITIES ?? "").split(","), ...fromFile].map((n) => n.trim().toLowerCase()).filter(Boolean);
 }
 
-export const isNoThirdParty = (i: { name: string; aliases?: string[] }, names: string[]): boolean => names.includes(i.name) || (i.aliases ?? []).some((a) => names.includes(a));
+export const isNoThirdParty = (i: { name: string; aliases?: string[] }, names: string[]): boolean => {
+  const list = names.map((n) => n.toLowerCase());
+  return list.includes(i.name.toLowerCase()) || (i.aliases ?? []).some((a) => list.includes(a.toLowerCase()));
+};
 
 /** The source identity of a T3 Claude home folder (the pool home maps to the swap pool), or undefined. */
 export function t3ClaudeSource(file: IdentitiesFile, folder: string, t3Home: string = t3Paths().t3Home, restricted: string[] = noThirdPartyNames()): T3ClaudeSource | undefined {
