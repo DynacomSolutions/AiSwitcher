@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { writeFileAtomic } from "./pool/fs.ts";
@@ -149,19 +150,34 @@ export function composeT3ClaudeSettings(source: Json, own: Json, opts: T3ClaudeC
  * The expected plugin JSON files. A plugin the home already has keeps its own entry (own install path, own cache), so a
  * home with its own plugin cache is in step. Missing plugins and marketplaces come from the source. Pure.
  */
-export function composeT3ClaudePluginFiles(installed: Json | undefined, marketplaces: Json | undefined, opts: T3ClaudeConfigOptions = {}, own: { installed?: Json; marketplaces?: Json } = {}): { installed?: Json; marketplaces?: Json } {
-  const out: { installed?: Json; marketplaces?: Json } = {};
+export function composeT3ClaudePluginFiles(installed: Json | undefined, marketplaces: Json | undefined, opts: T3ClaudeConfigOptions = {}, own: { installed?: Json; marketplaces?: Json } = {}, exists: (path: string) => boolean = existsSync): { installed?: Json; marketplaces?: Json; skipped?: string[] } {
+  const out: { installed?: Json; marketplaces?: Json; skipped?: string[] } = {};
   if (installed) {
     const copy = clone(installed);
     let plugins = obj(copy.plugins) ?? {};
     if (opts.noThirdParty) plugins = filterKeys(plugins, isThirdPartySender) as Json;
     const ownPlugins = obj(own.installed?.plugins) ?? {};
-    copy.plugins = Object.fromEntries(Object.entries(plugins).map(([id, v]) => [id, id in ownPlugins ? ownPlugins[id] : v]));
+    const merged = Object.fromEntries(Object.entries(plugins).map(([id, v]) => [id, id in ownPlugins ? ownPlugins[id] : v]));
+    // Plugins only the home has stay, except third-party senders in a restricted home.
+    for (const [id, v] of Object.entries(ownPlugins)) if (!(id in merged) && !(opts.noThirdParty && isThirdPartySender(id))) merged[id] = v;
+    copy.plugins = merged;
     out.installed = copy;
   }
   if (marketplaces) {
-    const m = opts.noThirdParty ? (filterKeys(marketplaces, isThirdPartySender) as Json) : clone(marketplaces);
-    out.marketplaces = Object.fromEntries(Object.entries(m).map(([name, v]) => [name, own.marketplaces && stable(obj(own.marketplaces[name])?.source) === stable(obj(v)?.source) ? own.marketplaces[name] : v]));
+    let m = opts.noThirdParty ? (filterKeys(marketplaces, isThirdPartySender) as Json) : clone(marketplaces);
+    // A directory source whose path is missing on this host cannot be installed: skip it.
+    out.skipped = [];
+    m = Object.fromEntries(Object.entries(m).filter(([name, v]) => {
+      const src = obj(obj(v)?.source);
+      if (src?.source === "directory" && typeof src.path === "string" && !exists(src.path)) {
+        out.skipped!.push(`${name} (${src.path})`);
+        return false;
+      }
+      return true;
+    }));
+    const merged = Object.fromEntries(Object.entries(m).map(([name, v]) => [name, own.marketplaces && stable(obj(own.marketplaces[name])?.source) === stable(obj(v)?.source) ? own.marketplaces[name] : v]));
+    for (const [name, v] of Object.entries(own.marketplaces ?? {})) if (!(name in merged) && !(opts.noThirdParty && isThirdPartySender(name))) merged[name] = v;
+    out.marketplaces = merged;
   }
   return out;
 }
@@ -190,6 +206,8 @@ export interface T3ClaudeFile {
   label: string;
   /** What differs semantically from the file on disk. Empty when the file is in step. */
   diffs: string[];
+  /** Info lines, for example a source marketplace skipped because its directory is missing. */
+  notes: string[];
 }
 
 const keysOf = (v: unknown): string[] => Object.keys(obj(v) ?? {});
@@ -209,15 +227,19 @@ function diffSettings(expected: Json, actual: Json): string[] {
 }
 
 /** Plugin ids and marketplace sources, never install paths. */
-function diffInstalled(expected: Json, actual: Json): string[] {
+function diffInstalled(expected: Json, actual: Json, noThirdParty: boolean): string[] {
   const a = keysOf(actual.plugins);
   const e = keysOf(expected.plugins);
-  return [...e.filter((id) => !a.includes(id)).map((id) => `missing ${id}`), ...a.filter((id) => !e.includes(id)).map((id) => `extra ${id}`)].sort();
+  return [...e.filter((id) => !a.includes(id)).map((id) => `missing ${id}`), ...a.filter((id) => !e.includes(id) && noThirdParty && isThirdPartySender(id)).map((id) => `extra ${id}`)].sort();
 }
 
-function diffMarketplaces(expected: Json, actual: Json): string[] {
+function diffMarketplaces(expected: Json, actual: Json, noThirdParty: boolean): string[] {
   const bad: string[] = [];
   for (const name of new Set([...Object.keys(expected), ...Object.keys(actual)])) {
+    if (!(name in expected)) {
+      if (noThirdParty && isThirdPartySender(name)) bad.push(name);
+      continue;
+    }
     if (stable(obj(expected[name])?.source) !== stable(obj(actual[name])?.source)) bad.push(name);
   }
   return bad.sort();
@@ -229,12 +251,12 @@ export async function planT3ClaudeHome(folder: string, sourceDir: string, opts: 
   const actualSettings = await readJson(join(folder, "settings.json")).catch(() => undefined);
   const own = ownOverride ?? actualSettings ?? {};
   const settings = composeT3ClaudeSettings(source, own, opts);
-  const files: T3ClaudeFile[] = [{ path: join(folder, "settings.json"), content: settings, label: "settings.json", diffs: actualSettings ? diffSettings(settings, actualSettings).map((k) => k) : ["missing"] }];
+  const files: T3ClaudeFile[] = [{ path: join(folder, "settings.json"), content: settings, label: "settings.json", diffs: actualSettings ? diffSettings(settings, actualSettings) : ["missing"], notes: [] }];
   const ownInstalled = await readJson(join(folder, "plugins", "installed_plugins.json")).catch(() => undefined);
   const ownMarkets = await readJson(join(folder, "plugins", "known_marketplaces.json")).catch(() => undefined);
   const plugins = composeT3ClaudePluginFiles(await readJson(join(sourceDir, "plugins", "installed_plugins.json")), await readJson(join(sourceDir, "plugins", "known_marketplaces.json")), opts, { installed: ownInstalled, marketplaces: ownMarkets });
-  if (plugins.installed) files.push({ path: join(folder, "plugins", "installed_plugins.json"), content: plugins.installed, label: "plugins/installed_plugins.json", diffs: ownInstalled ? diffInstalled(plugins.installed, ownInstalled) : ["missing"] });
-  if (plugins.marketplaces) files.push({ path: join(folder, "plugins", "known_marketplaces.json"), content: plugins.marketplaces, label: "plugins/known_marketplaces.json", diffs: ownMarkets ? diffMarketplaces(plugins.marketplaces, ownMarkets) : ["missing"] });
+  if (plugins.installed) files.push({ path: join(folder, "plugins", "installed_plugins.json"), content: plugins.installed, label: "plugins/installed_plugins.json", diffs: ownInstalled ? diffInstalled(plugins.installed, ownInstalled, opts.noThirdParty === true) : ["missing"], notes: [] });
+  if (plugins.marketplaces) files.push({ path: join(folder, "plugins", "known_marketplaces.json"), content: plugins.marketplaces, label: "plugins/known_marketplaces.json", diffs: ownMarkets ? diffMarketplaces(plugins.marketplaces, ownMarkets, opts.noThirdParty === true) : ["missing"], notes: (plugins.skipped ?? []).map((n) => `source marketplace ${n} skipped: directory missing on this host`) });
   return files;
 }
 

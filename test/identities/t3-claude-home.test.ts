@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyT3Instance } from "../../src/identities/t3-instance.ts";
-import { composeT3ClaudeSettings, diffT3ClaudeHome, isThirdPartySender } from "../../src/identities/t3-claude-home.ts";
+import { composeT3ClaudePluginFiles, composeT3ClaudeSettings, diffT3ClaudeHome, isThirdPartySender } from "../../src/identities/t3-claude-home.ts";
 import { isNoThirdParty, noThirdPartyNames } from "../../src/shared/t3-claude-source.ts";
 import { syncT3ClaudeHomes } from "../../src/shared/t3-claude-sync.ts";
 import { createT3ClaudeTicker } from "../../src/sync/t3-claude-ticker.ts";
@@ -212,4 +212,41 @@ test("repair leaves a home that is in step untouched", async () => {
   expect(out[0]!.status).toBe("current");
   expect(await readFile(join(folder, "plugins", "installed_plugins.json"), "utf8")).toBe(text);
   expect(await Bun.file(join(folder, "settings.json")).text()).toBe(before);
+});
+
+test("a source directory marketplace missing on this host is skipped with an info line, not drift", async () => {
+  const gone = join(home, "missing-dir");
+  await writeFile(join(source, "plugins", "known_marketplaces.json"), JSON.stringify({ ...MARKETS, "local-skills": { source: { source: "directory", path: gone } } }));
+  await run("claude-team-pool", { dir: source, noThirdParty: false });
+  const folder = join(home, ".t3", "gateway", "claude-team-pool");
+  expect(Object.keys(await read(join(folder, "plugins", "known_marketplaces.json")))).toEqual(["ai-tools", "typesafe-ai"]);
+  expect(await diffT3ClaudeHome(folder, source)).toEqual([]);
+  const registry = join(home, "identities.json");
+  await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "swap", label: "swap", aliases: ["team-pool"], configDir: source, swapPool: { accounts: [] } }] }));
+  const out = await syncT3ClaudeHomes({ home, env: {}, registryPath: registry, check: true });
+  expect(out[0]!.status).toBe("current");
+  expect(out[0]!.notes?.join(" ")).toContain("local-skills");
+  // an existing directory is still copied
+  await mkdir(gone);
+  expect(Object.keys(composeT3ClaudePluginFiles(undefined, { x: { source: { source: "directory", path: gone } } }).marketplaces ?? {})).toEqual(["x"]);
+});
+
+test("target-only plugins and marketplaces are allowed, except third-party senders in a restricted home", async () => {
+  await run("claude-team-pool", { dir: source, noThirdParty: false });
+  await run("t3-claude-restricted", { dir: source, noThirdParty: true });
+  for (const [name, restricted] of [["claude-team-pool", false], ["t3-claude-restricted", true]] as const) {
+    const folder = join(home, ".t3", "gateway", name);
+    const inst = await read(join(folder, "plugins", "installed_plugins.json"));
+    inst.plugins["cluster-art@cluster"] = [{ installPath: "/x" }];
+    await writeFile(join(folder, "plugins", "installed_plugins.json"), JSON.stringify(inst));
+    const mk = await read(join(folder, "plugins", "known_marketplaces.json"));
+    mk["cluster"] = { source: { source: "directory", path: "/x" } };
+    await writeFile(join(folder, "plugins", "known_marketplaces.json"), JSON.stringify(mk));
+    expect(await diffT3ClaudeHome(folder, source, { noThirdParty: restricted })).toEqual([]);
+    inst.plugins["jev-extra@x"] = [{ installPath: "/y" }];
+    mk["jev-market"] = { source: {} };
+    await writeFile(join(folder, "plugins", "installed_plugins.json"), JSON.stringify(inst));
+    await writeFile(join(folder, "plugins", "known_marketplaces.json"), JSON.stringify(mk));
+    expect(await diffT3ClaudeHome(folder, source, { noThirdParty: restricted })).toEqual(restricted ? ["plugins/installed_plugins.json: extra jev-extra@x", "plugins/known_marketplaces.json: jev-market"] : []);
+  }
 });

@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { diffT3ClaudeHome, listT3ClaudeHomes, planT3ClaudeHome, writeT3ClaudeHome } from "../identities/t3-claude-home.ts";
+import { listT3ClaudeHomes, planT3ClaudeHome, writeT3ClaudeHome } from "../identities/t3-claude-home.ts";
 import { t3Paths } from "../identities/t3-anthropic-proxy.ts";
 import { loadClaudeIdentities, noThirdPartyNames, t3ClaudeSource } from "./t3-claude-source.ts";
 
@@ -21,6 +21,8 @@ export interface T3ClaudeSyncResult {
   /** Differences found (check) or files written (apply). */
   changes: string[];
   error?: string;
+  /** Info lines (not drift). */
+  notes?: string[];
 }
 
 /** Brings every mapped T3 Claude home in step with its source identity, or reports the drift with `check`. */
@@ -39,10 +41,12 @@ export async function syncT3ClaudeHomes(opts: T3ClaudeSyncOptions = {}): Promise
       continue;
     }
     try {
-      const diffs = await diffT3ClaudeHome(folder, source.dir, { noThirdParty: source.noThirdParty });
-      if (diffs.length === 0) results.push({ folder, source: source.name, status: "current", changes: [] });
-      else if (opts.check) results.push({ folder, source: source.name, status: "drift", changes: diffs });
-      else results.push({ folder, source: source.name, status: "updated", changes: await writeT3ClaudeHome(await planT3ClaudeHome(folder, source.dir, { noThirdParty: source.noThirdParty })) });
+      const plan = await planT3ClaudeHome(folder, source.dir, { noThirdParty: source.noThirdParty });
+      const diffs = plan.filter((f) => f.diffs.length > 0).map((f) => `${f.label}: ${f.diffs.join(", ")}`);
+      const notes = plan.flatMap((f) => f.notes);
+      if (diffs.length === 0) results.push({ folder, source: source.name, status: "current", changes: [], notes });
+      else if (opts.check) results.push({ folder, source: source.name, status: "drift", changes: diffs, notes });
+      else results.push({ folder, source: source.name, status: "updated", changes: await writeT3ClaudeHome(plan), notes });
     } catch (err) {
       results.push({ folder, source: source.name, status: "failed", changes: [], error: err instanceof Error ? err.message : String(err) });
     }

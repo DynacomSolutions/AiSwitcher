@@ -16,6 +16,7 @@ export async function runT3ClaudeSyncCommand(args: string[], flags: ParsedArgs["
   for (const r of results) {
     if (r.status === "skipped") continue;
     deps.out(`t3-claude-sync: ${describeT3ClaudeResult(r)}`);
+    for (const n of r.notes ?? []) deps.out(`t3-claude-sync: info: ${r.folder}: ${n}`);
     if (r.status === "drift" || r.status === "failed") drift = true;
   }
   if (drift) throw new Error(check ? "t3-claude-sync: a T3 Claude home differs from its source identity" : "t3-claude-sync: a T3 Claude home failed");
