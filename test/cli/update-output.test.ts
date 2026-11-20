@@ -53,3 +53,17 @@ test("a backup lock held by a live process is reported, not waited on silently",
     expect(err.mock.calls.map((c) => String(c[0])).join("\n")).toContain(`another backup (pid ${process.pid}) holds`);
   } finally { err.mockRestore(); }
 });
+
+test("update runs the agent-guard check and prints one line", async () => {
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  const calls: string[][] = [];
+  try {
+    await runUpdate({
+      skipBackup: true,
+      shimDir: join(tmpdir(), "ais-no-such-shims"),
+      agentGuard: { exists: () => true, run: async (_c, a) => { calls.push(a); return { exitCode: 0, stdout: "", stderr: "" }; } },
+    });
+    expect(calls).toEqual([["--check"]]);
+    expect(log.mock.calls.map((c) => String(c[0])).join("\n")).toContain("agent-guard: all homes up to date");
+  } finally { log.mockRestore(); }
+});

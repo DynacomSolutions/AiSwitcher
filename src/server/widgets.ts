@@ -60,7 +60,6 @@ export interface PanelInfo {
 export class PanelError extends Error {}
 
 export const PLUGIN_NAME = "AIS Console";
-export const MAX_ROWS = 50;
 
 /** What the panels read. Each source is the same engine call as the matching `/api/*` route. */
 export interface WidgetSources {
@@ -285,9 +284,7 @@ async function agentsPanel(sources: WidgetSources, now: Date): Promise<PanelBody
   const byTool = new Map<string, number>();
   for (const p of processes) byTool.set(p.tool ?? "other", (byTool.get(p.tool ?? "other") ?? 0) + 1);
   const ranked = [...byTool.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  const shown = ranked.length > 4 ? ranked.slice(0, 3) : ranked;
-  const stats = shown.map(([tool, n]) => stat(tool, n));
-  if (ranked.length > 4) stats.push(stat("Other", ranked.slice(3).reduce((sum, [, n]) => sum + n, 0)));
+  const stats = ranked.map(([tool, n]) => stat(tool, n));
   // Only the tool, identity name and age leave this panel: no cwd, no command line, no pid.
   const rows: Row[] = processes.map((p) => ({
     label: p.tool ?? "agent",
@@ -333,21 +330,45 @@ async function gatewayUsagePanel(sources: WidgetSources): Promise<PanelBody> {
 
 /* ------------------------------- claude swap ------------------------------ */
 
+/** Highest 5-hour or weekly fraction (0..100) per Claude identity in the limits payload. Per-model windows are left out, as in `maxUtilization`. */
+function claudeLimitsByIdentity(payload: unknown): Map<string, { used: number; window: string }> {
+  const out = new Map<string, { used: number; window: string }>();
+  for (const result of asList((payload as Obj | undefined)?.results)) {
+    if (asString(result.toolName) !== "claude") continue;
+    const name = asString((result.identity as Obj | undefined)?.name);
+    if (name === "" || result.status === "unavailable") continue;
+    for (const w of asList(result.windows)) {
+      const used = asNumber(w.usedPercent);
+      const window = w.category === "session" ? "5-hour" : w.category === "week" && !w.model ? "weekly" : "";
+      if (used === undefined || window === "") continue;
+      const known = out.get(name);
+      if (!known || used > known.used) out.set(name, { used, window });
+    }
+  }
+  return out;
+}
+
 async function claudeSwapPanel(sources: WidgetSources): Promise<PanelBody> {
   const pools = await sources.claudeSwap?.();
   if (!pools || pools.length === 0) return { status: "unknown", summary: "No swap pool", stats: [], rows: [] };
+  // The console cannot read gateway logins, so members without direct usage use the shared limits data.
+  const needsLimits = pools.some((p) => p.rows.some((m) => asNumber(m.usage?.maxUtilization) === undefined));
+  const limits = needsLimits ? claudeLimitsByIdentity(await sources.limits().catch(() => undefined)) : new Map<string, { used: number; window: string }>();
   const rows: Row[] = [];
   for (const pool of pools) {
     for (const member of pool.rows) {
       const label = `${pool.pool} / ${member.name}`;
       const role = member.active ? "Active" : member.allowed ? "Standby" : "Not allowed";
-      const max = asNumber(member.usage?.maxUtilization);
+      const direct = asNumber(member.usage?.maxUtilization);
+      const fromLimits = direct === undefined ? limits.get(member.name) : undefined;
+      const max = direct ?? fromLimits?.used;
       if (max === undefined) {
-        rows.push({ label, detail: `${role}, no usage data`, value: "-", status: "unknown" });
+        const word = member.usage?.status && /^[a-z-]{1,24}$/.test(member.usage.status) ? member.usage.status : "unavailable";
+        rows.push({ label, detail: `${role}, usage ${word}`, value: "-", status: "unknown" });
         continue;
       }
       const fraction = clamp01(max / 100);
-      rows.push({ label, detail: role, value: pct(fraction), fraction, status: levelOfFraction(fraction) });
+      rows.push({ label, detail: fromLimits ? `${role}, ${fromLimits.window}` : role, value: pct(fraction), fraction, status: levelOfFraction(fraction) });
     }
   }
   const active = pools.flatMap((p) => p.rows).filter((m) => m.active).length;
@@ -366,7 +387,7 @@ async function spendGuardPanel(sources: WidgetSources): Promise<PanelBody> {
   if (!guard || !guard.running) return { status: "unknown", summary: "Spend guard not running", stats: [], rows: [] };
   // Account ids, profile names and budget names stay out: rows are named by identity.
   const rows: Row[] = guard.accounts.map((a, i) => {
-    const label = a.identities.length > 0 ? a.identities.slice(0, 2).join(", ") : `Account ${i + 1}`;
+    const label = a.identities.length > 0 ? a.identities.join(", ") : `Account ${i + 1}`;
     const limit = a.budgetLimitUsd;
     if (a.degraded || limit === undefined || limit <= 0) {
       return { label, detail: "No budget cap", value: "-", status: "unknown" as const };
@@ -467,8 +488,8 @@ export class WidgetService {
       link,
       status: body.status,
       summary: body.summary,
-      stats: body.stats.slice(0, 4),
-      rows: body.rows.slice(0, MAX_ROWS).map((r) => ({ ...r, link })),
+      stats: body.stats,
+      rows: body.rows.map((r) => ({ ...r, link })),
       ...(body.series?.length ? { series: body.series.slice(0, 2).map((s) => ({ label: s.label, points: s.points.slice(-48) })) } : {}),
     } satisfies PanelModel);
   }

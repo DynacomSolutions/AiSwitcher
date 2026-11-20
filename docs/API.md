@@ -425,7 +425,8 @@ An unknown id gives 404 `{ "error": "unknown panel" }`. A failing backend gives
 502 `{ "error": "<short reason>" }`. The server caches each panel for its
 `refreshSeconds` and runs one build for concurrent requests. Email-shaped and
 token-shaped strings are masked. Output holds no file paths, command lines or
-credential data.
+credential data. A panel never cuts its rows or stats and has no "Other"
+group: every row and every stat shows at its real size.
 
 | Panel id | Shows | refreshSeconds |
 |---|---|---|
@@ -433,7 +434,7 @@ credential data.
 | `identities` | Login state per identity (from `/api/auth`). Stats count logged in, expiring, expired and not logged in. Retired identities and swap pools are left out. | 300 |
 | `agents` | Running agent sessions (from `/api/processes`; link `/dashboard`): a stat per tool, and a row per session with tool, identity and age. | 60 |
 | `gateway-usage` | Gateway tokens per app and provider over 7 days (from `/api/gateway/usage`). Status `unknown` when the gateway is not configured. There is no `series`, because the source has no daily points. | 300 |
-| `claude-swap` | Claude swap pool members with their highest window use (from `/api/claude-swap`). | 300 |
+| `claude-swap` | Claude swap pool members with their highest 5-hour or weekly use (from `/api/claude-swap`). A member without direct usage takes the figure from the limits data of the same Claude identity, and the row detail names the window. Per-model windows are ignored. A member with no data is `unknown`, and the detail gives the usage status word. | 300 |
 | `spend-guard` | Budget use per account (from `/api/spend-guard`). Rows carry identity names only. Status `unknown` when the scheduler is not running. | 300 |
 
 There is no `errors` panel, because the console keeps no list of recent

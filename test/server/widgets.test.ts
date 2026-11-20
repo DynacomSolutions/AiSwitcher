@@ -202,6 +202,25 @@ describe("panel mapping", () => {
     expect(off).toMatchObject({ status: "unknown", summary: "Gateway not configured", rows: [] });
   });
 
+  test("no top-N cut and no Other bucket", async () => {
+    const pairs = Array.from({ length: 60 }, (_, i) => ({ app: `app-${i}`, provider: "claude", days: 7, tokens: 1000 + i }));
+    const usage = await panel("gateway-usage", sources({ gatewayUsage: async () => ({ configured: true, rows: pairs }) }));
+    expect(usage.rows).toHaveLength(60);
+
+    const many = Array.from({ length: 70 }, (_, i) => ({ tool: `tool-${i % 6}`, identity: `id-${i}`, startedAt: null }));
+    const agents = await panel("agents", sources({ processes: async () => ({ processes: many as never }) }));
+    expect(agents.rows).toHaveLength(70);
+    expect(agents.stats).toHaveLength(6);
+    expect(agents.stats.map((s) => s.label)).not.toContain("Other");
+    expect(agents.stats.reduce((sum, s) => sum + Number(s.value), 0)).toBe(70);
+
+    const spend = await panel(
+      "spend-guard",
+      sources({ spendGuard: () => ({ running: true, accounts: [{ accountId: "x", budgetLimitUsd: 100, effectiveUsd: 1, breached: false, degraded: false, identities: ["a", "b", "c", "d"] }] }) as never }),
+    );
+    expect(spend.rows[0]?.label).toBe("a, b, c, d");
+  });
+
   test("claude-swap and spend-guard: unknown rows stay unknown, no ids leave", async () => {
     const swap = await panel("claude-swap");
     expect(swap.rows.map((r) => [r.label, r.status, r.fraction])).toEqual([["shared / m1", "crit", 0.97], ["shared / m3", "crit", 1], ["shared / m2", "unknown", undefined]]);
@@ -210,6 +229,41 @@ describe("panel mapping", () => {
     expect(JSON.stringify(spend)).not.toContain("0000000000");
     const none = await panel("spend-guard", sources({ spendGuard: () => undefined }));
     expect(none).toMatchObject({ status: "unknown", summary: "Spend guard not running" });
+  });
+
+  test("claude-swap: members without direct usage take the limits fraction", async () => {
+    const pool = (rows: Array<{ name: string; usage?: { status: string; maxUtilization?: number } }>) => async () => [{ pool: "shared", rows: rows.map((r) => ({ ...r, active: false, allowed: true })) }];
+    const claude = (name: string, windows: unknown[], extra: object = {}) => limitsResult("anthropic", name, windows, { toolName: "claude", ...extra });
+    const src = sources({
+      limits: async () => ({
+        results: [
+          claude("alice", [
+            { category: "session", usedPercent: 30 },
+            { category: "week", usedPercent: 60 },
+            { category: "week", usedPercent: 99, model: "Model" },
+          ]),
+          claude("bob", [{ category: "session", usedPercent: 82 }, { category: "week", usedPercent: 10 }]),
+          claude("dora", [{ category: "session", usedPercent: 5 }]),
+          limitsResult("openai", "erin", [{ category: "session", usedPercent: 90 }], { toolName: "codex" }),
+        ],
+      }),
+      claudeSwap: pool([
+        { name: "alice", usage: { status: "unavailable" } },
+        { name: "bob", usage: { status: "unavailable" } },
+        { name: "dora", usage: { status: "live", maxUtilization: 20 } },
+        { name: "erin", usage: { status: "unavailable" } },
+        { name: "frank" },
+      ]),
+    });
+    const model = await panel("claude-swap", src);
+    const byLabel = Object.fromEntries(model.rows.map((r) => [r.label, r]));
+    expect(byLabel["shared / alice"]).toMatchObject({ detail: "Standby, weekly", fraction: 0.6, status: "ok" });
+    expect(byLabel["shared / bob"]).toMatchObject({ detail: "Standby, 5-hour", fraction: 0.82, status: "warn" });
+    expect(byLabel["shared / dora"]).toMatchObject({ detail: "Standby", fraction: 0.2 });
+    expect(byLabel["shared / erin"]).toMatchObject({ detail: "Standby, usage unavailable", status: "unknown" });
+    expect(byLabel["shared / frank"]).toMatchObject({ detail: "Standby, usage unavailable", status: "unknown" });
+    const full = await panel("claude-swap", sources({ limits: src.limits, claudeSwap: pool([{ name: "alice" }, { name: "bob" }]) }));
+    expect(full.status).toBe("warn");
   });
 
   test("masks email-shaped values in every string", async () => {

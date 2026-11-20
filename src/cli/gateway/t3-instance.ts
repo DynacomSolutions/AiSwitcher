@@ -1,3 +1,4 @@
+import { installAgentGuardForHome, type AgentGuardDeps } from "../../identities/agent-guard-install.ts";
 import { applyT3Instance, type InstanceDriver, type T3InstanceOptions } from "../../identities/t3-instance.ts";
 import { isUsageTrouble, describeUsageResult } from "../../identities/t3-usage-credentials.ts";
 import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
@@ -11,7 +12,7 @@ const USAGE = "Usage: ais gateway t3-instance <instance-id> --driver=claude|grok
  * `ais gateway t3-instance`: creates or updates one T3 Code provider instance whose folder holds only the gateway app
  * token (src/identities/t3-instance.ts). T3 watches its settings file, so nothing is restarted here.
  */
-export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["flags"], deps: GatewayCliDeps, opts: Pick<T3InstanceOptions, "home" | "env"> = {}): Promise<void> {
+export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["flags"], deps: GatewayCliDeps, opts: Pick<T3InstanceOptions, "home" | "env"> = {}, guard: AgentGuardDeps = {}): Promise<void> {
   const id = args[0];
   if (!id || args.length > 1) throw new CliUsageError(USAGE);
   const check = boolFlag(flags, "check");
@@ -70,6 +71,8 @@ export async function runT3InstanceCommand(args: string[], flags: ParsedArgs["fl
     deps.out(`t3-instance: ${describeUsageResult(u, check)}`);
     if (isUsageTrouble(u, false)) trouble = true;
   }
+  // Runs on every apply, also when the home is current, so a home that missed the guard gets it. Never fails the command.
+  if (!check && !remove) await installAgentGuardForHome(driver, { ...(opts.home ? { home: opts.home } : {}), log: deps.out, ...guard });
   if (check && r.status !== "current" && r.status !== "absent") throw new Error(`t3-instance ${id} differs`);
   if (trouble) throw new Error(`t3-instance ${id}: usage credential problem`);
 }
