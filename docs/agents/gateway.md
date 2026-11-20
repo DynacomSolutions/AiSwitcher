@@ -510,6 +510,14 @@ throwaway pod outside the `dev` namespace.
 - The usage table becomes a TimescaleDB hypertable only on the first migration.
   If TimescaleDB is added to the database later, the table stays a plain table
   until someone converts it by hand.
+- Wide usage reads (`usageByIdentity`, `usageByModel`, `usageByModelDaily`) sum the continuous aggregate
+  `gateway_usage_15m` (migration 0009): one row per 15 minutes, provider, identity, app and model, with real-time
+  aggregation on. A refresh policy runs every 5 minutes over all history and leaves the last hour to the real-time tail.
+  A range is split into an aligned middle (aggregate) and raw edges (ledger), so results equal a raw scan, except that
+  cost sums may differ in the last bits. A late insert older than one hour shows after the next refresh. Daily reads fall
+  back to the raw ledger for a zone whose offset is not a multiple of 15 minutes. Without the aggregate (plain table,
+  or `new PgGatewayStore(url, { usageRollup: "off" })`) the store scans `gateway_usage`. If TimescaleDB is added later,
+  run the SQL of `0009_usage_rollup.sql` by hand after the hypertable conversion.
 
 ## Refresh guard
 

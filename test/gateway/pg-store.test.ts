@@ -57,6 +57,8 @@ if (!url && process.env.CI && !optOut) {
       await sql`DROP TABLE IF EXISTS gateway_side_counts CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_refresh_journal CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_usage_history CASCADE`;
+      // The continuous aggregate depends on the hypertable, so it goes first.
+      await sql`DROP MATERIALIZED VIEW IF EXISTS gateway_usage_15m CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_usage CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_tokens CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_apps CASCADE`;
@@ -107,7 +109,7 @@ if (!url && process.env.CI && !optOut) {
       const sql = new SQL(url);
       try {
         const rows = await sql`SELECT version FROM schema_migrations`;
-        expect(rows.length).toBe(8);
+        expect(rows.length).toBe(9);
         const t = await sql`SELECT to_regclass('gateway_usage') AS r`;
         expect(t[0].r).toBe("gateway_usage");
         const ext = await sql`SELECT 1 AS x FROM pg_extension WHERE extname = 'timescaledb'`;
@@ -116,7 +118,178 @@ if (!url && process.env.CI && !optOut) {
         if (ext.length > 0) {
           const h = await sql`SELECT hypertable_name FROM timescaledb_information.hypertables`;
           expect(h.map((r: { hypertable_name: string }) => r.hypertable_name)).toContain("gateway_usage");
+          const agg = await sql`SELECT view_name FROM timescaledb_information.continuous_aggregates WHERE view_name = 'gateway_usage_15m'`;
+          expect(agg.length).toBe(1);
+          const jobs = await sql`SELECT 1 AS x FROM timescaledb_information.jobs WHERE hypertable_name = 'gateway_usage_15m' AND proc_name = 'policy_refresh_continuous_aggregate'`;
+          expect(jobs.length).toBe(1);
+        } else {
+          // Without TimescaleDB the plain table stays, the rollup is skipped and the version is still recorded.
+          expect(rows.map((r: { version: string }) => r.version)).toContain("0009_usage_rollup");
+          const view = await sql`SELECT to_regclass('gateway_usage_15m') AS r`;
+          expect(view[0].r).toBeNull();
         }
+      } finally {
+        await sql.close();
+      }
+    });
+  });
+
+  describe("usage rollup", () => {
+    const DAY = 86_400_000;
+    const start = Date.UTC(2026, 9, 20); // 20 Oct 2026
+    const zones = ["UTC", "Asia/Bangkok", "Europe/London", "Asia/Kathmandu", "Australia/Lord_Howe", "America/St_Johns"];
+    const providers = ["claude", "codex"] as const;
+    const apps = ["web", "batch", "bot"];
+    const models = ["claude-sonnet-4-5", "claude-opus-4-1", "gpt-5", null, "unknown-model-x"];
+
+    // Small deterministic generator (LCG), so a failure repeats.
+    function rng(seed: number): () => number {
+      let x = seed >>> 0;
+      return () => {
+        x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+        return x / 2 ** 32;
+      };
+    }
+
+    function makeRows(from: number, to: number, count: number, seed: number) {
+      const rnd = rng(seed);
+      const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)] as T;
+      // Instants that are local midnights in the tested zones on the tested days, and bucket edges.
+      const special: number[] = [];
+      for (let d = Math.floor(from / DAY) * DAY; d < to; d += DAY) {
+        for (const mins of [0, 17 * 60, 18 * 60 + 15, 13 * 60, 2 * 60 + 30, 3 * 60 + 30, 23 * 60, 15, 30, 45]) special.push(d + mins * 60_000);
+      }
+      const rows = [];
+      for (let i = 0; i < count; i += 1) {
+        const r = rnd();
+        let ts: number;
+        if (r < 0.2) ts = special[Math.floor(rnd() * special.length)] as number;
+        else if (r < 0.4) ts = from + Math.floor(rnd() * ((to - from) / 900_000)) * 900_000;
+        else ts = from + Math.floor(rnd() * (to - from));
+        ts = Math.min(Math.max(ts, from), to - 1);
+        const hasCost = rnd() < 0.6;
+        const tokens = () => (rnd() < 0.1 ? 0 : Math.floor(rnd() * 5000));
+        rows.push({
+          ts: new Date(ts).toISOString(),
+          app: pick(apps),
+          provider: pick(providers),
+          identity: `id${Math.floor(rnd() * 4)}`,
+          model: pick(models) ?? undefined,
+          inputTokens: tokens(),
+          outputTokens: tokens(),
+          cacheReadTokens: tokens(),
+          cacheWriteTokens: tokens(),
+          estCostUsd: hasCost ? Math.round(rnd() * 1e6) / 1e5 : undefined,
+          status: "ok",
+          httpStatus: 200,
+          latencyMs: 5,
+          streamed: false,
+        });
+      }
+      return rows;
+    }
+
+    async function refresh(): Promise<void> {
+      const sql = new SQL(url as string);
+      try {
+        await sql.unsafe("CALL refresh_continuous_aggregate('gateway_usage_15m', NULL, NULL)");
+      } finally {
+        await sql.close();
+      }
+    }
+
+    const iso = (ms: number): Date => new Date(ms);
+    // Unaligned, aligned, short and open ranges, plus a range across the London DST end (25 Oct 2026).
+    const ranges: { name: string; since: Date; until?: Date }[] = [
+      { name: "all time", since: new Date("1970-01-01T00:00:00.000Z") },
+      { name: "all time with until", since: new Date("1970-01-01T00:00:00.000Z"), until: iso(start + 9 * DAY) },
+      { name: "unaligned both ends", since: iso(start + 2 * DAY + 7 * 60_000 + 13), until: iso(start + 6 * DAY + 41 * 60_000 + 977) },
+      { name: "aligned both ends", since: iso(start + 3 * DAY + 900_000), until: iso(start + 7 * DAY + 3 * 900_000) },
+      { name: "until on a boundary", since: iso(start + DAY + 123_456), until: iso(start + 5 * DAY) },
+      { name: "since on a boundary, until open", since: iso(start + 4 * DAY + 2 * 900_000) },
+      { name: "since unaligned, until open", since: iso(start + 4 * DAY + 5 * 60_000) },
+      { name: "shorter than a bucket", since: iso(start + 3 * DAY + 60_000), until: iso(start + 3 * DAY + 9 * 60_000) },
+      { name: "one bucket exactly", since: iso(start + 3 * DAY), until: iso(start + 3 * DAY + 900_000) },
+      { name: "just over one bucket", since: iso(start + 3 * DAY - 1), until: iso(start + 3 * DAY + 900_001) },
+      { name: "empty", since: iso(start + 3 * DAY), until: iso(start + 3 * DAY) },
+      { name: "DST end in London", since: new Date("2026-10-24T20:00:00.000Z"), until: new Date("2026-10-26T05:30:00.000Z") },
+      { name: "before the data", since: new Date("2020-01-01T00:00:00.000Z"), until: new Date("2020-02-01T00:00:00.000Z") },
+    ];
+
+    function expectSameRows(got: unknown[], want: unknown[], label: string): void {
+      expect(got.length, `${label}: row count`).toBe(want.length);
+      for (let i = 0; i < want.length; i += 1) {
+        const g = got[i] as Record<string, unknown>;
+        const w = want[i] as Record<string, unknown>;
+        const { estCostUsd: gc, ...gRest } = g;
+        const { estCostUsd: wc, ...wRest } = w;
+        expect(gRest, `${label}: row ${i}`).toEqual(wRest);
+        expect(Math.abs((gc as number) - (wc as number)), `${label}: cost of row ${i}`).toBeLessThan(1e-6);
+      }
+    }
+
+    async function compareAll(rollup: PgGatewayStore, raw: PgGatewayStore, stage: string): Promise<void> {
+      for (const r of ranges) {
+        const label = `${stage} / ${r.name}`;
+        expectSameRows(await rollup.usageByIdentity(r.since, r.until), await raw.usageByIdentity(r.since, r.until), `${label} / identity`);
+        expectSameRows(await rollup.usageByModel(r.since, r.until), await raw.usageByModel(r.since, r.until), `${label} / model`);
+        for (const tz of zones) {
+          expectSameRows(await rollup.usageByModelDaily(r.since, r.until, tz), await raw.usageByModelDaily(r.since, r.until, tz), `${label} / daily ${tz}`);
+        }
+      }
+    }
+
+    test("rollup reads equal raw reads before and after each refresh, with late rows", async () => {
+      const rollup = await fresh();
+      const raw = new PgGatewayStore(url as string, { usageRollup: "off" });
+      stores.push(raw);
+      const hasTimescale = await rollup.usesUsageRollup();
+      if (Boolean(process.env.CI) && !optOut) expect(hasTimescale).toBe(true);
+      expect(await raw.usesUsageRollup()).toBe(false);
+      if (!hasTimescale) {
+        console.warn("SKIP usage rollup equivalence: TimescaleDB is not available");
+        return;
+      }
+      // Stage 0: nothing materialised, so every row comes from the real-time tail.
+      await rollup.appendUsage(makeRows(start, start + 9 * DAY, 3000, 1));
+      await compareAll(rollup, raw, "unrefreshed");
+      // Stage 1: materialised.
+      await refresh();
+      await compareAll(rollup, raw, "refreshed");
+      // Stage 2: rows after the watermark come through the real-time path.
+      await rollup.appendUsage(makeRows(start + 9 * DAY, start + 10 * DAY + 6 * 3_600_000, 800, 2));
+      await compareAll(rollup, raw, "real-time tail");
+      // Stage 3: late rows inside the materialised range show after the next refresh.
+      await rollup.appendUsage(makeRows(start + DAY, start + 8 * DAY, 500, 3));
+      await refresh();
+      await compareAll(rollup, raw, "second refresh");
+    }, 120_000);
+
+    test("an invalid zone fails on both paths and a zone off the 15-minute grid reads the raw ledger", async () => {
+      const rollup = await fresh();
+      const raw = new PgGatewayStore(url as string, { usageRollup: "off" });
+      stores.push(raw);
+      await rollup.appendUsage(makeRows(start, start + 3 * DAY, 200, 4));
+      const since = new Date("1970-01-01T00:00:00.000Z");
+      const bad = await rollup.usageByModelDaily(since, undefined, "Not/AZone").then(() => undefined, (e) => e);
+      const badRaw = await raw.usageByModelDaily(since, undefined, "Not/AZone").then(() => undefined, (e) => e);
+      expect(bad).toBeDefined();
+      expect(badRaw).toBeDefined();
+      // A fixed offset of +00:07 is not a multiple of 15 minutes.
+      const odd = "<+00:07>-00:07";
+      expectSameRows(await rollup.usageByModelDaily(since, undefined, odd), await raw.usageByModelDaily(since, undefined, odd), "odd offset");
+    });
+
+    test("migrate succeeds again after the rollup is dropped and rebuilds it", async () => {
+      const s = await fresh();
+      if (!(await s.usesUsageRollup())) return;
+      const sql = new SQL(url as string);
+      try {
+        await sql`DROP MATERIALIZED VIEW gateway_usage_15m CASCADE`;
+        await sql`DELETE FROM schema_migrations WHERE version = '0009_usage_rollup'`;
+        await migrate(url as string);
+        const r = await sql`SELECT to_regclass('gateway_usage_15m') AS r`;
+        expect(r[0].r).toBe("gateway_usage_15m");
       } finally {
         await sql.close();
       }
