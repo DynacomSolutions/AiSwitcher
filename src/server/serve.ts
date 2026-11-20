@@ -3,7 +3,8 @@ import { join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, statSync } from "node:fs";
 import { browserAuthFromEnv } from "./browser-authorize.ts";
-import { createApp } from "./app.ts";
+import { createApp, createWidgetService } from "./app.ts";
+import { parseWidgetsPort, widgetsListenerFetch } from "./widgets.ts";
 import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
 import { loadSpendGuardConfig, SpendGuardScheduler } from "./spend-guard.ts";
 import { loadHerdrBridgeConfig, HerdrBridgeScheduler } from "./herdr-bridge.ts";
@@ -210,6 +211,8 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     ...(browserAuth ? { browserAuth } : {}),
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
+  // One widget panel service (one cache) for the main listener and the optional widgets listener.
+  deps.widgets = createWidgetService(deps);
   const app = createApp(deps);
   const lifecycle = new ServerLifecycle();
 
@@ -265,6 +268,9 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     },
   });
 
+  // Optional read-only widgets listener (AIS_WIDGETS_PORT). Off by default. No auth: see docs/agents/console-web.md.
+  const widgetsServer = startWidgetsListener(process.env.AIS_WIDGETS_PORT, port, host, deps.widgets, lifecycle);
+
   if (options.managed !== false) {
     warmUsageCaches();
     const actualPort = server.port ?? port;
@@ -294,6 +300,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
       claudeSwap?.stop();
       resetExpiryPush?.stop();
       loginFlows.stop();
+      void widgetsServer?.stop(false);
       void stopServerAfterDrain(server, lifecycle).then(finishShutdownWhenDrained);
     };
     process.on("SIGTERM", shutdown);
@@ -315,7 +322,47 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     }
   }
 
-  return { port: server.port ?? port, token, stop: () => { stopUsageSnapshotSampler(); scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); claudeSwap?.stop(); resetExpiryPush?.stop(); loginFlows.stop(); server.stop(true); } };
+  return { port: server.port ?? port, token, stop: () => { stopUsageSnapshotSampler(); scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); claudeSwap?.stop(); resetExpiryPush?.stop(); loginFlows.stop(); void widgetsServer?.stop(true); server.stop(true); } };
+}
+
+/** Starts the widgets-only listener when AIS_WIDGETS_PORT is valid. A bad value logs an error and starts nothing; the main server is not affected. */
+export function startWidgetsListener(
+  raw: string | undefined,
+  mainPort: number,
+  host: string,
+  widgets: Parameters<typeof widgetsListenerFetch>[0],
+  lifecycle: ServerLifecycle,
+  log: (line: string) => void = console.error,
+): { stop(closeActiveConnections?: boolean): Promise<void> } | undefined {
+  const parsed = parseWidgetsPort(raw, mainPort);
+  if (parsed.error) {
+    log(`[ais] widgets listener not started: ${parsed.error}`);
+    return undefined;
+  }
+  if (parsed.port === undefined) return undefined;
+  try {
+    return Bun.serve({
+      port: parsed.port,
+      hostname: host,
+      idleTimeout: 120,
+      async fetch(req) {
+        const finishRequest = lifecycle.beginRequest();
+        if (!finishRequest) return Response.json({ ok: false, draining: true }, { status: 503 });
+        try {
+          return trackResponseBody(await widgetsListenerFetch(widgets, req), finishRequest);
+        } catch (error) {
+          finishRequest();
+          throw error;
+        }
+      },
+      error() {
+        return Response.json({ error: "internal error" }, { status: 500 });
+      },
+    });
+  } catch (error) {
+    log(`[ais] widgets listener not started: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
 }
 
 /** Best-effort discovery of the built WebUI dist relative to wherever this
