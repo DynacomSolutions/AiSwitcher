@@ -234,7 +234,11 @@ src/
     local/dispatch.ts          `ais local list|start`: local llama.cpp model (shared/local-models.ts)
     browser/                  `ais browser ...`: admin.ts (approve/list/revoke/agent-token), extension.ts
                              (`extension path|update [--from=<zip>]`: atomic install of the release asset
-                             ais-browser-extension.zip into ~/.ais/browser-extension), dispatch.ts.
+                             ais-browser-extension.zip into ~/.ais/browser-extension), dispatch.ts,
+                             wiring.ts (`wiring [--check] [--json]`), mcp-service.ts and
+                             mcp-service-cli.ts (`mcp-service install|status|uninstall`: the systemd
+                             user unit of the shared MCP server). The server itself (`mcp-serve`) is
+                             src/browser/mcp-http.ts, its config and launch headers mcp-http-config.ts.
                              Feature guide: docs/agents/browser.md
     version.ts               `ais version` (reads package.json)
     help.ts                   `ais help` / bare `ais` / `--help`/`-h`

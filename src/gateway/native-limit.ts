@@ -39,7 +39,7 @@ export interface LimitInfo {
 function slotOf(label: string): LimitSlot | undefined {
   const l = label.toLowerCase();
   if (/(five|5h|session|~[1-5]h|hour)/.test(l)) return "short";
-  if (/(seven|7d|week|day|~\d+d)/.test(l)) return "long";
+  if (/(seven|7d|week|month|day|~\d+d)/.test(l)) return "long";
   return undefined;
 }
 
@@ -51,7 +51,7 @@ function parseReset(v: string | undefined): number | undefined {
 }
 
 /** One member's windows, in the shapes the native answers need. */
-function windowsOf(usage: PoolUsage | undefined): LimitWindow[] {
+function windowsOf(usage: PoolUsage | undefined, reservePercent = 100): LimitWindow[] {
   const out: LimitWindow[] = [];
   for (const w of usage?.windows ?? []) {
     const slot = slotOf(w.label) ?? (out.some((o) => o.slot === "short") ? "long" : "short");
@@ -60,7 +60,11 @@ function windowsOf(usage: PoolUsage | undefined): LimitWindow[] {
     const at = out.findIndex((o) => o.slot === slot);
     // A per-model weekly window (left in only for a request for that model) stands for the week when it is fuller.
     if (at >= 0) {
-      if (w.model !== undefined && w.utilization > (out[at] as LimitWindow).utilization) out[at] = entry;
+      const have = out[at] as LimitWindow;
+      // Two plain windows in one slot (a weekly and a monthly): the fuller one stands, and of two full ones the later reset.
+      const later = (reset ?? 0) > (have.resetsAtSec ?? 0);
+      const bothFull = w.utilization >= reservePercent && have.utilization >= reservePercent;
+      if (w.model !== undefined ? w.utilization > have.utilization : bothFull ? later : w.utilization > have.utilization && have.utilization < reservePercent) out[at] = entry;
       continue;
     }
     out.push(entry);
@@ -73,7 +77,7 @@ function windowsOf(usage: PoolUsage | undefined): LimitWindow[] {
  * `reservePercent` has reset (the latest of those resets); with no window over the reserve, the busiest window decides.
  */
 function memberRecovery(usage: PoolUsage | undefined, reservePercent: number): { resetAtSec: number; claim: LimitSlot; windows: LimitWindow[] } | undefined {
-  const windows = windowsOf(usage);
+  const windows = windowsOf(usage, reservePercent);
   if (windows.length === 0) return undefined;
   let blocking = windows.filter((w) => w.utilization >= reservePercent);
   if (blocking.length === 0) blocking = [windows.reduce((a, b) => (b.utilization > a.utilization ? b : a))];
@@ -195,4 +199,16 @@ export function nativeLimitResponse(provider: GatewayProvider, usages: Array<Poo
   if (provider !== "claude" && provider !== "codex") return undefined;
   const info = summariseLimit(usages, reservePercent, now, extra);
   return provider === "claude" ? anthropicLimitResponse(info, now) : codexLimitResponse(info, now);
+}
+
+/**
+ * The earliest time a member is usable again, only when some member is blocked by a full window (at or over the reserve)
+ * with a known reset. Undefined when no reading shows a full window, so callers keep a short hold for a real burst 429.
+ */
+export function fullWindowReset(usages: Array<PoolUsage | undefined>, reservePercent: number, now: Date): number | undefined {
+  const nowSec = Math.floor(now.getTime() / 1000);
+  // A stale figure may predate a reset: it never sets a reset here.
+  const full = usages.filter((u) => u && !u.stale && !u.noPlan && windowsOf(u, reservePercent).some((w) => w.utilization >= reservePercent));
+  const info = summariseLimit(full, reservePercent, now);
+  return info.guessed || full.length === 0 ? undefined : Math.max(info.resetAtSec, nowSec + 1);
 }

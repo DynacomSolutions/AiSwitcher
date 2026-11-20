@@ -28,6 +28,7 @@ import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { browserLaunchEnv, browserLaunchWiring } from "./browser-wiring.ts";
+import { claudeSessionIdFromArgv, ensureMcpDaemonStarted, ensureMcpKey, mcpPort, mcpUnitInstalled } from "../browser/mcp-http-config.ts";
 import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
 import { addClaudeAccountPreload, CLAUDE_ACCOUNT_PRELOAD_MARKER, installClaudeAccountPreload } from "../identities/claude-account-preload.ts";
@@ -196,7 +197,17 @@ export async function runWrapper(
     }
     // A preset config dir (T3 Code sets CLAUDE_CONFIG_DIR) resolves no identity; map it back
     // to the registered one so a pool folder gets pool wiring instead of none.
-    const browserArgs = (await browserLaunchWiring({
+    // While the shared MCP service is installed (Linux), the server is wired as HTTP and started on demand; otherwise as stdio.
+    const mcpPortNumber = mcpPort();
+    let mcpKey: string | undefined;
+    if ((cfg.toolName === "claude" || cfg.toolName === "codex") && mcpUnitInstalled()) {
+      try {
+        mcpKey = ensureMcpKey();
+      } catch {
+        mcpKey = undefined; // no usable key: keep the stdio form
+      }
+    }
+    const browserWiring = await browserLaunchWiring({
       toolName: cfg.toolName,
       configDirValue: resolved.configDirValue,
       resolvedIdentity: resolved.identity,
@@ -206,7 +217,23 @@ export async function runWrapper(
       firstArg: parsed.cleanedArgv[0],
       aisBinary: resolveInstalledAisBinary(),
       loadFile: () => loadIdentitiesFile(cfg.identitiesJsonPath),
-    })).args;
+      ...(mcpKey
+        ? {
+            http: {
+              port: mcpPortNumber,
+              key: mcpKey,
+              ownerPid: process.pid,
+              cwd: process.cwd(),
+              home: resolved.configDirValue,
+              ...(cfg.toolName === "claude" && claudeSessionIdFromArgv(parsed.cleanedArgv) ? { sessionId: claudeSessionIdFromArgv(parsed.cleanedArgv)! } : {}),
+              ...(process.env.T3CODE_THREAD_ID ? { t3Thread: process.env.T3CODE_THREAD_ID } : {}),
+              ...(process.env.T3CODE_HOME ? { t3Home: process.env.T3CODE_HOME } : {}),
+            },
+          }
+        : {}),
+    });
+    const browserArgs = browserWiring.args;
+    if (mcpKey && browserArgs.length > 0) await ensureMcpDaemonStarted(mcpPortNumber);
     const launchArgs = cfg.toolName === "codex"
       ? codexSubcommandConfigArgs([...browserArgs, ...memoryProjection.argv])
       : [...browserArgs, ...gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd())];
@@ -253,6 +280,7 @@ export async function runWrapper(
           })(),
           ...extraEnv,
           ...browserLaunchEnv(cfg.toolName, browserArgs, process.env),
+          ...browserWiring.env,
           ...memoryProjection.env,
           ...(cfg.toolName === "codex" ? await codexLocalGatewayEnv(resolved.configDirValue) : {}),
           ...claudeAccountPreloadEnv,

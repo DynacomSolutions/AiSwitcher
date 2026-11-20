@@ -48,6 +48,39 @@ T3 Code starts Claude and Codex through the AIS shims with `CLAUDE_CONFIG_DIR` /
 
 Reason (owner report, 19 Nov 2026): the T3 "Pool (Claude)" instance moved to a folder under `~/.t3/gateway`. That folder matched no identity, so resumed threads lost the `ais-browser` tools.
 
+## Shared MCP service
+
+Reason (owner report, 19 Nov 2026): a moved T3 folder and one MCP process per session left sessions without browser tools. Each launch started its own stdio `ais browser mcp` process (about 110 MB each). When the wiring failed, the session had no tools at all. The owner asked for one shared server that starts when needed.
+
+Design:
+- `ais browser mcp-serve` is one daemon for all sessions on a host. It speaks MCP Streamable HTTP on `127.0.0.1` only, port 47150 (env `AIS_BROWSER_MCP_PORT`), path `/mcp`.
+- It answers `POST` with `application/json` (no SSE), `202` for notifications, `405` for `GET /mcp`, and `GET /healthz` with `200` (`503` while it drains). `DELETE /mcp` ends that session.
+- It is stateless per request. It needs no `initialize` and ignores an unknown `Mcp-Session-Id`, so a daemon restart is invisible to clients.
+- Code: `src/browser/mcp-http.ts` (daemon), `src/browser/mcp-http-config.ts` (headers, key, auto start), `src/cli/browser/mcp-service.ts` (unit). The daemon reuses `handleRpc`, `callTool` and `sendSessionEnd` from `mcp-shim.ts`.
+- The launch describes its session in headers: `X-AIS-Pool`, `X-AIS-Tool`, `X-AIS-Identity`, `X-AIS-Config-Dir`, `X-AIS-Home`, `X-AIS-Gateway`, `X-AIS-Session-Id`, `X-AIS-T3-Thread`, `X-AIS-T3-Home`, `X-AIS-Cwd`, `X-AIS-Owner-Pid`. Paths are percent-encoded. The daemon checks every value: absolute paths without `..`, numeric pid, known tool.
+- The session key is the Claude transcript id (from `<home>/sessions/<pid>.json`, else the `--session-id` or `--resume` value of the launch, else `agent-<pid>`). The daemon keeps one context per key, so chat-name caching, call cancel and session end work as in the stdio shim.
+
+Key and safety:
+- The key is in `~/.ais/browser-mcp/key` (file 0600, folder 0700, 32 random bytes as hex). The daemon or the installer creates it. Requests need `Authorization: Bearer <key>`, compared in constant time. AIS never logs or prints the key.
+- A `Host` or `Origin` that is not loopback gets `403` (DNS rebinding guard).
+- Claude Code expands `${AIS_BROWSER_MCP_KEY}` in the `headers` of `--mcp-config`. The launch passes `Bearer ${AIS_BROWSER_MCP_KEY}` in the args and sets the real key only in the environment of the launched tool, so the key never shows in `ps`. Codex 0.167 supports `url`, `http_headers` and `bearer_token_env_var`: it gets the same env variable and `bearer_token_env_var`.
+
+Session end:
+- `DELETE /mcp` sends the session end notice, so the extension closes the tabs of the session.
+- A reaper runs every 30 s and sends the notice when `X-AIS-Owner-Pid` no longer exists (the launcher execs the tool, so it is the agent pid). A context without a pid expires after 30 min idle.
+- On SIGTERM the daemon stops accepting, finishes in-flight calls and exits, with no timers. It never sends session end for live sessions on its own restart.
+
+Unit and install:
+- `ais-browser-mcp.service` is a systemd user unit (`Restart=always`, `RestartSec=1s`, `MemoryHigh=512M`, `MemoryMax=1G`). It is ready only when the port listens.
+- `ais browser mcp-service install|status|uninstall` manages it. `ais update` and the host install run the install with `respectDisabled` (a unit you stopped stays stopped) and restart it when the binary changes.
+- Linux with a systemd user manager only. On macOS or without systemd nothing is installed.
+
+Wiring and fallback:
+- While the unit file exists, launches wire the HTTP form (Claude `type: http`, Codex `url`). If the port does not answer a 200 ms TCP connect, the launch runs `systemctl --user start --no-block ais-browser-mcp.service` and goes on.
+- Without the unit file the stdio wiring is unchanged (macOS, and hosts that did not install the service).
+- `ais browser wiring` prints `mode: http` or `mode: stdio` and whether the daemon answers (`--json` adds `mode` and `daemonAnswering` to each row).
+- A session that started before the install keeps its stdio process until you resume it.
+
 ## Tools
 
 `list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.

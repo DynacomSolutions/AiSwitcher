@@ -1,4 +1,5 @@
 import type { ParsedArgs } from "../args.ts";
+import { isLimitsProbe } from "../../shared/limits-probe.ts";
 import { boolFlag, stringFlag } from "../args.ts";
 import { green } from "../colors.ts";
 import { CliUsageError } from "../errors.ts";
@@ -100,6 +101,8 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
     // discard output and errors; unlike `sync now`, this never makes a user
     // wait for SSH and never turns an unavailable host into a command error.
     case "background": {
+      // A usage probe loads plugins that may start sync; never do work there.
+      if (isLimitsProbe()) return;
       if (boolFlag(flags, "pull-only") && boolFlag(flags, "push-only")) return;
       const direction = boolFlag(flags, "pull-only") ? "pull" : boolFlag(flags, "push-only") ? "push" : "both";
       const scope = scopeFromFlags(flags);

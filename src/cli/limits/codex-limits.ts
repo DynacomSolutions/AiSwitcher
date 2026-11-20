@@ -1,4 +1,5 @@
 import type { Identity } from "../../identities/types.ts";
+import { isLimitsProbe } from "../../shared/limits-probe.ts";
 import { hasMemberCopy, memberDir, memberStoreEnabled, memberStoreRoot } from "../../identities/gateway-members.ts";
 import { classifyLogin } from "../../identities/gateway-routed.ts";
 import { codexAccountOf, codexAuthPath, parseCodexAuth, readCodexAuthText } from "../../identities/codex-auth.ts";
@@ -449,6 +450,10 @@ export function isCodexAuthRejectionError(error: string | undefined): boolean {
 export async function fetchCodexLimits(identity: Identity, deps: CodexStoreUsageDeps = {}): Promise<FetchedLimitResult> {
   // Routed through the AIS gateway: the folder holds the gateway entry and the login lives in the gateway member store.
   if (readsViaMemberStore(identity, deps.memberRoot)) return fetchCodexLimitsViaStore(identity, deps);
+  // A usage probe must never start another probe (see shared/limits-probe.ts).
+  if (isLimitsProbe()) {
+    return { toolName: "codex", identity, windows: [], status: "unavailable", error: "usage probes are disabled inside a usage probe" };
+  }
   // ONE reconcile per fetch, BEFORE the first attempt: pi may hold a
   // fresher copy of this account's grant (its own copy is refreshed during
   // pi usage), and adopting the freshest copy here is what stops
