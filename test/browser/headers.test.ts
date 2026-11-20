@@ -1,0 +1,69 @@
+import { expect, test } from "bun:test";
+import { browserHeaders, isOtherProviderName } from "../../src/browser/headers.ts";
+
+const TOKEN = "aisg_SYNTHETIC_FIXTURE_tok_abc";
+const id = (name: string, extra: object = {}) => ({ name, label: name, configDir: `/ids/${name}`, ...extra });
+const file: any = {
+  version: 1,
+  identities: [id("alpha"), id("beta", { retired: true }), id("team-pool", { configDir: "/ids/pool", swapPool: { accounts: ["alpha"], active: "alpha" } })],
+};
+const real = (p: string): string => {
+  if (p.endsWith("/projects") || p.endsWith("/sessions")) throw new Error("ENOENT");
+  return p;
+};
+const base = {
+  cwd: "/w/proj",
+  loadFile: async () => file,
+  real,
+  t3Gateway: "/t3/gateway",
+  readToken: async (dir: string) => (dir === "/ids/alpha" ? TOKEN : undefined),
+  poolAuth: async () => ({ identity: "alpha", token: TOKEN }),
+  label: async () => "Fix the login page",
+};
+
+test("claude identity: bearer token, session id, encoded label, no pool", async () => {
+  const h = await browserHeaders({ ...base, env: { CLAUDE_CONFIG_DIR: "/ids/alpha", CLAUDE_CODE_SESSION_ID: "0b3b1a52-3c1e-4f7e-9d54-3a0f6d2a9c11" } });
+  expect(h.Authorization).toBe(`Bearer ${TOKEN}`);
+  expect(h["X-AIS-Session-Id"]).toBe("0b3b1a52-3c1e-4f7e-9d54-3a0f6d2a9c11");
+  expect(decodeURIComponent(h["X-AIS-Session-Label"]!)).toBe("Fix the login page");
+  expect(h["X-AIS-Pool"]).toBeUndefined();
+});
+
+test("pool folder: active member token and pool header", async () => {
+  const h = await browserHeaders({ ...base, env: { CLAUDE_CONFIG_DIR: "/ids/pool" } });
+  expect(h.Authorization).toBe(`Bearer ${TOKEN}`);
+  expect(h["X-AIS-Pool"]).toBe("team-pool");
+  expect(h["X-AIS-Session-Id"]).toBeUndefined();
+});
+
+test("T3 gateway folder maps by name", async () => {
+  const h = await browserHeaders({ ...base, env: { CLAUDE_CONFIG_DIR: "/t3/gateway/t3-claude-alpha" } });
+  expect(h.Authorization).toBe(`Bearer ${TOKEN}`);
+});
+
+test("codex: --tool and --config-dir, no session id header", async () => {
+  const h = await browserHeaders({ ...base, env: { CLAUDE_CODE_SESSION_ID: "x" }, tool: "codex", configDir: "/ids/alpha" });
+  expect(h.Authorization).toBe(`Bearer ${TOKEN}`);
+  expect(h["X-AIS-Session-Id"]).toBeUndefined();
+});
+
+test("prints nothing for no identity, retired identity, no token, pool error, other providers, no folder", async () => {
+  expect(await browserHeaders({ ...base, env: { CLAUDE_CONFIG_DIR: "/elsewhere" } })).toEqual({});
+  expect(await browserHeaders({ ...base, env: { CLAUDE_CONFIG_DIR: "/ids/beta" } })).toEqual({});
+  expect(await browserHeaders({ ...base, readToken: async () => undefined, env: { CLAUDE_CONFIG_DIR: "/ids/alpha" } })).toEqual({});
+  expect(await browserHeaders({ ...base, poolAuth: async () => ({ error: "no token" }), env: { CLAUDE_CONFIG_DIR: "/ids/pool" } })).toEqual({});
+  expect(await browserHeaders({ ...base, env: { CLAUDE_CONFIG_DIR: "/t3/gateway/t3-claude-kimi-alpha" } })).toEqual({});
+  expect(await browserHeaders({ ...base, env: { CLAUDE_CONFIG_DIR: "/t3/gateway/t3-claude-zai-pool" } })).toEqual({});
+  expect(await browserHeaders({ ...base, env: {} })).toEqual({});
+  expect(await browserHeaders({ ...base, loadFile: async () => { throw new Error("x"); }, env: { CLAUDE_CONFIG_DIR: "/ids/alpha" } })).toEqual({});
+});
+
+test("a provider folder named like an identity is still refused", async () => {
+  const f: any = { version: 1, identities: [id("t3-claude-kimi-alpha", { configDir: "/t3/gateway/t3-claude-kimi-alpha" })] };
+  expect(await browserHeaders({ ...base, loadFile: async () => f, env: { CLAUDE_CONFIG_DIR: "/t3/gateway/t3-claude-kimi-alpha" } })).toEqual({});
+});
+
+test("provider name check", () => {
+  for (const n of ["t3-claude-kimi-alpha", "t3-claude-zai-pool", "kimi", "zai-x"]) expect(isOtherProviderName(n)).toBe(true);
+  for (const n of ["t3-claude-alpha", "pool", "team"]) expect(isOtherProviderName(n)).toBe(false);
+});

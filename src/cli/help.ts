@@ -125,7 +125,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   browser: {
-    usage: "ais browser approve|list|revoke|agent-token|extension|wiring|mcp|upload ...",
+    usage: "ais browser approve|list|revoke|agent-token|extension|headers|codex-config|mcp|upload ...",
     desc: "AIS Browser: bind Chrome extensions to an identity or swap pool; agent tokens",
     examples: ["ais browser approve ABCD2345 --identity=work --name=work-chrome"],
     subs: {
@@ -140,15 +140,19 @@ export const HELP: Record<string, HelpNode> = {
         "ais browser extension path | update [--from=<zip>]",
         "path prints the folder to Load unpacked (~/.ais/browser-extension); update installs the latest ais-browser-extension.zip release asset there atomically (gh, else GITHUB_TOKEN/GH_TOKEN), or --from=<zip> for a local file",
       ),
-      wiring: sub(
-        "ais browser wiring [--check] [--json]",
-        "For each enabled T3 Code claude/codex instance (from <T3 home>/userdata/settings.json), run the launch wiring steps and print its folder, mapped identity or pool, and wired or NOT wired with the reason. --check exits 1 when any instance is not wired; never prints tokens",
+      headers: sub(
+        "ais browser headers [--tool=claude|codex] [--config-dir=<dir>]",
+        "Prints the JSON headers (bearer token of the session's identity or pool member, session id, session name, pool) for the gateway MCP endpoint /browser/mcp. Claude runs it as headersHelper of the shared-skills plugin, Codex as http_headers_helper. Prints {} for a folder with no identity, a Kimi or Z.ai folder, or no token. Not for manual use: it prints a token",
+      ),
+      "codex-config": sub(
+        "ais browser codex-config [<codex home>...] [--check] [--remove]",
+        "Writes the ais-browser MCP server (gateway URL and headers helper, no token) in a managed block of each Codex folder's config.toml. Without folders: every Codex identity folder and every t3-codex-* folder. Skips Kimi and Z.ai folders. --check reports only, --remove deletes the block",
       ),
       upload: sub(
         "ais browser upload --session <id> [--label <name>] --tab <tabId> (--ref <ref> | --coordinate <x,y>) [--browser <name>] <paths...>",
         "Upload files from this machine to a page's file input through the gateway. The gateway MCP server cannot read your files, so its upload_file tool error names this command with the session id. Limits: 10 files, 10 MiB in total",
       ),
-      mcp: sub("ais browser mcp", "Stdio MCP server exposing the browser tools; started by Claude and Codex launches that have an agent token when the gateway address is not known (not for manual use). With a known gateway address, launches use its shared HTTP endpoint /browser/mcp instead"),
+      mcp: sub("ais browser mcp", "Stdio MCP server exposing the browser tools (a fallback for a client that cannot reach the gateway endpoint /browser/mcp; launches no longer start it). It reads upload_file paths itself"),
     },
   },
   swap: {

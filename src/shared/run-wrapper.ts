@@ -19,18 +19,12 @@ import { codexLocalGatewayEnv } from "../identities/codex-gateway-home.ts";
 import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
 import { gatePluginArgs } from "./plugin-gating.ts";
 import { poolLaunchCheck } from "../identities/pool/launch.ts";
-import { loadIdentitiesFile } from "../identities/store.ts";
 import { adapterFor } from "../identities/pool/registry.ts";
 import { runLaunchGate } from "../spend/gate.ts";
 import type { HerdrChatTool } from "./herdr-chat-source.ts";
 import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
-import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import { browserLaunchEnv, browserLaunchWiring } from "./browser-wiring.ts";
-import { claudeSessionIdFromArgv } from "../browser/mcp-launch.ts";
-import { launchSessionLabel } from "../browser/session-label.ts";
-import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
 
 export function herdrTitleForLaunch(
@@ -185,35 +179,9 @@ export async function runWrapper(
       resolved.configDirValue,
       sharedConfigArgs,
     );
-    const gatewayUrl = cfg.toolName !== "claude" && cfg.toolName !== "codex" ? undefined : process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
-    // A preset config dir (T3 Code sets CLAUDE_CONFIG_DIR) resolves no identity; map it back
-    // to the registered one so a pool folder gets pool wiring instead of none.
-    // With a known gateway URL and a token, the browser server is wired as the gateway's HTTP endpoint (no process starts here); otherwise as stdio.
-    const browserTool = cfg.toolName === "claude" || cfg.toolName === "codex" ? cfg.toolName : undefined;
-    const browserWiring = await browserLaunchWiring({
-      toolName: cfg.toolName,
-      configDirValue: resolved.configDirValue,
-      resolvedIdentity: resolved.identity,
-      fromEnv: resolved.source === "env",
-      activeIdentity,
-      gatewayUrl,
-      firstArg: parsed.cleanedArgv[0],
-      aisBinary: resolveInstalledAisBinary(),
-      loadFile: () => loadIdentitiesFile(cfg.identitiesJsonPath),
-      ...(gatewayUrl && browserTool
-        ? {
-            http: {
-              ...(browserTool === "claude" && claudeSessionIdFromArgv(parsed.cleanedArgv) ? { sessionId: claudeSessionIdFromArgv(parsed.cleanedArgv)! } : {}),
-              // Looked up only when a token exists (see browserLaunchWiring).
-              label: () => launchSessionLabel(process.env, browserTool, process.cwd()),
-            },
-          }
-        : {}),
-    });
-    const browserArgs = browserWiring.args;
     const launchArgs = cfg.toolName === "codex"
-      ? codexSubcommandConfigArgs([...browserArgs, ...memoryProjection.argv])
-      : [...browserArgs, ...gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd())];
+      ? codexSubcommandConfigArgs([...memoryProjection.argv])
+      : [...gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd())];
     const inheritedTitleOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
     const liveImage = isAisLive();
     const chatTitleTool = herdrTitleForLaunch(cfg.toolName, Boolean(parentSession), inheritedTitleOwner, liveImage);
@@ -256,8 +224,6 @@ export async function runWrapper(
             }
           })(),
           ...extraEnv,
-          ...browserLaunchEnv(cfg.toolName, browserArgs, process.env),
-          ...browserWiring.env,
           ...memoryProjection.env,
           ...(cfg.toolName === "codex" ? await codexLocalGatewayEnv(resolved.configDirValue) : {}),
           ...(titleOwnerPid !== undefined ? { AIS_HERDR_TITLE_OWNER_PID: titleOwnerPid } : {}),
