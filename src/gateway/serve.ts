@@ -636,7 +636,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       : undefined,
   );
   const canonical = hooks.canonical ?? canonicalResolver();
-  const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : new SQL(opts.databaseUrl, { max: 2, connection: { statement_timeout: 5_000 } });
+  // No startup parameters here: the database pooler refuses them ("unsupported startup parameter: statement_timeout").
+  // The usage source bounds every shared call itself.
+  const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : new SQL(opts.databaseUrl, { max: 2 });
   const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
   const usage = createUsageSource({
     fetchUsage: hooks.fetchUsage ?? withOpencodeUsage(creds, fetchPoolUsage),
