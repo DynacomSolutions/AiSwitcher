@@ -1,8 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runBrowserWiring } from "../../src/cli/browser/wiring.ts";
 import { identityForConfigDir } from "../../src/shared/browser-wiring.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ais-t3-wiring-"));
@@ -53,45 +52,35 @@ test("retired identities never map", () => {
   expect(map(join(gw, "t3-claude-beta"))).toBeUndefined();
 });
 
-test("wiring check: wired and unwired instances", async () => {
-  const t3 = join(root, "t3");
-  mkdirSync(join(t3, "userdata"), { recursive: true });
-  const poolDir = join(root, "ids", "alpha");
-  mkdirSync(poolDir, { recursive: true });
-  writeFileSync(join(poolDir, "ais-browser-token"), "SYNTHETIC_FIXTURE-token\n");
-  const reg = join(root, "claude-identities.json");
-  const f = {
-    version: 1,
-    identities: [
-      { name: "alpha", label: "alpha", configDir: poolDir },
-      { name: "team-pool", label: "p", configDir: join(root, "ids", "pool"), aliases: ["shared-pool"], swapPool: { accounts: ["alpha"], active: "alpha" } },
-    ],
+test("a launcher's own folder maps to the identity its transcript link points into; unrelated links do not", () => {
+  const id = (name: string, dir: string, extra: object = {}) => ({ name, label: name, configDir: dir, ...extra });
+  const file: any = { version: 1, identities: [id("work", "/ids/work"), id("old", "/ids/old", { retired: true }), id("cx", "/cx/cx")] };
+  const links: Record<string, string> = {
+    "/t3/claude-work/projects": "/ids/work/projects",
+    "/t3/codex-cx/sessions": "/cx/cx/sessions",
+    "/t3/claude-old/projects": "/ids/old/projects",
+    "/t3/stray/projects": "/elsewhere/projects",
+    "/t3/plain/projects": "/t3/plain/projects",
   };
-  writeFileSync(reg, JSON.stringify(f));
-  const inst = (driver: string, homePath: string, enabled = true) => ({ driver, enabled, config: { homePath } });
-  writeFileSync(join(t3, "userdata", "settings.json"), JSON.stringify({
-    providerInstances: {
-      "shared-pool": inst("claudeAgent", join(gw, "shared-pool")),
-      "t3-claude-gamma": inst("claudeAgent", join(gw, "t3-claude-gamma")),
-      "t3-claude-off": inst("claudeAgent", join(gw, "t3-claude-off"), false),
-      "t3-grok-x": inst("grok", join(gw, "t3-grok-x")),
-    },
-  }));
-  const lines: string[] = [];
-  const res = await runBrowserWiring({ check: true }, { t3Home: t3, aisBinary: "/bin/ais", registryPath: () => reg, gatewayUrl: async () => undefined, out: (l) => lines.push(l) });
-  expect(res.ok).toBe(false);
-  expect(res.rows.map((r) => [r.instance, r.target, r.wired, r.reason])).toEqual([
-    ["shared-pool", "pool:team-pool", true, undefined],
-    ["t3-claude-gamma", null, false, "no identity"],
-  ]);
-  expect(lines.join("\n")).toContain("NOT wired: no identity");
-  expect(lines.join("\n")).not.toContain("SYNTHETIC_FIXTURE");
-  const json: string[] = [];
-  await runBrowserWiring({ json: true }, { t3Home: t3, aisBinary: "/bin/ais", registryPath: () => reg, gatewayUrl: async () => undefined, out: (l) => json.push(l) });
-  expect(JSON.parse(json[0]!)).toHaveLength(2);
-  const none = await runBrowserWiring({}, { t3Home: t3, aisBinary: undefined, registryPath: () => reg, gatewayUrl: async () => undefined, out: () => {} });
-  expect(none.rows[0]!.reason).toBe("ais binary not installed");
-  rmSync(join(poolDir, "ais-browser-token"));
-  const noTok = await runBrowserWiring({}, { t3Home: t3, aisBinary: "/bin/ais", registryPath: () => reg, gatewayUrl: async () => undefined, out: () => {} });
-  expect(noTok.rows[0]!.reason).toBe("no token");
+  const real = (p: string): string => {
+    if (p in links) return links[p]!;
+    if (p.endsWith("/projects") || p.endsWith("/sessions")) throw new Error("ENOENT");
+    return p;
+  };
+  expect(identityForConfigDir(file, "/t3/claude-work", real)?.name).toBe("work");
+  expect(identityForConfigDir(file, "/t3/codex-cx", real)?.name).toBe("cx");
+  expect(identityForConfigDir(file, "/t3/claude-old", real)).toBeUndefined();
+  expect(identityForConfigDir(file, "/t3/stray", real)).toBeUndefined();
+  expect(identityForConfigDir(file, "/t3/plain", real)).toBeUndefined();
+  expect(identityForConfigDir(file, "/t3/none", real)).toBeUndefined();
+});
+
+test("a preset config dir maps back to its registered pool and plain identity; retired and unknown folders map to nothing", () => {
+  const id = (name: string, extra: object = {}) => ({ name, label: name, configDir: `/m/${name}`, ...extra });
+  const pool = { name: "team-pool", label: "p", configDir: "/ids/swap", swapPool: { accounts: ["a", "b"], active: "a" } };
+  const file: any = { version: 1, identities: [id("a"), id("b"), id("old", { configDir: "/ids/old", retired: true }), pool] };
+  expect(identityForConfigDir(file, "/ids/swap/")?.name).toBe("team-pool");
+  expect(identityForConfigDir(file, "/m/a")?.name).toBe("a");
+  expect(identityForConfigDir(file, "/ids/old")).toBeUndefined();
+  expect(identityForConfigDir(file, "/elsewhere")).toBeUndefined();
 });

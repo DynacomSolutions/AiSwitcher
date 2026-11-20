@@ -239,11 +239,11 @@ src/
     browser/                  `ais browser ...`: admin.ts (approve/list/revoke/agent-token), extension.ts
                              (`extension path|update [--from=<zip>]`: atomic install of the release asset
                              ais-browser-extension.zip into ~/.ais/browser-extension), dispatch.ts,
-                             wiring.ts (`wiring [--check] [--json]`), upload.ts (`upload`: files from
+                             headers.ts + src/browser/headers.ts (`headers`: JSON headers for the gateway MCP endpoint, run by the Claude plugin's headersHelper and by Codex), codex-config.ts (`codex-config`: managed `[mcp_servers.ais-browser]` block in Codex config.toml), upload.ts (`upload`: files from
                              the agent's machine, posted to /browser/call). The shared MCP server is
                              the gateway: src/gateway/browser/mcp.ts (`POST|DELETE /browser/mcp`),
                              call path in gateway/browser/routing.ts; shared parts in
-                             src/browser/mcp-core.ts, launch headers in src/browser/mcp-launch.ts.
+                             src/browser/mcp-core.ts, header builder in src/browser/mcp-launch.ts. No launcher wiring: the server entry comes from the .ais plugin.
                              Feature guide: docs/agents/browser.md
     version.ts               `ais version` (reads package.json)
     help.ts                   `ais help` / bare `ais` / `--help`/`-h`

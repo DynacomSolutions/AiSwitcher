@@ -187,7 +187,7 @@ async function readToken(env: NodeJS.ProcessEnv, configDir?: string): Promise<st
   return undefined;
 }
 
-async function readTokenFile(dir: string): Promise<string | undefined> {
+export async function readTokenFile(dir: string): Promise<string | undefined> {
   try {
     return (await readFile(join(dir, BROWSER_TOKEN_FILE), "utf8")).trim() || undefined;
   } catch {

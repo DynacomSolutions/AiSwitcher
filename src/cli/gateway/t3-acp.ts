@@ -55,13 +55,17 @@ export async function runT3AcpCommand(args: string[], flags: ParsedArgs["flags"]
 export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions = {}): Promise<number> {
   const [agentId, ...rest] = argv;
   if (agentId === "--supported") return 0;
+  if (agentId === "--supported=binary") return 0; // old builds know no `--binary=`: they fail this probe
   if (!agentId) {
     process.stderr.write("ais __acp_relay: an agent id is required\n");
     return 2;
   }
-  const fallback = rest[0]?.startsWith("--fallback=") ? rest[0].slice("--fallback=".length) : undefined;
-  const agentArgs = fallback !== undefined ? rest.slice(1) : rest;
-  const install = (await resolveAgentInstall(agentId, opts)) ?? (fallback ? { agentId, version: "0", executable: fallback } : undefined);
+  // `--binary=<path>` runs exactly that executable (the grok launcher has already chosen it); `--fallback=` is the last resort.
+  const first = rest[0] ?? "";
+  const binary = first.startsWith("--binary=") ? first.slice("--binary=".length) : undefined;
+  const fallback = first.startsWith("--fallback=") ? first.slice("--fallback=".length) : undefined;
+  const agentArgs = binary !== undefined || fallback !== undefined ? rest.slice(1) : rest;
+  const install = binary ? { agentId, version: "0", executable: binary } : ((await resolveAgentInstall(agentId, opts)) ?? (fallback ? { agentId, version: "0", executable: fallback } : undefined));
   if (!install) {
     process.stderr.write(`ais __acp_relay: T3 Code has no install of ${agentId}\n`);
     return 127;
@@ -70,5 +74,6 @@ export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions =
   const env = { ...process.env };
   if (install.binDirectory) env.PATH = `${install.binDirectory}${process.platform === "win32" ? ";" : ":"}${env.PATH ?? ""}`;
   const adapter = adapterFor(agentId, env);
-  return runAcpRelay({ command: install.executable, args: agentArgs, env, ...(adapter ? { adapter } : {}) });
+  // The idle-permission answer was measured with kimi-code only; other agents keep their own wake turns and approval mode.
+  return runAcpRelay({ command: install.executable, args: agentArgs, env, ...(adapter ? { adapter } : {}), ...(agentId === "kimi-code" ? {} : { answerIdlePermissions: false }) });
 }
