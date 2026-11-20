@@ -35,6 +35,7 @@ import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import * as claudeResets from "./claude-resets.ts";
 import { poolsUsage, type PoolsUsageResponse } from "./pools-usage.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
+import { renderReadinessMetrics } from "./limits-warm.ts";
 import type { ResetExpiryNotifier } from "./reset-expiry-push.ts";
 import { mountBrowserAuthorize, type BrowserAuthConfig } from "./browser-authorize.ts";
 import { loadBrowserBindings, revokeBrowserBinding, type BrowserBindingsView } from "./browser-bindings.ts";
@@ -145,13 +146,14 @@ async function registryPoolKeys(): Promise<Set<string>> {
 }
 
 /** The `/api/limits` answer: the host scan merged with the gateway limits, with accounts per row. */
-async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string; identity?: string }, maxAgeS: number): Promise<unknown> {
+async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string; identity?: string }, maxAgeS: number, onGateway?: (view: GatewayLimitsView | undefined) => void): Promise<unknown> {
   // The cluster gateway is the source of truth for the limits of the identities it manages; the host scan covers the rest.
   // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
   const [result, gateway] = await Promise.all([
     runScanIsolated("limits", { ...filters, maxAgeS }, 45_000),
     (deps.gatewayLimits ?? loadGatewayLimits)().catch(() => undefined),
   ]);
+  onGateway?.(gateway);
   if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "limits scan failed");
   const payload = gateway ? await mergeGatewayLimits(result.payload, gateway, filters) : result.payload;
   return withRowAccounts(payload);
@@ -159,8 +161,11 @@ async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string;
 
 /** The widget panel service over the same engines the `/api/*` routes use. serve.ts creates one and shares it with the widgets listener. */
 export function createWidgetService(deps: ConsoleAppDeps, linkBase?: string): WidgetService {
+  // A gateway read that failed (for example a timeout) leaves the host rows only. Such a panel is kept for a short time.
+  let limitsDegraded = false;
   return new WidgetService({
-    limits: () => loadLimitsPayload(deps, {}, 45),
+    limits: () => loadLimitsPayload(deps, {}, 45, (view) => void (limitsDegraded = view === undefined || view.error !== undefined)),
+    limitsDegraded: () => limitsDegraded,
     auth: async () => authApi.authStatus(Object.values(TOOL_CONFIGS), await freshRefreshStatus(deps.authRefresh)),
     processes: () => scanProcesses(),
     gatewayUsage: (days) => (deps.gatewayUsage ?? loadGatewayUsage)(days),
@@ -176,7 +181,7 @@ export function createWidgetService(deps: ConsoleAppDeps, linkBase?: string): Wi
 export function createApp(deps: ConsoleAppDeps): Hono {
   const app = new Hono();
 
-  app.get("/metrics", (c) => c.text(renderScanMetrics(), 200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" }));
+  app.get("/metrics", (c) => c.text(renderScanMetrics() + renderReadinessMetrics(), 200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" }));
 
   app.onError((err, c) => {
     if (err instanceof HttpError) return c.json({ error: err.message }, err.status as 400);
