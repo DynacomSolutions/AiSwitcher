@@ -145,6 +145,40 @@ test("leaves wrong hosts, methods, paths, and tokens untouched", async () => {
   }
 });
 
+test("does not consume an unrelated POST body while checking fetch scope", async () => {
+  let received = "";
+  const server = createServer((request, response) => {
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => { received += chunk; });
+    request.on("end", () => { response.writeHead(200); response.end("ok"); });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not expose a port");
+    const root = await mkdtemp(join(tmpdir(), "ais-claude-preload-"));
+    roots.push(root);
+    const config = join(root, "claude");
+    await mkdir(config, { recursive: true });
+    await writeFile(config + "/settings.json", JSON.stringify({ env: { ANTHROPIC_BASE_URL: "https://gateway.invalid" } }));
+    await writeFile(config + "/.credentials.json", JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE" } }));
+    const preload = await installClaudeAccountPreload(root);
+    const script = `const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode("unrelated-body")); controller.close(); } }); fetch("http://127.0.0.1:${address.port}/unrelated", { method: "POST", body, duplex: "half" }).then((response) => response.text()).then(console.log).catch((error) => { console.error(error); process.exitCode = 1; });`;
+    const child = Bun.spawn([process.execPath, "--preload", preload, "-e", script], {
+      env: { ...process.env, CLAUDE_CONFIG_DIR: config, AIS_CLAUDE_ACCOUNT_PRELOAD: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([child.stdout.text(), child.stderr.text(), child.exited]);
+    expect(exitCode, `${stderr}\n${stdout}`).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout.trim()).toBe("ok");
+    expect(received).toBe("unrelated-body");
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
 test("removes the AIS bearer before a cross-origin fetch redirect", async () => {
   const gatewayRequests: { url: string; auth?: string }[] = [];
   const redirectRequests: { url: string; auth?: string }[] = [];

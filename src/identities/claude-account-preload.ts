@@ -219,14 +219,18 @@ syncBuiltinESMExports();
 const nativeFetch = globalThis.fetch;
 if (typeof nativeFetch === "function") {
   globalThis.fetch = function aisClaudeFetch(input, init) {
+    let inputUrl;
+    let method;
+    try {
+      inputUrl = new URL(input instanceof Request ? input.url : String(input));
+      method = init && init.method !== undefined ? init.method : input instanceof Request ? input.method : "GET";
+    } catch { return nativeFetch.apply(this, arguments); }
+    if (inputUrl.origin !== "https://api.anthropic.com" || String(method).toUpperCase() !== "GET" || !accountPath(inputUrl.pathname + inputUrl.search)) return nativeFetch.apply(this, arguments);
     let effective;
     try { effective = input instanceof Request ? new Request(input, init) : new Request(String(input), init); } catch { return nativeFetch.apply(this, arguments); }
-    let candidate;
-    try { candidate = new URL(effective.url); } catch { return nativeFetch.apply(this, arguments); }
-    const method = effective.method || "GET";
     const auth = effective.headers.get("authorization");
-    if (candidate.origin !== "https://api.anthropic.com" || String(method).toUpperCase() !== "GET" || !accountPath(candidate.pathname + candidate.search) || !hasGatewayAuth(auth)) return nativeFetch.apply(this, arguments);
-    const target = targetFor(candidate.pathname + candidate.search);
+    if (!hasGatewayAuth(auth)) return nativeFetch.apply(this, arguments);
+    const target = targetFor(inputUrl.pathname + inputUrl.search);
     // Fetch removes Authorization when a followed redirect changes origin. Keep the native redirect policy and this
     // rule, so an AIS bearer never crosses from the configured gateway to an unrelated origin.
     return nativeFetch.call(this, new Request(target, effective));
