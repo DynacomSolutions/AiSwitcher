@@ -1428,3 +1428,120 @@ describe("single refresher: dead logins, seeded metrics and the renewal route", 
     await waitFor(async () => (await metricsText(g)).includes('ais_gateway_login_revoked{provider="claude",identity="ka1"} 0'));
   });
 });
+
+describe("usage warm readiness", () => {
+  const metricsText = async (g: { port: number }): Promise<string> => (await fetch(`${base(g)}/metrics`)).text();
+  const readyText = async (g: { port: number }): Promise<{ status: number; text: string }> => {
+    const r = await fetch(`${base(g)}/readyz`);
+    return { status: r.status, text: await r.text() };
+  };
+  const limits = async (g: { adminPort: number }) =>
+    (await (await fetch(`http://127.0.0.1:${g.adminPort}/limits`, { headers: { authorization: `Bearer ${ADMIN}` } })).json()) as { limits: Array<{ provider: string; identity: string; status: string; maxUtilization?: number }> };
+  const LIVE = { status: "live" as const, maxUtilization: 42, windows: [], capturedAt: "2026-11-20T00:00:00.000Z" };
+
+  test("readyz waits for the slow identity, then limits shows its figure", async () => {
+    await seed();
+    let finish!: () => void;
+    const slow = new Promise<void>((r) => (finish = r));
+    const g = await boot({ usageFor: undefined, poolMembers: async () => [], fetchUsage: async () => (await slow, LIVE) });
+    await Bun.sleep(100);
+    const cold = await readyText(g);
+    expect(cold.status).toBe(503);
+    expect(cold.text).toBe("warming usage cache\n");
+    expect(g.ready()).toBe(false);
+    expect(await (await fetch(`${base(g)}/metrics`)).text()).toContain('ais_gateway_readiness_state{state="cold"} 1');
+    finish();
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const m = await metricsText(g);
+    expect(m).toContain("ais_gateway_ready 1");
+    expect(m).toContain('ais_gateway_readiness_state{state="warm"} 1');
+    expect(m).toContain("ais_gateway_usage_warmup_timeouts_total 0");
+    const row = (await limits(g)).limits.find((l) => l.identity === "id1");
+    expect(row?.status).toBe("live");
+    expect(row?.maxUtilization).toBe(42);
+  });
+
+  test("a never-resolving fetch times out, warns with the identity, and the gateway turns ready", async () => {
+    await seed();
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    const g = await boot({ usageFor: undefined, poolMembers: async () => [], usageWarmTimeoutMs: 80, fetchUsage: () => new Promise(() => {}) });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    expect(warnings.some((w) => w.includes("claude/id1"))).toBe(true);
+    const m = await metricsText(g);
+    expect(m).toContain("ais_gateway_usage_warmup_timeouts_total 1");
+    expect(m).toContain("ais_gateway_usage_warmup_cold_identities 1");
+    expect(m).toContain('ais_gateway_readiness_state{state="timeout"} 1');
+    expect(m).toContain('ais_gateway_readiness_state{state="cold"} 0');
+    expect(m).toContain("ais_gateway_ready 1");
+  });
+
+  test("readiness drops at once when stop starts", async () => {
+    await seed();
+    const g = await boot({ usageFor: undefined, poolMembers: async () => [], fetchUsage: async () => LIVE });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    expect(g.ready()).toBe(true);
+    const stopped = g.stop();
+    expect(g.ready()).toBe(false);
+    await stopped;
+  });
+
+  test("a warm set that never resolves still turns ready after the timeout", async () => {
+    await seed();
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    const g = await boot({ usageFor: undefined, poolMembers: () => new Promise<string[]>(() => {}), usageWarmTimeoutMs: 80, fetchUsage: async () => LIVE });
+    const t0 = Date.now();
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200, 1500);
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(warnings.some((w) => w.includes("<warm set unreadable>"))).toBe(true);
+    expect(await metricsText(g)).toContain("ais_gateway_usage_warmup_timeouts_total 1");
+  });
+
+  test("an enumeration that keeps failing ends as a timeout", async () => {
+    await seed();
+    const g = await boot({ usageFor: undefined, poolMembers: async () => [], canonical: async () => { throw new Error("registry unreadable"); }, usageWarmTimeoutMs: 80, fetchUsage: async () => LIVE });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200, 1500);
+    const m = await metricsText(g);
+    expect(m).toContain("ais_gateway_usage_warmup_timeouts_total 1");
+    expect(m).toContain('ais_gateway_readiness_state{state="timeout"} 1');
+  });
+
+  test("stop during the warm-up is not ready, counts no timeout and warns nothing", async () => {
+    await seed();
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    const g = await boot({ usageFor: undefined, poolMembers: async () => [], usageWarmTimeoutMs: 150, fetchUsage: () => new Promise(() => {}) });
+    await Bun.sleep(30);
+    expect(g.ready()).toBe(false);
+    const stopped = g.stop();
+    expect(g.ready()).toBe(false);
+    await stopped;
+    await Bun.sleep(250);
+    expect(warnings.some((w) => w.includes("ready anyway"))).toBe(false);
+  });
+
+  test("the warm-up duration gauge is above zero after a delayed warm", async () => {
+    await seed();
+    const g = await boot({ usageFor: undefined, poolMembers: async () => [], fetchUsage: async () => (await Bun.sleep(60), LIVE) });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const m = await metricsText(g);
+    const seconds = Number(/ais_gateway_usage_warmup_seconds ([0-9.]+)/.exec(m)?.[1]);
+    expect(seconds).toBeGreaterThan(0);
+  });
+
+  test("the warm set is the one GET /limits lists, with pool members and aliases", async () => {
+    await seed();
+    const fetched: string[] = [];
+    const g = await boot({
+      usageFor: undefined,
+      poolMembers: async (p) => (p === "claude" ? ["m1", "alias2"] : []),
+      canonical: async (_p, i) => (i === "alias2" ? "m2" : i),
+      fetchUsage: async (p, i) => (fetched.push(`${p}/${i}`), LIVE),
+    });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    expect([...new Set(fetched)].sort()).toEqual(["claude/id1", "claude/m1", "claude/m2"]);
+    const listed = (await limits(g)).limits.map((l) => `${l.provider}/${l.identity}`).sort();
+    expect(listed).toEqual([...new Set(fetched)].sort());
+  });
+});

@@ -15,7 +15,7 @@ const MAX_USAGE_DAYS = 90;
 
 const PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"];
 /** Providers whose subscription usage the usage source can read (GET /limits). The others have no account windows. */
-const LIMITS_PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "zai"];
+export const LIMITS_PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "zai"];
 const STYLES: readonly ApiStyle[] = ["anthropic", "openai"];
 /** Paths the proxy port answers itself; an app of this name could never be reached. */
 const RESERVED_NAMES = new Set(["healthz", "readyz", "metrics", "browser"]);
@@ -202,6 +202,27 @@ export function parseHistoryBody(raw: unknown): UsageHistoryRow[] | string {
   return out;
 }
 
+/**
+ * The identities GET /limits lists for one provider, sorted: canonical pool members plus the identities of active pinned apps.
+ * The gateway warm-up uses this too, so the warmed set and the listed set cannot drift.
+ */
+export async function limitsIdentities(
+  deps: Pick<AdminDeps, "poolMembers" | "canonical">,
+  apps: readonly GatewayApp[],
+  provider: GatewayProvider,
+): Promise<string[]> {
+  const names = new Set<string>();
+  // One unreadable registry must not blank the other providers: keep this provider's pinned identities.
+  const members = deps.poolMembers ? await deps.poolMembers(provider).catch(() => [] as string[]) : [];
+  for (const member of members) names.add((await deps.canonical?.(provider, member)) ?? member);
+  for (const app of apps) {
+    if (app.state === "active" && app.provider === provider && app.target.kind === "pin") {
+      names.add((await deps.canonical?.(provider, app.target.identity)) ?? app.target.identity);
+    }
+  }
+  return [...names].sort();
+}
+
 export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
   const read = deps.readStore ?? store;
@@ -232,16 +253,8 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const limits: AdminLimitRow[] = [];
     for (const provider of LIMITS_PROVIDERS) {
       if (providerFilter !== undefined && provider !== providerFilter) continue;
-      const names = new Set<string>();
-      // One unreadable registry must not blank the other providers: keep this provider's pinned identities.
-      const members = deps.poolMembers ? await deps.poolMembers(provider).catch(() => [] as string[]) : [];
-      for (const member of members) names.add((await deps.canonical?.(provider, member)) ?? member);
-      for (const app of apps) {
-        if (app.state === "active" && app.provider === provider && app.target.kind === "pin") {
-          names.add((await deps.canonical?.(provider, app.target.identity)) ?? app.target.identity);
-        }
-      }
-      for (const identity of [...names].sort()) {
+      const names = await limitsIdentities(deps, apps, provider);
+      for (const identity of names) {
         if (identityFilter !== undefined && identity !== identityFilter) continue;
         const usage = await deps.usageFor(provider, identity).catch(() => undefined);
         limits.push({ provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }) });
