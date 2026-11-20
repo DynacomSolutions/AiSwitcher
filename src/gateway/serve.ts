@@ -20,6 +20,7 @@ import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { isOperationalPath, publicHostsFromEnv, viaPublicHost } from "./public-host.ts";
 import { aliSessionOnce, aliSetupSelfTest, listAliAccounts, type AliSetupDeps } from "./ali-session.ts";
+import { withStoreWaitTimeout } from "./admin-store.ts";
 import { createAdminApp, limitsIdentities, LIMITS_PROVIDERS, type IdentityState } from "./admin.ts";
 import { createWarmGate, positiveIntEnv } from "../shared/warm-gate.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
@@ -704,6 +705,22 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     adminToken: opts.adminToken,
     now,
     renewal: () => buildRenewalReport({ tools: GATEWAY_REFRESH_TOOLS, accounts: renewalAccounts, summary: () => refreshBackend.summary?.() ?? Promise.resolve([]), isRevoked: (tool, name, fingerprint) => fingerprint !== undefined && deadLogins.get(`${tool}/${name}`)?.fingerprint === fingerprint, now }),
+    ...(homeStore
+      ? {
+          // Host credential sync over HTTP (admin-store.ts): the host never opens a database connection of its own.
+          storeAdmin: {
+            homeStore,
+            journal: async (provider: string, identity: string, oldFp: string) => {
+              const lock = await refreshBackend.acquire({ provider, identity }, 5_000);
+              try {
+                return await lock.findByOldFp(oldFp);
+              } finally {
+                await lock.release();
+              }
+            },
+          },
+        }
+      : {}),
     identityState: hooks.identityState ?? defaultIdentityState,
     // The same cached usage reads the proxy selects on: the console Limits page shows them through GET /limits.
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
@@ -951,7 +968,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const adminServer = Bun.serve({
     hostname: hooks.host ?? "0.0.0.0",
     port: opts.adminPort,
-    fetch: (req) => (relay && req.method === "POST" && new URL(req.url).pathname === RELAY_PATH ? relay.handleRelay(req) : admin.fetch(req)),
+    // The store long poll (/store/wait) outlasts Bun's 10 s idle timeout: its request timeout is switched off.
+    fetch: withStoreWaitTimeout((req) => (relay && req.method === "POST" && new URL(req.url).pathname === RELAY_PATH ? relay.handleRelay(req) : admin.fetch(req))),
   });
 
   const checkLedger = watchLedger(ledger, alerter);

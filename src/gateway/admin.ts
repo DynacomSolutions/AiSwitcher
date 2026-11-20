@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { AppRevokedError, revokedMessage, type GatewayStore } from "./store.ts";
 import { registerBrowserAdmin } from "./browser/admin.ts";
+import { registerStoreAdmin, type StoreAdminDeps } from "./admin-store.ts";
 import type { LoginRenewal } from "./renewal.ts";
 import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
@@ -41,6 +42,8 @@ export interface AdminDeps {
   browserHub?: { revoke(binding: string): void };
   /** Who renews each gateway login and when (GET /logins/renewal); absent when the gateway has no refresh journal. */
   renewal?(): Promise<LoginRenewal[]>;
+  /** The credential store behind the host sync routes (/store/*, admin-store.ts); absent when the gateway has no credential store. */
+  storeAdmin?: StoreAdminDeps;
   /** One identity's cached subscription usage (GET /limits); absent when the gateway has no usage source. */
   usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   /** The member accounts of every swap pool of one provider (GET /limits). */
@@ -235,6 +238,8 @@ export function createAdminApp(deps: AdminDeps): Hono {
   });
   hono.onError(() => err(503, "store unavailable"));
   registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserHub ? { hub: deps.browserHub } : {}), ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
+
+  registerStoreAdmin(hono, deps.storeAdmin, (status, message, extra) => Response.json({ error: message, ...extra }, { status }));
 
   // Renewal state of every login the gateway keeps alive: journal (last refresh, last error) plus the stored login (expiry).
   hono.get("/logins/renewal", async (c) => {

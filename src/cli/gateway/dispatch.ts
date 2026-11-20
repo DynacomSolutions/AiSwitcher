@@ -237,7 +237,7 @@ async function runStoreCommand(args: string[], flags: ParsedArgs["flags"], deps:
 async function runStoreSync(once: boolean, deps: GatewayCliDeps): Promise<void> {
   const { describeHostSync, hostStoreConfig, hostSyncLockPath, hostSyncOnce, startHostSync } = await import("../../gateway/host-sync.ts");
   const cfg = await hostStoreConfig();
-  if (!cfg) throw new CliUsageError("No credential store configured on this host: run `ais gateway store setup --key-file=<path>` with the database URL on stdin (or set AIS_GATEWAY_STORE_DATABASE_URL and AIS_GATEWAY_STORE_KEY)");
+  if (!cfg) throw new CliUsageError("No credential store configured on this host: set AIS_GATEWAY_STORE_KEY (or AIS_GATEWAY_STORE_KEY_FILE), AIS_GATEWAY_ADMIN_URL and AIS_GATEWAY_ADMIN_TOKEN in ~/.secrets");
   if (once) {
     deps.out(describeHostSync(await hostSyncOnce(cfg)));
     return;
@@ -274,6 +274,8 @@ async function runStorePrune(dryRun: boolean, deps: GatewayCliDeps): Promise<voi
   const { hostStoreConfig } = await import("../../gateway/host-sync.ts");
   const cfg = await hostStoreConfig();
   if (!cfg) throw new CliUsageError("No credential store configured on this host: run `ais gateway store setup --key-file=<path>` first");
+  // Prune deletes rows, which the gateway API does not offer, so it keeps the direct database path (an owner command, run once at a rollout).
+  if (!cfg.databaseUrl) throw new CliUsageError("`ais gateway store prune` needs direct database access: set AIS_GATEWAY_STORE_DIRECT=1 and AIS_GATEWAY_STORE_DATABASE_URL for this one command");
   const { PgHomeStore } = await import("../../gateway/home-store.ts");
   const { pruneUnmanagedLogins } = await import("../../gateway/store-prune.ts");
   const { loadGatewayRenewal } = await import("../../server/gateway-renewal.ts");

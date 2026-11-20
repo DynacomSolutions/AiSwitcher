@@ -70,8 +70,8 @@ reconciliation.
   snapshot dirty. A configDir change syncs without `cwd` (only crush-backed
   tools read it); a `.crush` change syncs with that cwd. The same daemon also
   supervises the host credential-store sync (`sync/store-sync-supervisor.ts`,
-  `docs/agents/gateway.md` "Host files"): only on a host whose
-  `AIS_GATEWAY_STORE_DATABASE_URL` is set (env or `~/.secrets`), as a separate
+  `docs/agents/gateway.md` "Host files"): only on a host that holds the store key
+  (`AIS_GATEWAY_STORE_KEY` or `_KEY_FILE`, env or `~/.secrets`), as a separate
   `ais gateway store sync` child, because the store import switches on the
   member-store view for its whole process. Sidecars never scan:
   without the daemon only the post-exit sync runs, by design. A root's first

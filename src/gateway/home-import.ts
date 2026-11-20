@@ -13,7 +13,7 @@ import type { Identity } from "../identities/types.ts";
 import { loadGatewayGuard } from "../sync/gateway-guard.ts";
 import { storeMayHoldLogin } from "./host-login-gate.ts";
 import { isFresher, isReplacedLogin, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
-import { sha256Hex, type HomeFileKind, type PgHomeStore } from "./home-store.ts";
+import { sha256Hex, type HomeFileKind, type HomeStoreClient } from "./home-store.ts";
 import type { RefreshGuardBackend } from "./refresh-guard.ts";
 
 /**
@@ -130,7 +130,7 @@ const relOf = (home: string, abs: string): string | undefined => {
 };
 
 export async function importHome(
-  store: PgHomeStore,
+  store: Pick<HomeStoreClient, "get" | "put">,
   opts: { home?: string; dryRun?: boolean; lock?: RefreshGuardBackend; entries?: ImportEntry[]; lockTimeoutMs?: number } = {},
 ): Promise<ImportReport> {
   const home = opts.home ?? homedir();

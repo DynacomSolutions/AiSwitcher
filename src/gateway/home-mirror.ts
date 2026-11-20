@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
-import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type PgHomeStore } from "./home-store.ts";
+import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type HomeStoreClient } from "./home-store.ts";
 
 /**
  * One replica's side of the PostgreSQL credential store (home-store.ts): keeps the replica's HOME in step with the rows.
@@ -155,7 +155,7 @@ export function mergeByKey(mine: string, theirs: string): Buffer | undefined {
 export const REPLACED_MARKER_FILE = "login-replaced.json";
 
 /** The marker row beside a member-store login path (same folder), or undefined. A read problem counts as none. */
-export async function replacedFingerprintsFor(store: PgHomeStore, loginRel: string): Promise<Set<string>> {
+export async function replacedFingerprintsFor(store: Pick<HomeStoreClient, "get">, loginRel: string): Promise<Set<string>> {
   const slash = loginRel.lastIndexOf("/");
   if (slash < 0 || !loginRel.includes("gateway-members/")) return new Set();
   const markerRel = `${loginRel.slice(0, slash)}/${REPLACED_MARKER_FILE}`;
@@ -169,7 +169,7 @@ export async function replacedFingerprintsFor(store: PgHomeStore, loginRel: stri
 }
 
 /** True when `content` still holds a refresh token the owner replaced at `loginRel`. */
-export async function isReplacedLogin(store: PgHomeStore, loginRel: string, content: string): Promise<boolean> {
+export async function isReplacedLogin(store: Pick<HomeStoreClient, "get">, loginRel: string, content: string): Promise<boolean> {
   const replaced = await replacedFingerprintsFor(store, loginRel);
   if (replaced.size === 0) return false;
   return refreshFingerprints(content).some((fp) => replaced.has(fp));
@@ -206,7 +206,7 @@ export class HomeMirror {
   lastSyncAt = 0;
 
   constructor(
-    readonly store: PgHomeStore,
+    readonly store: HomeStoreClient,
     opts: MirrorOptions = {},
   ) {
     this.home = opts.home ?? homedir();
