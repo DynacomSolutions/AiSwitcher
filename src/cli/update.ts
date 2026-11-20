@@ -1,3 +1,4 @@
+import { checkAndInstallAgentGuard, type AgentGuardDeps } from "../identities/agent-guard-install.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { open } from "node:fs/promises";
@@ -44,6 +45,8 @@ export interface UpdateOptions {
   installProfileSyncService?: (restartIfActive: boolean) => Promise<ProfileSyncServiceResult>;
   /** Test seam: registers the AIS Browser self-update helper; resolves with the Chrome manifests written. */
   installBrowserHost?: () => Promise<string[]>;
+  /** Test seam for the agent-guard step; `false` skips it. */
+  agentGuard?: AgentGuardDeps | false;
 }
 
 async function installedVersion(binary: string): Promise<string | undefined> {
@@ -155,6 +158,12 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     } catch (error) {
       console.log(`${prefix} ${yellow(`warning: AIS Browser self-update not registered: ${error instanceof Error ? error.message : String(error)}`)}`);
     }
+  }
+
+  // Checks every T3 gateway home and agent home; installs only when something is out of date. Never fails the update.
+  if (options.agentGuard ? true : options.agentGuard !== false && defaultShimDir) {
+    const line = await checkAndInstallAgentGuard(options.agentGuard || {}).catch(() => undefined);
+    if (line) console.log(`${prefix} ${line}`);
   }
 
   console.log(

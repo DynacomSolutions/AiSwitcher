@@ -330,21 +330,45 @@ async function gatewayUsagePanel(sources: WidgetSources): Promise<PanelBody> {
 
 /* ------------------------------- claude swap ------------------------------ */
 
+/** Highest 5-hour or weekly fraction (0..100) per Claude identity in the limits payload. Per-model windows are left out, as in `maxUtilization`. */
+function claudeLimitsByIdentity(payload: unknown): Map<string, { used: number; window: string }> {
+  const out = new Map<string, { used: number; window: string }>();
+  for (const result of asList((payload as Obj | undefined)?.results)) {
+    if (asString(result.toolName) !== "claude") continue;
+    const name = asString((result.identity as Obj | undefined)?.name);
+    if (name === "" || result.status === "unavailable") continue;
+    for (const w of asList(result.windows)) {
+      const used = asNumber(w.usedPercent);
+      const window = w.category === "session" ? "5-hour" : w.category === "week" && !w.model ? "weekly" : "";
+      if (used === undefined || window === "") continue;
+      const known = out.get(name);
+      if (!known || used > known.used) out.set(name, { used, window });
+    }
+  }
+  return out;
+}
+
 async function claudeSwapPanel(sources: WidgetSources): Promise<PanelBody> {
   const pools = await sources.claudeSwap?.();
   if (!pools || pools.length === 0) return { status: "unknown", summary: "No swap pool", stats: [], rows: [] };
+  // The console cannot read gateway logins, so members without direct usage use the shared limits data.
+  const needsLimits = pools.some((p) => p.rows.some((m) => asNumber(m.usage?.maxUtilization) === undefined));
+  const limits = needsLimits ? claudeLimitsByIdentity(await sources.limits().catch(() => undefined)) : new Map<string, { used: number; window: string }>();
   const rows: Row[] = [];
   for (const pool of pools) {
     for (const member of pool.rows) {
       const label = `${pool.pool} / ${member.name}`;
       const role = member.active ? "Active" : member.allowed ? "Standby" : "Not allowed";
-      const max = asNumber(member.usage?.maxUtilization);
+      const direct = asNumber(member.usage?.maxUtilization);
+      const fromLimits = direct === undefined ? limits.get(member.name) : undefined;
+      const max = direct ?? fromLimits?.used;
       if (max === undefined) {
-        rows.push({ label, detail: `${role}, no usage data`, value: "-", status: "unknown" });
+        const word = member.usage?.status && /^[a-z-]{1,24}$/.test(member.usage.status) ? member.usage.status : "unavailable";
+        rows.push({ label, detail: `${role}, usage ${word}`, value: "-", status: "unknown" });
         continue;
       }
       const fraction = clamp01(max / 100);
-      rows.push({ label, detail: role, value: pct(fraction), fraction, status: levelOfFraction(fraction) });
+      rows.push({ label, detail: fromLimits ? `${role}, ${fromLimits.window}` : role, value: pct(fraction), fraction, status: levelOfFraction(fraction) });
     }
   }
   const active = pools.flatMap((p) => p.rows).filter((m) => m.active).length;

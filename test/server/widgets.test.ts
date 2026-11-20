@@ -231,6 +231,41 @@ describe("panel mapping", () => {
     expect(none).toMatchObject({ status: "unknown", summary: "Spend guard not running" });
   });
 
+  test("claude-swap: members without direct usage take the limits fraction", async () => {
+    const pool = (rows: Array<{ name: string; usage?: { status: string; maxUtilization?: number } }>) => async () => [{ pool: "shared", rows: rows.map((r) => ({ ...r, active: false, allowed: true })) }];
+    const claude = (name: string, windows: unknown[], extra: object = {}) => limitsResult("anthropic", name, windows, { toolName: "claude", ...extra });
+    const src = sources({
+      limits: async () => ({
+        results: [
+          claude("alice", [
+            { category: "session", usedPercent: 30 },
+            { category: "week", usedPercent: 60 },
+            { category: "week", usedPercent: 99, model: "Model" },
+          ]),
+          claude("bob", [{ category: "session", usedPercent: 82 }, { category: "week", usedPercent: 10 }]),
+          claude("dora", [{ category: "session", usedPercent: 5 }]),
+          limitsResult("openai", "erin", [{ category: "session", usedPercent: 90 }], { toolName: "codex" }),
+        ],
+      }),
+      claudeSwap: pool([
+        { name: "alice", usage: { status: "unavailable" } },
+        { name: "bob", usage: { status: "unavailable" } },
+        { name: "dora", usage: { status: "live", maxUtilization: 20 } },
+        { name: "erin", usage: { status: "unavailable" } },
+        { name: "frank" },
+      ]),
+    });
+    const model = await panel("claude-swap", src);
+    const byLabel = Object.fromEntries(model.rows.map((r) => [r.label, r]));
+    expect(byLabel["shared / alice"]).toMatchObject({ detail: "Standby, weekly", fraction: 0.6, status: "ok" });
+    expect(byLabel["shared / bob"]).toMatchObject({ detail: "Standby, 5-hour", fraction: 0.82, status: "warn" });
+    expect(byLabel["shared / dora"]).toMatchObject({ detail: "Standby", fraction: 0.2 });
+    expect(byLabel["shared / erin"]).toMatchObject({ detail: "Standby, usage unavailable", status: "unknown" });
+    expect(byLabel["shared / frank"]).toMatchObject({ detail: "Standby, usage unavailable", status: "unknown" });
+    const full = await panel("claude-swap", sources({ limits: src.limits, claudeSwap: pool([{ name: "alice" }, { name: "bob" }]) }));
+    expect(full.status).toBe("warn");
+  });
+
   test("masks email-shaped values in every string", async () => {
     const src = sources({ auth: async () => ({ entries: [{ toolName: "claude", identity: "who@example.com", state: "ok" }] }) });
     const model = await panel("identities", src);
