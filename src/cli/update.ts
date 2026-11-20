@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { open } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { installBrowserMcpService } from "./browser/mcp-service.ts";
 import { defaultExtensionDir, installHost } from "./browser/extension.ts";
 import { runBackup } from "../../scripts/backup.ts";
 import { createProgressTracker, type BackupProgress } from "../shared/backup-progress.ts";
@@ -42,6 +43,10 @@ export interface UpdateOptions {
   fetchImpl?: typeof fetch;
   /** Test seam for the profile-sync user service step (Linux only). */
   installProfileSyncService?: (restartIfActive: boolean) => Promise<ProfileSyncServiceResult>;
+  /** Test seam for the shared browser MCP user service step (Linux only). */
+  installBrowserMcpService?: (restartIfActive: boolean) => Promise<{ path: string; changed: boolean; action: string }>;
+  /** Test seam for the platform check of the browser MCP service step. */
+  platform?: NodeJS.Platform;
   /** Test seam: registers the AIS Browser self-update helper; resolves with the Chrome manifests written. */
   installBrowserHost?: () => Promise<string[]>;
 }
@@ -145,6 +150,20 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     }
     const described = describeProfileSyncServiceResult(result);
     if (described) console.log(`${prefix} ${described.warn ? yellow(`warning: ${described.line}`) : described.line}`);
+  }
+
+  // The shared browser MCP server (Linux with systemd). A first install enables and starts it.
+  // A unit that was stopped on purpose stays stopped. Never fails the update.
+  if (
+    (options.platform ?? process.platform) === "linux" &&
+    (options.installBrowserMcpService || (defaultShimDir && (await Bun.file(join(shimDir, "ais")).exists())))
+  ) {
+    try {
+      const unit = await (options.installBrowserMcpService ?? ((restart) => installBrowserMcpService({ restartIfActive: restart, respectDisabled: true })))(aisUpdated);
+      console.log(`${prefix} browser MCP service ${unit.action}: ${unit.path}`);
+    } catch (error) {
+      console.log(`${prefix} browser MCP service skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   // The extension updates itself (side panel or automatically) through this helper; ais update never touches its files.

@@ -107,3 +107,50 @@ test("re-downloading the same ais does not restart the profile sync service", as
     expect(calls).toEqual([false]);
   } finally { log.mockRestore(); }
 });
+
+const releaseFetch = (async () => new Response("#!/bin/sh\necho 9.9.9\n")) as unknown as typeof fetch;
+const noProfileService = async () => ({ status: "no-user-manager" as const });
+
+test("update installs the browser MCP service on Linux and restarts it when ais changed", async () => {
+  const shimDir = await shims("0.0.1");
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  const calls: boolean[] = [];
+  try {
+    await runUpdate({
+      shimDir, skipBackup: true, fetchImpl: releaseFetch, platform: "linux",
+      installProfileSyncService: noProfileService as never,
+      installBrowserMcpService: async (restart) => (calls.push(restart), { path: "/u/ais-browser-mcp.service", changed: true, action: "started" }),
+    });
+    expect(calls).toEqual([true]);
+    expect(log.mock.calls.map((c) => String(c[0])).join("\n")).toContain("browser MCP service started: /u/ais-browser-mcp.service");
+  } finally { log.mockRestore(); }
+});
+
+test("a browser MCP service failure prints a skip line and the update still succeeds", async () => {
+  const shimDir = await shims("0.0.1");
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await runUpdate({
+      shimDir, skipBackup: true, fetchImpl: releaseFetch, platform: "linux",
+      installProfileSyncService: noProfileService as never,
+      installBrowserMcpService: async () => { throw new Error("no systemd"); },
+    });
+    const lines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(lines).toContain("browser MCP service skipped: no systemd");
+    expect(lines).toContain("done, updated 1 binary");
+  } finally { log.mockRestore(); }
+});
+
+test("update does not install the browser MCP service on darwin", async () => {
+  const shimDir = await shims("0.0.1");
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  let called = 0;
+  try {
+    await runUpdate({
+      shimDir, skipBackup: true, fetchImpl: releaseFetch, platform: "darwin",
+      installProfileSyncService: noProfileService as never,
+      installBrowserMcpService: async () => (called++, { path: "x", changed: true, action: "started" }),
+    });
+    expect(called).toBe(0);
+  } finally { log.mockRestore(); }
+});
