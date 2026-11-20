@@ -209,7 +209,7 @@ describe("grok launcher relay", () => {
       const fake = join(dir, "fakegrok");
       await writeFile(fake, '#!/bin/sh\necho "direct $*"\n', { mode: 0o755 });
       const ais = join(dir, "ais");
-      await writeFile(ais, '#!/bin/sh\n[ "$1" = "__acp_relay" ] && [ "$2" = "--supported" ] && exit 0\necho "relay $*"\n', { mode: 0o755 });
+      await writeFile(ais, '#!/bin/sh\n[ "$1" = "__acp_relay" ] && [ "$2" = "--supported=binary" ] && exit 0\necho "relay $*"\n', { mode: 0o755 });
       const l = join(dir, "launch");
       await writeFile(l, grokLauncherSource({ binary: fake, t3Home: dir, fallback: "/fb/grok", ais }));
       const go = async (...args: string[]) => {
@@ -217,7 +217,12 @@ describe("grok launcher relay", () => {
         return (await new Response(p.stdout).text()).trim();
       };
       expect(await go("agent", "stdio")).toBe(`relay __acp_relay grok-build --binary=${fake} agent stdio`);
+      for (const mode of ["auto", "default"]) expect(await go("--permission-mode", mode, "agent", "stdio")).toBe(`relay __acp_relay grok-build --binary=${fake} --permission-mode ${mode} agent stdio`);
       expect(await go("--version")).toBe("direct --version");
+      // An older ais answers `--supported` but not `--supported=binary`.
+      await writeFile(ais, '#!/bin/sh\n[ "$2" = "--supported" ] && exit 0\nexit 127\n', { mode: 0o755 });
+      expect(await go("agent", "stdio")).toBe("direct agent stdio");
+      expect(await go("--permission-mode", "auto", "agent", "stdio")).toBe("direct --permission-mode auto agent stdio");
       await writeFile(ais, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
       expect(await go("agent", "stdio")).toBe("direct agent stdio");
     } finally {

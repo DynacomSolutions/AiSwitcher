@@ -147,8 +147,14 @@ export function grokLauncherSource(opts: { binary?: string; t3Home: string; fall
     "fi",
     ...(opts.ais
       ? [
+          "# T3 starts the session as `agent stdio`, or `--permission-mode <mode> agent stdio`: `agent` can follow other flags.",
+          "IS_AGENT=0",
+          'for a in "$@"; do',
+          '  if [ "$a" = "agent" ]; then IS_AGENT=1; break; fi',
+          "done",
           `AIS=${shQuote(opts.ais)}`,
-          'if [ "$1" = "agent" ] && [ -x "$AIS" ] && "$AIS" __acp_relay --supported >/dev/null 2>&1; then',
+          "# `--supported=binary`: an older ais answers `--supported` but does not know `--binary=`, so it must fail this probe.",
+          'if [ "$IS_AGENT" = 1 ] && [ -x "$AIS" ] && "$AIS" __acp_relay --supported=binary >/dev/null 2>&1; then',
           '  exec "$AIS" __acp_relay grok-build "--binary=$BIN" "$@"',
           "fi",
         ]
