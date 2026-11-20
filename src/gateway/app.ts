@@ -14,7 +14,7 @@ import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadReque
 import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
-import { genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit, type LimitCandidate } from "./native-limit.ts";
+import { fullWindowReset, genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit, type LimitCandidate } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
@@ -862,7 +862,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
           h = holds.get(exKey(alt.identity));
         }
       }
-      if (h?.kind === "burst" && "identity" in free) {
+      // A burst-held member with no usage reading and no plan to read (it can never serve) must not pull the answer to a
+      // short retry while every member that has a reading is full: the answer is then the true reset of the full window.
+      const unreadable = h?.kind === "burst" && "identity" in free && (await deps.usageFor(app.provider, free.identity).catch(() => undefined))?.noPlan === true;
+      const trueReset = unreadable ? fullWindowReset(await memberUsages(app, deps, model), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, deps.now()) : undefined;
+      if (h?.kind === "burst" && "identity" in free && trueReset === undefined) {
         const secs = Math.min(60, Math.max(1, Math.ceil(((exhausted.get(exKey(free.identity)) ?? 0) - deps.now().getTime()) / 1000)));
         record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
         const res = providerError(style, 429, limitMessage("rate", Math.floor(deps.now().getTime() / 1000) + secs, "upstream rate limit, retry shortly"));
@@ -1164,9 +1168,15 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (!(upstreamMessage !== undefined && LIMIT_RESET_TEXT.test(upstreamMessage))) {
       const nowDate = deps.now();
       const heldUntil = exhausted.get(exKey(servedBy));
-      const resetAtSec = heldUntil !== undefined && heldUntil > nowDate.getTime()
-        ? Math.ceil(heldUntil / 1000)
-        : summariseLimit(await memberUsages(app, deps, model), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, nowDate, limitResets).resetAtSec;
+      const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
+      const usages = await memberUsages(app, deps, model);
+      // A full window in a usage reading gives the true reset. Only without one does the short hold of the member's own 429 count.
+      // Another member's full window must not beat this member's short hold while a member can still serve.
+      const served = await deps.usageFor(app.provider, servedBy).catch(() => undefined);
+      const servedBlocked = served?.noPlan === true || (served !== undefined && !served.stale && (utilisationOf(served) ?? 0) >= reserve);
+      const anyFree = usages.some((u) => u !== undefined && !u.stale && !u.noPlan && (utilisationOf(u) ?? 100) < reserve);
+      const resetAtSec = (servedBlocked || !anyFree ? fullWindowReset(usages, reserve, nowDate) : undefined)
+        ?? (heldUntil !== undefined && heldUntil > nowDate.getTime() ? Math.ceil(heldUntil / 1000) : summariseLimit(usages, reserve, nowDate, limitResets).resetAtSec);
       await discard(up);
       up = genericLimitResponse(style, resetAtSec, nowDate, redactText(upstreamMessage ?? "upstream rate limit", 120));
     }

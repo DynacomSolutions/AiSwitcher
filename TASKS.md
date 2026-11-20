@@ -221,6 +221,7 @@ ETA: 2026-11-20 14:00 ICT
 | 210 | Limits page: a spent Claude reset clears its windows at once, even while Anthropic rate-limits the usage read | done | claude | limits-multi-reset-refresh | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/564 (d5ccbb9), released v0.5.61.<br>Owner report 2026-11-17: three resets, one updated; the others waited out a 429 backoff (Retry-After, up to 15 min) and kept the old windows. The spend now zeroes the cleared windows (reset response `cleared`, else the grant kind) in the cached read and on the page. |
 | 217 | T3 usage view: OpenCode Go, Grok, Kimi and Z.ai limits through the AIS gateway | in_progress | claude | t3-usage-opencode-grok | | 2026-11-19 12:00 ICT | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/584, https://github.com/DynacomSolutions/AiSwitcher/pull/589, https://github.com/DynacomSolutions/AiSwitcher/pull/591; ships in v0.5.68.<br>Host: Kimi and Z.ai limits show in the T3 usage view; built-in Grok instance runs threads.<br>Cluster: pinned Claude usage and profile answer 200 from the eu3 T3 pod.<br>Next: OpenCode Go and Grok windows after the .cluster session widens the CONNECT CA name constraint. |
 | 239 | OpenCode homes get each gateway model's context and output limits | done | claude | opencode-model-limits | | | T3 showed 200,000 tokens for Kimi K3.1 Pro on the OpenCode pool. The model has 1,048,576.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/634 (3993341).<br>Live after release v0.5.77 and the host update. |
+| 241 | Limit answers use the true reset of the full window | in_progress | agent | gw-limit-true-reset | | 2026-11-20 17:00 ICT | Gateway had no usage reading for OpenCode members, so a limit answer used a short hold.<br>Fix: read Go plan windows, answer with the latest full window reset. |
 ## 6. Browser control extension
 ETA: 2026-11-18 18:30 ICT
 
@@ -336,3 +337,12 @@ One refresher per login across replicas and hosts, early renewal, a dead grant n
 | 240 | The gateway manages every live claude login; no "not managed" refusal for a login it serves | done | claude | gateway-manages-all-claude | 15.227 | | Fixes a regression from row 227 and a store prune (502 for one identity).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/621 (63593d2).<br>Live: the login renews in the gateway every 4 h, requests return 200. |
 | 231 | Kimi login has one refresher: the gateway usage poll no longer rotates it, pools hold no refresh token | done | claude | kimi-single-refresher | 15.221 | | Was 226 (id taken by 11.226).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/611 (00b8524), Opus review fixed.<br>Live: kimi journal chain continuous, one renewal per tick. |
 | 227 | Credential store holds only logins the gateway manages; WebUI ownership from the gateway list | done | claude | store-owned-matches-gateway | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/612 (375b818), Opus review fixed.<br>Prune removed 2 stale rows; live host copies kept. |
+
+## 16. Console data on Headlamp dashboards
+ETA: 2026-11-20 19:00 ICT
+The console serves the Headlamp widget panel API, so its identities, limits and agents show on Headlamp Dashboards.
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 242 | Console widget panel API: /api/widgets list and panels, read-only widgets listener | in_progress | claude | dashboard-widgets | | 2026-11-20 19:00 ICT | Panels follow the headlamp-plugins agent contract (PanelInfo, PanelModel v1).<br>Widgets listener off by default (AIS_WIDGETS_PORT). |
+| 243 | Cluster: widgets Service port and AIS_WIDGETS_PORT on the console | todo | claude | | 16.242 | | GitOps change in .cluster ais/k8s.<br>Headlamp reads it through the service proxy (RBAC). |

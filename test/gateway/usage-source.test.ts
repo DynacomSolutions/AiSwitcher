@@ -1,7 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { pickIdentity } from "../../src/gateway/select.ts";
-import { createUsageSource, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
+import { createUsageSource, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
 import type { GatewayApp } from "../../src/gateway/types.ts";
 
 const live = (u: number): PoolUsage => ({ status: "live", maxUtilization: u, capturedAt: "2026-11-02T00:00:00.000Z" });
@@ -242,5 +242,59 @@ describe("refreshNow (after a quota answer)", () => {
     await both;
     expect(calls).toEqual([undefined, true]);
     expect((await src.get("claude", "id1"))?.maxUtilization).toBe(77);
+  });
+});
+
+describe("opencode Go usage reading", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => { globalThis.fetch = realFetch; });
+  const answer = (status: number, body: unknown, seen?: { url?: string; auth?: string }): void => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (seen) { seen.url = String(url); seen.auth = new Headers(init?.headers).get("authorization") ?? undefined; }
+      return new Response(JSON.stringify(body), { status });
+    }) as unknown as typeof fetch;
+  };
+
+  test("reads the three windows with the member's key, percent and ISO reset", async () => {
+    const seen: { url?: string; auth?: string } = {};
+    answer(200, { usage: { rolling: { percent: 51, resetsAt: "2026-11-20T10:23:00.000Z" }, weekly: { percent: 100, status: "rate-limited", resetsAt: "2026-11-23T00:00:00.000Z" }, monthly: { percent: 20, resetsAt: "2026-12-01T00:00:00.000Z" } } }, seen);
+    const u = await fetchOpencodeUsage("KEY-1");
+    expect(seen.url).toBe("https://opencode.ai/zen/go/v1/usage");
+    expect(seen.auth).toBe("Bearer KEY-1");
+    expect(u?.status).toBe("rate-limited");
+    expect(u?.windows?.map((w) => [w.label, w.utilization, w.resetsAt])).toEqual([
+      ["session (5h)", 51, "2026-11-20T10:23:00.000Z"], ["week", 100, "2026-11-23T00:00:00.000Z"], ["month", 20, "2026-12-01T00:00:00.000Z"],
+    ]);
+  });
+
+  test("a key with no plan (no windows, or untouched windows with no reset) is a distinct no-plan state", async () => {
+    answer(200, { usage: {} });
+    expect(await fetchOpencodeUsage("K")).toMatchObject({ noPlan: true });
+    answer(200, { usage: { rolling: { percent: 0 }, weekly: { percent: 0 }, monthly: { percent: 0 } } });
+    expect(await fetchOpencodeUsage("K")).toMatchObject({ noPlan: true });
+  });
+
+  test("a failed read gives no figure, and the source keeps the last figure as stale", async () => {
+    answer(200, { usage: { weekly: { percent: 100, resetsAt: "2026-11-23T00:00:00.000Z" } } });
+    const fetchUsage = withOpencodeUsage({ get: async () => ({ accessToken: "K" }) }, async () => undefined);
+    const src = createUsageSource({ fetchUsage, ttlMs: 0 });
+    await src.prefill("opencode", "m1");
+    answer(500, {});
+    await src.prefill("opencode", "m1");
+    const kept = await src.get("opencode", "m1");
+    expect(kept?.stale).toBe(true);
+    expect(kept?.windows?.[0]?.utilization).toBe(100);
+  });
+
+  test("withOpencodeUsage sends other providers to the base fetcher", async () => {
+    const f = withOpencodeUsage({ get: async () => { throw new Error("no"); } }, async () => live(5));
+    expect(await f("claude", "x")).toEqual(live(5));
+  });
+
+  test("a no-plan reading is kept by the source", async () => {
+    answer(200, { usage: {} });
+    const src = createUsageSource({ fetchUsage: withOpencodeUsage({ get: async () => ({ accessToken: "K" }) }, async () => undefined) });
+    await src.prefill("opencode", "m2");
+    expect((await src.get("opencode", "m2"))?.noPlan).toBe(true);
   });
 });

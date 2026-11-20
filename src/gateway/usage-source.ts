@@ -3,6 +3,7 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
 import { adapterFor as poolAdapterFor } from "../identities/pool/registry.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { fetchZaiLimits } from "../cli/limits/zai-limits.ts";
+import { fetchOpencodeGoQuotaForKey } from "../cli/limits/opencode-limits.ts";
 import { usageFromLimits } from "../identities/pool/grant-file-adapter.ts";
 import type { GatewayProvider } from "./types.ts";
 
@@ -26,6 +27,22 @@ export const fetchPoolUsage: FetchUsage = async (provider, identity, opts) => {
   if (provider === "zai") return found ? zaiTokenUsage(await fetchZaiLimits(found)) : undefined;
   return found ? adapter!.fetchUsage(found, { noRefresh: true, ...(opts?.fresh ? { fresh: true } : {}) }) : undefined;
 };
+
+/**
+ * The OpenCode Go plan reading for one member, from its own key (rolling 5-hour, weekly and monthly dollar windows, each
+ * with its reset). A member with no Go plan, or a failed read, gives no figure, so it never blocks and never sets a reset.
+ */
+export async function fetchOpencodeUsage(apiKey: string): Promise<PoolUsage | undefined> {
+  const outcome = await fetchOpencodeGoQuotaForKey(apiKey);
+  if (outcome.noPlan) return { status: "unavailable", noPlan: true, capturedAt: new Date().toISOString() };
+  if (outcome.error || !outcome.windows) return undefined; // a failed read keeps the last figure (stale)
+  return usageFromLimits([{ status: "live", windows: outcome.windows }]);
+}
+
+/** The usage fetcher with the OpenCode Go branch: the opencode provider reads its Go plan with the member's own gateway credential, every other provider uses `base`. */
+export function withOpencodeUsage(creds: { get(provider: GatewayProvider, identity: string): Promise<{ accessToken: string }> }, base: FetchUsage): FetchUsage {
+  return (provider, identity, opts) => (provider === "opencode" ? creds.get(provider, identity).then((c) => fetchOpencodeUsage(c.accessToken)) : base(provider, identity, opts));
+}
 
 interface Entry {
   value: PoolUsage | undefined;
@@ -64,7 +81,7 @@ export function createUsageSource(opts: { fetchUsage: FetchUsage; ttlMs?: number
         // A reading with no figure (the usage API answered 429, as Anthropic's does for an account at its limit, or was
         // unavailable) keeps the last figure: answering "no limits" for a full account is wrong (T3 showed "No limits reported").
         const prev = entries.get(key)?.value;
-        const hasFigure = (v: PoolUsage | undefined): boolean => !!v && v.status !== "unavailable" && ((v.windows?.length ?? 0) > 0 || typeof v.maxUtilization === "number");
+        const hasFigure = (v: PoolUsage | undefined): boolean => !!v && (v.noPlan === true || (v.status !== "unavailable" && ((v.windows?.length ?? 0) > 0 || typeof v.maxUtilization === "number")));
         // For claude, "rate-limited" with a figure is the usage endpoint's 429 backoff repeating the last good read: old
         // figures, so stale (shown, never refused on). Codex says "rate-limited" for a live reading at 100%: that one stands.
         const backoff = provider === "claude" && u?.status === "rate-limited";
