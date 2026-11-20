@@ -429,9 +429,9 @@ credential data.
 
 | Panel id | Shows | refreshSeconds |
 |---|---|---|
-| `limits` | 5-hour and weekly windows per provider and identity (from `/api/limits`). Warn at 0.8, crit at 0.95. A failed read is a row with status `unknown`. | 300 |
+| `limits` | 5-hour, weekly, monthly and other windows per provider and identity (from `/api/limits`). Pools and retired identities are left out. Warn at 0.8, crit at 0.95. A failed read is a row with status `unknown`. | 300 |
 | `identities` | Login state per identity (from `/api/auth`). Stats count logged in, expiring, expired and not logged in. Retired identities and swap pools are left out. | 300 |
-| `agents` | Running agent sessions (from `/api/processes`): a stat per tool, and a row per session with tool, identity and age. | 60 |
+| `agents` | Running agent sessions (from `/api/processes`; link `/dashboard`): a stat per tool, and a row per session with tool, identity and age. | 60 |
 | `gateway-usage` | Gateway tokens per app and provider over 7 days (from `/api/gateway/usage`). Status `unknown` when the gateway is not configured. There is no `series`, because the source has no daily points. | 300 |
 | `claude-swap` | Claude swap pool members with their highest window use (from `/api/claude-swap`). | 300 |
 | `spend-guard` | Budget use per account (from `/api/spend-guard`). Rows carry identity names only. Status `unknown` when the scheduler is not running. | 300 |
@@ -455,9 +455,32 @@ stops.
   port. An invalid value logs an error and starts no widgets listener. The main
   server still starts.
 
-In the cluster, no public route points at this port. Clients reach it through
-the Kubernetes API server service proxy:
+- The `Host` header must be an IP literal (v4, or bracketed v6, with an optional
+  port), a loopback name or a vhost in `AIS_WEB_ALLOWED_HOSTS`. Any other `Host`
+  gives 403 `{ "error": "host not allowed" }`. This stops DNS rebinding.
+
+Exposure: no public route points at this port. In the cluster, any pod can
+reach `podIP:port`. The main console port is already reachable the same way. The
+output is masked read-only summaries. Kubernetes RBAC on `services/proxy` guards
+Headlamp access through the API server service proxy:
 `/api/v1/namespaces/<ns>/services/<svc>:<port-name>/proxy/api/widgets`.
+
+#### Links
+
+Headlamp cannot resolve console-relative paths. Set `AIS_WIDGETS_LINK_BASE` to an
+absolute `http` or `https` URL (no credentials, query or fragment). A trailing
+slash is removed. Then `link` is the base plus the console path, for example
+`<base>/limits`. Without the variable, `link` is an empty string in the list, in
+every panel and in every row. An invalid value logs an error and links stay
+empty. The variable has no default.
+
+#### Errors and caching
+
+A 502 shows the reason only for failures the widget code names itself. Any other
+backend error answers `{ "error": "<panel id> backend unavailable" }` and the
+real message goes to the server log. A failed build is remembered for
+`min(refreshSeconds, 60)` seconds. During that time the server serves the last
+good model, and answers 502 only when no good model exists yet.
 
 ### Push notifications
 
