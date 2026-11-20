@@ -89,6 +89,8 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly requests = new Counter("ais_gateway_requests_total", "Proxied requests by outcome.");
   private readonly tokens = new Counter("ais_gateway_tokens_total", "Tokens used by proxied requests.");
   private readonly refreshes = new Counter("ais_gateway_refresh_total", "Login refresh attempts by outcome.");
+  private readonly usageReads = new Counter("ais_gateway_usage_reads_total", "Usage readings taken, by provider and source (upstream or the shared database row).");
+  private readonly usageSharedErrors = new Counter("ais_gateway_usage_shared_errors_total", "Shared usage reading database calls that failed.");
   private readonly heartbeatWrites = new Counter("ais_gateway_heartbeat_writes_total", "Gateway ownership heartbeat writes, by outcome.");
   private readonly keepAlives = new Counter("ais_gateway_keepalive_total", "Idle keep-alive refresh passes over managed logins, by outcome.");
   private readonly refreshAttempts = new Counter("ais_gateway_refresh_attempts_total", "Login refresh attempts reaching the refresh guard, per account.");
@@ -208,6 +210,14 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.publicHostCount = n;
   }
 
+  usageRead(provider: string, source: "upstream" | "shared"): void {
+    this.usageReads.inc({ provider, source });
+  }
+
+  usageSharedError(): void {
+    this.usageSharedErrors.inc({});
+  }
+
   heartbeatWrite(outcome: string): void {
     this.heartbeatWrites.inc({ outcome });
   }
@@ -253,7 +263,7 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings]) out.push(...c.render());
     for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));

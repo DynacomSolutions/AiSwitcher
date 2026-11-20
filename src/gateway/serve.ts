@@ -32,6 +32,7 @@ import { errorTag, LedgerBuffer } from "./ledger-buffer.ts";
 import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
+import { MemoryUsageReadings, PgUsageReadings, type UsageReadings } from "./usage-readings.ts";
 import { createUsageSource, fetchPoolUsage, withOpencodeUsage, type FetchUsage } from "./usage-source.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
@@ -126,6 +127,8 @@ export interface GatewayHooks {
   usageWarmTimeoutMs?: number;
   /** Database reachability check behind /readyz (default SELECT 1 on the gateway database; a no-op when openStore is replaced). */
   ping?(): Promise<void>;
+  /** Usage readings shared by the replicas (default: the gateway database; in memory when openStore or ping is replaced). */
+  usageReadings?: UsageReadings;
   pingMs?: number;
   /** How often every replica re-reads its logins for the expiry, lifetime and revoked gauges (default 60 s). */
   gaugeMs?: number;
@@ -633,7 +636,14 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       : undefined,
   );
   const canonical = hooks.canonical ?? canonicalResolver();
-  const usage = createUsageSource({ fetchUsage: hooks.fetchUsage ?? withOpencodeUsage(creds, fetchPoolUsage) });
+  const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : new SQL(opts.databaseUrl, { max: 2, connection: { statement_timeout: 5_000 } });
+  const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
+  const usage = createUsageSource({
+    fetchUsage: hooks.fetchUsage ?? withOpencodeUsage(creds, fetchPoolUsage),
+    shared: sharedReadings,
+    onRead: (provider, source) => metrics.usageRead(provider, source),
+    onSharedError: () => metrics.usageSharedError(),
+  });
   // An unrestricted pool app uses real logins only, and of those only the ones the gateway manages.
   const poolMembers =
     hooks.poolMembers ??
@@ -807,6 +817,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       }
       return out;
     };
+    // Seed from the readings the other replicas took, so a fresh replica shows figures even when upstream answers 429. A failure skips it.
+    const seedMs = Math.max(1, Math.min(hooks.usageWarmTimeoutMs ?? 90_000, 5_000));
+    await bounded(sharedReadings.loadAll(), seedMs, "shared usage readings").then((rows) => usage.seed(rows), () => metrics.usageSharedError());
     const result = await usageGate.run(keys, (key) => {
       const slash = key.indexOf("/");
       return usage.prefill(key.slice(0, slash) as GatewayProvider, key.slice(slash + 1));
@@ -1133,6 +1146,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       // Last pushes (a heartbeat written during the pass) need the store open until here.
       await homeStore?.close().catch(() => undefined);
       await pingSql?.close().catch(() => undefined);
+      if (readingsSql) await bounded(usage.idle(), 2_000, "usage reads").catch(() => undefined);
+      await readingsSql?.close().catch(() => undefined);
       await inner.close?.();
       await refreshBackend.close?.();
     })();

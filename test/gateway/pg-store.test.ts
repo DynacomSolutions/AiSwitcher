@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
 import { isDataError } from "../../src/gateway/ledger-buffer.ts";
+import { PgUsageReadings } from "../../src/gateway/usage-readings.ts";
 import { migrate, PgGatewayStore } from "../../src/gateway/pg-store.ts";
 import { CachedGatewayStore } from "../../src/gateway/cache-store.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
@@ -57,6 +58,7 @@ if (!url && process.env.CI && !optOut) {
       await sql`DROP TABLE IF EXISTS gateway_side_counts CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_refresh_journal CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_usage_history CASCADE`;
+      await sql`DROP TABLE IF EXISTS usage_readings CASCADE`;
       // The continuous aggregate depends on the hypertable, so it goes first.
       await sql`DROP MATERIALIZED VIEW IF EXISTS gateway_usage_15m CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_usage CASCADE`;
@@ -311,6 +313,37 @@ if (!url && process.env.CI && !optOut) {
         await migrate(url as string);
         const r = await sql`SELECT to_regclass('gateway_usage_15m') AS r`;
         expect(r[0].r).toBe("gateway_usage_15m");
+      } finally {
+        await sql.close();
+      }
+    });
+  });
+
+  describe("shared usage readings", () => {
+    test("save keeps the newer reading by the database clock, claims are exclusive", async () => {
+      await fresh();
+      const sql = new SQL(url as string);
+      try {
+        const r = new PgUsageReadings(sql);
+        const u = (n: number) => ({ status: "live" as const, maxUtilization: n, capturedAt: "2026-11-20T00:00:00.000Z" });
+        await r.save("claude", "id1", u(10), 5_000);
+        await r.save("claude", "id1", u(99), 20_000); // older: ignored
+        const got = await r.load("claude", "id1");
+        expect(got?.reading.maxUtilization).toBe(10);
+        expect(got?.ageMs).toBeGreaterThanOrEqual(5_000);
+        expect(got?.ageMs).toBeLessThan(10_000);
+        await r.save("claude", "id1", u(20), 0);
+        expect((await r.load("claude", "id1"))?.reading.maxUtilization).toBe(20);
+        // A row dated in the future is replaced by any later save.
+        await r.save("claude", "id2", u(1), -60_000);
+        expect((await r.load("claude", "id2"))?.ageMs).toBeLessThan(0);
+        await r.save("claude", "id2", u(2), 0);
+        expect((await r.load("claude", "id2"))?.reading.maxUtilization).toBe(2);
+        expect(await r.load("claude", "none")).toBeUndefined();
+        expect(await r.claim("claude", "new", 10_000)).toBe(true);
+        expect(await r.claim("claude", "new", 10_000)).toBe(false);
+        expect(await r.claim("claude", "id1", 10_000)).toBe(true);
+        expect((await r.loadAll()).length).toBe(3);
       } finally {
         await sql.close();
       }
