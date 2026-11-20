@@ -179,7 +179,7 @@ ETA: 2026-11-15 23:00 ICT
 | 220 | Gateway: a revoked app stays revoked, its old tokens never work again | done | claude | gateway-revoke-revive | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/599 (41dfaf3), live on all 6 replicas.<br>Revoked name: add, rotate and admin PUT and mint give 409.<br>Leaked revoked tokens give 401 on every replica. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-20 03:00 ICT
+ETA: 2026-11-20 14:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
