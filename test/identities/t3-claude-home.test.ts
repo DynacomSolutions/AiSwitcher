@@ -162,3 +162,54 @@ test("sync applies the restriction to a listed source identity", async () => {
   const folder = join(home, ".t3", "gateway", "t3-claude-restricted");
   expect(Object.keys((await read(join(folder, "settings.json"))).enabledPlugins).sort()).toEqual(["superpowers@official", "tasks-board@ai-tools"]);
 });
+
+test("drift check allows gateway env keys, reordered and extra hooks, and a home's own plugin cache", async () => {
+  await run("claude-team-pool", { dir: source, noThirdParty: false });
+  const folder = join(home, ".t3", "gateway", "claude-team-pool");
+  const s = await read(join(folder, "settings.json"));
+  s.env.ANTHROPIC_BASE_URL = "https://gw.example/gateway/other";
+  s.env.NO_PROXY = "localhost";
+  s.env.NODE_EXTRA_CA_CERTS = "/other-ca.pem";
+  const pre = s.hooks.PreToolUse[0].hooks;
+  s.hooks.PreToolUse = [{ matcher: "Bash", hooks: [...pre].reverse() }, { matcher: "Bash", hooks: [pre[0]] }]; // reordered, duplicated
+  s.hooks.SessionStart = [{ hooks: [{ type: "command", command: "/guard/install.py" }] }]; // target-only
+  await writeFile(join(folder, "settings.json"), JSON.stringify(s));
+  const inst = await read(join(folder, "plugins", "installed_plugins.json"));
+  for (const id of Object.keys(inst.plugins)) inst.plugins[id][0].installPath = `${folder}/plugins/cache/${id}`;
+  await writeFile(join(folder, "plugins", "installed_plugins.json"), JSON.stringify(inst));
+  const mk = await read(join(folder, "plugins", "known_marketplaces.json"));
+  for (const n of Object.keys(mk)) mk[n].installLocation = `${folder}/plugins/marketplaces/${n}`;
+  await writeFile(join(folder, "plugins", "known_marketplaces.json"), JSON.stringify(mk));
+  expect(await diffT3ClaudeHome(folder, source)).toEqual([]);
+});
+
+test("drift check still flags a removed hook, a missing plugin and a changed marketplace source", async () => {
+  await run("claude-team-pool", { dir: source, noThirdParty: false });
+  const folder = join(home, ".t3", "gateway", "claude-team-pool");
+  const s = await read(join(folder, "settings.json"));
+  delete s.hooks.PreToolUse;
+  await writeFile(join(folder, "settings.json"), JSON.stringify(s));
+  const inst = await read(join(folder, "plugins", "installed_plugins.json"));
+  delete inst.plugins["jev-skills@ai-tools"];
+  await writeFile(join(folder, "plugins", "installed_plugins.json"), JSON.stringify(inst));
+  const mk = await read(join(folder, "plugins", "known_marketplaces.json"));
+  mk["ai-tools"].source = { source: "github", repo: "x/y" };
+  await writeFile(join(folder, "plugins", "known_marketplaces.json"), JSON.stringify(mk));
+  expect(await diffT3ClaudeHome(folder, source)).toEqual(["settings.json: hooks", "plugins/installed_plugins.json: missing jev-skills@ai-tools", "plugins/known_marketplaces.json: ai-tools"]);
+});
+
+test("repair leaves a home that is in step untouched", async () => {
+  await run("claude-team-pool", { dir: source, noThirdParty: false });
+  const folder = join(home, ".t3", "gateway", "claude-team-pool");
+  const inst = await read(join(folder, "plugins", "installed_plugins.json"));
+  inst.plugins["tasks-board@ai-tools"][0].installPath = `${folder}/plugins/cache/own`;
+  const text = JSON.stringify(inst);
+  await writeFile(join(folder, "plugins", "installed_plugins.json"), text);
+  const registry = join(home, "identities.json");
+  await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "swap", label: "swap", aliases: ["team-pool"], configDir: source, swapPool: { accounts: [] } }] }));
+  const before = await Bun.file(join(folder, "settings.json")).text();
+  const out = await syncT3ClaudeHomes({ home, env: {}, registryPath: registry });
+  expect(out[0]!.status).toBe("current");
+  expect(await readFile(join(folder, "plugins", "installed_plugins.json"), "utf8")).toBe(text);
+  expect(await Bun.file(join(folder, "settings.json")).text()).toBe(before);
+});

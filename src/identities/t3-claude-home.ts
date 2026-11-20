@@ -28,6 +28,9 @@ export const GATEWAY_ENV_KEYS: readonly string[] = [
   ...CLAUDE_PROXY_ENV_KEYS,
 ];
 
+/** Env keys that may differ between a home and its source: gateway auth, routing, proxy and CA settings. */
+export const isAllowedEnvKey = (key: string): boolean => key.startsWith("ANTHROPIC_") || GATEWAY_ENV_KEYS.includes(key) || key === "NODE_EXTRA_CA_CERTS" || /^no_proxy$/i.test(key);
+
 /** Gateway values of the attribution keys (no tool attribution in commits or PRs). */
 export const GATEWAY_ATTRIBUTION: Json = { attribution: { commit: "", pr: "" }, includeCoAuthoredBy: false, gitAttribution: false };
 
@@ -67,6 +70,47 @@ function filterHooks(hooks: unknown, drop: (command: string) => boolean): unknow
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** One "event\tmatcher\tcommand" string per hook command. Order and duplicates do not count. */
+export function hookKeys(hooks: unknown): string[] {
+  const events = obj(hooks);
+  if (!events) return [];
+  const out = new Set<string>();
+  for (const [event, groups] of Object.entries(events)) {
+    if (!Array.isArray(groups)) continue;
+    for (const g of groups) {
+      const group = obj(g);
+      const list = group?.hooks;
+      if (!Array.isArray(list)) continue;
+      for (const h of list) {
+        const command = obj(h)?.command;
+        if (typeof command === "string") out.add(`${event}\t${typeof group!.matcher === "string" ? group!.matcher : ""}\t${command}`);
+      }
+    }
+  }
+  return [...out].sort();
+}
+
+/** Adds the hook commands of `extra` that `have` does not hold yet. */
+function mergeHooks(base: unknown, extra: unknown, have: Set<string>): unknown {
+  const events = obj(extra);
+  if (!events) return base;
+  const out: Json = { ...obj(base) };
+  for (const [event, groups] of Object.entries(events)) {
+    if (!Array.isArray(groups)) continue;
+    for (const g of groups) {
+      const group = obj(g);
+      const list = group?.hooks;
+      if (!group || !Array.isArray(list)) continue;
+      const matcher = typeof group.matcher === "string" ? group.matcher : "";
+      const fresh = list.filter((h) => typeof obj(h)?.command === "string" && !have.has(`${event}\t${matcher}\t${obj(h)!.command}`));
+      if (fresh.length === 0) continue;
+      for (const h of fresh) have.add(`${event}\t${matcher}\t${obj(h)!.command}`);
+      out[event] = [...(Array.isArray(out[event]) ? (out[event] as unknown[]) : []), { ...group, hooks: fresh }];
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function filterKeys(record: unknown, drop: (key: string) => boolean): unknown {
   const o = obj(record);
   return o ? Object.fromEntries(Object.entries(o).filter(([k]) => !drop(k))) : record;
@@ -80,13 +124,17 @@ export function composeT3ClaudeSettings(source: Json, own: Json, opts: T3ClaudeC
   const out: Json = clone(source);
   const ownEnv = obj(own.env) ?? {};
   const env: Json = obj(out.env) ? { ...(out.env as Json) } : {};
-  for (const key of GATEWAY_ENV_KEYS) {
-    delete env[key];
-    if (key in ownEnv) env[key] = ownEnv[key];
-  }
+  for (const key of GATEWAY_ENV_KEYS) delete env[key];
+  // The home's own values of every allowed key win (they stay when the home is repaired). CA and NO_PROXY fall back to the source.
+  for (const key of Object.keys(ownEnv)) if (isAllowedEnvKey(key)) env[key] = ownEnv[key];
   out.env = env;
   Object.assign(out, GATEWAY_ATTRIBUTION);
-  const hooks = filterHooks(out.hooks, (c) => SWAP_HOOK.test(c) || (opts.noThirdParty === true && isThirdPartySender(c)));
+  const drop = (c: string) => SWAP_HOOK.test(c) || (opts.noThirdParty === true && isThirdPartySender(c));
+  let hooks = filterHooks(out.hooks, drop);
+  // Hooks that only the home has (for example the ones the agent-guard installer adds) stay.
+  const have = new Set(hookKeys(hooks));
+  const extra = filterHooks(own.hooks, (c) => drop(c));
+  hooks = mergeHooks(hooks, extra, have);
   if (hooks === undefined) delete out.hooks;
   else out.hooks = hooks;
   if (opts.noThirdParty) {
@@ -97,15 +145,24 @@ export function composeT3ClaudeSettings(source: Json, own: Json, opts: T3ClaudeC
   return out;
 }
 
-/** The expected plugin JSON files: `installed_plugins.json` and `known_marketplaces.json`. Pure. */
-export function composeT3ClaudePluginFiles(installed: Json | undefined, marketplaces: Json | undefined, opts: T3ClaudeConfigOptions = {}): { installed?: Json; marketplaces?: Json } {
+/**
+ * The expected plugin JSON files. A plugin the home already has keeps its own entry (own install path, own cache), so a
+ * home with its own plugin cache is in step. Missing plugins and marketplaces come from the source. Pure.
+ */
+export function composeT3ClaudePluginFiles(installed: Json | undefined, marketplaces: Json | undefined, opts: T3ClaudeConfigOptions = {}, own: { installed?: Json; marketplaces?: Json } = {}): { installed?: Json; marketplaces?: Json } {
   const out: { installed?: Json; marketplaces?: Json } = {};
   if (installed) {
     const copy = clone(installed);
-    if (opts.noThirdParty && obj(copy.plugins)) copy.plugins = filterKeys(copy.plugins, isThirdPartySender);
+    let plugins = obj(copy.plugins) ?? {};
+    if (opts.noThirdParty) plugins = filterKeys(plugins, isThirdPartySender) as Json;
+    const ownPlugins = obj(own.installed?.plugins) ?? {};
+    copy.plugins = Object.fromEntries(Object.entries(plugins).map(([id, v]) => [id, id in ownPlugins ? ownPlugins[id] : v]));
     out.installed = copy;
   }
-  if (marketplaces) out.marketplaces = opts.noThirdParty ? (filterKeys(marketplaces, isThirdPartySender) as Json) : clone(marketplaces);
+  if (marketplaces) {
+    const m = opts.noThirdParty ? (filterKeys(marketplaces, isThirdPartySender) as Json) : clone(marketplaces);
+    out.marketplaces = Object.fromEntries(Object.entries(m).map(([name, v]) => [name, own.marketplaces && stable(obj(own.marketplaces[name])?.source) === stable(obj(v)?.source) ? own.marketplaces[name] : v]));
+  }
   return out;
 }
 
@@ -131,41 +188,66 @@ export interface T3ClaudeFile {
   content: Json;
   /** Short name used in reports. */
   label: string;
+  /** What differs semantically from the file on disk. Empty when the file is in step. */
+  diffs: string[];
 }
 
-/** Every file a T3 Claude home must hold, computed from the source folder and the home's current settings. */
+const keysOf = (v: unknown): string[] => Object.keys(obj(v) ?? {});
+
+function diffSettings(expected: Json, actual: Json): string[] {
+  const bad: string[] = [];
+  for (const k of new Set([...Object.keys(expected), ...Object.keys(actual)])) {
+    if (k === "env") {
+      const strip = (e: unknown) => Object.fromEntries(Object.entries(obj(e) ?? {}).filter(([n]) => !isAllowedEnvKey(n)));
+      if (stable(strip(expected.env)) !== stable(strip(actual.env))) bad.push("env");
+    } else if (k === "hooks") {
+      const have = new Set(hookKeys(actual.hooks));
+      if (hookKeys(expected.hooks).some((h) => !have.has(h))) bad.push("hooks");
+    } else if (stable(expected[k]) !== stable(actual[k])) bad.push(k);
+  }
+  return bad.sort();
+}
+
+/** Plugin ids and marketplace sources, never install paths. */
+function diffInstalled(expected: Json, actual: Json): string[] {
+  const a = keysOf(actual.plugins);
+  const e = keysOf(expected.plugins);
+  return [...e.filter((id) => !a.includes(id)).map((id) => `missing ${id}`), ...a.filter((id) => !e.includes(id)).map((id) => `extra ${id}`)].sort();
+}
+
+function diffMarketplaces(expected: Json, actual: Json): string[] {
+  const bad: string[] = [];
+  for (const name of new Set([...Object.keys(expected), ...Object.keys(actual)])) {
+    if (stable(obj(expected[name])?.source) !== stable(obj(actual[name])?.source)) bad.push(name);
+  }
+  return bad.sort();
+}
+
+/** Every file a T3 Claude home must hold, computed from the source folder and the home's current files. */
 export async function planT3ClaudeHome(folder: string, sourceDir: string, opts: T3ClaudeConfigOptions = {}, ownOverride?: Json): Promise<T3ClaudeFile[]> {
   const source = (await readJson(join(sourceDir, "settings.json"))) ?? {};
-  const own = ownOverride ?? (await readJson(join(folder, "settings.json"))) ?? {};
-  const files: T3ClaudeFile[] = [{ path: join(folder, "settings.json"), content: composeT3ClaudeSettings(source, own, opts), label: "settings.json" }];
-  const plugins = composeT3ClaudePluginFiles(await readJson(join(sourceDir, "plugins", "installed_plugins.json")), await readJson(join(sourceDir, "plugins", "known_marketplaces.json")), opts);
-  if (plugins.installed) files.push({ path: join(folder, "plugins", "installed_plugins.json"), content: plugins.installed, label: "plugins/installed_plugins.json" });
-  if (plugins.marketplaces) files.push({ path: join(folder, "plugins", "known_marketplaces.json"), content: plugins.marketplaces, label: "plugins/known_marketplaces.json" });
+  const actualSettings = await readJson(join(folder, "settings.json")).catch(() => undefined);
+  const own = ownOverride ?? actualSettings ?? {};
+  const settings = composeT3ClaudeSettings(source, own, opts);
+  const files: T3ClaudeFile[] = [{ path: join(folder, "settings.json"), content: settings, label: "settings.json", diffs: actualSettings ? diffSettings(settings, actualSettings).map((k) => k) : ["missing"] }];
+  const ownInstalled = await readJson(join(folder, "plugins", "installed_plugins.json")).catch(() => undefined);
+  const ownMarkets = await readJson(join(folder, "plugins", "known_marketplaces.json")).catch(() => undefined);
+  const plugins = composeT3ClaudePluginFiles(await readJson(join(sourceDir, "plugins", "installed_plugins.json")), await readJson(join(sourceDir, "plugins", "known_marketplaces.json")), opts, { installed: ownInstalled, marketplaces: ownMarkets });
+  if (plugins.installed) files.push({ path: join(folder, "plugins", "installed_plugins.json"), content: plugins.installed, label: "plugins/installed_plugins.json", diffs: ownInstalled ? diffInstalled(plugins.installed, ownInstalled) : ["missing"] });
+  if (plugins.marketplaces) files.push({ path: join(folder, "plugins", "known_marketplaces.json"), content: plugins.marketplaces, label: "plugins/known_marketplaces.json", diffs: ownMarkets ? diffMarketplaces(plugins.marketplaces, ownMarkets) : ["missing"] });
   return files;
 }
 
-/** What differs between a home and its source, as short labels such as `settings.json: enabledPlugins`. Empty when in step. */
+/** What differs between a home and its source, as short labels. Empty when in step. */
 export async function diffT3ClaudeHome(folder: string, sourceDir: string, opts: T3ClaudeConfigOptions = {}): Promise<string[]> {
-  const diffs: string[] = [];
-  for (const f of await planT3ClaudeHome(folder, sourceDir, opts)) {
-    const actual = await readJson(f.path).catch(() => undefined);
-    if (!actual) {
-      diffs.push(`${f.label}: missing`);
-      continue;
-    }
-    const keys = new Set([...Object.keys(f.content), ...Object.keys(actual)]);
-    const bad = [...keys].filter((k) => stable(f.content[k]) !== stable(actual[k])).sort();
-    if (bad.length > 0) diffs.push(`${f.label}: ${bad.join(", ")}`);
-  }
-  return diffs;
+  return (await planT3ClaudeHome(folder, sourceDir, opts)).filter((f) => f.diffs.length > 0).map((f) => `${f.label}: ${f.diffs.join(", ")}`);
 }
 
-/** Writes the files that differ. Keeps the file mode (0600 for a new file). Returns the labels written. */
+/** Writes only the files that differ semantically; a home that is in step is not touched. Returns the labels written. */
 export async function writeT3ClaudeHome(files: T3ClaudeFile[]): Promise<string[]> {
   const written: string[] = [];
   for (const f of files) {
-    const actual = await readJson(f.path).catch(() => undefined);
-    if (actual && stable(actual) === stable(f.content)) continue;
+    if (f.diffs.length === 0) continue;
     let mode = 0o600;
     try {
       mode = (await stat(f.path)).mode & 0o777;

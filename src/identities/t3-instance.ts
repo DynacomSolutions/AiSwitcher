@@ -298,7 +298,9 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
       plans.push({ path: join(folder, "settings.json"), content: `${JSON.stringify(own, null, 2)}\n`, mode: 0o600, label: "settings.json (folder)" });
     } else {
       // Full copy of the source identity config; only the gateway env keys and the attribution keys come from the home.
+      // settings.json is always planned (it holds the gateway URL and models); the plugin files only when they drift.
       for (const f of await planT3ClaudeHome(folder, opts.source.dir, { noThirdParty: opts.source.noThirdParty }, own)) {
+        if (f.label !== "settings.json" && f.diffs.length === 0) continue;
         plans.push({ path: f.path, content: `${JSON.stringify(f.content, null, 2)}\n`, mode: f.label === "settings.json" ? 0o600 : 0o644, label: `${f.label} (folder)` });
       }
     }
