@@ -38,7 +38,7 @@ beforeAll(async () => {
 }, 120_000);
 afterAll(() => rmSync(compiledDir, { recursive: true, force: true }));
 
-function setup(options: { pool?: boolean } = {}) {
+function setup(options: { pool?: boolean; remotes?: string[] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "ais-execve-"));
   dirs.push(home);
   const realBin = join(home, "real-bin");
@@ -56,6 +56,9 @@ function setup(options: { pool?: boolean } = {}) {
         : [{ name: "acct-a", label: "A", configDir: join(home, "a") }],
     }),
   );
+  // Automatic sync only spawns a worker when a remote is configured.
+  const syncConfig = join(home, "sync-v2.json");
+  writeFileSync(syncConfig, JSON.stringify({ version: 2, remotes: options.remotes ?? ["my-host"] }));
   const out = join(home, "fake.out");
   const release = join(home, "release");
   const syncLog = join(home, "sync.log");
@@ -86,6 +89,7 @@ exit 7`,
   const env = {
     PATH: `${realBin}:${process.env.PATH ?? ""}`,
     HOME: home,
+    AIS_SYNC_CONFIG: syncConfig,
     AI_PROFILE_SWITCHER_REAL_BIN_DIR: realBin,
     AI_PROFILE_SWITCHER_SHIM_DIR: shimDir,
     FAKE_OUT: out,
@@ -234,6 +238,18 @@ describe.each([
     });
     expect(lines.every((l) => l.startsWith("sync background"))).toBe(true);
     expect(lines.at(-1)).toContain("--identity=acct-a");
+  }, 60_000);
+
+  execveTest("no background sync starts when no remote is configured", async () => {
+    const { home, env, out, release, syncLog } = setup({ remotes: [] });
+    const shim = Bun.spawn([...command(), "--identity=acct-a"], { cwd: home, env, stdin: "ignore", stdout: "ignore", stderr: "inherit" });
+    killers.push(shim.pid);
+    await waitFor(() => existsSync(out));
+    await Bun.sleep(1_500);
+    writeFileSync(release, "");
+    await shim.exited;
+    await Bun.sleep(1_500);
+    expect(existsSync(syncLog)).toBe(false);
   }, 60_000);
 });
 
