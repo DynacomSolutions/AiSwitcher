@@ -41,6 +41,30 @@ export interface ProcessInfoDto {
   identityEnv?: Record<string, string>;
 }
 
+/** How `identity` of an agent was found. */
+export type AgentIdentitySource =
+  /** The wrapper's session marker names a registered login. */
+  | "session-marker"
+  /** The tool's config-dir env var is a registered login's folder (or a T3 home named for it). */
+  | "config-dir"
+  /** The agent runs through a swap pool and the registry records this member as the active one. */
+  | "pool-active"
+  /** The agent runs through a gateway pool app and the gateway served this member last (its ledger). */
+  | "gateway-ledger"
+  /** Nothing names a login (a bare binary with no marker and no known folder). */
+  | "unresolved";
+
+/** An agent record: the process fields plus where it runs and who it runs as. Built by `server/agent-identity.ts`. */
+export interface AgentInfoDto extends ProcessInfoDto {
+  /** Name of the swap pool the agent runs through, or null for a direct login. */
+  pool: string | null;
+  /** The real login that runs the agent now: the account itself for a direct login, the member in use now for a pool. Null only when `identitySource` is "unresolved". */
+  identity: string | null;
+  identitySource: AgentIdentitySource;
+  /** What `identity` held before this field meant the real login: the wrapper's session marker (a login name, a pool or T3 home name), or null. */
+  sessionIdentity: string | null;
+}
+
 export interface ProcessesDto {
   processes: ProcessInfoDto[];
   scannedAt: string;

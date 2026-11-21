@@ -178,6 +178,30 @@ export interface LoadGatewayModelUsageDeps extends LoadGatewayUsageDeps {
   now?: () => Date;
 }
 
+export interface GatewayRecentUsageView {
+  configured: boolean;
+  rows: ModelUsageRow[];
+  error?: string;
+}
+
+/** Ledger rows per provider, identity, app and model since `since`, each with the time of its newest request (`lastTs`). Never throws. */
+export async function loadGatewayRecentUsage(since: Date, deps: LoadGatewayUsageDeps = {}): Promise<GatewayRecentUsageView> {
+  const url = (await readSecretsKey("AIS_GATEWAY_ADMIN_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_URL;
+  const token = (await readSecretsKey("AIS_GATEWAY_ADMIN_TOKEN", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_TOKEN;
+  if (!url || !token) return { configured: false, rows: [] };
+  const doFetch = deps.fetch ?? fetch;
+  try {
+    const res = await doFetch(`${url.replace(/\/+$/, "")}/usage/models?since=${encodeURIComponent(since.toISOString())}`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 8_000),
+    });
+    if (!res.ok) return { configured: true, rows: [], error: `admin answered ${res.status}` };
+    return { configured: true, rows: mapGatewayModelUsage(await res.json()) };
+  } catch {
+    return { configured: true, rows: [], error: "admin unreachable" };
+  }
+}
+
 /** Maps the admin `GET /usage/models` body to rows, dropping malformed entries. A missing model stays null (its tokens still count). */
 export function mapGatewayModelUsage(json: unknown): ModelUsageRow[] {
   const list = (json as { models?: unknown } | null | undefined)?.models;

@@ -48,6 +48,11 @@ export interface ProcessInfo {
    * session; the spend guard's kill candidates are exclusively these). */
   wrapped?: boolean;
   identityEnv?: Record<string, string>;
+  /** Swap pool the agent runs through, or null for a direct login. `identity` is the real login now (the member in use for a pool). */
+  pool?: string | null;
+  identitySource?: "session-marker" | "config-dir" | "pool-active" | "gateway-ledger" | "unresolved";
+  /** The raw wrapper marker (the value `identity` held before). */
+  sessionIdentity?: string | null;
 }
 
 export interface ProcessesResponse {
