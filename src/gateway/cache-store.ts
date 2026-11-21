@@ -1,6 +1,6 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
-import { AppRevokedError, type GatewayStore } from "./store.ts";
-import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
+import { AppRevokedError, type GatewayStore, type SessionUsageFilter } from "./store.ts";
+import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, SessionIdentityUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 
 /**
  * The proxy's view of the store. Apps and tokens are held in memory so a
@@ -259,6 +259,10 @@ export class CachedGatewayStore implements GatewayStore {
 
   appendUsage(rows: UsageRow[]): Promise<void> {
     return this.inner.appendUsage(rows);
+  }
+
+  usageBySession(since: Date, until?: Date, filter?: SessionUsageFilter): Promise<SessionIdentityUsageRow[]> {
+    return this.inner.usageBySession(since, until, filter);
   }
 
   usageSince(app: string, since: Date): Promise<number> {

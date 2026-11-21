@@ -1,8 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { TOOL_CONFIGS, loadAll } from "../cli/identities/resolve-tool.ts";
-import { loadGatewayRecentUsage } from "../gateway/usage-view.ts";
-import type { ModelUsageRow } from "../gateway/types.ts";
+import { loadGatewayRecentUsage, loadGatewaySessions } from "../gateway/usage-view.ts";
+import type { ModelUsageRow, SessionUsage } from "../gateway/types.ts";
 import { expandPath, translateHostPath } from "../identities/match.ts";
 import { isGatewayRoutedPool } from "../identities/pool/gateway-pool.ts";
 import { isSwapPool, type PoolIdentity } from "../identities/pool/swap-pool.ts";
@@ -10,8 +10,9 @@ import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { identityForConfigDir } from "../shared/browser-wiring.ts";
+import { readAgentSessionId } from "./agent-session.ts";
 import { scanProcesses } from "./processes.ts";
-import type { AgentIdentitySource, AgentInfoDto, ProcessInfoDto, ProcessesDto } from "./types.ts";
+import type { AgentIdentitySource, AgentIdentityUse, AgentInfoDto, ProcessInfoDto, ProcessesDto } from "./types.ts";
 
 /**
  * Who runs each agent. The raw process scan (`processes.ts`) only knows the wrapper's session marker. That marker is a login
@@ -19,9 +20,13 @@ import type { AgentIdentitySource, AgentInfoDto, ProcessInfoDto, ProcessesDto } 
  * the wrapper did not start has none. This module turns marker plus config folder into:
  *   - `pool`: the registered swap pool the agent runs through, or null;
  *   - `identity`: the real login now. A direct login is itself. A pool is its member in use now: for a pool routed
- *     through the gateway, the member the gateway served last for this tool (the gateway picks the member per request and
- *     keeps no session id, so this is the best the ledger can say); for a plain pool, the member the registry records
- *     as active (a swap copies that login into the pool folder, so it is the account the folder holds);
+ *     through the gateway, the account that served the latest request of this very session (the gateway ledger keeps the
+ *     session id the tool sends with every request, and the agent's own session file or open files name the same id);
+ *     when the ledger holds nothing for the session yet, the member the gateway served last for this tool in the last
+ *     15 minutes; for a plain pool, the member the registry records as active (a swap copies that login into the pool
+ *     folder, so it is the account the folder holds);
+ *   - `sessionId`, `activeIdentity` and `identities`: the session id, its latest account and the split of its turns and
+ *     tokens over every account the gateway served for it (a session can swap account in the middle);
  *   - `identitySource`: which of those rules answered.
  */
 
@@ -29,6 +34,8 @@ import type { AgentIdentitySource, AgentInfoDto, ProcessInfoDto, ProcessesDto } 
 export const LEDGER_WINDOW_MS = 15 * 60_000;
 /** The ledger read is shared by every scan inside this time. */
 const LEDGER_CACHE_MS = 10_000;
+/** How far back the session ledger is read: a session that runs for days keeps its history. */
+export const SESSION_WINDOW_MS = 30 * 86_400_000;
 
 /** The gateway app name in a base URL such as `https://host/gateway/agents-claude`, or undefined. */
 export function gatewayAppOfUrl(raw: string | undefined): string | undefined {
@@ -44,6 +51,10 @@ export interface AttributionDeps {
   ledger?: (since: Date) => Promise<ModelUsageRow[] | undefined>;
   /** The gateway app a tool folder routes to: a name, "" when routed but unnamed, undefined when not routed. */
   routedApp?: (tool: string, configDir: string, pool: PoolIdentity | undefined) => Promise<string | undefined>;
+  /** Gateway sessions (the account split per session id) for the given ids since the instant, or undefined when the gateway cannot be read. */
+  sessions?: (keys: string[], since: Date) => Promise<SessionUsage[] | undefined>;
+  /** The session id of the agent with this pid (config folder as this process reads it). Default: the tool's own session file, then its open files. */
+  sessionId?: (pid: number, configDir: string | undefined) => Promise<string | undefined>;
   now?: () => Date;
   /** Env holding `AIS_HOST_HOME` and the local home, for the host-path translation. Default: this process. */
   host?: { env: Record<string, string | undefined>; localHome?: string };
@@ -91,6 +102,8 @@ interface Resolved {
   pool: string | null;
   identity: string | null;
   identitySource: AgentIdentitySource;
+  /** The tool and the gateway app when the agent runs through a gateway-routed pool: its session is looked up in the gateway ledger. */
+  gateway?: { tool: string };
 }
 
 /** The member a gateway ledger served last for a pool, among the pool's own members, or undefined. */
@@ -122,15 +135,43 @@ export function createAgentScanner(deps: AttributionDeps & { scan?: () => Promis
     return ledgerCache.rows;
   };
 
+  const sessionIdOf = deps.sessionId ?? ((pid: number, configDir: string | undefined) => readAgentSessionId(pid, configDir));
+  const sessionsLoad = deps.sessions ?? ((keys: string[], since: Date) => loadGatewaySessions(since, keys).then((v) => (v.configured && !v.error ? v.sessions : undefined)));
+  let sessionCache: { at: number; keys: string; rows: Promise<Map<string, SessionUsage> | undefined> } | undefined;
+  /** Sessions by provider and session id. One read is shared by scans inside the ledger cache time; a failed read is undefined, never a guess. */
+  const sessionRows = (keys: string[]): Promise<Map<string, SessionUsage> | undefined> => {
+    const t = now().getTime();
+    const joined = keys.join(",");
+    if (!sessionCache || t - sessionCache.at > LEDGER_CACHE_MS || sessionCache.keys !== joined) {
+      const rows = sessionsLoad(keys, new Date(t - SESSION_WINDOW_MS))
+        .then((list) => (list ? new Map(list.map((s) => [`${s.provider}\u0000${s.sessionKey}`, s])) : undefined))
+        .catch(() => undefined);
+      sessionCache = { at: t, keys: joined, rows };
+    }
+    return sessionCache.rows;
+  };
+
   return async () => {
     const scanned = await (deps.scan ?? (() => scanProcesses(now())))();
     const registries = await files();
     const since = now().getTime() - LEDGER_WINDOW_MS;
-    const processes: AgentInfoDto[] = [];
+    const resolved: Array<{ p: ProcessInfoDto; r: Resolved; sessionId: string | null }> = [];
     for (const p of scanned.processes) {
       const r = await resolve(p, registries, routedApp, ledgerRows, since, deps.host);
-      processes.push({ ...p, ...r, sessionIdentity: p.identity });
+      const found = toolOf(p, deps.host?.env, deps.host?.localHome);
+      resolved.push({ p, r, sessionId: (await sessionIdOf(p.pid, found?.configDir)) ?? null });
     }
+    const keys = [...new Set(resolved.filter((x) => x.r.gateway && x.sessionId).map((x) => x.sessionId as string))].sort();
+    const sessions = keys.length > 0 ? await sessionRows(keys) : undefined;
+    const processes: AgentInfoDto[] = resolved.map(({ p, r, sessionId }) => {
+      const { gateway, ...rest } = r;
+      const own = gateway && sessionId ? sessions?.get(`${gateway.tool}\u0000${sessionId}`) : undefined;
+      if (own) {
+        const identities: AgentIdentityUse[] = own.identities.map((i) => ({ identity: i.identity, turns: i.turns, inputTokens: i.inputTokens, outputTokens: i.outputTokens, cacheReadTokens: i.cacheReadTokens, cacheWriteTokens: i.cacheWriteTokens, firstSeen: i.firstTs, lastSeen: i.lastTs }));
+        return { ...p, ...rest, identity: own.activeIdentity, identitySource: "gateway-session", sessionId, activeIdentity: own.activeIdentity, identities, sessionIdentity: p.identity };
+      }
+      return { ...p, ...rest, sessionId, activeIdentity: null, identities: [], sessionIdentity: p.identity };
+    });
     return { processes, scannedAt: scanned.scannedAt };
   };
 }
@@ -166,7 +207,9 @@ async function resolve(
   if (app !== undefined) {
     const rows = await ledgerRows();
     const member = rows ? lastLedgerMember(rows, found.tool, pool, app || undefined, since) : undefined;
-    if (member) return { pool: pool.name, identity: member, identitySource: "gateway-ledger" };
+    if (member) return { pool: pool.name, identity: member, identitySource: "gateway-ledger", gateway: { tool: found.tool } };
+    const active = pool.swapPool.active;
+    return { pool: pool.name, identity: active ?? null, identitySource: active ? "pool-active" : "unresolved", gateway: { tool: found.tool } };
   }
   const active = pool.swapPool.active;
   return active ? { pool: pool.name, identity: active, identitySource: "pool-active" } : { pool: pool.name, identity: null, identitySource: "unresolved" };

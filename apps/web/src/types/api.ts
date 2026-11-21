@@ -50,7 +50,13 @@ export interface ProcessInfo {
   identityEnv?: Record<string, string>;
   /** Swap pool the agent runs through, or null for a direct login. `identity` is the real login now (the member in use for a pool). */
   pool?: string | null;
-  identitySource?: "session-marker" | "config-dir" | "pool-active" | "gateway-ledger" | "unresolved";
+  identitySource?: "session-marker" | "config-dir" | "pool-active" | "gateway-session" | "gateway-ledger" | "unresolved";
+  /** The id the tool sends to the gateway for this session, or null. */
+  sessionId?: string | null;
+  /** The account that served the latest request of the session (gateway sessions only). */
+  activeIdentity?: string | null;
+  /** Each account the gateway served for the session, newest first, with turns and tokens by type. */
+  identities?: Array<{ identity: string; turns: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; firstSeen: string; lastSeen: string }>;
   /** The raw wrapper marker (the value `identity` held before). */
   sessionIdentity?: string | null;
 }

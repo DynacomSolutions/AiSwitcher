@@ -1,5 +1,5 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
-import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
+import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, SessionIdentityUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 
 /** The message for any attempt to reuse or extend a revoked app. */
@@ -13,6 +13,13 @@ export class AppRevokedError extends Error {
     super(revokedMessage(app));
     this.name = "AppRevokedError";
   }
+}
+
+/** Narrows a session read. `sessionKeys` limits it to those sessions (an empty list means all). */
+export interface SessionUsageFilter {
+  provider?: string;
+  app?: string;
+  sessionKeys?: string[];
 }
 
 export interface GatewayStore {
@@ -31,6 +38,11 @@ export interface GatewayStore {
   /** Sends a control notice on the app-change channel (payload starts with "!", so no app name can equal it). A cache uses it to check that its subscription is alive. */
   pingAppChanges?(payload: string): Promise<void>;
   appendUsage(rows: UsageRow[]): Promise<void>;
+  /**
+   * Served requests (status ok) that carry a session key, per session key, provider, app and account, for rows at or after
+   * `since` (before `until` when given). A session that changed account has one row per account.
+   */
+  usageBySession(since: Date, until?: Date, filter?: SessionUsageFilter): Promise<SessionIdentityUsageRow[]>;
   usageSince(app: string, since: Date): Promise<number>;
   /** usageSince for every app at once (one ledger scan), keyed by app; apps with no rows are absent. */
   usageTotalsSince(since: Date): Promise<Map<string, number>>;
@@ -186,6 +198,33 @@ export class MemoryGatewayStore implements GatewayStore {
       if (Date.parse(r.ts) >= cutoff) out.set(r.app, (out.get(r.app) ?? 0) + r.inputTokens + r.outputTokens + r.cacheWriteTokens);
     }
     return out;
+  }
+
+  async usageBySession(since: Date, until?: Date, filter: SessionUsageFilter = {}): Promise<SessionIdentityUsageRow[]> {
+    const from = since.getTime();
+    const to = until?.getTime() ?? Infinity;
+    const keys = filter.sessionKeys && filter.sessionKeys.length > 0 ? new Set(filter.sessionKeys) : undefined;
+    const by = new Map<string, SessionIdentityUsageRow>();
+    for (const r of this.usage) {
+      const t = Date.parse(r.ts);
+      if (t < from || t >= to || !r.sessionKey || r.status !== "ok" || r.identity === "-") continue;
+      if ((filter.provider && r.provider !== filter.provider) || (filter.app && r.app !== filter.app) || (keys && !keys.has(r.sessionKey))) continue;
+      const key = `${r.sessionKey}\u0000${r.provider}\u0000${r.app}\u0000${r.identity}`;
+      let a = by.get(key);
+      if (!a) {
+        a = { sessionKey: r.sessionKey, provider: r.provider, app: r.app, client: r.client ?? null, identity: r.identity, turns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, firstTs: r.ts, lastTs: r.ts };
+        by.set(key, a);
+      }
+      a.turns += 1;
+      a.inputTokens += r.inputTokens;
+      a.outputTokens += r.outputTokens;
+      a.cacheReadTokens += r.cacheReadTokens;
+      a.cacheWriteTokens += r.cacheWriteTokens;
+      if (!a.client && r.client) a.client = r.client;
+      if (t < Date.parse(a.firstTs)) a.firstTs = r.ts;
+      if (t > Date.parse(a.lastTs)) a.lastTs = r.ts;
+    }
+    return [...by.values()].sort((x, y) => x.sessionKey.localeCompare(y.sessionKey) || x.identity.localeCompare(y.identity));
   }
 
   async usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {

@@ -195,6 +195,10 @@ src/
                             (AIS_WIDGETS_PORT) and strict port parsing
     processes.ts           /proc scan for running agent CLIs, attributed to identities via
                             IDENTITY_SESSION_MARKER in each process's environ
+    agent-identity.ts      agent records: pool, real login, session id and the per-account
+                            split of a gateway pool session (joins processes.ts, the registries
+                            and the gateway admin `/usage/sessions`)
+    agent-session.ts       session id of a running agent (tool session file, open files)
     registries.ts          registry listing + all mutations via cli/identities/actions.ts's
                             pure functions + store.ts atomic save; optional apiKey at create
                             time forwarded to writeZaiAuthFile/writeAliAuthFile

@@ -10,6 +10,7 @@ import { checkCaps, dayStartIct } from "./caps.ts";
 import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
 import { providerError } from "./errors.ts";
 import type { LedgerBuffer } from "./ledger-buffer.ts";
+import { clientFamily, sessionKeyFromBodyTail, sessionKeyFromHeaders } from "./session-key.ts";
 import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadRequest, KnownBadFiles, MAX_FILE_CHECKS, MEDIA_REMOVED_HEADER, mediaAware, mentionedFileIds, rejectedUpload, withoutFiles, type FileVerdict } from "./media-recovery.ts";
 import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
@@ -503,6 +504,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
   };
   const identityForRow = app.target.kind === "pin" ? await canon(app.target.identity) : "-";
+  // The client's own session id and tool family: a header read now, the body tail once the body is read.
+  let sessionKey: string | undefined = sessionKeyFromHeaders(req.headers);
+  const client = clientFamily(req.headers.get("user-agent"));
   let recorded = false;
   const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string, reason?: string, upstream?: UpstreamErrorSummary): void => {
     if (recorded) return;
@@ -525,6 +529,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       httpStatus,
       latencyMs,
       streamed,
+      ...(sessionKey ? { sessionKey } : {}),
+      ...(client ? { client } : {}),
     };
     try {
       deps.ledger.push(row);
@@ -684,6 +690,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return reject(400, "request body could not be read");
   }
   model = requestModel(body);
+  if (!sessionKey && body.kind === "buffered") sessionKey = sessionKeyFromBodyTail(body.bytes);
   if (!side && app.models && app.models.length > 0 && body.kind === "stream") {
     deps.metrics.rejection(app.name, "model");
     return reject(413, "request too large to verify the model allowlist", identityForRow, model);

@@ -49,10 +49,24 @@ export type AgentIdentitySource =
   | "config-dir"
   /** The agent runs through a swap pool and the registry records this member as the active one. */
   | "pool-active"
+  /** The agent runs through a gateway pool app and the gateway ledger holds requests of this very session: the account of its latest request. */
+  | "gateway-session"
   /** The agent runs through a gateway pool app and the gateway served this member last (its ledger). */
   | "gateway-ledger"
   /** Nothing names a login (a bare binary with no marker and no known folder). */
   | "unresolved";
+
+/** One account a session used: its turns and tokens in the gateway ledger, and when it first and last served the session. */
+export interface AgentIdentityUse {
+  identity: string;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  firstSeen: string;
+  lastSeen: string;
+}
 
 /** An agent record: the process fields plus where it runs and who it runs as. Built by `server/agent-identity.ts`. */
 export interface AgentInfoDto extends ProcessInfoDto {
@@ -61,6 +75,12 @@ export interface AgentInfoDto extends ProcessInfoDto {
   /** The real login that runs the agent now: the account itself for a direct login, the member in use now for a pool. Null only when `identitySource` is "unresolved". */
   identity: string | null;
   identitySource: AgentIdentitySource;
+  /** The session id of the agent (the id its tool sends to the gateway), or null when no source names one. */
+  sessionId: string | null;
+  /** The account that served the latest request of this session. Equals `identity` when `identitySource` is "gateway-session"; null otherwise (no gateway traffic for the session). */
+  activeIdentity: string | null;
+  /** Every account the gateway served for this session, newest first, with turns and tokens by type. Empty unless `identitySource` is "gateway-session". */
+  identities: AgentIdentityUse[];
   /** What `identity` held before this field meant the real login: the wrapper's session marker (a login name, a pool or T3 home name), or null. */
   sessionIdentity: string | null;
 }

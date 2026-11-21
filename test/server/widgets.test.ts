@@ -67,6 +67,14 @@ function sources(overrides: Partial<WidgetSources> = {}): WidgetSources & { call
         { tool: "claude", identity: null, startedAt: null },
         { tool: "codex", identity: "bob", startedAt: "2026-11-18T05:00:00.000Z" },
         { tool: "claude", identity: "carol", pool: "team-pool", identitySource: "gateway-ledger", startedAt: "2026-11-20T09:00:00.000Z" },
+        {
+          tool: "claude", identity: "bob", pool: "team-pool", identitySource: "gateway-session", startedAt: "2026-11-20T09:00:00.000Z",
+          sessionId: "6cc07c23-4501-42cb-ba6e-3c14d864219e", activeIdentity: "bob",
+          identities: [
+            { identity: "bob", turns: 1, inputTokens: 5, outputTokens: 2, cacheReadTokens: 50, cacheWriteTokens: 0, firstSeen: "2026-11-20T09:30:00.000Z", lastSeen: "2026-11-20T09:30:00.000Z" },
+            { identity: "alice", turns: 2, inputTokens: 20, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, firstSeen: "2026-11-20T09:00:00.000Z", lastSeen: "2026-11-20T09:20:00.000Z" },
+          ],
+        },
       ] as never,
     }),
     gatewayUsage: async (days) => {
@@ -182,10 +190,10 @@ describe("panel mapping", () => {
   test("agents: stat per tool, row per session, no paths or command lines", async () => {
     const model = await panel("agents");
     expect(model.stats).toEqual([
-      { label: "claude", value: "3", status: "ok" },
+      { label: "claude", value: "4", status: "ok" },
       { label: "codex", value: "1", status: "ok" },
     ]);
-    expect(model.rows).toHaveLength(4);
+    expect(model.rows).toHaveLength(5);
     expect(model.rows[0]).toMatchObject({ label: "claude", detail: "alice", value: "1h 5m" });
     expect(model.rows[1]).toMatchObject({ detail: "unknown identity", value: "-" });
     expect(model.rows[2]).toMatchObject({ value: "2d 5h" });
@@ -196,8 +204,14 @@ describe("panel mapping", () => {
     expect(model.rows[1]).toMatchObject({ pool: null, identity: null, identitySource: "unresolved" });
     // The same data as the `tables` extension, one row per agent, for readers that parse it.
     expect(model.tables).toHaveLength(1);
-    expect(model.tables![0]!.columns.map((c) => c.key)).toEqual(["pool", "identity", "tool", "identitySource", "age"]);
-    expect(model.tables![0]!.rows[3]).toEqual({ pool: "team-pool", identity: "carol", tool: "claude", identitySource: "gateway-ledger", age: "1h 0m" });
+    expect(model.tables![0]!.columns.map((c) => c.key)).toEqual(["pool", "identity", "tool", "identitySource", "accounts", "age"]);
+    expect(model.tables![0]!.rows[3]).toEqual({ pool: "team-pool", identity: "carol", tool: "claude", identitySource: "gateway-ledger", accounts: "", age: "1h 0m" });
+    // A session the gateway served: the row carries the session id, the active account and the split; the table shows the split as text.
+    expect(model.rows[4]).toMatchObject({ pool: "team-pool", identity: "bob", identitySource: "gateway-session", sessionId: "6cc07c23-4501-42cb-ba6e-3c14d864219e", activeIdentity: "bob" });
+    expect(model.rows[4]!.identities!.map((i) => [i.identity, i.turns])).toEqual([["bob", 1], ["alice", 2]]);
+    expect(model.tables![0]!.rows[4]).toMatchObject({ identity: "bob", identitySource: "gateway-session", accounts: "bob 1 turn, alice 2 turns" });
+    // A direct login or an agent without gateway data has no session fields filled.
+    expect(model.rows[0]).toMatchObject({ sessionId: null, activeIdentity: null, identities: [] });
     const text = JSON.stringify(model);
     expect(text).not.toContain("/srv/");
     expect(text).not.toContain("secret-flag");

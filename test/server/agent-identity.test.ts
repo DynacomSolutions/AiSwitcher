@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { SIDECAR_ARG } from "../../src/shared/session-sidecar.ts";
 import { createAgentScanner, gatewayAppOfUrl, LEDGER_WINDOW_MS, type AttributionDeps } from "../../src/server/agent-identity.ts";
 import { isSessionSidecar, SIDECAR_ARGV1 } from "../../src/server/processes.ts";
-import type { ModelUsageRow } from "../../src/gateway/types.ts";
+import type { ModelUsageRow, SessionUsage } from "../../src/gateway/types.ts";
 import type { ProcessInfoDto } from "../../src/server/types.ts";
 import type { IdentitiesFile } from "../../src/identities/types.ts";
 
@@ -47,6 +47,9 @@ function scanner(processes: ProcessInfoDto[], deps: Partial<AttributionDeps> & {
     files: async () => registry(),
     ledger: async () => [],
     routedApp: async () => undefined,
+    sessions: async () => [],
+    // The default never reads the real /proc: a fake pid could be a live process of this machine.
+    sessionId: async () => undefined,
     now: () => T0,
     ...deps,
   });
@@ -157,6 +160,89 @@ describe("agent identity: pool routed through the gateway", () => {
 
   test("a gateway that cannot be read falls back to the registry's active member", async () => {
     const { processes } = await scanner([routed(20)], { routedApp: async () => "", ledger: async () => { throw new Error("down"); } })();
+    expect(processes[0]).toMatchObject({ pool: "team-pool", identity: "alice", identitySource: "pool-active" });
+  });
+});
+
+describe("agent identity: session ledger of a gateway pool", () => {
+  const SID = "6cc07c23-4501-42cb-ba6e-3c14d864219e";
+  const routed = (pid: number) => proc(pid, { identity: "example-pool-home", wrapped: true, identityEnv: { CLAUDE_CONFIG_DIR: `${HOME}/.claude/identities/swap` } });
+  const iso = (ms: number) => new Date(T0.getTime() - ms).toISOString();
+  const use = (identity: string, turns: number, firstMs: number, lastMs: number) => ({ identity, turns, inputTokens: turns * 10, outputTokens: turns, cacheReadTokens: turns * 100, cacheWriteTokens: 0, firstTs: iso(firstMs), lastTs: iso(lastMs) });
+  const session = (key: string, identities: SessionUsage["identities"]): SessionUsage => ({ sessionKey: key, provider: "claude", app: "agents-claude", client: "claude-cli", activeIdentity: identities[0]!.identity, identities, turns: identities.reduce((n, i) => n + i.turns, 0), firstTs: identities[identities.length - 1]!.firstTs, lastTs: identities[0]!.lastTs });
+  const common = { routedApp: async () => "agents-claude", ledger: async () => [ledgerRow("alice", iso(1000))] };
+
+  test("one session on one member: that member is active and holds the whole split", async () => {
+    const { processes } = await scanner([routed(30)], { ...common, sessionId: async () => SID, sessions: async () => [session(SID, [use("bob", 4, 600_000, 5_000)])] })();
+    expect(processes[0]).toMatchObject({ pool: "team-pool", identity: "bob", activeIdentity: "bob", identitySource: "gateway-session", sessionId: SID });
+    expect(processes[0]!.identities).toEqual([{ identity: "bob", turns: 4, inputTokens: 40, outputTokens: 4, cacheReadTokens: 400, cacheWriteTokens: 0, firstSeen: iso(600_000), lastSeen: iso(5_000) }]);
+  });
+
+  test("a swap in mid-session: the latest account is active and both accounts keep their share", async () => {
+    const { processes } = await scanner([routed(30)], { ...common, sessionId: async () => SID, sessions: async () => [session(SID, [use("carol", 2, 60_000, 1_000), use("bob", 5, 900_000, 100_000)])] })();
+    expect(processes[0]).toMatchObject({ identity: "carol", activeIdentity: "carol", identitySource: "gateway-session" });
+    expect(processes[0]!.identities.map((i) => [i.identity, i.turns])).toEqual([["carol", 2], ["bob", 5]]);
+  });
+
+  test("55 agents of one pool, each with its own session, keep each its own account (no shared last member)", async () => {
+    const procs = Array.from({ length: 55 }, (_, i) => routed(100 + i));
+    const keys = new Map(procs.map((p, i) => [p.pid, `sess-${String(i).padStart(4, "0")}-aaaa`]));
+    const members = ["alice", "bob", "carol"];
+    const list = procs.map((p, i) => session(keys.get(p.pid)!, [use(members[i % 3]!, 1, 1_000, 500)]));
+    const { processes } = await scanner(procs, { ...common, sessionId: async (pid) => keys.get(pid), sessions: async () => list })();
+    const counts = new Map<string, number>();
+    for (const p of processes) counts.set(p.identity!, (counts.get(p.identity!) ?? 0) + 1);
+    expect([...counts.entries()].sort()).toEqual([["alice", 19], ["bob", 18], ["carol", 18]]);
+    expect(processes.every((p) => p.identitySource === "gateway-session")).toBe(true);
+  });
+
+  test("a session with no gateway traffic yet keeps the last-member rule, with no split", async () => {
+    const { processes } = await scanner([routed(30)], { ...common, sessionId: async () => SID, sessions: async () => [] })();
+    expect(processes[0]).toMatchObject({ pool: "team-pool", identity: "alice", identitySource: "gateway-ledger", sessionId: SID, activeIdentity: null, identities: [] });
+  });
+
+  test("a gateway that cannot answer for sessions falls back, never guesses", async () => {
+    const { processes } = await scanner([routed(30)], { ...common, sessionId: async () => SID, sessions: async () => undefined })();
+    expect(processes[0]).toMatchObject({ identity: "alice", identitySource: "gateway-ledger", identities: [] });
+    const thrown = await scanner([routed(30)], { ...common, sessionId: async () => SID, sessions: async () => { throw new Error("down"); } })();
+    expect(thrown.processes[0]).toMatchObject({ identity: "alice", identitySource: "gateway-ledger" });
+  });
+
+  test("an agent whose session id is unknown keeps the last-member rule", async () => {
+    const { processes } = await scanner([routed(30)], { ...common, sessions: async () => { throw new Error("must not be asked"); } })();
+    expect(processes[0]).toMatchObject({ identity: "alice", identitySource: "gateway-ledger", sessionId: null });
+  });
+
+  test("the session lookup asks once for all ids and never for direct logins", async () => {
+    const asked: string[][] = [];
+    const direct = proc(40, { identity: "bob", wrapped: true });
+    const { processes } = await scanner([routed(30), routed(31), direct], {
+      ...common,
+      sessionId: async (pid) => `sess-${pid}-xxxxxxxx`,
+      sessions: async (keys) => { asked.push(keys); return []; },
+    })();
+    expect(asked).toEqual([["sess-30-xxxxxxxx", "sess-31-xxxxxxxx"]]);
+    expect(processes[2]).toMatchObject({ pool: null, identity: "bob", identitySource: "session-marker", activeIdentity: null, identities: [] });
+  });
+
+  test("a session of another provider with the same id is not used", async () => {
+    const other = { ...session(SID, [use("bob", 1, 1000, 500)]), provider: "codex" };
+    const { processes } = await scanner([routed(30)], { ...common, sessionId: async () => SID, sessions: async () => [other] })();
+    expect(processes[0]).toMatchObject({ identity: "alice", identitySource: "gateway-ledger" });
+  });
+});
+
+describe("agent identity: direct logins are unchanged by the session ledger", () => {
+  test("a direct login never asks the gateway and keeps its source", async () => {
+    let asked = 0;
+    const { processes } = await scanner([proc(50, { identity: "alice", wrapped: true })], { sessionId: async () => "6cc07c23-4501-42cb-ba6e-3c14d864219e", sessions: async () => { asked += 1; return []; } })();
+    expect(asked).toBe(0);
+    expect(processes[0]).toMatchObject({ pool: null, identity: "alice", identitySource: "session-marker", activeIdentity: null, identities: [] });
+  });
+
+  test("a plain (not gateway-routed) pool keeps the registry's active member", async () => {
+    const plain = proc(51, { identity: "team-pool", wrapped: true, identityEnv: { CLAUDE_CONFIG_DIR: `${HOME}/.claude/identities/swap` } });
+    const { processes } = await scanner([plain], { sessionId: async () => "6cc07c23-4501-42cb-ba6e-3c14d864219e" })();
     expect(processes[0]).toMatchObject({ pool: "team-pool", identity: "alice", identitySource: "pool-active" });
   });
 });

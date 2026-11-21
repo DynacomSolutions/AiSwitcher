@@ -6,6 +6,7 @@ import { registerStoreAdmin, type StoreAdminDeps } from "./admin-store.ts";
 import type { LoginRenewal } from "./renewal.ts";
 import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
+import { foldSessionUsage } from "./session-usage.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord, UsageHistoryRow } from "./types.ts";
 import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
@@ -408,6 +409,21 @@ export function createAdminApp(deps: AdminDeps): Hono {
     if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
     const rows = (await store.usageByModel(win.since, win.until)).filter((r) => provider === undefined || r.provider === provider);
     return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), models: rows });
+  });
+
+  // Client sessions with the split of their served requests over accounts: the account of the latest request is `activeIdentity`,
+  // `identities` lists each account the session used with its turns, tokens by type and first and last time. Only requests that carry
+  // a session id count. Same window rules as /usage/models. `session` (repeatable or comma separated, at most 500) limits it to those sessions.
+  hono.get("/usage/sessions", async (c) => {
+    const win = usageWindow((n) => c.req.query(n), deps.now());
+    if (typeof win === "string") return err(400, win);
+    const provider = c.req.query("provider");
+    if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
+    const sessionKeys = c.req.queries("session")?.flatMap((v) => v.split(",")).map((v) => v.trim()).filter((v) => v !== "");
+    if (sessionKeys && sessionKeys.length > 500) return err(400, "session takes at most 500 ids");
+    const app = c.req.query("app");
+    const rows = await store.usageBySession(win.since, win.until, { ...(provider ? { provider } : {}), ...(app ? { app } : {}), ...(sessionKeys && sessionKeys.length > 0 ? { sessionKeys } : {}) });
+    return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), sessions: foldSessionUsage(rows) });
   });
 
   // Per-day split of the same ledger (apps summed), bucketed in the IANA zone `tz` (default UTC), so the console can chart days.
