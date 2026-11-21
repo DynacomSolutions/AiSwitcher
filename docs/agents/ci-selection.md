@@ -5,6 +5,12 @@ Pushes to `main` run everything. The selector is `scripts/ci/affected.ts`;
 the host app uses the same engine through `scripts/host/affected.ts`, and the
 live image uses `image/build/affected.ts` with the `bun run build` metafile.
 
+The live image build is not part of pull request or `main` CI. It is a manual
+release job: `live-image.yml` runs on `workflow_dispatch`, and
+`release-live-image.yml` calls it for `live-v*` tags. The rows below that name
+the live image describe what that manual run selects. The image script tests in
+`test/image` still run in `ci.yml` on every pull request.
+
 ## How the selection works
 
 The repository is one bun package plus standalone apps, so the dependency
@@ -55,7 +61,7 @@ Any doubt runs everything:
 ## Skipped jobs still report
 
 The aggregate gates always run: `ci-gate` in `ci.yml`, `gate` in
-`host-app.yml` and `live-image.yml`. They fail when a needed job failed or
+`host-app.yml` and `live-image.yml` (the last one only on a manual or release run). They fail when a needed job failed or
 was cancelled, and pass when the selection deliberately skipped it. Required
 checks therefore keep reporting on every PR.
 

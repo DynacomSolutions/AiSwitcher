@@ -63,6 +63,10 @@ and the real privilege/USB acceptance evidence in `host-app.md` pass.
 
 ### Live image releases
 
+The live image build runs only by hand (`workflow_dispatch` on `live-image.yml`) or
+for a `live-v*` tag. It does not run on pull requests or pushes to `main`.
+A manual run builds and boot-checks the test image. Tick `release` to add the production image.
+
 `release-live-image.yml` accepts only raw `live-v*` tags. It calls the shared
 `live-image.yml` workflow with `release: true`, which builds the CI test image
 and a separate production image without test-only packages, then boots
