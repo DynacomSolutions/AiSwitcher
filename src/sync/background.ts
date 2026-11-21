@@ -1,13 +1,28 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { withUsableCwd } from "../shared/exec.ts";
+import { parseSyncConfig, syncConfigPath } from "./config.ts";
 import type { SyncRunOptions } from "./types.ts";
 
 interface BackgroundSyncDeps {
   resolveBinary?: () => string | undefined;
   spawnDetached?: (binary: string, args: string[]) => void;
   warn?: (message: string) => void;
+  /** Number of configured SSH remotes, read synchronously. */
+  remoteCount?: () => number;
+}
+
+/** Cheap synchronous remote count. A missing file means none (the loadSyncConfig
+ * default). An unreadable or invalid file counts as one, so the worker still
+ * starts and reports the problem as before. */
+export function configuredRemoteCount(path: string = syncConfigPath()): number {
+  if (!existsSync(path)) return 0;
+  try {
+    return parseSyncConfig(JSON.parse(readFileSync(path, "utf8"))).remotes.length;
+  } catch {
+    return 1;
+  }
 }
 
 export function resolveInstalledAisBinary(): string | undefined {
@@ -65,6 +80,8 @@ export function startBackgroundProfileSync(
   options: SyncRunOptions = {},
   deps: BackgroundSyncDeps = {},
 ): boolean {
+  // With no remotes the worker has no work: it only talks to SSH remotes.
+  if ((deps.remoteCount ?? configuredRemoteCount)() === 0) return false;
   const binary = (deps.resolveBinary ?? resolveInstalledAisBinary)();
   const warn = deps.warn ?? console.error;
   if (!binary) {

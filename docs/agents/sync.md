@@ -108,7 +108,10 @@ reconciliation.
   in `sync-v2.json` (default 10, 0 disables): a request inside the interval is
   queued as one file per request in `remote-cache/sync-pending/` (a coalesced run skipped by the sync lock is requeued) and one lock holder
   (`sync-pending.lock`) later runs a single scope-`all` pass; `last-auto-sync`
-  stamps the last start. `ais sync now` is never delayed. The background worker
+  stamps the last start. The worker re-reads the remote list before each cycle and before each host,
+  so `ais sync remove <host>` stops new transfers to that host at once (a running rsync may finish).
+  With no remotes configured, no worker starts, and a running worker clears its pending marks and exits.
+  `ais sync now` is never delayed. The background worker
   runs at nice 19 and (Linux) ionice idle; remote rsync and AIS commands run
   under `nice -n 19` plus `ionice -c3` when the remote has it. Staging is
   bounded: snapshots are removed after use, and a prune pass (start of each

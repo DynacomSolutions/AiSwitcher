@@ -14,6 +14,8 @@ export interface AutoScheduleDeps {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   run?: (options: SyncRunOptions) => Promise<{ skipped: boolean } | undefined>;
+  /** Number of configured remotes, read fresh. Checked before every cycle. */
+  remoteCount?: () => Promise<number>;
 }
 
 interface PendingRequest {
@@ -110,6 +112,13 @@ export async function scheduleAutomaticSync(request: SyncRunOptions, deps: AutoS
           const wait = ((await readStamp(stampPath)) ?? 0) + intervalMs - now();
           if (wait <= 0) break;
           await sleep(wait);
+        }
+        // Re-read the remote list for each cycle: a remote removed while this
+        // worker lives gets no further push or pull. With no remotes left the
+        // marks have no work to do (sync only talks to remotes), so drop them.
+        if (deps.remoteCount && (await deps.remoteCount()) === 0) {
+          await takePending(pendingDir);
+          return;
         }
         const pending = await takePending(pendingDir);
         if (!pending) continue;

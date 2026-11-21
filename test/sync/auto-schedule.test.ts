@@ -115,4 +115,32 @@ describe("scheduleAutomaticSync", () => {
     expect(h.runs[1]).toEqual({ direction: "pull" });
     expect(h.sleeps).toEqual([]);
   });
+
+  test("a remote removed between cycles gets no second call; an empty list ends the worker", async () => {
+    const h = await harness();
+    let remotes = ["my-host"];
+    const calls: string[][] = [];
+    const deps = {
+      ...h.deps,
+      remoteCount: async () => remotes.length,
+      run: async (o: SyncRunOptions) => {
+        calls.push([...remotes]);
+        h.runs.push(o);
+        return { skipped: false };
+      },
+    };
+    await scheduleAutomaticSync({ direction: "both" }, deps);
+    expect(calls).toEqual([["my-host"]]);
+
+    // Second request is queued; the remote is removed while the worker waits.
+    const inner = h.deps.sleep;
+    deps.sleep = async (ms: number) => {
+      await inner(ms);
+      remotes = [];
+    };
+    h.advance(60_000);
+    await scheduleAutomaticSync({ direction: "both" }, deps);
+    expect(calls.length).toBe(1);
+    expect(await readdir(join(h.deps.dir, "sync-pending"))).toEqual([]);
+  });
 });
