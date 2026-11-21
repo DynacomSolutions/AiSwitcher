@@ -329,7 +329,7 @@ AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gat
 | 199 | Host clients reach the gateway without the local ClusterIP (node failover) | done | claude | gateway-node-loss | 14.195 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/536, released v0.5.53; host relay on, Claude folders and T3 env point at it.<br>Live proof: client with the cluster service range dropped, real `claude -p` answered through a replica on another node; relay also failed over by itself during a real host reboot. |
 
 ## 15. Gateway logins never revoked by AIS
-ETA: 2026-11-19 20:00 ICT
+ETA: 2026-11-21 23:30 ICT
 One refresher per login across replicas and hosts, early renewal, a dead grant never sent again, renewal state visible on the WebUI and in metrics.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -342,6 +342,7 @@ One refresher per login across replicas and hosts, early renewal, a dead grant n
 | 252 | The gateway manages every live claude login; no "not managed" refusal for a login it serves | done | claude | gateway-manages-all-claude | 15.227 | | Was 240 (id taken by 6.240).<br> Fixes a regression from row 227 and a store prune (502 for one identity).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/621 (63593d2).<br>Live: the login renews in the gateway every 4 h, requests return 200. |
 | 231 | Kimi login has one refresher: the gateway usage poll no longer rotates it, pools hold no refresh token | done | claude | kimi-single-refresher | 15.221 | | Was 226 (id taken by 11.226).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/611 (00b8524), Opus review fixed.<br>Live: kimi journal chain continuous, one renewal per tick. |
 | 227 | Credential store holds only logins the gateway manages; WebUI ownership from the gateway list | done | claude | store-owned-matches-gateway | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/612 (375b818), Opus review fixed.<br>Prune removed 2 stale rows; live host copies kept. |
+| 260 | No false folder-login warning for a gateway-routed claude folder | in_progress | claude | folder-gateway-mismatch | | 2026-11-21 23:30 ICT | A folder that holds only the gateway entry kept the old cached account.<br>The WebUI showed it as a second login.<br>Fix: ignore that cache, and route-all writes the member account. |
 
 ## 16. Console data on Headlamp dashboards
 ETA: 2026-11-20 19:00 ICT
