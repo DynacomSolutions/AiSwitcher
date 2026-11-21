@@ -3,10 +3,14 @@
 The Arch live image is built by `image/build/build.sh`, on a GitHub-hosted
 runner, without any container runtime.
 
-- `pins.env`: Arch Linux Archive date, bootstrap tarball name, URL and sha256.
+- `pins.env`: Arch Linux Archive date, bootstrap tarball name, download hosts
+  and sha256, and the hosts that serve the dated package snapshot.
   The tarball is checked before extraction. Moving a pin is a deliberate commit.
-- `build/bootstrap.sh`: extracts the pinned Arch bootstrap tarball and points
-  pacman at the dated archive.
+- `build/bootstrap.sh`: downloads the pinned Arch bootstrap tarball (next host
+  and retry on failure, sha256 checked after each download), extracts it and
+  points pacman at the dated archive hosts (one `Server` line each, so pacman
+  falls back on a failed host). `build.sh` retries the package steps three times.
+  `archive.archlinux.org` is the last host because it often times out from CI.
 - `build/build.sh`: bind-mounts `proc`, `sys`, `dev`, enters the root with
   `chroot`, installs `archiso`, runs `mkarchiso` on `archiso/` and writes
   `out/archiso.iso` and `out/build-info.json` (package list and `base-id`).
