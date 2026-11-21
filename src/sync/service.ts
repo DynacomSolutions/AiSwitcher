@@ -434,6 +434,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
 
     if (direction === "pull" || direction === "both") {
       for (const host of config.remotes) {
+        if (!(await stillConfigured(host))) continue;
         const incomingDir = join(
           aisRemoteCacheDir(home),
           "profile-incoming",
@@ -521,6 +522,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
 
     if (direction === "push" || direction === "both") {
       for (const host of config.remotes) {
+        if (!(await stillConfigured(host))) continue;
         try {
           // Push to a remote snapshot and ask remote AIS to merge it. No
           // transport direction writes over a live history any more.
@@ -542,6 +544,16 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
     throw new AggregateError(errors, errors.map((error) => error.message).join("; "));
   }
   return result;
+}
+
+/** True while the host is still in the sync config. A remote removed during a
+ * long run gets no further transfer; one already running may finish. */
+async function stillConfigured(host: string): Promise<boolean> {
+  try {
+    return (await loadSyncConfig()).remotes.includes(host);
+  } catch {
+    return true;
+  }
 }
 
 export async function automaticSync(options: SyncRunOptions = {}): Promise<SyncRunResult | undefined> {

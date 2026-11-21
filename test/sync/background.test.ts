@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   backgroundSyncArgs,
+  configuredRemoteCount,
   lowPriorityPrefix,
   launchThenStartBackgroundSync,
   startBackgroundProfileSync,
@@ -35,11 +39,37 @@ describe("background profile sync", () => {
       {
         resolveBinary: () => "/shims/ais",
         spawnDetached: (binary, args) => calls.push({ binary, args }),
+        remoteCount: () => 1,
       },
     );
 
     expect(started).toBe(true);
     expect(calls).toEqual([{ binary: "/shims/ais", args: ["sync", "background"] }]);
+  });
+
+  test("does not spawn a worker when no remotes are configured", () => {
+    const calls: string[][] = [];
+    const started = startBackgroundProfileSync(
+      {},
+      { resolveBinary: () => "/shims/ais", spawnDetached: (_b, args) => calls.push(args), remoteCount: () => 0 },
+    );
+    expect(started).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("counts remotes from the config file: missing is none, invalid still spawns", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ais-bg-"));
+    try {
+      expect(configuredRemoteCount(join(dir, "none.json"))).toBe(0);
+      await Bun.write(join(dir, "empty.json"), JSON.stringify({ version: 2, remotes: [] }));
+      expect(configuredRemoteCount(join(dir, "empty.json"))).toBe(0);
+      await Bun.write(join(dir, "one.json"), JSON.stringify({ version: 2, remotes: ["my-host"] }));
+      expect(configuredRemoteCount(join(dir, "one.json"))).toBe(1);
+      await Bun.write(join(dir, "bad.json"), "{");
+      expect(configuredRemoteCount(join(dir, "bad.json"))).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   test("launches the agent before starting sync and returns immediately", () => {

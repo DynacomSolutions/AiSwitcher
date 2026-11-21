@@ -70,7 +70,7 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       const config = await loadSyncConfig();
       if (!removeRemote(config, host)) throw new CliUsageError(`SSH sync remote "${host}" is not configured.`);
       await saveSyncConfig(config);
-      console.log(`${green("✔")} Removed SSH sync remote ${host}.`);
+      console.log(`${green("✔")} Removed SSH sync remote ${host}. A transfer already running may finish; no new one starts.`);
       return;
     }
     case "now": {
@@ -116,7 +116,11 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
           waitForLock: boolFlag(flags, "wait"),
           includeDatabases: !boolFlag(flags, "no-databases"),
         },
-        { minIntervalMinutes, run: automaticSync },
+        {
+          minIntervalMinutes,
+          run: automaticSync,
+          remoteCount: () => loadSyncConfig().then((c) => c.remotes.length),
+        },
       );
       return;
     }
