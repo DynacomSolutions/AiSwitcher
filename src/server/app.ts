@@ -50,7 +50,7 @@ import {
   unretireIdentityInRegistry,
   updateIdentityInRegistry,
 } from "./registries.ts";
-import { scanProcesses } from "./processes.ts";
+import { createAgentScanner } from "./agent-identity.ts";
 import { WidgetService } from "./widgets.ts";
 import * as filesApi from "./files.ts";
 import { buildPermissions } from "./permissions.ts";
@@ -136,6 +136,9 @@ async function freshRefreshStatus(scheduler: AuthRefreshScheduler | undefined): 
   return scheduler.status();
 }
 
+/** Agent scan with pool and login attribution. One scanner keeps its short gateway-ledger cache across requests. */
+const scanAgents = createAgentScanner();
+
 /** "tool/identity" of every swap pool in the registries (pools hold no login). */
 async function registryPoolKeys(): Promise<Set<string>> {
   const keys = new Set<string>();
@@ -167,7 +170,7 @@ export function createWidgetService(deps: ConsoleAppDeps, linkBase?: string): Wi
     limits: () => loadLimitsPayload(deps, {}, 45, (view) => void (limitsDegraded = view === undefined || view.error !== undefined)),
     limitsDegraded: () => limitsDegraded,
     auth: async () => authApi.authStatus(Object.values(TOOL_CONFIGS), await freshRefreshStatus(deps.authRefresh)),
-    processes: () => scanProcesses(),
+    processes: scanAgents,
     gatewayUsage: (days) => (deps.gatewayUsage ?? loadGatewayUsage)(days),
     claudeSwap: async () => {
       const pools = [...(await (deps.poolKeys ?? registryPoolKeys)())].filter((k) => k.startsWith("claude/")).map((k) => k.slice("claude/".length));
@@ -236,7 +239,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     });
   });
 
-  app.get("/api/processes", (c) => scanProcesses().then((p) => c.json(p)));
+  app.get("/api/processes", (c) => scanAgents().then((p) => c.json(p)));
 
   /* ----------------------------- spend guard ------------------------------- */
 

@@ -7,6 +7,15 @@ import type { ProcessInfoDto, ProcessesDto } from "./types.ts";
 
 const PROC = "/proc";
 
+/** First argument of the wrapper's session sidecar (equals SIDECAR_ARG in shared/session-sidecar.ts; a test pins this).
+ * It is a local copy so this module does not load the sync code that session-sidecar.ts imports. */
+export const SIDECAR_ARGV1 = "__session-sidecar";
+
+/** True for the wrapper's session sidecar: argv[1] of the raw NUL-separated command line is `__session-sidecar`. */
+export function isSessionSidecar(rawCommand: string): boolean {
+  return rawCommand.split("\0")[1] === SIDECAR_ARGV1;
+}
+
 /** Binary names that count as "an AI agent is running". Shim names (zai/ali)
  * and real binaries (crush) both appear; the marker env var is what actually
  * attributes a process to an identity. */
@@ -123,6 +132,9 @@ async function inspectPid(pid: number, ticks: number, btime: number | null): Pro
   const argv0 = command.split("\0")[0] ?? "";
   const binary = argv0.split("/").pop() ?? argv0;
   if (!AGENT_BINARIES.has(binary)) return undefined;
+  // The wrapper's session sidecar runs the same binary with `__session-sidecar` as its first argument. It is a helper
+  // that watches the real tool's pid, not an agent: it has no session marker and holds a copy of the tool's env.
+  if (isSessionSidecar(command)) return undefined;
 
   let identity: string | null = null;
   let wrapped = false;

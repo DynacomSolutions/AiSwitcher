@@ -66,6 +66,7 @@ function sources(overrides: Partial<WidgetSources> = {}): WidgetSources & { call
         { tool: "claude", identity: "alice", startedAt: "2026-11-20T08:55:00.000Z", pid: 1, cwd: "/srv/synthetic/work", command: "claude --secret-flag" },
         { tool: "claude", identity: null, startedAt: null },
         { tool: "codex", identity: "bob", startedAt: "2026-11-18T05:00:00.000Z" },
+        { tool: "claude", identity: "carol", pool: "team-pool", identitySource: "gateway-ledger", startedAt: "2026-11-20T09:00:00.000Z" },
       ] as never,
     }),
     gatewayUsage: async (days) => {
@@ -181,13 +182,22 @@ describe("panel mapping", () => {
   test("agents: stat per tool, row per session, no paths or command lines", async () => {
     const model = await panel("agents");
     expect(model.stats).toEqual([
-      { label: "claude", value: "2", status: "ok" },
+      { label: "claude", value: "3", status: "ok" },
       { label: "codex", value: "1", status: "ok" },
     ]);
-    expect(model.rows).toHaveLength(3);
+    expect(model.rows).toHaveLength(4);
     expect(model.rows[0]).toMatchObject({ label: "claude", detail: "alice", value: "1h 5m" });
     expect(model.rows[1]).toMatchObject({ detail: "unknown identity", value: "-" });
     expect(model.rows[2]).toMatchObject({ value: "2d 5h" });
+    // A pool agent: the row names the pool and the member, and carries them as fields.
+    expect(model.rows[3]).toMatchObject({ label: "claude", detail: "team-pool / carol", tool: "claude", pool: "team-pool", identity: "carol", identitySource: "gateway-ledger" });
+    // A direct login has pool null; an older source that sends no source field reads as a session marker.
+    expect(model.rows[0]).toMatchObject({ pool: null, identity: "alice", identitySource: "session-marker" });
+    expect(model.rows[1]).toMatchObject({ pool: null, identity: null, identitySource: "unresolved" });
+    // The same data as the `tables` extension, one row per agent, for readers that parse it.
+    expect(model.tables).toHaveLength(1);
+    expect(model.tables![0]!.columns.map((c) => c.key)).toEqual(["pool", "identity", "tool", "identitySource", "age"]);
+    expect(model.tables![0]!.rows[3]).toEqual({ pool: "team-pool", identity: "carol", tool: "claude", identitySource: "gateway-ledger", age: "1h 0m" });
     const text = JSON.stringify(model);
     expect(text).not.toContain("/srv/");
     expect(text).not.toContain("secret-flag");

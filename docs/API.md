@@ -88,7 +88,20 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
 `GET /api/processes`
 
 Scans the process table for running agent CLIs and attributes each to its AIS
-identity via the `AI_PROFILE_SWITCHER_SESSION` marker env var.
+identity. The wrapper's session sidecar (`<tool> __session-sidecar`) is a helper
+and is not listed. Each record says where the agent runs and who it runs as:
+
+- `pool`: name of the registered swap pool the agent runs through, or `null` for a direct login.
+- `identity`: the real login now. A direct login is itself. For a pool it is the
+  member in use now: for a pool routed through the gateway, the member the gateway
+  served last for the pool's tool within 15 minutes (the gateway picks a member per
+  request and keeps no session id); for a plain pool, the registry's active member.
+  `null` only when `identitySource` is `unresolved`.
+- `identitySource`: `session-marker` (the marker names a registered login),
+  `config-dir` (the tool's config-dir env var is a login folder), `pool-active`,
+  `gateway-ledger` or `unresolved`.
+- `sessionIdentity`: what `identity` held before (the raw
+  `AI_PROFILE_SWITCHER_SESSION` marker: a login, pool or T3 home name), or `null`.
 
 ```jsonc
 {
@@ -96,7 +109,10 @@ identity via the `AI_PROFILE_SWITCHER_SESSION` marker env var.
     {
       "pid": 4242,
       "tool": "claude",          // best-effort binary basename match
-      "identity": "work",        // null if not launched via a wrapper
+      "identity": "work",        // the real login now (see above)
+      "pool": null,              // or the swap pool name
+      "identitySource": "session-marker",
+      "sessionIdentity": "work", // the raw wrapper marker, or null
       "cwd": "/home/me/Projects/foo",
       "startedAt": "2026-08-25T10:00:00Z",
       "command": "claude --identity=work",
@@ -432,7 +448,7 @@ group: every row and every stat shows at its real size.
 |---|---|---|
 | `limits` | 5-hour, weekly, monthly and other windows per provider and identity (from `/api/limits`). Pools and retired identities are left out. Warn at 0.8, crit at 0.95. A failed read is a row with status `unknown`. | 300 |
 | `identities` | Login state per identity (from `/api/auth`). Stats count logged in, expiring, expired and not logged in. Retired identities and swap pools are left out. | 300 |
-| `agents` | Running agent sessions (from `/api/processes`; link `/dashboard`): a stat per tool, and a row per session with tool, identity and age. | 60 |
+| `agents` | Running agent sessions (from `/api/processes`; link `/dashboard`): a stat per tool, a row per session with tool, pool, identity and age (row fields `tool`, `pool`, `identity`, `identitySource` are optional extras; `detail` is `pool / identity` for a pool agent), and a `tables` entry "Agents" with the columns pool, identity, tool, identitySource and age. | 60 |
 | `gateway-usage` | Gateway tokens per app and provider over 7 days (from `/api/gateway/usage`). Status `unknown` when the gateway is not configured. There is no `series`, because the source has no daily points. | 300 |
 | `claude-swap` | Claude swap pool members with their highest 5-hour or weekly use (from `/api/claude-swap`). A member without direct usage takes the figure from the limits data of the same Claude identity, and the row detail names the window. Per-model windows are ignored. A member with no data is `unknown`, and the detail gives the usage status word. | 300 |
 | `spend-guard` | Budget use per account (from `/api/spend-guard`). Rows carry identity names only. Status `unknown` when the scheduler is not running. | 300 |

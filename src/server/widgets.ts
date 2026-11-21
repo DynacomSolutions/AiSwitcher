@@ -7,7 +7,8 @@ import { PollCache } from "./expensive.ts";
  * engine to one model. No data is collected here and no panel cache is kept
  * outside `WidgetService`. */
 
-// The types below copy the widget panel contract. Do not add fields.
+// The types below copy the widget panel contract. Do not add fields, except the optional agent fields on `Row`
+// (`tool`, `pool`, `identity`, `identitySource`). A reader that does not know them ignores them.
 
 export type PanelStatus = "ok" | "warn" | "crit" | "unknown";
 
@@ -24,11 +25,23 @@ export interface Row {
   fraction?: number;
   status: PanelStatus;
   link?: string;
+  /** Agent rows only: the tool, the swap pool it runs through (null for a direct login), the real login now and how it was found. */
+  tool?: string;
+  pool?: string | null;
+  identity?: string | null;
+  identitySource?: string;
 }
 
 export interface Series {
   label: string;
   points: number[];
+}
+
+/** The optional v1 `tables` extension (the Headlamp dashboard parses it): a titled table with its own columns. */
+export interface PanelTable {
+  title: string;
+  columns: Array<{ key: string; label: string; align: "left" | "right" }>;
+  rows: Array<Record<string, string | number>>;
 }
 
 export interface PanelBody {
@@ -37,6 +50,7 @@ export interface PanelBody {
   stats: Stat[];
   rows: Row[];
   series?: Series[];
+  tables?: PanelTable[];
 }
 
 export interface PanelModel extends PanelBody {
@@ -90,8 +104,13 @@ export interface AuthEntryLike {
 }
 export interface ProcessLike {
   tool: string | null;
+  /** The wrapper's session marker (the old field). */
   identity: string | null;
   startedAt: string | null;
+  /** From the agent scan (`server/agent-identity.ts`). Absent from an older source. */
+  pool?: string | null;
+  sessionIdentity?: string | null;
+  identitySource?: string;
 }
 export interface GatewayUsageLike {
   configured: boolean;
@@ -290,18 +309,39 @@ async function agentsPanel(sources: WidgetSources, now: Date): Promise<PanelBody
   for (const p of processes) byTool.set(p.tool ?? "other", (byTool.get(p.tool ?? "other") ?? 0) + 1);
   const ranked = [...byTool.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const stats = ranked.map(([tool, n]) => stat(tool, n));
-  // Only the tool, identity name and age leave this panel: no cwd, no command line, no pid.
-  const rows: Row[] = processes.map((p) => ({
-    label: p.tool ?? "agent",
-    detail: p.identity ?? "unknown identity",
-    value: ageText(p.startedAt, now),
-    status: "ok" as const,
-  }));
+  // Only the tool, pool, login and age leave this panel: no cwd, no command line, no pid.
+  // `identity` of a ProcessLike from the agent scan is the real login now; an older source sends the marker there.
+  const rows: Row[] = processes.map((p) => {
+    const pool = p.pool ?? null;
+    const identity = p.identity;
+    return {
+      label: p.tool ?? "agent",
+      detail: identity === null ? "unknown identity" : pool ? `${pool} / ${identity}` : identity,
+      value: ageText(p.startedAt, now),
+      status: "ok" as const,
+      tool: p.tool ?? "agent",
+      pool,
+      identity,
+      identitySource: p.identitySource ?? (identity === null ? "unresolved" : "session-marker"),
+    };
+  });
   return {
     status: "ok",
     summary: processes.length === 0 ? "No agents running" : `${processes.length} agents running`,
     stats: stats.length > 0 ? stats : [stat("Running", 0)],
     rows,
+    // One table row per agent, so a reader that parses `tables` (the Headlamp dashboard) gets pool, login and tool as columns.
+    tables: [{
+      title: "Agents",
+      columns: [
+        { key: "pool", label: "Pool", align: "left" },
+        { key: "identity", label: "Identity", align: "left" },
+        { key: "tool", label: "Tool", align: "left" },
+        { key: "identitySource", label: "Source", align: "left" },
+        { key: "age", label: "Age", align: "right" },
+      ],
+      rows: rows.map((r) => ({ pool: r.pool ?? "", identity: r.identity ?? "", tool: r.tool ?? r.label, identitySource: r.identitySource ?? "", age: r.value })),
+    }],
   };
 }
 
@@ -502,6 +542,7 @@ export class WidgetService {
       summary: body.summary,
       stats: body.stats,
       rows: body.rows.map((r) => ({ ...r, link })),
+      ...(body.tables?.length ? { tables: body.tables } : {}),
       ...(body.series?.length ? { series: body.series.slice(0, 2).map((s) => ({ label: s.label, points: s.points.slice(-48) })) } : {}),
     } satisfies PanelModel);
   }
