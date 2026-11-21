@@ -19,6 +19,10 @@ runner, without any container runtime.
 - `build/assert-disk.sh`, `build/assert-eltorito.sh`: CI asserts (peak disk
   under 80% of free; both BIOS and EFI El Torito records).
 
+The CI job (`.github/workflows/live-image.yml`) is manual: run it with
+`workflow_dispatch`, or push a `live-v*` tag. It does not run on pull requests
+or on pushes to `main`.
+
 Local use needs root (chroot, mounts), so the build is exercised in CI only.
 
 ## Measurements (standard GitHub-hosted runner)

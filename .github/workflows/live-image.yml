@@ -7,10 +7,15 @@ on:
         description: Build and boot-check the production release image
         required: false
         type: boolean
-  pull_request:
-  push:
-    branches: [main]
+  # Manual release job (owner decision, 22 Nov 2026): it does not run on pull
+  # requests or pushes to main. Releases call it through release-live-image.yml.
   workflow_dispatch:
+    inputs:
+      release:
+        description: Build and boot-check the production image as well
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: live-image-${{ github.ref }}
