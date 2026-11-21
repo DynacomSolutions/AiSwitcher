@@ -254,6 +254,23 @@ describe("route-all-via-gateway: routing", () => {
     expect(claudeLine(await routeAllViaGateway(opts), "alpha")?.detail).toBeUndefined();
   });
 
+  test("routing replaces a stale cached oauthAccount in the folder with the member copy's and keeps the other keys", async () => {
+    await heartbeat();
+    await routeAllViaGateway(opts);
+    const path = join(dirOf(".claude", "alpha"), ".claude.json");
+    await writeFile(path, JSON.stringify({ oauthAccount: { accountUuid: "u-old", emailAddress: "old@example.com" }, projects: { big: "x" } }, null, 4));
+    const again = await routeAllViaGateway({ ...opts, now: () => NOW + 1000 });
+    expect(claudeLine(again, "alpha")?.detail).toContain("cached account");
+    const text = await readFile(path, "utf8");
+    expect(JSON.parse(text)).toEqual({ oauthAccount: { accountUuid: "u-alpha" }, projects: { big: "x" } });
+    expect(text).toContain('\n    "projects"');
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect((await files(dirOf(".claude", "alpha"))).filter((f) => f.startsWith(".claude.json.pre-gateway.")).length).toBe(1);
+    // a third run changes nothing
+    expect(claudeLine(await routeAllViaGateway(opts), "alpha")?.detail).toBeUndefined();
+    expect(await readFile(path, "utf8")).toBe(text);
+  });
+
   test("an existing key helper is kept", async () => {
     await mkdir(join(home, ".local", "bin"), { recursive: true });
     await writeFile(codexKeyHelperPath(home), "#!/bin/sh\necho mine\n", { mode: 0o700 });

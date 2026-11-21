@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { readAliApiKey } from "./ali-auth.ts";
 import { memberDir, memberStoreRoot, type MemberStoreTool } from "./gateway-members.ts";
+import { folderHoldsGatewayEntry } from "./gateway-routed.ts";
 import { expandPath } from "./match.ts";
 import { credentialPathsForTool } from "./credential-paths.ts";
 import { isRetired } from "./retired.ts";
@@ -272,8 +273,10 @@ export async function accountInfoFor(tool: ToolConfig["toolName"], identity: Ide
     const configDir = expandPath(identity.configDir);
     if (tool === "claude" || tool === "codex") {
       const read = tool === "claude" ? readClaudeDir : readCodexDir;
-      const folder = await read(configDir, "folder");
       const memberTool: MemberStoreTool = tool;
+      // A folder that holds only the pure gateway entry has no login: a cached account in its .claude.json is a leftover, not a login.
+      const gatewayFolder = folderHoldsGatewayEntry(memberTool, identity);
+      const folder = gatewayFolder ? undefined : await read(configDir, "folder");
       // A missing member copy reads as undefined, so the folder login stands.
       const member = await read(memberDir(memberTool, identity.name, memberRoot), "gateway-member");
       if (!member) return folder;
