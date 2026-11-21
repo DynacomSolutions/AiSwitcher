@@ -52,6 +52,50 @@ export interface ModelUsageRow extends IdentityUsageRow {
   lastTs?: string;
 }
 
+/** Served requests of one client session on one account (the store's `usageBySession` row). A session on several accounts has one row per account. */
+export interface SessionIdentityUsageRow {
+  sessionKey: string;
+  provider: string;
+  app: string;
+  /** The client tool family, or null when no request named one. */
+  client: string | null;
+  identity: string;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  firstTs: string;
+  lastTs: string;
+}
+
+/** One account a session used: its share of the session (the admin `GET /usage/sessions` `identities` entry). */
+export interface SessionIdentityUse {
+  identity: string;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  firstTs: string;
+  lastTs: string;
+}
+
+/** One client session with the split of its served requests over accounts (the admin `GET /usage/sessions` row). */
+export interface SessionUsage {
+  sessionKey: string;
+  provider: string;
+  app: string;
+  client: string | null;
+  /** The account that served the session's latest request. */
+  activeIdentity: string;
+  /** Every account the session used, newest first. */
+  identities: SessionIdentityUse[];
+  turns: number;
+  firstTs: string;
+  lastTs: string;
+}
+
 /** Ledger totals for one day, provider, identity and model (the admin `GET /usage/models/daily` row). Apps are summed. */
 export interface ModelDailyUsageRow {
   /** Calendar day "YYYY-MM-DD" in the zone the request named. */
@@ -83,6 +127,10 @@ export interface UsageRow {
   httpStatus: number;
   latencyMs: number;
   streamed: boolean;
+  /** The client's own session id (Claude Code `x-claude-code-session-id`, Codex `session-id`), when the request carried one. See `session-key.ts`. */
+  sessionKey?: string;
+  /** The client tool family from its user agent, for example `claude-cli` or `codex_exec`. */
+  client?: string;
 }
 
 /** One imported history figure. A null `day` is an all-time figure; a null `model` covers every model of the day. */

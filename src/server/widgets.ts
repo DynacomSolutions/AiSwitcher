@@ -8,7 +8,7 @@ import { PollCache } from "./expensive.ts";
  * outside `WidgetService`. */
 
 // The types below copy the widget panel contract. Do not add fields, except the optional agent fields on `Row`
-// (`tool`, `pool`, `identity`, `identitySource`). A reader that does not know them ignores them.
+// (`tool`, `pool`, `identity`, `identitySource`, `sessionId`, `activeIdentity`, `identities`). A reader that does not know them ignores them.
 
 export type PanelStatus = "ok" | "warn" | "crit" | "unknown";
 
@@ -30,6 +30,21 @@ export interface Row {
   pool?: string | null;
   identity?: string | null;
   identitySource?: string;
+  /** Agent rows only: the session id, the account that served its latest request, and every account it used with turns and tokens by type. */
+  sessionId?: string | null;
+  activeIdentity?: string | null;
+  identities?: AgentIdentityLike[];
+}
+
+export interface AgentIdentityLike {
+  identity: string;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  firstSeen: string;
+  lastSeen: string;
 }
 
 export interface Series {
@@ -111,6 +126,9 @@ export interface ProcessLike {
   pool?: string | null;
   sessionIdentity?: string | null;
   identitySource?: string;
+  sessionId?: string | null;
+  activeIdentity?: string | null;
+  identities?: AgentIdentityLike[];
 }
 export interface GatewayUsageLike {
   configured: boolean;
@@ -191,10 +209,12 @@ export function ageText(startedAt: string | null, now: Date): string {
 const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
 const LONG_TOKEN = /\b[A-Za-z0-9_-]{32,}\b/g;
 const MASK = "[masked]";
+/** A session id (a UUID) names a conversation, not a login: it is the one long run that stays readable, so a panel can show which session a row is. */
+const UUID_ONLY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Masks email-shaped values and long token-shaped runs in every string of a value. */
 export function maskDeep<T>(value: T): T {
-  if (typeof value === "string") return value.replace(EMAIL, MASK).replace(LONG_TOKEN, MASK) as T;
+  if (typeof value === "string") return value.replace(EMAIL, MASK).replace(LONG_TOKEN, (m) => (UUID_ONLY.test(m) ? m : MASK)) as T;
   if (Array.isArray(value)) return value.map((v) => maskDeep(v)) as T;
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, maskDeep(v)])) as T;
@@ -303,6 +323,11 @@ async function identitiesPanel(sources: WidgetSources, now: Date): Promise<Panel
 
 /* --------------------------------- agents --------------------------------- */
 
+/** "alice 12 turns, bob 3 turns": the accounts of one session with their turns, newest first. Empty when the gateway holds none. */
+function accountsText(list: AgentIdentityLike[]): string {
+  return list.map((i) => `${i.identity} ${i.turns} ${i.turns === 1 ? "turn" : "turns"}`).join(", ");
+}
+
 async function agentsPanel(sources: WidgetSources, now: Date): Promise<PanelBody> {
   const { processes } = await sources.processes();
   const byTool = new Map<string, number>();
@@ -323,6 +348,9 @@ async function agentsPanel(sources: WidgetSources, now: Date): Promise<PanelBody
       pool,
       identity,
       identitySource: p.identitySource ?? (identity === null ? "unresolved" : "session-marker"),
+      sessionId: p.sessionId ?? null,
+      activeIdentity: p.activeIdentity ?? null,
+      identities: p.identities ?? [],
     };
   });
   return {
@@ -338,9 +366,10 @@ async function agentsPanel(sources: WidgetSources, now: Date): Promise<PanelBody
         { key: "identity", label: "Identity", align: "left" },
         { key: "tool", label: "Tool", align: "left" },
         { key: "identitySource", label: "Source", align: "left" },
+        { key: "accounts", label: "Accounts", align: "left" },
         { key: "age", label: "Age", align: "right" },
       ],
-      rows: rows.map((r) => ({ pool: r.pool ?? "", identity: r.identity ?? "", tool: r.tool ?? r.label, identitySource: r.identitySource ?? "", age: r.value })),
+      rows: rows.map((r) => ({ pool: r.pool ?? "", identity: r.identity ?? "", tool: r.tool ?? r.label, identitySource: r.identitySource ?? "", accounts: accountsText(r.identities ?? []), age: r.value })),
     }],
   };
 }

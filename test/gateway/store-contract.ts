@@ -183,6 +183,28 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(await s.usageByModel(new Date("2027-01-01T00:00:00.000Z"))).toEqual([]);
   });
 
+  test("usageBySession splits a session over accounts and leaves out rows without a key, rejected rows and the '-' identity", async () => {
+    const s = await makeStore();
+    const sid = "6cc07c23-4501-42cb-ba6e-3c14d864219e";
+    await s.appendUsage([
+      { ...row("a", "2026-11-02T01:00:00.000Z", 10, 20), identity: "m1", sessionKey: sid, client: "claude-cli", cacheReadTokens: 5 },
+      { ...row("a", "2026-11-02T02:00:00.000Z", 3, 4), identity: "m1", sessionKey: sid },
+      { ...row("a", "2026-11-02T03:00:00.000Z", 1, 1), identity: "m2", sessionKey: sid, cacheWriteTokens: 2 },
+      { ...row("a", "2026-11-02T04:00:00.000Z", 9, 9), identity: "m2" },
+      { ...row("a", "2026-11-02T05:00:00.000Z", 0, 0), identity: "-", sessionKey: sid, status: "rejected" },
+      { ...row("a", "2026-11-02T06:00:00.000Z", 0, 0), identity: "m2", sessionKey: sid, status: "rejected" },
+    ]);
+    const got = await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"));
+    expect(got).toEqual([
+      { sessionKey: sid, provider: "codex", app: "a", client: "claude-cli", identity: "m1", turns: 2, inputTokens: 13, outputTokens: 24, cacheReadTokens: 5, cacheWriteTokens: 0, firstTs: "2026-11-02T01:00:00.000Z", lastTs: "2026-11-02T02:00:00.000Z" },
+      { sessionKey: sid, provider: "codex", app: "a", client: null, identity: "m2", turns: 1, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 2, firstTs: "2026-11-02T03:00:00.000Z", lastTs: "2026-11-02T03:00:00.000Z" },
+    ]);
+    expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), new Date("2026-11-02T02:00:00.000Z"))).toHaveLength(1);
+    expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { sessionKeys: ["other-session-id"] })).toEqual([]);
+    expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { provider: "claude" })).toEqual([]);
+    expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { app: "a", sessionKeys: [sid] })).toHaveLength(2);
+  });
+
   test("usageByModelDaily buckets per day in the zone, sums apps, prices null costs and bounds the window", async () => {
     const s = await makeStore();
     await s.appendUsage([

@@ -2,8 +2,8 @@ import { SQL, type TransactionSQL } from "bun";
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import { bumpSideCountOn, type SqlTag } from "./side-count.ts";
 import { errorTag } from "./ledger-buffer.ts";
-import { AppRevokedError, type GatewayStore } from "./store.ts";
-import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
+import { AppRevokedError, type GatewayStore, type SessionUsageFilter } from "./store.ts";
+import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, SessionIdentityUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 import { planRollupRange, rollupAggregateSql, rollupSource } from "./usage-rollup.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
@@ -16,6 +16,7 @@ import refreshJournalCode0007 from "./migrations/0007_refresh_journal_code.sql" 
 import usageHistory0008 from "./migrations/0008_usage_history.sql" with { type: "text" };
 import usageRollup0009 from "./migrations/0009_usage_rollup.sql" with { type: "text" };
 import usageReadings0010 from "./migrations/0010_usage_readings.sql" with { type: "text" };
+import usageSession0011 from "./migrations/0011_usage_session.sql" with { type: "text" };
 import type { PgListener } from "./pg-listen.ts";
 import { pgPoolOptions } from "./pg-pool.ts";
 
@@ -32,6 +33,7 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0008_usage_history", sql: usageHistory0008 },
   { version: USAGE_ROLLUP_VERSION, sql: usageRollup0009 },
   { version: "0010_usage_readings", sql: usageReadings0010 },
+  { version: "0011_usage_session", sql: usageSession0011 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
@@ -341,8 +343,45 @@ export class PgGatewayStore implements GatewayStore {
       http_status: r.httpStatus,
       latency_ms: r.latencyMs,
       streamed: r.streamed,
+      session_key: r.sessionKey ?? null,
+      client: r.client ?? null,
     }));
     await this.sql`INSERT INTO gateway_usage ${this.sql(values)}`;
+  }
+
+  async usageBySession(since: Date, until?: Date, filter: SessionUsageFilter = {}): Promise<SessionIdentityUsageRow[]> {
+    const to = until ? until.toISOString() : null;
+    const keys = filter.sessionKeys && filter.sessionKeys.length > 0 ? filter.sessionKeys : null;
+    const rows = await this.sql`
+      SELECT session_key, provider, app, identity, max(client) AS client,
+        COUNT(*) AS turns,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        MIN(ts) AS first_ts,
+        MAX(ts) AS last_ts
+      FROM gateway_usage
+      WHERE ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+        AND session_key IS NOT NULL AND status = 'ok' AND identity <> '-'
+        AND (${filter.provider ?? null}::text IS NULL OR provider = ${filter.provider ?? null}::text)
+        AND (${filter.app ?? null}::text IS NULL OR app = ${filter.app ?? null}::text)
+        AND (${keys}::text[] IS NULL OR session_key = ANY(${keys}::text[]))
+      GROUP BY session_key, provider, app, identity ORDER BY session_key, provider, app, identity`;
+    return rows.map((r: Row) => ({
+      sessionKey: String(r.session_key),
+      provider: String(r.provider),
+      app: String(r.app),
+      client: r.client === null || r.client === undefined ? null : String(r.client),
+      identity: String(r.identity),
+      turns: Number(r.turns),
+      inputTokens: Number(r.input_tokens),
+      outputTokens: Number(r.output_tokens),
+      cacheReadTokens: Number(r.cache_read_tokens),
+      cacheWriteTokens: Number(r.cache_write_tokens),
+      firstTs: iso(r.first_ts),
+      lastTs: iso(r.last_ts),
+    }));
   }
 
   async usageSince(app: string, since: Date): Promise<number> {

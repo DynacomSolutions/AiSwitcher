@@ -1,5 +1,5 @@
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import type { IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, UsageHistoryRow } from "./types.ts";
+import type { IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, SessionUsage, UsageHistoryRow } from "./types.ts";
 
 /** One row of the admin `GET /usage` answer: an app's tokens over a window. */
 export interface GatewayAppUsage {
@@ -199,6 +199,69 @@ export async function loadGatewayRecentUsage(since: Date, deps: LoadGatewayUsage
     return { configured: true, rows: mapGatewayModelUsage(await res.json()) };
   } catch {
     return { configured: true, rows: [], error: "admin unreachable" };
+  }
+}
+
+export interface GatewaySessionsView {
+  configured: boolean;
+  sessions: SessionUsage[];
+  error?: string;
+}
+
+/** Maps the admin `GET /usage/sessions` body to sessions, dropping malformed entries. */
+export function mapGatewaySessions(json: unknown): SessionUsage[] {
+  const list = (json as { sessions?: unknown } | null | undefined)?.sessions;
+  if (!Array.isArray(list)) return [];
+  const n = (v: unknown): number => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
+  const out: SessionUsage[] = [];
+  for (const raw of list) {
+    const r = raw as Record<string, unknown> | null;
+    if (!r || typeof r.sessionKey !== "string" || r.sessionKey === "" || typeof r.provider !== "string" || !Array.isArray(r.identities)) continue;
+    const identities: SessionUsage["identities"] = [];
+    for (const rawId of r.identities) {
+      const i = rawId as Record<string, unknown> | null;
+      if (!i || typeof i.identity !== "string" || i.identity === "" || typeof i.firstTs !== "string" || typeof i.lastTs !== "string") continue;
+      identities.push({ identity: i.identity, turns: n(i.turns), inputTokens: n(i.inputTokens), outputTokens: n(i.outputTokens), cacheReadTokens: n(i.cacheReadTokens), cacheWriteTokens: n(i.cacheWriteTokens), firstTs: i.firstTs, lastTs: i.lastTs });
+    }
+    if (identities.length === 0) continue;
+    out.push({
+      sessionKey: r.sessionKey,
+      provider: r.provider,
+      app: typeof r.app === "string" ? r.app : "",
+      client: typeof r.client === "string" && r.client !== "" ? r.client : null,
+      // The first entry is the newest, as the admin sorts them; the field is re-derived so a stray value never disagrees with the list.
+      activeIdentity: identities[0]!.identity,
+      identities,
+      turns: n(r.turns),
+      firstTs: typeof r.firstTs === "string" ? r.firstTs : identities[0]!.firstTs,
+      lastTs: typeof r.lastTs === "string" ? r.lastTs : identities[0]!.lastTs,
+    });
+  }
+  return out;
+}
+
+/** Sessions of the gateway ledger since `since` (admin `GET /usage/sessions`), limited to `sessionKeys` when given. Never throws. */
+export async function loadGatewaySessions(since: Date, sessionKeys: string[] = [], deps: LoadGatewayUsageDeps = {}): Promise<GatewaySessionsView> {
+  const url = (await readSecretsKey("AIS_GATEWAY_ADMIN_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_URL;
+  const token = (await readSecretsKey("AIS_GATEWAY_ADMIN_TOKEN", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_TOKEN;
+  if (!url || !token) return { configured: false, sessions: [] };
+  const doFetch = deps.fetch ?? fetch;
+  const base = url.replace(/\/+$/, "");
+  const sessions: SessionUsage[] = [];
+  try {
+    // At most 500 ids per call (the admin limit); a long list goes in several calls.
+    for (let at = 0; at === 0 || at < sessionKeys.length; at += 500) {
+      const part = sessionKeys.slice(at, at + 500).map((k) => `&session=${encodeURIComponent(k)}`).join("");
+      const res = await doFetch(`${base}/usage/sessions?since=${encodeURIComponent(since.toISOString())}${part}`, {
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(deps.timeoutMs ?? 8_000),
+      });
+      if (!res.ok) return { configured: true, sessions: [], error: res.status === 404 ? "gateway admin has no session ledger yet (older version)" : `admin answered ${res.status}` };
+      sessions.push(...mapGatewaySessions(await res.json()));
+    }
+    return { configured: true, sessions };
+  } catch {
+    return { configured: true, sessions: [], error: "admin unreachable" };
   }
 }
 

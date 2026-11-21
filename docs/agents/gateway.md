@@ -945,3 +945,22 @@ A portal sign-in writes the new login over the gateway entry in the folder. When
 exists), `LoginFlowManager` then runs route-all for that one identity (`adoptLoginIntoGateway`): same account, provably fresher
 than the store copy, no running session, no other holder. The new login moves to the store, the folder gets the gateway entry
 back, the marker is cleared. Whatever route-all refuses is returned as the flow's `note`.
+
+## Session ledger: which account served which session
+
+Each ledger row of a model request carries the client's own session id (`session_key`) and the tool family from its user
+agent (`client`). Migration `0011_usage_session` adds the two nullable columns with no index (an index build would
+block ledger writes; reads are bound by time and by `session_key IS NOT NULL`). Older rows keep null.
+
+- Claude Code sends `x-claude-code-session-id`. The same id is `session_id` in `metadata.user_id` of the body (JSON
+  string, or a `..._session_<id>` suffix in older versions), which is read from the last 4 KiB of a buffered body when
+  the header is missing. Codex sends `session-id` (also `thread-id`). `session_id` and `x-session-id` also count. A value
+  must look like an id (8 to 128 characters of letters, digits, `.`, `_`, `:` and `-`), else the row has no key.
+- Proven on live traffic shape: the Claude Code header and `metadata.user_id.session_id` both equal the id of
+  `claude --session-id <id>`; the Codex `session-id` equals the id in the rollout file name. The console reads the
+  same id for a running agent (see `docs/API.md`, live processes).
+- Admin `GET /usage/sessions` (same window rules as `/usage/models`; filters `provider`, `app`, and `session` up to 500
+  ids): `{ since, sessions: [{ sessionKey, provider, app, client, activeIdentity, identities: [{ identity, turns,
+  inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, firstTs, lastTs }], turns, firstTs, lastTs }] }`.
+  Only served requests (`status = ok`) with a key and a real identity count. `activeIdentity` is the account of the latest
+  request. `identities` is newest first. A pool that swaps member in the middle of a session shows both accounts.
