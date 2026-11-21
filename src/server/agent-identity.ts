@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { TOOL_CONFIGS, loadAll } from "../cli/identities/resolve-tool.ts";
 import { loadGatewayRecentUsage } from "../gateway/usage-view.ts";
 import type { ModelUsageRow } from "../gateway/types.ts";
-import { expandPath } from "../identities/match.ts";
+import { expandPath, translateHostPath } from "../identities/match.ts";
 import { isGatewayRoutedPool } from "../identities/pool/gateway-pool.ts";
 import { isSwapPool, type PoolIdentity } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
@@ -45,6 +45,8 @@ export interface AttributionDeps {
   /** The gateway app a tool folder routes to: a name, "" when routed but unnamed, undefined when not routed. */
   routedApp?: (tool: string, configDir: string, pool: PoolIdentity | undefined) => Promise<string | undefined>;
   now?: () => Date;
+  /** Env holding `AIS_HOST_HOME` and the local home, for the host-path translation. Default: this process. */
+  host?: { env: Record<string, string | undefined>; localHome?: string };
 }
 
 async function defaultFiles(): Promise<Map<string, IdentitiesFile>> {
@@ -74,11 +76,12 @@ async function defaultRoutedApp(tool: string, configDir: string, pool: PoolIdent
 }
 
 /** The tool whose registry an agent belongs to: the one whose config-dir env var the process holds, else its binary. */
-function toolOf(p: ProcessInfoDto): { tool: string; configDir: string | undefined } | undefined {
+function toolOf(p: ProcessInfoDto, hostEnv: Record<string, string | undefined> = process.env, localHome?: string): { tool: string; configDir: string | undefined } | undefined {
   const env = p.identityEnv ?? {};
   for (const [tool, cfg] of Object.entries(TOOL_CONFIGS)) {
     const dir = env[cfg.envVarName];
-    if (dir) return { tool, configDir: dir };
+    // The process env holds a host path. The console pod mounts the host home elsewhere, so translate it before any compare.
+    if (dir) return { tool, configDir: translateHostPath(dir, hostEnv, localHome) };
   }
   const tool = p.tool && p.tool in TOOL_CONFIGS ? p.tool : undefined;
   return tool ? { tool, configDir: undefined } : undefined;
@@ -125,7 +128,7 @@ export function createAgentScanner(deps: AttributionDeps & { scan?: () => Promis
     const since = now().getTime() - LEDGER_WINDOW_MS;
     const processes: AgentInfoDto[] = [];
     for (const p of scanned.processes) {
-      const r = await resolve(p, registries, routedApp, ledgerRows, since);
+      const r = await resolve(p, registries, routedApp, ledgerRows, since, deps.host);
       processes.push({ ...p, ...r, sessionIdentity: p.identity });
     }
     return { processes, scannedAt: scanned.scannedAt };
@@ -138,8 +141,9 @@ async function resolve(
   routedApp: NonNullable<AttributionDeps["routedApp"]>,
   ledgerRows: () => Promise<ModelUsageRow[] | undefined>,
   since: number,
+  host?: AttributionDeps["host"],
 ): Promise<Resolved> {
-  const found = toolOf(p);
+  const found = toolOf(p, host?.env, host?.localHome);
   const file = found ? registries.get(found.tool) : undefined;
   if (!found || !file) return p.identity ? { pool: null, identity: p.identity, identitySource: "session-marker" } : { pool: null, identity: null, identitySource: "unresolved" };
 
