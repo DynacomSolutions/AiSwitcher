@@ -45,7 +45,18 @@ sde=$(date -ud "${ARCH_ARCHIVE_DATE//\//-}" +%s)
 
 in_root pacman-key --init
 in_root pacman-key --populate archlinux
-in_root pacman -Syu --noconfirm archiso grub gcc
+# Network steps retry: the archive hosts can fail for a few minutes. Package
+# versions stay fixed by the dated snapshot, so a retry changes no content.
+retry() {
+  local n
+  for n in 1 2 3; do
+    "$@" && return 0
+    echo "build: attempt $n of 3 failed: $*" >&2
+    if [ "$n" -lt 3 ]; then sleep $((n * 30)); fi
+  done
+  return 1
+}
+retry in_root pacman -Syu --noconfirm archiso grub gcc
 log archiso-installed
 
 rm -rf "$root/build"
@@ -57,7 +68,7 @@ cp -a "$repo/image/archiso" "$root/build/profile"
 # AIS_STAGE_DIR holds the compiled ais tools and herdr (see stage-profile.sh).
 [ -n "${AIS_STAGE_DIR:-}" ] || { echo "build: AIS_STAGE_DIR is required" >&2; exit 1; }
 "$here/stage-profile.sh" "$root/build/profile" "$AIS_STAGE_DIR"
-in_root mkarchiso -v -w /build/work -o /build/out /build/profile
+retry in_root mkarchiso -v -w /build/work -o /build/out /build/profile
 log mkarchiso-done
 
 mkdir -p "$out"

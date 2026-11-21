@@ -3,10 +3,13 @@
 The Arch live image is built by `image/build/build.sh`, on a GitHub-hosted
 runner, without any container runtime.
 
-- `pins.env`: Arch Linux Archive date, bootstrap tarball name, URL and sha256.
+- `pins.env`: Arch Linux Archive date, bootstrap tarball name, download hosts
+  and sha256, and the hosts that serve the dated package snapshot.
   The tarball is checked before extraction. Moving a pin is a deliberate commit.
-- `build/bootstrap.sh`: extracts the pinned Arch bootstrap tarball and points
-  pacman at the dated archive.
+- `build/bootstrap.sh`: downloads the pinned Arch bootstrap tarball (next host
+  and retry on failure, sha256 checked after each download), extracts it and
+  points pacman at the dated archive hosts (one `Server` line each). `build.sh` retries the package steps three times.
+  Only `archive.archlinux.org` holds the dated package snapshot.
 - `build/build.sh`: bind-mounts `proc`, `sys`, `dev`, enters the root with
   `chroot`, installs `archiso`, runs `mkarchiso` on `archiso/` and writes
   `out/archiso.iso` and `out/build-info.json` (package list and `base-id`).
@@ -15,6 +18,10 @@ runner, without any container runtime.
 - `build/affected.ts`: decides whether a pull request needs the image build.
 - `build/assert-disk.sh`, `build/assert-eltorito.sh`: CI asserts (peak disk
   under 80% of free; both BIOS and EFI El Torito records).
+
+The CI job (`.github/workflows/live-image.yml`) is manual: run it with
+`workflow_dispatch`, or push a `live-v*` tag. It does not run on pull requests
+or on pushes to `main`.
 
 Local use needs root (chroot, mounts), so the build is exercised in CI only.
 
