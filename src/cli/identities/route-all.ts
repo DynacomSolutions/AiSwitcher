@@ -308,6 +308,42 @@ async function writeAccountRecord(tool: MemberStoreTool, identity: Identity, dir
   if (account !== undefined) await writeFileDurable(join(dir, ".claude.json"), `${JSON.stringify({ oauthAccount: account })}\n`);
 }
 
+/**
+ * claude: the folder's `.claude.json` keeps a cached `oauthAccount` of the account that lived there before routing. Once the
+ * folder holds the gateway entry, that cache must name the routed account: the member copy's record, or nothing when the member
+ * copy has none and the cache names another account. Returns the new text, or undefined when nothing changes.
+ */
+async function folderAccountText(identity: Identity, root: string): Promise<string | undefined> {
+  const path = join(identity.configDir, ".claude.json");
+  const cjText = await readText(path);
+  if (cjText === undefined) return undefined;
+  const cj = parseJson(cjText);
+  if (!cj) return undefined;
+  const memberAccount = parseJson(await readText(join(memberDir("claude", identity.name, root), ".claude.json")))?.oauthAccount;
+  const indent = /^\{\r?\n([ \t]+)"/.exec(cjText)?.[1] ?? (cjText.includes("\n") ? 2 : 0);
+  const tail = cjText.endsWith("\n") ? "\n" : "";
+  if (memberAccount !== undefined) {
+    if (JSON.stringify(cj.oauthAccount) === JSON.stringify(memberAccount)) return undefined;
+    return `${JSON.stringify({ ...cj, oauthAccount: memberAccount }, null, indent)}${tail}`;
+  }
+  const uuid = (cj.oauthAccount as { accountUuid?: unknown } | undefined)?.accountUuid;
+  if (!("oauthAccount" in cj)) return undefined;
+  const routed = routingOf(await readText(join(identity.configDir, ".credentials.json")))?.account;
+  if (routed !== undefined && uuid === routed) return undefined;
+  const { oauthAccount: _drop, ...rest } = cj;
+  return `${JSON.stringify(rest, null, indent)}${tail}`;
+}
+
+/** Makes the folder's cached `oauthAccount` equal the routed account (backed up first, written atomically, only when it changes). */
+async function syncFolderAccount(identity: Identity, root: string, now: () => number): Promise<string[]> {
+  const text = await folderAccountText(identity, root);
+  if (text === undefined) return [];
+  const path = join(identity.configDir, ".claude.json");
+  const b = await backupUnique(path, now);
+  await writeFileAtomic(path, text);
+  return [`cached account in .claude.json set to the routed account${b ? ` (backed up to ${b})` : ""}`];
+}
+
 /* ------------------------------------------------------------------ running sessions */
 
 const scanOpts = (opts: RouteAllOptions) => ({ ...(opts.procRoot ? { procRoot: opts.procRoot } : {}), ...(opts.home ? { home: opts.home } : {}) });
@@ -711,6 +747,7 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
       if (tool === "codex") await ensureCodexHelper(helper);
       const routing = await routingNow(identity, ctx, localText);
       notes.push(...(tool === "claude" ? await applyClaude(dir, token, base, routing, now) : await applyCodex(dir, token, base, helper, routing, now)));
+      if (tool === "claude") notes.push(...(await syncFolderAccount(identity, root, now)));
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.name : "error");
       if (nowKind !== "login") return `failed while completing the gateway entry (${code}); the member store still holds the login`;
@@ -891,9 +928,11 @@ async function alreadyRouted(identity: Identity, ctx: ToolContext): Promise<Rout
   }
   // An entry written before the routing record existed gets one, so other hosts can tell a fresh sign-in from this login.
   const needsRecord = hasMemberCopy(tool, identity.name, root) && routingOf(await readText(loginPath)) === undefined;
-  if (holders.piRemovals.length === 0 && !needsRecord) return done(false);
+  const needsAccount = tool === "claude" && hasMemberCopy(tool, identity.name, root) && (await folderAccountText(identity, root)) !== undefined;
+  if (holders.piRemovals.length === 0 && !needsRecord && !needsAccount) return done(false);
   if (opts.dryRun) {
     if (needsRecord) notes.push("the gateway entry would get its routing record");
+    if (needsAccount) notes.push("the cached account in .claude.json would be set to the routed account");
     notes.push(...holders.piRemovals.map((r) => `pi identity ${r.name}'s ${r.provider} entry would be removed (backed up)`));
     return done(false);
   }
@@ -906,6 +945,7 @@ async function alreadyRouted(identity: Identity, ctx: ToolContext): Promise<Rout
       await writeFileAtomic(loginPath, withRouting(entryText, await routingNow(identity, ctx, undefined)));
       notes.push("added the routing record to the gateway entry");
     }
+    if (needsAccount && classifyLogin(tool, await readText(loginPath)) === "gateway") notes.push(...(await syncFolderAccount(identity, root, now)));
     return undefined;
   });
   if (problem) notes.push(`but ${problem}`);

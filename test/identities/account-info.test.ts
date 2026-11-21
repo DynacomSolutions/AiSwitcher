@@ -55,6 +55,37 @@ describe("accountInfoFor", () => {
     expect(info?.mismatch).toBeUndefined();
   });
 
+  const gatewayEntry = JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_key", refreshToken: null, expiresAt: 4102444800000, scopes: [] }, aisGatewayRouting: { host: "h", at: 1, fingerprints: [] } });
+  const realLogin = JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-SYNTHETIC_FIXTURE-a", refreshToken: "rt-SYNTHETIC_FIXTURE-a", expiresAt: 1, scopes: [] } });
+
+  test("claude folder with only the gateway entry and a stale cached account gives no mismatch", async () => {
+    const root = await temp();
+    const members = join(root, "members");
+    await seed(join(members, "claude", "alpha"), ".claude.json", claudeJson("alice@example.test", "id-a"));
+    await seed(join(root, "alpha"), ".claude.json", claudeJson("old@example.test", "id-old"));
+    await seed(join(root, "alpha"), ".credentials.json", gatewayEntry);
+    const info = await accountInfoFor("claude", ident("alpha", join(root, "alpha")), members);
+    expect(info?.email).toBe("alice@example.test");
+    expect(info?.mismatch).toBeUndefined();
+  });
+
+  test("claude folder with a real different login still gives a mismatch", async () => {
+    const root = await temp();
+    const members = join(root, "members");
+    await seed(join(members, "claude", "alpha"), ".claude.json", claudeJson("alice@example.test", "id-a"));
+    await seed(join(root, "alpha"), ".claude.json", claudeJson("bob@example.test", "id-b"));
+    await seed(join(root, "alpha"), ".credentials.json", realLogin);
+    const info = await accountInfoFor("claude", ident("alpha", join(root, "alpha")), members);
+    expect(info?.mismatch).toEqual({ folderEmail: "bob@example.test", folderAccountId: "id-b" });
+  });
+
+  test("claude gateway-entry folder without a member copy has no account", async () => {
+    const root = await temp();
+    await seed(join(root, "alpha"), ".claude.json", claudeJson("old@example.test", "id-old"));
+    await seed(join(root, "alpha"), ".credentials.json", gatewayEntry);
+    expect(await accountInfoFor("claude", ident("alpha", join(root, "alpha")), join(root, "members"))).toBeUndefined();
+  });
+
   test("codex reads the id_token email and the account id claim", async () => {
     const root = await temp();
     const auth = { tokens: { id_token: jwt({ email: "alice@example.test", "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } }), access_token: "SYNTHETIC_FIXTURE_a" } };
