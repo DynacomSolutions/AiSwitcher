@@ -161,6 +161,21 @@ describe("agent identity: pool routed through the gateway", () => {
   });
 });
 
+describe("agent identity: console pod with another home", () => {
+  test("a host folder path is translated before the pool match", async () => {
+    const hostProc = proc(70, { identityEnv: { CLAUDE_CONFIG_DIR: "/srv/hostuser/.claude/identities/swap" } });
+    const host = { env: { AIS_HOST_HOME: "/srv/hostuser" }, localHome: HOME };
+    const { processes } = await scanner([hostProc], { host })();
+    expect(processes[0]).toMatchObject({ pool: "team-pool", identity: "alice", identitySource: "pool-active" });
+  });
+
+  test("without the translation the same folder stays unresolved", async () => {
+    const hostProc = proc(71, { identityEnv: { CLAUDE_CONFIG_DIR: "/srv/hostuser/.claude/identities/swap" } });
+    const { processes } = await scanner([hostProc], { host: { env: {}, localHome: HOME } })();
+    expect(processes[0]).toMatchObject({ pool: null, identity: null, identitySource: "unresolved" });
+  });
+});
+
 describe("helpers", () => {
   test("gatewayAppOfUrl reads the app from a gateway base URL", () => {
     expect(gatewayAppOfUrl("https://host.example.com/gateway/agents-claude")).toBe("agents-claude");
