@@ -8,9 +8,8 @@ runner, without any container runtime.
   The tarball is checked before extraction. Moving a pin is a deliberate commit.
 - `build/bootstrap.sh`: downloads the pinned Arch bootstrap tarball (next host
   and retry on failure, sha256 checked after each download), extracts it and
-  points pacman at the dated archive hosts (one `Server` line each, so pacman
-  falls back on a failed host). `build.sh` retries the package steps three times.
-  `archive.archlinux.org` is the last host because it often times out from CI.
+  points pacman at the dated archive hosts (one `Server` line each). `build.sh` retries the package steps three times.
+  Only `archive.archlinux.org` holds the dated package snapshot.
 - `build/build.sh`: bind-mounts `proc`, `sys`, `dev`, enters the root with
   `chroot`, installs `archiso`, runs `mkarchiso` on `archiso/` and writes
   `out/archiso.iso` and `out/build-info.json` (package list and `base-id`).
