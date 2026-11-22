@@ -1,9 +1,10 @@
 import { Hono } from "hono";
-import { BROWSER_TOOLS, SESSION_END_TOOL, DEFAULT_CALL_TIMEOUT_MS, UPLOAD_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallResult } from "../../browser/protocol.ts";
+import { BROWSER_TOOLS, SESSION_END_TOOL, DEFAULT_CALL_TIMEOUT_MS, UPLOAD_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallRequest, type CallResult } from "../../browser/protocol.ts";
 import { shortSessionId } from "../../browser/session-label.ts";
 import { validateToolArgs } from "../../browser/tool-args.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import type { GatewayMetrics } from "../metrics.ts";
+import type { ChatAuth } from "./chat-auth.ts";
 import { authAgentToken } from "./auth.ts";
 import type { BrowserHub } from "./hub.ts";
 import type { BrowserDeps } from "./deps.ts";
@@ -30,6 +31,16 @@ export function forwardedSession(b: BrowserBinding, identity: string, id: string
   return { id, identity: `pool:${b.target.pool}`, label: (label || shortSessionId(id)).slice(0, 80) };
 }
 
+/** A chat call may use one binding and the tabs linked to the chat. Nothing else. */
+export interface CallScope { binding: string; color: string; linked: ReadonlySet<number> }
+
+/** Session ids that start with this belong to chats. Only a chat token may use them. */
+const RESERVED_SESSION_PREFIX = "chat:";
+export const usesReservedSessionId = (id: string): boolean => id.toLowerCase().startsWith(RESERVED_SESSION_PREFIX);
+
+/** Tools a chat may call without a `tabId`. */
+const TABLESS_TOOLS: ReadonlySet<string> = new Set(["tabs_context", "tabs_create", "wait"]);
+
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 
@@ -44,6 +55,8 @@ export type CallHub = Pick<BrowserHub, "connected" | "call" | "abort" | "revoke"
 export interface CallDeps extends BrowserDeps {
   hub: CallHub;
   metrics?: GatewayMetrics;
+  /** Resolves per-chat tokens. Without it, every chat token is refused. */
+  chat?: ChatAuth;
 }
 
 /** An HTTP-shaped answer: `/browser/call` returns it as is, the MCP endpoint reads the `CallResult` out of it. */
@@ -59,7 +72,7 @@ export async function agentFromRequest(deps: Pick<BrowserDeps, "store">, req: Re
  * The call path behind `POST /browser/call`, as a function: the MCP endpoint runs the same code in-process.
  * `body` is the untrusted `{browser?, session, tool, args}` object. Tool-level failures are status 200 with `ok:false`.
  */
-export function createBrowserCaller(deps: CallDeps): (identity: string, body: unknown, signal?: AbortSignal) => Promise<CallOutcome> {
+export function createBrowserCaller(deps: CallDeps): (identity: string, body: unknown, signal?: AbortSignal, scope?: CallScope) => Promise<CallOutcome> {
   const fail = (id: string, tool: string, error: BrowserErrorCode, message: string): CallOutcome => {
     deps.metrics?.browserCall(tool, error, 0);
     return { status: 200, body: { id, ok: false, error, message } };
@@ -67,8 +80,9 @@ export function createBrowserCaller(deps: CallDeps): (identity: string, body: un
   const reject = (status: number, error: string): CallOutcome => ({ status, body: { error } });
   const poolMembers = async (pool: string): Promise<string[]> => (await deps.browserPoolMembers?.(pool)) ?? [];
 
-  return async (identity, body, signal) => {
+  return async (identity, body, signal, scope) => {
     if (!isObj(body) || !isObj(body.session) || typeof body.session.id !== "string" || body.session.id === "" || body.session.id.length > 128) return reject(400, "session.id is required");
+    if (!scope && usesReservedSessionId(body.session.id)) return reject(400, "reserved session id prefix");
     const tool = body.tool;
     if (typeof tool !== "string" || (tool !== SESSION_END_TOOL && !(BROWSER_TOOLS as readonly string[]).includes(tool))) return reject(400, "unknown tool");
     if (body.args !== undefined && !isObj(body.args)) return reject(400, "args must be an object");
@@ -83,7 +97,18 @@ export function createBrowserCaller(deps: CallDeps): (identity: string, body: un
     const label = typeof body.session.label === "string" ? body.session.label.slice(0, 80) : "";
 
     const connected = deps.hub.connected();
-    const allowed = await allowedBindings(identity, connected, poolMembers);
+    // A chat scope replaces the identity rules: the one binding that made the chat, and only if it is connected.
+    const allowed = scope ? connected.filter((b) => b.name === scope.binding) : await allowedBindings(identity, connected, poolMembers);
+    if (scope && tool !== "list_browsers" && tool !== SESSION_END_TOOL) {
+      // `tabs_create` stays allowed: the extension links the created tab to the chat and sends `chat.link` before the result.
+      if (tool === "tabs_create" && args.groupId !== undefined) return fail(id, tool, "forbidden_tab", "A chat cannot open a tab in a granted group.");
+      const needsTab = !TABLESS_TOOLS.has(tool);
+      if (needsTab || "tabId" in args) {
+        const t = args.tabId;
+        if (typeof t !== "number" || !scope.linked.has(t)) return fail(id, tool, "forbidden_tab", `Tab ${typeof t === "number" || typeof t === "string" ? String(t).slice(0, 40) : "(none)"} is not linked to this chat.`);
+      }
+    }
+    const session = (b: BrowserBinding, sid: string): CallRequest["session"] => ({ ...forwardedSession(b, identity, sid, label), ...(scope ? { color: scope.color, chat: true as const } : {}) });
     if (tool === "list_browsers") {
       deps.metrics?.browserCall(tool, "ok", 0);
       return { status: 200, body: { id, ok: true, content: [{ type: "text", text: JSON.stringify(allowed.map(summary)) }] } satisfies CallResult };
@@ -91,13 +116,17 @@ export function createBrowserCaller(deps: CallDeps): (identity: string, body: un
     if (tool === SESSION_END_TOOL) {
       const sessionId = body.session.id;
       // Best-effort notice: tell the named browser, else every browser this identity may drive (the caller cannot know which one holds the session's tabs).
-      const targets = typeof body.browser === "string" ? allowed.filter((b) => b.name === body.browser) : allowed;
-      await Promise.all(targets.map((b) => deps.hub.call(b.name, { id: crypto.randomUUID(), session: forwardedSession(b, identity, sessionId, label), tool: SESSION_END_TOOL, args }, 5_000).catch(() => undefined)));
+      const targets = !scope && typeof body.browser === "string" ? allowed.filter((b) => b.name === body.browser) : allowed;
+      await Promise.all(targets.map((b) => deps.hub.call(b.name, { id: crypto.randomUUID(), session: session(b, sessionId), tool: SESSION_END_TOOL, args }, 5_000).catch(() => undefined)));
       deps.metrics?.browserCall(tool, "ok", 0);
       return { status: 200, body: { id, ok: true, content: [{ type: "text", text: "ok" }] } satisfies CallResult };
     }
     let chosen: BrowserBinding | undefined;
-    if (typeof body.browser === "string") {
+    if (scope) {
+      // The `browser` argument is ignored: a chat has one browser.
+      chosen = allowed[0];
+      if (!chosen) return fail(id, tool, "no_browser", "The browser of this chat is not connected.");
+    } else if (typeof body.browser === "string") {
       chosen = allowed.find((b) => b.name === body.browser);
       if (!chosen) {
         if (connected.some((b) => b.name === body.browser)) return reject(403, "browser not available to this identity");
@@ -114,12 +143,32 @@ export function createBrowserCaller(deps: CallDeps): (identity: string, body: un
     signal?.addEventListener("abort", onAbort, { once: true });
     const result = await deps.hub.call(
       chosen.name,
-      { id, session: forwardedSession(chosen, identity, body.session.id, label), tool: tool as BrowserTool, args },
+      { id, session: session(chosen, body.session.id), tool: tool as BrowserTool, args },
       tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : tool === "upload_file" ? UPLOAD_CALL_TIMEOUT_MS : DEFAULT_CALL_TIMEOUT_MS,
     );
     signal?.removeEventListener("abort", onAbort);
+    if (scope && tool === "tabs_context" && result.ok) return { status: 200, body: scopeTabsContext(result, scope.linked) };
     return { status: 200, body: result };
   };
+}
+
+/**
+ * Defence in depth: a chat sees only its linked tabs. The reply drops `otherTabs` and `grantedGroups`, and keeps the
+ * `sessionTabs` entries that are linked. A reply this code cannot read is refused, not passed through.
+ */
+function scopeTabsContext(result: Extract<CallResult, { ok: true }>, linked: ReadonlySet<number>): CallResult {
+  try {
+    const content = result.content.map((c) => {
+      if (c.type !== "text") throw new Error("unexpected content");
+      const v = JSON.parse(c.text) as unknown;
+      if (!isObj(v)) throw new Error("unexpected shape");
+      const mine = Array.isArray(v.sessionTabs) ? v.sessionTabs.filter((t) => isObj(t) && typeof t.tabId === "number" && linked.has(t.tabId)) : [];
+      return { ...c, text: JSON.stringify({ ...v, sessionTabs: mine, otherTabs: [], grantedGroups: [] }) };
+    });
+    return { ...result, content };
+  } catch {
+    return { id: result.id, ok: false, error: "internal", message: "The tab list could not be read." };
+  }
 }
 
 const summary = (b: BrowserBinding) => ({ name: b.name, profileLabel: b.profileLabel, target: b.target });

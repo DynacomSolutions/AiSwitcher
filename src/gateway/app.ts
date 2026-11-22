@@ -4,6 +4,7 @@ import { extractToken } from "./auth.ts";
 import { BodyBudget } from "./body-budget.ts";
 import type { BrowserHub } from "./browser/hub.ts";
 import { createPairRoutes } from "./browser/pair.ts";
+import type { ChatAuth } from "./browser/chat-auth.ts";
 import { createMcpRoutes } from "./browser/mcp.ts";
 import { createCallRoutes, type CallHub } from "./browser/routing.ts";
 import { checkCaps, dayStartIct } from "./caps.ts";
@@ -52,6 +53,8 @@ export interface GatewayDeps {
   browserIdentityExists?(identity: string): Promise<string | undefined>;
   /** Browser relay; the agent call routes are only mounted when present. */
   browserHub?: CallHub;
+  /** Resolves per-chat browser tokens for `/browser/mcp`. Without it, chat tokens get 401. */
+  chat?: ChatAuth;
   /** Most request-body bytes held for replay at once across all requests. Defaults to AIS_GATEWAY_BODY_BUDGET_MB, else BODY_BUDGET_BYTES. */
   bodyBudgetBytes?: number;
   /** Side and served requests (lists, search, speech, pool-served routes) an app may make per day. Defaults to AIS_GATEWAY_SIDE_DAILY_LIMIT, else no limit (not counted at all). */
@@ -457,10 +460,11 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
     proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
+  const chatDeps = deps.chat ? { chat: deps.chat } : {};
   hono.route("/browser", createPairRoutes(browserDeps));
   if (deps.browserHub) {
     hono.route("/browser", createCallRoutes({ ...browserDeps, hub: deps.browserHub }));
-    hono.route("/browser", createMcpRoutes({ ...browserDeps, hub: deps.browserHub }));
+    hono.route("/browser", createMcpRoutes({ ...browserDeps, ...chatDeps, hub: deps.browserHub }));
   }
   hono.all("/:app", (c) => handle(c.req.raw));
   hono.all("/:app/*", (c) => handle(c.req.raw));

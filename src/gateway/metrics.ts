@@ -2,7 +2,13 @@ import { BROWSER_ERROR_CODES, BROWSER_TOOLS } from "../browser/protocol.ts";
 
 /** Fixed label sets of ais_gateway_browser_mcp_requests_total. */
 export const MCP_METHOD_LABELS = ["initialize", "ping", "tools/list", "tools/call", "notification", "delete", "get", "other"] as const;
-export const MCP_OUTCOME_LABELS = ["ok", "tool_error", "unauthorised", "bad_request", "forbidden", "error"] as const;
+export const MCP_OUTCOME_LABELS = ["ok", "tool_error", "unauthorised", "bad_request", "forbidden", "unavailable", "error"] as const;
+/** Fixed label sets of the chat metrics. */
+/** Event labels. `other` is the overflow label for unknown values. */
+export const CHAT_EVENT_LABELS = ["session_created", "session_closed", "session_resumed", "idle_closed"] as const;
+/** Outcome labels. `other` is the overflow label for unknown values. */
+export const CHAT_OUTCOME_LABELS = ["ok", "cancelled", "error"] as const;
+export const CHAT_ERROR_KINDS = ["pod_start", "attach", "agent_exit", "acp", "timeout", "limit", "resume_failed", "store", "owner_unreachable", "limit", "other"] as const;
 /** Counters the proxy reports. `PrometheusMetrics` is the production implementation. */
 export interface GatewayMetrics {
   request(e: {
@@ -27,6 +33,14 @@ export interface GatewayMetrics {
   browserMcpRequest(method: string, outcome: string): void;
   /** A browser pairing completed (token delivered). */
   browserPairing(): void;
+  /** A chat session event. Unknown values are counted as "other". */
+  chatSession(event: string): void;
+  /** A chat turn ended. Unknown values are counted as "other". */
+  chatTurn(outcome: string): void;
+  /** A chat error. Unknown kinds are counted as "other". */
+  chatError(kind: string): void;
+  /** Seconds a chat pod took to start. */
+  chatPodStart(seconds: number): void;
   /** Media parts replaced by a text note because the provider refused the file they name (media-recovery.ts). */
   mediaRemoved?(app: string, parts: number): void;
   /** An error event inside a response that began with HTTP 200 (stream or body). Labels are bounded by the implementation. */
@@ -46,6 +60,10 @@ export const noopMetrics: GatewayMetrics = {
   browserCall() {},
   browserMcpRequest() {},
   browserPairing() {},
+  chatSession() {},
+  chatTurn() {},
+  chatError() {},
+  chatPodStart() {},
 };
 
 const BUCKETS = [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300];
@@ -116,6 +134,14 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly browserCalls = new Counter("ais_gateway_browser_calls_total", "Browser tool calls by tool and outcome.");
   private readonly browserMcpRequests = new Counter("ais_gateway_browser_mcp_requests_total", "Browser MCP endpoint requests by JSON-RPC method and outcome.");
   private readonly browserPairings = new Counter("ais_gateway_browser_pairings_total", "Browser pairings completed.");
+  private readonly chatSessions = new Counter("ais_gateway_chat_sessions_total", "Chat session events by event.");
+  private readonly chatTurns = new Counter("ais_gateway_chat_turns_total", "Chat turns by outcome.");
+  private readonly chatErrors = new Counter("ais_gateway_chat_errors_total", "Chat errors by kind.");
+  private readonly podBucketCounts = BUCKETS.map(() => 0);
+  private podCount = 0;
+  private podSum = 0;
+  /** Set once the chat broker exists. */
+  chatGauges: { active(): number } = { active: () => 0 };
   private readonly callBucketCounts = BUCKETS.map(() => 0);
   private callCount = 0;
   private callSum = 0;
@@ -196,6 +222,26 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.callSum += seconds;
     BUCKETS.forEach((b, i) => {
       if (seconds <= b) this.callBucketCounts[i] = (this.callBucketCounts[i] ?? 0) + 1;
+    });
+  }
+
+  chatSession(event: string): void {
+    this.chatSessions.inc({ event: (CHAT_EVENT_LABELS as readonly string[]).includes(event) ? event : "other" });
+  }
+
+  chatTurn(outcome: string): void {
+    this.chatTurns.inc({ outcome: (CHAT_OUTCOME_LABELS as readonly string[]).includes(outcome) ? outcome : "other" });
+  }
+
+  chatError(kind: string): void {
+    this.chatErrors.inc({ kind: (CHAT_ERROR_KINDS as readonly string[]).includes(kind) ? kind : "other" });
+  }
+
+  chatPodStart(seconds: number): void {
+    this.podCount += 1;
+    this.podSum += seconds;
+    BUCKETS.forEach((b, i) => {
+      if (seconds <= b) this.podBucketCounts[i] = (this.podBucketCounts[i] ?? 0) + 1;
     });
   }
 
@@ -281,7 +327,7 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors]) out.push(...c.render());
     for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
@@ -289,6 +335,10 @@ export class PrometheusMetrics implements GatewayMetrics {
     out.push("# HELP ais_gateway_browser_call_seconds Browser tool call duration.", "# TYPE ais_gateway_browser_call_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_browser_call_seconds_bucket{le="${b}"} ${this.callBucketCounts[i]}`));
     out.push(`ais_gateway_browser_call_seconds_bucket{le="+Inf"} ${this.callCount}`, `ais_gateway_browser_call_seconds_sum ${this.callSum}`, `ais_gateway_browser_call_seconds_count ${this.callCount}`);
+    out.push("# HELP ais_gateway_chat_pod_start_seconds Time a chat pod took to start.", "# TYPE ais_gateway_chat_pod_start_seconds histogram");
+    BUCKETS.forEach((b, i) => out.push(`ais_gateway_chat_pod_start_seconds_bucket{le="${b}"} ${this.podBucketCounts[i]}`));
+    out.push(`ais_gateway_chat_pod_start_seconds_bucket{le="+Inf"} ${this.podCount}`, `ais_gateway_chat_pod_start_seconds_sum ${this.podSum}`, `ais_gateway_chat_pod_start_seconds_count ${this.podCount}`);
+    out.push("# HELP ais_gateway_chats_active Chat sessions active now.", "# TYPE ais_gateway_chats_active gauge", `ais_gateway_chats_active ${this.chatGauges.active()}`);
     out.push("# HELP ais_gateway_body_budget_waiting Requests queued for request-body memory budget.", "# TYPE ais_gateway_body_budget_waiting gauge", `ais_gateway_body_budget_waiting ${this.budgetWaiting}`);
     out.push("# HELP ais_gateway_body_budget_wait_seconds Time requests waited for request-body memory budget.", "# TYPE ais_gateway_body_budget_wait_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_body_budget_wait_seconds_bucket{le="${b}"} ${this.budgetBucketCounts[i]}`));

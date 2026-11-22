@@ -66,6 +66,7 @@ export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
   { domain: "kernel.org", reason: "CI only: scripts/ci/apt-install.sh falls back to the public Ubuntu mirror on mirrors.edge.kernel.org when the runner cannot resolve the Ubuntu archive hosts; never called by the product" },
   { domain: "command.run", reason: "engine event name in mods/ais-usage, not a host" },
   { domain: "process.run", reason: "engine event name in mods/ais-usage, not a host" },
+  { domain: "chat.link", reason: "chat frame type name, not a host; covers chat frame type names repo-wide" },
 ];
 
 // Not a domain/hostname (no TLD-shaped last label), so the scanner never

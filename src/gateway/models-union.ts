@@ -2,6 +2,7 @@ import type { GatewayDeps } from "./app.ts";
 import { stripHopByHop, upstreamHeaders } from "./app.ts";
 import { providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
+import { routeFor } from "./routes.ts";
 import { allowedMembers } from "./select.ts";
 import type { ApiStyle, GatewayApp } from "./types.ts";
 
@@ -102,6 +103,38 @@ export async function poolModels(input: PoolModelsInput): Promise<Response> {
   // Codex keeps the list's ETag in its models cache: give the union its own, stable for the same content.
   headers.set("etag", `W/"${new Bun.CryptoHasher("sha256").update(body).digest("hex").slice(0, 32)}"`);
   return new Response(body, { status: 200, headers });
+}
+
+/** Headers a provider needs on a model list when no client request supplies them. */
+const LIST_HEADERS: Record<ApiStyle, Record<string, string>> = { anthropic: { "anthropic-version": "2023-06-01" }, openai: {} };
+/** Model name fields, most specific first. */
+const NAME_FIELDS = ["display_name", "displayName", "name"] as const;
+
+/**
+ * The models an app can serve, as `{id, name}`: the union over a pool's members, or the one list of a pin.
+ * It uses the same route and the same member lists as `GET /<app>/models`. Throws when no list could be read, so a caller can show a fixed notice.
+ */
+export async function listAppModels(app: GatewayApp, deps: GatewayDeps, signal: AbortSignal): Promise<Array<{ id: string; name: string }>> {
+  const route = routeFor(app.provider, app.style, "GET", "/models");
+  if (route?.kind !== "upstream" || route.models === undefined) throw new Error("this provider has no model list");
+  const res = await poolModels({ app, deps, style: app.style, url: route.url, incoming: new Headers(LIST_HEADERS[app.style]), signal, single: false });
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new Error(`model list failed with status ${res.status}`);
+  }
+  const shape = listOf(await res.json().catch(() => undefined));
+  if (!shape) throw new Error("model list has no entries");
+  const out: Array<{ id: string; name: string }> = [];
+  const seen = new Set<string>();
+  for (const e of shape.entries) {
+    const id = entryName(e);
+    if (id === undefined || seen.has(id) || visibilityRank(e) === 0) continue;
+    seen.add(id);
+    let name = id;
+    if (isObj(e)) for (const f of NAME_FIELDS) if (typeof e[f] === "string" && (e[f] as string).length > 0) { name = e[f] as string; break; }
+    out.push({ id, name });
+  }
+  return out;
 }
 
 function passThrough(res: Response): Response {
