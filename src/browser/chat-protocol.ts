@@ -53,6 +53,8 @@ const str = (v: unknown, max = MAX_SHORT): string | undefined => (typeof v === "
 const int = (v: unknown): number | undefined => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined);
 const id = (v: unknown): string | undefined => (typeof v === "string" && ID_RE.test(v) ? v : undefined);
 const sel = (v: unknown): string | undefined => (typeof v === "string" && SEL_RE.test(v) ? v : undefined);
+/** True when a provider, identity, model or effort id is safe to send in a selection. */
+export const selectable = (v: string): boolean => SEL_RE.test(v);
 const oneOf = <T extends string>(set: readonly T[], v: unknown): T | undefined => (typeof v === "string" && (set as readonly string[]).includes(v) ? (v as T) : undefined);
 const text = (v: unknown): string | undefined => str(v, MAX_CHAT_TEXT);
 const name = (v: unknown): string | undefined => (typeof v === "string" && v.length >= 1 && v.length <= MAX_CHAT_NAME ? v : undefined);

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ChatCatalogProvider } from "../../../src/browser/chat-protocol.ts";
+import { selectable } from "../../../src/browser/chat-protocol.ts";
 import { buildPicker, choose, menuKey } from "../src/sidepanel/chat/picker.ts";
 import { createPicker } from "../src/sidepanel/chat/picker-view.ts";
 import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
@@ -52,7 +53,37 @@ describe("buildPicker", () => {
   });
 });
 
+describe("selectable ids", () => {
+  const odd: ChatCatalogProvider[] = [{ provider: "claude", efforts: ["ok", "bad effort"], identities: [{ name: "work", kind: "identity", models: [{ id: "a b", name: "Spaced" }, { id: "x".repeat(129), name: "Long" }, { id: "fine", name: "Fine" }] }, { name: "bad name", kind: "identity", models: [] }] }];
+  test("selectable follows the protocol rule", () => {
+    expect(selectable("a b")).toBe(false);
+    expect(selectable("x".repeat(129))).toBe(false);
+    expect(selectable("x".repeat(128))).toBe(true);
+  });
+  test("catalogue model ids a b and 129 characters are not pickable", () => {
+    const m = buildPicker(odd, { provider: "claude", identity: "work" });
+    expect(m.groups[0]!.identities.map(i => i.name)).toEqual(["work"]);
+    expect(m.groups[0]!.identities[0]!.models.map(x => x.id)).toEqual(["fine"]);
+    expect(m.efforts).toEqual(["ok"]);
+    expect(choose(undefined, { provider: "claude", identity: "work", model: "a b" }, odd).model).toBe("fine");
+  });
+  test("live config ids are checked the same way", () => {
+    const m = buildPicker(odd, { provider: "claude", identity: "work" }, { models: [{ id: "a b", name: "x" }, { id: "ok1", name: "Ok" }], efforts: ["no way", "hi"], current: {} });
+    expect(m.groups[0]!.identities[0]!.models.map(x => x.id)).toEqual(["ok1"]);
+    expect(m.efforts).toEqual(["hi"]);
+  });
+  test("an empty model list without an error says the default model is used", () => {
+    const m = buildPicker([{ provider: "claude", efforts: [], identities: [{ name: "work", kind: "identity", models: [] }] }], { provider: "claude", identity: "work" });
+    expect(m.notice).toBe("The agent's default model will be used.");
+  });
+});
+
 describe("choose", () => {
+  test("keeps the effort when the new group offers it too", () => {
+    const two: ChatCatalogProvider[] = [catalog[0]!, { provider: "codex", efforts: ["low", "max"], identities: [{ name: "work", kind: "identity", models: [{ id: "c1", name: "C" }] }] }];
+    expect(choose({ provider: "claude", identity: "work", model: "m1", effort: "low" }, { provider: "codex", identity: "work" }, two)).toEqual({ provider: "codex", identity: "work", model: "c1", effort: "low" });
+    expect(choose({ provider: "claude", identity: "work", model: "m1", effort: "high" }, { provider: "codex", identity: "work" }, two).effort).toBeUndefined();
+  });
   test("resets the model when the provider changes and clears an unsupported effort", () => {
     const r = choose({ provider: "claude", identity: "work", model: "m2", effort: "high" }, { provider: "kimi", identity: "work" }, catalog);
     expect(r).toEqual({ provider: "kimi", identity: "work", model: "k1" });
@@ -79,59 +110,114 @@ describe("menuKey", () => {
 });
 
 describe("picker view", () => {
-  const setup = () => {
+  const setup = (sel: Parameters<typeof buildPicker>[1] = { provider: "claude", identity: "work", model: "m1" }, extra: Partial<ReturnType<typeof buildPicker>> = {}) => {
     const doc = fakeDoc();
     const picks: unknown[] = [];
     let opened = 0;
     const p = createPicker(asDoc(doc), { onOpen: () => { opened++; }, onPick: x => picks.push(x), onEffort: e => picks.push({ effort: e }) }, "Model");
-    p.update(buildPicker(catalog, { provider: "claude", identity: "work", model: "m1" }));
+    p.update({ ...buildPicker(catalog, sel), ...extra });
     const root = p.root as unknown as FakeNode;
     const items = () => walk(root).filter(n => n.attrs.role === "menuitemradio");
-    return { doc, p, picks, root, items, opened: () => opened };
+    const menu = () => walk(root).find(n => n.attrs.role === "menu")!;
+    const panel = () => walk(root).find(n => n.className === "picker-menu")!;
+    return { doc, p, picks, root, items, menu, panel, btn: p.button as unknown as FakeNode, opened: () => opened };
   };
-  test("the button is a menu button and the menu has radio items", () => {
+  const key = (s: ReturnType<typeof setup>, k: string) => s.menu().dispatch("keydown", { key: k });
+  test("the button is a menu button and the menu has radio items in groups", () => {
     const s = setup();
-    const btn = s.p.button as unknown as FakeNode;
-    expect(btn.attrs["aria-haspopup"]).toBe("menu");
-    expect(btn.attrs["aria-expanded"]).toBe("false");
-    btn.click();
-    expect(btn.attrs["aria-expanded"]).toBe("true");
+    expect(s.btn.attrs["aria-haspopup"]).toBe("menu");
+    expect(s.btn.attrs["aria-expanded"]).toBe("false");
+    expect(s.panel().hidden).toBe(true);
+    s.btn.click();
+    expect(s.btn.attrs["aria-expanded"]).toBe("true");
     expect(s.opened()).toBe(1);
-    expect(walk(s.root).some(n => n.attrs.role === "menu" && !n.hidden)).toBe(true);
-    // work, Model One, Model Two, pool-a, kimi work, low, high
-    expect(s.items().map(n => n.textContent).filter((_, k) => k !== 3)).toEqual(["Clwork", "Model One", "Model Two", "Kiwork", "low", "high"]);
-    expect(s.items().some(n => n.textContent.includes("Pool"))).toBe(true);
+    expect(s.panel().hidden).toBe(false);
+    expect(s.items().map(n => n.textContent)).toEqual(["Clwork", "ClpoolPool", "Kiwork", "Model One", "Model Two", "low", "high"].map((t, k) => (k === 1 ? s.items()[1]!.textContent : t)));
+    expect(s.items()[1]!.textContent.includes("Pool")).toBe(true);
+    expect(walk(s.menu()).filter(n => n.attrs.role === "group").map(n => n.attrs["aria-label"])).toEqual(["Identity", "Model", "Effort"]);
+  });
+  test("hints sit outside the menu element", () => {
+    const s = setup(undefined, { notice: "Careful", loading: true });
+    expect(walk(s.menu()).some(n => n.className === "hint")).toBe(false);
+    expect(walk(s.root).filter(n => n.className === "hint").map(n => n.textContent)).toEqual(["Loading providers", "Careful"]);
+  });
+  test("ArrowDown, ArrowUp, Home and End move focus", () => {
+    const s = setup();
+    s.btn.click();
+    expect(s.doc.activeElement).toBe(s.items()[0]!);
+    key(s, "End");
+    expect(s.doc.activeElement).toBe(s.items()[6]!);
+    key(s, "ArrowDown");
+    expect(s.doc.activeElement).toBe(s.items()[0]!);
+    key(s, "ArrowUp");
+    expect(s.doc.activeElement).toBe(s.items()[6]!);
+    key(s, "Home");
+    expect(s.doc.activeElement).toBe(s.items()[0]!);
+  });
+  test("the button keydown opens the menu", () => {
+    const s = setup();
+    s.btn.dispatch("keydown", { key: "ArrowDown" });
+    expect(s.btn.attrs["aria-expanded"]).toBe("true");
+    expect(s.doc.activeElement).toBe(s.items()[0]!);
   });
   test("Escape closes the menu and returns focus to the button", () => {
     const s = setup();
-    const btn = s.p.button as unknown as FakeNode;
-    btn.click();
-    const menu = walk(s.root).find(n => n.attrs.role === "menu")!;
-    menu.dispatch("keydown", { key: "ArrowDown" });
+    s.btn.click();
+    key(s, "ArrowDown");
     expect(s.doc.activeElement).toBe(s.items()[1]!);
-    menu.dispatch("keydown", { key: "Escape" });
-    expect(btn.attrs["aria-expanded"]).toBe("false");
-    expect(s.doc.activeElement).toBe(btn);
+    key(s, "Escape");
+    expect(s.btn.attrs["aria-expanded"]).toBe("false");
+    expect(s.doc.activeElement).toBe(s.btn);
+  });
+  test("focus stays on the same item after a rebuild while open", () => {
+    const s = setup();
+    s.btn.click();
+    for (let k = 0; k < 4; k++) key(s, "ArrowDown");
+    expect(s.doc.activeElement!.textContent).toBe("Model Two");
+    s.p.update({ ...buildPicker(catalog, { provider: "claude", identity: "work", model: "m1" }), notice: "Changed" });
+    expect(s.doc.activeElement!.textContent).toBe("Model Two");
+    expect(s.items().includes(s.doc.activeElement as FakeNode)).toBe(true);
   });
   test("clicking a model picks it and closes; an outside click closes", () => {
     const s = setup();
-    const btn = s.p.button as unknown as FakeNode;
-    btn.click();
+    s.btn.click();
     s.doc.dispatch("click");
-    expect(btn.attrs["aria-expanded"]).toBe("true");
+    expect(s.btn.attrs["aria-expanded"]).toBe("true");
     s.items().find(n => n.textContent === "Model Two")!.click();
     expect(s.picks).toEqual([{ provider: "claude", identity: "work", model: "m2" }]);
-    expect(btn.attrs["aria-expanded"]).toBe("false");
-    btn.click();
+    expect(s.btn.attrs["aria-expanded"]).toBe("false");
+    s.btn.click();
     s.doc.dispatch("click");
     s.doc.dispatch("click");
-    expect(btn.attrs["aria-expanded"]).toBe("false");
+    expect(s.btn.attrs["aria-expanded"]).toBe("false");
+  });
+  test("focus leaving the picker closes the menu", () => {
+    const s = setup();
+    s.btn.click();
+    const other = s.doc.createElement("button") as unknown as FakeNode;
+    s.root.dispatch("focusout", { relatedTarget: s.items()[0]! });
+    expect(s.btn.attrs["aria-expanded"]).toBe("true");
+    s.root.dispatch("focusout", { relatedTarget: null });
+    expect(s.btn.attrs["aria-expanded"]).toBe("true");
+    s.root.dispatch("focusout", { relatedTarget: other });
+    expect(s.btn.attrs["aria-expanded"]).toBe("false");
+  });
+  test("a locked picker disables other identities and sends nothing for them", () => {
+    const s = setup(undefined, { locked: true });
+    s.btn.click();
+    const [work, pool] = s.items();
+    expect(work!.attrs["aria-disabled"]).toBeUndefined();
+    expect(pool!.attrs["aria-disabled"]).toBe("true");
+    expect(walk(s.root).some(n => n.className === "hint" && n.textContent === "Start a new chat to use a different provider or identity.")).toBe(true);
+    pool!.click();
+    expect(s.picks).toEqual([]);
+    expect(s.btn.attrs["aria-expanded"]).toBe("true");
   });
   test("names go in as text, not markup", () => {
     const doc = fakeDoc();
     const p = createPicker(asDoc(doc), { onOpen() {}, onPick() {}, onEffort() {} }, "Model");
-    p.update(buildPicker([{ provider: "codex", efforts: [], identities: [{ name: "<b>x</b>", kind: "identity", models: [{ id: "i", name: "<img>" }] }] }], { provider: "codex", identity: "<b>x</b>", model: "i" }));
+    p.update(buildPicker([{ provider: "codex", efforts: [], identities: [{ name: "x", kind: "identity", models: [{ id: "i", name: "<img>" }] }] }], { provider: "codex", identity: "x", model: "i" }));
     expect(asEl(p.root as unknown as FakeNode)).toBeDefined();
-    expect(walk(p.root as unknown as FakeNode).some(n => n.textContent.includes("<b>x</b>"))).toBe(true);
+    expect(walk(p.root as unknown as FakeNode).some(n => n.textContent === "<img>")).toBe(true);
   });
 });

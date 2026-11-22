@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { MAX_CHAT_NAME, MAX_CHAT_TABS, MAX_CHAT_TEXT } from "../../../src/browser/chat-protocol.ts";
 import type { TabInfo } from "../src/background/chrome-api.ts";
 import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../src/shared/chat.ts";
-import { AGENT_TAB, ChatTab, LOADING_PROVIDERS, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
+import { AGENT_TAB, ChatTab, checkSelection, parseSelection, LOADING_PROVIDERS, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
 import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
 import type { FakeNode } from "./fake-dom.ts";
 
@@ -400,5 +400,85 @@ describe("chat tab", () => {
     expect(onlyOwnKeys({ "chatSeen:1": {} }, ["chatSeen:1", "chatSelection"])).toBe(true);
     expect(onlyOwnKeys({ "chatSeen:1": {}, paused: {} }, ["chatSeen:1", "chatSelection"])).toBe(false);
     expect(onlyOwnKeys({}, ["chatSeen:1"])).toBe(false);
+  });
+});
+
+describe("picker wiring", () => {
+  const cat = [{ provider: "claude" as const, efforts: ["low"], identities: [{ name: "work", kind: "identity" as const, models: [{ id: "m1", name: "One" }, { id: "m2", name: "Two" }] }, { name: "pool-a", kind: "pool" as const, models: [{ id: "p1", name: "Pool One" }] }] }];
+  const make = (stored: unknown, over: { send?: (c: ChatPanelCommand) => Promise<ChatCommandResult | undefined> } = {}) => {
+    const doc = fakeDoc();
+    const root = doc.createElement("section");
+    let push: (m: unknown) => void = () => {};
+    const sent: ChatPanelCommand[] = [];
+    const saved: unknown[] = [];
+    const t = new ChatTab({
+      doc: asDoc(doc), windowId: 1,
+      connect: () => ({ postMessage: () => {}, onMessage: l => { push = l; }, onDisconnect: () => {} }),
+      queryTabs: async () => [tab(5, { active: true })],
+      send: c => { sent.push(c); return over.send ? over.send(c) : Promise.resolve({ ok: true }); },
+      loadSeen: async () => ({}), saveSeen: () => {},
+      loadSelection: async () => stored, saveSelection: s => { saved.push(s); },
+    }, asEl(root));
+    t.start();
+    return { t, root, sent, saved, push: (s: ChatPanelState) => push(s), flush: () => new Promise(r => setTimeout(r, 0)) };
+  };
+  test("parseSelection applies selectable to every field", () => {
+    expect(parseSelection({ provider: "claude", identity: "work", model: "a b", effort: "low" })).toEqual({ provider: "claude", identity: "work", effort: "low" });
+    expect(parseSelection({ provider: "claude", identity: "bad name" })).toBeUndefined();
+    expect(parseSelection({ provider: "nope", identity: "work" })).toBeUndefined();
+  });
+  test("checkSelection drops what the catalogue lacks", () => {
+    expect(checkSelection({ provider: "claude", identity: "work", model: "zz", effort: "max" }, cat)).toEqual({ provider: "claude", identity: "work" });
+    expect(checkSelection({ provider: "claude", identity: "gone" }, cat)).toBeUndefined();
+  });
+  test("New chat waits for the catalogue and then uses the stored selection", async () => {
+    const s = make({ provider: "claude", identity: "pool-a", model: "p1" });
+    s.push(stateOf([]));
+    await s.flush();
+    byText(s.root, "button", "New chat")!.click();
+    await s.flush();
+    expect(s.sent.some(c => c.type === "ais-chat-create")).toBe(false);
+    expect(byClass(s.root, "banner").find(b => b.textContent === LOADING_PROVIDERS)).toBeDefined();
+    s.push(stateOf([], { catalog: cat }));
+    byText(s.root, "button", "New chat")!.click();
+    await s.flush();
+    const create = s.sent.find(c => c.type === "ais-chat-create");
+    expect(create && create.type === "ais-chat-create" ? create.selection : undefined).toEqual({ provider: "claude", identity: "pool-a", model: "p1" });
+  });
+  test("a stored model the catalogue lacks is dropped", async () => {
+    const s = make({ provider: "claude", identity: "work", model: "gone" });
+    await s.flush();
+    s.push(stateOf([], { catalog: cat }));
+    byText(s.root, "button", "New chat")!.click();
+    await s.flush();
+    const create = s.sent.find(c => c.type === "ais-chat-create");
+    expect(create && create.type === "ais-chat-create" ? create.selection : undefined).toEqual({ provider: "claude", identity: "work" });
+  });
+  test("a model pick in an open chat sends ais-chat-config, other identities send nothing", async () => {
+    const s = make(undefined);
+    s.push(stateOf([view("a", { selection: { provider: "claude", identity: "work" } })], { catalog: cat }));
+    s.t.select("a");
+    await s.flush();
+    const pickers = byClass(s.root, "picker");
+    const detail = pickers[1]!;
+    const items = walk(detail).filter(n => n.attrs.role === "menuitemradio");
+    const pool = items.find(n => n.textContent.includes("pool-a"))!;
+    expect(pool.attrs["aria-disabled"]).toBe("true");
+    pool.click();
+    items.find(n => n.textContent === "Two")!.click();
+    await s.flush();
+    expect(s.sent.filter(c => c.type === "ais-chat-config")).toEqual([{ type: "ais-chat-config", chatId: "a", model: "m2" }]);
+  });
+  test("opening a menu asks for the catalogue and asks again after a failed send", async () => {
+    const s = make(undefined, { send: () => Promise.resolve(undefined) });
+    s.push(stateOf([]));
+    await s.flush();
+    const btn = walk(byClass(s.root, "picker")[0]!).find(n => n.className === "picker-button")!;
+    btn.click();
+    await s.flush();
+    btn.click();
+    btn.click();
+    await s.flush();
+    expect(s.sent.filter(c => c.type === "ais-chat-catalog").length).toBe(2);
   });
 });
