@@ -137,6 +137,7 @@ export class ChatTab {
   private shown: string | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private lastUsed: ChatSelection | undefined;
+  private selectionLoaded: boolean;
   private catalogAsked = false;
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -168,6 +169,7 @@ export class ChatTab {
   private readonly detailPicker: Picker;
 
   constructor(private readonly d: ChatViewDeps, private readonly root: HTMLElement) {
+    this.selectionLoaded = d.loadSelection === undefined;
     const doc = d.doc;
     this.loading = el(doc, "p", "hint", "Loading");
     this.connBanner = el(doc, "p", "banner bad", "AIS is not connected to the gateway. Connect it in the Status tab.");
@@ -184,7 +186,7 @@ export class ChatTab {
     this.listPicker = createPicker(doc, {
       onOpen: () => this.askCatalog(),
       onPick: p => this.pickNew(p),
-      onEffort: effort => { const cur = this.newSelection(); if (cur) this.setNew({ ...cur, effort }); },
+      onEffort: effort => { const cur = this.newSelection(); if (cur && selectable(effort)) this.setNew({ ...cur, effort }); },
     }, "Provider and model for new chats");
     this.listEl.append(head, this.listPicker.root, this.capHint, this.empty, this.ul);
 
@@ -217,7 +219,7 @@ export class ChatTab {
   start(): void {
     this.root.replaceChildren(this.loading, this.connBanner, this.errBanner, this.listEl, this.detailEl);
     void this.d.loadSeen().then(s => { this.seen = { ...s }; this.seenLoaded = true; this.noteSeen(); this.paint(); }, () => { this.seenLoaded = true; });
-    void this.d.loadSelection?.().then(v => { this.lastUsed = parseSelection(v); this.paint(); }, () => { /* no stored selection */ });
+    void this.d.loadSelection?.().then(v => { this.lastUsed = parseSelection(v); this.selectionLoaded = true; this.paint(); }, () => { this.selectionLoaded = true; this.paint(); });
     this.open();
     void this.refreshTabs();
   }
@@ -235,7 +237,7 @@ export class ChatTab {
   private newSelection(): ChatSelection | undefined {
     const s = this.state;
     const catalog = s?.catalog;
-    if (!s || !catalog) return undefined;
+    if (!s || !catalog || !this.selectionLoaded) return undefined;
     const mine = openChats(s.chats, this.d.windowId).at(-1)?.summary.selection;
     const first = catalog.find(p => p.identities.some(i => selectable(i.name)));
     return checkSelection(this.lastUsed, catalog) ?? checkSelection(mine, catalog) ?? (first ? { provider: first.provider, identity: first.identities.find(i => selectable(i.name))!.name } : undefined);

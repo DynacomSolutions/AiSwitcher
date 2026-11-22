@@ -149,10 +149,10 @@ export function createPicker(doc: Document, h: PickerHandlers, label: string): P
     const i = entries.findIndex(en => en.node === (e as FocusEvent).target);
     if (i >= 0) index = i;
   });
-  // Focus that moves to another element outside the picker closes the menu. A null target (a removed node) does not.
+  // Focus that moves to the button (Shift+Tab) or to another element outside the picker closes the menu. A null target (a removed node) does not.
   root.addEventListener("focusout", e => {
     const to = (e as FocusEvent).relatedTarget as Node | null;
-    if (open && to && !root.contains(to)) setOpen(false, false);
+    if (open && to && (to === button || !root.contains(to))) setOpen(false, false);
   });
   doc.addEventListener("click", () => { if (!inside) setOpen(false, false); inside = false; });
 

@@ -132,8 +132,7 @@ describe("picker view", () => {
     expect(s.btn.attrs["aria-expanded"]).toBe("true");
     expect(s.opened()).toBe(1);
     expect(s.panel().hidden).toBe(false);
-    expect(s.items().map(n => n.textContent)).toEqual(["Clwork", "ClpoolPool", "Kiwork", "Model One", "Model Two", "low", "high"].map((t, k) => (k === 1 ? s.items()[1]!.textContent : t)));
-    expect(s.items()[1]!.textContent.includes("Pool")).toBe(true);
+    expect(s.items().map(n => n.textContent)).toEqual(["Clwork", "Clpool-aPool", "Kiwork", "Model One", "Model Two", "low", "high"]);
     expect(walk(s.menu()).filter(n => n.attrs.role === "group").map(n => n.attrs["aria-label"])).toEqual(["Identity", "Model", "Effort"]);
   });
   test("hints sit outside the menu element", () => {
@@ -201,6 +200,14 @@ describe("picker view", () => {
     expect(s.btn.attrs["aria-expanded"]).toBe("true");
     s.root.dispatch("focusout", { relatedTarget: other });
     expect(s.btn.attrs["aria-expanded"]).toBe("false");
+  });
+  test("focus moving back to the button closes the menu and keeps focus there", () => {
+    const s = setup();
+    s.btn.click();
+    s.btn.focus();
+    s.root.dispatch("focusout", { relatedTarget: s.btn });
+    expect(s.btn.attrs["aria-expanded"]).toBe("false");
+    expect(s.doc.activeElement).toBe(s.btn);
   });
   test("a locked picker disables other identities and sends nothing for them", () => {
     const s = setup(undefined, { locked: true });

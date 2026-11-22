@@ -445,6 +445,31 @@ describe("picker wiring", () => {
     const create = s.sent.find(c => c.type === "ais-chat-create");
     expect(create && create.type === "ais-chat-create" ? create.selection : undefined).toEqual({ provider: "claude", identity: "pool-a", model: "p1" });
   });
+  test("New chat before the stored selection loads sends nothing and keeps the stored selection", async () => {
+    let release: (v: unknown) => void = () => {};
+    const stored = new Promise<unknown>(r => { release = r; });
+    const s = make(stored);
+    s.push(stateOf([], { catalog: cat }));
+    byText(s.root, "button", "New chat")!.click();
+    await s.flush();
+    expect(s.sent.some(c => c.type === "ais-chat-create")).toBe(false);
+    expect(s.saved).toEqual([]);
+    release({ provider: "claude", identity: "pool-a", model: "p1" });
+    await s.flush();
+    byText(s.root, "button", "New chat")!.click();
+    await s.flush();
+    const create = s.sent.find(c => c.type === "ais-chat-create");
+    expect(create && create.type === "ais-chat-create" ? create.selection : undefined).toEqual({ provider: "claude", identity: "pool-a", model: "p1" });
+  });
+  test("an effort that is not selectable is not saved for a new chat", async () => {
+    const s = make(undefined);
+    await s.flush();
+    s.push(stateOf([], { catalog: [{ ...cat[0]!, efforts: ["low", "bad effort"] }] }));
+    const items = walk(byClass(s.root, "picker")[0]!).filter(n => n.attrs.role === "menuitemradio");
+    items.find(n => n.textContent === "low")!.click();
+    expect(s.saved.length).toBe(1);
+    expect(s.saved[0]).toMatchObject({ effort: "low" });
+  });
   test("a stored model the catalogue lacks is dropped", async () => {
     const s = make({ provider: "claude", identity: "work", model: "gone" });
     await s.flush();
