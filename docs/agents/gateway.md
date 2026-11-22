@@ -536,6 +536,45 @@ throwaway pod outside the `dev` namespace.
   or `new PgGatewayStore(url, { usageRollup: "off" })`) the store scans `gateway_usage`. If TimescaleDB is added later,
   run the SQL of `0009_usage_rollup.sql` by hand after the hypertable conversion.
 
+## Side-panel chat (operators)
+
+The gateway can run chats for the Chrome extension side panel. Each chat is an `AgentSession` pod that the gateway creates and talks to. The feature guide is `docs/agents/browser.md`, section "Side-panel chat".
+
+Environment. Chat is on only when `AIS_GATEWAY_CHAT_GROUP` and `AIS_GATEWAY_CHAT_MCP_URL` are both set. With both set, `AIS_GATEWAY_CHAT_NAMESPACE` and `AIS_GATEWAY_CHAT_NODE` are required. If one is missing, the gateway logs a warning and runs with chat off.
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `AIS_GATEWAY_CHAT_GROUP` | API group of the `AgentSession` resource. | none (chat off) |
+| `AIS_GATEWAY_CHAT_MCP_URL` | URL of this gateway's `/browser/mcp`, as the pods reach it. | none (chat off) |
+| `AIS_GATEWAY_CHAT_NAMESPACE` | Namespace of the sessions. | required |
+| `AIS_GATEWAY_CHAT_NODE` | Node that chat pods run on (`spec.node`). | required |
+| `AIS_GATEWAY_CHAT_CLASS` | Value of `spec.class` of every chat session. | `chat` |
+| `AIS_GATEWAY_CHAT_CONFIG_MAP` | ConfigMap with the picker list (key `config.json`). | `agent-runtime-config` |
+| `AIS_GATEWAY_CHAT_MAX` | Open chats on the whole gateway. | 12 |
+| `AIS_GATEWAY_CHAT_IDLE_MINUTES` | Idle time before a chat pod ends. Never more than 180. | 120 |
+| `AIS_GATEWAY_CHAT_START_TIMEOUT_MS` | Time limit of one pod start. | 240000 |
+
+RBAC. The gateway ServiceAccount needs a token (`automountServiceAccountToken: true`) and a Role in the session namespace:
+
+- `agentsessions` in the chat group: `create`, `get`, `list`, `watch`, `patch`, `delete`. `list` finds sessions after a rollout. `patch` writes the heartbeat annotations.
+- `configmaps`: `get`, limited to the one ConfigMap name.
+- `pods/attach`: `create` and `get`, for the ACP stream.
+
+Four rules differ from the first design. Operators must apply them:
+
+1. Chat pods use `workspace: chat`. Never `tree`: it mounts the whole projects root read-write.
+2. The Role needs `list`, `patch` and the ConfigMap `get` above. The gateway no longer runs without the Kubernetes API.
+3. The agent container reads its stdin from the attach and stops when the attach closes (`stdinOnce`). A pod cannot be reattached. A rollout ends the pods and the next prompt starts a new one, which loads the earlier session.
+4. Admission cannot read other objects. A chat session name matches `^chat-[0-9a-f]{8}-[0-9]{1,3}$`. A create policy lets only the gateway ServiceAccount create `chat-` names, and forces `workspace: chat` and the label `<group>/created-by: ais-gateway`. The attach policy lets the gateway attach only to pods `agent-chat-...` that match the pattern.
+
+No new NetworkPolicy is needed. The agent egress policy already allows the gateway on its port.
+
+The database needs migration `0012_chat`. Chat events, leases and states live there. Closed chats are deleted after 30 days.
+
+Metrics: `ais_gateway_chat_sessions_total`, `ais_gateway_chat_turns_total`, `ais_gateway_chat_errors_total`, `ais_gateway_chat_pod_start_seconds` and `ais_gateway_chats_active`. A rising `ais_gateway_chat_errors_total{kind="owner_unreachable"}` means a replica did not answer a forwarded command.
+
+Rollout. On SIGTERM, readiness drops first. The chat drain then starts: new prompts get `unavailable`, open asks end as cancelled, and turns in flight finish with no timer. Pods end and leases free after the turns. The ledger flushes after the drain. Chats resume with `session/load` on the next prompt.
+
 ## Refresh guard
 
 The gateway alone refreshes account logins, and a provider rotates the refresh

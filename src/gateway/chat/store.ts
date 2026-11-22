@@ -129,6 +129,12 @@ export class MemoryChatStore implements ChatStore {
     return n;
   }
 
+  async countOpen(): Promise<number> {
+    let n = 0;
+    for (const c of this.chats.values()) if (c.state !== "closed") n += 1;
+    return n;
+  }
+
   async pruneClosed(beforeMs: number): Promise<number> {
     return this.prune((c) => c.state === "closed" && c.closedAt !== undefined && c.closedAt < beforeMs);
   }

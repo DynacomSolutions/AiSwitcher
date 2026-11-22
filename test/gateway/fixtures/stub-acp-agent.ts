@@ -82,6 +82,23 @@ async function runPrompt(id: string | number, sessionId: string, text: string) {
     process.stderr.write("stub exiting\n");
     process.exit(3);
   }
+  if (text.startsWith("wait:")) {
+    await new Promise((r) => setTimeout(r, Number(text.slice(5)) || 0));
+    chunk(sessionId, "waited");
+    return done();
+  }
+  if (text === "mcp-tabs") {
+    const server = (mcpByS.get(sessionId) ?? [])[0];
+    if (!server) {
+      chunk(sessionId, "no mcp server");
+      return done();
+    }
+    const headers: Record<string, string> = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+    for (const h of server.headers ?? []) headers[h.name] = h.value;
+    const res = await fetch(server.url, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "tabs_context", arguments: {} } }) });
+    chunk(sessionId, `tabs:${res.status}:${await res.text()}`);
+    return done();
+  }
   if (text === "mcp") {
     const server = (mcpByS.get(sessionId) ?? [])[0];
     if (!server) {

@@ -85,6 +85,8 @@ export interface ChatStore {
   ownedBy(replica: string): Promise<ChatRecord[]>;
   /** Deletes chats closed before the cut-off, with their events, in batches of 500. Returns the number of chats removed. */
   pruneClosed(beforeMs: number): Promise<number>;
+  /** Number of chats that are not closed, over all bindings. The gateway-wide cap reads it. */
+  countOpen(): Promise<number>;
   /** Deletes open chats without a live lease whose updatedAt is before the cut-off, with their events, in batches of 500. Returns the number removed. */
   pruneIdle(cutMs: number): Promise<number>;
 }

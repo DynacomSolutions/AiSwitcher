@@ -108,6 +108,16 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect(await s.hasTurnEnd(id, 252)).toBe(false);
   });
 
+  test("countOpen counts the chats that are not closed, over all bindings", async () => {
+    const s = await make();
+    const before = await s.countOpen();
+    const a = await owned(s);
+    await owned(s, { binding: "b2", windowId: 2 });
+    expect(await s.countOpen()).toBe(before + 2);
+    await s.update(a.id, { state: "closed" }, a.fence);
+    expect(await s.countOpen()).toBe(before + 1);
+  });
+
   test("events(afterSeq) returns the rest in order and honours limit", async () => {
     const s = await make();
     const { id, fence } = await owned(s);

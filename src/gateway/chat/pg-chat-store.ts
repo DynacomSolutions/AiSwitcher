@@ -172,6 +172,11 @@ export class PgChatStore implements ChatStore {
     return rows[0]?.found === true;
   }
 
+  async countOpen(): Promise<number> {
+    const rows = await this.sql.unsafe("SELECT count(*)::int AS n FROM gateway_chats WHERE state <> 'closed'");
+    return Number(rows[0]?.n ?? 0);
+  }
+
   /** nowMs is ignored: the database clock decides expiry. */
   async acquireLease(id: string, replica: string, ttlMs: number, _nowMs: number): Promise<number | undefined> {
     const rows = await this.sql.unsafe(

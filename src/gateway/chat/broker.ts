@@ -1190,6 +1190,11 @@ export class ChatBroker implements ChatAuth {
     }
   }
 
+  /** Chats with a running agent on this replica. The `ais_gateway_chats_active` gauge reads it. */
+  active(): number {
+    return this.runtimes.size;
+  }
+
   /**
    * Finish this replica's work for a rollout. New prompts are refused. Asks end as cancelled. Turns in flight end by themselves:
    * there is no timer here, the pod grace period is the only ceiling. Then each pod detaches, each chat goes idle and each lease is released,
