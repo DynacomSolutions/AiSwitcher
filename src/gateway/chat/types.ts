@@ -62,8 +62,9 @@ export interface ChatOwner { replica: string; ttlMs: number }
  */
 export interface ChatStore {
   /** Atomic count of the open chats of (binding, windowId). Returns "cap" when the window is full, and "global" when `globalCap` open chats exist over all bindings (the check and the insert are one atomic step). Throws ChatExistsError on a used id, even when the window is full.
+   * With `since` (epoch ms, the approval time of the binding) the window count skips chats made earlier: they belong to an older binding of the same name.
    * With owner, the same step sets the owner, the lease and epoch 1, so the caller has the fence ({ replica, epoch: record.epoch }) at once. */
-  create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number): Promise<ChatRecord | "cap" | "global">;
+  create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number, since?: number): Promise<ChatRecord | "cap" | "global">;
   get(id: string): Promise<ChatRecord | undefined>;
   listByBinding(binding: string, opts?: { windowId?: number; includeClosed?: boolean }): Promise<ChatRecord[]>;
   /** Throws ChatLeaseLostError when the fence is stale or expired, ChatClosedError on a move from closed to an open state. Returns undefined for an unknown chat. */
@@ -87,6 +88,6 @@ export interface ChatStore {
   pruneClosed(beforeMs: number): Promise<number>;
   /** Number of chats that are not closed, over all bindings. The gateway-wide cap reads it. */
   countOpen(): Promise<number>;
-  /** Deletes open chats without a live lease whose updatedAt is before the cut-off, with their events, in batches of 500. Returns the number removed. */
-  pruneIdle(cutMs: number): Promise<number>;
+  /** Deletes open chats without a live lease whose updatedAt is before the cut-off, with their events, in batches of 500. Returns the ids removed, so the caller can stop any pod. */
+  pruneIdle(cutMs: number): Promise<string[]>;
 }

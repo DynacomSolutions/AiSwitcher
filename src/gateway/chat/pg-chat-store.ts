@@ -53,7 +53,7 @@ export class PgChatStore implements ChatStore {
     if (this.ownsSql) await this.sql.close();
   }
 
-  async create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number): Promise<ChatRecord | "cap" | "global"> {
+  async create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number, since?: number): Promise<ChatRecord | "cap" | "global"> {
     // The advisory lock serialises creates of one window, so the count and the insert never race.
     // A second lock on a constant key serialises the gateway-wide count over all replicas. The order is always window, then global.
     let rows: Row[];
@@ -67,18 +67,18 @@ export class PgChatStore implements ChatStore {
            SELECT $1, $2, $3, $4, $5, $6::text::jsonb, 'starting', $7::text::jsonb, $8, $9, $10, $11::bigint, $11::bigint, $13::text,
              CASE WHEN $13::text IS NULL THEN 0 ELSE 1 END,
              CASE WHEN $13::text IS NULL THEN NULL ELSE clock_timestamp() + make_interval(secs => $14::double precision / 1000.0) END
-           WHERE (SELECT count(*) FROM gateway_chats WHERE binding = $2 AND window_id = $3 AND state <> 'closed') < $12
+           WHERE (SELECT count(*) FROM gateway_chats WHERE binding = $2 AND window_id = $3 AND state <> 'closed' AND ($16::bigint IS NULL OR created_at >= $16::bigint)) < $12
              AND ($15::int IS NULL OR (SELECT count(*) FROM gateway_chats WHERE state <> 'closed') < $15::int)
            RETURNING ${COLS}`,
           [rec.id, rec.binding, rec.windowId, rec.name, rec.color, JSON.stringify(rec.selection), JSON.stringify(rec.tabIds),
-            rec.acpSessionId ?? null, rec.podSession ?? null, rec.canLoad ?? null, rec.createdAt, cap, owner?.replica ?? null, owner?.ttlMs ?? null, globalCap ?? null],
+            rec.acpSessionId ?? null, rec.podSession ?? null, rec.canLoad ?? null, rec.createdAt, cap, owner?.replica ?? null, owner?.ttlMs ?? null, globalCap ?? null, since ?? null],
         );
         if (inserted.length === 0) {
           // The reason is read inside the transaction, under both locks, so no other create or close can change the counts.
           const c = await t.unsafe(
-            `SELECT (SELECT count(*) FROM gateway_chats WHERE binding = $1 AND window_id = $2 AND state <> 'closed')::int AS win,
+            `SELECT (SELECT count(*) FROM gateway_chats WHERE binding = $1 AND window_id = $2 AND state <> 'closed' AND ($3::bigint IS NULL OR created_at >= $3::bigint))::int AS win,
                     (SELECT count(*) FROM gateway_chats WHERE state <> 'closed')::int AS total`,
-            [rec.binding, rec.windowId],
+            [rec.binding, rec.windowId, since ?? null],
           );
           const win = Number(c[0]?.win ?? 0);
           const total = Number(c[0]?.total ?? 0);
@@ -226,23 +226,23 @@ export class PgChatStore implements ChatStore {
     return rows.map((r: Row) => toRecord(r));
   }
 
-  private async prune(where: string, cut: number): Promise<number> {
-    let total = 0;
+  private async prune(where: string, cut: number): Promise<string[]> {
+    const ids: string[] = [];
     for (;;) {
       const rows = await this.sql.unsafe(
         `DELETE FROM gateway_chats WHERE id IN (SELECT id FROM gateway_chats WHERE ${where} LIMIT ${BATCH}) RETURNING id`,
         [cut],
       );
-      total += rows.length;
-      if (rows.length < BATCH) return total;
+      for (const r of rows) ids.push(String((r as { id: unknown }).id));
+      if (rows.length < BATCH) return ids;
     }
   }
 
   async pruneClosed(beforeMs: number): Promise<number> {
-    return this.prune("state = 'closed' AND closed_at < $1::bigint", beforeMs);
+    return (await this.prune("state = 'closed' AND closed_at < $1::bigint", beforeMs)).length;
   }
 
-  async pruneIdle(cutMs: number): Promise<number> {
+  async pruneIdle(cutMs: number): Promise<string[]> {
     return this.prune("state <> 'closed' AND updated_at < $1::bigint AND (lease_until IS NULL OR lease_until <= clock_timestamp())", cutMs);
   }
 }

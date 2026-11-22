@@ -8,7 +8,7 @@ export const MCP_OUTCOME_LABELS = ["ok", "tool_error", "unauthorised", "bad_requ
 export const CHAT_EVENT_LABELS = ["session_created", "session_closed", "session_resumed", "idle_closed"] as const;
 /** Outcome labels. `other` is the overflow label for unknown values. */
 export const CHAT_OUTCOME_LABELS = ["ok", "cancelled", "error"] as const;
-export const CHAT_ERROR_KINDS = ["pod_start", "attach", "agent_exit", "acp", "timeout", "limit", "rate_limit", "resume_failed", "store", "owner_unreachable", "limit", "other"] as const;
+export const CHAT_ERROR_KINDS = ["pod_start", "attach", "agent_exit", "acp", "timeout", "limit", "rate_limit", "close_binding", "resume_failed", "store", "owner_unreachable", "limit", "other"] as const;
 /** Counters the proxy reports. `PrometheusMetrics` is the production implementation. */
 export interface GatewayMetrics {
   request(e: {

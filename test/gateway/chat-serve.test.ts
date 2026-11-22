@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
 import { MemoryChatBus } from "../../src/gateway/chat/bus.ts";
+import { MemoryChatStore } from "../../src/gateway/chat/store.ts";
 import { buildChatSession, type KubeApi, type PodHandle, type PodPhaseNotice, type PodSpecInput } from "../../src/gateway/chat/kube.ts";
 import { chatTokenKey, mintChatToken } from "../../src/gateway/chat/token.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
@@ -438,4 +439,140 @@ test("stop() flushes the ledger while a chat turn still runs", async () => {
   expect(turnEnded).toBe(false);
   await stopping;
   expect(turnEnded).toBe(true);
+});
+
+test("revoking a binding closes its chats, so a later binding of the same name lists none and the pods stop", async () => {
+  const token = await pair();
+  const transport = stub();
+  const g = await boot({ chatTransport: transport });
+  const c = await Client.open(g.port, token);
+  await c.until(() => c.of("chat.list").length === 1);
+  // One chat has a pod. The other stays in starting, with no pod, like a panel that never sent a prompt.
+  const running = crypto.randomUUID();
+  const waiting = crypto.randomUUID();
+  c.send(create(running));
+  c.send({ t: "chat.prompt", chatId: running, text: "say:hi" });
+  await c.until(() => c.of("chat.event").some((e) => e.chatId === running && e.body.k === "turn_end"));
+  c.send(create(waiting, { windowId: 2 }));
+  await c.until(() => c.of("chat.state").some((s) => s.chatId === waiting && s.state === "starting"));
+  expect(transport.starts).toHaveLength(1);
+
+  const admin = { authorization: `Bearer ${ADMIN}` };
+  const res = await fetch(`http://127.0.0.1:${g.adminPort}/browser/bindings/work`, { method: "DELETE", headers: admin });
+  expect(res.status).toBe(200);
+  expect(transport.stopped).toEqual(expect.arrayContaining([running, waiting]));
+
+  // A new binding with the same name (the old one was revoked, so the name is free).
+  await store.putBrowserBinding({ name: "work", target: { kind: "identity", identity: "id1" }, profileLabel: "w2", state: "active", createdAt: "2026-11-02T00:00:00.000Z" });
+  const t2 = generateToken();
+  await store.addBrowserToken("work", t2.prefix, t2.hash);
+  const c2 = await Client.open(g.port, t2.token);
+  await c2.until(() => c2.of("chat.list").length === 1);
+  expect(c2.of("chat.list")[0]?.chats).toEqual([]);
+  c2.send({ t: "chat.list" });
+  await c2.until(() => c2.of("chat.list").length === 2);
+  expect(c2.of("chat.list")[1]?.chats).toEqual([]);
+});
+
+/** Revokes "work" in the store only (no clean-up) and pairs a new binding of the same name, approved after the old chats were made. */
+async function reuseName(): Promise<string> {
+  await Bun.sleep(20);
+  await store.revokeBrowserBinding("work");
+  await store.putBrowserBinding({ name: "work", target: { kind: "identity", identity: "id1" }, profileLabel: "w2", state: "active", createdAt: new Date().toISOString() });
+  const t = generateToken();
+  await store.addBrowserToken("work", t.prefix, t.hash);
+  return t.token;
+}
+
+test("a new binding of a reused name never sees, resumes or prompts the chats of the old binding, even when no clean-up ran", async () => {
+  const token = await pair();
+  const transport = stub();
+  const g = await boot({ chatTransport: transport });
+  const c = await Client.open(g.port, token);
+  await c.until(() => c.of("chat.list").length === 1);
+  const open = crypto.randomUUID();
+  const closed = crypto.randomUUID();
+  c.send(create(open));
+  c.send(create(closed, { windowId: 2 }));
+  await c.until(() => c.of("chat.state").filter((s) => s.state === "starting").length >= 2);
+  c.send({ t: "chat.close", chatId: closed });
+  await c.until(() => c.of("chat.state").some((s) => s.chatId === closed && s.state === "closed"));
+
+  const c2 = await Client.open(g.port, await reuseName());
+  await c2.until(() => c2.of("chat.list").length === 1);
+  expect(c2.of("chat.list")[0]?.chats).toEqual([]);
+  c2.send({ t: "chat.list" });
+  await c2.until(() => c2.of("chat.list").length === 2);
+  expect(c2.of("chat.list")[1]?.chats).toEqual([]);
+  for (const chatId of [open, closed]) c2.send({ t: "chat.resume", chatId, afterSeq: 0 });
+  await c2.until(() => c2.of("chat.reject").length === 2);
+  c2.send({ t: "chat.prompt", chatId: open, text: "say:stolen" });
+  await c2.until(() => c2.of("chat.reject").length === 3);
+  expect(c2.of("chat.event")).toEqual([]);
+  expect(transport.starts).toHaveLength(0);
+  // Its own chats work as before.
+  const own = crypto.randomUUID();
+  c2.send(create(own));
+  c2.send({ t: "chat.prompt", chatId: own, text: "say:mine" });
+  await c2.until(() => c2.of("chat.event").some((e) => e.body.k === "turn_end"));
+  expect(texts(c2)).toBe("mine");
+});
+
+test("chat.create on a revoked binding is refused", async () => {
+  const token = await pair();
+  const g = await boot({ chatTransport: stub() });
+  const c = await Client.open(g.port, token);
+  await c.until(() => c.of("chat.list").length === 1);
+  await store.revokeBrowserBinding("work");
+  const chatId = crypto.randomUUID();
+  c.send(create(chatId));
+  await c.until(() => c.of("chat.reject").length === 1);
+  expect(c.of("chat.reject")[0]).toMatchObject({ chatId, code: "bad_request" });
+  expect(c.of("chat.state")).toEqual([]);
+});
+
+test("a socket of the old binding cannot list, create, resume or prompt once the name is approved again", async () => {
+  const token = await pair();
+  // Two replicas over one store. The hub of the first one never hears of the new approval, like a lost revoke notice.
+  const chatStore = new MemoryChatStore();
+  const chatBus = new MemoryChatBus();
+  const g = await boot({ chatTransport: stub(), chatStore, chatBus });
+  const g2 = await boot({ chatTransport: stub(), chatStore, chatBus });
+  const old = await Client.open(g.port, token);
+  await old.until(() => old.of("chat.list").length === 1);
+  const c2 = await Client.open(g2.port, await reuseName());
+  await c2.until(() => c2.of("chat.list").length === 1);
+  const mine = crypto.randomUUID();
+  c2.send(create(mine));
+  await c2.until(() => c2.of("chat.state").some((s) => s.chatId === mine));
+  // The old socket stays open, as when the revoke notice was lost.
+  old.send({ t: "chat.list" });
+  await old.until(() => old.of("chat.list").length === 2);
+  expect(old.of("chat.list")[1]?.chats).toEqual([]);
+  const theirs = crypto.randomUUID();
+  old.send(create(theirs));
+  old.send({ t: "chat.resume", chatId: mine, afterSeq: 0 });
+  old.send({ t: "chat.prompt", chatId: mine, text: "say:stolen" });
+  await old.until(() => old.of("chat.reject").length === 3);
+  expect(old.of("chat.reject")[0]).toMatchObject({ chatId: theirs, code: "bad_request" });
+  expect(old.of("chat.event")).toEqual([]);
+  expect(c2.of("chat.list")[0]?.chats).toEqual([]);
+  c2.send({ t: "chat.list" });
+  await c2.until(() => c2.of("chat.list").length === 2);
+  expect((c2.of("chat.list")[1]?.chats ?? []).map((x: Frame) => x.chatId)).toEqual([mine]);
+});
+
+test("old chats that were never closed do not count against the window cap of a new binding of the same name", async () => {
+  const token = await pair();
+  const g = await boot({ chatTransport: stub() });
+  const c = await Client.open(g.port, token);
+  await c.until(() => c.of("chat.list").length === 1);
+  for (let i = 0; i < 6; i++) c.send(create(crypto.randomUUID()));
+  await c.until(() => c.of("chat.state").filter((s) => s.state === "starting").length >= 6);
+  const c2 = await Client.open(g.port, await reuseName());
+  await c2.until(() => c2.of("chat.list").length === 1);
+  const chatId = crypto.randomUUID();
+  c2.send(create(chatId));
+  await c2.until(() => c2.of("chat.state").some((s) => s.chatId === chatId));
+  expect(c2.of("chat.reject")).toEqual([]);
 });

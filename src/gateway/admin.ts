@@ -41,6 +41,8 @@ export interface AdminDeps {
   browserPoolMembers?(pool: string): Promise<string[] | undefined>;
   browserIdentityExists?(identity: string): Promise<string | undefined>;
   browserHub?: { revoke(binding: string): void };
+  /** Closes the chats of a revoked binding (side-panel chat). Absent when chat is off. */
+  onBindingRevoked?(binding: string, before?: number): Promise<void>;
   /** Who renews each gateway login and when (GET /logins/renewal); absent when the gateway has no refresh journal. */
   renewal?(): Promise<LoginRenewal[]>;
   /** The credential store behind the host sync routes (/store/*, admin-store.ts); absent when the gateway has no credential store. */
@@ -238,7 +240,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
     return next();
   });
   hono.onError(() => err(503, "store unavailable"));
-  registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserHub ? { hub: deps.browserHub } : {}), ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
+  registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserHub ? { hub: deps.browserHub } : {}), ...(deps.onBindingRevoked ? { onBindingRevoked: deps.onBindingRevoked } : {}), ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
 
   registerStoreAdmin(hono, deps.storeAdmin, (status, message, extra) => Response.json({ error: message, ...extra }, { status }));
 

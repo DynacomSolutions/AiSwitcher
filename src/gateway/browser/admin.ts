@@ -68,10 +68,16 @@ export function registerBrowserAdmin(hono: Hono, deps: BrowserDeps): void {
       for (let i = 2; await nameTaken(name); i++) name = `${base}-${i}`;
     }
     const binding: BrowserBinding = { name, target, profileLabel: pairing.profileLabel, state: "active", createdAt: deps.now().toISOString() };
-    // Reusing a revoked name: its old tokens must not authenticate the new binding.
+    // Reusing a revoked name: its old tokens must not authenticate the new binding, and its old chats must not reach it.
+    const previous = await store.getBrowserBinding(name);
     await store.deleteBrowserTokens(name);
     await store.putBrowserBinding(binding);
     await store.putPairing({ ...pairing, approvedBinding: name });
+    // Chat visibility already hides the older binding's chats (by approval time). This only ends their pods and records.
+    // It never blocks the approval. The hook counts a failure in the metrics.
+    if (previous?.state === "revoked" && deps.onBindingRevoked) {
+      void deps.onBindingRevoked(name, Date.parse(binding.createdAt)).catch(() => undefined);
+    }
     return c.json({ binding });
   });
 
@@ -88,6 +94,9 @@ export function registerBrowserAdmin(hono: Hono, deps: BrowserDeps): void {
     if (!(await store.getBrowserBinding(name))) return err(404, "no such binding");
     await store.revokeBrowserBinding(name);
     deps.hub?.revoke(name);
+    // The chats of the binding end with it: a later binding of the same name must not list them.
+    // Revoke always succeeds. The hook counts a failed clean-up in the metrics.
+    await deps.onBindingRevoked?.(name).catch(() => undefined);
     return c.json({ binding: name, state: "revoked" });
   });
 

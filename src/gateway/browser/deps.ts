@@ -9,6 +9,8 @@ export interface BrowserDeps {
   browserPoolMembers?(pool: string): Promise<string[] | undefined>;
   /** The canonical name of an identity (alias resolved), or undefined when it does not exist. When absent, names are used as given. */
   browserIdentityExists?(identity: string): Promise<string | undefined>;
+  /** Clean-up of the chats of a revoked binding (pods and records). With `before` (epoch ms) only chats made earlier. */
+  onBindingRevoked?(binding: string, before?: number): Promise<void>;
   /** Closes the live extension socket of a revoked binding. */
   hub?: { revoke(binding: string): void; extensionVersion?(binding: string): string | undefined };
 }

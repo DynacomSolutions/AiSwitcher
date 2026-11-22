@@ -8,7 +8,7 @@ import { ChatBroker, chatIdleMsFromEnv, type BrokerDeps } from "../../src/gatewa
 import { sessionName } from "../../src/gateway/chat/kube.ts";
 import type { Timers } from "../../src/gateway/chat/pod-transport.ts";
 import { MemoryChatStore } from "../../src/gateway/chat/store.ts";
-import { chatTokenKey } from "../../src/gateway/chat/token.ts";
+import { chatTokenKey, mintChatToken } from "../../src/gateway/chat/token.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 import { StubPodTransport } from "./fixtures/stub-transport.ts";
 
@@ -588,4 +588,60 @@ test("an adopted prompt with a turn end more than 200 events later does not run 
   await Bun.sleep(600);
   expect(b.transport.starts).toHaveLength(0);
   expect(await turnEnds(store, id)).toBe(2);
+});
+
+test("closeBinding on one replica closes the chat that another replica runs, and a chat that never got a pod", async () => {
+  const { store, a, b, id } = await pair();
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await idle(store, id);
+  // The pod of `id` lives on replica a. A second chat is still in starting, with no pod and no owner.
+  const waiting = await b.broker.create({ chatId: crypto.randomUUID(), binding: "bind-1", windowId: 2, name: "Waiting", color: "#aabbcc", selection: { provider: "claude", identity: "alpha" }, tabIds: [] });
+  if ("code" in waiting) throw new Error("rejected");
+  expect((await store.get(waiting.id))?.state).toBe("starting");
+  await b.broker.closeBinding("bind-1");
+  await until(async () => (await store.get(id))?.state === "closed", "owner closed its chat");
+  await until(async () => (await store.get(waiting.id))?.state === "closed", "waiting chat closed");
+  expect(a.transport.stoppedSessions.length + a.transport.stopped.length).toBeGreaterThan(0);
+  expect(await store.listByBinding("bind-1")).toEqual([]);
+  expect(b.metrics.render().includes('kind="other"')).toBe(false);
+});
+
+test("a binding approved after the chat was made cannot use it, even when the owner is out of reach and the clean-up cannot close it", async () => {
+  const clockRef = { approved: 0 };
+  const { store, bus, a, b, id } = await pair({ b: { bindingSince: async () => clockRef.approved } });
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await idle(store, id);
+  expect((await store.get(id))?.leaseLive).toBe(true);
+  clockRef.approved = (await store.get(id))!.createdAt + 1;
+  bus.drop = () => true;
+  const reject = { code: "bad_request" as const, message: "This chat does not exist." };
+  for (const cmd of ["prompt", "close", "link"] as const) expect(await b.broker.dispatch({ chatId: id, binding: "bind-1", cmd, args: cmd === "prompt" ? { text: "x" } : cmd === "link" ? { tabIds: [] } : {} })).toEqual(reject);
+  expect(await b.broker.prompt(id, "bind-1", "x")).toEqual(reject);
+  expect(await b.broker.principal(mintChatToken(KEY, { chatId: id, binding: "bind-1", exp: Date.now() + 1e9, gen: (await store.get(id))!.generation }))).toBeUndefined();
+  // The clean-up cannot reach the owner. It gives up after its bound and counts the chat, and it does not throw.
+  await b.broker.closeBinding("bind-1", { waitMs: 100 });
+  expect((await store.get(id))?.state).not.toBe("closed");
+  expect(b.metrics.render()).toContain('ais_gateway_chat_errors_total{kind="close_binding"} 1');
+  expect(await bodies(store, id).then((x) => x.filter((e) => e.k === "user"))).toHaveLength(1);
+});
+
+test("stopPods stops the pod of each pruned chat id", async () => {
+  const { a, id } = await pair();
+  await a.broker.stopPods([id, "other-id"]);
+  expect(a.transport.stopped).toEqual([id, "other-id"]);
+});
+
+test("the timer's retry closes the open chats made before the approval of an active binding, and no others", async () => {
+  const { store, a, id } = await pair();
+  const made = (await store.get(id))!.createdAt;
+  const fresh = await a.broker.create({ chatId: crypto.randomUUID(), binding: "bind-1", windowId: 2, name: "New", color: "#aabbcc", selection: { provider: "claude", identity: "alpha" }, tabIds: [] });
+  if ("code" in fresh) throw new Error("rejected");
+  await a.broker.retryStaleChats([{ name: "bind-1", since: made }]);
+  expect((await store.get(id))?.state).toBe("starting");
+  await a.broker.retryStaleChats([{ name: "bind-1", since: made + 1 }, { name: "no-such", since: made + 1 }]);
+  expect((await store.get(id))?.state).toBe("closed");
+  expect((await store.get(fresh.id))?.state).toBe("closed");
+  expect(a.metrics.render().includes("close_binding")).toBe(false);
 });

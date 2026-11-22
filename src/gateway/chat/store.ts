@@ -23,11 +23,11 @@ export class MemoryChatStore implements ChatStore {
     return r.ownerReplica === f.replica && r.epoch === f.epoch && r.leaseUntil !== undefined && r.leaseUntil > this.now();
   }
 
-  async create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number): Promise<ChatRecord | "cap" | "global"> {
+  async create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number, since?: number): Promise<ChatRecord | "cap" | "global"> {
     if (this.chats.has(rec.id)) throw new ChatExistsError(rec.id);
     let open = 0;
     for (const c of this.chats.values()) {
-      if (c.binding === rec.binding && c.windowId === rec.windowId && c.state !== "closed") open += 1;
+      if (c.binding === rec.binding && c.windowId === rec.windowId && c.state !== "closed" && (since === undefined || c.createdAt >= since)) open += 1;
     }
     if (open >= cap) return "cap";
     if (globalCap !== undefined) {
@@ -123,16 +123,16 @@ export class MemoryChatStore implements ChatStore {
     return [...this.chats.values()].filter((c) => c.ownerReplica === replica && c.state !== "closed").map((r) => this.copy(r));
   }
 
-  private prune(match: (c: ChatRecord) => boolean): number {
-    let n = 0;
+  private prune(match: (c: ChatRecord) => boolean): string[] {
+    const ids: string[] = [];
     for (const [id, c] of this.chats) {
       if (match(c)) {
         this.chats.delete(id);
         this.log.delete(id);
-        n += 1;
+        ids.push(id);
       }
     }
-    return n;
+    return ids;
   }
 
   async countOpen(): Promise<number> {
@@ -142,10 +142,10 @@ export class MemoryChatStore implements ChatStore {
   }
 
   async pruneClosed(beforeMs: number): Promise<number> {
-    return this.prune((c) => c.state === "closed" && c.closedAt !== undefined && c.closedAt < beforeMs);
+    return this.prune((c) => c.state === "closed" && c.closedAt !== undefined && c.closedAt < beforeMs).length;
   }
 
-  async pruneIdle(cutMs: number): Promise<number> {
+  async pruneIdle(cutMs: number): Promise<string[]> {
     return this.prune((c) => c.state !== "closed" && c.updatedAt < cutMs && (c.leaseUntil === undefined || c.leaseUntil <= this.now()));
   }
 }
