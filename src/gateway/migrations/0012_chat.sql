@@ -1,4 +1,4 @@
--- Side-panel chats: one row per chat, plus an ordered event log. A replica owns a chat through its lease.
+-- Side-panel chats: one row per chat, plus an ordered event log. A replica owns a chat through its lease. The epoch grows on each acquire and fences stale owners.
 CREATE TABLE IF NOT EXISTS gateway_chats (
   id             text PRIMARY KEY,
   binding        text NOT NULL,
@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS gateway_chats (
   can_load       boolean,
   owner_replica  text,
   lease_until    timestamptz,
+  epoch          bigint NOT NULL DEFAULT 0,
   last_seq       bigint NOT NULL DEFAULT 0,
   generation     integer NOT NULL DEFAULT 0,
   created_at     bigint NOT NULL,
