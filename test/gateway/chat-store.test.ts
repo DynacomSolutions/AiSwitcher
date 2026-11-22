@@ -40,6 +40,27 @@ if (!url && process.env.CI && !optOut) {
   afterAll(async () => {
     for (const s of stores) await s.close();
   });
+  describe("PgChatStore jsonb columns", () => {
+    test("stored jsonb values are objects and arrays, not JSON strings", async () => {
+      const s = new PgChatStore(url);
+      stores.push(s);
+      await migrate(url);
+      const c = (await s.create({ id: `jsonb-${crypto.randomUUID()}`, binding: "b", windowId: 1, name: "n", color: "#000000", selection: { provider: "claude", identity: "i" }, tabIds: [1, 2], createdAt: Date.now() }, 6, { replica: "r1", ttlMs: 60_000 })) as { id: string; epoch: number };
+      const fence = { replica: "r1", epoch: c.epoch };
+      await s.appendEvent(c.id, { k: "notice", text: "x" }, fence);
+      await s.update(c.id, { selection: { provider: "claude", identity: "j" }, tabIds: [3] }, fence);
+      const admin = new SQL(url);
+      try {
+        const chat = await admin`SELECT jsonb_typeof(selection) AS sel, jsonb_typeof(tab_ids) AS tabs FROM gateway_chats WHERE id = ${c.id}`;
+        expect(chat[0]).toEqual({ sel: "object", tabs: "array" });
+        const ev = await admin`SELECT jsonb_typeof(body) AS body FROM gateway_chat_events WHERE chat_id = ${c.id}`;
+        expect(ev.map((r: { body: string }) => r.body)).toEqual(["object"]);
+      } finally {
+        await admin.close();
+      }
+    });
+  });
+
   describe("PgChatStore contract", () => {
     chatStoreContract(async () => {
       for (const s of stores.splice(0)) await s.close();
