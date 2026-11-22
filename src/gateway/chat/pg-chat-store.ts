@@ -164,6 +164,14 @@ export class PgChatStore implements ChatStore {
     return rows.map((r: Row) => ({ seq: Number(r.seq), ts: Number(r.ts), body: json<ChatBody>(r.body) }));
   }
 
+  async hasTurnEnd(id: string, afterSeq: number): Promise<boolean> {
+    const rows = await this.sql.unsafe(
+      "SELECT EXISTS (SELECT 1 FROM gateway_chat_events WHERE chat_id = $1 AND seq > $2::bigint AND body->>'k' = 'turn_end') AS found",
+      [id, afterSeq],
+    );
+    return rows[0]?.found === true;
+  }
+
   /** nowMs is ignored: the database clock decides expiry. */
   async acquireLease(id: string, replica: string, ttlMs: number, _nowMs: number): Promise<number | undefined> {
     const rows = await this.sql.unsafe(

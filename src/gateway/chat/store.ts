@@ -85,6 +85,10 @@ export class MemoryChatStore implements ChatStore {
     return (this.log.get(id) ?? []).filter((e) => e.seq > afterSeq).slice(0, Math.max(0, limit)).map((e) => structuredClone(e));
   }
 
+  async hasTurnEnd(id: string, afterSeq: number): Promise<boolean> {
+    return (this.log.get(id) ?? []).some((e) => e.seq > afterSeq && e.body.k === "turn_end");
+  }
+
   async acquireLease(id: string, replica: string, ttlMs: number, _nowMs: number): Promise<number | undefined> {
     const r = this.chats.get(id);
     if (!r) return undefined;

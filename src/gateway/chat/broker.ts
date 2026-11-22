@@ -897,17 +897,28 @@ export class ChatBroker implements ChatAuth {
     return chat.leaseLive === true ? chat.ownerReplica : undefined;
   }
 
-  /** Put an error item in the feed. It needs the lease, so it takes the lease for the write. It never throws. */
-  private async feedNotice(chatId: string, message: string): Promise<void> {
+  /**
+   * Put an item in the feed. A running agent writes with its own fence. Without one, the write takes the lease for a moment.
+   * It runs inside the per-chat lock, so two notices cannot take the lease from each other. It never throws.
+   */
+  private async feedNotice(chatId: string, message: string, kind: "error" | "notice" = "error"): Promise<void> {
     try {
-      const epoch = await this.d.store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now());
-      if (epoch === undefined) return;
-      const fence: LeaseFence = { replica: this.d.replicaId, epoch };
-      try {
-        await this.emit(chatId, { k: "error", code: "unavailable", message }, fence);
-      } finally {
-        await this.d.store.releaseLease(chatId, fence).catch(() => undefined);
-      }
+      await this.locked(chatId, async () => {
+        const body: ChatBody = kind === "notice" ? { k: "notice", text: message } : { k: "error", code: "unavailable", message };
+        const rt = this.runtimes.get(chatId);
+        if (rt) {
+          await this.emit(chatId, body, rt.fence);
+          return;
+        }
+        const epoch = await this.d.store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now());
+        if (epoch === undefined) return;
+        const fence: LeaseFence = { replica: this.d.replicaId, epoch };
+        try {
+          await this.emit(chatId, body, fence);
+        } finally {
+          await this.d.store.releaseLease(chatId, fence).catch(() => undefined);
+        }
+      });
     } catch {
       // The metric already counted it.
     }
@@ -1127,13 +1138,17 @@ export class ChatBroker implements ChatAuth {
         await this.claims.get(chatId);
         const st = this.starting.get(chatId);
         if (st && !st.ending) await st.promise.catch(() => undefined);
+        // Every acked prompt ends in a turn, a draining notice or a busy notice.
+        if (this.draining) {
+          await this.feedNotice(chatId, DRAINING_MESSAGE);
+          return;
+        }
         if (!busy()) {
           // The claim that held the chat failed, or the turn ended. Nothing runs, so this prompt runs now.
           await this.onCmd(m, false);
           return;
         }
-        const rt = this.runtimes.get(chatId);
-        if (rt) this.push(rt.ctx, { k: "notice", text: BUSY_NOTICE });
+        await this.feedNotice(chatId, BUSY_NOTICE, "notice");
         return;
       }
       // Claim the chat and the number before the first await, so two commands in one tick cannot both run.
@@ -1147,7 +1162,7 @@ export class ChatBroker implements ChatAuth {
         const chat = row?.seq === m.seq && row.body.k === "user" ? await this.d.store.get(chatId) : undefined;
         if (!chat || chat.state === "closed" || row?.body.k !== "user" || this.draining) return;
         // An adopted prompt may have run on the owner before it went silent. A turn end after it means it ran.
-        if (!ack && (await this.d.store.events(chatId, m.seq, 200)).some((e) => e.body.k === "turn_end")) return;
+        if (!ack && (await this.d.store.hasTurnEnd(chatId, m.seq))) return;
         this.cancelledEarly.delete(chatId);
         this.launch(chatId, row.body.text, m.seq);
         launched = true;

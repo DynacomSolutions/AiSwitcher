@@ -521,3 +521,71 @@ test("an adopted prompt that already has a turn end after it does not run again"
   expect(b.transport.starts).toHaveLength(0);
   expect(await turnEnds(store, id)).toBe(2);
 });
+
+const restarting = async (s: MemoryChatStore, id: string) => (await bodies(s, id)).filter((x) => x.k === "error" && x.message.includes("restarting")).length;
+
+test("an acked forwarded prompt gets a draining notice when drain begins while a local prompt holds the claim", async () => {
+  const { store, bus, a, id } = await pair();
+  const other = await store.appendEvent(id, { k: "user", text: "say:other" });
+  const orig = store.get.bind(store);
+  // The dispatch read comes first. The read inside prompt() is the second one, and it holds the claim while it waits.
+  let reads = 0;
+  store.get = async (cid: string) => {
+    reads += 1;
+    if (reads === 2) await Bun.sleep(100);
+    return orig(cid);
+  };
+  const local = prompt(a.broker, id, "say:local");
+  await Bun.sleep(10);
+  await bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: other });
+  await Bun.sleep(10);
+  const drained = a.broker.drain();
+  expect(await local).toMatchObject({ code: "unavailable" });
+  await drained;
+  await until(async () => (await restarting(store, id)) === 1, "draining notice for the forwarded prompt");
+  expect(a.transport.starts).toHaveLength(0);
+});
+
+test("an acked forwarded prompt gets a draining notice when the local prompt waits in its own draining notice", async () => {
+  const { store, bus, a, id } = await pair();
+  const other = await store.appendEvent(id, { k: "user", text: "say:other" });
+  const origAppend = store.appendEvent.bind(store);
+  const origAcquire = store.acquireLease.bind(store);
+  let armed = true;
+  let drained: Promise<void> | undefined;
+  store.appendEvent = async (cid, body, fence) => {
+    const seq = await origAppend(cid, body, fence);
+    if (armed && body.k === "user" && body.text === "say:local") {
+      armed = false;
+      await bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: other });
+      await Bun.sleep(10);
+      drained = a.broker.drain();
+    }
+    return seq;
+  };
+  store.acquireLease = async (...args) => {
+    await Bun.sleep(150);
+    return origAcquire(...args);
+  };
+  expect(await prompt(a.broker, id, "say:local")).toBeUndefined();
+  await until(async () => (await restarting(store, id)) === 2, "a notice for each prompt");
+  await drained;
+  expect((await bodies(store, id)).filter((x) => x.k === "notice" && x.text.includes("did not take"))).toHaveLength(0);
+});
+
+test("an adopted prompt with a turn end more than 200 events later does not run again", async () => {
+  const { store, bus, clock, a, b, id } = await pair({ frozenA: true, ackMs: 300 });
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await idle(store, id);
+  bus.drop = (m) => m.t === "cmd";
+  expect(await prompt(b.broker, id, "say:two")).toBeUndefined();
+  const rec = await store.get(id);
+  const fence = { replica: rec?.ownerReplica as string, epoch: rec?.epoch as number };
+  for (let i = 0; i < 250; i++) await store.appendEvent(id, { k: "text", text: `t${i}` }, fence);
+  await store.appendEvent(id, { k: "turn_end", stopReason: "end_turn" }, fence);
+  clock.t += 61_000;
+  await Bun.sleep(600);
+  expect(b.transport.starts).toHaveLength(0);
+  expect(await turnEnds(store, id)).toBe(2);
+});

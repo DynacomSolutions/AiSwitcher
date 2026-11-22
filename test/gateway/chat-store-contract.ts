@@ -97,6 +97,17 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect((await s.get(id))?.lastSeq).toBe(23);
   });
 
+  test("hasTurnEnd finds a turn_end after a number, however far away it is", async () => {
+    const s = await make();
+    const { id, fence } = await owned(s);
+    await s.appendEvent(id, user("m1"), fence);
+    for (let i = 0; i < 250; i += 1) await s.appendEvent(id, { k: "text", text: `t${i}` }, fence);
+    expect(await s.hasTurnEnd(id, 1)).toBe(false);
+    await s.appendEvent(id, { k: "turn_end", stopReason: "end_turn" }, fence);
+    expect(await s.hasTurnEnd(id, 1)).toBe(true);
+    expect(await s.hasTurnEnd(id, 252)).toBe(false);
+  });
+
   test("events(afterSeq) returns the rest in order and honours limit", async () => {
     const s = await make();
     const { id, fence } = await owned(s);

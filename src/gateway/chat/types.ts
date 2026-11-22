@@ -74,6 +74,8 @@ export interface ChatStore {
    */
   appendEvent(id: string, body: ChatBody, fence?: LeaseFence): Promise<number>;
   events(id: string, afterSeq: number, limit: number): Promise<ChatEventRow[]>;
+  /** True when the chat has a turn_end event with a number above afterSeq. No row cap. */
+  hasTurnEnd(id: string, afterSeq: number): Promise<boolean>;
   /** Returns the new epoch when the lease was free, already owned by this replica, or expired. Returns undefined otherwise. */
   acquireLease(id: string, replica: string, ttlMs: number, nowMs: number): Promise<number | undefined>;
   /** Throws ChatLeaseLostError when the fence is stale or the lease has expired. */
