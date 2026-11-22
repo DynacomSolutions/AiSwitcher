@@ -399,3 +399,125 @@ test("per-chat entries go on close, and late acks stay bounded", async () => {
   await Bun.sleep(100);
   expect(inner.acked.size).toBeLessThanOrEqual(1000);
 });
+
+test("a prompt taken just before drain begins shows a notice and is not lost silently", async () => {
+  const { store, a, id } = await pair();
+  const orig = store.appendEvent.bind(store);
+  let armed = true;
+  let drained: Promise<void> | undefined;
+  store.appendEvent = async (cid, body, fence) => {
+    const seq = await orig(cid, body, fence);
+    if (armed && body.k === "user") {
+      armed = false;
+      drained = a.broker.drain();
+    }
+    return seq;
+  };
+  expect(await prompt(a.broker, id, "say:late")).toBeUndefined();
+  await until(async () => (await bodies(store, id)).some((x) => x.k === "error" && x.message.includes("restarting")), "drain notice");
+  await drained;
+  expect(a.transport.starts).toHaveLength(0);
+});
+
+test("a busy owner acks at once, so a slow pod start gives no reject and a retry still runs", async () => {
+  const { store, a, b, id } = await pair({ slowStartMs: 500, ackMs: 100 });
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await store.get(id))?.state === "starting", "starting");
+  expect(await prompt(b.broker, id, "say:two")).toBeUndefined();
+  await Bun.sleep(300);
+  expect(b.rejects).toHaveLength(0);
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await idle(store, id);
+  // The busy prompt did not run, so its number is not recorded: the same number runs when it comes again.
+  const row = (await store.events(id, 0, 100)).find((e) => e.body.k === "user" && e.body.text === "say:two");
+  await b.broker.dispatch({ chatId: id, binding: "bind-1", cmd: "cancel" });
+  await a.broker.dispatch({ chatId: id, binding: "bind-1", cmd: "cancel" });
+  const bus = (b.broker as unknown as { d: { bus: MemoryChatBus } }).d.bus;
+  await bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: row?.seq ?? 0 });
+  await until(async () => (await turnEnds(store, id)) === 2, "retry ran");
+});
+
+test("cancel, close and configure still run on a draining owner", async () => {
+  const { store, a, b, id } = await pair();
+  await prompt(a.broker, id, "slow");
+  await until(async () => (await store.get(id))?.state === "thinking", "thinking");
+  const d = a.broker.drain();
+  expect(await b.broker.dispatch({ chatId: id, binding: "bind-1", cmd: "cancel" })).toBeUndefined();
+  const outcome = await Promise.race([d.then(() => "done"), Bun.sleep(5000).then(() => "stuck")]);
+  expect(outcome).toBe("done");
+  expect((await bodies(store, id)).some((x) => x.k === "turn_end" && x.stopReason === "cancelled")).toBe(true);
+});
+
+test("when the claim that held the chat fails, the second command runs and no busy notice shows", async () => {
+  const { store, bus, a, id } = await pair();
+  // Event 1 is the start notice, not a user event: the first command fails its claim.
+  const good = await store.appendEvent(id, { k: "user", text: "say:good" });
+  await Promise.all([bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: 1 }), bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: good })]);
+  await until(async () => (await turnEnds(store, id)) === 1, "the good prompt ran");
+  expect((await bodies(store, id)).filter((x) => x.k === "notice" && x.text.includes("did not take"))).toHaveLength(0);
+  expect(a.transport.starts).toHaveLength(1);
+});
+
+test("a command that meets a local prompt before its start gets the busy notice", async () => {
+  const { store, bus, a, id } = await pair();
+  const other = await store.appendEvent(id, { k: "user", text: "say:other" });
+  const orig = store.appendEvent.bind(store);
+  let slowed = true;
+  store.appendEvent = async (cid, body, fence) => {
+    if (slowed && body.k === "user" && body.text === "say:local") {
+      slowed = false;
+      await Bun.sleep(100);
+    }
+    return orig(cid, body, fence);
+  };
+  const local = prompt(a.broker, id, "say:local");
+  await Bun.sleep(10);
+  await bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: other });
+  expect(await local).toBeUndefined();
+  await until(async () => (await bodies(store, id)).some((x) => x.k === "notice" && x.text.includes("did not take")), "busy notice");
+  await until(async () => (await turnEnds(store, id)) >= 1, "local turn");
+});
+
+test("a resync goes on after a failed read, and overlapping reconnects merge", async () => {
+  const id2Box: { id?: string } = {};
+  const { store, bus, a, b, id } = await pair({ b: { watchedChats: () => [id2Box.id ?? "", ...(id2Box.id ? [] : [])] } });
+  const rec2 = await a.broker.create({ chatId: crypto.randomUUID(), binding: "bind-1", windowId: 1, name: "Two", color: "#aabbcc", selection: { provider: "claude", identity: "alpha" }, tabIds: [] });
+  if ("code" in rec2) throw new Error("rejected");
+  id2Box.id = rec2.id;
+  void id;
+  b.seen.length = 0;
+  const orig = store.get.bind(store);
+  let gets = 0;
+  store.get = async (cid: string) => {
+    gets += 1;
+    await Bun.sleep(20);
+    if (cid === "" ) throw new Error("boom");
+    return orig(cid);
+  };
+  (b.broker as unknown as { d: { watchedChats: () => string[] } }).d.watchedChats = () => ["", rec2.id];
+  bus.simulateReconnect();
+  bus.simulateReconnect();
+  bus.simulateReconnect();
+  await until(() => b.seen.some(([c]) => c === rec2.id), "second chat pushed after the first read failed");
+  await Bun.sleep(200);
+  // Both replicas listen. Three reconnects at once make one run plus one merged rerun on each: 2 x 2 x 3 reads at most (18 without merging).
+  expect(gets).toBeLessThanOrEqual(12);
+});
+
+test("an adopted prompt that already has a turn end after it does not run again", async () => {
+  const { store, bus, clock, a, b, id } = await pair({ frozenA: true, ackMs: 150 });
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await idle(store, id);
+  bus.drop = (m) => m.t === "cmd";
+  expect(await prompt(b.broker, id, "say:two")).toBeUndefined();
+  // The owner ran the prompt before it went silent, but its ack never came.
+  const rec = await store.get(id);
+  const fence = { replica: rec?.ownerReplica as string, epoch: rec?.epoch as number };
+  await store.appendEvent(id, { k: "text", text: "two" }, fence);
+  await store.appendEvent(id, { k: "turn_end", stopReason: "end_turn" }, fence);
+  clock.t += 61_000;
+  await Bun.sleep(400);
+  expect(b.transport.starts).toHaveLength(0);
+  expect(await turnEnds(store, id)).toBe(2);
+});

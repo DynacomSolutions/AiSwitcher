@@ -205,6 +205,10 @@ export class ChatBroker implements ChatAuth {
   private readonly lastAccepted = new Map<string, number>();
   /** A forwarded prompt that holds the chat while it checks the store. A second command waits for it. */
   private readonly claims = new Map<string, Promise<void>>();
+  private resyncing = false;
+  private resyncAgain = false;
+  /** Chats where a start was refused because the replica drains. The prompt then gets a feed notice. */
+  private readonly drainRefused = new Set<string>();
   private offReconnect: (() => void) | undefined;
   private draining = false;
   private unsubscribe: (() => Promise<void>) | undefined;
@@ -260,12 +264,30 @@ export class ChatBroker implements ChatAuth {
    * read the store again and push the last event number, so a consumer reads from its own cursor and fills the gap. The state follows.
    */
   private async resync(): Promise<void> {
-    const ids = new Set<string>([...this.notified.keys(), ...(this.d.watchedChats?.() ?? [])]);
-    for (const id of ids) {
-      const rec = await this.d.store.get(id);
-      if (!rec) continue;
-      this.notified.set(id, Math.max(this.notified.get(id) ?? 0, rec.lastSeq));
-      this.d.publish(id, rec.lastSeq);
+    // Overlapping reconnects merge into one more run.
+    if (this.resyncing) {
+      this.resyncAgain = true;
+      return;
+    }
+    this.resyncing = true;
+    try {
+      do {
+        this.resyncAgain = false;
+        const ids = new Set<string>([...this.notified.keys(), ...(this.d.watchedChats?.() ?? [])]);
+        for (const id of ids) {
+          // One failed read must not stop the other chats.
+          try {
+            const rec = await this.d.store.get(id);
+            if (!rec) continue;
+            this.setBounded(this.notified, id, Math.max(this.notified.get(id) ?? 0, rec.lastSeq));
+            this.d.publish(id, rec.lastSeq);
+          } catch {
+            this.d.metrics.chatError("store");
+          }
+        }
+      } while (this.resyncAgain && !this.stopped);
+    } finally {
+      this.resyncing = false;
     }
   }
 
@@ -417,7 +439,10 @@ export class ChatBroker implements ChatAuth {
     const { store, transport, metrics } = this.d;
     if (!UUID_RE.test(chatId)) return undefined;
     // A replica in drain starts nothing. The next owner starts the pod.
-    if (this.draining) return undefined;
+    if (this.draining) {
+      this.drainRefused.add(chatId);
+      return undefined;
+    }
     const startedAt = this.d.now();
     const pre = await store.get(chatId);
     if (!pre || pre.state === "closed") return undefined;
@@ -780,6 +805,7 @@ export class ChatBroker implements ChatAuth {
     // Claim the chat before the first await, so two prompts cannot both pass.
     this.turning.add(chatId);
     this.cancelledEarly.delete(chatId);
+    const release = this.claim(chatId);
     let handed = false;
     try {
       const chat = await this.d.store.get(chatId);
@@ -801,8 +827,20 @@ export class ChatBroker implements ChatAuth {
       this.launch(chatId, clean(text), seq);
       return undefined;
     } finally {
+      release();
       if (!handed) this.turning.delete(chatId);
     }
+  }
+
+  /** Mark the chat as held by a prompt that has not started its turn yet. A forwarded command waits for the release. */
+  private claim(chatId: string): () => void {
+    let release = (): void => undefined;
+    const p = new Promise<void>((r) => (release = r));
+    this.claims.set(chatId, p);
+    return () => {
+      if (this.claims.get(chatId) === p) this.claims.delete(chatId);
+      release();
+    };
   }
 
   /** Start the turn of an accepted prompt. The chat must be in `turning`. */
@@ -818,6 +856,11 @@ export class ChatBroker implements ChatAuth {
     try {
       for (let attempt = 0; attempt < 3; attempt++) {
         const rt = await this.startPod(chatId);
+        if (!rt && this.drainRefused.delete(chatId)) {
+          // The replica began to drain after it took the prompt. The prompt stays in the feed, so show why it did not run.
+          await this.feedNotice(chatId, DRAINING_MESSAGE);
+          return;
+        }
         // A cancel that came while the pod started ends the turn before it begins.
         const early = this.cancelledEarly.delete(chatId);
         if (rt) {
@@ -910,16 +953,6 @@ export class ChatBroker implements ChatAuth {
       return;
     }
     await this.onCmd(msg, false);
-  }
-
-  /** Tell the feed that a forwarded prompt did not run because the agent was busy. It never waits for the whole turn. */
-  private async busyNotice(chatId: string): Promise<void> {
-    await this.claims.get(chatId);
-    const st = this.starting.get(chatId);
-    if (st) await st.promise.catch(() => undefined);
-    const rt = this.runtimes.get(chatId);
-    if (rt) this.push(rt.ctx, { k: "notice", text: BUSY_NOTICE });
-    else if (!this.turning.has(chatId) && !this.starting.has(chatId)) await this.feedNotice(chatId, BUSY_NOTICE);
   }
 
   /** Check the arguments of a command with the protocol parsers, so the bus carries only valid commands. */
@@ -1077,49 +1110,63 @@ export class ChatBroker implements ChatAuth {
    * The ack goes out only after the command is taken or known as taken. A replica in drain takes nothing and acks nothing.
    */
   private async onCmd(m: Extract<ChatBusMsg, { t: "cmd" }>, ack = true): Promise<void> {
-    if (this.draining) return;
     if (m.cmd === "prompt") {
+      // A replica in drain takes no new prompt and acks nothing. The sender adopts it or the next owner does.
+      if (this.draining) return;
       if (m.seq === undefined) return;
       const chatId = m.chatId;
-      // A repeat of a prompt that this replica already took (a retry after a late ack).
+      // A repeat of a prompt that this replica already started (a retry after a late ack).
       if ((this.lastAccepted.get(chatId) ?? 0) >= m.seq) {
         if (ack) this.ack(m);
         return;
       }
-      if (this.turning.has(chatId) || (this.starting.get(chatId) && !this.starting.get(chatId)?.ending) || this.runtimes.get(chatId)?.ctx.busy) {
-        this.setBounded(this.lastAccepted, chatId, m.seq);
-        await this.busyNotice(chatId);
+      const busy = (): boolean => this.turning.has(chatId) || !!(this.starting.get(chatId) && !this.starting.get(chatId)?.ending) || !!this.runtimes.get(chatId)?.ctx.busy;
+      if (busy()) {
+        // The owner took the command, so it acks at once. The notice follows when the busy state is clear.
         if (ack) this.ack(m);
+        await this.claims.get(chatId);
+        const st = this.starting.get(chatId);
+        if (st && !st.ending) await st.promise.catch(() => undefined);
+        if (!busy()) {
+          // The claim that held the chat failed, or the turn ended. Nothing runs, so this prompt runs now.
+          await this.onCmd(m, false);
+          return;
+        }
+        const rt = this.runtimes.get(chatId);
+        if (rt) this.push(rt.ctx, { k: "notice", text: BUSY_NOTICE });
         return;
       }
       // Claim the chat and the number before the first await, so two commands in one tick cannot both run.
       const before = this.lastAccepted.get(chatId);
       this.setBounded(this.lastAccepted, chatId, m.seq);
       this.turning.add(chatId);
-      let release = (): void => undefined;
-      this.claims.set(chatId, new Promise<void>((r) => (release = r)));
+      const release = this.claim(chatId);
       let launched = false;
       try {
         const row = (await this.d.store.events(chatId, m.seq - 1, 1))[0];
         const chat = row?.seq === m.seq && row.body.k === "user" ? await this.d.store.get(chatId) : undefined;
         if (!chat || chat.state === "closed" || row?.body.k !== "user" || this.draining) return;
+        // An adopted prompt may have run on the owner before it went silent. A turn end after it means it ran.
+        if (!ack && (await this.d.store.events(chatId, m.seq, 200)).some((e) => e.body.k === "turn_end")) return;
         this.cancelledEarly.delete(chatId);
         this.launch(chatId, row.body.text, m.seq);
         launched = true;
         if (ack) this.ack(m);
       } finally {
-        this.claims.delete(chatId);
         release();
         if (!launched) {
           this.turning.delete(chatId);
-          if (before === undefined) this.lastAccepted.delete(chatId);
-          else this.lastAccepted.set(chatId, before);
+          // Undo only the number this call set. A newer value belongs to another command.
+          if (this.lastAccepted.get(chatId) === m.seq) {
+            if (before === undefined) this.lastAccepted.delete(chatId);
+            else this.lastAccepted.set(chatId, before);
+          }
         }
       }
       return;
     }
     const chat = await this.d.store.get(m.chatId);
-    if (!chat || this.draining) return;
+    if (!chat) return;
     if (ack) this.ack(m);
     try {
       await this.runLocal({ chatId: m.chatId, binding: chat.binding, cmd: m.cmd, ...(m.args ? { args: m.args } : {}) });
