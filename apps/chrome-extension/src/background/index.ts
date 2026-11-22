@@ -62,9 +62,12 @@ async function connect(): Promise<void> {
   try { connection.start(s.gatewayUrl, s.token); } catch { connection.stop(); }
 }
 
+tabs.onExpired = sessionId => state.resumeSession(sessionId);
 state.onChange(paused => connection.sendState(paused));
 // Stop ends every grant: the user takes the groups back.
 state.onStop(() => tabs.revokeAll());
+// The full Stop also ends the running turn of every chat.
+state.onStop(() => hub.cancelRunning());
 // A granted group the user closed or dissolved is no longer granted.
 chrome.tabGroups.onRemoved.addListener(() => { void tabs.pruneGrants(); });
 

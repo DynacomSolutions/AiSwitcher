@@ -154,12 +154,15 @@ export class TabManager {
     });
   }
 
+  /** Called with the id of a session that expired from idleness. The state clears its stop block there. */
+  onExpired?: (sessionId: string) => void;
+
   /** Ends sessions that made no call for SESSION_END_MS. */
   expireIdle(): void {
     for (const id of [...this.sessions.keys()]) {
       const seen = this.lastSeen.get(id);
       if (seen === undefined) this.lastSeen.set(id, this.now());
-      else if (this.now() - seen > SESSION_END_MS) this.endSession(id);
+      else if (this.now() - seen > SESSION_END_MS) { this.endSession(id); this.onExpired?.(id); }
     }
   }
 

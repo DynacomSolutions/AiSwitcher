@@ -199,7 +199,7 @@ export class Executor {
     if (this.tabs.touch(req.session)) {
       for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void this.markControlled(tabId, req.session);
     }
-    const controller = this.state.track(id, req.session.id);
+    const controller = this.state.track(id, req.session.id, req.session.identity);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : this.defaultTimeout;
     const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
     const aborted = new Promise<never>((_, reject) => {
@@ -223,7 +223,7 @@ export class Executor {
   /** The agent session ended: closes the tabs it created, releases the rest. Works while paused, so a pause never leaves a dead session's tabs behind. */
   private async endSession(req: CallRequest): Promise<CallResult> {
     const s = this.tabs.sessions.get(req.session.id);
-    if (!s || s.identity === req.session.identity) this.state.resumeSession(req.session.id);
+    if (!s || s.identity === req.session.identity) this.state.resumeSession(req.session.id, req.session.identity);
     if (s && s.identity !== req.session.identity) return { id: req.id, ok: true, content: [{ type: "text", text: "no such session" }] };
     const tabIds = s ? [...s.tabIds] : [];
     await this.tabs.closeSession(req.session.id);

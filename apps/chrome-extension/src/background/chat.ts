@@ -121,6 +121,11 @@ export class ChatHub {
     if (chatId !== undefined && this.chats.has(chatId)) this.d.send({ t: "chat.cancel", chatId });
   }
 
+  /** The full Stop: cancel the turn of every chat that has one running. */
+  cancelRunning(): void {
+    for (const [chatId, e] of this.chats) if (e.view.summary.state === "thinking" || e.view.summary.state === "waiting") this.d.send({ t: "chat.cancel", chatId });
+  }
+
   private sendLinks(chatId: string): void {
     this.d.send({ t: "chat.link", chatId, tabIds: this.d.tabs.chatLinks(sessionIdForChat(chatId)).slice(0, MAX_CHAT_TABS) });
   }

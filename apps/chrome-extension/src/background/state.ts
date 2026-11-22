@@ -2,12 +2,15 @@
 import type { ChromeApi } from "./chrome-api.ts";
 
 const PAUSED_KEY = "paused";
+export const MAX_STOPPED = 256;
 
 export class State {
   private _paused = false;
   private readonly inflight = new Map<string, AbortController>();
   private readonly sessionOf = new Map<string, string>();
-  private readonly stopped = new Set<string>();
+  /** Stopped sessions, with the identity that was known when the user stopped them. Oldest entries go first at the cap. */
+  private readonly stopped = new Map<string, string | undefined>();
+  private readonly identityOf = new Map<string, string>();
   private readonly sessionStopListeners = new Set<(sessionId: string) => void>();
   private sessionsOnTab: (tabId: number) => string[] = () => [];
   private readonly changeListeners = new Set<(paused: boolean) => void>();
@@ -40,10 +43,15 @@ export class State {
   }
 
   /** Register an in-flight call. The signal aborts with reason "stopped" on stop() or "aborted" on abort(). */
-  track(id: string, sessionId?: string): AbortController {
+  track(id: string, sessionId?: string, identity?: string): AbortController {
     const controller = new AbortController();
     this.inflight.set(id, controller);
     if (sessionId !== undefined) this.sessionOf.set(id, sessionId);
+    if (sessionId !== undefined && identity !== undefined) {
+      this.identityOf.delete(sessionId);
+      this.identityOf.set(sessionId, identity);
+      while (this.identityOf.size > MAX_STOPPED) this.identityOf.delete(this.identityOf.keys().next().value as string);
+    }
     return controller;
   }
 
@@ -53,7 +61,12 @@ export class State {
   isStopped(sessionId: string): boolean { return this.stopped.has(sessionId); }
 
   /** Clears the block set by stopSession. Called when the user prompts that chat again, and when the session ends. */
-  resumeSession(sessionId: string): void { this.stopped.delete(sessionId); }
+  resumeSession(sessionId: string, identity?: string): void {
+    // A session end from another identity must not lift the user's block.
+    const stopper = this.stopped.get(sessionId);
+    if (identity !== undefined && stopper !== undefined && stopper !== identity) return;
+    this.stopped.delete(sessionId);
+  }
 
   onSessionStop(listener: (sessionId: string) => void): void { this.sessionStopListeners.add(listener); }
 
@@ -62,7 +75,9 @@ export class State {
 
   /** Abort the in-flight calls of one session with stopped_by_user and block its new calls. Does not pause and does not detach. */
   stopSession(sessionId: string): void {
-    this.stopped.add(sessionId);
+    this.stopped.delete(sessionId);
+    this.stopped.set(sessionId, this.identityOf.get(sessionId));
+    while (this.stopped.size > MAX_STOPPED) this.stopped.delete(this.stopped.keys().next().value as string);
     for (const l of this.sessionStopListeners) { try { l(sessionId); } catch { /* best effort */ } }
     for (const [id, c] of [...this.inflight]) {
       if (this.sessionOf.get(id) !== sessionId) continue;
