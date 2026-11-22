@@ -2,7 +2,8 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { ChatBroker, type BrokerDeps, type BrokerReject } from "../../src/gateway/chat/broker.ts";
 import { PodStartError } from "../../src/gateway/chat/pod-transport.ts";
 import { MemoryChatStore } from "../../src/gateway/chat/store.ts";
-import { chatTokenKey, verifyChatToken } from "../../src/gateway/chat/token.ts";
+import { chatTokenKey, mintChatToken, verifyChatToken } from "../../src/gateway/chat/token.ts";
+import { sessionName } from "../../src/gateway/chat/kube.ts";
 import type { ChatRecord } from "../../src/gateway/chat/types.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 import { StubPodTransport, type StubTransportOptions } from "./fixtures/stub-transport.ts";
@@ -119,7 +120,7 @@ test("the first start sends initialize then session/new with one http mcp server
   expect(h["X-AIS-Session-Id"]).toBe(`chat:${rec.id}`);
   expect(h["X-AIS-Session-Label"]).toBe("My%20chat");
   const token = String(h.Authorization).replace(/^Bearer /, "");
-  expect(verifyChatToken(KEY, token, rec.createdAt)).toEqual({ chatId: rec.id, binding: "bind-1", exp: rec.createdAt + 7 * DAY });
+  expect(verifyChatToken(KEY, token, rec.createdAt)).toEqual({ chatId: rec.id, binding: "bind-1", exp: rec.createdAt + 7 * DAY, gen: 1 });
   const after = await store.get(rec.id);
   expect(after?.state).toBe("idle");
   expect(after?.generation).toBe(1);
@@ -236,15 +237,15 @@ test("principal() returns the chat for a good token and undefined once the chat 
   const { broker, store, clock } = setup();
   const rec = await made(broker, { tabIds: [7, 9] });
   const mint = (await import("../../src/gateway/chat/token.ts")).mintChatToken;
-  const token = mint(KEY, { chatId: rec.id, binding: "bind-1", exp: rec.createdAt + 7 * DAY });
+  const token = mint(KEY, { chatId: rec.id, binding: "bind-1", exp: rec.createdAt + 7 * DAY, gen: 0 });
   const p = await broker.principal(token);
   expect(p).toMatchObject({ chatId: rec.id, binding: "bind-1", identity: "alpha", label: "My chat", color: "#aabbcc" });
   expect([...(p?.linked ?? [])]).toEqual([7, 9]);
   expect(await broker.principal("aisc1.bad.token")).toBeUndefined();
-  expect(await broker.principal(mint(KEY, { chatId: rec.id, binding: "bind-2", exp: rec.createdAt + 7 * DAY }))).toBeUndefined();
-  expect(await broker.principal(mint(chatTokenKey("other"), { chatId: rec.id, binding: "bind-1", exp: rec.createdAt + 7 * DAY }))).toBeUndefined();
+  expect(await broker.principal(mint(KEY, { chatId: rec.id, binding: "bind-2", exp: rec.createdAt + 7 * DAY, gen: 0 }))).toBeUndefined();
+  expect(await broker.principal(mint(chatTokenKey("other"), { chatId: rec.id, binding: "bind-1", exp: rec.createdAt + 7 * DAY, gen: 0 }))).toBeUndefined();
   // Past maxAgeMs, even with a token that has not expired.
-  const long = mint(KEY, { chatId: rec.id, binding: "bind-1", exp: rec.createdAt + 30 * DAY });
+  const long = mint(KEY, { chatId: rec.id, binding: "bind-1", exp: rec.createdAt + 30 * DAY, gen: 0 });
   clock.t = rec.createdAt + 7 * DAY + 1;
   expect(await broker.principal(long)).toBeUndefined();
   clock.t = rec.createdAt + 1000;
@@ -258,14 +259,15 @@ test("principal() returns the chat for a good token and undefined once the chat 
 test("principal() is undefined when the binding has no identity", async () => {
   const { broker } = setup({}, { identityOf: async () => undefined });
   const rec = await made(broker);
-  const token = (await import("../../src/gateway/chat/token.ts")).mintChatToken(KEY, { chatId: rec.id, binding: "bind-1", exp: rec.createdAt + DAY });
+  const token = (await import("../../src/gateway/chat/token.ts")).mintChatToken(KEY, { chatId: rec.id, binding: "bind-1", exp: rec.createdAt + DAY, gen: 0 });
   expect(await broker.principal(token)).toBeUndefined();
 });
 
-test("chatPodStart is observed with the seconds from create to initialize", async () => {
-  const { broker, metrics, clock } = setup();
+test("chatPodStart is observed with the seconds from the start of the start path to initialize", async () => {
+  const clock = { t: 1_700_000_000_000 };
+  const { broker, metrics } = setup({ beforeSpawn: async () => void (clock.t += 2500) }, {}, { store: new MemoryChatStore(() => clock.t), clock });
   const rec = await made(broker);
-  clock.t = rec.createdAt + 2500;
+  clock.t += 10_000; // idle time between create and the first start does not count
   await broker.startPod(rec.id);
   const out = metrics.render();
   expect(out).toContain("ais_gateway_chat_pod_start_seconds_count 1");
@@ -290,4 +292,168 @@ test("a known create and start flow emits no other series", async () => {
   const out = metrics.render();
   expect(out).toContain('ais_gateway_chat_sessions_total{event="session_created"} 1');
   expect(out).not.toContain('"other"');
+});
+
+const tokenOf = (transport: StubPodTransport, n = 1): string => {
+  const line = transport.written.map((l) => JSON.parse(l)).filter((m) => m.method === "session/new")[n - 1];
+  return String(line.params.mcpServers[0].headers.find((x: { name: string }) => x.name === "Authorization").value).replace(/^Bearer /, "");
+};
+const tick = () => Bun.sleep(10);
+
+test("the lease is renewed during a slow start, so the start ends idle", async () => {
+  const timers = new FakeTimers();
+  const clock = { t: 1_700_000_000_000 };
+  const { broker, store } = setup(
+    {
+      beforeSpawn: async () => {
+        clock.t += 30_000;
+        timers.fire(20_000);
+        await tick();
+        clock.t += 50_000; // now past the first expiry of 60 s
+      },
+    },
+    { timers },
+    { store: new MemoryChatStore(() => clock.t), clock },
+  );
+  const rec = await made(broker);
+  expect(await broker.startPod(rec.id)).toBeDefined();
+  expect((await store.get(rec.id))?.state).toBe("idle");
+});
+
+test("a hung start with renewals still shows a timeout item", async () => {
+  const timers = new FakeTimers();
+  const clock = { t: 1_700_000_000_000 };
+  const { broker, store } = setup({ hang: true }, { timers, startTimeoutMs: 300_000 }, { store: new MemoryChatStore(() => clock.t), clock });
+  const rec = await made(broker);
+  const p = broker.startPod(rec.id);
+  await tick();
+  clock.t += 30_000;
+  timers.fire(20_000);
+  await tick();
+  clock.t += 50_000;
+  timers.fire(300_000);
+  expect(await p).toBeUndefined();
+  expect((await bodies(store, rec.id)).at(-1)).toMatchObject({ k: "error", code: "timeout" });
+});
+
+test("a lost lease stops only its own session and never the session of the new owner", async () => {
+  const clock = { t: 1_700_000_000_000 };
+  const store = new MemoryChatStore(() => clock.t);
+  const cluster = new Set<string>();
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  const a = setup({ cluster, beforeSpawn: () => held }, { replicaId: "replica-a" }, { store, clock });
+  const b = setup({ cluster }, { replicaId: "replica-b" }, { store, clock });
+  const rec = await made(a.broker);
+  const pa = a.broker.startPod(rec.id);
+  await tick();
+  clock.t += 120_000; // the lease of A has expired
+  expect(await b.broker.startPod(rec.id)).toBeDefined();
+  release();
+  expect(await pa).toBeUndefined();
+  expect(a.transport.starts[0]?.generation).toBe(1);
+  expect(b.transport.starts[0]?.generation).toBe(2);
+  expect(a.transport.stopped).toEqual([]);
+  expect(a.transport.stoppedSessions).toContain(sessionName(rec.id, 1));
+  expect(cluster.has(sessionName(rec.id, 2))).toBe(true);
+  expect((await store.get(rec.id))?.state).toBe("idle");
+  expect(JSON.stringify(await bodies(store, rec.id))).not.toContain('"error"');
+});
+
+test("a token of an older generation, and any token after a failed start, is refused", async () => {
+  const first = setup();
+  const rec = await made(first.broker);
+  await first.broker.startPod(rec.id);
+  const old = tokenOf(first.transport);
+  expect(await first.broker.principal(old)).toBeDefined();
+  await first.broker.dispose();
+  const second = setup({}, {}, { store: first.store, clock: first.clock });
+  await second.broker.startPod(rec.id);
+  expect(await second.broker.principal(old)).toBeUndefined();
+  expect(await second.broker.principal(tokenOf(second.transport))).toBeDefined();
+  const bad = setup({ env: { STUB_ACP_NEW_ERROR: "1" } });
+  const r2 = await made(bad.broker);
+  const t = mintChatToken(KEY, { chatId: r2.id, binding: "bind-1", exp: r2.createdAt + DAY, gen: 1 });
+  await bad.broker.startPod(r2.id);
+  expect(await bad.broker.principal(t)).toBeUndefined();
+});
+
+test("an agent error on session/new is classified as acp", async () => {
+  const { broker, store } = setup({ env: { STUB_ACP_NEW_ERROR: "1" } });
+  const rec = await made(broker);
+  expect(await broker.startPod(rec.id)).toBeUndefined();
+  expect((await bodies(store, rec.id)).at(-1)).toMatchObject({ k: "error", code: "acp" });
+});
+
+test("a store error while reporting a failure still stops the pod and never rejects", async () => {
+  const clock = { t: 1_700_000_000_000 };
+  const inner = new MemoryChatStore(() => clock.t);
+  const store = Object.create(inner) as MemoryChatStore;
+  store.appendEvent = async (id, body, fence) => {
+    if (body.k === "error") throw new Error("database down");
+    return inner.appendEvent(id, body, fence);
+  };
+  const { broker, transport } = setup({ failStart: new PodStartError("InitFailed") }, {}, { store, clock });
+  const rec = await made(broker);
+  expect(await broker.startPod(rec.id)).toBeUndefined();
+  expect(transport.stopped).toContain(rec.id);
+});
+
+test("a store error at the start of a start gives undefined, not a rejection", async () => {
+  const clock = { t: 1_700_000_000_000 };
+  const inner = new MemoryChatStore(() => clock.t);
+  const store = Object.create(inner) as MemoryChatStore;
+  const { broker } = setup({}, {}, { store, clock });
+  const rec = await made(broker);
+  store.get = async () => {
+    throw new Error("database down");
+  };
+  expect(await broker.startPod(rec.id)).toBeUndefined();
+});
+
+test("a new start removes the pod of an older generation", async () => {
+  const cluster = new Set<string>();
+  const first = setup({ cluster });
+  const rec = await made(first.broker);
+  await first.broker.startPod(rec.id);
+  expect([...cluster]).toEqual([sessionName(rec.id, 1)]);
+  await first.broker.dispose();
+  const second = setup({ cluster }, {}, { store: first.store, clock: first.clock });
+  await second.broker.startPod(rec.id);
+  expect([...cluster]).toEqual([sessionName(rec.id, 2)]);
+});
+
+test("startPod refuses a chat past maxAgeMs with fixed copy", async () => {
+  const { broker, store, transport, clock } = setup();
+  const rec = await made(broker);
+  clock.t = rec.createdAt + 7 * DAY + 1;
+  expect(await broker.startPod(rec.id)).toBeUndefined();
+  expect(transport.starts).toHaveLength(0);
+  expect((await bodies(store, rec.id)).at(-1)).toEqual({ k: "error", code: "expired", message: "This chat is too old. Open a new chat." });
+});
+
+test("an abort from dispose is not a failure and leaves the chat resumable", async () => {
+  const { broker, store, metrics, transport } = setup({ hang: true });
+  const rec = await made(broker);
+  const p = broker.startPod(rec.id);
+  await tick();
+  await broker.dispose();
+  expect(await p).toBeUndefined();
+  expect(JSON.stringify(await bodies(store, rec.id))).not.toContain('"error"');
+  expect((await store.get(rec.id))?.state).toBe("starting");
+  expect(metrics.render()).not.toContain("ais_gateway_chat_errors_total{");
+  expect(transport.stopped).toEqual([]);
+});
+
+test("create frees its lease even when the notice cannot be stored", async () => {
+  const clock = { t: 1_700_000_000_000 };
+  const inner = new MemoryChatStore(() => clock.t);
+  const store = Object.create(inner) as MemoryChatStore;
+  store.appendEvent = async () => {
+    throw new Error("database down");
+  };
+  const { broker } = setup({}, {}, { store, clock });
+  const id = crypto.randomUUID();
+  await expect(broker.create(input({ chatId: id }))).rejects.toThrow();
+  expect(await inner.acquireLease(id, "replica-z", 1000, clock.t)).toBeDefined();
 });

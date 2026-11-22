@@ -1,6 +1,7 @@
 // A PodTransport for broker tests. It runs the stub ACP agent as a local process, with no cluster.
 import { join } from "node:path";
 import { createLineReader } from "../../../src/gateway/chat/acp.ts";
+import { sessionName } from "../../../src/gateway/chat/kube.ts";
 import type { PodHandle, PodPhaseNotice, PodSpecInput, PodStream, PodTransport, AgentRuntimeConfig } from "../../../src/gateway/chat/kube.ts";
 
 const STUB = join(import.meta.dir, "stub-acp-agent.ts");
@@ -18,6 +19,10 @@ export interface StubTransportOptions {
   env?: Record<string, string>;
   /** Phase notices to send before the stream opens. */
   phases?: PodPhaseNotice[];
+  /** Runs inside start(), before the agent process begins. Tests use it to move clocks or to hold a start. */
+  beforeSpawn?: () => Promise<void>;
+  /** The names of the live sessions. Share one set between transports to model one cluster. */
+  cluster?: Set<string>;
 }
 
 export class StubPodTransport implements PodTransport {
@@ -27,9 +32,13 @@ export class StubPodTransport implements PodTransport {
   readonly written: string[] = [];
   readonly stopped: string[] = [];
   readonly closedStreams: string[] = [];
+  readonly stoppedSessions: string[] = [];
+  readonly cluster: Set<string>;
   private readonly procs = new Set<{ kill(): void }>();
 
-  constructor(readonly opts: StubTransportOptions = {}) {}
+  constructor(readonly opts: StubTransportOptions = {}) {
+    this.cluster = opts.cluster ?? new Set();
+  }
 
   async start(input: PodSpecInput, signal: AbortSignal, onPhase: (n: PodPhaseNotice) => void): Promise<PodHandle> {
     this.starts.push(input);
@@ -42,6 +51,8 @@ export class StubPodTransport implements PodTransport {
         signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
       });
     }
+    await this.opts.beforeSpawn?.();
+    this.cluster.add(sessionName(input.chatId, input.generation));
     const cmd = this.opts.exitAtOnce
       ? [process.execPath, "-e", "process.stderr.write('boom-from-pod leak-marker-xyz\\n'); process.exit(3)"]
       : this.opts.silent
@@ -90,11 +101,18 @@ export class StubPodTransport implements PodTransport {
         finish("closed locally");
       },
     };
-    return { name: `pod-${input.chatId.slice(0, 8)}`, session: `chat-${input.generation}`, cwd: "/work", stream };
+    return { name: `pod-${input.chatId.slice(0, 8)}`, session: sessionName(input.chatId, input.generation), cwd: "/work", stream };
   }
 
   async stop(chatId: string): Promise<void> {
     this.stopped.push(chatId);
+    const prefix = sessionName(chatId, 0).slice(0, -1);
+    for (const n of [...this.cluster]) if (n.startsWith(prefix)) this.cluster.delete(n);
+  }
+
+  async stopSession(session: string): Promise<void> {
+    this.stoppedSessions.push(session);
+    this.cluster.delete(session);
   }
 
   async catalog(): Promise<AgentRuntimeConfig> {

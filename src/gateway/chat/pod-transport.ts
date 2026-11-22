@@ -183,7 +183,7 @@ export interface KubePodTransportDeps {
   maxLineBytes?: number;
 }
 
-interface Live { cancelled: boolean; ac: AbortController; stream?: PodStream; stop(): void }
+interface Live { name: string; cancelled: boolean; ac: AbortController; stream?: PodStream; stop(): void }
 
 export class KubePodTransport implements PodTransport {
   private readonly now: () => number;
@@ -226,6 +226,11 @@ export class KubePodTransport implements PodTransport {
     await Promise.all(sessions.map((s) => this.d.api.deleteSession(s.metadata.name)));
   }
 
+  async stopSession(session: string): Promise<void> {
+    for (const set of [...this.live.values()]) for (const l of [...set]) if (l.name === session) l.stop();
+    await this.d.api.deleteSession(session);
+  }
+
   async start(input: PodSpecInput, signal: AbortSignal, onPhase: (n: PodPhaseNotice) => void): Promise<PodHandle> {
     const { api, env } = this.d;
     const name = sessionName(input.chatId, input.generation);
@@ -236,7 +241,7 @@ export class KubePodTransport implements PodTransport {
     };
     const beat = this.heartbeat(name, notes);
     const startId = randomUUID();
-    const live: Live = { cancelled: false, ac: new AbortController(), stream: undefined, stop: () => { live.cancelled = true; live.ac.abort(); beat.stop(); live.stream?.close(); } };
+    const live: Live = { name, cancelled: false, ac: new AbortController(), stream: undefined, stop: () => { live.cancelled = true; live.ac.abort(); beat.stop(); live.stream?.close(); } };
     const waitSignal = AbortSignal.any([signal, live.ac.signal]);
     const untrack = this.track(input.chatId, live);
     let streamed = false;

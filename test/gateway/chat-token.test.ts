@@ -1,9 +1,10 @@
+import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import { CHAT_TOKEN_HEAD, chatTokenKey, mintChatToken, verifyChatToken } from "../../src/gateway/chat/token.ts";
 import { ChatGrants } from "../../src/gateway/browser/chat-grants.ts";
 
 const key = chatTokenKey("admin-secret");
-const claims = { chatId: "c1", binding: "b1", exp: 2_000_000 };
+const claims = { chatId: "c1", binding: "b1", exp: 2_000_000, gen: 1 };
 const now = 1_000_000;
 
 describe("chat token", () => {
@@ -19,6 +20,14 @@ describe("chat token", () => {
     const raw = Buffer.from(sig, "base64url");
     raw[0] = (raw[0] ?? 0) ^ 1;
     expect(verifyChatToken(key, head + raw.toString("base64url"), now)).toBeUndefined();
+  });
+
+  test("a token without a valid generation fails", () => {
+    for (const gen of [undefined, -1, 1.5, "1"]) {
+      const payload = Buffer.from(JSON.stringify({ ...claims, gen })).toString("base64url");
+      const sig = createHmac("sha256", key).update(payload).digest("base64url");
+      expect(verifyChatToken(key, `${CHAT_TOKEN_HEAD}${payload}.${sig}`, now)).toBeUndefined();
+    }
   });
 
   test("another key fails", () => {

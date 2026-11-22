@@ -1,5 +1,5 @@
 // A stand-in ACP agent for tests. It speaks JSON lines on stdio.
-// Environment: STUB_ACP_STATE (file that stores session ids), STUB_ACP_LOAD ("0" turns loadSession off), STUB_ACP_HTTP ("0" turns HTTP MCP off).
+// Environment: STUB_ACP_STATE (file that stores session ids), STUB_ACP_LOAD ("0" turns loadSession off), STUB_ACP_HTTP ("0" turns HTTP MCP off), STUB_ACP_NEW_ERROR ("1" makes session/new fail).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createLineReader } from "../../../src/gateway/chat/acp.ts";
 
@@ -90,6 +90,7 @@ function handle(m: any): void {
     case "initialize":
       return reply({ protocolVersion: 1, agentCapabilities: { mcpCapabilities: { http: process.env.STUB_ACP_HTTP !== "0" }, loadSession: process.env.STUB_ACP_LOAD !== "0" } });
     case "session/new": {
+      if (process.env.STUB_ACP_NEW_ERROR === "1") return send({ jsonrpc: "2.0", id: m.id, error: { code: -32000, message: "no session for you" } });
       const sessionId = `stub-${crypto.randomUUID().slice(0, 8)}`;
       if (statePath) appendFileSync(statePath, `${sessionId}\n`);
       mcpByS.set(sessionId, m.params?.mcpServers ?? []);

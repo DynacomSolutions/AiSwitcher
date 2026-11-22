@@ -23,6 +23,8 @@ export interface PodTransport {
   start(input: PodSpecInput, signal: AbortSignal, onPhase: (n: PodPhaseNotice) => void): Promise<PodHandle>;
   /** Delete the sessions labelled with this chat id. */
   stop(chatId: string): Promise<void>;
+  /** Delete one named session and close its stream here. Used when the lease of a chat is lost, so no other replica's session is hit. */
+  stopSession(session: string): Promise<void>;
   /** Read the ConfigMap. */
   catalog(): Promise<AgentRuntimeConfig>;
 }

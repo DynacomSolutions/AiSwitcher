@@ -5,7 +5,7 @@ import type { ChatAuth, ChatPrincipal } from "../browser/chat-auth.ts";
 import type { GatewayMetrics } from "../metrics.ts";
 import { AcpClient, AcpError } from "./acp.ts";
 import { KubeHttpError } from "./kube-http.ts";
-import type { PodHandle, PodTransport } from "./kube.ts";
+import { sessionName, type PodHandle, type PodTransport } from "./kube.ts";
 import { PodStartError, type Timers } from "./pod-transport.ts";
 import { ChatClosedError, ChatExistsError, ChatLeaseLostError, type ChatRecord, type ChatStore, type LeaseFence } from "./types.ts";
 import { mintChatToken, verifyChatToken } from "./token.ts";
@@ -43,6 +43,16 @@ export interface BrokerDeps {
 
 export type BrokerReject = { code: (typeof CHAT_ERROR_CODES)[number]; message: string };
 
+/** Renews the lease of one chat while a start or a running agent needs it. */
+interface Lease {
+  chatId: string;
+  fence: LeaseFence;
+  timer: unknown;
+  stopped: boolean;
+  /** Runs when the lease is gone. */
+  onLost(): void;
+}
+
 /** A chat with a running agent. Later tasks add prompt, cancel and close on top of it. */
 export interface ChatRuntime {
   chatId: string;
@@ -50,10 +60,13 @@ export interface ChatRuntime {
   acp: AcpClient;
   handle: PodHandle;
   sessionId: string;
+  lease: Lease;
 }
 
 /** The agent did not offer HTTP MCP. */
 class NoHttpError extends Error {}
+/** The chat is older than maxAgeMs. */
+class ExpiredError extends Error {}
 
 type Failure = { code: (typeof CHAT_ERROR_CODES)[number]; message: string; kind: string };
 
@@ -64,9 +77,11 @@ const exitFailure = (reason: string | undefined): Failure => ({
   message: `The agent stopped before it was ready (reason: ${EXIT_REASONS[reason ?? ""] ?? "closed"}).`,
   kind: "agent_exit",
 });
+/** Older generations of one chat that a new start removes. Bounded, so the loop stays short. */
+const OLD_GENERATIONS = 10;
 
 export class ChatBroker implements ChatAuth {
-  private readonly runtimes = new Map<string, ChatRuntime & { renew: unknown }>();
+  private readonly runtimes = new Map<string, ChatRuntime>();
   private readonly starting = new Map<string, { promise: Promise<ChatRuntime | undefined>; ac: AbortController }>();
   private readonly timers: Timers;
 
@@ -78,13 +93,15 @@ export class ChatBroker implements ChatAuth {
     return this.d.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
   }
 
-  /** Events always go through the store, then out to the listeners. A lost lease is not an error here. */
-  private async emit(chatId: string, body: ChatBody, fence: LeaseFence): Promise<void> {
+  /** Events always go through the store, then out to the listeners. Returns false when the lease is lost. */
+  private async emit(chatId: string, body: ChatBody, fence: LeaseFence): Promise<boolean> {
     try {
       const seq = await this.d.store.appendEvent(chatId, body, fence);
       this.d.publish(chatId, seq);
+      return true;
     } catch (e) {
-      if (!(e instanceof ChatLeaseLostError)) throw e;
+      if (e instanceof ChatLeaseLostError) return false;
+      throw e;
     }
   }
 
@@ -104,8 +121,11 @@ export class ChatBroker implements ChatAuth {
     }
     if (rec === "cap") return { code: "window_cap", message: `A window holds at most ${MAX_CHATS_PER_WINDOW} chats.` };
     const fence = { replica: this.d.replicaId, epoch: rec.epoch };
-    await this.emit(rec.id, { k: "notice", text: "Starting your agent" }, fence);
-    await this.d.store.releaseLease(rec.id, fence);
+    try {
+      await this.emit(rec.id, { k: "notice", text: "Starting your agent" }, fence);
+    } finally {
+      await this.d.store.releaseLease(rec.id, fence).catch(() => undefined);
+    }
     this.d.metrics.chatSession("session_created");
     return (await this.d.store.get(rec.id)) ?? rec;
   }
@@ -115,7 +135,9 @@ export class ChatBroker implements ChatAuth {
     const claims = verifyChatToken(this.d.tokenKey, token, now);
     if (!claims) return undefined;
     const chat = await this.d.store.get(claims.chatId);
-    if (!chat || chat.state === "closed" || chat.binding !== claims.binding) return undefined;
+    if (!chat || chat.state === "closed" || chat.state === "failed" || chat.binding !== claims.binding) return undefined;
+    // A token belongs to one pod generation. A newer start or a failed start makes an older token useless.
+    if (claims.gen !== chat.generation) return undefined;
     if (now > chat.createdAt + (this.d.maxAgeMs ?? 7 * DAY_MS)) return undefined;
     const identity = await this.d.identityOf(chat.binding);
     if (identity === undefined) return undefined;
@@ -125,6 +147,7 @@ export class ChatBroker implements ChatAuth {
   /**
    * Start the pod of a chat and open its ACP session. One start runs per chat at a time.
    * Returns the runtime, or undefined when the start failed (the chat then holds an error item) or another replica owns the chat.
+   * It never rejects.
    */
   startPod(chatId: string): Promise<ChatRuntime | undefined> {
     const live = this.runtimes.get(chatId);
@@ -132,33 +155,78 @@ export class ChatBroker implements ChatAuth {
     const pending = this.starting.get(chatId);
     if (pending) return pending.promise;
     const ac = new AbortController();
-    const promise = this.runStart(chatId, ac).finally(() => this.starting.delete(chatId));
+    const promise = this.runStart(chatId, ac)
+      .catch(() => {
+        this.d.metrics.chatError("other");
+        return undefined;
+      })
+      .finally(() => this.starting.delete(chatId));
     this.starting.set(chatId, { promise, ac });
     return promise;
+  }
+
+  private armRenew(lease: Lease): void {
+    if (lease.stopped) return;
+    lease.timer = this.timers.setTimeout(() => {
+      void this.d.store.renewLease(lease.chatId, lease.fence, this.leaseTtl, this.d.now()).then(
+        () => this.armRenew(lease),
+        (e: unknown) => {
+          if (lease.stopped) return;
+          if (e instanceof ChatLeaseLostError) {
+            this.stopLease(lease);
+            lease.onLost();
+          } else this.armRenew(lease);
+        },
+      );
+    }, Math.max(1000, Math.floor(this.leaseTtl / 3)));
+  }
+
+  private stopLease(lease: Lease): void {
+    lease.stopped = true;
+    this.timers.clearTimeout(lease.timer);
   }
 
   private async runStart(chatId: string, ac: AbortController): Promise<ChatRuntime | undefined> {
     const { store, transport, metrics } = this.d;
     if (!UUID_RE.test(chatId)) return undefined;
-    const chat = await store.get(chatId);
-    if (!chat || chat.state === "closed") return undefined;
+    const startedAt = this.d.now();
+    const pre = await store.get(chatId);
+    if (!pre || pre.state === "closed") return undefined;
     const epoch = await store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now());
     if (epoch === undefined) return undefined;
     const fence: LeaseFence = { replica: this.d.replicaId, epoch };
+    const lease: Lease = { chatId, fence, timer: undefined, stopped: false, onLost: () => undefined };
 
     let timedOut = false;
+    let leaseLost = false;
     let handle: PodHandle | undefined;
-    const timer = this.timers.setTimeout(() => {
-      timedOut = true;
-      ac.abort();
-    }, this.d.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS);
-    // An abort after the attach closes the stream, so a waiting ACP request ends.
-    ac.signal.addEventListener("abort", () => handle?.stream.close(), { once: true });
+    let name = "";
     let closedReason: string | undefined;
+    let kept = false;
+    let startTimer: unknown;
     try {
+      // The lease is renewed from here, so a slow start does not lose it.
+      lease.onLost = () => {
+        leaseLost = true;
+        ac.abort();
+      };
+      this.armRenew(lease);
+      startTimer = this.timers.setTimeout(() => {
+        timedOut = true;
+        ac.abort();
+      }, this.d.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS);
+      // An abort after the attach closes the stream, so a waiting ACP request ends.
+      ac.signal.addEventListener("abort", () => handle?.stream.close(), { once: true });
+      // Read the chat again now that this replica owns it. Another replica may have changed it since the first read.
+      const chat = await store.get(chatId);
+      if (!chat || chat.state === "closed") return undefined;
       // The generation lives in the store and only grows, so a pod name is never used twice.
       const generation = chat.generation + 1;
+      name = sessionName(chatId, generation);
+      if (this.d.now() > chat.createdAt + (this.d.maxAgeMs ?? 7 * DAY_MS)) throw new ExpiredError();
       await store.update(chatId, { state: "starting", generation }, fence);
+      // A pod from before a gateway restart must not stay next to the new one.
+      for (let g = Math.max(1, generation - OLD_GENERATIONS); g < generation; g++) await transport.stopSession(sessionName(chatId, g)).catch(() => undefined);
       handle = await transport.start(
         { chatId, generation, provider: chat.selection.provider, identity: chat.selection.identity },
         ac.signal,
@@ -174,10 +242,10 @@ export class ChatBroker implements ChatAuth {
         this.d.acpTimeoutMs === undefined ? {} : { requestTimeoutMs: this.d.acpTimeoutMs },
       );
       const caps = await acp.initialize();
-      metrics.chatPodStart((this.d.now() - chat.createdAt) / 1000);
+      metrics.chatPodStart((this.d.now() - startedAt) / 1000);
       if (!caps.http) throw new NoHttpError();
       // The token goes to the agent over the ACP stream only. It is never stored or logged.
-      const token = mintChatToken(this.d.tokenKey, { chatId, binding: chat.binding, exp: chat.createdAt + 7 * DAY_MS });
+      const token = mintChatToken(this.d.tokenKey, { chatId, binding: chat.binding, exp: chat.createdAt + 7 * DAY_MS, gen: generation });
       const { sessionId } = await acp.newSession({
         cwd: handle.cwd,
         mcpServers: [
@@ -193,32 +261,44 @@ export class ChatBroker implements ChatAuth {
           },
         ],
       });
-      this.timers.clearTimeout(timer);
+      this.timers.clearTimeout(startTimer);
       await store.update(chatId, { state: "idle", acpSessionId: sessionId, podSession: handle.session, canLoad: caps.loadSession }, fence);
-      const rt: ChatRuntime & { renew: unknown } = { chatId, fence, acp, handle, sessionId, renew: undefined };
+      const rt: ChatRuntime = { chatId, fence, acp, handle, sessionId, lease };
+      lease.onLost = () => void this.drop(chatId);
       this.runtimes.set(chatId, rt);
-      this.armRenew(rt);
+      kept = true;
       void acp.closed.then((reason) => this.onAgentClosed(rt, reason));
       return rt;
     } catch (e) {
-      this.timers.clearTimeout(timer);
+      // Classify first. Closing the stream changes the close reason.
+      const f = this.classify(e, { timedOut, handle, closedReason, named: name !== "" });
       handle?.stream.close();
-      if (e instanceof ChatLeaseLostError || e instanceof ChatClosedError) {
-        // Another owner or a close took the chat. This start stops without a word.
-        await transport.stop(chatId).catch(() => undefined);
+      const own = handle?.session ?? name;
+      if (leaseLost || e instanceof ChatLeaseLostError || e instanceof ChatClosedError) {
+        // Another owner took the chat. Stop only our own session, never the session of the new owner.
+        if (own) await transport.stopSession(own).catch(() => undefined);
         return undefined;
       }
-      const f = this.classify(e, { timedOut, handle, closedReason });
-      await this.fail(chatId, fence, f);
+      if (ac.signal.aborted && !timedOut) {
+        // The broker is shutting down. This is not a failure, and the chat can start again later.
+        if (own) await transport.stopSession(own).catch(() => undefined);
+        return undefined;
+      }
+      await this.fail(chatId, fence, f, own);
       return undefined;
     } finally {
-      this.timers.clearTimeout(timer);
+      this.timers.clearTimeout(startTimer);
+      if (!kept) {
+        this.stopLease(lease);
+        await store.releaseLease(chatId, fence).catch(() => undefined);
+      }
     }
   }
 
   /** Fixed copy by cause. The text of the error itself never reaches the feed. */
-  private classify(e: unknown, s: { timedOut: boolean; handle: PodHandle | undefined; closedReason: string | undefined }): Failure {
+  private classify(e: unknown, s: { timedOut: boolean; handle: PodHandle | undefined; closedReason: string | undefined; named: boolean }): Failure {
     if (s.timedOut) return { code: "timeout", message: "The agent did not start in time.", kind: "timeout" };
+    if (e instanceof ExpiredError) return { code: "expired", message: "This chat is too old. Open a new chat.", kind: "limit" };
     if (e instanceof PodStartError) return { code: "pod_start", message: e.message, kind: "pod_start" };
     if (e instanceof NoHttpError) return { code: "acp", message: "This agent cannot use HTTP tools", kind: "acp" };
     if (s.handle) {
@@ -226,43 +306,40 @@ export class ChatBroker implements ChatAuth {
       if (s.closedReason !== undefined) return exitFailure(s.closedReason);
       return { code: "acp", message: "The agent could not open a session.", kind: "acp" };
     }
+    if (!s.named) return { code: "unavailable", message: "The chat service is not available.", kind: "other" };
     if (e instanceof KubeHttpError) return { code: "pod_start", message: "The agent could not start.", kind: "pod_start" };
     return { code: "attach", message: "The agent could not be reached.", kind: "attach" };
   }
 
-  private async fail(chatId: string, fence: LeaseFence, f: Failure): Promise<void> {
+  /**
+   * Show a failure in the feed and stop the pod. It never throws.
+   * With a live lease it stops every session of the chat. With a lost lease it stops only `session`, so a new owner keeps its pod.
+   */
+  private async fail(chatId: string, fence: LeaseFence, f: Failure, session: string): Promise<void> {
     const { store, transport, metrics } = this.d;
-    metrics.chatError(f.kind);
+    let lost = false;
     try {
-      await this.emit(chatId, { k: "error", code: f.code, message: f.message }, fence);
-      await store.update(chatId, { state: "failed" }, fence);
+      metrics.chatError(f.kind);
+      lost = !(await this.emit(chatId, { k: "error", code: f.code, message: f.message }, fence));
+      if (!lost) await store.update(chatId, { state: "failed" }, fence);
     } catch (e) {
-      if (!(e instanceof ChatLeaseLostError || e instanceof ChatClosedError)) throw e;
+      if (e instanceof ChatLeaseLostError || e instanceof ChatClosedError) lost = true;
+    } finally {
+      if (lost) {
+        if (session) await transport.stopSession(session).catch(() => undefined);
+      } else await transport.stop(chatId).catch(() => undefined);
     }
-    await transport.stop(chatId).catch(() => undefined);
-    await store.releaseLease(chatId, fence).catch(() => undefined);
   }
 
   /** The agent ended while the chat was running. */
-  private onAgentClosed(rt: ChatRuntime & { renew: unknown }, reason: string): void {
+  private onAgentClosed(rt: ChatRuntime, reason: string): void {
     if (this.runtimes.get(rt.chatId) !== rt) return;
     this.runtimes.delete(rt.chatId);
-    this.timers.clearTimeout(rt.renew);
-    void this.fail(rt.chatId, rt.fence, { code: "agent_exit", message: `The agent stopped (reason: ${EXIT_REASONS[reason] ?? "closed"}).`, kind: "agent_exit" }).catch(() => undefined);
-  }
-
-  private armRenew(rt: ChatRuntime & { renew: unknown }): void {
-    rt.renew = this.timers.setTimeout(() => {
-      void this.d.store.renewLease(rt.chatId, rt.fence, this.leaseTtl, this.d.now()).then(
-        () => {
-          if (this.runtimes.get(rt.chatId) === rt) this.armRenew(rt);
-        },
-        (e: unknown) => {
-          if (e instanceof ChatLeaseLostError) this.drop(rt.chatId);
-          else if (this.runtimes.get(rt.chatId) === rt) this.armRenew(rt);
-        },
-      );
-    }, Math.max(1000, Math.floor(this.leaseTtl / 3)));
+    this.stopLease(rt.lease);
+    const f: Failure = { code: "agent_exit", message: `The agent stopped (reason: ${EXIT_REASONS[reason] ?? "closed"}).`, kind: "agent_exit" };
+    void this.fail(rt.chatId, rt.fence, f, rt.handle.session)
+      .finally(() => this.d.store.releaseLease(rt.chatId, rt.fence).catch(() => undefined))
+      .catch(() => undefined);
   }
 
   /** Forget a runtime and close its stream. It sends no event. */
@@ -270,7 +347,7 @@ export class ChatBroker implements ChatAuth {
     const rt = this.runtimes.get(chatId);
     if (!rt) return undefined;
     this.runtimes.delete(chatId);
-    this.timers.clearTimeout(rt.renew);
+    this.stopLease(rt.lease);
     rt.handle.stream.close();
     return rt;
   }

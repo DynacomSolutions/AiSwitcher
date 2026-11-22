@@ -232,6 +232,19 @@ test("stop deletes every session labelled with the chat id", async () => {
   c.stream.close();
 });
 
+test("stopSession deletes one named session and leaves the others", async () => {
+  const { server, transport } = setup();
+  const a = await transport.start(input(), new AbortController().signal, () => {});
+  const b = await transport.start(input({ generation: 2 }), new AbortController().signal, () => {});
+  const closed: string[] = [];
+  a.stream.onClose((r) => closed.push(r));
+  await transport.stopSession(sessionName(CHAT, 1));
+  expect([...server.sessions.keys()]).toEqual([sessionName(CHAT, 2)]);
+  expect(closed).toEqual(["closed locally"]);
+  await transport.stopSession(sessionName(CHAT, 1));
+  b.stream.close();
+});
+
 test("a closed WebSocket ends the stream with a reason", async () => {
   const { server, transport } = setup();
   const h = await transport.start(input(), new AbortController().signal, () => {});
