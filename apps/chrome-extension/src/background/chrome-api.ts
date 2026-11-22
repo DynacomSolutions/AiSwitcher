@@ -64,6 +64,13 @@ export interface ChromeApi {
     /** A group's title or colour changed. */
     onUpdated(listener: (groupId: number) => void): void;
   };
+  notifications: {
+    /** Shows a notification that stays until the user answers (requireInteraction). `buttons` are the button labels. */
+    create(id: string, opts: { title: string; message: string; buttons: string[] }): Promise<void>;
+    clear(id: string): Promise<void>;
+    onButtonClicked(listener: (id: string, buttonIndex: number) => void): void;
+    onClosed(listener: (id: string, byUser: boolean) => void): void;
+  };
   debugger: {
     attach(tabId: number): Promise<void>;
     detach(tabId: number): Promise<void>;
@@ -73,6 +80,17 @@ export interface ChromeApi {
     onEvent(listener: (tabId: number, method: string, params: Record<string, unknown>, sessionId?: string) => void): void;
     onDetach(listener: (tabId: number, reason: string) => void): void;
   };
+}
+
+/**
+ * Joins tab lists, keeps the first copy of each tab id and returns tab-strip order (window, then index). The real query reads both chrome.tabs.query and every window,
+ * so one tab of a split view can never hide the other.
+ */
+export function mergeTabLists(...lists: TabInfo[][]): TabInfo[] {
+  const seen = new Set<number>();
+  const out: TabInfo[] = [];
+  for (const list of lists) for (const t of list) if (t.id !== -1 && !seen.has(t.id)) { seen.add(t.id); out.push(t); }
+  return out.sort((x, y) => x.windowId - y.windowId || x.index - y.index);
 }
 
 function toTab(t: chrome.tabs.Tab): TabInfo {
@@ -97,7 +115,12 @@ export function realChromeApi(): ChromeApi {
       get: async tabId => {
         try { return toTab(await chrome.tabs.get(tabId)); } catch { return undefined; }
       },
-      query: async () => (await chrome.tabs.query({})).map(toTab),
+      query: async () => {
+        const base = (await chrome.tabs.query({})).map(toTab);
+        let perWindow: TabInfo[] = [];
+        try { perWindow = (await chrome.windows.getAll({ populate: true })).flatMap(w => (w.tabs ?? []).map(toTab)); } catch { /* the plain query stands alone */ }
+        return mergeTabLists(base, perWindow);
+      },
       create: async (url, opts) => {
         const props: Record<string, unknown> = { active: false };
         if (url) props.url = url;
@@ -149,6 +172,12 @@ export function realChromeApi(): ChromeApi {
       },
       queryByTitle: async title => (await chrome.tabGroups.query({ title })).map(g => ({ id: g.id, title: g.title ?? "", color: g.color })),
       onUpdated: listener => chrome.tabGroups.onUpdated.addListener(g => listener(g.id)),
+    },
+    notifications: {
+      create: async (id, opts) => { await chrome.notifications.create(id, { type: "basic", iconUrl: chrome.runtime.getURL("icons/icon-128.png"), title: opts.title, message: opts.message, requireInteraction: true, buttons: opts.buttons.map(title => ({ title })) }); },
+      clear: async id => { await chrome.notifications.clear(id); },
+      onButtonClicked: listener => chrome.notifications.onButtonClicked.addListener((id, index) => listener(id, index)),
+      onClosed: listener => chrome.notifications.onClosed.addListener((id, byUser) => listener(id, byUser)),
     },
     debugger: {
       attach: tabId => chrome.debugger.attach({ tabId }, "1.3"),

@@ -47,6 +47,37 @@ export class FakeChrome implements ChromeApi {
     this.tabList.set(id, t);
     return t;
   }
+  /**
+   * A browser restart: storage.session is empty, every listener is gone, and Chrome restores the same tabs and groups
+   * (URLs, titles, colours, order, split views) under new tab, group and split view ids. Returns old tab id -> new tab id.
+   */
+  restart(): Map<number, number> {
+    this.session = {};
+    this.removedListeners = []; this.eventListeners = []; this.createdListeners = []; this.activatedListeners = []; this.groupUpdatedListeners = []; this.detachListeners = []; this.notificationButtonListeners = []; this.notificationClosedListeners = [];
+    this.attachedTabs.clear();
+    const tabMap = new Map<number, number>();
+    const groupMap = new Map<number, number>();
+    const splitMap = new Map<number, number>();
+    let nextTab = this.nextTab + 700;
+    let nextGroup = this.nextGroup + 40;
+    let nextSplit = this.nextSplit + 40;
+    const restored = new Map<number, TabInfo>();
+    for (const t of [...this.tabList.values()].sort((x, y) => x.windowId - y.windowId || x.index - y.index)) {
+      if (t.groupId !== -1 && !groupMap.has(t.groupId)) groupMap.set(t.groupId, nextGroup++);
+      if (t.splitViewId !== -1 && !splitMap.has(t.splitViewId)) splitMap.set(t.splitViewId, nextSplit++);
+      const id = nextTab++;
+      tabMap.set(t.id, id);
+      restored.set(id, { ...t, id, groupId: t.groupId === -1 ? -1 : groupMap.get(t.groupId)!, splitViewId: t.splitViewId === -1 ? -1 : splitMap.get(t.splitViewId)!, active: false });
+    }
+    const groups = new Map<number, { title: string; color: string }>();
+    for (const [old, fresh] of groupMap) { const g = this.groups.get(old); if (g) groups.set(fresh, g); }
+    this.tabList = restored;
+    this.groups = groups;
+    this.nextTab = nextTab;
+    this.nextGroup = nextGroup;
+    this.nextSplit = nextSplit;
+    return tabMap;
+  }
   /** Tab ids of one window in tab-strip order. */
   order(windowId = 1): number[] {
     return [...this.tabList.values()].filter(t => t.windowId === windowId).sort((x, y) => x.index - y.index).map(t => t.id);
@@ -174,6 +205,29 @@ export class FakeChrome implements ChromeApi {
     onUpdated: (l: (groupId: number) => void) => { this.groupUpdatedListeners.push(l); },
     get: async (id: number) => (this.groupLive(id) ? { id, title: this.groups.get(id)?.title ?? "", color: this.groups.get(id)?.color as GroupColor | undefined } : undefined),
     queryByTitle: async (title: string) => [...this.groups].filter(([id, g]) => g.title === title && this.groupLive(id)).map(([id, g]) => ({ id, title: g.title })),
+  };
+  /** Notifications on screen (id -> content), every one ever shown, and the ids that were cleared. */
+  shown = new Map<string, { title: string; message: string; buttons: string[] }>();
+  everShown: Array<{ id: string; title: string; message: string; buttons: string[] }> = [];
+  clearedNotifications: string[] = [];
+  notificationButtonListeners: Array<(id: string, index: number) => void> = [];
+  notificationClosedListeners: Array<(id: string, byUser: boolean) => void> = [];
+  /** The user presses a button of the notification on screen (the latest one when no id is given). */
+  clickNotification(index: number, id = [...this.shown.keys()].at(-1)): void {
+    if (id === undefined) throw new Error("No notification on screen.");
+    for (const l of this.notificationButtonListeners) l(id, index);
+  }
+  /** The user dismisses the notification on screen. */
+  dismissNotification(id = [...this.shown.keys()].at(-1)): void {
+    if (id === undefined) throw new Error("No notification on screen.");
+    this.shown.delete(id);
+    for (const l of this.notificationClosedListeners) l(id, true);
+  }
+  notifications = {
+    create: async (id: string, o: { title: string; message: string; buttons: string[] }) => { this.shown.set(id, o); this.everShown.push({ id, ...o }); },
+    clear: async (id: string) => { this.clearedNotifications.push(id); this.shown.delete(id); },
+    onButtonClicked: (l: (id: string, index: number) => void) => { this.notificationButtonListeners.push(l); },
+    onClosed: (l: (id: string, byUser: boolean) => void) => { this.notificationClosedListeners.push(l); },
   };
   debugger = {
     attach: async (id: number) => { this.attachedTabs.add(id); },

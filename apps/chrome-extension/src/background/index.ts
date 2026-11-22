@@ -78,10 +78,14 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // Controlled tabs that load a new page lose the overlay with the old document: draw it again.
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.url !== undefined || info.groupId !== undefined) tabs.scheduleSavedRefresh(); // a saved group's snapshot follows navigation and regrouping
+  tabs.tabUpdated({ ...(info.url !== undefined ? { url: info.url } : {}), ...(info.status !== undefined ? { status: info.status } : {}), ...(info.groupId !== undefined ? { groupId: info.groupId } : {}) }); // a browser restart restores tabs lazily: relink again once they load
   if (info.status === "complete" && ui.has(tabId) && !state.paused) void ui.refresh(tabId);
 });
 
 chrome.tabs.onMoved.addListener(() => tabs.scheduleSavedRefresh());
+chrome.tabs.onCreated.addListener(() => tabs.scheduleSavedRefresh());
+chrome.tabs.onAttached.addListener(() => tabs.scheduleSavedRefresh());
+chrome.tabs.onDetached.addListener(() => tabs.scheduleSavedRefresh());
 
 // The panel opens from the toolbar button.
 void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});

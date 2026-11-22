@@ -84,7 +84,7 @@ Deploy: the gateway image must contain this code. No new config is needed. The d
 
 ## Tools
 
-`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `split_tabs`, `unsplit_tabs`, `save_group`, `open_group`, `forget_group`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
+`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `split_tabs`, `unsplit_tabs`, `save_group`, `open_group`, `forget_group`, `request_group`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
 
 Split view (two tabs side by side) needs Chrome 155 or later. Older Chrome versions fail these calls with `bad_args` and the message "Split view needs Chrome 155 or later. This Chrome is <version>."
 
@@ -92,6 +92,30 @@ Split view (two tabs side by side) needs Chrome 155 or later. Older Chrome versi
 - `unsplit_tabs {tabId}` ends the split view that holds the tab. Every tab of that split view must be in the session or a granted group, else `forbidden_tab`. The tabs stay open.
 - `tabs_create {splitWithTabId}` opens the new tab in a split view with a tab of the session. The new tab stays in the background and joins the group of that tab: tracked as a created tab in the session group, or as a tab in the granted group (it stays open when the session ends). It cannot be combined with `groupId`.
 - `tabs_context` adds `splitViewId` to each tab that is in a split view.
+- `tabs_context` gives every tab its `groupId` (-1 when the tab is in no group) and adds `groups: [{groupId, title, tabCount, scope}]` for every open tab group in every window. `scope` is `own` (the group of this session), `granted` (a group the user granted, or a saved group this session holds), `saved` (a saved group of another holder) or `other`. The extension reads the tabs from `chrome.tabs.query` and from every window and joins the lists by tab id, so one tab of a split view never hides its partner.
+
+### Chat groups survive restarts
+
+A group that a session created stays with the chat that made it. The chat is the identity plus the session label (the chat title). The session id is not used, because it changes when the agent restarts (for example after context compaction).
+
+- The extension keeps one record per chat group in `chrome.storage.local` (`agentGroups`): identity, label, group title, colour, the ordered tabs (tab id, URL, created or adopted, owned or not), the current group id and the last session id. The record follows the live group (tab created, closed, moved, navigated, group renamed). A write waits 1.5 seconds after the last change. A record that would lose tabs is only written when the group is still open 10 seconds later, as for saved groups.
+- Reclaim: when a session with the same identity and the same non-empty label makes a call, and the session that held the group made no call for 10 minutes and has no call running (or is unknown after a reload, or ended), the group becomes the new session's own group. Its tabs return to the session with their created or adopted flags. No tab is moved, closed, reloaded or activated. A session that made a call in the last 10 minutes, or has a call running, keeps its group: nobody steals it. A different identity or a different label never reclaims. A group that a saved group or a grant claims is never reclaimed.
+- Browser restart: Chrome restores tabs and groups with new ids. At start the extension links a record to a live group only when the title matches, the tab URLs equal the recorded URLs (same count, same order), and no session, grant, saved group or other record claims it. The link must be unique: when two records or saved groups (of any identity) match one group, or one record matches two groups, none links. Tabs that are still loading (restored lazily) report their URL or pending URL. For 10 minutes after the start the extension tries the link again whenever a tab finishes loading or changes URL. Saved groups use the same unique link and the same retry. While a record or saved group with a title is not linked, no session joins a live group with that title (by `tabs_create`), and a group of another chat's record is never joined by title. The next call of a session also tries the link.
+- `save_group` and a grant take over the group: the record is removed. `session_end` removes the record and closes the created tabs, as before.
+
+### Asking for an existing group (`request_group`)
+
+`request_group {groupId}` asks the user to give the session an existing tab group that no agent uses, for example a group made before records existed. Get the id from `groups` in `tabs_context` (scope `other`).
+
+- Refused at once with `forbidden_tab`, with no prompt: a chat-panel session, a group that is granted, a saved group, the own group of another live session, and a group linked to the record of another identity or chat. `bad_args` when the session already has an own group with tabs, or the group is gone. For the session's own group the answer is "already yours".
+- Prompt: a Chrome notification "AIS Browser: allow an agent to use a tab group?" with Approve and Deny. It names the agent label and identity, the group title and the tab count, and stays until the user answers. The call waits up to 120 seconds and ends early when the call is aborted. Deny, a closed notification and a timeout give `forbidden_tab`. The notification is always cleared.
+- Only one request per group waits at a time.
+- After the click, every refusal rule runs again. A group that was granted or saved while the prompt was open is not taken.
+- Approve: the group becomes the own group of the session. Every tab is adopted and approved. No tab is moved, closed, reloaded or activated. The agent record is written at once. `close_tab` refuses an approved tab, and the session end neither closes nor ungroups it.
+- The approval is kept per tab in the agent record. A later session of the chat that reclaims the group, also after a browser restart, still cannot close or ungroup those tabs.
+- The call limit of `request_group` is 150 seconds (gateway and extension), so the 120 second prompt fits.
+- Only the tabs counted in the prompt are taken. A tab added while the prompt is open gives `forbidden_tab` ("Ask again"). A group of another session of the same identity shows "Another agent session made this group." in the prompt. A group of a session of another identity is refused.
+- The extension needs the `notifications` permission. It gives no install warning.
 
 ### Saved tab groups
 
