@@ -37,20 +37,20 @@ describe("OverlayUi", () => {
     const ui = new OverlayUi(f.s);
     await ui.markControlled(4, session);
     const t0 = Date.now();
-    await ui.beforeAction(4, { x: 1, y: 2, kind: "click" });
+    await ui.beforeAction(4, { x: 1, y: 2, kind: "click", sessionId: "s" });
     const took = Date.now() - t0;
     expect(took).toBeGreaterThanOrEqual(300);
     expect(took).toBeLessThan(700);
     const ac = new AbortController();
     const t1 = Date.now();
-    const p = ui.beforeAction(4, { x: 1, y: 2, kind: "click" }, ac.signal);
+    const p = ui.beforeAction(4, { x: 1, y: 2, kind: "click", sessionId: "s" }, ac.signal);
     setTimeout(() => ac.abort(), 20);
     await p;
     expect(Date.now() - t1).toBeLessThan(200);
     const pre = new AbortController();
     pre.abort();
     const n = f.calls.length;
-    await ui.beforeAction(4, { x: 1, y: 2, kind: "click" }, pre.signal);
+    await ui.beforeAction(4, { x: 1, y: 2, kind: "click", sessionId: "s" }, pre.signal);
     expect(f.calls.length).toBe(n);
   });
 
@@ -70,8 +70,69 @@ describe("OverlayUi", () => {
   test("scripting failures (chrome:// pages) are swallowed", async () => {
     const ui = new OverlayUi(fakeScripting({ fail: true }).s);
     await ui.markControlled(1, session);
-    await ui.beforeAction(1, { x: 0, y: 0, kind: "hover" });
+    await ui.beforeAction(1, { x: 0, y: 0, kind: "hover", sessionId: "s" });
     await ui.unmarkAll();
+  });
+});
+
+describe("OverlayUi per-session cursors", () => {
+  const a = { id: "a", identity: "dyn", label: "Chat A", color: "#f97316" };
+  const b = { id: "b", identity: "dyn", label: "Chat B", color: "#22c55e" };
+
+  test("OverlayUi keeps two sessions on one tab and markedTabs works for each", async () => {
+    const ui = new OverlayUi(fakeScripting().s);
+    await ui.markControlled(1, a);
+    await ui.markControlled(1, b);
+    await ui.markControlled(2, a);
+    expect(ui.markedTabs("a").sort()).toEqual([1, 2]);
+    expect(ui.markedTabs("b")).toEqual([1]);
+    expect(ui.has(1)).toBe(true);
+  });
+
+  test("beforeAction moves the acting session's cursor even after another session was marked last", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s);
+    await ui.markControlled(1, a);
+    await ui.markControlled(1, b);
+    await ui.beforeAction(1, { x: 1, y: 2, kind: "click", sessionId: "a" });
+    const act = f.calls.filter(c => c.method === "action").at(-1)!;
+    expect(act.arg).toMatchObject({ sessionId: "a", color: "#f97316", tag: "Chat A" });
+    await ui.beforeAction(1, { x: 1, y: 2, kind: "click", sessionId: "b" });
+    expect(f.calls.filter(c => c.method === "action").at(-1)!.arg).toMatchObject({ sessionId: "b", color: "#22c55e", tag: "Chat B" });
+    const n = f.calls.length;
+    await ui.beforeAction(1, { x: 1, y: 2, kind: "click", sessionId: "gone" });
+    expect(f.calls.length).toBe(n);
+  });
+
+  test("unmarkSession removes one session and keeps the other marked", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s);
+    await ui.markControlled(1, a);
+    await ui.markControlled(1, b);
+    await ui.unmarkSession(1, "b");
+    expect(f.calls.filter(c => c.method === "unmark").map(c => c.arg)).toEqual([{ sessionId: "b" }]);
+    expect(ui.markedTabs("a")).toEqual([1]);
+    expect(ui.markedTabs("b")).toEqual([]);
+    expect(ui.has(1)).toBe(true);
+    await ui.unmarkSession(1, "a");
+    expect(ui.has(1)).toBe(false);
+  });
+
+  test("a session with no colour falls back to the identity colour (external agents unchanged)", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s);
+    await ui.markControlled(1, session);
+    expect(f.calls[0]!.arg).toMatchObject({ sessionId: "s", color: hexForIdentity("dyn"), tag: "dyn" });
+  });
+
+  test("refresh re-marks every session still active on the tab", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s, () => 0);
+    await ui.markControlled(1, a);
+    await ui.markControlled(1, b);
+    await ui.refresh(1);
+    const marks = f.calls.filter(c => c.method === "mark").slice(2).map(c => (c.arg as { sessionId: string }).sessionId).sort();
+    expect(marks).toEqual(["a", "b"]);
   });
 });
 
@@ -100,7 +161,7 @@ describe("OverlayUi session end and races", () => {
     t = 80_000;
     await ui.refresh(3);
     expect(f.calls.filter(c => c.method === "mark")).toHaveLength(2);
-    await ui.beforeAction(3, { x: 1, y: 1, kind: "click" });
+    await ui.beforeAction(3, { x: 1, y: 1, kind: "click", sessionId: "s" });
     t = 80_000 + 89_000;
     await ui.refresh(3);
     expect(f.calls.filter(c => c.method === "mark")).toHaveLength(3);
@@ -122,8 +183,28 @@ describe("OverlayUi session end and races", () => {
     await ui2.markControlled(6, session);
     f2.navigate(); // the page navigated: overlay gone, next call must re-inject
     f2.s.inject = async () => { await ui2.unmark(6); };
-    await ui2.beforeAction(6, { x: 1, y: 1, kind: "click" });
+    await ui2.beforeAction(6, { x: 1, y: 1, kind: "click", sessionId: "s" });
     expect(f2.calls.filter(c => c.method === "action")).toHaveLength(0);
+  });
+
+  test("an unmarkSession during injection wins for that session only", async () => {
+    const f = fakeScripting({ missing: true });
+    const ui = new OverlayUi(f.s);
+    const other = { id: "o", identity: "dyn", label: "Other", color: "#22c55e" };
+    await ui.markControlled(7, other);
+    const inject = f.s.inject;
+    f.s.inject = async tabId => { await inject(tabId); await ui.unmarkSession(tabId, "s"); };
+    f.navigate();
+    await ui.markControlled(7, session);
+    expect(f.calls.filter(c => c.method === "mark" && (c.arg as { sessionId: string }).sessionId === "s")).toHaveLength(0);
+    expect(ui.markedTabs("o")).toEqual([7]);
+  });
+
+  test("an empty chat label falls back to the identity for the tag", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s);
+    await ui.markControlled(1, { id: "c", identity: "dyn", label: "  ", color: "#f97316" });
+    expect(f.calls[0]!.arg).toMatchObject({ tag: "dyn" });
   });
 
   test("suspend and restore reach only marked tabs and are capped at 150 ms", async () => {

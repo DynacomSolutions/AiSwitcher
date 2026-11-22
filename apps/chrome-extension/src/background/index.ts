@@ -9,6 +9,7 @@ import { colorForIdentity, TabManager } from "./tabs.ts";
 import { PopupGuard } from "./popups.ts";
 import { HOST_NAME, Updater } from "./updater.ts";
 import { handleMessage } from "./messages.ts";
+import { ChatHub, servePort } from "./chat.ts";
 import { hexForIdentity, OverlayUi } from "./ui.ts";
 import type { PanelStatus } from "../shared/panel.ts";
 
@@ -20,7 +21,17 @@ const tabs = new TabManager(api);
 // Registered at top level so Chrome wakes the worker for tab events.
 const popups = new PopupGuard(api, tabs);
 const ui = new OverlayUi();
-const executor = new Executor({ api, tabs, state, ui });
+const hub = new ChatHub({
+  send: frame => connection.sendChat(frame),
+  tabs,
+  storage: api.sessionStorage,
+  now: () => Date.now(),
+  newId: () => crypto.randomUUID(),
+  resumeSession: sessionId => state.resumeSession(sessionId),
+  endSession: sessionId => { for (const tabId of ui.markedTabs(sessionId)) void ui.unmarkSession(tabId, sessionId); state.resumeSession(sessionId); },
+});
+// Link changes reach the gateway through the hub. While offline it sends nothing: the welcome sends every chat's current links.
+const executor = new Executor({ api, tabs, state, ui, onLinks: (sessionId, tabIds) => hub.onLinks(sessionId, tabIds) });
 const updater = new Updater({
   sendNative: msg => chrome.runtime.sendNativeMessage(HOST_NAME, msg),
   reload: async () => { await tabs.handover().catch(() => {}); chrome.runtime.reload(); },
@@ -36,7 +47,9 @@ const connection = new Connection({
   isPaused: () => state.paused,
   onCall: req => executor.run(req),
   onAbort: id => state.abort(id),
-  onStatus: status => { void api.storage.set({ status }); },
+  onStatus: status => { void api.storage.set({ status }); hub.setConnected(status === "connected"); },
+  onChat: frame => hub.handleFrame(frame),
+  onWelcome: () => hub.onWelcome(),
   onSignedOut: () => { void clearToken(api.storage); },
 });
 
@@ -49,9 +62,12 @@ async function connect(): Promise<void> {
   try { connection.start(s.gatewayUrl, s.token); } catch { connection.stop(); }
 }
 
+tabs.onExpired = sessionId => state.resumeSession(sessionId);
 state.onChange(paused => connection.sendState(paused));
 // Stop ends every grant: the user takes the groups back.
 state.onStop(() => tabs.revokeAll());
+// The full Stop also ends the running turn of every chat.
+state.onStop(() => hub.cancelRunning());
 // A granted group the user closed or dissolved is no longer granted.
 chrome.tabGroups.onRemoved.addListener(() => { void tabs.pruneGrants(); });
 
@@ -91,13 +107,20 @@ async function panelStatus(): Promise<PanelStatus> {
   };
 }
 
-const startup = Promise.all([state.load(), api.storage.get([DISCONNECTED_KEY]).then(r => { disconnected = r[DISCONNECTED_KEY] === true; }), tabs.load(), popups.load(), updater.load()]).then(connect);
+const startup = Promise.all([state.load(), api.storage.get([DISCONNECTED_KEY]).then(r => { disconnected = r[DISCONNECTED_KEY] === true; }), tabs.load(), hub.load(), popups.load(), updater.load()]).then(connect);
 
 // Keeps the worker (and thus the socket) honest after Chrome suspends it. Waits for the startup load so it never races it.
 chrome.alarms.create("ais-keepalive", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(() => {
   void startup.then(async () => { tabs.expireIdle(); if (connection.needsRestart()) await connect(); await updater.tick().catch(() => {}); });
 });
+
+// A stopped agent leaves the page at once. Its next call is rejected until the user resumes it.
+state.onSessionStop(sessionId => { hub.onSessionStopped(sessionId); for (const tabId of ui.markedTabs(sessionId)) void ui.unmarkSession(tabId, sessionId); });
+state.setSessionsOnTab(tabId => ui.sessionsOn(tabId));
+
+// The side panel keeps one port open. The hub pushes its window's chat state on it.
+chrome.runtime.onConnect.addListener(port => { servePort(port, hub, chrome.runtime.id); });
 
 // Control messages from the side panel and the in-page Stop button (see messages.ts for who may send what).
 chrome.runtime.onMessage.addListener((msg: unknown, sender, reply) => handleMessage(msg, sender, reply, {
@@ -110,7 +133,9 @@ chrome.runtime.onMessage.addListener((msg: unknown, sender, reply) => handleMess
     await connect();
   },
   isMarked: tabId => ui.has(tabId),
+  isSessionMarked: (tabId, sessionId) => ui.sessionsOn(tabId).includes(sessionId),
   grant: (groupId, sessionId) => tabs.grant(groupId, sessionId),
   revoke: async groupId => { tabs.revoke(groupId); },
+  chatCommand: cmd => hub.command(cmd),
   updater,
 }));

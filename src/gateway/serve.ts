@@ -164,6 +164,8 @@ export interface GatewayHooks {
   chatKubeApi?: KubeApi;
   /** Tests: the chat bus (in-memory store mode only). */
   chatBus?: ChatBus;
+  /** Tests: the chat store (in-memory store mode only). A second gateway given the same store sees the chats of the first. */
+  chatStore?: ChatStore;
 }
 
 /** What `AIS_GATEWAY_CHAT_*` configures. */
@@ -1216,7 +1218,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
             })();
           return new KubePodTransport({ api, env: cfg.kube });
         })();
-      const chatStore: ChatStore = testing ? new MemoryChatStore() : new PgChatStore(opts.databaseUrl, { sql: sharedSql });
+      const chatStore: ChatStore = testing ? (hooks.chatStore ?? new MemoryChatStore()) : new PgChatStore(opts.databaseUrl, { sql: sharedSql });
       const bus: ChatBus = testing ? (hooks.chatBus ?? new MemoryChatBus()) : new PgChatBus(sharedSql, sharedListener);
       const mcpUrl = chatEnv?.mcpUrl ?? `http://127.0.0.1:${server.port}/browser/mcp`;
       const replicaId = `${process.env.HOSTNAME ?? "gateway"}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`;

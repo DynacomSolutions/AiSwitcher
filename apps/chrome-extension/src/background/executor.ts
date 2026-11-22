@@ -111,6 +111,8 @@ export interface ExecutorDeps {
   fileChooserWaitMs?: number;
   /** How long a fresh attach waits for the page to answer (tests shorten it). */
   attachAnswerMs?: number;
+  /** A chat session's link set changed (a tab it created): the gateway must hear of it before the call result. */
+  onLinks?: (sessionId: string, tabIds: number[]) => void | Promise<void>;
 }
 
 export class Executor {
@@ -118,6 +120,9 @@ export class Executor {
   private readonly tabs: TabManager;
   private readonly state: State;
   private readonly ui: Ui;
+  private readonly onLinks: (sessionId: string, tabIds: number[]) => void | Promise<void>;
+  /** Per tab: the tail of the calls of chat sessions, so chats that share a tab never run on it at the same time. */
+  private readonly tabLocks = new Map<number, Promise<void>>();
   private readonly attached = new Set<number>();
   /** Per tab: the domain enables of an attach the page has not answered yet. */
   private readonly enabling = new Map<number, Promise<void>>();
@@ -147,6 +152,8 @@ export class Executor {
     this.tabs = deps.tabs;
     this.state = deps.state;
     this.ui = deps.ui ?? noopUi;
+    this.onLinks = deps.onLinks ?? (() => {});
+    if (deps.onLinks) this.tabs.onLinksChanged = deps.onLinks;
     this.sleepFn = deps.sleep ?? ((ms, signal) => new Promise<void>((resolve, reject) => {
       const t = setTimeout(resolve, ms);
       signal.addEventListener("abort", () => { clearTimeout(t); reject(new Error("aborted")); }, { once: true });
@@ -180,6 +187,10 @@ export class Executor {
     const fail = (error: BrowserErrorCode, message: string): CallResult => ({ id, ok: false, error, message });
     if (req.tool === SESSION_END_TOOL) return this.endSession(req);
     if (this.state.paused) return fail("paused_by_user", "The user paused this browser. Do not retry until they resume it.");
+    if (this.state.isStopped(req.session.id)) {
+      for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void Promise.resolve(this.ui.unmarkSession(tabId, req.session.id)).catch(() => {});
+      return fail("stopped_by_user", "You stopped this agent on this page.");
+    }
     if (req.tool === "list_browsers") return fail("bad_args", "list_browsers is answered by the gateway");
     if (!Object.hasOwn(TOOL_SCHEMAS, req.tool)) return fail("bad_args", `Unknown tool ${String(req.tool)}`);
     const tool: ExtensionTool = req.tool;
@@ -190,7 +201,7 @@ export class Executor {
       for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void this.markControlled(tabId, req.session);
     }
     await this.tabs.regrant(req.session).catch(() => {});
-    const controller = this.state.track(id);
+    const controller = this.state.track(id, req.session.id, req.session.identity);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : this.defaultTimeout;
     const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
     const aborted = new Promise<never>((_, reject) => {
@@ -214,9 +225,11 @@ export class Executor {
   /** The agent session ended: closes the tabs it created, releases the rest. Works while paused, so a pause never leaves a dead session's tabs behind. */
   private async endSession(req: CallRequest): Promise<CallResult> {
     const s = this.tabs.sessions.get(req.session.id);
+    if (!s || s.identity === req.session.identity) this.state.resumeSession(req.session.id, req.session.identity);
     if (s && s.identity !== req.session.identity) return { id: req.id, ok: true, content: [{ type: "text", text: "no such session" }] };
     const tabIds = s ? [...s.tabIds] : [];
     await this.tabs.closeSession(req.session.id);
+    if (req.session.chat === true) this.tabs.dropChat(req.session.id);
     await Promise.all(tabIds.map(async tabId => { await this.detach(tabId); await this.unmark(tabId); }));
     return { id: req.id, ok: true, content: [{ type: "text", text: "session ended" }] };
   }
@@ -237,6 +250,7 @@ export class Executor {
     const a = <T extends ExtensionTool>(_t: T): ToolArgs[T] => args as ToolArgs[T];
     switch (tool) {
       case "tabs_context": {
+        if (session.chat === true) return this.chatContext(session.id);
         const { own, granted, other } = await this.tabs.list(session.id);
         const view = (t: TabInfo) => ({ tabId: t.id, url: t.url, title: t.title, active: t.active, ...(t.splitViewId !== undefined && t.splitViewId !== -1 ? { splitViewId: t.splitViewId } : {}) });
         const dialog = (t: TabInfo) => {
@@ -254,6 +268,7 @@ export class Executor {
         this.throwIfAborted(sig);
         const { url, groupId, splitWithTabId } = a("tabs_create");
         const target = url ? this.normaliseUrl(url) : undefined;
+        if (session.chat === true && groupId !== undefined) throw new ToolError("forbidden_tab", "A chat cannot open tabs in a granted group.");
         if (splitWithTabId !== undefined) {
           if (groupId !== undefined) throw new ToolError("bad_args", "Use either groupId or splitWithTabId, not both. The new tab opens in the group of the tab it splits with.");
           this.requireSplit();
@@ -277,6 +292,12 @@ export class Executor {
           return text(JSON.stringify({ tabId: made.id, url: made.url, groupId }));
         }
         const tab = await this.tabs.create(session, target);
+        if (session.chat === true) {
+          // The gateway must accept the new tab before the agent can use it.
+          const links = [...new Set([...this.tabs.chatLinks(session.id), tab.id])];
+          this.tabs.setChatLinks(session.id, links, true);
+          await this.onLinks(session.id, links);
+        }
         await this.markControlled(tab.id, session);
         return text(JSON.stringify({ tabId: tab.id, url: tab.url }));
       }
@@ -345,8 +366,12 @@ export class Executor {
       }
       case "adopt_tab": {
         const { tabId } = a("adopt_tab");
+        if (session.chat === true && !this.tabs.chatLinked(session.id, tabId) && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", "Only tabs you linked to this chat can be used. Link it in the side panel.");
         const tab = await this.api.tabs.get(tabId);
         if (!tab) throw new ToolError("tab_closed", `Tab ${tabId} no longer exists.`);
+        if (session.chat === true) {
+          return text(`Tab ${tabId} is linked to this chat and is already usable.`);
+        }
         if (this.tabs.inGrantedGroup(session.id, session.identity, tab)) return text(`Tab ${tabId} is in a group granted to this session and is already usable.`);
         if (this.tabs.grantee(tab.groupId) !== undefined) throw new ToolError("forbidden_tab", `Tab ${tabId} is in a group the user granted to another session.`);
         const savedName = await this.tabs.savedNameOfGroup(tab.groupId);
@@ -357,7 +382,7 @@ export class Executor {
         await this.tabs.addToSession(session, tabId);
         // The owner's tab may already show a dialog, which blocks the page marker: attached first, so it is seen (or the page is found unresponsive) before the marker hangs.
         try {
-          await this.watchDialogs(tabId, tool, async () => { await this.ensureAttached(sig, tabId); await this.markControlled(tabId, session); });
+          await this.watchDialogs(tabId, tool, async () => { await this.ensureAttached(sig, tabId); await this.markControlled(tabId, session); }, sig);
         } catch (e) {
           const d = this.dialogs.get(tabId);
           if (e instanceof PageUnresponsive) return text(`Adopted tab ${tabId}: ${tab.title}. ${e.message}`);
@@ -376,17 +401,59 @@ export class Executor {
     }
     const { tabId } = a("screenshot");
     const tab = await this.ownedTab(req, tabId);
-    const open = this.dialogs.get(tabId);
-    if (open && !DIALOG_SAFE.has(tool)) throw this.dialogError(tabId, open);
     // A page blocked by a dialog answers neither CDP input nor script injection: a dialog that opens mid-call ends the call at once.
-    return this.watchDialogs(tabId, tool, async () => {
-      // Attached before anything touches the page: a page that does not answer (a dialog Chrome never reported) ends the call here.
-      await this.ensureAttached(sig, tabId);
-      if (open) void this.markControlled(tabId, session); else await this.markControlled(tabId, session);
-      this.throwIfAborted(sig);
-      if (tool !== "hover") await this.releaseHold(tabId);
-      return this.tabTool(tool, req, sig, tab);
-    });
+    // The dialog is read inside `work`, after a chat has the tab lock: an earlier call may have opened one.
+    const work = async (): Promise<Content> => {
+      const open = this.dialogs.get(tabId);
+      if (open && !DIALOG_SAFE.has(tool)) throw this.dialogError(tabId, open);
+      return this.watchDialogs(tabId, tool, async () => {
+        // Attached before anything touches the page: a page that does not answer (a dialog Chrome never reported) ends the call here.
+        await this.ensureAttached(sig, tabId);
+        if (open) void this.markControlled(tabId, session); else await this.markControlled(tabId, session);
+        this.throwIfAborted(sig);
+        if (tool !== "hover") await this.releaseHold(tabId);
+        return this.tabTool(tool, req, sig, tab);
+      }, sig);
+    };
+    return session.chat === true ? this.withTabLock(tabId, work, sig) : work();
+  }
+
+  /** Runs `work` after every earlier chat call on the same tab has ended. */
+  private async withTabLock<T>(tabId: number, work: () => Promise<T>, sig: AbortSignal): Promise<T> {
+    const prev = this.tabLocks.get(tabId) ?? Promise.resolve();
+    const start = (): Promise<T> => {
+      // A call aborted while it waited never starts.
+      if (sig.aborted) return Promise.reject(new ToolError(this.abortCode(sig.reason), this.abortMessage(sig.reason)));
+      return work();
+    };
+    const run = prev.then(start, start);
+    // An abort ends this call's own hold on the lock. It never ends the hold of the call before it.
+    const aborted = new Promise<void>(resolve => { if (sig.aborted) resolve(); else sig.addEventListener("abort", () => resolve(), { once: true }); });
+    const settle = (): Promise<void> => Promise.race([run.then(() => {}, () => {}), aborted]);
+    const tail = prev.then(settle, settle);
+    this.tabLocks.set(tabId, tail);
+    void tail.then(() => { if (this.tabLocks.get(tabId) === tail) this.tabLocks.delete(tabId); });
+    return run;
+  }
+
+  /** What a chat sees: its linked tabs and the tabs it created. Nothing else. */
+  private async chatContext(sessionId: string): Promise<Content> {
+    const all = await this.api.tabs.query();
+    const live = new Set(all.map(t => t.id));
+    const links = this.tabs.chatLinks(sessionId);
+    const dead = links.filter(id => !live.has(id));
+    if (dead.length > 0) this.tabs.setChatLinks(sessionId, links.filter(id => live.has(id)));
+    const created = this.tabs.sessions.get(sessionId)?.tabIds ?? new Set<number>();
+    const mine = all.filter(t => created.has(t.id) || this.tabs.chatLinked(sessionId, t.id));
+    const row = (t: TabInfo) => {
+      const d = this.dialogs.get(t.id);
+      return {
+        tabId: t.id, url: t.url, title: t.title, active: t.active,
+        ...(d ? { dialog: { type: d.type, message: d.message, url: d.url, ...(d.defaultPrompt !== undefined ? { defaultPrompt: d.defaultPrompt } : {}) } } : {}),
+        scope: created.has(t.id) ? "own" : "linked",
+      };
+    };
+    return text(JSON.stringify({ sessionTabs: mine.map(row), otherTabs: [], grantedGroups: [], note: "You can use only the tabs listed here: tabs the user linked to this chat and tabs you created. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
   }
 
   private async tabTool(tool: ExtensionTool, req: CallRequest, sig: AbortSignal, tab: TabInfo): Promise<Content> {
@@ -401,13 +468,13 @@ export class Executor {
       case "find": return text(await this.find(sig, tabId, a("find").query));
       case "click": {
         const p = await this.target(sig, tabId, a("click"));
-        await this.input(sig, tabId, p, "click");
+        await this.input(sig, tabId, p, "click", session.id);
         await this.press(sig, tabId, p, a("click").button ?? "left", a("click").clickCount ?? 1);
         return text(`Clicked at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
       case "hover": {
         const p = await this.target(sig, tabId, a("hover"));
-        await this.input(sig, tabId, p, "hover");
+        await this.input(sig, tabId, p, "hover", session.id);
         await this.hidden(sig, tabId, () => this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y }), true);
         return text(`Hovered at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
@@ -419,14 +486,14 @@ export class Executor {
           p = { x: r.x, y: r.y };
           await this.cdp(sig, tabId, "DOM.focus", { backendNodeId: r.backendNodeId });
         }
-        await this.input(sig, tabId, p, "type");
+        await this.input(sig, tabId, p, "type", session.id);
         await this.cdp(sig, tabId, "Input.insertText", { text: value });
         return text(`Typed ${value.length} characters.`);
       }
       case "key": {
         let specs;
         try { specs = parseKeys(a("key").key); } catch (e) { throw new ToolError("bad_args", (e as Error).message); }
-        await this.input(sig, tabId, this.lastPoint.get(tabId) ?? { x: 0, y: 0 }, "key");
+        await this.input(sig, tabId, this.lastPoint.get(tabId) ?? { x: 0, y: 0 }, "key", session.id);
         for (let n = 0; n < (a("key").repeat ?? 1); n++) {
           for (const k of specs) {
             const common = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
@@ -441,11 +508,11 @@ export class Executor {
         if (!s.direction) {
           if (!s.ref) throw new ToolError("bad_args", "scroll needs a direction or a ref");
           const p = await this.refPoint(sig, tabId, s.ref);
-          await this.input(sig, tabId, p, "scroll");
+          await this.input(sig, tabId, p, "scroll", session.id);
           return text("Scrolled element into view.");
         }
         const p = s.ref || s.coordinate ? await this.target(sig, tabId, s) : await this.viewportCentre(sig, tabId);
-        await this.input(sig, tabId, p, "scroll");
+        await this.input(sig, tabId, p, "scroll", session.id);
         const delta = (s.amount ?? 3) * 100;
         const dx = s.direction === "left" ? -delta : s.direction === "right" ? delta : 0;
         const dy = s.direction === "up" ? -delta : s.direction === "down" ? delta : 0;
@@ -453,7 +520,7 @@ export class Executor {
         return text(`Scrolled ${s.direction}.`);
       }
       case "form_input": return this.formInput(sig, tabId, a("form_input").ref, a("form_input").value);
-      case "upload_file": return this.uploadFile(sig, tabId, a("upload_file"));
+      case "upload_file": return this.uploadFile(sig, tabId, a("upload_file"), session.id);
       case "javascript": {
         const r = (await this.cdp(sig, tabId, "Runtime.evaluate", { expression: a("javascript").code, awaitPromise: true, returnByValue: true, userGesture: true })) as { result?: { value?: unknown; description?: string }; exceptionDetails?: { text?: string; exception?: { description?: string } } };
         if (r.exceptionDetails) throw new ToolError("internal", `JavaScript error: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "unknown"}`);
@@ -527,6 +594,16 @@ export class Executor {
 
   private async ownedTab(req: CallRequest, tabId: number): Promise<TabInfo> {
     const own = this.tabs.owns(req.session.id, tabId, req.session.identity);
+    if (req.session.chat === true) {
+      if (!own && !this.tabs.chatLinked(req.session.id, tabId)) throw new ToolError("forbidden_tab", `Tab ${tabId} is not linked to this chat. Only tabs you linked to this chat can be used. Link it in the side panel.`);
+      const linked = await this.api.tabs.get(tabId);
+      if (!linked) {
+        this.tabs.forget(tabId);
+        this.dropTab(tabId);
+        throw new ToolError("tab_closed", `Tab ${tabId} was closed.`);
+      }
+      return linked;
+    }
     const forbidden = (): ToolError => new ToolError("forbidden_tab", `Tab ${tabId} is not in this session. Use tabs_create, or adopt_tab to take one of the user's tabs.`);
     if (!own && this.tabs.grantedGroups(req.session.id).length === 0) throw forbidden();
     const tab = await this.api.tabs.get(tabId);
@@ -551,18 +628,22 @@ export class Executor {
   }
 
   /** Runs a call on a tab; a dialog that opens on that tab meanwhile fails the call at once with dialog_open. The call's own work is left to finish (or hang) on its own. */
-  private async watchDialogs<T>(tabId: number, tool: ExtensionTool, work: () => Promise<T>): Promise<T> {
+  private async watchDialogs<T>(tabId: number, tool: ExtensionTool, work: () => Promise<T>, sig?: AbortSignal): Promise<T> {
     let watcher: { tool: ExtensionTool; reject: (e: ToolError) => void } | undefined;
     const opened = new Promise<never>((_, reject) => { watcher = { tool, reject }; });
     opened.catch(() => {});
     const set = this.dialogWatchers.get(tabId) ?? new Set();
     set.add(watcher!);
     this.dialogWatchers.set(tabId, set);
+    // An aborted call is no longer the cause of a dialog that opens later.
+    const onAbort = (): void => { set.delete(watcher!); };
+    if (sig) { if (sig.aborted) onAbort(); else sig.addEventListener("abort", onAbort, { once: true }); }
     const running = work();
     running.catch(() => {});
     try {
       return await Promise.race([running, opened]);
     } finally {
+      sig?.removeEventListener("abort", onAbort);
       set.delete(watcher!);
       if (set.size === 0 && this.dialogWatchers.get(tabId) === set) this.dialogWatchers.delete(tabId);
     }
@@ -967,9 +1048,9 @@ export class Executor {
     throw new ToolError("bad_args", "Give either ref or coordinate.");
   }
 
-  private async input(sig: AbortSignal, tabId: number, p: { x: number; y: number }, kind: ActionKind): Promise<void> {
+  private async input(sig: AbortSignal, tabId: number, p: { x: number; y: number }, kind: ActionKind, sessionId: string): Promise<void> {
     this.lastPoint.set(tabId, { x: p.x, y: p.y });
-    try { await this.ui.beforeAction(tabId, { x: p.x, y: p.y, kind }, sig); } catch { /* visuals never fail a tool call */ }
+    try { await this.ui.beforeAction(tabId, { x: p.x, y: p.y, kind, sessionId }, sig); } catch { /* visuals never fail a tool call */ }
     this.throwIfAborted(sig);
   }
 
@@ -990,14 +1071,14 @@ export class Executor {
    * is read from the disk of this machine. A ref to a file input is filled directly; any other target is clicked and the
    * file chooser it opens is held back (no dialog appears) to learn which input asked for files.
    */
-  private async uploadFile(sig: AbortSignal, tabId: number, args: ToolArgs["upload_file"]): Promise<Content> {
+  private async uploadFile(sig: AbortSignal, tabId: number, args: ToolArgs["upload_file"], sessionId: string): Promise<Content> {
     let input: { backendNodeId: number; sessionId?: string } | undefined;
     if (args.ref) {
       const backendNodeId = this.refTable(tabId).byRef.get(args.ref);
       if (backendNodeId === undefined) throw new ToolError("bad_args", `Unknown ref ${args.ref}; call read_page or find first.`);
       if (await this.isFileInput(sig, tabId, backendNodeId)) input = { backendNodeId };
     }
-    input ??= await this.openChooser(sig, tabId, args);
+    input ??= await this.openChooser(sig, tabId, args, sessionId);
     await this.setFiles(sig, tabId, input, args.files);
     return text(`Uploaded ${args.files.map(f => f.name).join(", ")}.`);
   }
@@ -1017,12 +1098,12 @@ export class Executor {
   }
 
   /** Clicks the target with file chooser interception on, in the page and in every cross-origin iframe, and returns the input that asked for files. */
-  private async openChooser(sig: AbortSignal, tabId: number, target: { ref?: string; coordinate?: [number, number] }): Promise<{ backendNodeId: number; sessionId?: string }> {
+  private async openChooser(sig: AbortSignal, tabId: number, target: { ref?: string; coordinate?: [number, number] }, actingSession: string): Promise<{ backendNodeId: number; sessionId?: string }> {
     const p = await this.target(sig, tabId, target);
     const armed = await this.interceptChoosers(sig, tabId);
     const opened = this.waitForEvent(tabId, ["Page.fileChooserOpened"], this.chooserWait, true);
     try {
-      await this.input(sig, tabId, p, "click");
+      await this.input(sig, tabId, p, "click", actingSession);
       await this.press(sig, tabId, p);
       const chooser = await opened.promise;
       this.throwIfAborted(sig);

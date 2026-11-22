@@ -39,9 +39,11 @@ export class FakeChrome implements ChromeApi {
   groupUpdatedListeners: Array<(groupId: number) => void> = [];
   moveCalls: Array<{ tabId: number; index: number }> = [];
 
-  addTab(id: number, url = "https://example.test/", title = "T", windowId = 1): TabInfo {
+  addTab(id: number, url = "https://example.test/", title = "T", where: number | { splitViewId?: number; windowId?: number } = 1): TabInfo {
+    const extra = typeof where === "number" ? { windowId: where } : where;
+    const windowId = extra.windowId ?? 1;
     const index = [...this.tabList.values()].filter(t => t.windowId === windowId).length;
-    const t: TabInfo = { id, windowId, groupId: -1, url, title, active: false, splitViewId: -1, index, pinned: false };
+    const t: TabInfo = { id, windowId, groupId: -1, url, title, active: false, splitViewId: extra.splitViewId ?? -1, index, pinned: false };
     this.tabList.set(id, t);
     return t;
   }

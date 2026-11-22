@@ -153,6 +153,24 @@ describe("pause and stop", () => {
     expect(api.store.paused).toBe(true);
   });
 
+  test("stopSession aborts only that session's in-flight call, blocks its next call, and resume clears it", async () => {
+    const { api, state, tabs, executor } = setup();
+    const other = { id: "s2", identity: "dyn", label: "dyn / s2" };
+    await tabs.create(session, "https://example.test/");
+    await tabs.create(other, "https://example.test/");
+    const a = executor.run(call("wait", { seconds: 100 }));
+    const b = executor.run(call("wait", { seconds: 0.05 }, other));
+    await new Promise(r => setTimeout(r, 5));
+    state.stopSession("s1");
+    expect(await a).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(await b).toMatchObject({ ok: true });
+    expect(state.paused).toBe(false);
+    expect(await executor.run(call("tabs_context", {}))).toMatchObject({ ok: false, error: "stopped_by_user", message: "You stopped this agent on this page." });
+    expect(await executor.run(call("tabs_context", {}, other))).toMatchObject({ ok: true });
+    state.resumeSession("s1");
+    expect(await executor.run(call("tabs_context", {}))).toMatchObject({ ok: true });
+  });
+
   test("stop during a multi-step click dispatches no input and leaves nothing attached", async () => {
     const { api, state, tabs, executor } = setup();
     const tab = await tabs.create(session, "https://example.test/");
@@ -224,6 +242,7 @@ describe("args and tools", () => {
       beforeAction: (tabId, p) => { events.push(`before:${tabId}:${p.kind}:${p.x},${p.y}`); },
       markControlled: (tabId, s) => { events.push(`mark:${tabId}:${s.id}`); },
       unmark() {},
+      unmarkSession() {},
       unmarkAll() {},
       suspend() {},
       restore() {},
@@ -340,6 +359,7 @@ describe("visuals and abort hygiene", () => {
       beforeAction: (_t, _p, s) => { signal = s; log.push("before"); },
       markControlled: (t) => { log.push(`mark:${t}`); },
       unmark: (t) => { log.push(`unmark:${t}`); },
+      unmarkSession: () => {},
       unmarkAll: () => { log.push("unmarkAll"); },
       suspend: t => { log.push(`suspend:${t}`); },
       restore: t => { log.push(`restore:${t}`); },
@@ -356,6 +376,20 @@ describe("visuals and abort hygiene", () => {
     api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
     await executor.run(call("screenshot", { tabId: tab.id }));
     expect((await executor.run(call("hover", { tabId: tab.id, coordinate: [10, 10] }))).ok).toBe(true);
+  });
+
+  test("beforeAction receives the acting session's id", async () => {
+    const r = recordingUi();
+    const ids: string[] = [];
+    r.ui.beforeAction = (_t, p) => { ids.push(p.sessionId); };
+    const { api, tabs, executor } = setup(r.ui);
+    const tab = await tabs.create(session);
+    api.cdpResults["Page.getLayoutMetrics"] = { cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 } };
+    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
+    await executor.run(call("screenshot", { tabId: tab.id }));
+    await executor.run(call("hover", { tabId: tab.id, coordinate: [10, 10] }));
+    expect(ids.length).toBeGreaterThan(0);
+    expect(new Set(ids)).toEqual(new Set([session.id]));
   });
 
   test("unmark on close_tab, tab removal, stop and pause", async () => {

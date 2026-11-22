@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { ChatToExt } from "../../../src/browser/chat-protocol.ts";
 import type { CallRequest, CallResult } from "../../../src/browser/protocol.ts";
 import { Connection } from "../src/background/connection.ts";
 import type { ConnectionStatus, Scheduler, SocketLike } from "../src/background/connection.ts";
@@ -28,6 +29,8 @@ function setup(paused = false) {
   const calls: CallRequest[] = [];
   const statuses: ConnectionStatus[] = [];
   let signedOut = 0;
+  const chat: ChatToExt[] = [];
+  let welcomes = 0;
   const conn = new Connection({
     createSocket: url => { const s = new FakeSocket(url); sockets.push(s); return s; },
     version: "1",
@@ -36,10 +39,12 @@ function setup(paused = false) {
     onAbort: () => {},
     onStatus: s => statuses.push(s),
     onSignedOut: () => { signedOut++; },
+    onChat: f => { chat.push(f); },
+    onWelcome: () => { welcomes++; },
     scheduler,
   });
   const req = (id: string) => ({ t: "call", req: { id, session: { id: "s", identity: "i", label: "l" }, tool: "wait", args: { seconds: 0 } } });
-  return { conn, sockets, timers, calls, statuses, req, signedOut: () => signedOut };
+  return { conn, sockets, timers, calls, statuses, chat, welcomes: () => welcomes, req, signedOut: () => signedOut };
 }
 
 const flush = () => new Promise(r => setTimeout(r, 0));
@@ -143,5 +148,45 @@ describe("connection", () => {
     expect(b.conn.status).toBe("replaced");
     expect(b.timers.filter(x => !x.interval)).toHaveLength(0);
     expect(b.signedOut()).toBe(0);
+  });
+
+  const summary = { chatId: "a", name: "Chat 1", color: "#3b82f6", windowId: 1, state: "idle", selection: { provider: "claude", identity: "alpha" }, tabIds: [], lastSeq: 0, updatedAt: 1 };
+  const welcome = { t: "welcome", binding: "b", target: { kind: "identity", identity: "i" } };
+
+  test("Connection delivers a valid chat frame to onChat and drops a malformed one", () => {
+    const t = setup();
+    t.conn.start("wss://gw.example.test", "tok");
+    const s = t.sockets[0]!;
+    s.serve(welcome);
+    expect(t.welcomes()).toBe(1);
+    s.serve({ t: "chat.event", chatId: "a", seq: 1, ts: 1, body: { k: "text", text: "hi" } });
+    s.serve({ t: "chat.event", chatId: "a", seq: -1, ts: 1, body: { k: "text", text: "hi" } });
+    s.serve({ t: "chat.event", chatId: "a", seq: 2, ts: 1, body: { k: "nope" } });
+    s.serve({ t: "chat.state", chatId: "other", state: "idle", summary });
+    s.serve({ t: "chat.bogus" });
+    s.serve({ t: "chat.state", chatId: "a", state: "idle", summary });
+    expect(t.chat.map(f => f.t)).toEqual(["chat.event", "chat.state"]);
+    expect(s.closed).toBe(false);
+    expect(t.conn.status).toBe("connected");
+  });
+
+  test("chat frames before welcome are ignored", () => {
+    const t = setup();
+    t.conn.start("wss://gw.example.test", "tok");
+    t.sockets[0]!.serve({ t: "chat.list", chats: [] });
+    expect(t.chat).toEqual([]);
+  });
+
+  test("sendChat sends once welcomed and returns false before and after a drop", () => {
+    const t = setup();
+    expect(t.conn.sendChat({ t: "chat.list" })).toBe(false);
+    t.conn.start("wss://gw.example.test", "tok");
+    const s = t.sockets[0]!;
+    expect(t.conn.sendChat({ t: "chat.list" })).toBe(false);
+    s.serve(welcome);
+    expect(t.conn.sendChat({ t: "chat.cancel", chatId: "a" })).toBe(true);
+    expect(s.sent.at(-1)).toEqual({ t: "chat.cancel", chatId: "a" });
+    s.onclose!({ code: 1006 });
+    expect(t.conn.sendChat({ t: "chat.list" })).toBe(false);
   });
 });

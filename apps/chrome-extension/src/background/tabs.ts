@@ -1,14 +1,16 @@
 // Tab ownership: Map<sessionId, {groupId, tabIds}>, one Chrome tab group per agent session.
+import { CHAT_PALETTE } from "../shared/chat-palette.ts";
 import { UnsupportedApiError } from "./chrome-api.ts";
 import type { ChromeApi, GroupColor, TabInfo } from "./chrome-api.ts";
 
 /** `adopted` is the subset of `tabIds` the session did not create itself (adopt_tab, or tabs opened inside a user-granted group): they outlive it. */
-export interface SessionTabs { groupId: number; tabIds: Set<number>; adopted: Set<number>; identity: string; label: string }
-export interface SessionRef { id: string; identity: string; label: string }
+export interface SessionTabs { groupId: number; tabIds: Set<number>; adopted: Set<number>; identity: string; label: string; chat?: true; color?: string }
+export interface SessionRef { id: string; identity: string; label: string; chat?: true; color?: string }
 
 const SESSIONS_KEY = "sessions";
 const GRANTS_KEY = "grants";
 const HANDOVER_KEY = "handover";
+const CHAT_LINKS_KEY = "chatLinks";
 const SAVED_KEY = "savedGroups";
 /** Tab changes in a saved group are written to its snapshot after this quiet time, so closing a whole group never shrinks the snapshot tab by tab. */
 const SAVED_REFRESH_MS = 1500;
@@ -44,6 +46,34 @@ export class TabManager {
   /** User-granted tab groups: groupId -> session id. The group is never renamed, recoloured or closed by the session. */
   private readonly grants = new Map<number, string>();
   private readonly lastSeen = new Map<string, number>();
+  /** Tabs the user linked to each chat session. A tab may be linked to several chats. */
+  private readonly links = new Map<string, Set<number>>();
+
+  // ---- chat links --------------------------------------------------------
+
+  /** Replaces the link set of a chat session. */
+  setChatLinks(sessionId: string, tabIds: number[], silent = false): void {
+    if (tabIds.length === 0) this.links.delete(sessionId); else this.links.set(sessionId, new Set(tabIds));
+    this.persist();
+    if (!silent) this.linksChanged(sessionId);
+  }
+
+  /** Called with the new link set of a chat on every change. Set by the executor. */
+  onLinksChanged?: (sessionId: string, tabIds: number[]) => void | Promise<void>;
+
+  private linksChanged(sessionId: string): void {
+    if (!this.onLinksChanged) return;
+    try { void Promise.resolve(this.onLinksChanged(sessionId, this.chatLinks(sessionId))).catch(() => {}); } catch { /* a failing sender never breaks tab handling */ }
+  }
+
+  chatLinks(sessionId: string): number[] { return [...(this.links.get(sessionId) ?? [])]; }
+
+  chatLinked(sessionId: string, tabId: number): boolean { return this.links.get(sessionId)?.has(tabId) ?? false; }
+
+  /** The chat ended: its links go. */
+  dropChat(sessionId: string): void {
+    if (this.links.delete(sessionId)) { this.persist(); this.linksChanged(sessionId); }
+  }
   /** Saved groups by name, shared by every session of this browser. Persisted in chrome.storage.local. */
   private readonly saved = new Map<string, SavedGroup>();
   private readonly opening = new Set<string>();
@@ -430,16 +460,19 @@ export class TabManager {
       const s = this.sessions.get(ref.id);
       if (!s || s.groupId === -1 || this.grants.has(s.groupId)) return;
       if (!(await this.api.tabGroups.get(s.groupId))) return;
-      await this.api.tabGroups.update(s.groupId, { title: ref.label, color: colorForIdentity(ref.identity) });
+      await this.api.tabGroups.update(s.groupId, { title: ref.label, color: this.groupColour(ref, this.sessions.get(ref.id)) });
     });
   }
+
+  /** Called with the id of a session that expired from idleness. The state clears its stop block there. */
+  onExpired?: (sessionId: string) => void;
 
   /** Ends sessions that made no call for SESSION_END_MS. */
   expireIdle(): void {
     for (const id of [...this.sessions.keys()]) {
       const seen = this.lastSeen.get(id);
       if (seen === undefined) this.lastSeen.set(id, this.now());
-      else if (this.now() - seen > SESSION_END_MS) this.endSession(id);
+      else if (this.now() - seen > SESSION_END_MS) { this.endSession(id); this.onExpired?.(id); }
     }
   }
 
@@ -487,13 +520,17 @@ export class TabManager {
       s.adopted.delete(tabId);
       if (s.tabIds.size === 0 && !this.queues.has(id) && this.grantedGroups(id).length === 0) this.sessions.delete(id); // session over: Chrome drops the empty group itself
     }
+    const changed: string[] = [];
+    for (const [id, set] of this.links) if (set.delete(tabId)) { changed.push(id); if (set.size === 0) this.links.delete(id); }
     this.persist();
+    for (const id of changed) this.linksChanged(id);
   }
 
   private snapshot(): Record<string, unknown> {
-    const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted] }));
+    const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted], ...(s.chat ? { chat: true } : {}), ...(s.color !== undefined ? { color: s.color } : {}) }));
     const grants = [...this.grants].map(([groupId, sessionId]) => ({ groupId, sessionId }));
-    return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants };
+    const chatLinks = [...this.links].map(([sessionId, tabIds]) => ({ sessionId, tabIds: [...tabIds] }));
+    return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants, [CHAT_LINKS_KEY]: chatLinks };
   }
 
   private persist(): void {
@@ -515,23 +552,32 @@ export class TabManager {
   }
 
   private async loadSessions(): Promise<void> {
-    let stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY]);
+    let stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY, CHAT_LINKS_KEY]);
     const handed = (await this.api.storage.get([HANDOVER_KEY]))[HANDOVER_KEY] as ({ at?: number } & Record<string, unknown>) | undefined;
     if (handed) {
       await this.api.storage.remove([HANDOVER_KEY]);
       if (!Array.isArray(stored[SESSIONS_KEY]) && typeof handed.at === "number" && this.now() - handed.at < HANDOVER_MAX_AGE_MS) {
         stored = handed;
-        await this.api.sessionStorage.set({ [SESSIONS_KEY]: handed[SESSIONS_KEY], [GRANTS_KEY]: handed[GRANTS_KEY] });
+        await this.api.sessionStorage.set({ [SESSIONS_KEY]: handed[SESSIONS_KEY], [GRANTS_KEY]: handed[GRANTS_KEY], [CHAT_LINKS_KEY]: handed[CHAT_LINKS_KEY] ?? [] });
       }
     }
     const raw = stored[SESSIONS_KEY];
     if (!Array.isArray(raw)) return;
     const live = new Set((await this.api.tabs.query()).map(t => t.id));
+    const storedLinks = stored[CHAT_LINKS_KEY];
+    if (Array.isArray(storedLinks)) {
+      for (const e of storedLinks as Array<{ sessionId?: unknown; tabIds?: unknown }>) {
+        if (typeof e.sessionId !== "string" || !Array.isArray(e.tabIds)) continue;
+        const ids = e.tabIds.filter((t): t is number => typeof t === "number" && live.has(t));
+        if (ids.length > 0) this.links.set(e.sessionId, new Set(ids));
+        if (ids.length !== e.tabIds.length) this.linksChanged(e.sessionId);
+      }
+    }
     const grants = Array.isArray(stored[GRANTS_KEY]) ? stored[GRANTS_KEY] as Array<{ groupId: number; sessionId: string }> : [];
-    for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; tabIds: number[]; adoptedTabIds?: number[] }>) {
+    for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; tabIds: number[]; adoptedTabIds?: number[]; chat?: boolean; color?: string }>) {
       const tabIds = new Set(e.tabIds.filter(id => live.has(id)));
       const adopted = new Set((e.adoptedTabIds ?? []).filter(id => tabIds.has(id))); // older data has no split: every tab counts as created
-      if (tabIds.size > 0 || grants.some(g => g.sessionId === e.id)) this.sessions.set(e.id, { groupId: e.groupId, tabIds, adopted, identity: e.identity, label: e.label });
+      if (tabIds.size > 0 || grants.some(g => g.sessionId === e.id)) this.sessions.set(e.id, { groupId: e.groupId, tabIds, adopted, identity: e.identity, label: e.label, ...(e.chat ? { chat: true as const } : {}), ...(typeof e.color === "string" ? { color: e.color } : {}) });
     }
     for (const g of grants) if (this.sessions.has(g.sessionId)) this.grants.set(g.groupId, g.sessionId);
     await this.pruneGrants();
@@ -544,12 +590,21 @@ export class TabManager {
       this.sessions.set(ref.id, s);
     }
     if (ref.label !== "") s.label = ref.label;
+    if (ref.chat === true) s.chat = true;
+    if (ref.color !== undefined) s.color = ref.color;
     return s;
+  }
+
+  /** A chat group takes the chat's palette colour. Every other session keeps its identity colour. */
+  private groupColour(ref: SessionRef, s?: SessionTabs): GroupColor {
+    const chat = ref.chat === true || s?.chat === true;
+    const hex = ref.color ?? s?.color;
+    return (chat && hex !== undefined ? CHAT_PALETTE.find(p => p.hex === hex)?.group : undefined) ?? colorForIdentity(ref.identity);
   }
 
   private async newGroup(ref: SessionRef, s: SessionTabs, tabId: number): Promise<void> {
     s.groupId = await this.api.tabs.group([tabId]);
-    await this.api.tabGroups.update(s.groupId, { title: ref.label || s.label, color: colorForIdentity(ref.identity) });
+    await this.api.tabGroups.update(s.groupId, { title: ref.label || s.label, color: this.groupColour(ref, s) });
   }
 
   /** One queue per session id: group creation for a session is strictly serial, so concurrent first calls cannot make two groups. */
@@ -633,7 +688,11 @@ export class TabManager {
       });
       return owner;
     }
-    await this.addToSession({ id: owner, identity: s.identity, label: s.label }, tab.id, false);
+    await this.addToSession({ id: owner, identity: s.identity, label: s.label, ...(s.chat ? { chat: true as const } : {}), ...(s.color !== undefined ? { color: s.color } : {}) }, tab.id, false);
+    if (s.chat) {
+      // A page of a chat opened this tab: the chat may use it, so the gateway must hear of it.
+      this.setChatLinks(owner, [...new Set([...this.chatLinks(owner), tab.id])]);
+    }
     return owner;
   }
 
