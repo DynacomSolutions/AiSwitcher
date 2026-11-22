@@ -387,3 +387,16 @@ ETA: 2026-11-25 18:00 ICT
 | 270 | Chat: show the usage limit and its reset time | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>Sent as code limit, so released extensions accept it.<br>Released in v0.5.95. |
 | 271 | Chat: keep Codex start warnings out of the reply | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>The warning shows as a notice.<br>Released in v0.5.95. |
 | 272 | Chat: close a binding's chats when its pairing is revoked | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>Chats are visible only to the approval they were made under.<br>Released in v0.5.95. |
+
+## 19. CI speed and flaky tests
+
+- Faster CI feedback: cache the host app Rust build, fit job timeouts to measured p99, fix flaky tests, then measure.
+
+ETA: 2026-11-23 20:00 ICT
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 280 | Cache the host app Rust build output | in_progress | claude | ci-speed | | 2026-11-23 20:00 ICT | `native` p50 16.2 min Linux, 12.6 min macOS.<br>Cause: the target dir was not the cached path. |
+| 281 | Fit every job timeout to its p99 | in_progress | claude | ci-speed | | 2026-11-23 20:00 ICT | |
+| 282 | Fix the flaky CI tests | in_progress | claude | ci-flaky | | 2026-11-23 20:00 ICT | affected.test.ts null diff in shallow checkouts.<br>Two 5 s timeouts on node spawn and backup lock. |
+| 283 | Measure before and after p50 and p90 | in_progress | claude | ci-speed | 19.280, 19.281 | 2026-11-23 20:00 ICT | |
