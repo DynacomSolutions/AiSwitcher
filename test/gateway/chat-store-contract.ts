@@ -67,6 +67,17 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect(await s.create(mk({ binding: "b-g3", windowId: 13 }), 6, undefined, max)).toBe("global");
   });
 
+  test("a full window gives cap, never global, and without a global cap global is never returned", async () => {
+    const s = await make();
+    for (let i = 0; i < 2; i += 1) await s.create(mk({ binding: "b-v", windowId: 21 }), 2);
+    expect(await s.create(mk({ binding: "b-v", windowId: 21 }), 2)).toBe("cap");
+    // The gateway is full too: the window is the first reason.
+    const full = (await s.countOpen());
+    expect(await s.create(mk({ binding: "b-v", windowId: 21 }), 2, undefined, full)).toBe("cap");
+    expect(await s.create(mk({ binding: "b-v", windowId: 22 }), 2, undefined, full)).toBe("global");
+    expect(await s.create(mk({ binding: "b-v", windowId: 22 }), 2)).not.toBe("global");
+  });
+
   test("10 concurrent creates for one window with cap 6 give exactly 6 successes", async () => {
     const s = await make();
     const results = await Promise.all(Array.from({ length: 10 }, () => s.create(mk({ binding: "b-race", windowId: 7 }), 6)));

@@ -327,7 +327,6 @@ test("chat frames are refused until the chat bus is listening, and the start is 
   early.send(create(chatId));
   await early.until(() => early.of("chat.reject").length === 1);
   expect(early.of("chat.reject")[0]).toMatchObject({ chatId, code: "unavailable" });
-  expect(early.of("chat.list")).toEqual([]);
   // The retry succeeds on the third try. A new connection then gets the list and a working chat.
   const end = Date.now() + 5000;
   while (bus.attempts < 3 && Date.now() < end) await Bun.sleep(10);
@@ -339,4 +338,55 @@ test("chat frames are refused until the chat bus is listening, and the start is 
   expect(warnings.some((w) => w.includes("could not listen"))).toBe(true);
   const body = await (await fetch(`http://127.0.0.1:${g.port}/metrics`)).text();
   expect(body).toMatch(/ais_gateway_chat_errors_total\{kind="other"\} [2-9]/);
+});
+
+class GateBus extends MemoryChatBus {
+  attempts = 0;
+  live = 0;
+  gate?: Promise<void>;
+  /** Attempt numbers that fail at once. */
+  failOn = new Set<number>();
+  /** Attempt numbers that wait for `gate`. */
+  holdOn = new Set<number>();
+  override async subscribe(h: Parameters<MemoryChatBus["subscribe"]>[0]) {
+    this.attempts += 1;
+    if (this.failOn.has(this.attempts)) throw new Error("listen down");
+    if (this.holdOn.has(this.attempts)) await this.gate;
+    const off = await super.subscribe(h);
+    this.live += 1;
+    return async () => {
+      this.live -= 1;
+      await off();
+    };
+  }
+}
+
+test("a chat start that finishes after stop() unsubscribes and sets no handlers", async () => {
+  const bus = new GateBus();
+  let open!: () => void;
+  bus.gate = new Promise<void>((r) => (open = r));
+  bus.failOn.add(1);
+  bus.holdOn.add(2);
+  const g = await boot({ chatTransport: stub(), chatBus: bus });
+  const end = Date.now() + 5000;
+  while (bus.attempts < 2 && Date.now() < end) await Bun.sleep(5);
+  expect(bus.attempts).toBe(2);
+  await g.stop();
+  open();
+  await Bun.sleep(100);
+  expect(bus.live).toBe(0);
+  // No further retry after stop.
+  expect(bus.attempts).toBe(2);
+});
+
+test("a panel that is already attached when the chat start first works gets the chat list", async () => {
+  const token = await pair();
+  const bus = new GateBus();
+  bus.failOn.add(1);
+  const g = await boot({ chatTransport: stub(), chatBus: bus });
+  const early = await Client.open(g.port, token);
+  await early.until(() => early.of("chat.list").length === 1);
+  early.send(create(crypto.randomUUID()));
+  await early.until(() => early.of("chat.state").length === 1);
+  expect(early.closeCode).toBeUndefined();
 });

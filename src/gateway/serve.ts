@@ -1261,20 +1261,30 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       let brokerStarted = false;
       let framesStarted = false;
       let tries = 0;
+      /** A start that ends after stop() must leave nothing running: it undoes its own listeners. */
+      const abandon = async (): Promise<void> => {
+        await live.stop().catch(() => undefined);
+        await broker.dispose().catch(() => undefined);
+      };
       const startChat = async (): Promise<void> => {
         if (draining) return;
         try {
           if (!brokerStarted) {
             await broker.start();
             brokerStarted = true;
+            if (draining) return abandon();
           }
           if (!framesStarted) {
             await live.start();
             framesStarted = true;
+            if (draining) return abandon();
           }
           hubOpts.onChat = (b, m, r) => live.handle(b, m, r);
           hubOpts.onAttach = (b) => live.onAttach(b);
+          // Panels that attached before the start worked got no list: send it now, as onAttach does.
+          for (const b of hub.connected()) void live.onAttach(b).catch(() => undefined);
         } catch (err) {
+          if (draining) return abandon();
           metrics.chatError("other");
           const wait = Math.min((hooks.warmBackoff?.initialMs ?? 5_000) * 2 ** tries, hooks.warmBackoff?.maxMs ?? 60_000);
           tries += 1;
