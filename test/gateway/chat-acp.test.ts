@@ -393,3 +393,54 @@ test("an oversized line from the agent closes the client with line too long", ()
     await expect(p).rejects.toThrow();
     expect(lineCbs.length).toBe(1);
   }));
+
+test("a failed loadSession of a live id keeps the session known", async () => {
+  const f = fake();
+  const sid = await openSession(f);
+  const p = f.client.loadSession({ sessionId: sid, cwd: "/work", mcpServers: [] });
+  f.feed({ jsonrpc: "2.0", id: f.lastId(), error: { code: -32002, message: "unknown session" } });
+  await expect(p).rejects.toBeInstanceOf(AcpError);
+  f.feed({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "still" } } } });
+  expect(f.updates.filter((x) => x.u.kind === "text")).toHaveLength(1);
+});
+
+test("an error of null next to a result is a success", async () => {
+  const f = fake();
+  const init = f.client.initialize();
+  f.feed({ jsonrpc: "2.0", id: f.lastId(), error: null, result: { protocolVersion: 1, agentCapabilities: {} } });
+  expect(await init).toEqual({ http: false, loadSession: false });
+});
+
+test("a duplicate in-flight permission id is answered cancelled and the first waiter stays", async () => {
+  const f = fake();
+  const sid = await openSession(f);
+  const req = () => f.feed({ jsonrpc: "2.0", id: "dup", method: "session/request_permission", params: { sessionId: sid, options: [{ optionId: "a", name: "A", kind: "allow_once" }] } });
+  req();
+  req();
+  await Bun.sleep(10);
+  const answers = f.written.filter((w) => w.id === "dup").map((w) => w.result.outcome);
+  expect(answers).toHaveLength(2);
+  expect(answers[0]).toEqual({ outcome: "cancelled" });
+  expect(answers[1]).toEqual({ outcome: "selected", optionId: "a" });
+});
+
+test("a CRLF line of exactly the cap does not overflow", () => {
+  const lines: string[] = [];
+  let overflows = 0;
+  const r = createLineReader({ maxBytes: 4, onLine: (l) => void lines.push(l), onOverflow: () => void overflows++ });
+  r.push("abcd\r");
+  r.push("\n");
+  expect(lines).toEqual(["abcd"]);
+  expect(overflows).toBe(0);
+});
+
+test("the line reader handles a million one-byte pushes in under a second", () => {
+  let n = 0;
+  const r = createLineReader({ onLine: () => void n++, onOverflow: () => {} });
+  const one = new Uint8Array([120]);
+  const nl = new Uint8Array([10]);
+  const t0 = performance.now();
+  for (let i = 0; i < 1_000_000; i++) r.push(i % 1000 === 999 ? nl : one);
+  expect(performance.now() - t0).toBeLessThan(1000);
+  expect(n).toBe(1000);
+});

@@ -67,25 +67,41 @@ export function createLineReader(opts: { maxBytes?: number; onLine: (line: strin
   const maxBytes = opts.maxBytes ?? MAX_LINE_BYTES;
   const decoder = new TextDecoder();
   let pending = "";
+  let pendingBytes = 0;
   let stopped = false;
   const overflow = () => {
     stopped = true;
     pending = "";
+    pendingBytes = 0;
     opts.onOverflow();
   };
   return {
     push(chunk) {
       if (stopped) return;
-      pending += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-      for (let nl = pending.indexOf("\n"); nl !== -1; nl = pending.indexOf("\n")) {
-        let line = pending.slice(0, nl);
-        pending = pending.slice(nl + 1);
-        if (line.endsWith("\r")) line = line.slice(0, -1);
-        if (Buffer.byteLength(line) > maxBytes) return overflow();
+      const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+      let start = 0;
+      for (let nl = text.indexOf("\n"); nl !== -1; nl = text.indexOf("\n", start)) {
+        const seg = text.slice(start, nl);
+        start = nl + 1;
+        let line = pending + seg;
+        let bytes = pendingBytes + Buffer.byteLength(seg);
+        pending = "";
+        pendingBytes = 0;
+        if (line.endsWith("\r")) {
+          line = line.slice(0, -1);
+          bytes -= 1;
+        }
+        if (bytes > maxBytes) return overflow();
         opts.onLine(line);
         if (stopped) return;
       }
-      if (Buffer.byteLength(pending) > maxBytes) overflow();
+      if (start < text.length) {
+        const rest = text.slice(start);
+        pending += rest;
+        pendingBytes += Buffer.byteLength(rest);
+        // A trailing CR may belong to a CRLF whose LF comes next, so allow one extra byte.
+        if (pendingBytes > maxBytes + (pending.endsWith("\r") ? 1 : 0)) overflow();
+      }
     },
   };
 }
@@ -159,12 +175,13 @@ export class AcpClient {
 
   async loadSession(p: { sessionId: string; cwd: string; mcpServers: AcpMcpServer[] }): Promise<void> {
     // The agent may replay history before it answers, so the id is known from the start.
+    const had = this.sessions.has(p.sessionId);
     this.sessions.add(p.sessionId);
     try {
       const r = await this.request("session/load", { sessionId: p.sessionId, cwd: p.cwd, mcpServers: p.mcpServers }, this.timeoutMs);
       if (isObj(r)) this.applyConfig(p.sessionId, r);
     } catch (e) {
-      this.sessions.delete(p.sessionId);
+      if (!had) this.sessions.delete(p.sessionId);
       throw e;
     }
   }
@@ -266,7 +283,7 @@ export class AcpClient {
     if (!p) return;
     this.pending.delete(msg.id);
     if (p.timer) clearTimeout(p.timer);
-    if (msg.error !== undefined) {
+    if (msg.error != null) {
       const e = isObj(msg.error) ? msg.error : {};
       p.reject(new AcpError(typeof e.code === "number" ? e.code : -32603, str(e.message) ?? "ACP error", e.data));
     } else p.resolve(msg.result);
@@ -307,6 +324,10 @@ export class AcpClient {
   private async onPermissionRequest(rpcId: string | number, params: Obj): Promise<void> {
     const sessionId = str(params.sessionId) ?? "";
     if (!this.sessions.has(sessionId)) {
+      this.respondPermission(rpcId, undefined);
+      return;
+    }
+    if (this.permWaiters.has(rpcId)) {
       this.respondPermission(rpcId, undefined);
       return;
     }
