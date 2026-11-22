@@ -113,7 +113,7 @@ export class OverlayUi implements Ui {
 
   /** A chat session has its own colour and shows its chat name. An external agent keeps the identity colour and tag. */
   private payload(s: UiSession): { sessionId: string; identity: string; label: string; color: string; tag: string } {
-    return { sessionId: s.id, identity: s.identity, label: s.label, color: s.color ?? hexForIdentity(s.identity), tag: s.color ? s.label : s.identity };
+    return { sessionId: s.id, identity: s.identity, label: s.label, color: s.color ?? hexForIdentity(s.identity), tag: s.color ? (s.label.trim() || s.identity) : s.identity };
   }
 
   async markControlled(tabId: number, session: UiSession): Promise<void> {
@@ -121,14 +121,14 @@ export class OverlayUi implements Ui {
     if (!m) this.marked.set(tabId, m = new Map());
     m.set(session.id, session);
     this.lastActive.set(tabId, this.now());
-    await this.run(tabId, "mark", this.payload(session), true, () => this.marked.has(tabId));
+    await this.run(tabId, "mark", this.payload(session), true, () => this.marked.get(tabId)?.has(session.id) === true);
   }
 
   async beforeAction(tabId: number, point: ActionPoint, signal?: AbortSignal): Promise<void> {
     const session = this.marked.get(tabId)?.get(point.sessionId);
     if (!session || signal?.aborted) return;
     this.lastActive.set(tabId, this.now());
-    await withTimeout(this.run(tabId, "action", { x: point.x, y: point.y, kind: point.kind, ...this.payload(session) }, true, () => this.marked.has(tabId)), BEFORE_ACTION_MAX_MS, signal);
+    await withTimeout(this.run(tabId, "action", { x: point.x, y: point.y, kind: point.kind, ...this.payload(session) }, true, () => this.marked.get(tabId)?.has(session.id) === true), BEFORE_ACTION_MAX_MS, signal);
   }
 
   async suspend(tabId: number): Promise<void> {
@@ -173,6 +173,6 @@ export class OverlayUi implements Ui {
       this.lastActive.delete(tabId);
       return;
     }
-    for (const s of [...m.values()]) await this.run(tabId, "mark", this.payload(s), true, () => this.marked.has(tabId));
+    for (const s of [...m.values()]) await this.run(tabId, "mark", this.payload(s), true, () => this.marked.get(tabId)?.has(s.id) === true);
   }
 }

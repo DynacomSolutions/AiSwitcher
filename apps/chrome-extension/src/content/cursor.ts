@@ -74,8 +74,6 @@ export function createCursor(root: ShadowRoot): Cursor {
 export interface Cursors {
   /** The cursor for a session. It is created on first use. */
   for(sessionId: string): Cursor;
-  /** Hides every cursor except one. */
-  hideOthers(except: string): void;
   /** Session ids that have a cursor, with the cursor element. */
   entries(): Array<[string, Cursor]>;
   /** Removes one session's cursor. Returns true when it existed. */
@@ -84,15 +82,14 @@ export interface Cursors {
 }
 
 /** One Cursor element per agent session id. */
-export function createCursors(root: ShadowRoot): Cursors {
+export function createCursors(root: ShadowRoot, make: (root: ShadowRoot) => Cursor = createCursor): Cursors {
   const all = new Map<string, Cursor>();
   return {
     for(sessionId) {
       let c = all.get(sessionId);
-      if (!c) all.set(sessionId, c = createCursor(root));
+      if (!c) all.set(sessionId, c = make(root));
       return c;
     },
-    hideOthers(except) { for (const [id, c] of all) if (id !== except) c.hide(); },
     entries() { return [...all]; },
     remove(sessionId) { const c = all.get(sessionId); if (!c) return false; c.destroy(); all.delete(sessionId); return true; },
     destroy() { for (const c of all.values()) c.destroy(); all.clear(); },

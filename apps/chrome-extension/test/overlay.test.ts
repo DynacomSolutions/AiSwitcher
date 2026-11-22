@@ -187,6 +187,26 @@ describe("OverlayUi session end and races", () => {
     expect(f2.calls.filter(c => c.method === "action")).toHaveLength(0);
   });
 
+  test("an unmarkSession during injection wins for that session only", async () => {
+    const f = fakeScripting({ missing: true });
+    const ui = new OverlayUi(f.s);
+    const other = { id: "o", identity: "dyn", label: "Other", color: "#22c55e" };
+    await ui.markControlled(7, other);
+    const inject = f.s.inject;
+    f.s.inject = async tabId => { await inject(tabId); await ui.unmarkSession(tabId, "s"); };
+    f.navigate();
+    await ui.markControlled(7, session);
+    expect(f.calls.filter(c => c.method === "mark" && (c.arg as { sessionId: string }).sessionId === "s")).toHaveLength(0);
+    expect(ui.markedTabs("o")).toEqual([7]);
+  });
+
+  test("an empty chat label falls back to the identity for the tag", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s);
+    await ui.markControlled(1, { id: "c", identity: "dyn", label: "  ", color: "#f97316" });
+    expect(f.calls[0]!.arg).toMatchObject({ tag: "dyn" });
+  });
+
   test("suspend and restore reach only marked tabs and are capped at 150 ms", async () => {
     const f = fakeScripting({ slowMs: 2000 });
     const ui = new OverlayUi(f.s);

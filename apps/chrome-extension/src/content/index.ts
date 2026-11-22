@@ -1,6 +1,7 @@
 // Content script injected on demand into controlled tabs. Exposes globalThis.__aisOverlay, which lives in the extension's
 // isolated world: page scripts cannot see it. The shadow root is closed and kept in this closure for the same reason.
 import { createCursors, CURSOR_CSS, type CursorKind } from "./cursor.ts";
+import { createSessionTracker } from "./sessions.ts";
 import { createIndicator, INDICATOR_CSS } from "./indicator.ts";
 
 const HOST_ID = "ais-browser-overlay";
@@ -19,7 +20,7 @@ function init(): void {
   let host: HTMLElement | null = null;
   let root: ShadowRoot | undefined;
   let cursors: ReturnType<typeof createCursors> | undefined;
-  const meta = new Map<string, { colour: string; tag: string }>();
+  const sessions = createSessionTracker();
   let indicator: ReturnType<typeof createIndicator> | undefined;
   let expiry: ReturnType<typeof setTimeout> | undefined;
   let suspended = false;
@@ -73,6 +74,7 @@ function init(): void {
     mark(a: MarkArg): string {
       if (orphaned()) { api.unmark(); return "orphaned"; }
       ensure().indicator.show(a.identity, a.label, a.color);
+      sessions.add(a.sessionId, a.color, a.tag ?? a.identity);
       touch();
       return "ok";
     },
@@ -83,8 +85,7 @@ function init(): void {
       touch();
       if (a.kind !== "key") {
         const tag = a.tag ?? a.identity;
-        meta.set(a.sessionId, { colour: a.color, tag });
-        o.cursors.hideOthers(a.sessionId);
+        sessions.add(a.sessionId, a.color, tag);
         const c = o.cursors.for(a.sessionId);
         await c.moveTo(a.x, a.y, tag, a.color);
         c.ripple(a.x, a.y, a.kind, a.color);
@@ -98,12 +99,11 @@ function init(): void {
     unmark(a?: { sessionId?: string } | null): string {
       if (a?.sessionId) {
         cursors?.remove(a.sessionId);
-        meta.delete(a.sessionId);
-        if (cursors && cursors.entries().length > 0) return "ok";
+        if (!sessions.remove(a.sessionId)) return "ok";
       }
       clearTimeout(expiry);
       cursors?.destroy();
-      meta.clear();
+      sessions.clear();
       indicator?.destroy();
       host?.remove();
       host = null;
@@ -127,7 +127,7 @@ function init(): void {
           pillOn: root.querySelector(".pill.on") !== null,
           glowOn: root.querySelector(".glow.on") !== null,
           cursor: rect(root.querySelector(".cursor")),
-          cursors: (cursors?.entries() ?? []).map(([sessionId, c]) => ({ sessionId, rect: rect(c.el), colour: meta.get(sessionId)?.colour ?? "", tag: meta.get(sessionId)?.tag ?? "" })),
+          cursors: (cursors?.entries() ?? []).map(([sessionId, c]) => ({ sessionId, rect: rect(c.el), colour: sessions.info(sessionId)?.colour ?? "", tag: sessions.info(sessionId)?.tag ?? "" })),
           stop: rect(stopButton),
         };
       },
