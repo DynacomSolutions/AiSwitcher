@@ -4,7 +4,7 @@ import { CHAT_ERROR_CODES, MAX_CHATS_PER_WINDOW, sessionIdForChat, type ChatBody
 import type { ChatAuth, ChatPrincipal } from "../browser/chat-auth.ts";
 import type { GatewayMetrics } from "../metrics.ts";
 import { AcpClient, AcpError, type AcpPermission, type AcpUpdate } from "./acp.ts";
-import { clean, cut, mergeTool, pieces, promptFailure, type ToolBody } from "./turn.ts";
+import { clean, cut, mergeTool, pieces, promptFailure, shortField, type ToolBody } from "./turn.ts";
 import { KubeHttpError } from "./kube-http.ts";
 import { sessionName, type PodHandle, type PodTransport } from "./kube.ts";
 import { PodStartError, type Timers } from "./pod-transport.ts";
@@ -23,8 +23,6 @@ const MAX_IDLE_MS = 3 * 3_600_000;
 const MAX_TOOLS_KEPT = 500;
 const DEFAULT_CANCEL_GRACE_MS = 15_000;
 const DEFAULT_STALL_MS = 30 * 60_000;
-/** The parser of the extension accepts at most this many characters in a short field. */
-const MAX_SHORT = 256;
 const HUNG_MESSAGE = "The agent did not stop. It was restarted. Send a message to continue.";
 const STATE_TRIES = 3;
 const STATE_BACKOFF_MS = 50;
@@ -590,7 +588,11 @@ export class ChatBroker implements ChatAuth {
   private onUpdate(ctx: Ctx, u: AcpUpdate): void {
     if (u.kind === "other") return;
     if (u.kind === "config") {
-      const body: Extract<ChatBody, { k: "config" }> = { k: "config", models: u.models, efforts: u.efforts, current: { ...u.current } };
+      const f = shortField;
+      const current: { model?: string; effort?: string } = {};
+      if (u.current.model !== undefined) current.model = f(u.current.model);
+      if (u.current.effort !== undefined) current.effort = f(u.current.effort);
+      const body: Extract<ChatBody, { k: "config" }> = { k: "config", models: u.models.slice(0, 4096).map((m) => ({ id: f(m.id), name: f(m.name) })), efforts: u.efforts.slice(0, 64).map((e) => f(e)), current };
       ctx.config = body;
       this.push(ctx, body);
       return;
@@ -610,9 +612,9 @@ export class ChatBroker implements ChatAuth {
     return new Promise((resolve) => {
       const requestId = `${ctx.generation}-${++ctx.permSeq}`;
       ctx.perms.set(requestId, { options: p.options, resolve });
-      const short = (x: string): string => Array.from(clean(x)).slice(0, MAX_SHORT).join("");
+      const short = shortField;
       const options = p.options.slice(0, 64).map((o) => ({ id: short(o.id), name: short(o.name), kind: short(o.kind) }));
-      this.push(ctx, { k: "permission", requestId, rpcId: p.rpcId, title: cut(p.title), options });
+      this.push(ctx, { k: "permission", requestId, rpcId: typeof p.rpcId === "string" ? shortField(p.rpcId) : p.rpcId, title: cut(p.title), options });
       this.setState(ctx, "waiting");
     });
   }
@@ -622,7 +624,7 @@ export class ChatBroker implements ChatAuth {
     const ask = ctx.perms.get(requestId);
     if (!ask) return;
     ctx.perms.delete(requestId);
-    const short = (x: string): string => Array.from(clean(x)).slice(0, MAX_SHORT).join("");
+    const short = shortField;
     const found = optionId === undefined ? undefined : ask.options.find((o) => o.id === optionId || short(o.id) === optionId);
     ask.resolve(found === undefined ? {} : { optionId: found.id });
     this.push(ctx, found === undefined ? { k: "permission_resolved", requestId, cancelled: true } : { k: "permission_resolved", requestId, optionId: short(found.id) });
@@ -696,7 +698,7 @@ export class ChatBroker implements ChatAuth {
     this.setState(ctx, "thinking");
     try {
       const r = await rt.acp.prompt(rt.sessionId, text);
-      this.push(ctx, { k: "turn_end", stopReason: r.stopReason });
+      this.push(ctx, { k: "turn_end", stopReason: shortField(r.stopReason) });
       metrics.chatTurn(r.stopReason === "cancelled" || ctx.cancelRequested ? "cancelled" : "ok");
     } catch (e) {
       if (e instanceof AcpError) {
@@ -766,6 +768,8 @@ export class ChatBroker implements ChatAuth {
    */
   private withFence<T>(chatId: string, fn: (fence: LeaseFence, rt: ChatRuntime | undefined) => Promise<T>): Promise<T> {
     return this.locked(chatId, async () => {
+      // A clean-up of the last pod writes with its own lease. Wait for it, so this write cannot take that lease away.
+      for (let e = this.starting.get(chatId); e?.ending; e = this.starting.get(chatId)) await e.promise.catch(() => undefined);
       const rt = this.runtimes.get(chatId);
       if (rt) return fn(rt.fence, rt);
       const epoch = await this.d.store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now());
@@ -868,8 +872,10 @@ export class ChatBroker implements ChatAuth {
         if (ctx.perms.size === 0 && quiet >= stall) this.restartHung(rt);
         continue;
       }
-      if (ctx.perms.size > 0 || this.turning.has(rt.chatId) || this.starting.has(rt.chatId)) continue;
+      if (this.turning.has(rt.chatId) || this.starting.has(rt.chatId)) continue;
       if (quiet < limit) continue;
+      // An open ask outside a turn does not keep the pod alive. It ends as cancelled with the pod.
+      this.cancelPerms(ctx);
       this.idleEnd(rt);
       const e = this.starting.get(rt.chatId);
       if (e) ending.push(e.promise);

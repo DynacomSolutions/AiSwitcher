@@ -25,6 +25,18 @@ function headFitting(text: string, maxBytes: number): string {
   return text.slice(0, end);
 }
 
+/** A short field of the feed: at most 256 UTF-16 units, cut between code points, no NUL. The parser of the extension limits it so. */
+export function shortField(raw: string, max = 256): string {
+  const text = clean(raw);
+  if (text.length <= max) return text;
+  let end = 0;
+  for (const cp of text) {
+    if (end + cp.length > max) break;
+    end += cp.length;
+  }
+  return text.slice(0, end);
+}
+
 /** Cut a long value to 8 KiB of UTF-8, between code points. The marker shows the cut. */
 export function cut(raw: string): string {
   const text = clean(raw);
@@ -53,7 +65,7 @@ export type ToolBody = Extract<ChatBody, { k: "tool" }>;
 export function mergeTool(prev: ToolBody | undefined, u: Extract<AcpUpdate, { kind: "tool" }>): ToolBody {
   const next: ToolBody = {
     k: "tool",
-    toolCallId: Array.from(clean(u.toolCallId)).slice(0, 256).join(""),
+    toolCallId: shortField(u.toolCallId),
     title: Array.from(clean(u.title ?? prev?.title ?? "Tool")).slice(0, 512).join(""),
     status: (u.status !== undefined ? STATUS[u.status] : undefined) ?? prev?.status ?? "pending",
   };

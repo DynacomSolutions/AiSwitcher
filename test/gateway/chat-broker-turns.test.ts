@@ -5,7 +5,8 @@ import { join } from "node:path";
 import type { ChatBody } from "../../src/browser/chat-protocol.ts";
 import type { BrowserBinding } from "../../src/browser/types.ts";
 import { createBrowserCaller } from "../../src/gateway/browser/routing.ts";
-import { cut, pieces } from "../../src/gateway/chat/turn.ts";
+import { parseChatToExt } from "../../src/browser/chat-protocol.ts";
+import { cut, pieces, shortField } from "../../src/gateway/chat/turn.ts";
 import { ChatBroker, type BrokerDeps } from "../../src/gateway/chat/broker.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { MemoryChatStore } from "../../src/gateway/chat/store.ts";
@@ -612,4 +613,77 @@ test("an unknown or already answered requestId changes nothing", async () => {
   await broker.answerPermission(rec.id, perm.requestId, "allow");
   expect((await bodies(store, rec.id)).filter((b) => b.k === "permission_resolved")).toHaveLength(1);
   expect(before).toBeGreaterThan(0);
+});
+
+// ---- Round 2 ----
+
+/** Make every error and notice append slow, and tell when the first one starts. */
+function slowAppends(store: MemoryChatStore, ms: number): { started: () => boolean } {
+  const real = store.appendEvent.bind(store);
+  let started = false;
+  store.appendEvent = async (id, body, fence) => {
+    if (body.k === "error" || (body.k === "notice" && body.text.startsWith("The agent stopped after"))) {
+      started = true;
+      await Bun.sleep(ms);
+    }
+    return real(id, body, fence);
+  };
+  return { started: () => started };
+}
+
+test("rename during an agent exit clean-up does not break the clean-up", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "say:hi");
+  await turnEnded(store, rec.id);
+  const slow = slowAppends(store, 150);
+  await send(broker, rec.id, "exit");
+  await until(() => slow.started(), "clean-up started");
+  await broker.rename(rec.id, "Renamed");
+  expect((await bodies(store, rec.id)).some((b) => b.k === "error" && b.code === "agent_exit")).toBe(true);
+  expect((await store.get(rec.id))?.state).toBe("idle");
+  expect((await store.get(rec.id))?.name).toBe("Renamed");
+});
+
+test("link during an idle end clean-up does not break the clean-up", async () => {
+  const { broker, store, clock, transport } = setup({}, { idleMs: 1000 });
+  const rec = await made(broker);
+  await send(broker, rec.id, "say:hi");
+  await turnEnded(store, rec.id);
+  await idleState(store, rec.id);
+  const slow = slowAppends(store, 150);
+  clock.t += 2000;
+  const sweep = broker.sweepIdle();
+  await until(() => slow.started(), "clean-up started");
+  await broker.link(rec.id, [7, 8]);
+  await sweep;
+  expect((await bodies(store, rec.id)).some((b) => b.k === "notice" && b.text.startsWith("The agent stopped after"))).toBe(true);
+  expect((await store.get(rec.id))?.state).toBe("idle");
+  expect((await store.get(rec.id))?.tabIds).toEqual([7, 8]);
+  expect(transport.stoppedSessions).toEqual([sessionName(rec.id, 1)]);
+});
+
+test("short fields keep to 256 UTF-16 units and a permission with emoji names passes the parser", () => {
+  const out = shortField("😀".repeat(200));
+  expect(out.length).toBeLessThanOrEqual(256);
+  expect(out).toBe("😀".repeat(128));
+  expect(shortField("a\u0000b")).toBe("ab");
+  const item = { t: "chat.event", chatId: "c1", seq: 1, ts: 1, body: { k: "permission", requestId: "1-1", rpcId: 1, title: "t", options: [{ id: shortField("😀".repeat(200)), name: shortField("😀".repeat(200)), kind: "allow_once" }] } };
+  expect(parseChatToExt(item)).toBeDefined();
+});
+
+test("an open ask outside a turn is cancelled when the chat is idle past idleMs, and the pod ends", async () => {
+  const { broker, store, transport, clock } = setup({}, { idleMs: 1000, leaseTtlMs: 10 * 3_600_000 });
+  const rec = await made(broker);
+  await send(broker, rec.id, "lateask");
+  await turnEnded(store, rec.id);
+  const perm = await permissionOf(store, rec.id);
+  await until(async () => (await store.get(rec.id))?.state === "waiting", "waiting");
+  await broker.sweepIdle();
+  expect(transport.stoppedSessions).toEqual([]);
+  clock.t += 2000;
+  await broker.sweepIdle();
+  expect(transport.stoppedSessions).toEqual([sessionName(rec.id, 1)]);
+  expect(await bodies(store, rec.id)).toContainEqual({ k: "permission_resolved", requestId: perm.requestId, cancelled: true });
+  expect((await store.get(rec.id))?.state).toBe("idle");
 });
