@@ -48,7 +48,7 @@ describe("a chat keeps its group", () => {
     expect(ctx.sessionTabs.map((x: { tabId: number }) => x.tabId)).toEqual(newIds);
     expect(ctx.sessionTabs.every((x: { scope: string }) => x.scope === "own")).toBe(true);
     expect(ctx.otherTabs).toEqual([]);
-    expect(ctx.groups).toEqual([{ groupId: t.api.tabList.get(newIds[0]!)!.groupId, title: "Job board", tabCount: 4, scope: "own" }]);
+    expect(ctx.groups).toEqual([{ groupId: t.api.tabList.get(newIds[0]!)!.groupId, title: "Job board", tabCount: 4, scope: "own", hiddenTabCount: 0 }]);
     const saved = await fresh.call("save_group", { name: "Job board" }, B);
     expect(saved.ok).toBe(true);
     expect(fresh.json(saved)).toMatchObject({ tabCount: 4 });
@@ -236,9 +236,9 @@ describe("tabs_context lists every tab and group", () => {
     const ctx = t.json(await t.call("tabs_context"));
     const ownGroup = t.api.tabList.get(own)!.groupId;
     expect(ctx.groups).toEqual([
-      { groupId: ownGroup, title: "Job board", tabCount: 1, scope: "own" },
-      { groupId: g1, title: "Reading", tabCount: 1, scope: "other" },
-      { groupId: g2, title: "Other window", tabCount: 1, scope: "other" },
+      { groupId: ownGroup, title: "Job board", tabCount: 1, scope: "own", hiddenTabCount: 0 },
+      { groupId: g1, title: "Reading", tabCount: 1, scope: "other", hiddenTabCount: 0 },
+      { groupId: g2, title: "Other window", tabCount: 1, scope: "other", hiddenTabCount: 0 },
     ]);
     const group = (id: number) => [...ctx.sessionTabs, ...ctx.otherTabs].find((x: { tabId: number }) => x.tabId === id).groupId;
     expect(group(own)).toBe(ownGroup);
@@ -426,5 +426,109 @@ describe("review fixes", () => {
     expect(await fresh.tabs.retryRelink()).toBe(true);
     const gid = t.api.tabList.get(newIds[0]!)!.groupId;
     expect((fresh.api.store.agentGroups as Array<{ groupId: number }>).some(r => r.groupId === gid)).toBe(true);
+  });
+});
+
+describe("a dead restored session never counts as live", () => {
+  const SA = { id: "old-a", identity: "alice", label: "Old title" };
+  const SB = { id: "old-b", identity: "alice", label: "Project" };
+  const SC = { id: "new-c", identity: "alice", label: "Project" };
+  const until = async (fn: () => boolean) => { for (let i = 0; i < 200 && !fn(); i++) await Bun.sleep(5); expect(fn()).toBe(true); };
+
+  /** A and B each own a group of 4 created tabs; the extension reloads; two hours pass with no call and several expireIdle passes. */
+  async function reloaded() {
+    const t = setup();
+    const a: number[] = [];
+    const b: number[] = [];
+    for (let i = 0; i < 4; i++) a.push(await t.create(SA, `https://a.example.com/${i}`));
+    for (let i = 0; i < 4; i++) b.push(await t.create(SB, `https://b.example.com/${i}`));
+    await t.tabs.refreshAgents();
+    await t.tabs.handover();
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    for (let i = 0; i < 24; i++) { clock += 5 * 60_000; fresh.tabs.expireIdle(); }
+    return { t: fresh, a, b, gidA: t.api.tabList.get(a[0]!)!.groupId, gidB: t.api.tabList.get(b[0]!)!.groupId };
+  }
+  const holderLive = (t: TabManager, id: string): boolean => (t as unknown as { holderLive(id: string): boolean }).holderLive(id);
+
+  test("after a reload and two hours, a new session of the chat takes the dead session's group; nothing is closed, moved or ungrouped", async () => {
+    const { t, a, b, gidA, gidB } = await reloaded();
+    expect(t.tabs.sessions.has("old-a")).toBe(true);
+    expect(holderLive(t.tabs, "old-a")).toBe(false);
+    expect(holderLive(t.tabs, "old-b")).toBe(false);
+    const moves = t.api.moveCalls.length;
+    const activations = t.api.activations.length;
+    const ctx = t.json(await t.call("tabs_context", {}, SC));
+    expect(ctx.sessionTabs.map((x: { tabId: number }) => x.tabId)).toEqual(b);
+    expect(t.tabs.sessions.has("old-b")).toBe(false);
+    expect(t.tabs.sessions.get("new-c")).toMatchObject({ groupId: gidB });
+    expect(t.tabs.sessions.get("new-c")!.adopted.size).toBe(0); // created tabs stay owned
+    expect(t.api.tabList.size).toBe(8);
+    for (const id of b) expect(t.api.tabList.get(id)!.groupId).toBe(gidB);
+    for (const id of a) expect(t.api.tabList.get(id)!.groupId).toBe(gidA);
+    expect(t.api.moveCalls.length).toBe(moves);
+    expect(t.api.activations.length).toBe(activations);
+    const rec = (t.api.store.agentGroups as Array<{ groupId: number; holder: string }>).find(r => r.groupId === gidB);
+    expect(rec?.holder).toBe("new-c");
+    // groups[] names the dead holder of A's group, with its label, and counts the hidden tabs.
+    const g = ctx.groups.find((x: { groupId: number }) => x.groupId === gidA);
+    expect(g).toMatchObject({ scope: "other", holderLabel: "Old title", holderLive: false, hiddenTabCount: 4 });
+    expect(ctx.groups.find((x: { groupId: number }) => x.groupId === gidB).holderLabel).toBeUndefined();
+  });
+
+  test("request_group on the dead session's group shows the note, Approve keeps created flags, and one session never holds two groups", async () => {
+    const { t, a, gidA, gidB } = await reloaded();
+    await t.call("tabs_context", {}, SC);
+    // C already owns B's group now: a second group is refused.
+    const refused = await t.call("request_group", { groupId: gidA }, SC);
+    expect(refused).toMatchObject({ ok: false, error: "bad_args" });
+    expect(JSON.stringify(refused)).toContain("This session already has its own group. Save it with save_group, then use another chat for the other group.");
+    // A fresh session D of another chat of the same identity has no own group: it may ask for A's group.
+    const SD = { id: "new-d", identity: "alice", label: "Third chat" };
+    const pending = t.call("request_group", { groupId: gidA }, SD);
+    await until(() => t.api.shown.size === 1);
+    expect(t.api.everShown[0]!.message).toContain("Another agent session made this group.");
+    t.api.clickNotification(0);
+    expect((await pending).ok).toBe(true);
+    const d = t.tabs.sessions.get("new-d")!;
+    expect(d.groupId).toBe(gidA);
+    expect([...d.tabIds].sort()).toEqual([...a].sort());
+    expect(d.adopted.size).toBe(0);
+    expect(d.approved?.size).toBe(4);
+    expect(t.tabs.sessions.has("old-a")).toBe(false);
+    expect(t.api.tabList.size).toBe(8);
+    expect(gidB).not.toBe(gidA);
+  });
+
+  test("a live holder keeps its group", async () => {
+    const { t, b } = await reloaded();
+    await t.call("tabs_context", {}, SB); // B calls again after the reload: live
+    clock += 5 * 60_000;
+    const ctx = t.json(await t.call("tabs_context", {}, SC));
+    expect(ctx.sessionTabs).toEqual([]);
+    expect(t.tabs.sessions.get("old-b")!.tabIds.size).toBe(4);
+    expect(b.length).toBe(4);
+  });
+
+  test("a pending long call keeps the holder live", async () => {
+    const { t } = await reloaded();
+    t.tabs.callStarted("old-b");
+    clock += 90 * 60_000;
+    expect(holderLive(t.tabs, "old-b")).toBe(true);
+    const ctx = t.json(await t.call("tabs_context", {}, SC));
+    expect(ctx.sessionTabs).toEqual([]);
+    t.tabs.callEnded("old-b");
+    clock += HOLDER_LIVE_MS + 1;
+    expect(holderLive(t.tabs, "old-b")).toBe(false);
+  });
+
+  test("another identity never reclaims and never sees a holder label", async () => {
+    const { t, gidA } = await reloaded();
+    const ctx = t.json(await t.call("tabs_context", {}, { id: "evil", identity: "bob", label: "Project" }));
+    expect(ctx.sessionTabs).toEqual([]);
+    expect(t.tabs.sessions.get("old-b")!.tabIds.size).toBe(4);
+    for (const g of ctx.groups) { expect(g.holderLabel).toBeUndefined(); expect(g.holderLive).toBeUndefined(); }
+    const r = await t.call("request_group", { groupId: gidA }, { id: "evil", identity: "bob", label: "Project" });
+    expect(r).toMatchObject({ ok: false, error: "forbidden_tab" });
   });
 });
