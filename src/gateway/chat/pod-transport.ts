@@ -377,8 +377,10 @@ export class KubePodTransport implements PodTransport {
         const phase = s.status?.phase ?? "";
         const reason = reasonCode(s.status?.reason || undefined);
         if (TERMINAL.has(phase)) return finish(() => reject(new PodStartError(s.status?.reason ? reason : phase === "Succeeded" ? "Ended" : "Unknown")));
-        if (phase === "Running") {
-          return finish(() => resolve({ pod: s.status?.pod || `agent-${name}`, cwd: s.status?.worktreePath ?? "" }));
+        // The controller can report Running before it sets the folder. Keep watching until the folder is an absolute path.
+        const cwd = s.status?.worktreePath;
+        if (phase === "Running" && typeof cwd === "string" && cwd.startsWith("/")) {
+          return finish(() => resolve({ pod: s.status?.pod || `agent-${name}`, cwd }));
         }
         if (!s.status?.reason) lastReason = undefined;
         else if (s.status.reason !== lastReason) {

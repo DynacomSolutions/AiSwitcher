@@ -553,6 +553,8 @@ export class ChatBroker implements ChatAuth {
           ],
         },
       ];
+      // The agent refuses a relative folder. Fail here with fixed copy instead of sending the call.
+      if (!handle.cwd.startsWith("/")) throw new PodStartError("BadWorkdir");
       let sessionId: string | undefined;
       // A chat that had a session before is dormant. Load the session when the agent can, else say so and start a new one.
       if (chat.acpSessionId !== undefined) {
@@ -673,6 +675,7 @@ export class ChatBroker implements ChatAuth {
     const err: Record<string, unknown> = { error: e instanceof Error ? e.constructor.name : typeof e };
     if (e instanceof KubeHttpError) Object.assign(err, { op: e.op, status: e.status, ...(e.kubeReason !== undefined ? { kubeReason: e.kubeReason } : {}) });
     else if (e instanceof PodStartError) err.reason = e.reason;
+    else if (e instanceof AcpError) err.acpCode = e.code;
     try {
       (this.d.log ?? ((line: string) => console.info(line)))(JSON.stringify({ event: "chat_start_failed", chat: chatId, generation, code: f.code, kind: f.kind, ...err }));
     } catch {

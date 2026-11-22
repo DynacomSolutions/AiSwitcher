@@ -140,6 +140,39 @@ test("start creates the session, waits through Pending, attaches and returns a h
   await until(() => server.watcherCount() === 0);
 });
 
+test("Running without a worktree path keeps waiting, then resolves with the path from a later event", async () => {
+  const { server, transport } = setup({ initialPhase: "Pending" });
+  let settled = false;
+  const p = transport.start(input(), new AbortController().signal, () => {});
+  void p.then(() => (settled = true), () => (settled = true));
+  await until(() => server.sessions.has(name1));
+  server.setStatus(name1, { phase: "Running", pod: `agent-${name1}` });
+  await new Promise((r) => setTimeout(r, 100));
+  expect(settled).toBe(false);
+  server.setStatus(name1, { phase: "Running", pod: `agent-${name1}`, worktreePath: "relative/path" });
+  await new Promise((r) => setTimeout(r, 100));
+  expect(settled).toBe(false);
+  server.setStatus(name1, { phase: "Running", pod: `agent-${name1}`, worktreePath: "/work/chat/home" });
+  const h = await p;
+  expect(h.cwd).toBe("/work/chat/home");
+  h.stream.close();
+});
+
+test("Running without a worktree path and no later event never resolves with an empty cwd", async () => {
+  const { server, transport } = setup({ initialPhase: "Pending" });
+  const ac = new AbortController();
+  let resolved = false;
+  const p = transport.start(input(), ac.signal, () => {});
+  const out = p.then(() => ((resolved = true), undefined), (e: unknown) => e);
+  await until(() => server.sessions.has(name1));
+  server.setStatus(name1, { phase: "Running", pod: `agent-${name1}` });
+  await new Promise((r) => setTimeout(r, 200));
+  expect(resolved).toBe(false);
+  ac.abort();
+  expect(((await out) as Error).message).toBe("aborted");
+  expect(resolved).toBe(false);
+});
+
 test("start surfaces NodeBudget as a notice and keeps waiting", async () => {
   const { server, transport } = setup({ initialPhase: "Pending" });
   const notices: PodPhaseNotice[] = [];
