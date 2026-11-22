@@ -511,6 +511,17 @@ throwaway pod outside the `dev` namespace.
   tokens, keys, e-mail addresses and long opaque runs removed; `src/gateway/upstream-error.ts`). A call that failed
   before any answer has `reason` set to the failure's code or class (`ECONNRESET`, `TimeoutError`). Request bodies,
   whole response bodies and headers are never logged. `kubectl -n <ns> logs deploy/ais-gateway | grep upstream_error`.
+- An error inside a 200 answer (the provider sent the HTTP status first, then failed in the body) is found while the bytes
+  stream past, with no change to them and no added wait (`UsageTap.streamError()` in `src/gateway/usage.ts`). It covers
+  the Responses `error` and `response.failed` events, a Chat Completions `{"error":...}` chunk, an Anthropic `event: error`
+  and a failed non-streamed body. The gateway then writes one `{"event":"stream_error",...}` log line per response with
+  `app` (the route), `upstream` (provider), `style`, `model`, `type` (the event), `errorType`, `code`, `message` (cut to 300
+  characters, credential shapes removed) and `requestId` (the body's id, else the upstream's `x-request-id` header). An event
+  with no message still gives a line. Prompt text is never logged. The request is recorded with status `stream_error`
+  instead of `ok` (log, ledger and `ais_gateway_requests_total`; a `stream_error` status also marks a body read that failed
+  half way). The counter `ais_gateway_stream_errors_total{app,provider,event,error_type}` counts each one; the Watchdog rule
+  `ais-gateway-stream-errors` alerts on more than 5 in 15 minutes for one app.
+  `kubectl -n <ns> logs deploy/ais-gateway | grep '"event":"stream_error"'`.
 - Revoking an app needs the database. While the database is down, revoke
   returns 503 and the app stays active; retry once the database is back.
 - The usage table becomes a TimescaleDB hypertable only on the first migration.

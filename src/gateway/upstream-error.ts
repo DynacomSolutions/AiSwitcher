@@ -64,20 +64,22 @@ export function summariseUpstreamError(bytes: Uint8Array): UpstreamErrorSummary 
   if (bytes.length === 0) return undefined;
   const raw = new TextDecoder().decode(bytes);
   const top = record(parseBody(raw));
+  if (top) return summariseErrorJson(top);
+  // Not JSON: an edge's HTML page or plain text. Tags go, the words stay.
+  const plain = redactText(raw.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ").replace(/<[^>]*>/g, " "));
+  return plain ? { message: plain } : undefined;
+}
+
+/** The error fields of one parsed JSON error object (any of the shapes above). Undefined when it names no type, code or message. */
+export function summariseErrorJson(top: Record<string, unknown>): UpstreamErrorSummary | undefined {
   const out: UpstreamErrorSummary = {};
-  if (top) {
-    const err = record(top.error) ?? record(top.detail) ?? {};
-    const type = text(err.type) ?? (top.type !== "error" ? text(top.type) : undefined);
-    const code = text(err.code) ?? text(top.code) ?? text(err.status) ?? text(top.status);
-    const message = text(err.message) ?? text(top.message) ?? text(top.error) ?? text(top.detail) ?? text(top.error_description) ?? text(err.detail);
-    if (type) out.type = redactText(type, ERROR_FIELD_MAX);
-    if (code) out.code = redactText(code, ERROR_FIELD_MAX);
-    if (message) out.message = redactText(message);
-  } else {
-    // Not JSON: an edge's HTML page or plain text. Tags go, the words stay.
-    const plain = redactText(raw.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ").replace(/<[^>]*>/g, " "));
-    if (plain) out.message = plain;
-  }
+  const err = record(top.error) ?? record(top.detail) ?? {};
+  const type = text(err.type) ?? (top.type !== "error" ? text(top.type) : undefined);
+  const code = text(err.code) ?? text(top.code) ?? text(err.status) ?? text(top.status);
+  const message = text(err.message) ?? text(top.message) ?? text(top.error) ?? text(top.detail) ?? text(top.error_description) ?? text(err.detail);
+  if (type) out.type = redactText(type, ERROR_FIELD_MAX);
+  if (code) out.code = redactText(code, ERROR_FIELD_MAX);
+  if (message) out.message = redactText(message);
   return out.type || out.code || out.message ? out : undefined;
 }
 
