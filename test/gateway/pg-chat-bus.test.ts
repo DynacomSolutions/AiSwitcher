@@ -1,17 +1,27 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
-import { CHAT_CHANNEL, MAX_BUS_PAYLOAD, PgChatBus, parseBusMsg, type ChatBusMsg } from "../../src/gateway/chat/bus.ts";
+import { CHAT_CHANNEL, MAX_BUS_PAYLOAD, MemoryChatBus, PgChatBus, parseBusMsg, type ChatBusMsg } from "../../src/gateway/chat/bus.ts";
 import { bunListenConn, SharedListener } from "../../src/gateway/pg-listen.ts";
 
 const url = process.env.AIS_GATEWAY_TEST_DATABASE_URL;
 const optOut = process.env.AIS_GATEWAY_TEST_NO_DATABASE === "1";
 
-test("parseBusMsg accepts the four message kinds and refuses anything else", () => {
+test("parseBusMsg accepts the event, state, cmd and ack kinds and refuses anything else", () => {
   expect(parseBusMsg('{"t":"event","chatId":"c","seq":3}')).toEqual({ t: "event", chatId: "c", seq: 3 });
   expect(parseBusMsg('{"t":"cmd","to":"r","chatId":"c","cmd":"prompt","seq":2}')).toEqual({ t: "cmd", to: "r", chatId: "c", cmd: "prompt", seq: 2 });
   expect(parseBusMsg('{"t":"cmd","to":"r","chatId":"c","cmd":"rm -rf"}')).toBeUndefined();
   expect(parseBusMsg('{"t":"event","chatId":"c"}')).toBeUndefined();
   expect(parseBusMsg("not json")).toBeUndefined();
+  expect(parseBusMsg('{"t":"ack","to":"r","chatId":"c","ref":"x"}')).toEqual({ t: "ack", to: "r", chatId: "c", ref: "x" });
+  expect(parseBusMsg('{"t":"ack","to":"r","chatId":"c"}')).toBeUndefined();
+  expect(parseBusMsg('{"t":"grants","chatId":"c"}')).toBeUndefined();
+  expect(parseBusMsg('{"t":"cmd","to":"r","chatId":"c","cmd":"prompt","from":"f","ref":"x"}')).toEqual({ t: "cmd", to: "r", chatId: "c", cmd: "prompt", from: "f", ref: "x" });
+});
+
+test("MemoryChatBus refuses a message over the same 7 KB cap as Postgres", async () => {
+  const bus = new MemoryChatBus();
+  await expect(bus.publish({ t: "cmd", to: "r", chatId: "c", cmd: "configure", args: { name: "x".repeat(MAX_BUS_PAYLOAD) } })).rejects.toThrow("too large");
+  await bus.publish({ t: "event", chatId: "c", seq: 1 });
 });
 
 if (!url && process.env.CI && !optOut) {

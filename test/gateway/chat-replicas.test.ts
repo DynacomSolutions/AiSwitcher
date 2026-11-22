@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatBody } from "../../src/browser/chat-protocol.ts";
 import { MemoryChatBus, type ChatBusMsg } from "../../src/gateway/chat/bus.ts";
-import { ChatBroker, chatIdleMsFromEnv } from "../../src/gateway/chat/broker.ts";
+import { ChatBroker, chatIdleMsFromEnv, type BrokerDeps } from "../../src/gateway/chat/broker.ts";
 import { sessionName } from "../../src/gateway/chat/kube.ts";
 import type { Timers } from "../../src/gateway/chat/pod-transport.ts";
 import { MemoryChatStore } from "../../src/gateway/chat/store.ts";
@@ -26,14 +26,14 @@ afterEach(async () => {
 const frozen: Timers = { setTimeout: () => 0, clearTimeout: () => undefined };
 
 /** Two replicas over one store, one bus and one fake cluster. */
-async function pair(opts: { frozenA?: boolean; ackMs?: number } = {}) {
+async function pair(opts: { frozenA?: boolean; ackMs?: number; a?: Partial<BrokerDeps>; b?: Partial<BrokerDeps>; slowStartMs?: number } = {}) {
   const clock = { t: 1_700_000_000_000 };
   const store = new MemoryChatStore(() => clock.t);
   const bus = new MemoryChatBus();
   const cluster = new Set<string>();
   const stateFile = join(root, `${crypto.randomUUID()}.state`);
-  const make = async (replicaId: string, timers?: Timers) => {
-    const transport = new StubPodTransport({ cluster, env: { STUB_ACP_STATE: stateFile } });
+  const make = async (replicaId: string, timers?: Timers, extra: Partial<BrokerDeps> = {}, slow = 0) => {
+    const transport = new StubPodTransport({ cluster, env: { STUB_ACP_STATE: stateFile }, ...(slow ? { beforeSpawn: () => Bun.sleep(slow) } : {}) });
     transports.push(transport);
     const seen: Array<[string, number]> = [];
     const rejects: Array<{ chatId: string; code: string; message: string }> = [];
@@ -50,6 +50,7 @@ async function pair(opts: { frozenA?: boolean; ackMs?: number } = {}) {
       publish: (id, seq) => void seen.push([id, seq]),
       identityOf: async (b) => (b === "bind-1" ? "alpha" : undefined),
       ...(timers ? { timers } : {}),
+      ...extra,
       ...(opts.ackMs !== undefined ? { forwardAckMs: opts.ackMs } : {}),
       rejectChat: (chatId, code, message) => void rejects.push({ chatId, code, message }),
     });
@@ -57,8 +58,8 @@ async function pair(opts: { frozenA?: boolean; ackMs?: number } = {}) {
     await broker.start();
     return { broker, transport, seen, metrics, rejects };
   };
-  const a = await make("replica-a", opts.frozenA ? frozen : undefined);
-  const b = await make("replica-b");
+  const a = await make("replica-a", opts.frozenA ? frozen : undefined, opts.a, opts.slowStartMs);
+  const b = await make("replica-b", undefined, opts.b);
   const rec = await a.broker.create({ chatId: crypto.randomUUID(), binding: "bind-1", windowId: 1, name: "My chat", color: "#aabbcc", selection: { provider: "claude", identity: "alpha" }, tabIds: [7] });
   if ("code" in rec) throw new Error("rejected");
   return { clock, store, bus, cluster, a, b, id: rec.id };
@@ -192,27 +193,23 @@ test("drain of a chat with no turn detaches at once and refuses new prompts", as
   expect((await bodies(store, id)).filter((x) => x.k === "user")).toHaveLength(1);
 });
 
-test("a missed notice is recovered: events(afterSeq) from the store fills the gap", async () => {
+test("after a LISTEN reconnect the replica pushes the events it missed, the last one included", async () => {
   const { store, bus, a, b, id } = await pair();
-  let dropNext = true;
-  bus.drop = (m: ChatBusMsg) => {
-    if (m.t === "event" && dropNext) {
-      dropNext = false;
-      return true;
-    }
-    return false;
-  };
-  await prompt(a.broker, id, "say:gap");
-  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await turnEnds(store, id)) === 1, "first turn");
   await idle(store, id);
   await Bun.sleep(50);
+  // The connection is down: B gets no event notice, so it never hears of the last event (the turn end).
+  bus.drop = (m) => m.t === "event" || m.t === "state";
+  await prompt(a.broker, id, "say:two");
+  await until(async () => (await turnEnds(store, id)) === 2, "second turn");
+  await idle(store, id);
   const last = (await store.get(id))?.lastSeq ?? 0;
-  const top = Math.max(...b.seen.map(([, s]) => s));
-  expect(top).toBeGreaterThan(0);
-  // The consumer holds a cursor. A later notice makes it read from the store, and it gets the dropped events too.
-  const rows = await store.events(id, 0, 1000);
-  expect(rows.map((r) => r.seq)).toEqual(Array.from({ length: last }, (_, i) => i + 1));
-  expect(b.seen.some(([, s]) => s === last)).toBe(true);
+  expect(Math.max(...b.seen.map(([, s]) => s))).toBeLessThan(last);
+  bus.drop = undefined as never;
+  bus.simulateReconnect();
+  await until(() => b.seen.some(([, s]) => s === last), "last event after reconnect");
+  expect(((await store.events(id, 0, 1000)).at(-1)?.body as { k: string }).k).toBe("turn_end");
 });
 
 test("a prompt that the owner never receives is taken over once its lease has ended, and is not lost", async () => {
@@ -267,4 +264,138 @@ test("the idle limit reads the environment, defaults to 2 hours and is capped at
   expect(chatIdleMsFromEnv({ AIS_GATEWAY_CHAT_IDLE_MINUTES: "600" })).toBe(3 * 3_600_000);
   expect(chatIdleMsFromEnv({ AIS_GATEWAY_CHAT_IDLE_MINUTES: "abc" })).toBe(2 * 3_600_000);
   expect(chatIdleMsFromEnv({ AIS_GATEWAY_CHAT_IDLE_MINUTES: "0" })).toBe(2 * 3_600_000);
+});
+
+/** A user event stored by a non-owner, then a cmd for it on the bus. */
+async function storeAndSend(store: MemoryChatStore, bus: MemoryChatBus, id: string, text: string, to = "replica-a"): Promise<number> {
+  const seq = await store.appendEvent(id, { k: "user", text });
+  await bus.publish({ t: "cmd", to, chatId: id, cmd: "prompt", seq });
+  return seq;
+}
+
+test("two commands for one chat in one tick run one turn, and a repeat of the same number runs nothing", async () => {
+  const { store, bus, a, id } = await pair();
+  const s1 = await store.appendEvent(id, { k: "user", text: "say:one" });
+  const s2 = await store.appendEvent(id, { k: "user", text: "say:two" });
+  await Promise.all([bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: s1 }), bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: s2 })]);
+  await until(async () => (await turnEnds(store, id)) >= 1, "a turn");
+  await idle(store, id);
+  await Bun.sleep(100);
+  expect(await turnEnds(store, id)).toBe(1);
+  expect(a.transport.starts).toHaveLength(1);
+  const notes = async () => (await bodies(store, id)).filter((x) => x.k === "notice" && x.text.includes("did not take")).length;
+  expect(await notes()).toBe(1);
+  // The same number again (a retry after a late ack): no turn and no notice.
+  await bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: s1 });
+  await bus.publish({ t: "cmd", to: "replica-a", chatId: id, cmd: "prompt", seq: s1 });
+  await Bun.sleep(150);
+  expect(await turnEnds(store, id)).toBe(1);
+  expect(await notes()).toBe(1);
+});
+
+test("the same number twice in one tick runs one turn and no busy notice", async () => {
+  const { store, bus, a, id } = await pair();
+  const seq = await store.appendEvent(id, { k: "user", text: "say:once" });
+  const m = { t: "cmd" as const, to: "replica-a", chatId: id, cmd: "prompt" as const, seq };
+  await Promise.all([bus.publish(m), bus.publish(m)]);
+  await until(async () => (await turnEnds(store, id)) >= 1, "turn");
+  await idle(store, id);
+  await Bun.sleep(100);
+  expect(await turnEnds(store, id)).toBe(1);
+  expect((await bodies(store, id)).filter((x) => x.k === "notice" && x.text.includes("did not take"))).toHaveLength(0);
+  expect(a.transport.starts).toHaveLength(1);
+});
+
+test("a command that arrives while drain begins starts no pod", async () => {
+  const { store, bus, a, id } = await pair();
+  const orig = store.get.bind(store);
+  let armed = true;
+  let drained: Promise<void> | undefined;
+  store.get = async (cid: string) => {
+    const r = await orig(cid);
+    if (armed) {
+      armed = false;
+      drained = a.broker.drain();
+    }
+    return r;
+  };
+  await storeAndSend(store, bus, id, "say:late");
+  await until(() => drained !== undefined, "drain began");
+  await drained;
+  await Bun.sleep(100);
+  expect(a.transport.starts).toHaveLength(0);
+  expect(await turnEnds(store, id)).toBe(0);
+});
+
+test("a hung turn during drain is still restarted by the stall check, and drain ends", async () => {
+  const { store, clock, a, id } = await pair({ a: { sweepMs: 20, stallMs: 1000 } });
+  await prompt(a.broker, id, "hang");
+  await until(async () => (await store.get(id))?.state === "thinking", "thinking");
+  const d = a.broker.drain();
+  clock.t += 5000;
+  const outcome = await Promise.race([d.then(() => "done"), Bun.sleep(5000).then(() => "stuck")]);
+  expect(outcome).toBe("done");
+  expect((await store.get(id))?.ownerReplica).toBeUndefined();
+});
+
+test("a publish error rejects the dispatch at once, and a bad command or an oversize one never reaches the bus", async () => {
+  const { store, bus, a, b, id } = await pair({ ackMs: 30_000 });
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await idle(store, id);
+  const sent: unknown[] = [];
+  const pub = bus.publish.bind(bus);
+  bus.publish = async (m) => {
+    sent.push(m);
+    return pub(m);
+  };
+  const t0 = Date.now();
+  bus.drop = () => {
+    throw new Error("down");
+  };
+  const r = await prompt(b.broker, id, "say:two");
+  expect(r).toMatchObject({ code: "unavailable", message: "Your message could not be passed on. Try again." });
+  expect(Date.now() - t0).toBeLessThan(2000);
+  bus.drop = undefined as never;
+  sent.length = 0;
+  expect(await b.broker.dispatch({ chatId: id, binding: "bind-1", cmd: "configure", args: { name: "x".repeat(200) } })).toMatchObject({ code: "bad_request" });
+  expect(await b.broker.dispatch({ chatId: id, binding: "bind-1", cmd: "link", args: { tabIds: "no" } })).toMatchObject({ code: "bad_request" });
+  expect(sent).toHaveLength(0);
+});
+
+test("the owner gets a busy notice in the feed when a prompt arrives during its pod start", async () => {
+  const { store, a, b, id } = await pair({ slowStartMs: 300 });
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await store.get(id))?.state === "starting", "starting");
+  expect(await prompt(b.broker, id, "say:two")).toBeUndefined();
+  await until(async () => (await bodies(store, id)).some((x) => x.k === "notice" && x.text.includes("did not take")), "busy notice");
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+});
+
+test("the lease is judged by the store clock, not by this replica's clock", async () => {
+  const { store, clock, a, b, id } = await pair({ frozenA: true, ackMs: 30_000, b: { now: () => 1_700_000_000_000 - 600_000 } });
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await idle(store, id);
+  // The store clock says the lease ended. B's own clock is ten minutes behind and would call it live.
+  clock.t += 61_000;
+  expect(await prompt(b.broker, id, "say:two")).toBeUndefined();
+  await until(async () => (await turnEnds(store, id)) === 2, "turn on B without the ack wait");
+  expect(b.transport.starts).toHaveLength(1);
+});
+
+test("per-chat entries go on close, and late acks stay bounded", async () => {
+  const { store, bus, a, id } = await pair();
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await idle(store, id);
+  const inner = a.broker as unknown as { notified: Map<string, number>; lastAccepted: Map<string, number>; acked: Map<string, number> };
+  inner.lastAccepted.set(id, 5);
+  expect(inner.notified.has(id)).toBe(true);
+  await a.broker.close(id, "user");
+  expect(inner.notified.has(id)).toBe(false);
+  expect(inner.lastAccepted.has(id)).toBe(false);
+  for (let i = 0; i < 1500; i++) await bus.publish({ t: "ack", to: "replica-a", chatId: id, ref: `late-${i}` });
+  await Bun.sleep(100);
+  expect(inner.acked.size).toBeLessThanOrEqual(1000);
 });

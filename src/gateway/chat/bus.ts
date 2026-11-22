@@ -11,13 +11,20 @@ export type ChatBusMsg =
   | { t: "event"; chatId: string; seq: number }
   | { t: "state"; chatId: string }
   | { t: "cmd"; to: string; chatId: string; cmd: ChatCmd; seq?: number; args?: Record<string, unknown>; from?: string; ref?: string }
-  | { t: "ack"; to: string; chatId: string; ref: string }
-  | { t: "grants"; chatId: string };
+  | { t: "ack"; to: string; chatId: string; ref: string };
 
 export interface ChatBus {
   publish(m: ChatBusMsg): Promise<void>;
   subscribe(h: (m: ChatBusMsg) => void): Promise<() => Promise<void>>;
+  /** Runs after the LISTEN connection came back. Notices sent while it was down are lost, so the replica reads the store again. */
+  onReconnect?(h: () => void): () => void;
 }
+
+/** Bytes of one message as the bus sends it. */
+export const busSize = (m: ChatBusMsg): number => Buffer.byteLength(JSON.stringify(m));
+const checkSize = (m: ChatBusMsg): void => {
+  if (busSize(m) > MAX_BUS_PAYLOAD) throw new Error("chat bus message is too large");
+};
 
 const CMDS: readonly string[] = ["prompt", "cancel", "permission", "configure", "close", "link"];
 
@@ -37,8 +44,6 @@ export function parseBusMsg(payload: string): ChatBusMsg | undefined {
       return typeof o.seq === "number" ? { t: "event", chatId: o.chatId, seq: o.seq } : undefined;
     case "state":
       return { t: "state", chatId: o.chatId };
-    case "grants":
-      return { t: "grants", chatId: o.chatId };
     case "ack":
       return typeof o.to === "string" && typeof o.ref === "string" ? { t: "ack", to: o.to, chatId: o.chatId, ref: o.ref } : undefined;
     case "cmd": {
@@ -58,10 +63,22 @@ export function parseBusMsg(payload: string): ChatBusMsg | undefined {
 /** Replicas in one process (tests): every subscriber gets every message, in publish order. */
 export class MemoryChatBus implements ChatBus {
   private readonly subs = new Set<(m: ChatBusMsg) => void>();
+  private readonly reconnects = new Set<() => void>();
   /** Tests set this to drop messages. */
   drop?: (m: ChatBusMsg) => boolean;
 
+  /** Tests call this to model a LISTEN reconnect. */
+  simulateReconnect(): void {
+    for (const h of [...this.reconnects]) h();
+  }
+
+  onReconnect(h: () => void): () => void {
+    this.reconnects.add(h);
+    return () => void this.reconnects.delete(h);
+  }
+
   async publish(m: ChatBusMsg): Promise<void> {
+    checkSize(m);
     if (this.drop?.(m)) return;
     const copy = structuredClone(m);
     for (const h of [...this.subs]) queueMicrotask(() => h(structuredClone(copy)));
@@ -81,9 +98,13 @@ export class PgChatBus implements ChatBus {
   ) {}
 
   async publish(m: ChatBusMsg): Promise<void> {
+    checkSize(m);
     const payload = JSON.stringify(m);
-    if (Buffer.byteLength(payload) > MAX_BUS_PAYLOAD) throw new Error("chat bus message is too large");
     await this.sql`SELECT pg_notify(${CHAT_CHANNEL}, ${payload})`;
+  }
+
+  onReconnect(h: () => void): () => void {
+    return this.listener.onReconnect?.(h) ?? (() => undefined);
   }
 
   async subscribe(h: (m: ChatBusMsg) => void): Promise<() => Promise<void>> {

@@ -5,7 +5,7 @@ import { ChatClosedError, ChatExistsError, ChatFenceRequiredError, ChatLeaseLost
 const BATCH = 500;
 
 const COLS = `id, binding, window_id, name, color, selection, state, tab_ids, acp_session_id, pod_session, can_load,
-  owner_replica, (round(extract(epoch FROM lease_until) * 1000))::bigint AS lease_ms, epoch, last_seq, generation, created_at, updated_at, closed_at`;
+  owner_replica, (round(extract(epoch FROM lease_until) * 1000))::bigint AS lease_ms, (lease_until > clock_timestamp()) AS lease_live, epoch, last_seq, generation, created_at, updated_at, closed_at`;
 
 const json = <T>(v: unknown): T => (typeof v === "string" ? (JSON.parse(v) as T) : (v as T));
 
@@ -32,6 +32,7 @@ function toRecord(r: Row): ChatRecord {
   if (r.can_load != null) rec.canLoad = r.can_load as boolean;
   if (r.owner_replica != null) rec.ownerReplica = r.owner_replica as string;
   if (r.lease_ms != null) rec.leaseUntil = Number(r.lease_ms);
+  if (r.lease_live === true) rec.leaseLive = true;
   if (r.closed_at != null) rec.closedAt = Number(r.closed_at);
   return rec;
 }

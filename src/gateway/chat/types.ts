@@ -14,6 +14,8 @@ export interface ChatRecord {
   canLoad?: boolean;
   ownerReplica?: string;
   leaseUntil?: number;
+  /** Set by the store on read: the lease is live by the store's own clock. Never compare leaseUntil with another clock. */
+  leaseLive?: boolean;
   /** Grows by one on each acquireLease. A stale owner holds an old epoch. */
   epoch: number;
   lastSeq: number;
