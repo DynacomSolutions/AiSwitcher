@@ -25,6 +25,11 @@ const MAX_TOOLS_KEPT = 500;
 const DEFAULT_CANCEL_GRACE_MS = 15_000;
 const DEFAULT_STALL_MS = 30 * 60_000;
 const HUNG_MESSAGE = "The agent did not stop. It was restarted. Send a message to continue.";
+/**
+ * codex-acp sends this warning as the first reply chunk of a turn when it has no metadata for the model. It is no part of the answer,
+ * so the feed shows it as a notice. The rule is narrow on purpose: any other text stays reply text.
+ */
+const MODEL_METADATA_WARNING = /^Model metadata for \x60[^\x60]+\x60 not found\. Defaulting to fallback metadata/;
 const STATE_TRIES = 3;
 const STATE_BACKOFF_MS = 50;
 const RESTART_NOTICE = "This chat restarted. The agent does not remember earlier messages.";
@@ -803,6 +808,10 @@ export class ChatBroker implements ChatAuth {
       return;
     }
     if (ctx.replaying) return;
+    if (u.kind === "text" && MODEL_METADATA_WARNING.test(u.text)) {
+      for (const t of pieces(u.text)) this.push(ctx, { k: "notice", text: t });
+      return;
+    }
     if (u.kind !== "tool") {
       for (const t of pieces(u.text)) this.push(ctx, { k: u.kind, text: t });
       return;

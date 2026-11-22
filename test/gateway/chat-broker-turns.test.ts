@@ -96,6 +96,17 @@ test("a prompt streams text updates as ordered events and ends with turn_end end
   expect(tail[3]).toEqual({ k: "turn_end", stopReason: "end_turn" });
 });
 
+test("the model metadata warning is a notice and the reply text holds only the answer", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "warn");
+  await turnEnded(store, rec.id);
+  const all = await bodies(store, rec.id);
+  const warning = "Model metadata for `gpt-6-astra` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.";
+  expect(all).toContainEqual({ k: "notice", text: warning });
+  expect(all.filter((b) => b.k === "text")).toEqual([{ k: "text", text: "hello" }]);
+});
+
 test("tool updates become tool items per toolCallId with status pending then done", async () => {
   const { broker, store } = setup();
   const rec = await made(broker);

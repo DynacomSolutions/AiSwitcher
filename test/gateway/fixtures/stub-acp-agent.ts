@@ -54,6 +54,11 @@ async function runPrompt(id: string | number, sessionId: string, text: string, f
   }
   if (text === "limit") return send({ jsonrpc: "2.0", id, error: { code: -32000, message: "Rate limit reached. Resets at 2023-11-15T00:00:00Z" } });
   if (text === "weekly") return send({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: You've hit your weekly limit \u00b7 resets Nov 26, 2am (Asia/Bangkok)", data: { errorKind: "rate_limit" } } });
+  if (text === "warn") {
+    chunk(sessionId, "Model metadata for `gpt-6-astra` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.");
+    chunk(sessionId, "hello");
+    return done();
+  }
   if (text === "hang") return;
   if (text === "lateask") {
     done();
