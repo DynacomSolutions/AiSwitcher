@@ -6,7 +6,7 @@ import { AcpClient } from "../../src/gateway/chat/acp.ts";
 import { ACP_ARGS, buildChatSession, sessionName } from "../../src/gateway/chat/kube.ts";
 import type { PodPhaseNotice, PodSpecInput } from "../../src/gateway/chat/kube.ts";
 import { HttpKubeApi, inClusterKube } from "../../src/gateway/chat/kube-http.ts";
-import { KubePodTransport, PodStartError, type Timers } from "../../src/gateway/chat/pod-transport.ts";
+import { CatalogError, KubePodTransport, PodStartError, type Timers } from "../../src/gateway/chat/pod-transport.ts";
 import { ensureLocalTls } from "../../src/gateway/local-tls.ts";
 import { FAKE_GROUP, FAKE_NAMESPACE, FAKE_TOKEN, FakeKubeServer } from "./fixtures/fake-kube.ts";
 
@@ -52,11 +52,11 @@ afterEach(async () => {
   for (const s of servers.splice(0)) await s.stop();
 });
 
-function setup(opts: ConstructorParameters<typeof FakeKubeServer>[0] = {}, extra: { timers?: Timers; maxLineBytes?: number } = {}) {
+function setup(opts: ConstructorParameters<typeof FakeKubeServer>[0] = {}, extra: { timers?: Timers; maxLineBytes?: number; api?: { watchTimeoutSeconds?: number; attachOpenTimeoutMs?: number } } = {}) {
   const server = new FakeKubeServer(opts);
   servers.push(server);
-  const api = new HttpKubeApi({ baseUrl: server.baseUrl, token: FAKE_TOKEN, env });
-  const transport = new KubePodTransport({ api, env, now: () => 1_700_000_000_000, ...extra });
+  const api = new HttpKubeApi({ baseUrl: server.baseUrl, token: () => FAKE_TOKEN, env, ...extra.api });
+  const transport = new KubePodTransport({ api, env, now: () => 1_700_000_000_000, timers: extra.timers, maxLineBytes: extra.maxLineBytes });
   return { server, api, transport };
 }
 
@@ -131,7 +131,7 @@ test("start creates the session, waits through Pending, attaches and returns a h
   expect(h.session).toBe(name1);
   expect(h.name).toBe(`agent-${name1}`);
   expect(h.cwd).toBe("/work/chat/home");
-  expect(server.attachPaths[0]).toContain(`/pods/agent-${name1}/attach?stdin=true&stdout=true&stderr=true&tty=false`);
+  expect(server.attachPaths[0]).toContain(`/pods/agent-${name1}/attach?container=agent&stdin=true&stdout=true&stderr=true&tty=false`);
   expect(server.attachAuth[0]).toBe(`Bearer ${FAKE_TOKEN}`);
   expect(server.sessions.get(name1)!.spec).toMatchObject({ workspace: "chat" });
   const client = new AcpClient({ write: (l) => h.stream.write(l), onLine: (cb) => h.stream.onLine(cb), onClose: (cb) => h.stream.onClose(cb) }, { onUpdate() {}, onPermission: async () => ({}) });
@@ -325,13 +325,130 @@ test("catalog reads config.json from the ConfigMap", async () => {
   expect(await transport.catalog()).toEqual({});
 });
 
+test("catalog throws a typed error on invalid JSON", async () => {
+  const { server, transport } = setup();
+  server.configMap = { "config.json": "{not json" };
+  await expect(transport.catalog()).rejects.toBeInstanceOf(CatalogError);
+  server.configMap = { "config.json": "[1]" };
+  await expect(transport.catalog()).rejects.toBeInstanceOf(CatalogError);
+});
+
+test("a failed start never deletes a session of another chat (409 on create)", async () => {
+  const { server, transport } = setup();
+  const other = "77777777-aaaa-4bbb-8ccc-dddddddddddd";
+  server.sessions.set(name1, { metadata: { name: name1, labels: { [`${FAKE_GROUP}/chat-id`]: other } }, status: { phase: "Running", pod: "p" } });
+  const err = await transport.start(input(), new AbortController().signal, () => {}).then(() => undefined, (e: unknown) => e);
+  expect(err).toBeInstanceOf(Error);
+  await new Promise((r) => setTimeout(r, 50));
+  expect(server.sessions.has(name1)).toBe(true);
+  expect(server.sessions.get(name1)!.metadata.labels![`${FAKE_GROUP}/chat-id`]).toBe(other);
+});
+
+test("the service account token is read again after the cache time", async () => {
+  const server = new FakeKubeServer();
+  servers.push(server);
+  let clock = 1_000_000;
+  let reads = 0;
+  const files = (p: string): string => {
+    if (p.endsWith("ca.crt")) return "";
+    reads += 1;
+    return reads === 1 ? "old-token" : "new-token";
+  };
+  const kube = inClusterKube({ KUBERNETES_SERVICE_HOST: "127.0.0.1", KUBERNETES_SERVICE_PORT: "1" }, files, () => clock);
+  const api = new HttpKubeApi({ baseUrl: server.baseUrl, token: kube.token, env });
+  server.token = "new-token";
+  await expect(api.getConfigMap("x")).rejects.toThrow();
+  expect(reads).toBe(1);
+  clock += 61_000;
+  expect(await api.getConfigMap("x")).toBeTruthy();
+  expect(reads).toBe(2);
+});
+
+test("a 403 on the session read makes start reject with pod_start", async () => {
+  const { server, transport } = setup();
+  server.getStatusCode = 403;
+  const err = (await transport.start(input(), new AbortController().signal, () => {}).then(() => undefined, (e: unknown) => e)) as PodStartError;
+  expect(err).toBeInstanceOf(PodStartError);
+  expect(err.code).toBe("pod_start");
+  expect(err.reason).toBe("Forbidden");
+  await until(() => !server.sessions.has(name1));
+});
+
+test("a silent watch ends at its time limit and start asks again", async () => {
+  const timers = new FakeTimers();
+  const { server, transport } = setup({ initialPhase: "Pending" }, { timers, api: { watchTimeoutSeconds: 1 } });
+  const p = transport.start(input(), new AbortController().signal, () => {});
+  await until(() => server.watcherCount() === 1);
+  expect(server.watchQueries[0]).toContain("timeoutSeconds=1");
+  await until(() => timers.pending.includes(2_000), 5000);
+  server.setStatus(name1, { phase: "Running", pod: `agent-${name1}`, worktreePath: "/w" });
+  timers.fire(2_000);
+  const h = await p;
+  expect(h.cwd).toBe("/w");
+  h.stream.close();
+});
+
+test("the attach has an open timeout", async () => {
+  const { server, transport } = setup({}, { api: { attachOpenTimeoutMs: 100 } });
+  server.attachDelayMs = 1500;
+  const err = await transport.start(input(), new AbortController().signal, () => {}).then(() => undefined, (e: unknown) => e);
+  expect((err as Error).message).toBe("attach timed out");
+  await until(() => !server.sessions.has(name1));
+});
+
+test("stop during an in-flight create ends the start and leaves no session", async () => {
+  const { server, transport } = setup();
+  server.postDelayMs = 300;
+  const failed = transport.start(input(), new AbortController().signal, () => {}).then(() => undefined, (e: unknown) => e);
+  await new Promise((r) => setTimeout(r, 50));
+  await transport.stop(CHAT);
+  expect(((await failed) as Error).message).toBe("cancelled");
+  await until(() => server.sessions.size === 0);
+});
+
+test("a normal exit of the pod ends the stream with the reason pod exited", async () => {
+  const { server, transport } = setup();
+  const h = await transport.start(input(), new AbortController().signal, () => {});
+  const reasons: string[] = [];
+  h.stream.onClose((r) => reasons.push(r));
+  server.endStdin();
+  await until(() => reasons.length === 1);
+  expect(reasons[0]).toBe("pod exited");
+});
+
+test("the notice shows again after the reason clears and comes back", async () => {
+  const { server, transport } = setup({ initialPhase: "Pending" });
+  const notices: PodPhaseNotice[] = [];
+  const p = transport.start(input(), new AbortController().signal, (n) => notices.push(n));
+  await until(() => server.sessions.has(name1));
+  server.setStatus(name1, { phase: "Pending", reason: "NodeBudget" });
+  server.setStatus(name1, { phase: "Pending" });
+  server.setStatus(name1, { phase: "Pending", reason: "NodeBudget" });
+  await until(() => notices.length === 2);
+  server.setStatus(name1, { phase: "Running", pod: `agent-${name1}`, worktreePath: "/w" });
+  (await p).stream.close();
+});
+
+test("stderr is capped at 4096 UTF-8 bytes", async () => {
+  const { server, transport } = setup();
+  const h = await transport.start(input(), new AbortController().signal, () => {});
+  const out: string[] = [];
+  h.stream.onStderr((c) => out.push(c));
+  server.sendFrame(2, new TextEncoder().encode(`${"\u00e9".repeat(3500)}\n`));
+  await until(() => out.length === 1);
+  expect(Buffer.byteLength(out[0]!)).toBeLessThanOrEqual(4096);
+  h.stream.close();
+});
+
 test("inClusterKube reads the token and CA from the given file reader", () => {
   const files: Record<string, string> = {
     "/var/run/secrets/kubernetes.io/serviceaccount/token": "tok-value\n",
     "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt": "CA-PEM",
   };
   const r = inClusterKube({ KUBERNETES_SERVICE_HOST: "127.0.0.1", KUBERNETES_SERVICE_PORT: "443" }, (p) => files[p]!);
-  expect(r).toEqual({ baseUrl: "https://127.0.0.1:443", token: "tok-value", ca: "CA-PEM" });
+  expect(r.baseUrl).toBe("https://127.0.0.1:443");
+  expect(r.token()).toBe("tok-value");
+  expect(r.ca).toBe("CA-PEM");
   expect(inClusterKube({ KUBERNETES_SERVICE_HOST: "fd00::1", KUBERNETES_SERVICE_PORT: "443" }, (p) => files[p]!).baseUrl).toBe("https://[fd00::1]:443");
   expect(() => inClusterKube({}, (p) => files[p]!)).toThrow();
 });
