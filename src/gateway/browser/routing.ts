@@ -38,6 +38,9 @@ export interface CallScope { binding: string; color: string; linked: ReadonlySet
 const RESERVED_SESSION_PREFIX = "chat:";
 export const usesReservedSessionId = (id: string): boolean => id.toLowerCase().startsWith(RESERVED_SESSION_PREFIX);
 
+/** Tools a chat may call without a `tabId`. */
+const TABLESS_TOOLS: ReadonlySet<string> = new Set(["tabs_context", "tabs_create", "wait"]);
+
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 
@@ -97,10 +100,12 @@ export function createBrowserCaller(deps: CallDeps): (identity: string, body: un
     // A chat scope replaces the identity rules: the one binding that made the chat, and only if it is connected.
     const allowed = scope ? connected.filter((b) => b.name === scope.binding) : await allowedBindings(identity, connected, poolMembers);
     if (scope && tool !== "list_browsers" && tool !== SESSION_END_TOOL) {
+      // `tabs_create` stays allowed: the extension links the created tab to the chat and sends `chat.link` before the result.
       if (tool === "tabs_create" && args.groupId !== undefined) return fail(id, tool, "forbidden_tab", "A chat cannot open a tab in a granted group.");
-      if ("tabId" in args) {
+      const needsTab = !TABLESS_TOOLS.has(tool);
+      if (needsTab || "tabId" in args) {
         const t = args.tabId;
-        if (typeof t !== "number" || !scope.linked.has(t)) return fail(id, tool, "forbidden_tab", `Tab ${typeof t === "number" || typeof t === "string" ? String(t).slice(0, 40) : "(invalid)"} is not linked to this chat.`);
+        if (typeof t !== "number" || !scope.linked.has(t)) return fail(id, tool, "forbidden_tab", `Tab ${typeof t === "number" || typeof t === "string" ? String(t).slice(0, 40) : "(none)"} is not linked to this chat.`);
       }
     }
     const session = (b: BrowserBinding, sid: string): CallRequest["session"] => ({ ...forwardedSession(b, identity, sid, label), ...(scope ? { color: scope.color, chat: true as const } : {}) });
@@ -142,8 +147,28 @@ export function createBrowserCaller(deps: CallDeps): (identity: string, body: un
       tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : tool === "upload_file" ? UPLOAD_CALL_TIMEOUT_MS : DEFAULT_CALL_TIMEOUT_MS,
     );
     signal?.removeEventListener("abort", onAbort);
+    if (scope && tool === "tabs_context" && result.ok) return { status: 200, body: scopeTabsContext(result, scope.linked) };
     return { status: 200, body: result };
   };
+}
+
+/**
+ * Defence in depth: a chat sees only its linked tabs. The reply drops `otherTabs` and `grantedGroups`, and keeps the
+ * `sessionTabs` entries that are linked. A reply this code cannot read is refused, not passed through.
+ */
+function scopeTabsContext(result: Extract<CallResult, { ok: true }>, linked: ReadonlySet<number>): CallResult {
+  try {
+    const content = result.content.map((c) => {
+      if (c.type !== "text") throw new Error("unexpected content");
+      const v = JSON.parse(c.text) as unknown;
+      if (!isObj(v)) throw new Error("unexpected shape");
+      const mine = Array.isArray(v.sessionTabs) ? v.sessionTabs.filter((t) => isObj(t) && typeof t.tabId === "number" && linked.has(t.tabId)) : [];
+      return { ...c, text: JSON.stringify({ ...v, sessionTabs: mine, otherTabs: [], grantedGroups: [] }) };
+    });
+    return { ...result, content };
+  } catch {
+    return { id: result.id, ok: false, error: "internal", message: "The tab list could not be read." };
+  }
 }
 
 const summary = (b: BrowserBinding) => ({ name: b.name, profileLabel: b.profileLabel, target: b.target });

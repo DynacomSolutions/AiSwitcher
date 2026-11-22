@@ -89,6 +89,9 @@ export function cancelKey(identity: string, sessionId: string, requestId: string
 
 /** Who is calling: an agent token, or a chat token with its principal. Undefined when the token is not valid. */
 type Caller = { identity: string; chat?: ChatPrincipal };
+/** The chat service threw: the caller may retry. */
+const UNAVAILABLE = "unavailable" as const;
+const UNAVAILABLE_TEXT = "The chat service is unavailable. Try again.";
 
 const RESERVED = "reserved session id prefix";
 
@@ -108,11 +111,16 @@ export function createMcpRoutes(deps: CallDeps): Hono {
   deps.hub.onCancel?.((key) => inflight.get(key)?.abort());
 
   /** Resolves the bearer token. A chat token never falls back to the agent token path. */
-  async function callerFromRequest(req: Request): Promise<Caller | undefined> {
+  async function callerFromRequest(req: Request): Promise<Caller | typeof UNAVAILABLE | undefined> {
     const m = /^Bearer (.+)$/i.exec(req.headers.get("authorization") ?? "");
     const raw = m?.[1]?.trim();
     if (raw?.startsWith(CHAT_TOKEN_HEAD)) {
-      const principal = await deps.chat?.principal(raw).catch(() => undefined);
+      let principal: ChatPrincipal | undefined;
+      try {
+        principal = await deps.chat?.principal(raw);
+      } catch {
+        return UNAVAILABLE;
+      }
       return principal ? { identity: principal.identity, chat: principal } : undefined;
     }
     return agentFromRequest(deps, req);
@@ -182,6 +190,10 @@ export function createMcpRoutes(deps: CallDeps): Hono {
   hono.post("/mcp", async (c) => {
     const req = c.req.raw;
     const a = await callerFromRequest(req);
+    if (a === UNAVAILABLE) {
+      count("other", "unavailable");
+      return json(503, { error: UNAVAILABLE_TEXT }, { "retry-after": "2" });
+    }
     if (!a) {
       count("other", "unauthorised");
       return json(401, { error: UNAUTHORISED }, { "www-authenticate": "Bearer" });
@@ -237,6 +249,10 @@ export function createMcpRoutes(deps: CallDeps): Hono {
   hono.delete("/mcp", async (c) => {
     const req = c.req.raw;
     const a = await callerFromRequest(req);
+    if (a === UNAVAILABLE) {
+      count("delete", "unavailable");
+      return json(503, { error: UNAVAILABLE_TEXT }, { "retry-after": "2" });
+    }
     if (!a) {
       count("delete", "unauthorised");
       return json(401, { error: UNAUTHORISED }, { "www-authenticate": "Bearer" });
