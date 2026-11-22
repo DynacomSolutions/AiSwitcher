@@ -247,7 +247,7 @@ export class Executor {
         const mineGroup = this.tabs.sessions.get(session.id)?.groupId;
         // `scope` and `grantedGroups` are additive: "own" tabs are in this session's own group, "granted" tabs sit in a group the user granted.
         const ownView = (t: TabInfo) => (t.groupId !== -1 && t.groupId !== mineGroup && this.tabs.grantee(t.groupId) === session.id ? grantedView(t) : { ...actionable(t), scope: "own" });
-        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), note: "otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
+        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), savedGroups: await this.tabs.savedGroups(), note: "otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group. savedGroups are named groups that outlive a session: open one with open_group. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
       }
       case "tabs_create": {
         this.throwIfAborted(sig);
@@ -321,12 +321,35 @@ export class Executor {
         await this.splitError(() => this.api.tabs.unsplit(tab.splitViewId));
         return text(JSON.stringify({ unsplit: true, splitViewId: tab.splitViewId, tabIds: members.map(t => t.id) }));
       }
+      case "save_group": {
+        this.throwIfAborted(sig);
+        const { name, groupId } = a("save_group");
+        const key = this.groupName(name);
+        const r = await this.tabs.save(session, key, groupId);
+        if (!r.ok) throw new ToolError(r.code, r.message);
+        return text(JSON.stringify({ name: key, groupId: r.groupId, tabCount: r.tabCount, saved: true, note: "The tabs stay open after the session ends. Use open_group to open the group again." }));
+      }
+      case "open_group": {
+        this.throwIfAborted(sig);
+        const key = this.groupName(a("open_group").name);
+        const r = await this.tabs.open(session, key);
+        if (!r.ok) throw new ToolError(r.code, r.message);
+        return text(JSON.stringify({ name: r.name, groupId: r.groupId, tabs: r.tabs, ...(r.warnings.length > 0 ? { warnings: r.warnings } : {}) }));
+      }
+      case "forget_group": {
+        const key = this.groupName(a("forget_group").name);
+        const r = await this.tabs.forgetSaved(session, key);
+        if (!r.ok) throw new ToolError(r.code, r.message);
+        return text(JSON.stringify({ name: key, forgotten: true, open: r.wasOpen, note: "No tab was closed." }));
+      }
       case "adopt_tab": {
         const { tabId } = a("adopt_tab");
         const tab = await this.api.tabs.get(tabId);
         if (!tab) throw new ToolError("tab_closed", `Tab ${tabId} no longer exists.`);
         if (this.tabs.inGrantedGroup(session.id, session.identity, tab)) return text(`Tab ${tabId} is in a group granted to this session and is already usable.`);
         if (this.tabs.grantee(tab.groupId) !== undefined) throw new ToolError("forbidden_tab", `Tab ${tabId} is in a group the user granted to another session.`);
+        const savedName = await this.tabs.savedNameOfGroup(tab.groupId);
+        if (savedName !== undefined) throw new ToolError("forbidden_tab", `Tab ${tabId} is in the saved group "${savedName}". Use open_group to use it.`);
         const owner = this.tabs.ownerOf(tabId);
         if (owner !== undefined && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} belongs to another session.`);
         this.throwIfAborted(sig);
@@ -481,6 +504,12 @@ export class Executor {
   }
 
   /** Fails before anything changes when this Chrome has no split view. */
+  private groupName(name: string): string {
+    const key = name.trim();
+    if (key === "" || key.length > 100) throw new ToolError("bad_args", "name must have 1 to 100 characters.");
+    return key;
+  }
+
   private requireSplit(): void {
     if (!this.api.tabs.splitSupported()) throw new ToolError("bad_args", splitUnsupported().message);
   }

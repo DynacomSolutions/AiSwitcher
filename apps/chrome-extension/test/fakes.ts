@@ -1,5 +1,5 @@
 import { splitUnsupported } from "../src/background/chrome-api.ts";
-import type { ChromeApi, TabInfo } from "../src/background/chrome-api.ts";
+import type { ChromeApi, GroupColor, TabInfo } from "../src/background/chrome-api.ts";
 
 export class FakeChrome implements ChromeApi {
   store: Record<string, unknown> = {};
@@ -83,7 +83,7 @@ export class FakeChrome implements ChromeApi {
       this.createdActive.push(false);
       const base = opts?.splitWithTabId === undefined ? undefined : this.tabList.get(opts.splitWithTabId);
       if (opts?.splitWithTabId !== undefined && (!base || base.splitViewId !== -1)) throw new Error("Cannot split with this tab.");
-      const t = this.addTab(this.nextTab++, url ?? "chrome://newtab/", "T", base ? (opts?.windowId ?? 1) : 1);
+      const t = this.addTab(this.nextTab++, url ?? "chrome://newtab/", "T", opts?.windowId ?? 1);
       if (base) {
         // Chrome opens the new tab right after the base tab, in its group, in a split with it.
         const ids = this.order(base.windowId).filter(id => id !== t.id);
@@ -162,7 +162,7 @@ export class FakeChrome implements ChromeApi {
   private groupLive(id: number): boolean { return [...this.tabList.values()].some(t => t.groupId === id); }
   tabGroups = {
     update: async (id: number, p: { title: string; color: string }) => { this.groups.set(id, p); },
-    get: async (id: number) => (this.groupLive(id) ? { id, title: this.groups.get(id)?.title ?? "" } : undefined),
+    get: async (id: number) => (this.groupLive(id) ? { id, title: this.groups.get(id)?.title ?? "", color: this.groups.get(id)?.color as GroupColor | undefined } : undefined),
     queryByTitle: async (title: string) => [...this.groups].filter(([id, g]) => g.title === title && this.groupLive(id)).map(([id, g]) => ({ id, title: g.title })),
   };
   debugger = {

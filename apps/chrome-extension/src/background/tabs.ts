@@ -1,4 +1,5 @@
 // Tab ownership: Map<sessionId, {groupId, tabIds}>, one Chrome tab group per agent session.
+import { UnsupportedApiError } from "./chrome-api.ts";
 import type { ChromeApi, GroupColor, TabInfo } from "./chrome-api.ts";
 
 /** `adopted` is the subset of `tabIds` the session did not create itself (adopt_tab, or tabs opened inside a user-granted group): they outlive it. */
@@ -8,6 +9,9 @@ export interface SessionRef { id: string; identity: string; label: string }
 const SESSIONS_KEY = "sessions";
 const GRANTS_KEY = "grants";
 const HANDOVER_KEY = "handover";
+const SAVED_KEY = "savedGroups";
+/** Tab changes in a saved group are written to its snapshot after this quiet time, so closing a whole group never shrinks the snapshot tab by tab. */
+const SAVED_REFRESH_MS = 1500;
 /** A handover older than this is from an earlier browser run: tab ids no longer mean anything. */
 const HANDOVER_MAX_AGE_MS = 5 * 60_000;
 /** No call for this long: the session is treated as ended, its grants are revoked and it is dropped when it holds no tabs. */
@@ -23,14 +27,217 @@ export function colorForIdentity(identity: string): GroupColor {
 
 export type GrantResult = "ok" | "no_session" | "no_group" | "in_use";
 
+/** One tab of a saved group. `split` is a pair label (1, 2, ...) shared by the two tabs of a split view; absent when the tab is not in one. */
+export interface SavedTab { url: string; title: string; split?: number }
+/** A named tab group that outlives the agent session. `groupId` is -1 while the group is closed. `tabIds` are the live tab ids, used to check that a group id still means this group. */
+export interface SavedGroup { name: string; title: string; color: GroupColor; groupId: number; tabIds: number[]; tabs: SavedTab[] }
+export type SaveResult = { ok: true; groupId: number; tabCount: number } | { ok: false; code: "bad_args" | "forbidden_tab"; message: string };
+export type OpenResult =
+  | { ok: true; name: string; groupId: number; tabs: Array<{ tabId: number; url: string; splitViewId?: number }>; warnings: string[] }
+  | { ok: false; code: "bad_args" | "forbidden_tab"; message: string };
+export type ForgetResult = { ok: true; wasOpen: boolean } | { ok: false; code: "bad_args" | "forbidden_tab"; message: string };
+
 export class TabManager {
   readonly sessions = new Map<string, SessionTabs>();
   /** User-granted tab groups: groupId -> session id. The group is never renamed, recoloured or closed by the session. */
   private readonly grants = new Map<number, string>();
   private readonly lastSeen = new Map<string, number>();
+  /** Saved groups by name, shared by every session of this browser. Persisted in chrome.storage.local. */
+  private readonly saved = new Map<string, SavedGroup>();
+  private readonly opening = new Set<string>();
+  private savedTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly api: ChromeApi, private readonly now: () => number = Date.now) {
-    api.tabs.onRemoved(tabId => this.forget(tabId));
+    api.tabs.onRemoved(tabId => { this.forget(tabId); this.scheduleSavedRefresh(); });
+  }
+
+  // ---- saved groups ------------------------------------------------------
+
+  /** Saved groups with their live state. A group id that no longer means the saved group (browser restart) counts as closed. */
+  async savedGroups(): Promise<Array<{ name: string; groupId: number; open: boolean; tabCount: number }>> {
+    const out = [];
+    for (const g of this.saved.values()) {
+      const live = await this.liveTabs(g);
+      out.push({ name: g.name, groupId: live ? g.groupId : -1, open: live !== undefined, tabCount: live ? live.length : g.tabs.length });
+    }
+    return out;
+  }
+
+  /** The saved group that an open Chrome group belongs to, or undefined. Used to keep other sessions from adopting its tabs. */
+  async savedNameOfGroup(groupId: number): Promise<string | undefined> {
+    if (groupId === -1) return undefined;
+    for (const g of this.saved.values()) if (g.groupId === groupId && await this.liveTabs(g)) return g.name;
+    return undefined;
+  }
+
+  /** The live tabs of a saved group in strip order, or undefined when the group is closed. */
+  private async liveTabs(g: SavedGroup): Promise<TabInfo[] | undefined> {
+    if (g.groupId === -1 || !(await this.api.tabGroups.get(g.groupId))) return undefined;
+    const members = (await this.api.tabs.query()).filter(t => t.groupId === g.groupId);
+    if (members.length === 0 || !members.some(t => g.tabIds.includes(t.id))) return undefined; // the id now belongs to another group
+    return members.sort((x, y) => x.windowId - y.windowId || x.index - y.index);
+  }
+
+  private async loadSaved(): Promise<void> {
+    const raw = (await this.api.storage.get([SAVED_KEY]))[SAVED_KEY];
+    if (!Array.isArray(raw)) return;
+    for (const e of raw as SavedGroup[]) {
+      if (typeof e?.name !== "string" || !Array.isArray(e.tabs)) continue;
+      const g: SavedGroup = { ...e, tabIds: Array.isArray(e.tabIds) ? e.tabIds : [] };
+      // After a browser restart the ids are new. The group only counts as open when its id still names a group with the saved title.
+      const info = g.groupId === -1 ? undefined : await this.api.tabGroups.get(g.groupId);
+      if (!info || info.title !== g.title || !(await this.liveTabs(g))) g.groupId = -1;
+      this.saved.set(g.name, g);
+    }
+    await this.persistSaved();
+  }
+
+  private async persistSaved(): Promise<void> {
+    await this.api.storage.set({ [SAVED_KEY]: [...this.saved.values()] }).catch(() => {});
+  }
+
+  private async snapshotOf(g: SavedGroup, members: TabInfo[]): Promise<void> {
+    const labels = new Map<number, number>();
+    for (const t of members) if (t.splitViewId !== -1 && !labels.has(t.splitViewId)) labels.set(t.splitViewId, labels.size + 1);
+    g.tabs = members.map(t => ({ url: t.url, title: t.title, ...(t.splitViewId !== -1 ? { split: labels.get(t.splitViewId)! } : {}) }));
+    g.tabIds = members.map(t => t.id);
+    const info = await this.api.tabGroups.get(g.groupId);
+    if (info) { g.title = info.title; if (info.color) g.color = info.color; }
+  }
+
+  /** Writes the live state of every open saved group to its snapshot. A group with no live tab keeps its last snapshot. */
+  async refreshSaved(): Promise<void> {
+    let changed = false;
+    for (const g of this.saved.values()) {
+      const live = await this.liveTabs(g);
+      if (!live) continue;
+      await this.snapshotOf(g, live);
+      changed = true;
+    }
+    if (changed) await this.persistSaved();
+  }
+
+  /** Called after a tab of a saved group may have changed (created, closed, moved, navigated). Debounced. */
+  scheduleSavedRefresh(): void {
+    if (this.saved.size === 0) return;
+    if (this.savedTimer !== undefined) clearTimeout(this.savedTimer);
+    this.savedTimer = setTimeout(() => { this.savedTimer = undefined; void this.refreshSaved().catch(() => {}); }, SAVED_REFRESH_MS);
+  }
+
+  /**
+   * Saves the session's own group (no groupId) or a group granted to it under `name`. The group is then held for the owner:
+   * the session gets it as a grant, so its end never closes or ungroups the tabs, and the session gets a fresh own group next time.
+   */
+  save(ref: SessionRef, name: string, groupId?: number): Promise<SaveResult> {
+    return this.serial(ref.id, async () => {
+      const s = this.sessions.get(ref.id);
+      if (!s || s.identity !== ref.identity) return { ok: false, code: "bad_args", message: "This session has no tab group yet. Open a tab with tabs_create first." };
+      const own = groupId === undefined || groupId === s.groupId;
+      const gid = groupId ?? s.groupId;
+      if (own && s.groupId === -1) return { ok: false, code: "bad_args", message: "This session has no tab group yet. Open a tab with tabs_create first." };
+      if (!own && this.grants.get(gid) !== ref.id) return { ok: false, code: "forbidden_tab", message: `Group ${gid} is not this session's own group and is not granted to it.` };
+      const info = await this.api.tabGroups.get(gid);
+      if (!info) return { ok: false, code: "bad_args", message: `Group ${gid} no longer exists.` };
+      for (const g of this.saved.values()) {
+        if (g.groupId === gid && g.name !== name && await this.liveTabs(g)) return { ok: false, code: "bad_args", message: `This group is already saved as "${g.name}". Use forget_group first to save it under another name.` };
+      }
+      const same = this.saved.get(name);
+      if (same && same.groupId !== gid && await this.liveTabs(same)) return { ok: false, code: "bad_args", message: `The name "${name}" belongs to another group that is open. Choose another name.` };
+      const members = (await this.api.tabs.query()).filter(t => t.groupId === gid).sort((x, y) => x.windowId - y.windowId || x.index - y.index);
+      const color = info.color ?? colorForIdentity(ref.identity);
+      if (own) await this.api.tabGroups.update(gid, { title: name, color });
+      const entry: SavedGroup = { name, title: own ? name : info.title, color, groupId: gid, tabIds: [], tabs: [] };
+      await this.snapshotOf(entry, members);
+      this.saved.set(name, entry);
+      this.grants.set(gid, ref.id);
+      if (own) {
+        for (const t of members) if (s.tabIds.has(t.id)) s.adopted.add(t.id); // now the owner's: they outlive the session
+        s.groupId = -1;
+      }
+      this.persist();
+      await this.persistSaved();
+      return { ok: true, groupId: gid, tabCount: members.length };
+    });
+  }
+
+  /** Opens a saved group for the session: grants the open group, or recreates a closed one (inactive tabs, saved order, split views). */
+  open(ref: SessionRef, name: string): Promise<OpenResult> {
+    return this.serial(ref.id, async () => {
+      const g = this.saved.get(name);
+      if (!g) return { ok: false, code: "bad_args", message: `No saved group named "${name}". See savedGroups in tabs_context.` };
+      if (this.opening.has(name)) return { ok: false, code: "forbidden_tab", message: `Group "${name}" is in use: another session is opening it.` };
+      this.opening.add(name);
+      try {
+        const warnings: string[] = [];
+        const live = await this.liveTabs(g);
+        if (live) {
+          const r = await this.grant(g.groupId, ref.id);
+          if (r === "in_use") return { ok: false, code: "forbidden_tab", message: `Group "${name}" is in use by another session.` };
+          if (r !== "ok") return { ok: false, code: "bad_args", message: `Group "${name}" could not be opened (${r}).` };
+          await this.snapshotOf(g, live);
+          await this.persistSaved();
+          return { ok: true, name, groupId: g.groupId, tabs: live.map(t => ({ tabId: t.id, url: t.url, ...(t.splitViewId !== -1 ? { splitViewId: t.splitViewId } : {}) })), warnings };
+        }
+        return await this.recreate(ref, g, warnings);
+      } finally {
+        this.opening.delete(name);
+      }
+    });
+  }
+
+  private async recreate(ref: SessionRef, g: SavedGroup, warnings: string[]): Promise<OpenResult> {
+    const s = this.session(ref);
+    const made: Array<{ id: number; saved: SavedTab }> = [];
+    let windowId: number | undefined;
+    for (const saved of g.tabs) {
+      try {
+        const tab = await this.api.tabs.create(saved.url === "" ? undefined : saved.url, windowId === undefined ? undefined : { windowId });
+        windowId ??= tab.windowId;
+        made.push({ id: tab.id, saved });
+        s.tabIds.add(tab.id);
+        s.adopted.add(tab.id); // in a group held for the owner: stays open when the session ends
+      } catch (e) {
+        warnings.push(`Could not open ${saved.url}: ${e instanceof Error ? e.message : "unknown error"}`);
+      }
+    }
+    if (made.length === 0) {
+      this.persist();
+      return { ok: false, code: "bad_args", message: `Group "${g.name}" has no tab that could be opened again.` };
+    }
+    const groupId = await this.api.tabs.group(made.map(m => m.id));
+    await this.api.tabGroups.update(groupId, { title: g.title, color: g.color });
+    const pairs = new Map<number, number[]>();
+    for (const m of made) if (m.saved.split !== undefined) pairs.set(m.saved.split, [...(pairs.get(m.saved.split) ?? []), m.id]);
+    let splitSkipped = false;
+    for (const ids of pairs.values()) {
+      if (ids.length !== 2) continue;
+      if (!this.api.tabs.splitSupported()) { splitSkipped = true; continue; }
+      try { await this.api.tabs.createSplit([ids[0]!, ids[1]!]); } catch (e) {
+        if (e instanceof UnsupportedApiError) splitSkipped = true;
+        else warnings.push(`Could not restore a split view: ${e instanceof Error ? e.message : "unknown error"}`);
+      }
+    }
+    if (splitSkipped) warnings.push("Split views were not restored: this Chrome has no split view support (Chrome 155 or later).");
+    g.groupId = groupId;
+    this.grants.set(groupId, ref.id);
+    const members = (await this.api.tabs.query()).filter(t => t.groupId === groupId).sort((x, y) => x.windowId - y.windowId || x.index - y.index);
+    g.tabIds = members.map(t => t.id); // the saved tab list and its split pairing stay as saved, even when a tab or a split view could not be restored
+    this.persist();
+    await this.persistSaved();
+    return { ok: true, name: g.name, groupId, tabs: members.map(t => ({ tabId: t.id, url: t.url, ...(t.splitViewId !== -1 ? { splitViewId: t.splitViewId } : {}) })), warnings };
+  }
+
+  /** Deletes a saved group. An open group is released to the user (grant revoked); its tabs are never closed. */
+  async forgetSaved(ref: SessionRef, name: string): Promise<ForgetResult> {
+    const g = this.saved.get(name);
+    if (!g) return { ok: false, code: "bad_args", message: `No saved group named "${name}".` };
+    const open = (await this.liveTabs(g)) !== undefined;
+    const holder = open ? this.grants.get(g.groupId) : undefined;
+    if (holder !== undefined && holder !== ref.id) return { ok: false, code: "forbidden_tab", message: `Group "${name}" is in use by another session.` };
+    this.saved.delete(name);
+    if (open && holder === ref.id) this.revoke(g.groupId);
+    await this.persistSaved();
+    return { ok: true, wasOpen: open };
   }
 
   // ---- grants ------------------------------------------------------------
@@ -148,6 +355,7 @@ export class TabManager {
       s.tabIds.add(tab.id);
       s.adopted.add(tab.id); // sits in the user's group: stays open when the session ends
       try { await this.api.tabs.group([tab.id], groupId); } finally { this.persist(); }
+      this.scheduleSavedRefresh();
       return tab;
     });
   }
@@ -193,6 +401,7 @@ export class TabManager {
 
   /** Rebuild ownership and grants after a service-worker restart or a self-update reload; tabs and groups that no longer exist are dropped. */
   async load(): Promise<void> {
+    await this.loadSaved();
     let stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY]);
     const handed = (await this.api.storage.get([HANDOVER_KEY]))[HANDOVER_KEY] as ({ at?: number } & Record<string, unknown>) | undefined;
     if (handed) {
@@ -247,6 +456,7 @@ export class TabManager {
     const out = new Set<number>();
     for (const [id, s] of this.sessions) if (id !== except && s.groupId !== -1) out.add(s.groupId);
     for (const gid of this.grants.keys()) out.add(gid); // a granted group belongs to the user, never adopted as an agent group
+    for (const g of this.saved.values()) if (g.groupId !== -1) out.add(g.groupId); // a saved group is held for the owner, never re-adopted by a session with the same title
     return out;
   }
 

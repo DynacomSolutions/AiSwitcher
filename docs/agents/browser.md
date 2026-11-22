@@ -84,7 +84,7 @@ Deploy: the gateway image must contain this code. No new config is needed. The d
 
 ## Tools
 
-`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `split_tabs`, `unsplit_tabs`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
+`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `split_tabs`, `unsplit_tabs`, `save_group`, `open_group`, `forget_group`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
 
 Split view (two tabs side by side) needs Chrome 155 or later. Older Chrome versions fail these calls with `bad_args` and the message "Split view needs Chrome 155 or later. This Chrome is <version>."
 
@@ -92,6 +92,18 @@ Split view (two tabs side by side) needs Chrome 155 or later. Older Chrome versi
 - `unsplit_tabs {tabId}` ends the split view that holds the tab. Every tab of that split view must be in the session or a granted group, else `forbidden_tab`. The tabs stay open.
 - `tabs_create {splitWithTabId}` opens the new tab in a split view with a tab of the session. The new tab stays in the background and joins the group of that tab: tracked as a created tab in the session group, or as a tab in the granted group (it stays open when the session ends). It cannot be combined with `groupId`.
 - `tabs_context` adds `splitViewId` to each tab that is in a split view.
+
+### Saved tab groups
+
+When an agent opens tabs for the user to read after the session, it saves the group. An unsaved group closes with the session.
+
+- `save_group {name, groupId?}` saves a tab group under a name. Without `groupId` it saves the session's own group and sets the Chrome title to the name (the colour stays). With `groupId` it saves a group granted to the session and keeps the user's title. Any other group fails with `forbidden_tab`. The group is then held for the owner: the session keeps it as a grant, so the session end never closes or ungroups its tabs. The session may still use it and open tabs in it. The session gets a new own group the next time it needs one. The name is the key. Saving again under the same name refreshes the snapshot. A name that belongs to another open group fails with `bad_args`.
+- `open_group {name}` opens a saved group. An open group is granted to the session (`forbidden_tab` when another live session holds it). A closed group is recreated: every tab opens inactive in one window, in the saved order, in a new group with the saved title and colour. Split pairs are restored when Chrome allows it, else a warning is returned. No tab becomes the active tab. It returns `{name, groupId, tabs: [{tabId, url, splitViewId?}]}`.
+- `forget_group {name}` deletes the saved snapshot. An open group becomes a plain group of the user (the grant is revoked). It never closes a tab. It fails with `forbidden_tab` when another live session holds the group.
+- `tabs_context` adds `savedGroups: [{name, groupId, open, tabCount}]`. `groupId` is -1 for a closed group.
+- `adopt_tab` refuses a tab that sits in an open saved group (`forbidden_tab`): use `open_group`.
+
+Storage: the snapshots (name, title, colour, and the ordered tabs with url, title and split pairing) are in `chrome.storage.local`, so they survive extension reloads and browser restarts. The snapshot is refreshed by `save_group`, `open_group`, tabs the session opens in the group, and tab removal. A write waits 1.5 seconds after the last change, so closing a whole group keeps the full list. After a browser restart the old group id is invalid: a saved group counts as open only when its id still names a group with the saved title and one of its saved tab ids. Saved groups are shared by all sessions of one browser binding, but a live session holds a group at most once.
 
 `resize` emulates the tab's viewport over CDP (`Emulation.setDeviceMetricsOverride`, like DevTools responsive mode). It never resizes or moves the browser window. The override ends when the session detaches.
 
@@ -101,7 +113,7 @@ Close a tab only when the work in it is fully finished. A tab that waits for the
 
 - Do not call `close_tab` on a tab while a step in it waits for the owner. Examples: a sign-in, a 2FA code, "Verify that it's you", a CAPTCHA, a consent or payment page, a manual review, or a question to the owner about that page. Leave the tab open on the page the owner must use.
 - Before you ask the owner, make sure that the tab shows the page the owner needs (`tabs_context` or `screenshot`). In the question, give the browser profile (`profileLabel` from `list_browsers`) and the tab title, so that the owner can find the tab.
-- Keep the session alive while you wait. When the agent session ends, the extension closes the tabs the session created.
+- Keep the session alive while you wait. When the agent session ends, the extension closes the tabs the session created, except the tabs of a saved group (`save_group`).
 - Close a tab only when the work in it is finished and verified, and neither the owner nor the agent needs it again. A move to a different step is not the end of the work in the tab.
 - If you closed a tab by mistake, open it again on the correct page (`tabs_create` with the URL) before you ask the owner to act.
 - At the true end of the task, close the tabs the session opened.

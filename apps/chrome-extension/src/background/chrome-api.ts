@@ -17,9 +17,9 @@ interface SplitTabsApi {
   SPLIT_VIEW_ID_NONE?: number;
 }
 
-export interface GroupInfo { id: number; title: string }
-
 export type GroupColor = "grey" | "blue" | "red" | "yellow" | "green" | "pink" | "purple" | "cyan" | "orange";
+
+export interface GroupInfo { id: number; title: string; color?: GroupColor }
 
 export interface ChromeApi {
   storage: {
@@ -101,8 +101,8 @@ export function realChromeApi(): ChromeApi {
         if (opts?.splitWithTabId !== undefined) {
           if (typeof (chrome.tabs as unknown as SplitTabsApi).createSplit !== "function") throw splitUnsupported();
           props.splitWithTabId = opts.splitWithTabId;
-          if (opts.windowId !== undefined) props.windowId = opts.windowId; // the base tab's window, not the focused one
         }
+        if (opts?.windowId !== undefined) props.windowId = opts.windowId; // the base tab's window (split) or the window of a restored group, not the focused one
         try {
           return toTab(await chrome.tabs.create(props as chrome.tabs.CreateProperties));
         } catch (e) {
@@ -138,7 +138,7 @@ export function realChromeApi(): ChromeApi {
     tabGroups: {
       update: async (groupId, props) => { await chrome.tabGroups.update(groupId, props); },
       get: async groupId => {
-        try { const g = await chrome.tabGroups.get(groupId); return { id: g.id, title: g.title ?? "" }; } catch { return undefined; }
+        try { const g = await chrome.tabGroups.get(groupId); return { id: g.id, title: g.title ?? "", color: g.color }; } catch { return undefined; }
       },
       queryByTitle: async title => (await chrome.tabGroups.query({ title })).map(g => ({ id: g.id, title: g.title ?? "" })),
     },
