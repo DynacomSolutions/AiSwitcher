@@ -146,11 +146,12 @@ test("preload under plain node leaves fetch untouched and exports the decision",
   const file = t3Paths(s.opts).preload;
   const p = Bun.spawnSync(
     ["node", "--require", file, "-e", "const f=globalThis.fetch;const k=require(process.argv[1]);console.log(JSON.stringify({same:f===globalThis.fetch,t3:k.isT3Exe(process.execPath)}))", file],
-    { env: { ...process.env, AIS_T3_ANTHROPIC_PROXY: "http://127.0.0.1:9" } },
+    { env: { ...process.env, AIS_T3_ANTHROPIC_PROXY: "http://127.0.0.1:9" }, timeout: 25_000 },
   );
   expect(p.stderr.toString()).toBe("");
   expect(p.stdout.toString().trim()).toBe('{"same":true,"t3":false}');
-});
+  // A cold node start on a busy CI runner can take over the 5 s default, so allow 30 s.
+}, 30_000);
 
 test("preload decision accepts only the T3 runtime binary path", async () => {
   const s = await scratch();
