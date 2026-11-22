@@ -52,7 +52,9 @@ test("a backup lock held by a live process is reported, not waited on silently",
     await runBackup([], home, join(home, "none.json")).catch(() => undefined);
     expect(err.mock.calls.map((c) => String(c[0])).join("\n")).toContain(`another backup (pid ${process.pid}) holds`);
   } finally { err.mockRestore(); }
-});
+  // runBackup polls every 200 ms after the lock goes, then runs a real backup of the scratch home.
+  // On a busy CI runner that took over the 5 s default, so allow 20 s.
+}, 20_000);
 
 test("update runs the agent-guard check and prints one line", async () => {
   const log = spyOn(console, "log").mockImplementation(() => {});

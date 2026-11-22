@@ -248,7 +248,15 @@ describe("github output mode", () => {
         const index = line.indexOf("=");
         return [line.slice(0, index), line.slice(index + 1)];
       }));
-      const diff = diffChanges(base, head, ROOT)!;
+      const diff = diffChanges(base, head, ROOT);
+      if (!diff) {
+        // A shallow clone has no merge base, so the diff cannot be read. The script fails open.
+        expect(outputs.tests).toBe("all");
+        expect(outputs.macos).toBe("true");
+        expect(outputs.extension).toBe("true");
+        expect(outputs.web).toBe("true");
+        return;
+      }
       const changed = filterVersionOnlyBump(diff.paths, showFile(base, "package.json", ROOT), showFile(head, "package.json", ROOT));
       const expected = selectChanges(changed, { hasDeletions: diff.hasDeletions });
       expect(outputs.macos).toBe(String(expected.macos));
