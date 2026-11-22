@@ -32,6 +32,7 @@ describe("chat metrics", () => {
     expect(out).toContain('ais_gateway_chat_sessions_total{event="other"} 1');
     expect(out).toContain('ais_gateway_chat_turns_total{outcome="other"} 1');
     expect(out).toContain('ais_gateway_chat_errors_total{kind="other"} 1');
+    expect(out).not.toContain("bogus");
   });
 
   test("noopMetrics has the four methods", () => {

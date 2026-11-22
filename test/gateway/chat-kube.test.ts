@@ -13,7 +13,7 @@ import { FAKE_GROUP, FAKE_NAMESPACE, FAKE_TOKEN, FakeKubeServer } from "./fixtur
 const root = mkdtempSync(join(tmpdir(), "ais-chat-kube-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-const env = { group: FAKE_GROUP, namespace: FAKE_NAMESPACE, node: "node-a", configMap: "runtime-config" };
+const env = { group: FAKE_GROUP, namespace: FAKE_NAMESPACE, node: "node-a", configMap: "runtime-config", class: "chat" };
 const CHAT = "0b6f3c2a-1111-4222-8333-444455556666";
 const input = (over: Partial<PodSpecInput> = {}): PodSpecInput => ({ chatId: CHAT, generation: 1, provider: "claude", identity: "alpha", ...over });
 
@@ -103,7 +103,7 @@ test("buildChatSession sets workspace chat, the created-by label, the chat-id la
   expect(obj.metadata.namespace).toBe(FAKE_NAMESPACE);
   expect(obj.metadata.labels).toEqual({ [`${FAKE_GROUP}/created-by`]: "ais-gateway", [`${FAKE_GROUP}/chat-id`]: CHAT });
   expect(obj.metadata.annotations).toEqual({ [`${FAKE_GROUP}/client-seen`]: "1234" });
-  expect(obj.spec).toEqual({ workspace: "chat", provider: "claude", identity: "alpha", node: "node-a", args: ACP_ARGS.claude });
+  expect(obj.spec).toEqual({ workspace: "chat", provider: "claude", identity: "alpha", node: "node-a", class: "chat", args: ACP_ARGS.claude });
   const text = JSON.stringify(obj).toLowerCase();
   expect(text).not.toContain("secret");
   expect(text).not.toContain("token");

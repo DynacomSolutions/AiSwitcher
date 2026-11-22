@@ -27,7 +27,9 @@ export interface PodTransport {
   catalog(): Promise<AgentRuntimeConfig>;
 }
 
-export interface KubeConfigEnv { group: string; namespace: string; node: string; configMap: string }
+export interface KubeConfigEnv { group: string; namespace: string; node: string; configMap: string;
+  /** Value of `spec.class` on every chat AgentSession. Read from `AIS_GATEWAY_CHAT_CLASS`. */
+  class: string }
 
 export const sessionName = (chatId: string, generation: number): string => `chat-${chatId.replace(/-/g, "").slice(0, 8)}-${generation}`;
 export const ACP_ARGS: Record<ChatProvider, string[]> = { claude: ["claude-code-acp"], codex: ["codex-acp"], kimi: [], grok: [], zai: [], opencode: [] };
@@ -44,7 +46,7 @@ export function buildChatSession(i: PodSpecInput, env: KubeConfigEnv, nowS: numb
       labels: { [`${g}/created-by`]: "ais-gateway", [`${g}/chat-id`]: i.chatId },
       annotations: { [`${g}/client-seen`]: String(nowS), ...(startId ? { [`${g}/start-id`]: startId } : {}) },
     },
-    spec: { workspace: "chat", provider: i.provider, identity: i.identity, node: env.node, args: ACP_ARGS[i.provider] },
+    spec: { workspace: "chat", provider: i.provider, identity: i.identity, node: env.node, class: env.class, args: ACP_ARGS[i.provider] },
   };
 }
 

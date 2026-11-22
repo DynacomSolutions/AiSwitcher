@@ -4,7 +4,9 @@ import { BROWSER_ERROR_CODES, BROWSER_TOOLS } from "../browser/protocol.ts";
 export const MCP_METHOD_LABELS = ["initialize", "ping", "tools/list", "tools/call", "notification", "delete", "get", "other"] as const;
 export const MCP_OUTCOME_LABELS = ["ok", "tool_error", "unauthorised", "bad_request", "forbidden", "error"] as const;
 /** Fixed label sets of the chat metrics. */
+/** Event labels. `other` is the overflow label for unknown values. */
 export const CHAT_EVENT_LABELS = ["session_created", "session_closed", "session_resumed", "idle_closed"] as const;
+/** Outcome labels. `other` is the overflow label for unknown values. */
 export const CHAT_OUTCOME_LABELS = ["ok", "cancelled", "error"] as const;
 export const CHAT_ERROR_KINDS = ["pod_start", "attach", "agent_exit", "acp", "timeout", "limit", "resume_failed", "other"] as const;
 /** Counters the proxy reports. `PrometheusMetrics` is the production implementation. */
