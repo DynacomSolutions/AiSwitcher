@@ -191,6 +191,14 @@ const clearTimeoutSafe = (t: Timers, h: unknown): void => {
   if (h !== undefined) t.clearTimeout(h);
 };
 
+/** The note that tells the agent which Chrome tabs the chat is linked to. */
+export function browserContext(tabIds: number[]): string {
+  if (tabIds.length === 0) {
+    return "Browser context from the AIS side panel: no Chrome tab is linked to this chat. If the user asks about a page, tell them to link a tab in the side panel.";
+  }
+  return `Browser context from the AIS side panel: this chat is linked to the Chrome tab ids ${tabIds.join(", ")}. When the user says "this page", "the page" or "the linked page", they mean these tabs. Use the ${MCP_NAME} MCP tools to see them: tabs_context lists them, read_page and screenshot read one.`;
+}
+
 export class ChatBroker implements ChatAuth {
   private readonly runtimes = new Map<string, ChatRuntime>();
   private readonly starting = new Map<string, { promise: Promise<ChatRuntime | undefined>; ac: AbortController; ending?: boolean }>();
@@ -1272,7 +1280,10 @@ export class ChatBroker implements ChatAuth {
     ctx.lastActive = this.d.now();
     this.setState(ctx, "thinking");
     try {
-      const r = await rt.acp.prompt(rt.sessionId, text);
+      // Links change between turns, so read the current record. The context goes to the agent only: it is never stored or logged.
+      const cur = await this.d.store.get(rt.chatId).catch(() => undefined);
+      // A failed read sends no note: a wrong "no tab is linked" note is worse than none.
+      const r = await rt.acp.prompt(rt.sessionId, text, cur === undefined ? undefined : browserContext(cur.tabIds));
       this.push(ctx, { k: "turn_end", stopReason: shortField(r.stopReason) });
       metrics.chatTurn(r.stopReason === "cancelled" || ctx.cancelRequested ? "cancelled" : "ok");
     } catch (e) {

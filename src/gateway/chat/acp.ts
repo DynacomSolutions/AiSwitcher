@@ -189,8 +189,10 @@ export class AcpClient {
     }
   }
 
-  async prompt(sessionId: string, text: string): Promise<{ stopReason: string }> {
-    const r = await this.request("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
+  /** The optional context goes first as its own text block. The user's text stays unchanged in the last block. */
+  async prompt(sessionId: string, text: string, context?: string): Promise<{ stopReason: string }> {
+    const blocks = context ? [{ type: "text", text: context }, { type: "text", text }] : [{ type: "text", text }];
+    const r = await this.request("session/prompt", { sessionId, prompt: blocks });
     const stopReason = isObj(r) ? str(r.stopReason) : undefined;
     if (!stopReason) throw new AcpError(-32603, "session/prompt returned no stopReason");
     return { stopReason };
