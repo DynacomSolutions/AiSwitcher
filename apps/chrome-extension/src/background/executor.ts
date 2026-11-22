@@ -1,3 +1,4 @@
+import { GroupPrompt } from "./group-prompt.ts";
 import { DEFAULT_CALL_TIMEOUT_MS, SESSION_END_TOOL, WAIT_CALL_TIMEOUT_MS } from "../../../../src/browser/protocol.ts";
 import type { BrowserErrorCode, CallRequest, CallResult } from "../../../../src/browser/protocol.ts";
 import { TOOL_SCHEMAS, validateToolArgs } from "../../../../src/browser/tool-args.ts";
@@ -113,6 +114,8 @@ export interface ExecutorDeps {
   attachAnswerMs?: number;
   /** A chat session's link set changed (a tab it created): the gateway must hear of it before the call result. */
   onLinks?: (sessionId: string, tabIds: number[]) => void | Promise<void>;
+  /** How long request_group waits for the user (tests shorten it). */
+  groupPromptMs?: number;
 }
 
 export class Executor {
@@ -121,6 +124,8 @@ export class Executor {
   private readonly state: State;
   private readonly ui: Ui;
   private readonly onLinks: (sessionId: string, tabIds: number[]) => void | Promise<void>;
+  private readonly groupPrompt: GroupPrompt;
+  private readonly groupPromptMs: number;
   /** Per tab: the tail of the calls of chat sessions, so chats that share a tab never run on it at the same time. */
   private readonly tabLocks = new Map<number, Promise<void>>();
   private readonly attached = new Set<number>();
@@ -153,6 +158,8 @@ export class Executor {
     this.state = deps.state;
     this.ui = deps.ui ?? noopUi;
     this.onLinks = deps.onLinks ?? (() => {});
+    this.groupPrompt = new GroupPrompt(deps.api);
+    this.groupPromptMs = deps.groupPromptMs ?? 120_000;
     if (deps.onLinks) this.tabs.onLinksChanged = deps.onLinks;
     this.sleepFn = deps.sleep ?? ((ms, signal) => new Promise<void>((resolve, reject) => {
       const t = setTimeout(resolve, ms);
@@ -203,6 +210,7 @@ export class Executor {
     await this.tabs.regrant(req.session).catch(() => {});
     await this.tabs.reclaim(req.session).catch(() => {});
     const controller = this.state.track(id, req.session.id, req.session.identity);
+    this.tabs.callStarted(req.session.id);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : this.defaultTimeout;
     const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
     const aborted = new Promise<never>((_, reject) => {
@@ -219,6 +227,7 @@ export class Executor {
       return fail("internal", e instanceof Error ? e.message : "Unknown error");
     } finally {
       clearTimeout(timer);
+      this.tabs.callEnded(req.session.id);
       this.state.untrack(id);
     }
   }
@@ -229,7 +238,7 @@ export class Executor {
     if (!s || s.identity === req.session.identity) this.state.resumeSession(req.session.id, req.session.identity);
     if (s && s.identity !== req.session.identity) return { id: req.id, ok: true, content: [{ type: "text", text: "no such session" }] };
     const tabIds = s ? [...s.tabIds] : [];
-    await this.tabs.closeSession(req.session.id);
+    await this.tabs.closeSession(req.session.id, req.session.identity);
     if (req.session.chat === true) this.tabs.dropChat(req.session.id);
     await Promise.all(tabIds.map(async tabId => { await this.detach(tabId); await this.unmark(tabId); }));
     return { id: req.id, ok: true, content: [{ type: "text", text: "session ended" }] };
@@ -263,7 +272,7 @@ export class Executor {
         const mineGroup = this.tabs.sessions.get(session.id)?.groupId;
         // `scope` and `grantedGroups` are additive: "own" tabs are in this session's own group, "granted" tabs sit in a group the user granted.
         const ownView = (t: TabInfo) => (t.groupId !== -1 && t.groupId !== mineGroup && this.tabs.grantee(t.groupId) === session.id ? grantedView(t) : { ...actionable(t), scope: "own" });
-        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), groups: await this.tabs.groupsOverview(session.id), savedGroups: await this.tabs.savedGroups(session.identity), note: "groupId is -1 for a tab that is in no group. groups lists every open tab group: scope own is the group of this session, granted is a group the user granted, saved is a saved group, other is any other group. otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group. savedGroups are named groups that outlive a session: open one with open_group. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
+        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), groups: await this.tabs.groupsOverview(session.id), savedGroups: await this.tabs.savedGroups(session.identity), note: "groupId is -1 for a tab that is in no group. A group in groups with scope other can be asked for with request_group (the user must approve). groups lists every open tab group: scope own is the group of this session, granted is a group the user granted, saved is a saved group, other is any other group. otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group. savedGroups are named groups that outlive a session: open one with open_group. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
       }
       case "tabs_create": {
         this.throwIfAborted(sig);
@@ -364,6 +373,29 @@ export class Executor {
         const r = await this.tabs.forgetSaved(session, key);
         if (!r.ok) throw new ToolError(r.code, r.message);
         return text(JSON.stringify({ name: key, forgotten: true, open: r.wasOpen, note: "No tab was closed." }));
+      }
+      case "request_group": {
+        this.throwIfAborted(sig);
+        const { groupId } = a("request_group");
+        if (session.chat === true) throw new ToolError("forbidden_tab", "A chat cannot ask for a tab group.");
+        const first = await this.tabs.checkRequest(session, groupId);
+        if (!first.ok) throw new ToolError(first.code, first.message);
+        if (first.already) return text(JSON.stringify({ groupId, already: true, note: "This group is already yours." }));
+        if (!this.tabs.beginRequest(groupId)) throw new ToolError("forbidden_tab", `Another request for group ${groupId} is waiting for the user.`);
+        let answer;
+        try {
+          answer = await this.groupPrompt.ask({
+            title: "AIS Browser: allow an agent to use a tab group?",
+            message: `Agent "${session.label}" (identity ${session.identity}) asks to use the group "${first.title}" with ${first.tabCount} tabs. The agent can read and use these tabs. It never closes them.`,
+          }, sig, this.groupPromptMs);
+        } finally {
+          this.tabs.endRequest(groupId);
+        }
+        this.throwIfAborted(sig);
+        if (answer !== "approve") throw new ToolError("forbidden_tab", answer === "timeout" ? "The user did not answer in time. Do not ask again unless the user asks." : answer === "deny" ? "The user denied access to this group. Do not ask again." : "The user closed the question without an answer. Do not ask again unless the user asks.");
+        const done = await this.tabs.takeGroup(session, groupId);
+        if (!done.ok) throw new ToolError(done.code, done.message);
+        return text(JSON.stringify({ groupId, approved: true, tabCount: done.tabCount, note: "The group is now your own group and every tab is adopted. The session end closes and ungroups none of them." }));
       }
       case "adopt_tab": {
         const { tabId } = a("adopt_tab");
@@ -554,6 +586,7 @@ export class Executor {
       case "close_tab": {
         // Only tabs this session opened or adopted: tabs that merely sit in a granted group are the user's.
         if (!this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} was not opened by this session, so it cannot be closed.`);
+        if (this.tabs.isApproved(session.id, tabId)) throw new ToolError("forbidden_tab", `Tab ${tabId} is in a group the user approved for this session. The session never closes these tabs.`);
         // Attached first, so a "Leave site?" (beforeunload) dialog that closing raises is seen and ends the call instead of hanging it.
         await this.ensureAttached(sig, tabId);
         await this.api.tabs.remove(tabId);

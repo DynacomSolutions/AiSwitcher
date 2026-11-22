@@ -219,7 +219,7 @@ describe("tabs_context lists every tab and group", () => {
 
   test("the real query merges the window lists, so no tab hides another", () => {
     const mk = (id: number) => ({ id, windowId: 1, groupId: -1, url: "", title: "", active: false, splitViewId: -1, index: id, pinned: false });
-    expect(mergeTabLists([mk(1), mk(3)], [mk(1), mk(2), mk(3), mk(4)]).map(x => x.id)).toEqual([1, 3, 2, 4]);
+    expect(mergeTabLists([mk(1), mk(3)], [mk(1), mk(2), mk(3), mk(4)]).map(x => x.id)).toEqual([1, 2, 3, 4]);
     expect(mergeTabLists([mk(-1), mk(-1)]).length).toBe(0);
   });
 
@@ -252,67 +252,160 @@ describe("tabs_context lists every tab and group", () => {
   });
 });
 
-describe("legacy reclaim of a group without a record", () => {
-  const LEGACY = { id: "sess-l", identity: "alice", label: "ContractFinder" };
-  async function legacyGroup(title = "ContractFinder", count = 4, from = 1) {
+describe("review fixes", () => {
+  test("B1: a user group titled like the chat is never taken", async () => {
     const t = setup();
-    const ids: number[] = [];
-    for (let i = 0; i < count; i++) ids.push(t.api.addTab(from + i, `https://jobs.example.com/${title}/${i}`).id);
-    const gid = await t.api.tabs.group(ids);
-    t.api.groups.set(gid, { title, color: "blue" });
-    return { t, ids, gid };
-  }
-
-  test("a new session with the label takes the group as adopted tabs, saves it and leaves the tabs alone", async () => {
-    const { t, ids, gid } = await legacyGroup();
-    const ctx = t.json(await t.call("tabs_context", {}, LEGACY));
-    expect(ctx.sessionTabs.map((x: { tabId: number }) => x.tabId)).toEqual(ids);
-    expect(ctx.groups).toEqual([{ groupId: gid, title: "ContractFinder", tabCount: 4, scope: "own" }]);
-    expect((t.api.store.agentGroups as Array<{ tabs: Array<{ adopted: boolean }> }>)[0]!.tabs.every(x => x.adopted)).toBe(true);
-    expect(t.api.moveCalls).toEqual([]);
-    expect(t.api.activations).toEqual([]);
-    expect(t.api.createdActive).toEqual([]);
-    expect((await t.call("save_group", { name: "ContractFinder" }, LEGACY)).ok).toBe(true);
+    const a = t.api.addTab(1, "https://shop.example.com/1");
+    const b = t.api.addTab(2, "https://shop.example.com/2");
+    const gid = await t.api.tabs.group([a.id, b.id]);
+    t.api.groups.set(gid, { title: "Shopping", color: "red" });
+    const S = { id: "sess-s", identity: "alice", label: "Shopping" };
+    const ctx = t.json(await t.call("tabs_context", {}, S));
+    expect(ctx.sessionTabs).toEqual([]);
+    expect(t.tabs.owns("sess-s", a.id, "alice")).toBe(false);
+    await t.call("session_end", {}, S);
+    expect(t.api.tabList.size).toBe(2);
+    expect(t.api.tabList.get(a.id)!.groupId).toBe(gid);
+    expect(t.api.tabList.get(b.id)!.groupId).toBe(gid);
   });
 
-  test("a session end closes no tab of the adopted group", async () => {
-    const { t, ids, gid } = await legacyGroup();
-    await t.call("tabs_context", {}, LEGACY);
-    await t.call("session_end", {}, LEGACY);
-    expect(t.api.tabList.size).toBe(ids.length);
-    for (const id of ids) expect(t.api.tabList.get(id)!.groupId).toBe(-1);
-    expect(gid).toBeGreaterThan(0);
+  test("B2: another identity cannot take an unlinked record's group while its tabs load", async () => {
+    const { t, ids } = await ownerCase();
+    const idMap = t.api.restart();
+    const newIds = ids.map(id => idMap.get(id)!);
+    const real = newIds.map(id => t.api.tabList.get(id)!.url);
+    for (const id of newIds) t.api.tabList.get(id)!.url = "";
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    const gid = t.api.tabList.get(newIds[0]!)!.groupId;
+    const BOB = { id: "sess-bob", identity: "bob", label: "Job board" };
+    const made = await fresh.create(BOB, "https://bob.example.com/");
+    expect(fresh.json(await fresh.call("tabs_context", {}, BOB)).sessionTabs.map((x: { tabId: number }) => x.tabId)).toEqual([made]);
+    for (const id of newIds) { expect(fresh.tabs.ownerOf(id)).toBeUndefined(); expect(t.api.tabList.get(id)!.groupId).toBe(gid); }
+    expect(t.api.tabList.get(made)!.groupId).not.toBe(gid);
+    newIds.forEach((id, i) => { t.api.tabList.get(id)!.url = real[i]!; });
+    expect(await fresh.tabs.retryRelink()).toBe(true);
+    expect(fresh.json(await fresh.call("tabs_context", {}, B)).sessionTabs.map((x: { tabId: number }) => x.tabId)).toEqual(newIds);
   });
 
-  test("two groups with the same title: no reclaim", async () => {
-    const { t, ids } = await legacyGroup();
-    const x = t.api.addTab(50, "https://other.example.com/");
-    t.api.groups.set(await t.api.tabs.group([x.id]), { title: "ContractFinder", color: "red" });
-    expect(t.json(await t.call("tabs_context", {}, LEGACY)).sessionTabs).toEqual([]);
-    expect(t.tabs.ownerOf(ids[0]!)).toBeUndefined();
+  test("B2: a lazily restored saved group is not taken by a session with the same label, and relinks when the URLs load", async () => {
+    const t = setup();
+    const D = { id: "sess-docs", identity: "alice", label: "docs" };
+    const a = await t.create(D, "https://a.example.com/");
+    const b = await t.create(D, "https://b.example.com/");
+    await t.call("save_group", { name: "docs" }, D);
+    const idMap = t.api.restart();
+    const newIds = [a, b].map(id => idMap.get(id)!);
+    for (const id of newIds) t.api.tabList.get(id)!.url = "";
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    const D2 = { id: "sess-docs2", identity: "alice", label: "docs" };
+    const gid = t.api.tabList.get(newIds[0]!)!.groupId;
+    const made = await fresh.create(D2, "https://new.example.com/");
+    expect(t.api.tabList.get(made)!.groupId).not.toBe(gid);
+    for (const id of newIds) expect(fresh.tabs.ownerOf(id)).toBeUndefined();
+    t.api.tabList.get(newIds[0]!)!.url = "https://a.example.com/";
+    t.api.tabList.get(newIds[1]!)!.url = "https://b.example.com/";
+    expect(await fresh.tabs.retryRelink()).toBe(true);
+    expect(await fresh.tabs.savedGroups()).toEqual([{ name: "docs", groupId: gid, open: true, tabCount: 2 }]);
   });
 
-  test("a granted or saved group is not reclaimed", async () => {
-    const granted = await legacyGroup();
-    await granted.t.call("tabs_context", {}, OTHER_LABEL);
-    expect(await granted.t.tabs.grant(granted.gid, "sess-c")).toBe("ok");
-    expect(granted.t.json(await granted.t.call("tabs_context", {}, LEGACY)).sessionTabs).toEqual([]);
-    const s = setup();
-    const a = await s.create(OTHER_LABEL, "https://a.example.com/");
-    await s.call("save_group", { name: "ContractFinder" }, OTHER_LABEL);
-    expect(s.json(await s.call("tabs_context", {}, LEGACY)).sessionTabs).toEqual([]);
-    expect(s.tabs.ownerOf(a)).toBe("sess-c");
+  test("B3: two identities with the same title and URLs: after a restart neither links and no tab of the other closes", async () => {
+    const t = setup();
+    const BOB = { id: "sess-bob", identity: "bob", label: "Job board" };
+    const mine = [await t.create(A, "https://same.example.com/1"), await t.create(A, "https://same.example.com/2")];
+    const theirs = [await t.create(BOB, "https://same.example.com/1"), await t.create(BOB, "https://same.example.com/2")];
+    await t.tabs.refreshAgents();
+    expect((t.api.store.agentGroups as unknown[]).length).toBe(2);
+    const idMap = t.api.restart();
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    const ctxA = fresh.json(await fresh.call("tabs_context", {}, B));
+    expect(ctxA.sessionTabs).toEqual([]);
+    expect(fresh.json(await fresh.call("tabs_context", {}, { id: "sess-bob2", identity: "bob", label: "Job board" })).sessionTabs).toEqual([]);
+    await fresh.call("session_end", {}, B);
+    expect(t.api.tabList.size).toBe(4);
+    for (const id of [...mine, ...theirs]) expect(t.api.tabList.has(idMap.get(id)!)).toBe(true);
   });
 
-  test("a different label does not reclaim", async () => {
-    const { t } = await legacyGroup();
-    expect(t.json(await t.call("tabs_context", {}, OTHER_LABEL)).sessionTabs).toEqual([]);
+  test("B3: one record that matches two live groups links to neither", async () => {
+    const { t, ids } = await ownerCase(2);
+    const idMap = t.api.restart();
+    const newIds = ids.map(id => idMap.get(id)!);
+    const copy = [t.api.addTab(5001, t.api.tabList.get(newIds[0]!)!.url), t.api.addTab(5002, t.api.tabList.get(newIds[1]!)!.url)];
+    t.api.groups.set(await t.api.tabs.group(copy.map(c => c.id)), { title: "Job board", color: "red" });
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    expect(fresh.json(await fresh.call("tabs_context", {}, B)).sessionTabs).toEqual([]);
   });
 
-  test("a session that has its own group does not take another", async () => {
-    const { t, ids } = await legacyGroup();
-    await t.create({ ...LEGACY, label: "Mine" }, "https://mine.example.com/");
-    await t.call("tabs_context", LEGACY.id === "" ? {} : {}, LEGACY); // same session id, now labelled like the legacy group
-    expect(t.tabs.ownerOf(ids[0]!)).toBeUndefined();
+  test("N1: two parallel reclaims of the same chat give exactly one winner", async () => {
+    const { t } = await ownerCase();
+    clock += HOLDER_LIVE_MS + 1000;
+    const B2 = { id: "sess-b2", identity: "alice", label: "Job board" };
+    t.tabs.touch(B);
+    t.tabs.touch(B2);
+    const results = await Promise.all([t.tabs.reclaim(B), t.tabs.reclaim(B2)]);
+    expect(results.filter(Boolean).length).toBe(1);
+  });
+
+  test("N2: a holder with a call in progress is live, however long it runs", async () => {
+    const { t } = await ownerCase();
+    t.tabs.callStarted("sess-a");
+    clock += 3 * HOLDER_LIVE_MS;
+    expect(t.json(await t.call("tabs_context", {}, B)).sessionTabs).toEqual([]);
+    t.tabs.callEnded("sess-a");
+    expect(t.json(await t.call("tabs_context", {}, B)).sessionTabs).toEqual([]); // the end counts as a call too
+    clock += HOLDER_LIVE_MS + 1000;
+    expect(t.json(await t.call("tabs_context", {}, B)).sessionTabs.length).toBe(4);
+  });
+
+  test("N3: a group of another identity's record is not joined by title, and a join by the chat keeps its old tabs owned", async () => {
+    const { t, ids } = await ownerCase();
+    const BOB = { id: "sess-bob", identity: "bob", label: "Job board" };
+    const made = await t.create(BOB, "https://bob.example.com/");
+    expect(t.api.tabList.get(made)!.groupId).not.toBe(t.api.tabList.get(ids[0]!)!.groupId);
+    // The chat's own session joins its recorded group by title after its session entry is gone.
+    t.tabs.sessions.delete("sess-a");
+    await t.create(B, "https://new.example.com/");
+    await t.tabs.refreshAgents();
+    const rec = (t.api.store.agentGroups as Array<{ identity: string; tabs: Array<{ owned: boolean }> }>).find(r => r.identity === "alice")!;
+    expect(rec.tabs.length).toBe(5); // the four old tabs and the new one, all in the same group
+    expect(rec.tabs.filter(x => x.owned).length).toBe(5);
+  });
+
+  test("N4: ending a session never deletes the record of another identity", async () => {
+    const t = setup();
+    const BOB = { id: "sess-a", identity: "bob", label: "Job board" }; // same session id, other identity
+    await t.create(A, "https://a.example.com/");
+    await t.tabs.refreshAgents();
+    await t.tabs.closeSession("sess-a", "bob");
+    expect((t.api.store.agentGroups as unknown[]).length).toBe(1);
+    expect(BOB.identity).toBe("bob");
+  });
+
+  test("N5: merged tabs keep tab-strip order and the query is not repeated per record", async () => {
+    const mk = (id: number, windowId: number, index: number) => ({ id, windowId, groupId: -1, url: "", title: "", active: false, splitViewId: -1, index, pinned: false });
+    expect(mergeTabLists([mk(5, 1, 1)], [mk(6, 2, 0), mk(7, 1, 0)]).map(x => x.id)).toEqual([7, 5, 6]);
+    const { t } = await ownerCase();
+    for (const [i, u] of [["x", "https://x.example.com/"], ["y", "https://y.example.com/"]] as const) await t.create({ id: `s-${i}`, identity: "alice", label: `chat ${i}` }, u);
+    let queries = 0;
+    const real = t.api.tabs.query;
+    t.api.tabs.query = async () => { queries++; return real(); };
+    await t.tabs.refreshAgents();
+    expect(queries).toBe(1);
+  });
+
+  test("N6: refreshAgents waits for load, so it never overwrites the stored records", async () => {
+    const { t } = await ownerCase();
+    t.api.restart();
+    const fresh = new TabManager(t.api, () => clock);
+    fresh.sessions.set("sess-x", { groupId: 999, tabIds: new Set(), adopted: new Set(), identity: "carol", label: "Carol chat" });
+    const stored = (t.api.store.agentGroups as unknown[]).length;
+    const loading = fresh.load();
+    const refreshing = fresh.refreshAgents();
+    await Promise.all([loading, refreshing]);
+    expect((t.api.store.agentGroups as Array<{ label: string }>).some(r => r.label === "Job board")).toBe(true);
+    expect((t.api.store.agentGroups as unknown[]).length).toBe(stored);
   });
 });

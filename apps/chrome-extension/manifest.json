@@ -18,6 +18,7 @@
     "storage",
     "sidePanel",
     "alarms",
+    "notifications",
     "identity",
     "identity.email",
     "nativeMessaging"

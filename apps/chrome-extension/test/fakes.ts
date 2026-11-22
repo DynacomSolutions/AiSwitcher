@@ -53,7 +53,7 @@ export class FakeChrome implements ChromeApi {
    */
   restart(): Map<number, number> {
     this.session = {};
-    this.removedListeners = []; this.eventListeners = []; this.createdListeners = []; this.activatedListeners = []; this.groupUpdatedListeners = []; this.detachListeners = [];
+    this.removedListeners = []; this.eventListeners = []; this.createdListeners = []; this.activatedListeners = []; this.groupUpdatedListeners = []; this.detachListeners = []; this.notificationButtonListeners = []; this.notificationClosedListeners = [];
     this.attachedTabs.clear();
     const tabMap = new Map<number, number>();
     const groupMap = new Map<number, number>();
@@ -205,6 +205,29 @@ export class FakeChrome implements ChromeApi {
     onUpdated: (l: (groupId: number) => void) => { this.groupUpdatedListeners.push(l); },
     get: async (id: number) => (this.groupLive(id) ? { id, title: this.groups.get(id)?.title ?? "", color: this.groups.get(id)?.color as GroupColor | undefined } : undefined),
     queryByTitle: async (title: string) => [...this.groups].filter(([id, g]) => g.title === title && this.groupLive(id)).map(([id, g]) => ({ id, title: g.title })),
+  };
+  /** Notifications on screen (id -> content), every one ever shown, and the ids that were cleared. */
+  shown = new Map<string, { title: string; message: string; buttons: string[] }>();
+  everShown: Array<{ id: string; title: string; message: string; buttons: string[] }> = [];
+  clearedNotifications: string[] = [];
+  notificationButtonListeners: Array<(id: string, index: number) => void> = [];
+  notificationClosedListeners: Array<(id: string, byUser: boolean) => void> = [];
+  /** The user presses a button of the notification on screen (the latest one when no id is given). */
+  clickNotification(index: number, id = [...this.shown.keys()].at(-1)): void {
+    if (id === undefined) throw new Error("No notification on screen.");
+    for (const l of this.notificationButtonListeners) l(id, index);
+  }
+  /** The user dismisses the notification on screen. */
+  dismissNotification(id = [...this.shown.keys()].at(-1)): void {
+    if (id === undefined) throw new Error("No notification on screen.");
+    this.shown.delete(id);
+    for (const l of this.notificationClosedListeners) l(id, true);
+  }
+  notifications = {
+    create: async (id: string, o: { title: string; message: string; buttons: string[] }) => { this.shown.set(id, o); this.everShown.push({ id, ...o }); },
+    clear: async (id: string) => { this.clearedNotifications.push(id); this.shown.delete(id); },
+    onButtonClicked: (l: (id: string, index: number) => void) => { this.notificationButtonListeners.push(l); },
+    onClosed: (l: (id: string, byUser: boolean) => void) => { this.notificationClosedListeners.push(l); },
   };
   debugger = {
     attach: async (id: number) => { this.attachedTabs.add(id); },
