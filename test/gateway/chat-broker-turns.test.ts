@@ -96,6 +96,17 @@ test("a prompt streams text updates as ordered events and ends with turn_end end
   expect(tail[3]).toEqual({ k: "turn_end", stopReason: "end_turn" });
 });
 
+test("the model metadata warning is a notice and the reply text holds only the answer", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "warn");
+  await turnEnded(store, rec.id);
+  const all = await bodies(store, rec.id);
+  const warning = "Model metadata for `gpt-6-astra` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.";
+  expect(all).toContainEqual({ k: "notice", text: warning });
+  expect(all.filter((b) => b.k === "text")).toEqual([{ k: "text", text: "hello" }]);
+});
+
 test("tool updates become tool items per toolCallId with status pending then done", async () => {
   const { broker, store } = setup();
   const rec = await made(broker);
@@ -216,6 +227,17 @@ test("a rate-limit failure text becomes an error item with code limit and the re
   expect(err.message).toContain("2023-11-15T00:00:00.000Z");
   expect(err.message).not.toContain("Rate limit reached");
   expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="limit"} 1');
+  await idleState(store, rec.id);
+});
+
+test("an agent usage limit becomes a limit error item with the provider text", async () => {
+  const { broker, store, metrics } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "weekly");
+  await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
+  const err = (await bodies(store, rec.id)).find((b) => b.k === "error") as Extract<ChatBody, { k: "error" }>;
+  expect(err).toEqual({ k: "error", code: "limit", message: "You've hit your weekly limit \u00b7 resets Nov 26, 2am (Asia/Bangkok)" });
+  expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="rate_limit"} 1');
   await idleState(store, rec.id);
 });
 

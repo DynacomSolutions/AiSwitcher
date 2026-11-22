@@ -18,6 +18,7 @@ const DEFAULT_LOCK_WAIT_MS = 30_000;
 const UNLISTED = "This agent is not available.";
 const MODEL_UNLISTED = "This model is not available.";
 const NOT_FOUND = "This chat does not exist.";
+const REVOKED = "This browser connection was revoked. Pair it again.";
 const EXPIRED = "This chat has expired.";
 const SERVICE_BUSY = "The chat service is busy. Try again in a moment.";
 const CATALOG_DOWN = "The agent list is unavailable. Try again in a moment.";
@@ -35,6 +36,8 @@ export interface ChatFramesDeps {
   /** Longest a create waits for the create before it. Only the wait for the lock is bound, never a create in flight. Default 30 s. */
   createLockWaitMs?: number;
   metrics?: Pick<GatewayMetrics, "chatError">;
+  /** When the active binding of this name was approved (epoch ms); undefined when none is active. Without it the binding record of the frame decides. */
+  bindingSince?(binding: string): Promise<number | undefined>;
 }
 
 /** A chat that has a socket on this replica. `cursor` is the last event number that went out. */
@@ -110,11 +113,28 @@ export class ChatFrames {
     if (w) this.out(chatId, w, { t: "chat.reject", chatId, code, message });
   }
 
+  /** The approval time of the binding, or undefined when it is no longer active. A chat made before it belongs to an older binding of the same name. */
+  private async since(binding: BrowserBinding): Promise<number | undefined> {
+    const own = Date.parse(binding.createdAt);
+    if (!this.d.bindingSince) return Number.isNaN(own) ? 0 : own;
+    const active = await this.d.bindingSince(binding.name);
+    // The socket attached with an older binding of this name (its revoke notice was lost): it is not the active binding.
+    if (active === undefined || (!Number.isNaN(own) && active !== own)) return undefined;
+    return active;
+  }
+
+  /** The chats of the binding that the binding may see. */
+  private async mine(binding: BrowserBinding, opts?: { windowId?: number }): Promise<ChatRecord[]> {
+    const since = await this.since(binding);
+    if (since === undefined) return [];
+    return (await this.d.store.listByBinding(binding.name, opts)).filter((r) => r.createdAt >= since);
+  }
+
   /** A binding attached: send its chat list. The extension then sends `chat.resume` for each chat. */
   async onAttach(binding: BrowserBinding): Promise<void> {
     // A new socket knows nothing yet. Its resume frames set the cursors again.
     for (const [id, w] of this.watches) if (w.binding === binding.name) this.watches.delete(id);
-    const recs = await this.d.store.listByBinding(binding.name);
+    const recs = await this.mine(binding);
     this.d.hub.sendTo(binding.name, { t: "chat.list", chats: recs.slice(0, MAX_LIST).map(summaryOf) });
   }
 
@@ -136,7 +156,7 @@ export class ChatFrames {
       case "chat.create":
         return this.create(binding, f, reply);
       case "chat.list": {
-        const recs = await this.d.store.listByBinding(binding.name, f.windowId === undefined ? {} : { windowId: f.windowId });
+        const recs = await this.mine(binding, f.windowId === undefined ? {} : { windowId: f.windowId });
         reply({ t: "chat.list", chats: recs.slice(0, MAX_LIST).map(summaryOf) });
         return;
       }
@@ -154,7 +174,10 @@ export class ChatFrames {
     }
     // Every other frame names a chat. It waits for a create of the same chat that is still running.
     await this.pendingCreate.get(f.chatId);
-    const rec = await this.d.store.get(f.chatId);
+    const found = await this.d.store.get(f.chatId);
+    const since = found === undefined ? undefined : await this.since(binding);
+    // A chat of an older binding with the same name reads as missing.
+    const rec = found !== undefined && since !== undefined && found.createdAt >= since ? found : undefined;
     if (f.t === "chat.resume") {
       if (!rec) return reject("expired", EXPIRED);
       if (rec.binding !== binding.name) return reject("bad_request", NOT_FOUND);
@@ -228,13 +251,17 @@ export class ChatFrames {
 
   private async doCreate(binding: BrowserBinding, f: Extract<ChatFromExt, { t: "chat.create" }>, reply: (f: ChatToExt) => void): Promise<void> {
     const reject = (code: ChatErrorCode, message: string): void => reply({ t: "chat.reject", chatId: f.chatId, code, message });
+    if ((await this.since(binding)) === undefined) return reject("bad_request", REVOKED);
     const verdict = await this.d.catalog.check(f.selection.provider, f.selection.identity, f.selection.model);
     if (verdict === "identity") return reject("bad_request", UNLISTED);
     if (verdict === "model") return reject("bad_request", MODEL_UNLISTED);
-    const inWindow = await this.d.store.listByBinding(binding.name, { windowId: f.windowId });
+    const inWindow = await this.mine(binding, { windowId: f.windowId });
     if (inWindow.length >= this.d.maxPerWindow) return reject("window_cap", `A window holds at most ${this.d.maxPerWindow} chats.`);
+    // Read again after the awaits above: a create that waited may have outlived a new approval of the name.
+    const since = await this.since(binding);
+    if (since === undefined) return reject("bad_request", REVOKED);
     // The store checks the gateway-wide cap in the same step as the insert, so replicas cannot overshoot it.
-    const r = await this.d.broker.create({ chatId: f.chatId, binding: binding.name, windowId: f.windowId, name: f.name, color: f.color, selection: f.selection, tabIds: f.tabIds, maxLive: this.d.maxLive ?? 12 });
+    const r = await this.d.broker.create({ chatId: f.chatId, binding: binding.name, windowId: f.windowId, name: f.name, color: f.color, selection: f.selection, tabIds: f.tabIds, maxLive: this.d.maxLive ?? 12, since });
     if ("code" in r) return reject(r.code, r.message);
     reply({ t: "chat.state", chatId: r.id, state: r.state, summary: summaryOf(r) });
     const w = this.watch(r.id, binding.name, 0);

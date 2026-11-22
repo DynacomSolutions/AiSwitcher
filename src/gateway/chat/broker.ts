@@ -25,6 +25,11 @@ const MAX_TOOLS_KEPT = 500;
 const DEFAULT_CANCEL_GRACE_MS = 15_000;
 const DEFAULT_STALL_MS = 30 * 60_000;
 const HUNG_MESSAGE = "The agent did not stop. It was restarted. Send a message to continue.";
+/**
+ * codex-acp sends this warning as the first reply chunk of a turn when it has no metadata for the model. It is no part of the answer,
+ * so the feed shows it as a notice. The rule is narrow on purpose: any other text stays reply text.
+ */
+const MODEL_METADATA_WARNING = /^Model metadata for \x60[^\x60]+\x60 not found\. Defaulting to fallback metadata/;
 const STATE_TRIES = 3;
 const STATE_BACKOFF_MS = 50;
 const RESTART_NOTICE = "This chat restarted. The agent does not remember earlier messages.";
@@ -91,6 +96,12 @@ export interface BrokerDeps {
   /** Time between idle sweeps. Default 60 seconds. */
   sweepMs?: number;
   identityOf(binding: string): Promise<string | undefined>;
+  /**
+   * When the active binding of this name was approved (epoch ms), or undefined when no active binding has the name.
+   * A chat is usable only by a binding approved before the chat was made, so a reused name never reaches the chats of an older binding.
+   * Without it every chat of the name is visible (tests).
+   */
+  bindingSince?(binding: string): Promise<number | undefined>;
   /** Checks the stored provider and identity against the picker list before a pod starts. A throw fails the start closed. */
   checkSelection?(provider: ChatSelection["provider"], identity: string): Promise<"ok" | "identity" | "model">;
   /** Time limit of one ACP request in the start path. */
@@ -371,7 +382,7 @@ export class ChatBroker implements ChatAuth {
     }
   }
 
-  async create(i: { chatId: string; binding: string; windowId: number; name: string; color: string; selection: ChatSelection; tabIds: number[]; maxLive?: number }): Promise<ChatRecord | BrokerReject> {
+  async create(i: { chatId: string; binding: string; windowId: number; name: string; color: string; selection: ChatSelection; tabIds: number[]; maxLive?: number; since?: number }): Promise<ChatRecord | BrokerReject> {
     // The pod name and the admission rule use the first eight hex digits. A hostile id could collide on them.
     if (!UUID_RE.test(i.chatId)) return { code: "bad_request", message: "The chat id is not valid." };
     let rec: ChatRecord | "cap" | "global";
@@ -381,6 +392,7 @@ export class ChatBroker implements ChatAuth {
         MAX_CHATS_PER_WINDOW,
         { replica: this.d.replicaId, ttlMs: this.leaseTtl },
         i.maxLive,
+        i.since,
       );
     } catch (e) {
       if (e instanceof ChatExistsError) return { code: "bad_request", message: "A chat with this id exists." };
@@ -404,7 +416,7 @@ export class ChatBroker implements ChatAuth {
     const claims = verifyChatToken(this.d.tokenKey, token, now);
     if (!claims) return undefined;
     const chat = await this.d.store.get(claims.chatId);
-    if (!chat || chat.state === "closed" || chat.state === "failed" || chat.binding !== claims.binding) return undefined;
+    if (!chat || chat.state === "closed" || chat.state === "failed" || !(await this.belongs(chat, claims.binding))) return undefined;
     // A token belongs to one pod generation. A newer start or a failed start makes an older token useless.
     if (claims.gen !== chat.generation) return undefined;
     if (now > chat.createdAt + (this.d.maxAgeMs ?? 7 * DAY_MS)) return undefined;
@@ -803,6 +815,10 @@ export class ChatBroker implements ChatAuth {
       return;
     }
     if (ctx.replaying) return;
+    if (u.kind === "text" && MODEL_METADATA_WARNING.test(u.text)) {
+      for (const t of pieces(u.text)) this.push(ctx, { k: "notice", text: t });
+      return;
+    }
     if (u.kind !== "tool") {
       for (const t of pieces(u.text)) this.push(ctx, { k: u.kind, text: t });
       return;
@@ -858,7 +874,7 @@ export class ChatBroker implements ChatAuth {
     let handed = false;
     try {
       const chat = await this.d.store.get(chatId);
-      if (!chat || chat.binding !== binding) return { code: "bad_request", message: "This chat does not exist." };
+      if (!chat || !(await this.belongs(chat, binding))) return { code: "bad_request", message: "This chat does not exist." };
       if (chat.state === "closed") return { code: "bad_request", message: "This chat is closed." };
       if (this.draining) return { code: "unavailable", message: DRAINING_MESSAGE };
       const local = this.runtimes.get(chatId);
@@ -1059,7 +1075,20 @@ export class ChatBroker implements ChatAuth {
    */
   async dispatch(c: { chatId: string; binding: string; cmd: Extract<ChatBusMsg, { t: "cmd" }>["cmd"]; args?: Record<string, unknown> }): Promise<BrokerReject | undefined> {
     const chat = await this.d.store.get(c.chatId);
-    if (!chat || chat.binding !== c.binding) return { code: "bad_request", message: "This chat does not exist." };
+    if (!chat || !(await this.belongs(chat, c.binding))) return { code: "bad_request", message: "This chat does not exist." };
+    return this.dispatchChat(chat, c);
+  }
+
+  /** True when the chat belongs to the active binding of this name: same name, and made after the binding was approved. */
+  private async belongs(chat: ChatRecord, binding: string): Promise<boolean> {
+    if (chat.binding !== binding) return false;
+    if (!this.d.bindingSince) return true;
+    const since = await this.d.bindingSince(binding);
+    // The two times come from different replica clocks. Only a skew of seconds could hide a chat made right after the approval. Accepted.
+    return since !== undefined && chat.createdAt >= since;
+  }
+
+  private async dispatchChat(chat: ChatRecord, c: { chatId: string; binding: string; cmd: Extract<ChatBusMsg, { t: "cmd" }>["cmd"]; args?: Record<string, unknown> }): Promise<BrokerReject | undefined> {
     if (chat.state === "closed") return c.cmd === "close" ? undefined : { code: "bad_request", message: "This chat is closed." };
     if (this.draining && c.cmd === "prompt") return { code: "unavailable", message: DRAINING_MESSAGE };
     const args = this.checkCmd(c.chatId, c.cmd, c.args);
@@ -1288,7 +1317,7 @@ export class ChatBroker implements ChatAuth {
       metrics.chatTurn(r.stopReason === "cancelled" || ctx.cancelRequested ? "cancelled" : "ok");
     } catch (e) {
       if (e instanceof AcpError) {
-        const f = promptFailure(e.message, e.code, this.d.now());
+        const f = promptFailure(e.message, e.code, this.d.now(), e.data);
         metrics.chatError(f.kind);
         metrics.chatTurn("error");
         this.push(ctx, { k: "error", code: f.code, message: f.message });
@@ -1441,6 +1470,53 @@ export class ChatBroker implements ChatAuth {
         if (rt) await this.d.store.releaseLease(chatId, rt.fence).catch(() => undefined);
       }
     });
+  }
+
+  /**
+   * Clean up after a revoked binding: close its chats through the same path as `chat.close`. A chat that another replica owns gets the
+   * close command over the bus. A chat in `starting` with no pod has no owner, so this replica takes it and closes it.
+   * `before` limits it to chats made before that time (epoch ms), so a new binding of the same name keeps its own chats.
+   * This is clean-up only. Visibility does not depend on it: `belongs` hides the chats of an older binding at once.
+   * It waits at most `waitMs` (default 10 s, in total) until every chat is closed in the store. It never throws.
+   * A listing failure and each chat still open after the wait count as chat error kind `close_binding`.
+   */
+  async closeBinding(binding: string, opts: { before?: number; waitMs?: number } = {}): Promise<void> {
+    const { metrics, store } = this.d;
+    try {
+      const chats = (await store.listByBinding(binding)).filter((c) => opts.before === undefined || c.createdAt < opts.before);
+      await Promise.allSettled(chats.map((c) => this.dispatchChat(c, { chatId: c.id, binding, cmd: "close" })));
+      const end = Date.now() + (opts.waitMs ?? 10_000);
+      let open = chats;
+      for (;;) {
+        const states = await Promise.all(open.map((c) => store.get(c.id).catch(() => c)));
+        open = states.filter((c): c is ChatRecord => c !== undefined && c.state !== "closed");
+        if (open.length === 0 || Date.now() >= end) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      for (let i = 0; i < open.length; i++) metrics.chatError("close_binding");
+    } catch {
+      metrics.chatError("close_binding");
+    }
+  }
+
+  /**
+   * Retry the clean-up of a reused name: for each active binding, close the open chats made before its approval.
+   * Needed when the clean-ups at revoke and approve both failed. Best effort, and it never throws.
+   */
+  async retryStaleChats(bindings: Array<{ name: string; since: number }>): Promise<void> {
+    for (const b of bindings) {
+      try {
+        const stale = (await this.d.store.listByBinding(b.name)).some((c) => c.createdAt < b.since);
+        if (stale) await this.closeBinding(b.name, { before: b.since });
+      } catch {
+        this.d.metrics.chatError("close_binding");
+      }
+    }
+  }
+
+  /** Stop the pod of each chat id, best effort. The rows of these chats are already gone from the store. */
+  async stopPods(chatIds: string[]): Promise<void> {
+    await Promise.allSettled(chatIds.map((id) => this.d.transport.stop(id)));
   }
 
   /**

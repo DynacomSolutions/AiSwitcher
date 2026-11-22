@@ -55,6 +55,8 @@ const id = (v: unknown): string | undefined => (typeof v === "string" && ID_RE.t
 const sel = (v: unknown): string | undefined => (typeof v === "string" && SEL_RE.test(v) ? v : undefined);
 /** True when a provider, identity, model or effort id is safe to send in a selection. */
 export const selectable = (v: string): boolean => SEL_RE.test(v);
+/** A code that this build does not know reads as `acp`, so a newer gateway never makes an older panel drop a frame. */
+const errorCode = (v: unknown): ChatErrorCode | undefined => (typeof v === "string" ? (oneOf(CHAT_ERROR_CODES, v) ?? "acp") : undefined);
 const oneOf = <T extends string>(set: readonly T[], v: unknown): T | undefined => (typeof v === "string" && (set as readonly string[]).includes(v) ? (v as T) : undefined);
 const text = (v: unknown): string | undefined => str(v, MAX_CHAT_TEXT);
 const name = (v: unknown): string | undefined => (typeof v === "string" && v.length >= 1 && v.length <= MAX_CHAT_NAME ? v : undefined);
@@ -135,7 +137,7 @@ function body(v: unknown): ChatBody | undefined {
       return withOpt({ k: "permission_resolved", requestId } as ChatBody, { optionId: optionId.v, cancelled: cancelled.v });
     }
     case "error": {
-      const code = oneOf(CHAT_ERROR_CODES, v.code), message = str(v.message, MAX_CHAT_TEXT);
+      const code = errorCode(v.code), message = str(v.message, MAX_CHAT_TEXT);
       return code && message !== undefined ? { k: "error", code, message } : undefined;
     }
     case "turn_end": {
@@ -232,7 +234,7 @@ export function parseChatToExt(v: unknown): ChatToExt | undefined {
       return chats ? { t: "chat.list", chats } : undefined;
     }
     case "chat.reject": {
-      const chatId = opt(v.chatId, id), reqId = opt(v.reqId, id), code = oneOf(CHAT_ERROR_CODES, v.code), message = str(v.message, MAX_CHAT_TEXT);
+      const chatId = opt(v.chatId, id), reqId = opt(v.reqId, id), code = errorCode(v.code), message = str(v.message, MAX_CHAT_TEXT);
       if (!chatId.ok || !reqId.ok || !code || message === undefined) return undefined;
       return withOpt({ t: "chat.reject", code, message } as ChatToExt, { chatId: chatId.v, reqId: reqId.v });
     }

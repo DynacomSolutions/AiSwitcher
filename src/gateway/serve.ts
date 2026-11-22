@@ -172,6 +172,8 @@ export interface GatewayHooks {
 export interface ChatEnvConfig { kube: KubeConfigEnv; mcpUrl: string; maxLive: number; startTimeoutMs: number }
 
 const CHAT_MAX_DEFAULT = 12;
+/** The broker refuses to start a chat older than this (its default maxAgeMs). */
+const CHAT_MAX_AGE_MS = 7 * 86_400_000;
 /** Closed chats are kept this long, then pruned. */
 const CHAT_RETENTION_MS = 30 * 86_400_000;
 const CHAT_START_TIMEOUT_DEFAULT_MS = 240_000;
@@ -811,6 +813,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     browserPoolMembers,
     browserIdentityExists,
     browserHub: browser,
+    onBindingRevoked: async (binding, before) => {
+      await chatBroker?.closeBinding(binding, before === undefined ? {} : { before }).catch(() => metrics.chatError("close_binding"));
+    },
     ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}),
   });
 
@@ -1227,6 +1232,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         if (!b || b.state !== "active") return undefined;
         return b.target.kind === "identity" ? b.target.identity : b.target.pool;
       };
+      const bindingSince = async (binding: string): Promise<number | undefined> => {
+        const b = await store.getBrowserBinding(binding);
+        if (!b || b.state !== "active") return undefined;
+        const t = Date.parse(b.createdAt);
+        return Number.isNaN(t) ? 0 : t;
+      };
       let frames: ChatFrames | undefined;
       let catalogRef: ChatCatalog | undefined;
       const broker = new ChatBroker({
@@ -1245,6 +1256,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         rejectChat: (chatId, code, message) => frames?.rejectChat(chatId, code, message),
         watchedChats: () => frames?.watchedChats() ?? [],
         identityOf,
+        bindingSince,
         checkSelection: (provider, identity) => catalogRef?.check(provider, identity) ?? Promise.resolve("ok"),
         endBrowserSession: async (binding, sessionId) => {
           const identity = (await identityOf(binding)) ?? "chat";
@@ -1258,7 +1270,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         isPool: async (name) => (await browserPoolMembers(name)) !== undefined,
       });
       catalogRef = catalog;
-      frames = new ChatFrames({ broker, store: chatStore, bus, catalog, hub, maxPerWindow: MAX_CHATS_PER_WINDOW, maxLive: chatEnv?.maxLive ?? CHAT_MAX_DEFAULT, metrics });
+      frames = new ChatFrames({ broker, store: chatStore, bus, catalog, hub, bindingSince, maxPerWindow: MAX_CHATS_PER_WINDOW, maxLive: chatEnv?.maxLive ?? CHAT_MAX_DEFAULT, metrics });
       const live = frames;
       chatBroker = broker;
       chat = { broker, frames: live, store: chatStore };
@@ -1307,10 +1319,22 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   }
   // Refresh-journal retention: old resolved rows go, the newest per account and any rotated-out evidence stay.
   const pruneJournal = (): void => void Promise.resolve(refreshBackend.prune?.(JOURNAL_RETENTION_MS)).catch(() => undefined);
+  const retryChatCleanup = async (): Promise<void> => {
+    const bindings = (await store.listBrowserBindings()).filter((b) => b.state === "active").map((b) => ({ name: b.name, since: Date.parse(b.createdAt) })).filter((b) => !Number.isNaN(b.since));
+    await chat?.broker.retryStaleChats(bindings);
+  };
   const pruneTimer = setInterval(() => {
     if (!warmed || draining) return;
     pruneJournal();
     if (chat) void chat.store.pruneClosed(Date.now() - CHAT_RETENTION_MS).catch(() => metrics.chatError("store"));
+    // A chat that never got a pod (or lost it) and has no live lease must not stay listed for ever. It is too old to start again anyway.
+    // The rows are gone, so end any pod that still runs for them. Best effort: the pod also ends with its own idle sweep.
+    // The same tick retries the clean-up of reused names, in case the clean-ups at revoke and approve both failed.
+    if (chat) void retryChatCleanup().catch(() => metrics.chatError("close_binding"));
+    if (chat) {
+      const { broker, store: chatRows } = chat;
+      void chatRows.pruneIdle(Date.now() - CHAT_MAX_AGE_MS).then((ids) => broker.stopPods(ids)).catch(() => metrics.chatError("store"));
+    }
   }, 6 * 3_600_000);
   pruneTimer.unref?.();
 

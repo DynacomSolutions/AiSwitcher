@@ -38,6 +38,16 @@ async function owned(s: ChatStore, over: Partial<ChatCreate> = {}): Promise<{ id
 }
 
 export function chatStoreContract(make: () => Promise<ChatStore>): void {
+  test("create with since counts only the chats of the window made at or after it", async () => {
+    const s = await make();
+    for (let i = 0; i < 6; i += 1) expect(await s.create(mk(), 6)).not.toBe("cap");
+    expect(await s.create(mk(), 6)).toBe("cap");
+    expect(await s.create(mk({ createdAt: 5_000_000 }), 6, undefined, undefined, 5_000_000)).not.toBe("cap");
+    // Old chats stay out of the count, the new one is in it.
+    for (let i = 0; i < 5; i += 1) expect(await s.create(mk({ createdAt: 5_000_001 + i }), 6, undefined, undefined, 5_000_000)).not.toBe("cap");
+    expect(await s.create(mk({ createdAt: 5_000_100 }), 6, undefined, undefined, 5_000_000)).toBe("cap");
+  });
+
   test("create refuses the seventh open chat of one window and counts closed ones out", async () => {
     const s = await make();
     const ids: string[] = [];
@@ -258,11 +268,11 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     await s.releaseLease(fresh.id, fresh.fence);
     // An append moves updatedAt to now, so only the untouched chat is idle.
     const quiet = (await s.create(mk({ binding: "b-idle", createdAt: 5_000 }), 6)) as { id: string };
-    expect(await s.pruneIdle(6_000)).toBe(1);
+    expect(await s.pruneIdle(6_000)).toHaveLength(1);
     expect(await s.get(quiet.id)).toBeUndefined();
     expect(await s.get(idle.id)).toBeDefined();
     expect(await s.get(fresh.id)).toBeDefined();
-    expect(await s.pruneIdle(Date.now() + 60_000)).toBeGreaterThanOrEqual(2);
+    expect((await s.pruneIdle(Date.now() + 60_000)).length).toBeGreaterThanOrEqual(2);
     expect(await s.get(idle.id)).toBeUndefined();
     expect(await s.events(idle.id, 0, 10)).toEqual([]);
   });
@@ -270,10 +280,10 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
   test("pruneIdle keeps a chat with a live lease", async () => {
     const s = await make();
     const { id, fence } = await owned(s, { binding: "b-live", createdAt: 5_000 });
-    expect(await s.pruneIdle(Date.now() + 60_000)).toBe(0);
+    expect(await s.pruneIdle(Date.now() + 60_000)).toEqual([]);
     expect(await s.get(id)).toBeDefined();
     await s.releaseLease(id, fence);
-    expect(await s.pruneIdle(Date.now() + 60_000)).toBe(1);
+    expect(await s.pruneIdle(Date.now() + 60_000)).toHaveLength(1);
   });
 
   test("create with an owner sets the lease and epoch 1 at once", async () => {
@@ -313,7 +323,7 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
   test("prunes work through more than one batch of 500", async () => {
     const s = await make();
     for (let i = 0; i < 1_100; i += 1) await s.create(mk({ binding: "b-batch", windowId: i, createdAt: 2_000 }), 6);
-    expect(await s.pruneIdle(3_000)).toBeGreaterThanOrEqual(1_100);
+    expect((await s.pruneIdle(3_000)).length).toBeGreaterThanOrEqual(1_100);
     for (let i = 0; i < 1_100; i += 1) {
       const c = (await s.create(mk({ binding: "b-batch2", windowId: i, createdAt: 2_000 }), 6)) as { id: string };
       const epoch = (await s.acquireLease(c.id, "r1", 60_000, Date.now())) as number;
