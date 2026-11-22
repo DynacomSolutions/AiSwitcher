@@ -195,7 +195,7 @@ export class Executor {
     if (this.tabs.touch(req.session)) {
       for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void this.markControlled(tabId, req.session);
     }
-    const controller = this.state.track(id);
+    const controller = this.state.track(id, req.session.id);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : this.defaultTimeout;
     const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
     const aborted = new Promise<never>((_, reject) => {
@@ -294,7 +294,7 @@ export class Executor {
         await this.tabs.addToSession(session, tabId);
         // The owner's tab may already show a dialog, which blocks the page marker: attached first, so it is seen (or the page is found unresponsive) before the marker hangs.
         try {
-          await this.watchDialogs(tabId, tool, async () => { await this.ensureAttached(sig, tabId); await this.markControlled(tabId, session); });
+          await this.watchDialogs(tabId, tool, async () => { await this.ensureAttached(sig, tabId); await this.markControlled(tabId, session); }, sig);
         } catch (e) {
           const d = this.dialogs.get(tabId);
           if (e instanceof PageUnresponsive) return text(`Adopted tab ${tabId}: ${tab.title}. ${e.message}`);
@@ -325,7 +325,7 @@ export class Executor {
         this.throwIfAborted(sig);
         if (tool !== "hover") await this.releaseHold(tabId);
         return this.tabTool(tool, req, sig, tab);
-      });
+      }, sig);
     };
     return session.chat === true ? this.withTabLock(tabId, work, sig) : work();
   }
@@ -333,10 +333,16 @@ export class Executor {
   /** Runs `work` after every earlier chat call on the same tab has ended. */
   private async withTabLock<T>(tabId: number, work: () => Promise<T>, sig: AbortSignal): Promise<T> {
     const prev = this.tabLocks.get(tabId) ?? Promise.resolve();
-    const run = prev.then(work, work);
-    // The lock also ends when the call is aborted (timeout or stop), so a hung call never blocks the other chats.
+    const start = (): Promise<T> => {
+      // A call aborted while it waited never starts.
+      if (sig.aborted) return Promise.reject(new ToolError(this.abortCode(sig.reason), this.abortMessage(sig.reason)));
+      return work();
+    };
+    const run = prev.then(start, start);
+    // An abort ends this call's own hold on the lock. It never ends the hold of the call before it.
     const aborted = new Promise<void>(resolve => { if (sig.aborted) resolve(); else sig.addEventListener("abort", () => resolve(), { once: true }); });
-    const tail = Promise.race([run.then(() => {}, () => {}), aborted]);
+    const settle = (): Promise<void> => Promise.race([run.then(() => {}, () => {}), aborted]);
+    const tail = prev.then(settle, settle);
     this.tabLocks.set(tabId, tail);
     void tail.then(() => { if (this.tabLocks.get(tabId) === tail) this.tabLocks.delete(tabId); });
     return run;
@@ -515,18 +521,22 @@ export class Executor {
   }
 
   /** Runs a call on a tab; a dialog that opens on that tab meanwhile fails the call at once with dialog_open. The call's own work is left to finish (or hang) on its own. */
-  private async watchDialogs<T>(tabId: number, tool: ExtensionTool, work: () => Promise<T>): Promise<T> {
+  private async watchDialogs<T>(tabId: number, tool: ExtensionTool, work: () => Promise<T>, sig?: AbortSignal): Promise<T> {
     let watcher: { tool: ExtensionTool; reject: (e: ToolError) => void } | undefined;
     const opened = new Promise<never>((_, reject) => { watcher = { tool, reject }; });
     opened.catch(() => {});
     const set = this.dialogWatchers.get(tabId) ?? new Set();
     set.add(watcher!);
     this.dialogWatchers.set(tabId, set);
+    // An aborted call is no longer the cause of a dialog that opens later.
+    const onAbort = (): void => { set.delete(watcher!); };
+    if (sig) { if (sig.aborted) onAbort(); else sig.addEventListener("abort", onAbort, { once: true }); }
     const running = work();
     running.catch(() => {});
     try {
       return await Promise.race([running, opened]);
     } finally {
+      sig?.removeEventListener("abort", onAbort);
       set.delete(watcher!);
       if (set.size === 0 && this.dialogWatchers.get(tabId) === set) this.dialogWatchers.delete(tabId);
     }

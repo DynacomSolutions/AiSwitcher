@@ -207,7 +207,7 @@ export class TabManager {
   }
 
   private snapshot(): Record<string, unknown> {
-    const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted] }));
+    const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted], ...(s.chat ? { chat: true } : {}), ...(s.color !== undefined ? { color: s.color } : {}) }));
     const grants = [...this.grants].map(([groupId, sessionId]) => ({ groupId, sessionId }));
     const chatLinks = [...this.links].map(([sessionId, tabIds]) => ({ sessionId, tabIds: [...tabIds] }));
     return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants, [CHAT_LINKS_KEY]: chatLinks };
@@ -249,10 +249,10 @@ export class TabManager {
       }
     }
     const grants = Array.isArray(stored[GRANTS_KEY]) ? stored[GRANTS_KEY] as Array<{ groupId: number; sessionId: string }> : [];
-    for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; tabIds: number[]; adoptedTabIds?: number[] }>) {
+    for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; tabIds: number[]; adoptedTabIds?: number[]; chat?: boolean; color?: string }>) {
       const tabIds = new Set(e.tabIds.filter(id => live.has(id)));
       const adopted = new Set((e.adoptedTabIds ?? []).filter(id => tabIds.has(id))); // older data has no split: every tab counts as created
-      if (tabIds.size > 0 || grants.some(g => g.sessionId === e.id)) this.sessions.set(e.id, { groupId: e.groupId, tabIds, adopted, identity: e.identity, label: e.label });
+      if (tabIds.size > 0 || grants.some(g => g.sessionId === e.id)) this.sessions.set(e.id, { groupId: e.groupId, tabIds, adopted, identity: e.identity, label: e.label, ...(e.chat ? { chat: true as const } : {}), ...(typeof e.color === "string" ? { color: e.color } : {}) });
     }
     for (const g of grants) if (this.sessions.has(g.sessionId)) this.grants.set(g.groupId, g.sessionId);
     await this.pruneGrants();

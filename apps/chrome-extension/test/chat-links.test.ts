@@ -169,16 +169,95 @@ describe("chat links", () => {
     expect(api.tabList.has(5)).toBe(true);
     expect(tabs.chatLinks(chatA.id)).toEqual([]);
   });
-  test("a hung call releases the tab lock when it times out", async () => {
-    const { api, tabs, executor } = setup({ defaultTimeoutMs: 100 });
+  test("a hung call releases the tab lock when it is aborted", async () => {
+    const { api, state, tabs, executor } = setup({ defaultTimeoutMs: 5000 });
+    api.addTab(5);
+    tabs.setChatLinks(chatA.id, [5]);
+    tabs.setChatLinks(chatB.id, [5]);
+    api.cdpResults["Runtime.evaluate"] = () => new Promise(() => {});
+    const reqA = call("javascript", { tabId: 5, code: "A" }, chatA);
+    const a = executor.run(reqA);
+    await new Promise(r => setTimeout(r, 20));
+    const b = executor.run(call("get_console", { tabId: 5 }, chatB));
+    await new Promise(r => setTimeout(r, 20));
+    state.abort(reqA.id); // no timer involved: the order is fixed
+    expect((await b).ok).toBe(true);
+    expect(await a).toMatchObject({ ok: false });
+  });
+
+  test("an aborted queued call does not free the lock held by the call before it", async () => {
+    const { api, state, tabs, executor } = setup({ defaultTimeoutMs: 5000 });
+    api.addTab(5);
+    tabs.setChatLinks(chatA.id, [5]);
+    tabs.setChatLinks(chatB.id, [5]);
+    const chatC = { ...chatA, id: "chat:c" };
+    tabs.setChatLinks(chatC.id, [5]);
+    let release!: () => void;
+    api.cdpResults["Runtime.evaluate"] = (_p?: Record<string, unknown>) => new Promise(r => { release = () => r({ result: { value: 1 } }); });
+    const a = executor.run(call("javascript", { tabId: 5, code: "A" }, chatA));
+    await new Promise(r => setTimeout(r, 20));
+    const reqB = call("key", { tabId: 5, key: "a" }, chatB);
+    const b = executor.run(reqB);
+    await new Promise(r => setTimeout(r, 20));
+    const c = executor.run(call("key", { tabId: 5, key: "b" }, chatC));
+    await new Promise(r => setTimeout(r, 20));
+    state.abort(reqB.id);
+    await b;
+    await new Promise(r => setTimeout(r, 30));
+    expect(api.cdpLog.filter(l => l.method === "Input.dispatchKeyEvent")).toHaveLength(0);
+    release();
+    expect((await a).ok).toBe(true);
+    expect((await c).ok).toBe(true);
+    expect(api.cdpLog.filter(l => l.method === "Input.dispatchKeyEvent").length).toBeGreaterThan(0);
+  });
+
+  test("a dialog that opens after an abort names the running tool, not the aborted one", async () => {
+    const { api, state, tabs, executor } = setup({ defaultTimeoutMs: 5000 });
+    api.addTab(5);
+    tabs.setChatLinks(chatA.id, [5]);
+    tabs.setChatLinks(chatB.id, [5]);
+    api.cdpResults["Runtime.evaluate"] = () => new Promise(() => {});
+    api.cdpResults["Input.dispatchKeyEvent"] = () => {
+      api.emit(5, "Page.javascriptDialogOpening", { type: "alert", message: "hi", url: "https://example.test/" });
+      return new Promise(() => {});
+    };
+    const reqA = call("javascript", { tabId: 5, code: "A" }, chatA);
+    const a = executor.run(reqA);
+    await new Promise(r => setTimeout(r, 20));
+    const b = executor.run(call("key", { tabId: 5, key: "a" }, chatB));
+    await new Promise(r => setTimeout(r, 20));
+    state.abort(reqA.id);
+    await a;
+    expect(await b).toMatchObject({ ok: false, error: "dialog_open" });
+    expect(executor.pendingDialog(5)?.openedDuring).toBe("key");
+  });
+
+  test("stopSession aborts only that chat's calls and stopTab aborts both", async () => {
+    const { api, state, tabs, executor } = setup({ defaultTimeoutMs: 5000 });
     api.addTab(5);
     tabs.setChatLinks(chatA.id, [5]);
     tabs.setChatLinks(chatB.id, [5]);
     api.cdpResults["Runtime.evaluate"] = () => new Promise(() => {});
     const a = executor.run(call("javascript", { tabId: 5, code: "A" }, chatA));
-    const b = await executor.run(call("get_console", { tabId: 5 }, chatB));
-    expect(b.ok).toBe(true);
-    expect(await a).toMatchObject({ ok: false, error: "timeout" });
+    const b = executor.run(call("javascript", { tabId: 5, code: "B" }, chatB));
+    await new Promise(r => setTimeout(r, 20));
+    state.stopSession(chatA.id);
+    expect(await a).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(state.inflightCount).toBe(1);
+    state.setSessionsOnTab(() => [chatA.id, chatB.id]);
+    state.stopTab(5);
+    expect(await b).toMatchObject({ ok: false, error: "stopped_by_user" });
+  });
+
+  test("a chat popup is linked after a service-worker restart", async () => {
+    const { api, tabs, executor } = setup();
+    const opener = JSON.parse(textOf(await executor.run(call("tabs_create", {}, { ...chatA, color: "#f97316" })))).tabId as number;
+    await Promise.resolve();
+    const fresh = new TabManager(api);
+    await fresh.load();
+    const popup = api.addTab(300);
+    await fresh.claimOpened(popup, api.tabList.get(opener)!);
+    expect(fresh.chatLinks(chatA.id)).toContain(300);
   });
 
   test("a dialog opened by an earlier call is seen by the next chat call on the tab", async () => {
@@ -186,7 +265,10 @@ describe("chat links", () => {
     api.addTab(5);
     tabs.setChatLinks(chatA.id, [5]);
     tabs.setChatLinks(chatB.id, [5]);
+    let first = true;
     api.cdpResults["Runtime.evaluate"] = async () => {
+      if (!first) return new Promise(() => {}); // a call that wrongly ignores the open dialog hangs
+      first = false;
       api.emit(5, "Page.javascriptDialogOpening", { type: "alert", message: "hi", url: "https://example.test/" });
       await new Promise(r => setTimeout(r, 10));
       return { result: { value: 1 } };
