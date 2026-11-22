@@ -190,6 +190,28 @@ test("a failed start of a pod logs its reason code", async () => {
   expect(JSON.parse(lines[0]!)).toMatchObject({ event: "chat_start_failed", error: "PodStartError", reason: "InitFailed" });
 });
 
+test("a handle with a relative cwd fails the start with pod_start and sends no session/new", async () => {
+  const lines: string[] = [];
+  const { broker, store, transport } = setup({ cwd: "" }, { log: (l) => void lines.push(l) });
+  const rec = await made(broker);
+  expect(await broker.startPod(rec.id)).toBeUndefined();
+  expect(transport.written.map((l) => JSON.parse(l).method)).not.toContain("session/new");
+  expect(transport.written.map((l) => JSON.parse(l).method)).not.toContain("session/load");
+  expect((await bodies(store, rec.id)).at(-1)).toEqual({ k: "error", code: "pod_start", message: "The agent could not start." });
+  expect((await store.get(rec.id))?.state).toBe("failed");
+  expect(JSON.parse(lines[0]!)).toMatchObject({ event: "chat_start_failed", code: "pod_start", kind: "pod_start" });
+});
+
+test("an ACP error at start logs its numeric code and never its message", async () => {
+  const lines: string[] = [];
+  const { broker } = setup({ env: { STUB_ACP_NEW_ERROR: "1" } }, { log: (l) => void lines.push(l) });
+  const rec = await made(broker);
+  await broker.startPod(rec.id);
+  expect(lines).toHaveLength(1);
+  expect(JSON.parse(lines[0]!)).toMatchObject({ event: "chat_start_failed", error: "AcpError", acpCode: -32000 });
+  expect(lines[0]).not.toContain("no session for you");
+});
+
 test("an other start error logs its constructor name only", async () => {
   const lines: string[] = [];
   const { broker } = setup({ failStart: new Error("secret-host.internal leak-marker-xyz") }, { log: (l) => void lines.push(l) });

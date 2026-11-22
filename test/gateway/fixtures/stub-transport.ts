@@ -31,6 +31,8 @@ export interface StubTransportOptions {
   config?: AgentRuntimeConfig;
   /** stopSession waits this long before it deletes the session. */
   stopSessionDelayMs?: number;
+  /** The cwd of the handle. Default: /work. */
+  cwd?: string;
 }
 
 export class StubPodTransport implements PodTransport {
@@ -109,7 +111,7 @@ export class StubPodTransport implements PodTransport {
         finish("closed locally");
       },
     };
-    return { name: `pod-${input.chatId.slice(0, 8)}`, session: sessionName(input.chatId, input.generation), cwd: "/work", stream };
+    return { name: `pod-${input.chatId.slice(0, 8)}`, session: sessionName(input.chatId, input.generation), cwd: this.opts.cwd ?? "/work", stream };
   }
 
   async stop(chatId: string): Promise<void> {
