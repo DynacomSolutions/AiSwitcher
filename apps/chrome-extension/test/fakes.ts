@@ -22,8 +22,9 @@ export class FakeChrome implements ChromeApi {
   /** Every tab created, with the `active` flag it was created with (always false: agents never foreground a tab). */
   createdActive: boolean[] = [];
 
-  addTab(id: number, url = "https://example.test/", title = "T"): TabInfo {
-    const t: TabInfo = { id, windowId: 1, groupId: -1, url, title, active: false };
+  addTab(id: number, url = "https://example.test/", title = "T", extra: { splitViewId?: number; windowId?: number } = {}): TabInfo {
+    const t: TabInfo = { id, windowId: extra.windowId ?? 1, groupId: -1, url, title, active: false };
+    if (extra.splitViewId !== undefined) t.splitViewId = extra.splitViewId;
     this.tabList.set(id, t);
     return t;
   }

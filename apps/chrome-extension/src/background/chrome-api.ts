@@ -1,6 +1,6 @@
 // Small injectable facade over the chrome.* APIs the extension uses. Tests fake it.
 
-export interface TabInfo { id: number; windowId: number; groupId: number; url: string; title: string; active: boolean }
+export interface TabInfo { id: number; windowId: number; groupId: number; url: string; title: string; active: boolean; splitViewId?: number }
 
 export interface GroupInfo { id: number; title: string }
 
@@ -50,7 +50,7 @@ export interface ChromeApi {
 }
 
 function toTab(t: chrome.tabs.Tab): TabInfo {
-  return { id: t.id ?? -1, windowId: t.windowId, groupId: t.groupId ?? -1, url: t.url ?? t.pendingUrl ?? "", title: t.title ?? "", active: t.active };
+  return { id: t.id ?? -1, windowId: t.windowId, groupId: t.groupId ?? -1, url: t.url ?? t.pendingUrl ?? "", title: t.title ?? "", active: t.active, splitViewId: t.splitViewId };
 }
 
 export function realChromeApi(): ChromeApi {
