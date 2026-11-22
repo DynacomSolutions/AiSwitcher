@@ -10,7 +10,8 @@ export type ChatCmd = "prompt" | "cancel" | "permission" | "configure" | "close"
 export type ChatBusMsg =
   | { t: "event"; chatId: string; seq: number }
   | { t: "state"; chatId: string }
-  | { t: "cmd"; to: string; chatId: string; cmd: ChatCmd; seq?: number; args?: Record<string, unknown> }
+  | { t: "cmd"; to: string; chatId: string; cmd: ChatCmd; seq?: number; args?: Record<string, unknown>; from?: string; ref?: string }
+  | { t: "ack"; to: string; chatId: string; ref: string }
   | { t: "grants"; chatId: string };
 
 export interface ChatBus {
@@ -38,10 +39,14 @@ export function parseBusMsg(payload: string): ChatBusMsg | undefined {
       return { t: "state", chatId: o.chatId };
     case "grants":
       return { t: "grants", chatId: o.chatId };
+    case "ack":
+      return typeof o.to === "string" && typeof o.ref === "string" ? { t: "ack", to: o.to, chatId: o.chatId, ref: o.ref } : undefined;
     case "cmd": {
       if (typeof o.to !== "string" || typeof o.cmd !== "string" || !CMDS.includes(o.cmd)) return undefined;
       const m: ChatBusMsg = { t: "cmd", to: o.to, chatId: o.chatId, cmd: o.cmd as ChatCmd };
       if (typeof o.seq === "number") m.seq = o.seq;
+      if (typeof o.from === "string") m.from = o.from;
+      if (typeof o.ref === "string") m.ref = o.ref;
       if (typeof o.args === "object" && o.args !== null && !Array.isArray(o.args)) m.args = o.args as Record<string, unknown>;
       return m;
     }

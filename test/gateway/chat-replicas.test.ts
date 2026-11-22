@@ -26,7 +26,7 @@ afterEach(async () => {
 const frozen: Timers = { setTimeout: () => 0, clearTimeout: () => undefined };
 
 /** Two replicas over one store, one bus and one fake cluster. */
-async function pair(opts: { frozenA?: boolean; ackMs?: number; ackTries?: number } = {}) {
+async function pair(opts: { frozenA?: boolean; ackMs?: number } = {}) {
   const clock = { t: 1_700_000_000_000 };
   const store = new MemoryChatStore(() => clock.t);
   const bus = new MemoryChatBus();
@@ -36,6 +36,7 @@ async function pair(opts: { frozenA?: boolean; ackMs?: number; ackTries?: number
     const transport = new StubPodTransport({ cluster, env: { STUB_ACP_STATE: stateFile } });
     transports.push(transport);
     const seen: Array<[string, number]> = [];
+    const rejects: Array<{ chatId: string; code: string; message: string }> = [];
     const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
     const broker = new ChatBroker({
       store,
@@ -50,11 +51,11 @@ async function pair(opts: { frozenA?: boolean; ackMs?: number; ackTries?: number
       identityOf: async (b) => (b === "bind-1" ? "alpha" : undefined),
       ...(timers ? { timers } : {}),
       ...(opts.ackMs !== undefined ? { forwardAckMs: opts.ackMs } : {}),
-      ...(opts.ackTries !== undefined ? { forwardAckTries: opts.ackTries } : {}),
+      rejectChat: (chatId, code, message) => void rejects.push({ chatId, code, message }),
     });
     brokers.push(broker);
     await broker.start();
-    return { broker, transport, seen, metrics };
+    return { broker, transport, seen, metrics, rejects };
   };
   const a = await make("replica-a", opts.frozenA ? frozen : undefined);
   const b = await make("replica-b");
@@ -228,16 +229,36 @@ test("a prompt that the owner never receives is taken over once its lease has en
   expect((await bodies(store, id)).filter((x) => x.k === "user")).toHaveLength(2);
 });
 
-test("a prompt that stays unanswered by a live owner is counted, and its user event stays in the feed", async () => {
-  const { store, bus, a, b, id } = await pair({ ackMs: 20, ackTries: 3 });
+test("an owner that never acks with a live lease gives a reject that is not stored, and a retry reuses the stored prompt", async () => {
+  const { store, bus, a, b, id } = await pair({ ackMs: 20 });
   await prompt(a.broker, id, "say:one");
   await until(async () => (await turnEnds(store, id)) === 1, "turn");
   await idle(store, id);
   bus.drop = (m) => m.t === "cmd";
   expect(await prompt(b.broker, id, "say:two")).toBeUndefined();
-  await until(() => b.metrics.render().includes('kind="owner_unreachable"'), "metric");
-  expect((await bodies(store, id)).filter((x) => x.k === "user")).toHaveLength(2);
+  await until(() => b.rejects.length === 1, "reject");
+  expect(b.rejects[0]).toEqual({ chatId: id, code: "unavailable", message: "The chat did not answer. Try again in a moment." });
+  expect(b.metrics.render().includes('kind="owner_unreachable"')).toBe(true);
   expect(b.transport.starts).toHaveLength(0);
+  const users = async () => (await bodies(store, id)).filter((x) => x.k === "user");
+  expect(await users()).toHaveLength(2);
+  // The owner is back. The retry reuses the stored event and runs.
+  bus.drop = undefined as never;
+  expect(await prompt(b.broker, id, "say:two")).toBeUndefined();
+  await until(async () => (await turnEnds(store, id)) === 2, "retry turn");
+  expect(await users()).toHaveLength(2);
+});
+
+test("an owner that acks gives no reject and no metric", async () => {
+  const { store, a, b, id } = await pair({ ackMs: 20 });
+  await prompt(a.broker, id, "say:one");
+  await until(async () => (await turnEnds(store, id)) === 1, "turn");
+  await idle(store, id);
+  expect(await b.broker.dispatch({ chatId: id, binding: "bind-1", cmd: "configure", args: { name: "Renamed" } })).toBeUndefined();
+  await until(async () => (await store.get(id))?.name === "Renamed", "renamed on the owner");
+  await Bun.sleep(100);
+  expect(b.rejects).toHaveLength(0);
+  expect(b.metrics.render().includes("owner_unreachable")).toBe(false);
 });
 
 test("the idle limit reads the environment, defaults to 2 hours and is capped at 3 hours", () => {

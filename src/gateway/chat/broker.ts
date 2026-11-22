@@ -33,7 +33,7 @@ const BUSY_NOTICE = "The agent was still working, so it did not take your last m
 const UNREACHABLE_MESSAGE = "Your message could not reach the agent. Send it again.";
 const DRAINING_MESSAGE = "The gateway is restarting. Try again in a moment.";
 const DEFAULT_FORWARD_ACK_MS = 10_000;
-const DEFAULT_FORWARD_ACK_TRIES = 8;
+const NO_ACK_MESSAGE = "The chat did not answer. Try again in a moment.";
 const DEFAULT_SWEEP_MS = 60_000;
 const DEFAULT_START_TIMEOUT_MS = 5 * 60_000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -76,8 +76,8 @@ export interface BrokerDeps {
   bus?: ChatBus;
   /** After a prompt went to another replica, wait this long for the chat to move on. Then check again. Default 10 seconds. */
   forwardAckMs?: number;
-  /** Checks of a forwarded prompt before it counts as unreachable. Default 8. */
-  forwardAckTries?: number;
+  /** Tell the extension of a chat that a command failed. Not stored. */
+  rejectChat?(chatId: string, code: BrokerReject["code"], message: string): void;
   /** Time between idle sweeps. Default 60 seconds. */
   sweepMs?: number;
   identityOf(binding: string): Promise<string | undefined>;
@@ -189,6 +189,10 @@ export class ChatBroker implements ChatAuth {
   /** Highest event number this replica told its own listeners about, per chat. */
   private readonly notified = new Map<string, number>();
   private readonly watches = new Set<unknown>();
+  /** Refs of commands that the owner acknowledged. */
+  private readonly acked = new Set<string>();
+  /** A prompt that got no answer from a live owner. A retry with the same text reuses its stored event. */
+  private readonly unanswered = new Map<string, { seq: number; text: string }>();
   private draining = false;
   private unsubscribe: (() => Promise<void>) | undefined;
   private sweepTimer: unknown;
@@ -774,8 +778,7 @@ export class ChatBroker implements ChatAuth {
         if (!chat || chat.state === "closed") return;
         const owner = this.liveOwner(chat);
         if (owner !== undefined) {
-          await this.send({ t: "cmd", to: owner, chatId, cmd: "prompt", seq });
-          this.watch(chatId, seq, 1);
+          await this.sendCmd({ t: "cmd", to: owner, chatId, cmd: "prompt", seq });
           return;
         }
       }
@@ -811,29 +814,39 @@ export class ChatBroker implements ChatAuth {
   }
 
   /**
-   * After a prompt went to another replica, check that the chat moved on. When nothing followed the prompt and no replica holds
-   * a live lease, this replica runs the prompt itself. A live owner that stays silent is counted.
+   * Send a command to its owner and wait for the ack. The owner acks every command it gets.
+   * No ack after forwardAckMs: an expired lease means the owner is gone, so this replica runs the command.
+   * A live lease means the owner is silent: the extension gets a reject (not stored) and a metric counts it.
    */
-  private watch(chatId: string, seq: number, tries: number): void {
+  private async sendCmd(msg: Extract<ChatBusMsg, { t: "cmd" }>): Promise<void> {
+    const ref = crypto.randomUUID();
+    msg.from = this.d.replicaId;
+    msg.ref = ref;
+    await this.send(msg);
     if (this.stopped) return;
     const handle = this.timers.setTimeout(() => {
       this.watches.delete(handle);
-      void this.checkForwarded(chatId, seq, tries).catch(() => this.d.metrics.chatError("other"));
+      if (this.acked.delete(ref)) return;
+      void this.noAck(msg).catch(() => this.d.metrics.chatError("other"));
     }, this.d.forwardAckMs ?? DEFAULT_FORWARD_ACK_MS);
     this.watches.add(handle);
   }
 
-  private async checkForwarded(chatId: string, seq: number, tries: number): Promise<void> {
+  private async noAck(msg: Extract<ChatBusMsg, { t: "cmd" }>): Promise<void> {
     if (this.stopped || this.draining) return;
-    const chat = await this.d.store.get(chatId);
-    if (!chat || chat.state === "closed" || chat.lastSeq !== seq) return;
+    const chat = await this.d.store.get(msg.chatId);
+    if (!chat || chat.state === "closed") return;
     if (this.liveOwner(chat) !== undefined) {
-      if (tries >= (this.d.forwardAckTries ?? DEFAULT_FORWARD_ACK_TRIES)) this.d.metrics.chatError("owner_unreachable");
-      else this.watch(chatId, seq, tries + 1);
+      this.d.metrics.chatError("owner_unreachable");
+      this.d.rejectChat?.(msg.chatId, "unavailable", NO_ACK_MESSAGE);
+      // A retry of the same prompt reuses the stored event.
+      if (msg.cmd === "prompt" && msg.seq !== undefined) {
+        const row = (await this.d.store.events(msg.chatId, msg.seq - 1, 1))[0];
+        if (row?.seq === msg.seq && row.body.k === "user") this.unanswered.set(msg.chatId, { seq: msg.seq, text: row.body.text });
+      }
       return;
     }
-    const row = (await this.d.store.events(chatId, seq - 1, 1))[0];
-    if (row?.seq === seq && row.body.k === "user") await this.acceptStored(chatId, row.body.text, seq);
+    await this.onCmd(msg, false);
   }
 
   /** Run a prompt whose user event is already in the store. A busy chat gets a feed item, so the prompt is never lost. */
@@ -880,16 +893,19 @@ export class ChatBroker implements ChatAuth {
     if (c.cmd === "prompt") {
       const text = typeof c.args?.text === "string" ? clean(c.args.text) : "";
       if (chat.state === "thinking" || chat.state === "waiting") return { code: "busy", message: "The agent is still working on the last message." };
-      const seq = await this.d.store.appendEvent(c.chatId, { k: "user", text });
-      this.notify(c.chatId, seq);
+      const prior = this.unanswered.get(c.chatId);
+      this.unanswered.delete(c.chatId);
+      let seq: number;
+      if (prior && prior.text === text && chat.lastSeq === prior.seq) seq = prior.seq;
+      else {
+        seq = await this.d.store.appendEvent(c.chatId, { k: "user", text });
+        this.notify(c.chatId, seq);
+      }
       // The text stays in the store. The bus carries only its number.
       delete msg.args;
       msg.seq = seq;
-      await this.send(msg);
-      this.watch(c.chatId, seq, 1);
-      return undefined;
     }
-    await this.send(msg);
+    await this.sendCmd(msg);
     return undefined;
   }
 
@@ -938,11 +954,16 @@ export class ChatBroker implements ChatAuth {
       void this.d.store.get(m.chatId).then((r) => r && this.d.publish(m.chatId, r.lastSeq), () => undefined);
       return;
     }
+    if (m.t === "ack") {
+      if (m.to === this.d.replicaId) this.acked.add(m.ref);
+      return;
+    }
     if (m.t !== "cmd" || m.to !== this.d.replicaId) return;
     void this.onCmd(m).catch(() => this.d.metrics.chatError("other"));
   }
 
-  private async onCmd(m: Extract<ChatBusMsg, { t: "cmd" }>): Promise<void> {
+  private async onCmd(m: Extract<ChatBusMsg, { t: "cmd" }>, ack = true): Promise<void> {
+    if (ack && m.from !== undefined && m.ref !== undefined && !this.draining) void this.send({ t: "ack", to: m.from, chatId: m.chatId, ref: m.ref });
     if (m.cmd === "prompt") {
       if (m.seq === undefined) return;
       const row = (await this.d.store.events(m.chatId, m.seq - 1, 1))[0];
