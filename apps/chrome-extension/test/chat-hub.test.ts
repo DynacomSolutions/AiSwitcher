@@ -1,0 +1,382 @@
+import { describe, expect, test } from "bun:test";
+import type { ChatBody, ChatFromExt, ChatSelection, ChatSummary } from "../../../src/browser/chat-protocol.ts";
+import { sessionIdForChat } from "../../../src/browser/chat-protocol.ts";
+import type { CallRequest } from "../../../src/browser/protocol.ts";
+import { ChatHub, servePort } from "../src/background/chat.ts";
+import type { PortLike } from "../src/background/chat.ts";
+import { Executor } from "../src/background/executor.ts";
+import { acceptPort } from "../src/background/messages.ts";
+import { State } from "../src/background/state.ts";
+import { TabManager } from "../src/background/tabs.ts";
+import { CHAT_PALETTE } from "../src/shared/chat-palette.ts";
+import { parsePanelCommand } from "../src/shared/chat.ts";
+import { FakeChrome } from "./fakes.ts";
+
+const sel: ChatSelection = { provider: "claude", identity: "alpha" };
+
+function setup(online = true) {
+  const api = new FakeChrome();
+  const tabs = new TabManager(api);
+  const sent: ChatFromExt[] = [];
+  const resumed: string[] = [];
+  const ended: string[] = [];
+  let up = online;
+  let id = 0;
+  const make = () => new ChatHub({
+    send: f => { if (!up) return false; sent.push(f); return true; },
+    tabs, storage: api.sessionStorage, now: () => 1000, newId: () => `c${++id}`,
+    resumeSession: s => { resumed.push(s); }, endSession: s => { ended.push(s); },
+  });
+  const hub = make();
+  return { api, tabs, hub, sent, resumed, ended, make, setUp: (v: boolean) => { up = v; } };
+}
+type Env = ReturnType<typeof setup>;
+
+const summary = (chatId: string, over: Partial<ChatSummary> = {}): ChatSummary =>
+  ({ chatId, name: "Chat 1", color: CHAT_PALETTE[0]!.hex, windowId: 1, state: "idle", selection: sel, tabIds: [], lastSeq: 0, updatedAt: 1, ...over });
+const ev = (chatId: string, seq: number, body: ChatBody = { k: "text", text: `t${seq}` }) => ({ t: "chat.event" as const, chatId, seq, ts: seq, body });
+const create = (windowId = 1, tabIds = [5]) => ({ type: "ais-chat-create" as const, windowId, selection: sel, tabIds });
+
+describe("chat hub", () => {
+  test("an event with a seen seq is ignored (no duplicates after a resume)", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.hub.handleFrame(ev("a", 1));
+    e.hub.handleFrame(ev("a", 2));
+    e.hub.handleFrame(ev("a", 1));
+    e.hub.handleFrame(ev("a", 2));
+    expect(e.hub.state(1).chats[0]!.items.map(i => i.seq)).toEqual([1, 2]);
+    expect(e.sent.filter(f => f.t === "chat.resume")).toHaveLength(0);
+  });
+
+  test("a gap triggers chat.resume {afterSeq: lastSeq}, once for the same position", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.hub.handleFrame(ev("a", 1));
+    e.hub.handleFrame(ev("a", 4));
+    e.hub.handleFrame(ev("a", 5));
+    expect(e.sent.filter(f => f.t === "chat.resume")).toEqual([{ t: "chat.resume", chatId: "a", afterSeq: 1 }]);
+    expect(e.hub.state(1).chats[0]!.items.map(i => i.seq)).toEqual([1]);
+    e.hub.handleFrame(ev("a", 2));
+    e.hub.handleFrame(ev("a", 3));
+    e.hub.handleFrame(ev("a", 4));
+    expect(e.hub.state(1).chats[0]!.items.map(i => i.seq)).toEqual([1, 2, 3, 4]);
+  });
+
+  test("the feed keeps the last 500 items", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    for (let i = 1; i <= 520; i++) e.hub.handleFrame(ev("a", i));
+    const items = e.hub.state(1).chats[0]!.items;
+    expect(items).toHaveLength(500);
+    expect(items[0]!.seq).toBe(21);
+    expect(items.at(-1)!.seq).toBe(520);
+  });
+
+  test("create picks the lowest free colour and refuses the seventh chat of a window with the cap message", async () => {
+    const e = setup();
+    for (let i = 0; i < 6; i++) expect(await e.hub.command(create())).toEqual({ ok: true });
+    const colours = e.sent.filter(f => f.t === "chat.create").map(f => (f as Extract<ChatFromExt, { t: "chat.create" }>).color);
+    expect(colours).toEqual(CHAT_PALETTE.map(p => p.hex));
+    const r = await e.hub.command(create());
+    expect(r).toEqual({ ok: false, error: "You can have 6 chats in one window. Close a chat to start another." });
+    expect(e.hub.state(1).error).toContain("6 chats");
+    expect(e.sent.filter(f => f.t === "chat.create")).toHaveLength(6);
+    // another window has its own six
+    expect(await e.hub.command(create(2))).toEqual({ ok: true });
+  });
+
+  test("create reuses the colour of a closed chat", async () => {
+    const e = setup();
+    await e.hub.command(create());
+    await e.hub.command(create());
+    await e.hub.command({ type: "ais-chat-close", chatId: "c1" });
+    await e.hub.command(create());
+    const last = e.sent.filter(f => f.t === "chat.create").at(-1) as Extract<ChatFromExt, { t: "chat.create" }>;
+    expect(last.color).toBe(CHAT_PALETTE[0]!.hex);
+  });
+
+  test("create sends chat.create with the default linked tabs and sets the local links", async () => {
+    const e = setup();
+    await e.hub.command({ ...create(1, [5, 6]), text: "hello" });
+    expect(e.sent[0]).toEqual({ t: "chat.create", chatId: "c1", name: "Chat 1", color: CHAT_PALETTE[0]!.hex, windowId: 1, selection: sel, tabIds: [5, 6] });
+    expect(e.sent[1]).toEqual({ t: "chat.prompt", chatId: "c1", text: "hello" });
+    expect(e.tabs.chatLinks(sessionIdForChat("c1"))).toEqual([5, 6]);
+    expect(e.hub.state(1).chats[0]!.summary.tabIds).toEqual([5, 6]);
+  });
+
+  test("create offline fails with a clear message and keeps no chat", async () => {
+    const e = setup(false);
+    const r = await e.hub.command(create());
+    expect(r.ok).toBe(false);
+    expect(e.hub.state(1).chats).toHaveLength(0);
+  });
+
+  test("onWelcome sends list, resume and link frames in that order", async () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.hub.handleFrame({ t: "chat.state", chatId: "b", state: "idle", summary: summary("b", { color: CHAT_PALETTE[1]!.hex }) });
+    e.hub.handleFrame(ev("a", 1));
+    e.hub.handleFrame(ev("a", 2));
+    e.tabs.setChatLinks(sessionIdForChat("a"), [7], true);
+    e.sent.length = 0;
+    e.hub.onWelcome();
+    expect(e.sent).toEqual([
+      { t: "chat.list" },
+      { t: "chat.resume", chatId: "a", afterSeq: 2 }, { t: "chat.resume", chatId: "b", afterSeq: 0 },
+      { t: "chat.link", chatId: "a", tabIds: [7] }, { t: "chat.link", chatId: "b", tabIds: [] },
+    ]);
+  });
+
+  test("the list after a welcome does not repeat a resume already sent", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.hub.handleFrame(ev("a", 1));
+    e.hub.onWelcome();
+    e.sent.length = 0;
+    e.hub.handleFrame({ t: "chat.list", chats: [summary("a", { lastSeq: 3 })] });
+    expect(e.sent).toEqual([]);
+  });
+
+  test("a chat.reject with window_cap or unavailable becomes panel error text", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.reject", code: "window_cap", message: "Too many chats in this window." });
+    expect(e.hub.state(1).error).toBe("Too many chats in this window.");
+    e.hub.handleFrame({ t: "chat.reject", code: "unavailable", message: "Chat is not available." });
+    expect(e.hub.state(9).error).toBe("Chat is not available.");
+  });
+
+  test("a rejected create removes the local chat and its links", async () => {
+    const e = setup();
+    await e.hub.command(create());
+    e.hub.handleFrame({ t: "chat.reject", chatId: "c1", code: "window_cap", message: "No." });
+    expect(e.hub.state(1).chats).toHaveLength(0);
+    expect(e.tabs.chatLinks(sessionIdForChat("c1"))).toEqual([]);
+  });
+
+  test("a list from the gateway keeps a chat that was just created and drops one the gateway forgot", async () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "old", state: "idle", summary: summary("old", { color: CHAT_PALETTE[1]!.hex }) });
+    await e.hub.command(create());
+    e.hub.handleFrame({ t: "chat.list", chats: [] });
+    expect(e.hub.state(1).chats.map(c => c.summary.chatId)).toEqual(["c1"]);
+  });
+
+  test("state(windowId) returns only that window's chats", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a", { windowId: 1 }) });
+    e.hub.handleFrame({ t: "chat.state", chatId: "b", state: "idle", summary: summary("b", { windowId: 2 }) });
+    expect(e.hub.state(1).chats.map(c => c.summary.chatId)).toEqual(["a"]);
+    expect(e.hub.state(2).chats.map(c => c.summary.chatId)).toEqual(["b"]);
+    expect(e.hub.state(3).chats).toEqual([]);
+    expect(e.hub.state(1).cap).toBe(6);
+  });
+
+  test("a pending permission shows in the view until it is resolved", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "waiting", summary: summary("a") });
+    e.hub.handleFrame(ev("a", 1, { k: "permission", requestId: "r1", rpcId: 1, title: "Run", options: [] }));
+    expect(e.hub.state(1).chats[0]!.pending).toEqual({ permission: "r1" });
+    e.hub.handleFrame(ev("a", 2, { k: "permission_resolved", requestId: "r1", cancelled: true }));
+    expect(e.hub.state(1).chats[0]!.pending).toBeUndefined();
+  });
+
+  test("the worker restart restores chats and the last seq from session storage", async () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.hub.handleFrame(ev("a", 1));
+    e.hub.handleFrame(ev("a", 2));
+    await e.hub.flush();
+    const again = e.make();
+    await again.load();
+    expect(again.state(1).chats[0]!.items.map(i => i.seq)).toEqual([1, 2]);
+    again.handleFrame(ev("a", 2));
+    again.handleFrame(ev("a", 3));
+    expect(again.state(1).chats[0]!.items.map(i => i.seq)).toEqual([1, 2, 3]);
+    e.sent.length = 0;
+    again.onWelcome();
+    expect(e.sent).toContainEqual({ t: "chat.resume", chatId: "a", afterSeq: 3 });
+  });
+
+  test("subscribers hear a change with the window id and can stop", () => {
+    const e = setup();
+    const heard: number[] = [];
+    const off = e.hub.subscribe(w => heard.push(w));
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a", { windowId: 4 }) });
+    off();
+    e.hub.handleFrame(ev("a", 1));
+    expect(heard).toEqual([4]);
+  });
+});
+
+describe("chat hub commands", () => {
+  test("prompt lifts the stop block first, and an unknown chat is refused", async () => {
+    const e = setup();
+    expect((await e.hub.command({ type: "ais-chat-prompt", chatId: "zz", text: "x" })).ok).toBe(false);
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    expect(await e.hub.command({ type: "ais-chat-prompt", chatId: "a", text: "go" })).toEqual({ ok: true });
+    expect(e.resumed).toEqual(["chat:a"]);
+    expect(e.sent.at(-1)).toEqual({ t: "chat.prompt", chatId: "a", text: "go" });
+  });
+
+  test("a page Stop of the chat agent sends chat.cancel; an external agent does not", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "thinking", summary: summary("a") });
+    e.hub.onSessionStopped("chat:a");
+    e.hub.onSessionStopped("ext1");
+    e.hub.onSessionStopped("chat:unknown");
+    expect(e.sent).toEqual([{ t: "chat.cancel", chatId: "a" }]);
+  });
+
+  test("close sends chat.close, drops links, ends the session on pages and removes the chat", async () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.tabs.setChatLinks("chat:a", [5], true);
+    expect(await e.hub.command({ type: "ais-chat-close", chatId: "a" })).toEqual({ ok: true });
+    expect(e.sent.at(-1)).toEqual({ t: "chat.close", chatId: "a" });
+    expect(e.tabs.chatLinks("chat:a")).toEqual([]);
+    expect(e.ended).toEqual(["chat:a"]);
+    expect(e.hub.state(1).chats).toEqual([]);
+    // the link notice from dropChat did not reach the gateway for the closed chat
+    expect(e.sent.filter(f => f.t === "chat.link")).toEqual([]);
+  });
+
+  test("config, permission, rename and cancel become frames", async () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    await e.hub.command({ type: "ais-chat-config", chatId: "a", model: "m1" });
+    await e.hub.command({ type: "ais-chat-permission", chatId: "a", requestId: "r", optionId: "o" });
+    await e.hub.command({ type: "ais-chat-rename", chatId: "a", name: "New" });
+    await e.hub.command({ type: "ais-chat-cancel", chatId: "a" });
+    expect(e.sent).toEqual([
+      { t: "chat.config", chatId: "a", model: "m1" }, { t: "chat.permission", chatId: "a", requestId: "r", optionId: "o" },
+      { t: "chat.rename", chatId: "a", name: "New" }, { t: "chat.cancel", chatId: "a" },
+    ]);
+  });
+
+  test("a catalog reply fills the panel state; a second provider request merges", async () => {
+    const e = setup();
+    await e.hub.command({ type: "ais-chat-catalog" });
+    const first = e.sent[0] as Extract<ChatFromExt, { t: "chat.catalog" }>;
+    e.hub.handleFrame({ t: "chat.catalog", reqId: first.reqId, providers: [{ provider: "claude", identities: [], efforts: [] }, { provider: "codex", identities: [], efforts: [] }] });
+    await e.hub.command({ type: "ais-chat-catalog", provider: "codex" });
+    const second = e.sent[1] as Extract<ChatFromExt, { t: "chat.catalog" }>;
+    e.hub.handleFrame({ t: "chat.catalog", reqId: second.reqId, providers: [{ provider: "codex", identities: [], efforts: ["high"] }] });
+    expect(e.hub.state(1).catalog?.map(p => p.provider)).toEqual(["claude", "codex"]);
+    expect(e.hub.state(1).catalog?.[1]!.efforts).toEqual(["high"]);
+    // an answer nobody asked for is ignored
+    e.hub.handleFrame({ t: "chat.catalog", reqId: "other", providers: [] });
+    expect(e.hub.state(1).catalog).toHaveLength(2);
+  });
+
+  test("panel commands are checked for shape", () => {
+    expect(parsePanelCommand({ type: "ais-chat-prompt", chatId: "a", text: 5 })).toBeUndefined();
+    expect(parsePanelCommand({ type: "ais-chat-create", windowId: 1, tabIds: [1], selection: { provider: "nope", identity: "x" } })).toBeUndefined();
+    expect(parsePanelCommand({ type: "ais-pause" })).toBeUndefined();
+    expect(parsePanelCommand({ type: "ais-chat-close", chatId: "a" })).toEqual({ type: "ais-chat-close", chatId: "a" });
+  });
+
+  test("an invalid frame is never sent", async () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    const r = await e.hub.command({ ...create(), selection: { provider: "claude", identity: "bad identity!" } });
+    expect(r.ok).toBe(false);
+    expect(e.sent).toEqual([]);
+  });
+});
+
+describe("chat links to the gateway", () => {
+  const chat = { id: "chat:c1", identity: "chat", label: "Chat 1", chat: true as const };
+
+  test("link merges chat-created tabs back in, and sends one chat.link", async () => {
+    const e = setup();
+    e.api.addTab(5);
+    e.api.addTab(6);
+    const state = new State(e.api.storage);
+    const executor = new Executor({ api: e.api, tabs: e.tabs, state, defaultTimeoutMs: 500, onLinks: (s, ids) => e.hub.onLinks(s, ids) });
+    await e.hub.command(create(1, [5]));
+    const r = await executor.run({ id: "k1", session: chat, tool: "tabs_create", args: { url: "https://example.test/new" } } as CallRequest);
+    expect(r.ok).toBe(true);
+    const created = e.tabs.chatLinks("chat:c1").find(t => t !== 5)!;
+    e.sent.length = 0;
+    expect(await e.hub.command({ type: "ais-chat-link", chatId: "c1", tabIds: [6] })).toEqual({ ok: true });
+    expect(e.tabs.chatLinks("chat:c1").sort()).toEqual([6, created].sort());
+    expect(e.sent).toEqual([{ t: "chat.link", chatId: "c1", tabIds: e.tabs.chatLinks("chat:c1") }]);
+  });
+
+  test("a link change while offline is not lost: the welcome sends the current links", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.setUp(false);
+    e.tabs.onLinksChanged = (s, ids) => e.hub.onLinks(s, ids);
+    e.tabs.setChatLinks("chat:a", [8, 9]);
+    expect(e.sent).toEqual([]);
+    e.setUp(true);
+    e.hub.onWelcome();
+    expect(e.sent.at(-1)).toEqual({ t: "chat.link", chatId: "a", tabIds: [8, 9] });
+  });
+
+  test("a tab closed in the browser reaches the gateway as a new link set", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.tabs.onLinksChanged = (s, ids) => e.hub.onLinks(s, ids);
+    e.tabs.setChatLinks("chat:a", [5, 6], true);
+    e.api.closeTab(5);
+    expect(e.sent.at(-1)).toEqual({ t: "chat.link", chatId: "a", tabIds: [6] });
+    expect(e.hub.state(1).chats[0]!.summary.tabIds).toEqual([6]);
+  });
+});
+
+describe("chat port", () => {
+  const RID = "ext-id";
+  const fakePort = (over: Partial<PortLike> = {}) => {
+    let onMsg: (m: unknown) => void = () => {};
+    const posted: unknown[] = [];
+    let disconnected = false;
+    const port: PortLike = {
+      name: "ais-chat", sender: { id: RID, origin: `chrome-extension://${RID}` },
+      postMessage: m => { posted.push(m); }, disconnect: () => { disconnected = true; },
+      onMessage: { addListener: l => { onMsg = l; } }, onDisconnect: { addListener: () => {} },
+      ...over,
+    };
+    return { port, posted, say: (m: unknown) => onMsg(m), wasDisconnected: () => disconnected };
+  };
+
+  test("a port from a web page origin is refused", () => {
+    expect(acceptPort({ name: "ais-chat", sender: { id: RID, origin: "https://example.test" } }, RID)).toBe(false);
+    expect(acceptPort({ name: "ais-chat", sender: { id: "other", origin: "chrome-extension://other" } }, RID)).toBe(false);
+    expect(acceptPort({ name: "ais-chat" }, RID)).toBe(false);
+    expect(acceptPort({ name: "other", sender: { id: RID, origin: `chrome-extension://${RID}` } }, RID)).toBe(false);
+    expect(acceptPort({ name: "ais-chat", sender: { id: RID, origin: `chrome-extension://${RID}` } }, RID)).toBe(true);
+    const e = setup();
+    const p = fakePort({ sender: { id: RID, origin: "https://example.test" } });
+    expect(servePort(p.port, e.hub, RID)).toBe(false);
+    expect(p.wasDisconnected()).toBe(true);
+    expect(p.posted).toEqual([]);
+  });
+
+  test("the panel gets its window's state at once and on every change", async () => {
+    const e = setup();
+    const p = fakePort();
+    expect(servePort(p.port, e.hub, RID)).toBe(true);
+    p.say({ type: "ais-chat-subscribe", windowId: 1 });
+    expect(p.posted).toHaveLength(1);
+    await e.hub.command(create(1));
+    await e.hub.command(create(2));
+    expect(p.posted.length).toBeGreaterThanOrEqual(2);
+    const last = p.posted.at(-1) as { windowId: number; chats: unknown[] };
+    expect(last.windowId).toBe(1);
+    expect(last.chats).toHaveLength(1);
+  });
+
+  test("a panel command on the port reaches the hub; junk is ignored", () => {
+    const e = setup();
+    const p = fakePort();
+    servePort(p.port, e.hub, RID);
+    p.say({ type: "ais-chat-subscribe", windowId: 1 });
+    p.say({ type: "ais-chat-create", windowId: 1, selection: sel, tabIds: [5] });
+    p.say({ type: "ais-chat-create", windowId: "x" });
+    p.say("junk");
+    expect(e.sent.filter(f => f.t === "chat.create")).toHaveLength(1);
+  });
+});

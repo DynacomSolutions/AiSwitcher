@@ -1,5 +1,7 @@
 // runtime.onMessage handling, kept free of chrome.* so it can be unit tested with fake senders.
 import type { PanelStatus } from "../shared/panel.ts";
+import type { ChatCommandResult } from "../shared/chat.ts";
+import { parsePanelCommand } from "../shared/chat.ts";
 import type { GrantResult } from "./tabs.ts";
 
 export interface MessageSender { id?: string; origin?: string; frameId?: number; tab?: { id?: number } }
@@ -15,10 +17,17 @@ export interface MessageDeps {
   /** Grants a user's tab group to a live session. */
   grant(groupId: number, sessionId: string): Promise<GrantResult>;
   revoke(groupId: number): Promise<void>;
+  /** Runs a side panel chat command. Present when chat is wired. */
+  chatCommand?(cmd: NonNullable<ReturnType<typeof parsePanelCommand>>): Promise<ChatCommandResult>;
   updater?: { check(): Promise<unknown>; update(): Promise<void>; setAuto(enabled: boolean): Promise<void> };
 }
 
 const CONTENT_TYPES = new Set(["ais-stop", "ais-stop-session", "ais-stop-tab"]);
+
+/** Only the extension's own pages may open the chat port. A content script has the extension id but a web page origin. */
+export function acceptPort(port: { name: string; sender?: { id?: string; origin?: string } }, runtimeId: string): boolean {
+  return port.name === "ais-chat" && port.sender?.id === runtimeId && port.sender.origin === `chrome-extension://${runtimeId}`;
+}
 
 /**
  * Returns true when `reply` will be called asynchronously.
@@ -39,6 +48,13 @@ export function handleMessage(msg: unknown, sender: MessageSender, reply: (r: un
       const sessionId = (msg as { sessionId?: unknown }).sessionId;
       if (typeof sessionId !== "string" || !deps.isSessionMarked(tabId, sessionId)) return false;
     }
+  }
+  if (typeof type === "string" && type.startsWith("ais-chat-")) {
+    // Chat commands come from extension pages only: the content script list above never includes them.
+    const cmd = fromExtensionPage && deps.chatCommand ? parsePanelCommand(msg) : undefined;
+    if (!cmd || !deps.chatCommand) return false;
+    void deps.chatCommand(cmd).then(reply);
+    return true;
   }
   switch (type) {
     case "ais-pause": deps.state.pause(); reply({ ok: true }); return false;

@@ -1,4 +1,6 @@
 import type { CallRequest, CallResult, ExtToGateway, GatewayToExt } from "../../../../src/browser/protocol.ts";
+import { parseChatToExt } from "../../../../src/browser/chat-protocol.ts";
+import type { ChatFromExt, ChatToExt } from "../../../../src/browser/chat-protocol.ts";
 import { connectUrl, validateGatewayUrl } from "./pairing.ts";
 
 export type ConnectionStatus = "idle" | "connecting" | "connected" | "reconnecting" | "signed_out" | "replaced";
@@ -28,6 +30,10 @@ export interface ConnectionDeps {
   onStatus(status: ConnectionStatus): void;
   /** Close 4401: token revoked or bad. Caller clears the stored token. */
   onSignedOut(): void;
+  /** A chat frame from the gateway that passed the protocol parser. Only called while the connection is welcomed. */
+  onChat?(frame: ChatToExt): void;
+  /** The gateway accepted the hello. Called after the status changed to connected. */
+  onWelcome?(): void;
   scheduler?: Scheduler;
 }
 
@@ -84,6 +90,12 @@ export class Connection {
 
   sendState(paused: boolean): void {
     if (this.welcomed) this.send({ t: "state", paused });
+  }
+
+  /** Sends a chat frame. Returns false when the connection is not welcomed or the socket fails. */
+  sendChat(frame: ChatFromExt): boolean {
+    if (!this.welcomed || !this.socket) return false;
+    try { this.socket.send(JSON.stringify(frame)); return true; } catch { return false; }
   }
 
   private setStatus(s: ConnectionStatus): void {
@@ -160,6 +172,7 @@ export class Connection {
         this.pingTimer = this.sched.setInterval(() => this.send({ t: "ping" }), PING_INTERVAL_MS);
         this.setStatus("connected");
         if (this.deps.isPaused()) this.send({ t: "state", paused: true });
+        this.deps.onWelcome?.();
         return;
       case "call": {
         if (typeof msg.req !== "object" || msg.req === null || typeof msg.req.id !== "string") return; // malformed frame
@@ -175,6 +188,12 @@ export class Connection {
         return;
       case "pong":
         return;
+      default: {
+        // Chat frames. A frame that fails the parser is dropped and the socket stays open.
+        if (!this.welcomed || typeof msg.t !== "string" || !msg.t.startsWith("chat.")) return;
+        const frame = parseChatToExt(msg);
+        if (frame) this.deps.onChat?.(frame);
+      }
     }
   }
 }

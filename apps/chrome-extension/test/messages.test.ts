@@ -146,3 +146,30 @@ describe("update messages", () => {
     expect(t.calls).toEqual(["check", "update", "auto:false"]);
   });
 });
+
+describe("chat messages", () => {
+  const withChat = () => {
+    const t = setup();
+    const got: unknown[] = [];
+    t.deps.chatCommand = async cmd => { got.push(cmd); return { ok: true }; };
+    return { t, got };
+  };
+
+  test("an extension page runs a chat command and gets the result", async () => {
+    const { t, got } = withChat();
+    let reply: unknown;
+    const async = handleMessage({ type: "ais-chat-close", chatId: "a" }, page, v => { reply = v; }, t.deps);
+    expect(async).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(got).toEqual([{ type: "ais-chat-close", chatId: "a" }]);
+    expect(reply).toEqual({ ok: true });
+  });
+
+  test("a content script or a bad command never reaches the hub", () => {
+    const { t, got } = withChat();
+    expect(handleMessage({ type: "ais-chat-close", chatId: "a" }, content(7), () => {}, t.deps)).toBe(false);
+    expect(handleMessage({ type: "ais-chat-close", chatId: 5 }, page, () => {}, t.deps)).toBe(false);
+    expect(got).toEqual([]);
+  });
+});
