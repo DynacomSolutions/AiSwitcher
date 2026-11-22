@@ -64,6 +64,8 @@ export interface BrokerDeps {
   replicaId: string;
   metrics: GatewayMetrics;
   now(): number;
+  /** One log line. Default console.info. */
+  log?(line: string): void;
   leaseTtlMs?: number;
   /** Idle time before a chat pod stops. Default 2 hours, at most 3 hours (see DEFAULT_IDLE_MS). */
   idleMs?: number;
@@ -626,6 +628,7 @@ export class ChatBroker implements ChatAuth {
         if (own) await transport.stopSession(own).catch(() => undefined);
         return undefined;
       }
+      this.logStartFailure(chatId, generation, f, e);
       await this.fail(chatId, fence, f, own);
       return undefined;
     } finally {
@@ -662,6 +665,18 @@ export class ChatBroker implements ChatAuth {
       await this.fail(chatId, fence, LOST_FAILURE, session);
     } finally {
       await store.releaseLease(chatId, fence).catch(() => undefined);
+    }
+  }
+
+  /** One structured line per failed start. It holds codes only: never a message, a body, a token or agent output. */
+  private logStartFailure(chatId: string, generation: number, f: Failure, e: unknown): void {
+    const err: Record<string, unknown> = { error: e instanceof Error ? e.constructor.name : typeof e };
+    if (e instanceof KubeHttpError) Object.assign(err, { op: e.op, status: e.status, ...(e.kubeReason !== undefined ? { kubeReason: e.kubeReason } : {}) });
+    else if (e instanceof PodStartError) err.reason = e.reason;
+    try {
+      (this.d.log ?? ((line: string) => console.info(line)))(JSON.stringify({ event: "chat_start_failed", chat: chatId, generation, code: f.code, kind: f.kind, ...err }));
+    } catch {
+      // Logging never changes the failure path.
     }
   }
 

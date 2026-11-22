@@ -1237,6 +1237,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         replicaId,
         metrics,
         now: Date.now,
+        log: (line) => console.info(line),
         idleMs: chatIdleMsFromEnv(process.env),
         ...(chatEnv ? { startTimeoutMs: chatEnv.startTimeoutMs } : {}),
         bus,

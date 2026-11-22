@@ -1,5 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { ChatBroker, type BrokerDeps, type BrokerReject } from "../../src/gateway/chat/broker.ts";
+import { KubeHttpError } from "../../src/gateway/chat/kube-http.ts";
 import { PodStartError } from "../../src/gateway/chat/pod-transport.ts";
 import { MemoryChatStore } from "../../src/gateway/chat/store.ts";
 import { chatTokenKey, mintChatToken, verifyChatToken } from "../../src/gateway/chat/token.ts";
@@ -167,6 +168,36 @@ test("a failed pod start appends an error item with code pod_start, sets state f
   expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="pod_start"} 1');
   expect(transport.stopped).toContain(rec.id);
   expect(published.at(-1)).toEqual([rec.id, list.length]);
+});
+
+test("a failed start logs one line with op and status, and no message text", async () => {
+  const lines: string[] = [];
+  const err = new KubeHttpError(403, "create", "Forbidden");
+  const { broker } = setup({ failStart: err }, { log: (l) => void lines.push(l) });
+  const rec = await made(broker);
+  await broker.startPod(rec.id);
+  expect(lines).toHaveLength(1);
+  expect(JSON.parse(lines[0]!)).toEqual({ event: "chat_start_failed", chat: rec.id, generation: 1, code: "pod_start", kind: "pod_start", error: "KubeHttpError", op: "create", status: 403, kubeReason: "Forbidden" });
+  expect(lines[0]).not.toContain(err.message);
+});
+
+test("a failed start of a pod logs its reason code", async () => {
+  const lines: string[] = [];
+  const { broker } = setup({ failStart: new PodStartError("InitFailed") }, { log: (l) => void lines.push(l) });
+  const rec = await made(broker);
+  await broker.startPod(rec.id);
+  expect(lines).toHaveLength(1);
+  expect(JSON.parse(lines[0]!)).toMatchObject({ event: "chat_start_failed", error: "PodStartError", reason: "InitFailed" });
+});
+
+test("an other start error logs its constructor name only", async () => {
+  const lines: string[] = [];
+  const { broker } = setup({ failStart: new Error("secret-host.internal leak-marker-xyz") }, { log: (l) => void lines.push(l) });
+  const rec = await made(broker);
+  await broker.startPod(rec.id);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).not.toContain("leak-marker");
+  expect(JSON.parse(lines[0]!)).toMatchObject({ error: "Error", code: "attach" });
 });
 
 test("an unknown start error is shown as fixed copy, never raw", async () => {
