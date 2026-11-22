@@ -9,8 +9,11 @@ const S1 = { id: "s1", identity: "alice", label: "chat one" };
 const S2 = { id: "s2", identity: "alice", label: "chat two" };
 let n = 0;
 
+let clock = 1_000_000;
+const S3 = { id: "s3", identity: "bob", label: "other identity" };
+
 function setup(api = new FakeChrome()) {
-  const tabs = new TabManager(api);
+  const tabs = new TabManager(api, () => clock);
   const executor = new Executor({ api, tabs, state: new State(api.storage) });
   const call = (tool: BrowserTool | "session_end", args: Record<string, unknown> = {}, s = S1) => executor.run({ id: `c${++n}`, session: s, tool, args } as CallRequest);
   const json = (r: Awaited<ReturnType<typeof call>>) => JSON.parse(r.ok && r.content[0]?.type === "text" ? r.content[0].text : "{}");
@@ -264,5 +267,197 @@ describe("persistence", () => {
     expect(r.ok).toBe(true);
     expect(fresh.json(r).tabs.map((x: { url: string }) => x.url)).toEqual(["https://a.example.com/"]);
     expect(t.api.tabList.get(other.id)!.groupId).not.toBe(fresh.json(r).groupId);
+  });
+});
+
+describe("review fixes", () => {
+  test("an idle-expired session loses saved tabs; the next holder owns them and popups join the group under the holder", async () => {
+    const t = setup();
+    const a = await t.create();
+    const gid = t.api.tabList.get(a)!.groupId;
+    await t.call("save_group", { name: "docs" });
+    expect(t.tabs.owns("s1", a, "alice")).toBe(true);
+    clock += 31 * 60_000;
+    await t.call("tabs_context", {}, S2); // registers s2
+    t.tabs.expireIdle(); // first pass learns last-seen for sessions never seen
+    clock += 31 * 60_000;
+    t.tabs.expireIdle();
+    expect(t.tabs.grantee(gid)).toBeUndefined();
+    expect(t.tabs.owns("s1", a, "alice")).toBe(false);
+    expect(t.tabs.ownerOf(a)).toBeUndefined();
+    expect(await t.call("adopt_tab", { tabId: a }, S2)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    const r = await t.call("open_group", { name: "docs" }, S2);
+    expect(r.ok).toBe(true);
+    expect(t.tabs.grantee(gid)).toBe("s2");
+    expect(t.tabs.inGrantedGroup("s2", "alice", t.api.tabList.get(a)!)).toBe(true);
+    expect(t.tabs.owns("s1", a, "alice")).toBe(false);
+    // A popup from the saved tab joins the saved group under s2.
+    const popup = t.api.addTab(700);
+    expect(await t.tabs.claimOpened({ ...popup }, t.api.tabList.get(a)!)).toBe("s2");
+    expect(t.api.tabList.get(700)!.groupId).toBe(gid);
+    expect(t.tabs.owns("s2", 700, "alice")).toBe(true);
+  });
+
+  test("a popup from a saved tab nobody holds stays in the saved group", async () => {
+    const t = setup();
+    const a = await t.create();
+    const gid = t.api.tabList.get(a)!.groupId;
+    await t.call("save_group", { name: "docs" });
+    await t.call("session_end");
+    const popup = t.api.addTab(701);
+    expect(await t.tabs.claimOpened({ ...popup }, t.api.tabList.get(a)!)).toBeDefined();
+    expect(t.api.tabList.get(701)!.groupId).toBe(gid);
+    expect(t.tabs.ownerOf(701)).toBeUndefined();
+  });
+
+  test("a session that idled out regains its saved group on its next call when nobody else holds it", async () => {
+    const t = setup();
+    const a = await t.create();
+    const gid = t.api.tabList.get(a)!.groupId;
+    await t.call("save_group", { name: "docs" });
+    t.tabs.expireIdle();
+    clock += 31 * 60_000;
+    t.tabs.expireIdle();
+    expect(t.tabs.grantee(gid)).toBeUndefined();
+    await t.call("tabs_context");
+    expect(t.tabs.grantee(gid)).toBe("s1");
+    expect(t.tabs.owns("s1", a, "alice")).toBe(true);
+  });
+
+  test("an idled-out session does not take the group back from the session that opened it", async () => {
+    const t = setup();
+    const a = await t.create();
+    const gid = t.api.tabList.get(a)!.groupId;
+    await t.call("save_group", { name: "docs" });
+    t.tabs.expireIdle();
+    clock += 31 * 60_000;
+    t.tabs.expireIdle();
+    expect((await t.call("open_group", { name: "docs" }, S2)).ok).toBe(true);
+    await t.call("tabs_context");
+    expect(t.tabs.grantee(gid)).toBe("s2");
+    expect(t.tabs.owns("s1", a, "alice")).toBe(false);
+  });
+
+  test("a name is never taken over from a different group, open or closed", async () => {
+    const t = setup();
+    const a = await t.create();
+    await t.call("save_group", { name: "docs" });
+    await t.call("session_end");
+    t.api.closeTab(a); // saved group is closed now
+    await t.create(S2);
+    const r = await t.call("save_group", { name: "docs" }, S2);
+    expect(r).toMatchObject({ ok: false, error: "bad_args" });
+    expect(JSON.stringify(r)).toContain("forget_group");
+    expect(await t.tabs.savedGroups()).toEqual([{ name: "docs", groupId: -1, open: false, tabCount: 1 }]);
+  });
+
+  test("a shrink is only committed when the group is still alive 10 seconds later", async () => {
+    const t = setup();
+    const ids = [await t.create(), await t.create(), await t.create()];
+    await t.call("save_group", { name: "docs" });
+    const tabsOf = () => (t.api.store.savedGroups as Array<{ tabs: unknown[] }>)[0]!.tabs.length;
+    t.api.closeTab(ids[0]!);
+    await t.tabs.refreshSaved();
+    expect(tabsOf()).toBe(3);
+    t.api.closeTab(ids[1]!);
+    t.api.closeTab(ids[2]!); // the whole group closed
+    await t.tabs.refreshSaved();
+    expect(tabsOf()).toBe(3);
+    expect(await t.tabs.savedGroups()).toEqual([{ name: "docs", groupId: -1, open: false, tabCount: 3 }]);
+  });
+
+  test("a shrink of a group that stays open is committed after 10 seconds", async () => {
+    const t = setup();
+    const ids = [await t.create(), await t.create(), await t.create()];
+    await t.call("save_group", { name: "docs" });
+    t.api.closeTab(ids[0]!);
+    await t.tabs.refreshSaved();
+    clock += 11_000;
+    await t.tabs.refreshSaved();
+    expect((t.api.store.savedGroups as Array<{ tabs: unknown[] }>)[0]!.tabs).toHaveLength(2);
+  });
+
+  test("a renamed or recoloured group updates the snapshot through tabGroups.onUpdated", async () => {
+    const t = setup();
+    const a = await t.create();
+    const gid = t.api.tabList.get(a)!.groupId;
+    await t.call("save_group", { name: "docs" });
+    expect(t.api.groupUpdatedListeners.length).toBeGreaterThan(0);
+    t.api.groups.set(gid, { title: "Renamed", color: "red" });
+    await t.tabs.refreshSaved();
+    expect(t.api.store.savedGroups).toMatchObject([{ title: "Renamed", color: "red" }]);
+    expect(await t.tabs.savedGroups()).toEqual([{ name: "docs", groupId: gid, open: true, tabCount: 1 }]);
+  });
+
+  test("at load, a stale id is re-linked to the live group with the same title and a saved URL", async () => {
+    const t = setup();
+    const a = await t.create(S1, { url: "https://a.example.com/" });
+    await t.call("save_group", { name: "docs" });
+    // Browser restart: the browser restores the group with new ids.
+    t.api.closeTab(a);
+    t.api.session = {};
+    t.api.groups.clear();
+    const restored = t.api.addTab(900, "https://a.example.com/");
+    const newGroup = await t.api.tabs.group([restored.id]);
+    t.api.groups.set(newGroup, { title: "docs", color: "blue" });
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    expect(await fresh.tabs.savedGroups()).toEqual([{ name: "docs", groupId: newGroup, open: true, tabCount: 1 }]);
+    const before = t.api.tabList.size;
+    const r = await fresh.call("open_group", { name: "docs" }, S2);
+    expect(fresh.json(r).groupId).toBe(newGroup);
+    expect(t.api.tabList.size).toBe(before);
+  });
+
+  test("saving again by name after the own group became the saved group refreshes it", async () => {
+    const t = setup();
+    const a = await t.create();
+    const gid = t.api.tabList.get(a)!.groupId;
+    await t.call("save_group", { name: "docs" });
+    t.api.tabList.get(a)!.url = "https://moved.example.com/";
+    const r = await t.call("save_group", { name: "docs" });
+    expect(r.ok).toBe(true);
+    expect(t.json(r)).toMatchObject({ groupId: gid, tabCount: 1 });
+    expect((t.api.store.savedGroups as Array<{ tabs: Array<{ url: string }> }>)[0]!.tabs[0]!.url).toBe("https://moved.example.com/");
+  });
+
+  test("a recreated group is made in the window that holds the new tabs", async () => {
+    const t = setup();
+    const a = await t.create();
+    await t.call("save_group", { name: "docs" });
+    await t.call("session_end");
+    t.api.closeTab(a);
+    await t.call("open_group", { name: "docs" }, S2);
+    expect(t.api.groupWindowIds.at(-1)).toBe(1);
+  });
+
+  test("if grouping fails the new tabs are closed and nothing is saved or granted", async () => {
+    const t = setup();
+    const a = await t.create();
+    await t.call("save_group", { name: "docs" });
+    await t.call("session_end");
+    t.api.closeTab(a);
+    const user = t.api.addTab(5);
+    t.api.groupNewFailure = "grouping failed";
+    const r = await t.call("open_group", { name: "docs" }, S2);
+    expect(r).toMatchObject({ ok: false, error: "internal" });
+    expect([...t.api.tabList.keys()]).toEqual([user.id]);
+    expect(await t.tabs.savedGroups()).toEqual([{ name: "docs", groupId: -1, open: false, tabCount: 1 }]);
+    expect(t.tabs.grantedGroups("s2")).toEqual([]);
+    expect(t.tabs.owns("s2", user.id, "alice")).toBe(false);
+  });
+
+  test("open_group, forget_group and save_group on an existing name need the same identity", async () => {
+    const t = setup();
+    await t.create();
+    await t.call("save_group", { name: "docs" });
+    await t.call("session_end");
+    await t.create(S3);
+    expect(await t.call("open_group", { name: "docs" }, S3)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(await t.call("forget_group", { name: "docs" }, S3)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(await t.call("save_group", { name: "docs" }, S3)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.json(await t.call("tabs_context", {}, S3)).savedGroups).toEqual([]);
+    expect(t.json(await t.call("tabs_context", {}, S2)).savedGroups).toHaveLength(1);
+    expect(await t.tabs.savedGroups()).toHaveLength(1);
   });
 });

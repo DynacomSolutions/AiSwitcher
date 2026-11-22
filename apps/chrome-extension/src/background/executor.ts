@@ -189,6 +189,7 @@ export class Executor {
     if (this.tabs.touch(req.session)) {
       for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void this.markControlled(tabId, req.session);
     }
+    await this.tabs.regrant(req.session).catch(() => {});
     const controller = this.state.track(id);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : this.defaultTimeout;
     const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
@@ -247,7 +248,7 @@ export class Executor {
         const mineGroup = this.tabs.sessions.get(session.id)?.groupId;
         // `scope` and `grantedGroups` are additive: "own" tabs are in this session's own group, "granted" tabs sit in a group the user granted.
         const ownView = (t: TabInfo) => (t.groupId !== -1 && t.groupId !== mineGroup && this.tabs.grantee(t.groupId) === session.id ? grantedView(t) : { ...actionable(t), scope: "own" });
-        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), savedGroups: await this.tabs.savedGroups(), note: "otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group. savedGroups are named groups that outlive a session: open one with open_group. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
+        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), savedGroups: await this.tabs.savedGroups(session.identity), note: "otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group. savedGroups are named groups that outlive a session: open one with open_group. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
       }
       case "tabs_create": {
         this.throwIfAborted(sig);

@@ -32,6 +32,11 @@ export class FakeChrome implements ChromeApi {
   unsplitCalls: number[] = [];
   /** The windowId each tabs.create call was given (undefined when none). */
   createWindowIds: Array<number | undefined> = [];
+  /** The windowId each grouping call was given. */
+  groupWindowIds: Array<number | undefined> = [];
+  /** When set, creating a group fails with this message. */
+  groupNewFailure: string | undefined;
+  groupUpdatedListeners: Array<(groupId: number) => void> = [];
   moveCalls: Array<{ tabId: number; index: number }> = [];
 
   addTab(id: number, url = "https://example.test/", title = "T", windowId = 1): TabInfo {
@@ -126,7 +131,9 @@ export class FakeChrome implements ChromeApi {
       for (const t of members) t.splitViewId = -1;
     },
     remove: async (id: number) => { this.closeTab(id); },
-    group: async (ids: number[], groupId?: number) => {
+    group: async (ids: number[], groupId?: number, windowId?: number) => {
+      this.groupWindowIds.push(windowId);
+      if (this.groupNewFailure && groupId === undefined) throw new Error(this.groupNewFailure);
       if (groupId !== undefined && this.groupFailures.has(groupId)) throw new Error("No group with id");
       const g = groupId ?? this.nextGroup++;
       for (const id of ids) { const t = this.tabList.get(id); if (t) t.groupId = g; }
@@ -161,7 +168,8 @@ export class FakeChrome implements ChromeApi {
   /** Chrome drops a group when its last tab leaves, so a group exists only while a tab is in it. */
   private groupLive(id: number): boolean { return [...this.tabList.values()].some(t => t.groupId === id); }
   tabGroups = {
-    update: async (id: number, p: { title: string; color: string }) => { this.groups.set(id, p); },
+    update: async (id: number, p: { title: string; color: string }) => { this.groups.set(id, p); for (const l of this.groupUpdatedListeners) l(id); },
+    onUpdated: (l: (groupId: number) => void) => { this.groupUpdatedListeners.push(l); },
     get: async (id: number) => (this.groupLive(id) ? { id, title: this.groups.get(id)?.title ?? "", color: this.groups.get(id)?.color as GroupColor | undefined } : undefined),
     queryByTitle: async (title: string) => [...this.groups].filter(([id, g]) => g.title === title && this.groupLive(id)).map(([id, g]) => ({ id, title: g.title })),
   };
