@@ -1,4 +1,5 @@
 // A stand-in ACP agent for tests. It speaks JSON lines on stdio.
+// Prompts: say:<text>, tool, ask, slow, wait:<ms>, mcp, mcp-tabs, run:<json> (browser tool calls), and a few failure scripts. Anything else echoes.
 // Environment: STUB_ACP_STATE (file that stores session ids), STUB_ACP_LOAD ("0" turns loadSession off), STUB_ACP_HTTP ("0" turns HTTP MCP off), STUB_ACP_NEW_ERROR ("1" makes session/new fail), STUB_ACP_NEW_HANG ("1" never answers session/new).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createLineReader } from "../../../src/gateway/chat/acp.ts";
@@ -86,6 +87,45 @@ async function runPrompt(id: string | number, sessionId: string, text: string) {
     await new Promise((r) => setTimeout(r, Number(text.slice(5)) || 0));
     chunk(sessionId, "waited");
     return done();
+  }
+  if (text.startsWith("run:")) {
+    // run:{"steps":[{"tool":"read_page","args":{"tabId":1}}],"repeat":false,"gapMs":200}
+    // Calls the browser tools through the MCP server of the chat, step by step. With "repeat" the steps loop until a call fails or the turn is cancelled.
+    // The reply is one text line: `RUN <n> <tool>=ok|ERR|ABORTED:<first text>` joined with " || ", the last two calls at most.
+    const spec = JSON.parse(text.slice(4)) as { steps: Array<{ tool: string; args?: Record<string, unknown> }>; repeat?: boolean; gapMs?: number };
+    const server = (mcpByS.get(sessionId) ?? [])[0];
+    if (!server) {
+      chunk(sessionId, "no mcp server");
+      return done();
+    }
+    const headers: Record<string, string> = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+    for (const h of server.headers ?? []) headers[h.name] = h.value;
+    const ac = new AbortController();
+    cancels.set(sessionId, () => ac.abort());
+    const lines: string[] = [];
+    let count = 0;
+    outer: do {
+      for (const st of spec.steps) {
+        if (ac.signal.aborted) break outer;
+        count++;
+        try {
+          const res = await fetch(server.url, { method: "POST", headers, signal: ac.signal, body: JSON.stringify({ jsonrpc: "2.0", id: 1000 + count, method: "tools/call", params: { name: st.tool, arguments: st.args ?? {} } }) });
+          const j = JSON.parse(await res.text());
+          const r = j.result ?? { isError: true, content: [{ type: "text", text: JSON.stringify(j.error ?? j) }] };
+          const first = (r.content ?? []).find((c: { type: string }) => c.type === "text");
+          lines.push(`${st.tool}=${r.isError ? "ERR" : "ok"}:${String(first?.text ?? "image").slice(0, 400)}`);
+          if (r.isError) break outer;
+        } catch {
+          lines.push(`${st.tool}=ABORTED:`);
+          break outer;
+        }
+        if (spec.gapMs) await new Promise((r) => setTimeout(r, spec.gapMs));
+      }
+    } while (spec.repeat);
+    const cancelled = ac.signal.aborted;
+    cancels.delete(sessionId);
+    chunk(sessionId, `RUN ${count} ${lines.slice(-2).join(" || ")}`);
+    return done(cancelled ? "cancelled" : "end_turn");
   }
   if (text === "mcp-tabs") {
     const server = (mcpByS.get(sessionId) ?? [])[0];
