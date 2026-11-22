@@ -12,7 +12,7 @@ export function splitPartners(tabs: ReadonlyArray<Pick<TabInfo, "id" | "windowId
 
 const linkable = (url: string): boolean => /^(https?|file):/i.test(url);
 
-/** The default chat context: the active tab first, then its split partners. Only http, https and file tabs. */
+/** The default chat context: the active tab first when it is linkable, then its split partners. Only http, https and file tabs. The result may be empty, and it need not hold the active tab. */
 export function defaultChatTabs(tabs: ReadonlyArray<TabInfo>, activeTabId: number): number[] {
   const ids = [activeTabId, ...splitPartners(tabs, activeTabId)];
   const out: number[] = [];

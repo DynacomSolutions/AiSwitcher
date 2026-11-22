@@ -20,6 +20,7 @@ const RECONNECT_MS = 500;
 const SAVE_MS = 250;
 export const LOADING_PROVIDERS = "Providers are loading. Try again in a moment.";
 export const RESTARTED = "The extension restarted. Try again.";
+export const LINK_PROMPT = "Link a tab so the agent can see a page.";
 export const AGENT_TAB = "The agent opened this page. Close the tab to remove it.";
 
 function el<K extends keyof HTMLElementTagNameMap>(doc: Document, tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
@@ -161,6 +162,7 @@ export class ChatTab {
   private readonly detailState: HTMLElement;
   private readonly chipsEl: HTMLElement;
   private readonly addSelect: HTMLSelectElement;
+  private readonly linkPrompt: HTMLElement;
   private readonly addOptions = new Map<string, { node: HTMLElement }>();
   private readonly addFirst: HTMLOptionElement;
   private readonly feedSlot: HTMLElement;
@@ -200,6 +202,8 @@ export class ChatTab {
     this.addSelect = el(doc, "select", "chip-add");
     this.addSelect.setAttribute("aria-label", "Link a page");
     this.addSelect.addEventListener("change", () => this.addTab());
+    this.linkPrompt = el(doc, "span", "chip-prompt", LINK_PROMPT);
+    this.linkPrompt.hidden = true;
     this.addSelect.addEventListener("blur", () => this.paint());
     this.addFirst = el(doc, "option", undefined, "Add a page");
     this.addFirst.value = "";
@@ -530,7 +534,9 @@ export class ChatTab {
       syncKeyed(doc, this.addSelect, this.addOptions, [...label.keys()], id => { const o = el(doc, "option"); o.value = id; return { node: o }; }, (item, id) => this.setText(item.node, label.get(id)!));
     }
     this.addSelect.hidden = addable.length === 0;
-    if (this.addSelect.parentNode !== holder) holder.append(this.addSelect);
+    this.linkPrompt.hidden = links.length > 0;
+    this.setText(this.addFirst, links.length === 0 ? "Link a tab" : "Add a page");
+    if (this.addSelect.parentNode !== holder) holder.append(this.linkPrompt, this.addSelect);
   }
 
   private unlink(tabId: number): void {

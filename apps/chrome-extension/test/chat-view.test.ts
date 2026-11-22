@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { MAX_CHAT_NAME, MAX_CHAT_TABS, MAX_CHAT_TEXT } from "../../../src/browser/chat-protocol.ts";
 import type { TabInfo } from "../src/background/chrome-api.ts";
 import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../src/shared/chat.ts";
-import { AGENT_TAB, ChatTab, checkSelection, parseSelection, LOADING_PROVIDERS, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
+import { AGENT_TAB, LINK_PROMPT, ChatTab, checkSelection, parseSelection, LOADING_PROVIDERS, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
 import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
 import type { FakeNode } from "./fake-dom.ts";
 
@@ -505,5 +505,27 @@ describe("picker wiring", () => {
     btn.click();
     await s.flush();
     expect(s.sent.filter(c => c.type === "ais-chat-catalog").length).toBe(2);
+  });
+});
+
+describe("a chat with no linkable tab", () => {
+  test("starts with no links, does not throw, and the panel shows the Link a tab prompt", async () => {
+    const tabs = [tab(5, { url: "chrome://newtab/", active: true }), tab(6)];
+    const s = setup([], { tabs });
+    s.push(stateOf([], { catalog: [{ provider: "claude", efforts: [], identities: [{ name: "work", kind: "identity", models: [] }] }] }));
+    await s.flush();
+    byText(s.root, "button", "New chat")!.click();
+    await s.flush();
+    const create = s.sent.find(c => c.type === "ais-chat-create");
+    expect(create && create.type === "ais-chat-create" ? create.tabIds : undefined).toEqual([]);
+    s.push(stateOf([view("a", { tabIds: [] })]));
+    s.t.select("a");
+    await s.flush();
+    const prompt = byClass(s.root, "chip-prompt")[0]!;
+    expect(prompt.textContent).toBe(LINK_PROMPT);
+    expect(prompt.hidden).toBe(false);
+    expect(byText(s.root, "option", "Link a tab")).toBeDefined();
+    s.push(stateOf([view("a", { tabIds: [6] })]));
+    expect(byClass(s.root, "chip-prompt")[0]!.hidden).toBe(true);
   });
 });
