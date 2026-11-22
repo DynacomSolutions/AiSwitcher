@@ -37,6 +37,17 @@ async function runPrompt(id: string | number, sessionId: string, text: string) {
     update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "tc1", status: "completed", content: [{ type: "content", content: { type: "text", text: "file body" } }] });
     return done();
   }
+  if (text === "big") {
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: "tc3", title: "Big", status: "pending" });
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "tc3", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(1_000_000) } }] });
+    return done();
+  }
+  if (text === "image") {
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: "tc4", title: "Shot", status: "pending" });
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "tc4", status: "completed", content: [{ type: "content", content: { type: "image", data: "AAAAIMAGEDATA", mimeType: "image/png" } }, { type: "content", content: { type: "text", text: "caption" } }] });
+    return done();
+  }
+  if (text === "limit") return send({ jsonrpc: "2.0", id, error: { code: -32000, message: "Rate limit reached. Resets at 2023-11-15T00:00:00Z" } });
   if (text === "ask") {
     const rpcId = `perm-${nextOut++}`;
     const answer = new Promise<any>((resolve) => replies.set(rpcId, resolve));

@@ -56,6 +56,9 @@ function contentText(content: unknown): string | undefined {
   return parts.length > 0 ? parts.join("\n") : undefined;
 }
 
+const hasImagePart = (content: unknown): boolean =>
+  Array.isArray(content) && content.some((c) => isObj(c) && (c.type === "image" || (isObj(c.content) && c.content.type === "image")));
+
 export const MAX_LINE_BYTES = 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -308,7 +311,8 @@ export class AcpClient {
         if (status !== undefined) t.status = status;
         const args = stringify(u.rawInput);
         if (args !== undefined) t.args = args;
-        const result = contentText(u.content) ?? stringify(u.rawOutput);
+        // A result with an image part never falls back to rawOutput, as rawOutput can hold the image data.
+        const result = contentText(u.content) ?? (hasImagePart(u.content) ? undefined : stringify(u.rawOutput));
         if (result !== undefined) t.result = result;
         out = t;
       }
