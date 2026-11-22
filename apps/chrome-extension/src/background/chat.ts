@@ -14,7 +14,8 @@ export const MAX_ITEMS = 500;
 export const ALL_WINDOWS = -1;
 const STORE_KEY = "chatHub";
 const CAP_MESSAGE = `You can have ${MAX_CHATS_PER_WINDOW} chats in one window. Close a chat to start another.`;
-const OFFLINE_MESSAGE = "The browser is not connected to the gateway.";
+export const OFFLINE_MESSAGE = "AIS is not connected to the gateway. Connect it in the extension panel, then try again.";
+const PERSIST_DELAY_MS = 250;
 
 export interface ChatHubDeps {
   /** Sends a frame to the gateway. Returns false when it cannot (offline). */
@@ -27,6 +28,8 @@ export interface ChatHubDeps {
   resumeSession?(sessionId: string): void;
   /** A chat ended: remove its cursor and pill from pages and clear its stop block. */
   endSession?(sessionId: string): void;
+  /** Timer for coalesced writes. Tests replace it. */
+  timer?: { set(fn: () => void, ms: number): unknown; clear(handle: unknown): void };
 }
 
 interface Entry { view: ChatView; provisional: boolean; resumeFrom?: number }
@@ -38,7 +41,10 @@ export class ChatHub {
   private readonly catalogReqs = new Map<string, ChatProvider | undefined>();
   private catalog: ChatCatalogProvider[] | undefined;
   private connected = false;
-  private error: string | undefined;
+  /** Panel error text per window. A reject that names no chat goes in `globalError` and shows in every window. */
+  private readonly errors = new Map<number, string>();
+  private globalError: string | undefined;
+  private persistTimer: unknown;
   private writing: Promise<void> | undefined;
   private dirty = false;
 
@@ -55,14 +61,17 @@ export class ChatHub {
     }
   }
 
-  /** Resolves when the last write to session storage ended. */
-  async flush(): Promise<void> { while (this.writing) await this.writing; }
+  /** Writes now, without waiting for the timer. Used on chat close and when the panel disconnects. */
+  async flush(): Promise<void> {
+    if (this.persistTimer !== undefined) { this.clearTimer(); this.persistTimer = undefined; }
+    do { await this.write(); } while (this.dirty);
+  }
 
   // ---- panel side --------------------------------------------------------
 
   state(windowId: number): ChatPanelState {
     const chats = [...this.chats.values()].filter(e => e.view.summary.windowId === windowId).map(e => e.view);
-    return { windowId, connected: this.connected, chats, ...(this.catalog ? { catalog: this.catalog } : {}), cap: MAX_CHATS_PER_WINDOW, ...(this.error !== undefined ? { error: this.error } : {}) };
+    return { windowId, connected: this.connected, chats, ...(this.catalog ? { catalog: this.catalog } : {}), cap: MAX_CHATS_PER_WINDOW, ...(this.errors.get(windowId) ?? this.globalError ? { error: (this.errors.get(windowId) ?? this.globalError) as string } : {}) };
   }
 
   subscribe(l: (windowId: number) => void): () => void {
@@ -81,9 +90,19 @@ export class ChatHub {
     for (const l of [...this.listeners]) { try { l(windowId); } catch { /* a bad listener never stops the hub */ } }
   }
 
+  /** Writes soon. Many events in a burst make one write. */
   private persist(): void {
     this.dirty = true;
-    if (this.writing) return;
+    if (this.persistTimer !== undefined) return;
+    const timer = this.d.timer ?? { set: (fn: () => void, ms: number) => setTimeout(fn, ms), clear: (h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>) };
+    this.persistTimer = timer.set(() => { this.persistTimer = undefined; void this.write(); }, PERSIST_DELAY_MS);
+    this.clearTimer = () => timer.clear(this.persistTimer);
+  }
+
+  private clearTimer: () => void = () => {};
+
+  private write(): Promise<void> {
+    if (this.writing) return this.writing;
     const run = async (): Promise<void> => {
       while (this.dirty) {
         this.dirty = false;
@@ -92,6 +111,7 @@ export class ChatHub {
       }
     };
     this.writing = run().finally(() => { this.writing = undefined; });
+    return this.writing;
   }
 
   // ---- gateway side ------------------------------------------------------
@@ -205,9 +225,9 @@ export class ChatHub {
   }
 
   private onReject(f: Extract<ChatToExt, { t: "chat.reject" }>): void {
-    this.error = f.message;
     if (f.reqId !== undefined) this.catalogReqs.delete(f.reqId);
     const e = f.chatId === undefined ? undefined : this.chats.get(f.chatId);
+    if (e) { this.errors.set(e.view.summary.windowId, f.message); e.resumeFrom = undefined; } else this.globalError = f.message;
     if (f.chatId !== undefined && e?.provisional) {
       this.chats.delete(f.chatId);
       this.d.tabs.setChatLinks(sessionIdForChat(f.chatId), [], true);
@@ -218,8 +238,13 @@ export class ChatHub {
   // ---- commands from the panel ------------------------------------------
 
   async command(c: ChatPanelCommand): Promise<ChatCommandResult> {
+    const windowId = c.type === "ais-chat-create" ? c.windowId : "chatId" in c ? this.chats.get(c.chatId)?.view.summary.windowId : undefined;
     const r = this.run(c);
-    if (r.ok) { if (this.error !== undefined) { this.error = undefined; this.changed(ALL_WINDOWS, false); } } else { this.error = r.error; this.changed(ALL_WINDOWS, false); }
+    if (r.ok) {
+      const had = this.errors.delete(windowId ?? ALL_WINDOWS) || (windowId === undefined && this.globalError !== undefined);
+      if (windowId === undefined) this.globalError = undefined;
+      if (had) this.changed(windowId ?? ALL_WINDOWS, false);
+    } else if (windowId !== undefined) { this.errors.set(windowId, r.error); this.changed(windowId, false); } else { this.globalError = r.error; this.changed(ALL_WINDOWS, false); }
     return r;
   }
 
@@ -307,6 +332,7 @@ export class ChatHub {
     this.d.tabs.dropChat(sessionIdForChat(chatId));
     this.d.endSession?.(sessionIdForChat(chatId));
     this.changed(e.view.summary.windowId);
+    void this.flush();
     return r;
   }
 }
@@ -340,6 +366,6 @@ export function servePort(port: PortLike, hub: ChatHub, runtimeId: string): bool
     const cmd = parsePanelCommand(m);
     if (cmd) void hub.command(cmd);
   });
-  port.onDisconnect.addListener(off);
+  port.onDisconnect.addListener(() => { off(); void hub.flush(); });
   return true;
 }

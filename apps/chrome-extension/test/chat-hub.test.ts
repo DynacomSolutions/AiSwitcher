@@ -108,7 +108,7 @@ describe("chat hub", () => {
   test("create offline fails with a clear message and keeps no chat", async () => {
     const e = setup(false);
     const r = await e.hub.command(create());
-    expect(r.ok).toBe(false);
+    expect(r).toEqual({ ok: false, error: "AIS is not connected to the gateway. Connect it in the extension panel, then try again." });
     expect(e.hub.state(1).chats).toHaveLength(0);
   });
 
@@ -140,10 +140,67 @@ describe("chat hub", () => {
 
   test("a chat.reject with window_cap or unavailable becomes panel error text", () => {
     const e = setup();
-    e.hub.handleFrame({ t: "chat.reject", code: "window_cap", message: "Too many chats in this window." });
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a", { windowId: 1 }) });
+    e.hub.handleFrame({ t: "chat.reject", chatId: "a", code: "window_cap", message: "Too many chats in this window." });
     expect(e.hub.state(1).error).toBe("Too many chats in this window.");
+    expect(e.hub.state(2).error).toBeUndefined();
+    // a reject that names no chat shows in every window
     e.hub.handleFrame({ t: "chat.reject", code: "unavailable", message: "Chat is not available." });
     expect(e.hub.state(9).error).toBe("Chat is not available.");
+  });
+
+  test("an error stays in its window: a refused create in window 1 does not show in window 2, and a success in window 2 keeps it", async () => {
+    const e = setup();
+    for (let i = 0; i < 6; i++) await e.hub.command(create(1));
+    expect((await e.hub.command(create(1))).ok).toBe(false);
+    expect(e.hub.state(1).error).toContain("6 chats");
+    expect(e.hub.state(2).error).toBeUndefined();
+    expect(await e.hub.command(create(2))).toEqual({ ok: true });
+    expect(e.hub.state(1).error).toContain("6 chats");
+    expect(await e.hub.command({ type: "ais-chat-prompt", chatId: "c1", text: "go" })).toEqual({ ok: true });
+    expect(e.hub.state(1).error).toBeUndefined();
+  });
+
+  test("a failed resume does not freeze the feed: the next gap asks again", () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.hub.handleFrame(ev("a", 1));
+    e.hub.handleFrame(ev("a", 4));
+    e.hub.handleFrame({ t: "chat.reject", chatId: "a", code: "resume_failed", message: "Resume failed." });
+    e.hub.handleFrame(ev("a", 5));
+    expect(e.sent.filter(f => f.t === "chat.resume")).toEqual([{ t: "chat.resume", chatId: "a", afterSeq: 1 }, { t: "chat.resume", chatId: "a", afterSeq: 1 }]);
+  });
+
+  test("writes to session storage are coalesced and flush writes at once", async () => {
+    const api = new FakeChrome();
+    let writes = 0;
+    const storage = { get: api.sessionStorage.get, set: async (v: Record<string, unknown>) => { writes++; await api.sessionStorage.set(v); } };
+    let fire: (() => void) | undefined;
+    let timers = 0;
+    const hub = new ChatHub({ send: () => true, tabs: new TabManager(api), storage, now: () => 0, newId: () => "x", timer: { set: fn => { timers++; fire = fn; return 1; }, clear: () => { fire = undefined; } } });
+    hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    for (let i = 1; i <= 50; i++) hub.handleFrame(ev("a", i));
+    expect(timers).toBe(1);
+    expect(writes).toBe(0);
+    fire!();
+    await hub.flush();
+    expect(writes).toBe(1);
+    hub.handleFrame(ev("a", 51));
+    await hub.flush();
+    expect(writes).toBe(2);
+    expect(timers).toBe(2);
+    expect(fire).toBeUndefined();
+  });
+
+  test("one tab create by a chat sends one chat.link frame", async () => {
+    const e = setup();
+    const state = new State(e.api.storage);
+    const executor = new Executor({ api: e.api, tabs: e.tabs, state, defaultTimeoutMs: 500, onLinks: (s, ids) => e.hub.onLinks(s, ids) });
+    await e.hub.command(create(1, [5]));
+    e.sent.length = 0;
+    const r = await executor.run({ id: "k1", session: { id: "chat:c1", identity: "chat", label: "Chat 1", chat: true }, tool: "tabs_create", args: { url: "https://example.test/new" } } as CallRequest);
+    expect(r.ok).toBe(true);
+    expect(e.sent.filter(f => f.t === "chat.link")).toHaveLength(1);
   });
 
   test("a rejected create removes the local chat and its links", async () => {
