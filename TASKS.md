@@ -366,3 +366,17 @@ A new gateway or console pod takes traffic only after its usage cache is warm, s
 | 250 | Check the gateway and console rollout path, then verify a real rollout | done | claude | ais-warm-readiness | 17.248, 17.249, 17.251 | | Probes, drain and maxSurge/maxUnavailable fixed in https://github.com/DynacomSolutions/.cluster/pull/2836.<br>Live 18:00, 18:21 and 18:32 UTC 21 Nov rollouts: 339 widget reads, 0 "No limit data". |
 | 251 | Gateway replicas share usage readings in PostgreSQL | done | claude | gateway-readings-pooler | 17.248 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/664 and https://github.com/DynacomSolutions/AiSwitcher/pull/670 (e32d8c2).<br>Live: about 80% of claude reads shared, 0 shared errors, 0 warm-up timeouts. |
 | 259 | Sync worker keeps removed remotes | done | claude | ais-session-backup-hoarddb | | | Detached worker kept pushing to a removed remote.<br>Fix: re-read remotes each cycle and per host; no worker spawn with zero remotes.<br>Running transfers may finish.<br>Merged in PR 676 (dd610a7). |
+
+## 18. Side-panel chat with page agents
+
+- Chat in the AIS Browser side panel about open pages (split view too); agents run as AgentSession pods; broker in the gateway.
+
+ETA: 2026-11-25 18:00 ICT
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 261 | Scratch-only chat pods, gateway RBAC and attach policy in .cluster | todo | claude | | | | `workspace: chat` mounts only session scratch.<br>Gateway may attach only to sessions it created. |
+| 262 | Gateway chat broker: AgentSession pods over ACP, per-chat browser token | todo | claude | | 18.261 | | chat.* frames, Postgres lease between replicas, transcripts, metrics, drain. |
+| 263 | Extension: per-chat tab grants, split-view context, one cursor per agent | todo | claude | | 18.262 | | Several chats share tabs; pill lists every agent on the tab. |
+| 264 | Side panel Chat view with T3-style provider and model picker | todo | claude | | 18.262, 18.263 | | Chat list, feed, tool and permission cards, linked-tab chips. |
+| 265 | Prove a real pod chat from Chromium on the cluster, then release | todo | claude | | 18.264 | | Real pod chat plus Chromium e2e; release.yml after the version bump. |
