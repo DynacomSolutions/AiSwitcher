@@ -3,6 +3,7 @@
 import type { ChatCatalogProvider, ChatFromExt, ChatProvider, ChatSummary, ChatToExt } from "../../../../src/browser/chat-protocol.ts";
 import { MAX_CHAT_TABS, MAX_CHATS_PER_WINDOW, parseChatFromExt, sessionIdForChat } from "../../../../src/browser/chat-protocol.ts";
 import { nextChatColour } from "../shared/chat-palette.ts";
+import { CAP_MESSAGE } from "../shared/chat.ts";
 import type { ChatCommandResult, ChatItem, ChatPanelCommand, ChatPanelState, ChatView } from "../shared/chat.ts";
 import { parsePanelCommand, parsePortSubscribe } from "../shared/chat.ts";
 import type { ChromeApi } from "./chrome-api.ts";
@@ -13,7 +14,6 @@ export const MAX_ITEMS = 500;
 /** A listener gets this window id when a change touches every window. */
 export const ALL_WINDOWS = -1;
 const STORE_KEY = "chatHub";
-const CAP_MESSAGE = `You can have ${MAX_CHATS_PER_WINDOW} chats in one window. Close a chat to start another.`;
 export const OFFLINE_MESSAGE = "AIS is not connected to the gateway. Connect it in the extension panel, then try again.";
 const PERSIST_DELAY_MS = 250;
 

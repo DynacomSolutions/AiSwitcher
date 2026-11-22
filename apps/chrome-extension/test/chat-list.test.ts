@@ -32,7 +32,7 @@ describe("capState", () => {
     const six = ["1", "2", "3", "4", "5", "6"].map(i => chat(i, "idle"));
     const r = capState(six, 1);
     expect(r.full).toBe(true);
-    expect(r.message).toBe("You can have 6 chats open in this window. Close one to start another.");
+    expect(r.message).toBe("You can have 6 chats in one window. Close a chat to start another.");
     expect(capState([...six.slice(0, 5), chat("x", "closed")], 1).full).toBe(false);
     expect(capState([...six.slice(0, 5), chat("y", "idle", { windowId: 2 })], 1).full).toBe(false);
   });

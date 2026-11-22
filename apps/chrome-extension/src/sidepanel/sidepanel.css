@@ -139,3 +139,7 @@ textarea.composer-box:focus { outline: none; border-color: var(--accent); box-sh
 .composer-hint { margin: 0; }
 button.secondary { background: var(--card); color: var(--ink); border-color: var(--line); }
 button.secondary:hover { background: var(--idle-bg); }
+.row-main { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.inline-form .hint { margin: 0; }
+input.rename-box { font: inherit; font-size: 13px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; flex: 1; min-width: 0; }

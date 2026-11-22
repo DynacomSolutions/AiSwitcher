@@ -5,7 +5,11 @@ export class FakeNode {
   children: FakeNode[] = [];
   parent?: FakeNode;
   attrs: Record<string, string> = {};
-  listeners: Record<string, Array<() => void>> = {};
+  listeners: Record<string, Array<(e?: any) => void>> = {};
+  style: Record<string, string> = {};
+  value = "";
+  disabled = false;
+  maxLength = -1;
   className = "";
   hidden = false;
   private text = "";
@@ -34,7 +38,8 @@ export class FakeNode {
   remove(): void { if (this.parent) { this.parent.children = this.parent.children.filter((c) => c !== this); this.parent = undefined; } }
   setAttribute(k: string, v: string): void { this.attrs[k] = v; }
   removeAttribute(k: string): void { delete this.attrs[k]; }
-  addEventListener(t: string, fn: () => void): void { (this.listeners[t] ??= []).push(fn); }
+  addEventListener(t: string, fn: (e?: any) => void): void { (this.listeners[t] ??= []).push(fn); }
+  dispatch(t: string, e: Record<string, unknown> = {}): void { for (const fn of this.listeners[t] ?? []) fn({ preventDefault() {}, ...e }); }
   click(): void { for (const fn of this.listeners.click ?? []) fn(); }
   focus(): void { if (this.doc) this.doc.activeElement = this; }
   insertAdjacentHTML(): never { throw new Error("insertAdjacentHTML used"); }

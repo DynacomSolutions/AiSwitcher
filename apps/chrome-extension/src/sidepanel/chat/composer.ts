@@ -1,4 +1,5 @@
 // Composer: pure state rules plus the DOM of the message box.
+import { MAX_CHAT_TEXT } from "../../../../../src/browser/chat-protocol.ts";
 import type { ChatView } from "../../shared/chat.ts";
 
 export const NO_PAGES_HINT = "No pages are linked. The agent cannot see any tab.";
@@ -12,10 +13,14 @@ export function composerMode(c: ChatView | undefined, paused: boolean): { send: 
   return { send: !running && s !== "starting" && s !== "closed", stop: running, ...(hint ? { hint } : {}) };
 }
 
-export interface ComposerHandlers { onSend(text: string): void; onStop(): void }
-export interface Composer { root: HTMLElement; update(mode: { send: boolean; stop: boolean; hint?: string }): void; focus(): void }
+export interface ComposerHandlers {
+  /** Resolves true when the message was accepted. The draft stays until then. */
+  onSend(text: string): Promise<boolean>;
+  onStop(): void;
+}
+export interface Composer { root: HTMLElement; box: HTMLTextAreaElement; update(mode: { send: boolean; stop: boolean; hint?: string }): void; focus(): void }
 
-/** Builds the message box. Enter sends, Shift+Enter adds a line. The draft stays when the mode changes. */
+/** Builds the message box. Enter sends, Shift+Enter adds a line. The draft stays when the mode changes or a send fails. */
 export function createComposer(doc: Document, h: ComposerHandlers): Composer {
   const root = doc.createElement("div");
   root.className = "composer";
@@ -24,6 +29,7 @@ export function createComposer(doc: Document, h: ComposerHandlers): Composer {
   const box = doc.createElement("textarea");
   box.className = "composer-box";
   box.rows = 2;
+  box.maxLength = MAX_CHAT_TEXT;
   box.placeholder = "Message the agent";
   box.setAttribute("aria-label", "Message");
   const button = doc.createElement("button");
@@ -33,11 +39,12 @@ export function createComposer(doc: Document, h: ComposerHandlers): Composer {
   row.append(box, button);
   root.append(hint, row);
   let mode = { send: false, stop: false } as { send: boolean; stop: boolean };
+  let sending = false;
   const submit = (): void => {
     const text = box.value.trim();
-    if (!mode.send || text.length === 0) return;
-    box.value = "";
-    h.onSend(text);
+    if (!mode.send || sending || text.length === 0 || text.length > MAX_CHAT_TEXT) return;
+    sending = true;
+    void h.onSend(text).then(ok => { if (ok && box.value.trim() === text) box.value = ""; }, () => { /* the draft stays */ }).finally(() => { sending = false; });
   };
   box.addEventListener("keydown", e => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); }
@@ -45,6 +52,7 @@ export function createComposer(doc: Document, h: ComposerHandlers): Composer {
   button.addEventListener("click", () => { if (mode.stop) h.onStop(); else submit(); });
   return {
     root,
+    box,
     update(m) {
       mode = m;
       button.textContent = m.stop ? "Stop" : "Send";

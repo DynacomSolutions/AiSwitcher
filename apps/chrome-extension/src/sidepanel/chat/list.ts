@@ -1,6 +1,7 @@
 // Chat list logic for the side panel. Pure: no DOM and no chrome API.
 import type { ChatProvider } from "../../../../../src/browser/chat-protocol.ts";
 import { MAX_CHATS_PER_WINDOW } from "../../../../../src/browser/chat-protocol.ts";
+import { CAP_MESSAGE } from "../../shared/chat.ts";
 import type { ChatView } from "../../shared/chat.ts";
 
 export type RowState = "thinking" | "waiting for you" | "idle" | "failed" | "starting";
@@ -19,7 +20,7 @@ export function openChats(chats: ChatView[], windowId: number): ChatView[] {
 
 export function capState(chats: ChatView[], windowId: number): { full: boolean; message?: string } {
   if (openChats(chats, windowId).length < MAX_CHATS_PER_WINDOW) return { full: false };
-  return { full: true, message: `You can have ${MAX_CHATS_PER_WINDOW} chats open in this window. Close one to start another.` };
+  return { full: true, message: CAP_MESSAGE };
 }
 
 /** True while a turn runs. Close asks for a confirmation then. */

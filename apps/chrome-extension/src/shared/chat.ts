@@ -1,6 +1,9 @@
 // Types shared by the service worker and the side panel for chats.
 import type { ChatBody, ChatCatalogProvider, ChatProvider, ChatSelection, ChatSummary } from "../../../../src/browser/chat-protocol.ts";
-import { CHAT_PROVIDERS } from "../../../../src/browser/chat-protocol.ts";
+import { CHAT_PROVIDERS, MAX_CHATS_PER_WINDOW } from "../../../../src/browser/chat-protocol.ts";
+
+/** Shown by the hub and by the panel when a window has the most chats. */
+export const CAP_MESSAGE = `You can have ${MAX_CHATS_PER_WINDOW} chats in one window. Close a chat to start another.`;
 
 export interface ChatItem { seq: number; ts: number; body: ChatBody }
 export interface ChatView { summary: ChatSummary; items: ChatItem[]; pending?: { permission?: string } }

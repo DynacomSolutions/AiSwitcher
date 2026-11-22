@@ -1,0 +1,228 @@
+import { describe, expect, test } from "bun:test";
+import { MAX_CHAT_NAME, MAX_CHAT_TEXT } from "../../../src/browser/chat-protocol.ts";
+import type { TabInfo } from "../src/background/chrome-api.ts";
+import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../src/shared/chat.ts";
+import { AGENT_TAB, ChatTab, LOADING_PROVIDERS, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
+import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
+import type { FakeNode } from "./fake-dom.ts";
+
+const view = (id: string, over: Partial<ChatView["summary"]> = {}, items: ChatView["items"] = []): ChatView => ({
+  summary: { chatId: id, name: `Chat ${id}`, color: "#3b82f6", windowId: 1, state: "idle", selection: { provider: "claude", identity: "a" }, tabIds: [5], lastSeq: items.length, updatedAt: 0, ...over },
+  items,
+});
+const stateOf = (chats: ChatView[], over: Partial<ChatPanelState> = {}): ChatPanelState => ({ windowId: 1, connected: true, chats, cap: 6, ...over });
+const tab = (id: number, over: Partial<TabInfo> = {}): TabInfo => ({ id, windowId: 1, groupId: -1, url: `https://t${id}.test/`, title: `T${id}`, active: false, ...over });
+
+function setup(chats: ChatView[], opts: { tabs?: TabInfo[]; result?: () => ChatCommandResult | undefined; seen?: Record<string, number> } = {}) {
+  const doc = fakeDoc();
+  const root = doc.createElement("section");
+  const sent: ChatPanelCommand[] = [];
+  const saved: Array<Record<string, number>> = [];
+  let push: (m: unknown) => void = () => {};
+  const t = new ChatTab({
+    doc: asDoc(doc), windowId: 1,
+    connect: () => ({ postMessage: () => {}, onMessage: l => { push = l; }, onDisconnect: () => {} }),
+    queryTabs: async () => opts.tabs ?? [tab(5)],
+    send: async c => { sent.push(c); return opts.result ? opts.result() : { ok: true }; },
+    loadSeen: async () => opts.seen ?? {},
+    saveSeen: s => { saved.push(s); },
+  }, asEl(root));
+  t.start();
+  return { doc, root, t, sent, saved, push: (s: ChatPanelState) => push(s), chats, flush: () => new Promise(r => setTimeout(r, 0)) };
+}
+const all = (root: FakeNode): FakeNode[] => walk(root);
+const byClass = (root: FakeNode, cls: string): FakeNode[] => all(root).filter(n => n.className.split(" ").includes(cls));
+const byText = (root: FakeNode, tag: string, text: string): FakeNode | undefined => all(root).find(n => n.tag === tag && n.textContent === text);
+const byLabel = (root: FakeNode, label: string): FakeNode | undefined => all(root).find(n => n.attrs["aria-label"] === label);
+
+describe("chat tab", () => {
+  test("a focused row Close button keeps focus across a state update", async () => {
+    const s = setup([view("a"), view("b")]);
+    s.push(stateOf([view("a"), view("b")]));
+    await s.flush();
+    const close = byLabel(s.root, "Close Chat a")!;
+    expect(close).toBeDefined();
+    close.focus();
+    s.push(stateOf([view("a", { state: "thinking" }), view("b", { name: "Renamed" })]));
+    expect(s.doc.activeElement).toBe(close);
+    expect(byLabel(s.root, "Close Chat a")).toBe(close);
+    expect(byLabel(s.root, "Rename Renamed")).toBeDefined();
+  });
+
+  test("rename and close buttons have accessible names", async () => {
+    const s = setup([view("a")]);
+    s.push(stateOf([view("a")]));
+    await s.flush();
+    expect(byLabel(s.root, "Rename Chat a")).toBeDefined();
+    expect(byLabel(s.root, "Close Chat a")).toBeDefined();
+  });
+
+  test("the draft stays when send fails and clears when it works", async () => {
+    let result: ChatCommandResult | undefined = { ok: false, error: "Offline" };
+    const s = setup([view("a")], { result: () => result });
+    s.push(stateOf([view("a")]));
+    s.t.select("a");
+    await s.flush();
+    const box = byClass(s.root, "composer-box")[0]!;
+    expect(box.maxLength).toBe(MAX_CHAT_TEXT);
+    box.value = "hello";
+    box.dispatch("keydown", { key: "Enter", shiftKey: false });
+    await s.flush();
+    expect(box.value).toBe("hello");
+    expect(byClass(s.root, "banner").find(b => b.textContent === "Offline")).toBeDefined();
+    result = undefined;
+    box.dispatch("keydown", { key: "Enter", shiftKey: false });
+    await s.flush();
+    expect(box.value).toBe("hello");
+    expect(byClass(s.root, "banner").find(b => b.textContent === RESTARTED)).toBeDefined();
+    result = { ok: true };
+    box.dispatch("keydown", { key: "Enter", shiftKey: false });
+    await s.flush();
+    expect(box.value).toBe("");
+    expect(s.sent.filter(c => c.type === "ais-chat-prompt").length).toBe(3);
+  });
+
+  test("a message over the limit is not sent and Shift+Enter does not send", async () => {
+    const s = setup([view("a")]);
+    s.push(stateOf([view("a")]));
+    s.t.select("a");
+    await s.flush();
+    const box = byClass(s.root, "composer-box")[0]!;
+    box.value = "x".repeat(MAX_CHAT_TEXT + 1);
+    box.dispatch("keydown", { key: "Enter", shiftKey: false });
+    box.value = "short";
+    box.dispatch("keydown", { key: "Enter", shiftKey: true });
+    await s.flush();
+    expect(s.sent.length).toBe(0);
+  });
+
+  test("Back keeps the draft of the chat", async () => {
+    const s = setup([view("a")]);
+    s.push(stateOf([view("a")]));
+    s.t.select("a");
+    await s.flush();
+    const box = byClass(s.root, "composer-box")[0]!;
+    box.value = "draft";
+    s.t.select(undefined);
+    s.t.select("a");
+    expect(byClass(s.root, "composer-box")[0]).toBe(box);
+    expect(box.value).toBe("draft");
+  });
+
+  test("two paints of the same chat use the same feed element and keep focus on Show more", async () => {
+    const long = "r".repeat(600);
+    const items: ChatView["items"] = [{ seq: 1, ts: 0, body: { k: "tool", toolCallId: "t1", title: "Read", status: "done", result: long } }];
+    const s = setup([view("a", {}, items)]);
+    s.push(stateOf([view("a", {}, items)]));
+    s.t.select("a");
+    await s.flush();
+    const feed = byClass(s.root, "feed")[0]!;
+    const more = byText(s.root, "button", "Show more")!;
+    expect(more).toBeDefined();
+    more.focus();
+    s.push(stateOf([view("a", { updatedAt: 5 }, items)]));
+    expect(byClass(s.root, "feed")[0]).toBe(feed);
+    expect(s.doc.activeElement).toBe(more);
+  });
+
+  test("rename is inline: Enter saves, Escape cancels, and the box has a length limit", async () => {
+    const s = setup([view("a")]);
+    s.push(stateOf([view("a")]));
+    await s.flush();
+    byLabel(s.root, "Rename Chat a")!.click();
+    const box = byClass(s.root, "rename-box")[0]!;
+    expect(box.maxLength).toBe(MAX_CHAT_NAME);
+    expect(box.value).toBe("Chat a");
+    box.dispatch("keydown", { key: "Escape" });
+    expect(s.sent.length).toBe(0);
+    byLabel(s.root, "Rename Chat a")!.click();
+    box.value = "  New name ";
+    box.dispatch("keydown", { key: "Enter" });
+    expect(s.sent).toEqual([{ type: "ais-chat-rename", chatId: "a", name: "New name" }]);
+  });
+
+  test("close asks inline only while a turn runs", async () => {
+    const s = setup([view("a"), view("b", { state: "thinking" })]);
+    s.push(stateOf([view("a"), view("b", { state: "thinking" })]));
+    await s.flush();
+    byLabel(s.root, "Close Chat a")!.click();
+    expect(s.sent).toEqual([{ type: "ais-chat-close", chatId: "a" }]);
+    byLabel(s.root, "Close Chat b")!.click();
+    expect(s.sent.length).toBe(1);
+    const confirm = byClass(s.root, "inline-form").find(f => f.textContent.includes("Close this chat? The agent stops.") && !f.hidden)!;
+    expect(confirm).toBeDefined();
+    byText(confirm, "button", "Close")!.click();
+    expect(s.sent[1]).toEqual({ type: "ais-chat-close", chatId: "b" });
+  });
+
+  test("adding a tab in a split view adds its partner, removing removes only that tab", async () => {
+    const tabs = [tab(5), tab(6, { splitViewId: 9 }), tab(7, { splitViewId: 9 }), tab(8)];
+    const s = setup([view("a")], { tabs });
+    s.push(stateOf([view("a")]));
+    s.t.select("a");
+    await s.flush();
+    const select = byClass(s.root, "chip-add")[0]!;
+    select.value = "6";
+    select.dispatch("change");
+    expect(s.sent[0]).toEqual({ type: "ais-chat-link", chatId: "a", tabIds: [5, 6, 7] });
+    s.push(stateOf([view("a", { tabIds: [5, 6, 7] })]));
+    await s.flush();
+    byLabel(s.root, "Unlink T6")!.click();
+    expect(s.sent[1]).toEqual({ type: "ais-chat-link", chatId: "a", tabIds: [5, 7] });
+  });
+
+  test("an agent-created tab that comes back shows the explanation", async () => {
+    const s = setup([view("a", { tabIds: [5, 6] })], { tabs: [tab(5), tab(6)] });
+    s.push(stateOf([view("a", { tabIds: [5, 6] })]));
+    s.t.select("a");
+    await s.flush();
+    byLabel(s.root, "Unlink T6")!.click();
+    s.push(stateOf([view("a", { tabIds: [5, 6] })]));
+    await s.flush();
+    expect(byClass(s.root, "banner").find(b => b.textContent === AGENT_TAB)).toBeDefined();
+  });
+
+  test("New chat is disabled while a create is in flight and the loading line clears with the catalogue", async () => {
+    let release: (r: ChatCommandResult) => void = () => {};
+    const doc = fakeDoc();
+    const root = doc.createElement("section");
+    let push: (m: unknown) => void = () => {};
+    const sent: ChatPanelCommand[] = [];
+    const t = new ChatTab({
+      doc: asDoc(doc), windowId: 1,
+      connect: () => ({ postMessage: () => {}, onMessage: l => { push = l; }, onDisconnect: () => {} }),
+      queryTabs: async () => [tab(5, { active: true })],
+      send: c => { sent.push(c); return c.type === "ais-chat-create" ? new Promise(r => { release = r; }) : Promise.resolve({ ok: true }); },
+      loadSeen: async () => ({}), saveSeen: () => {},
+    }, asEl(root));
+    t.start();
+    push(stateOf([]));
+    const btn = byText(root, "button", "New chat")!;
+    btn.click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(byClass(root, "banner").find(b => b.textContent === LOADING_PROVIDERS)).toBeDefined();
+    expect(byClass(root, "banner").find(b => b.textContent === LOADING_PROVIDERS)!.attrs.role).toBe("alert");
+    push(stateOf([], { catalog: [{ provider: "claude", identities: [{ name: "a", kind: "identity", models: [] }], efforts: [] }] }));
+    expect(byClass(root, "banner").find(b => b.textContent === LOADING_PROVIDERS)?.hidden ?? true).toBe(true);
+    btn.click();
+    await new Promise(r => setTimeout(r, 0));
+    expect(btn.disabled).toBe(true);
+    btn.click();
+    expect(sent.filter(c => c.type === "ais-chat-create").length).toBe(1);
+    release({ ok: true });
+    await new Promise(r => setTimeout(r, 0));
+    expect(btn.disabled).toBe(false);
+  });
+
+  test("a reload keeps the seen marks from session storage", async () => {
+    const s = setup([view("a", {}, [{ seq: 1, ts: 0, body: { k: "notice", text: "x" } }, { seq: 2, ts: 0, body: { k: "notice", text: "y" } }])], { seen: { a: 1 } });
+    await s.flush();
+    s.push(stateOf(s.chats));
+    await s.flush();
+    expect(byClass(s.root, "chat-row")[0]!.className).toContain("unread");
+    const t2 = setup(s.chats, { seen: { a: 2 } });
+    await t2.flush();
+    t2.push(stateOf(s.chats));
+    expect(byClass(t2.root, "chat-row")[0]!.className).not.toContain("unread");
+  });
+});
