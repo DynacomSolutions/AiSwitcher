@@ -2,7 +2,7 @@
 // isolated world: page scripts cannot see it. The shadow root is closed and kept in this closure for the same reason.
 import { createCursors, CURSOR_CSS, type CursorKind } from "./cursor.ts";
 import { createSessionTracker } from "./sessions.ts";
-import { createIndicator, INDICATOR_CSS } from "./indicator.ts";
+import { createIndicator, displayIdentity, INDICATOR_CSS, type PillAgent } from "./indicator.ts";
 
 const HOST_ID = "ais-browser-overlay";
 /** No tool call for this long: the session is treated as over and the overlay goes away. */
@@ -33,9 +33,20 @@ function init(): void {
   /** The service worker is gone (extension reloaded or updated): this script is orphaned, so take the overlay down. */
   function orphaned(): boolean { return !chrome.runtime?.id; }
 
-  function requestStop(): void {
+  /** Chat name and colour per session, in mark order. The pill reads from here. */
+  const agents = new Map<string, PillAgent>();
+  let lastActive = "";
+
+  function showPill(a: MarkArg): void {
+    const label = a.label.trim() || displayIdentity(a.identity);
+    agents.set(a.sessionId, { sessionId: a.sessionId, label, color: a.color });
+    lastActive = a.sessionId;
+    ensure().indicator.show([...agents.values()], lastActive);
+  }
+
+  function requestStop(message: { type: string; sessionId?: string }): void {
     try {
-      void Promise.resolve(chrome.runtime.sendMessage({ type: "ais-stop" })).catch(() => { if (orphaned()) api.unmark(); });
+      void Promise.resolve(chrome.runtime.sendMessage(message)).catch(() => { if (orphaned()) api.unmark(); });
     } catch {
       if (orphaned()) api.unmark();
     }
@@ -53,7 +64,11 @@ function init(): void {
     style.textContent = `${CURSOR_CSS}\n${INDICATOR_CSS}`;
     root.append(style);
     cursors = createCursors(root);
-    indicator = createIndicator(root, requestStop);
+    indicator = createIndicator(root, {
+      stopAll: () => requestStop({ type: "ais-stop" }),
+      stopSession: sessionId => requestStop({ type: "ais-stop-session", sessionId }),
+      stopTab: () => requestStop({ type: "ais-stop-tab" }),
+    });
     applySuspended();
     (document.documentElement ?? document).append(host);
     return { cursors, indicator };
@@ -73,15 +88,15 @@ function init(): void {
   const api = {
     mark(a: MarkArg): string {
       if (orphaned()) { api.unmark(); return "orphaned"; }
-      ensure().indicator.show(a.identity, a.label, a.color);
+      showPill(a);
       sessions.add(a.sessionId, a.color, a.tag ?? a.identity);
       touch();
       return "ok";
     },
     async action(a: ActionArg): Promise<string> {
       if (orphaned()) { api.unmark(); return "orphaned"; }
+      showPill(a);
       const o = ensure();
-      o.indicator.show(a.identity, a.label, a.color);
       touch();
       if (a.kind !== "key") {
         const tag = a.tag ?? a.identity;
@@ -99,11 +114,16 @@ function init(): void {
     unmark(a?: { sessionId?: string } | null): string {
       if (a?.sessionId) {
         cursors?.remove(a.sessionId);
-        if (!sessions.remove(a.sessionId)) return "ok";
+        agents.delete(a.sessionId);
+        if (!sessions.remove(a.sessionId)) {
+          if (indicator && agents.size > 0) indicator.show([...agents.values()], [...agents.keys()].pop()!);
+          return "ok";
+        }
       }
       clearTimeout(expiry);
       cursors?.destroy();
       sessions.clear();
+      agents.clear();
       indicator?.destroy();
       host?.remove();
       host = null;

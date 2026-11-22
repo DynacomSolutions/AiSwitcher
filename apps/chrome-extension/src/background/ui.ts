@@ -91,6 +91,9 @@ export class OverlayUi implements Ui {
 
   has(tabId: number): boolean { return this.marked.has(tabId); }
 
+  /** Sessions marked on one tab, in mark order. */
+  sessionsOn(tabId: number): string[] { return [...(this.marked.get(tabId)?.keys() ?? [])]; }
+
   /** Tabs currently marked as controlled by the given session. */
   markedTabs(sessionId: string): number[] {
     return [...this.marked].filter(([, m]) => m.has(sessionId)).map(([id]) => id);

@@ -6,6 +6,8 @@ const PAUSED_KEY = "paused";
 export class State {
   private _paused = false;
   private readonly inflight = new Map<string, AbortController>();
+  private readonly sessionOf = new Map<string, string>();
+  private sessionsOnTab: (tabId: number) => string[] = () => [];
   private readonly changeListeners = new Set<(paused: boolean) => void>();
   private readonly stopListeners = new Set<() => void | Promise<void>>();
 
@@ -36,13 +38,30 @@ export class State {
   }
 
   /** Register an in-flight call. The signal aborts with reason "stopped" on stop() or "aborted" on abort(). */
-  track(id: string): AbortController {
+  track(id: string, sessionId?: string): AbortController {
     const controller = new AbortController();
     this.inflight.set(id, controller);
+    if (sessionId !== undefined) this.sessionOf.set(id, sessionId);
     return controller;
   }
 
-  untrack(id: string): void { this.inflight.delete(id); }
+  untrack(id: string): void { this.inflight.delete(id); this.sessionOf.delete(id); }
+
+  /** Lookup of the sessions marked on a tab. Used by stopTab. */
+  setSessionsOnTab(fn: (tabId: number) => string[]): void { this.sessionsOnTab = fn; }
+
+  /** Abort the in-flight calls of one session with stopped_by_user. Does not pause and does not detach. */
+  stopSession(sessionId: string): void {
+    for (const [id, c] of [...this.inflight]) {
+      if (this.sessionOf.get(id) !== sessionId) continue;
+      c.abort("stopped");
+      this.inflight.delete(id);
+      this.sessionOf.delete(id);
+    }
+  }
+
+  /** Abort the calls of every session marked on the tab. */
+  stopTab(tabId: number): void { for (const s of this.sessionsOnTab(tabId)) this.stopSession(s); }
 
   /** Gateway asked to abort one call. */
   abort(id: string): void { this.inflight.get(id)?.abort("aborted"); }
@@ -51,6 +70,7 @@ export class State {
   async stop(): Promise<void> {
     for (const c of this.inflight.values()) c.abort("stopped");
     this.inflight.clear();
+    this.sessionOf.clear();
     this.pause();
     await Promise.all([...this.stopListeners].map(async l => { try { await l(); } catch { /* best effort */ } }));
   }

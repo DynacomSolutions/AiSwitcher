@@ -44,7 +44,7 @@ export interface PanelStatus {
   update?: UpdateInfo;
 }
 
-export type PanelMessage = "ais-pause" | "ais-resume" | "ais-stop" | "ais-disconnect" | "ais-connect" | "ais-grant" | "ais-revoke" | "ais-update-check" | "ais-update-now" | "ais-update-auto";
+export type PanelMessage = "ais-pause" | "ais-resume" | "ais-stop" | "ais-stop-session" | "ais-stop-tab" | "ais-disconnect" | "ais-connect" | "ais-grant" | "ais-revoke" | "ais-update-check" | "ais-update-now" | "ais-update-auto";
 
 export const targetText = (t: BrowserTarget | undefined): string =>
   t ? (t.kind === "pool" ? `Pool ${t.pool}` : `Identity ${t.identity}`) : "Not bound";

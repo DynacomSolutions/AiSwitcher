@@ -96,6 +96,8 @@ chrome.alarms.onAlarm.addListener(() => {
   void startup.then(async () => { tabs.expireIdle(); if (connection.needsRestart()) await connect(); await updater.tick().catch(() => {}); });
 });
 
+state.setSessionsOnTab(tabId => ui.sessionsOn(tabId));
+
 // Control messages from the side panel and the in-page Stop button (see messages.ts for who may send what).
 chrome.runtime.onMessage.addListener((msg: unknown, sender, reply) => handleMessage(msg, sender, reply, {
   runtimeId: chrome.runtime.id,
@@ -107,6 +109,7 @@ chrome.runtime.onMessage.addListener((msg: unknown, sender, reply) => handleMess
     await connect();
   },
   isMarked: tabId => ui.has(tabId),
+  isSessionMarked: (tabId, sessionId) => ui.sessionsOn(tabId).includes(sessionId),
   grant: (groupId, sessionId) => tabs.grant(groupId, sessionId),
   revoke: async groupId => { tabs.revoke(groupId); },
   updater,

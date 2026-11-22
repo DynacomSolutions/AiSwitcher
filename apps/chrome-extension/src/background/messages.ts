@@ -6,21 +6,25 @@ export interface MessageSender { id?: string; origin?: string; frameId?: number;
 
 export interface MessageDeps {
   runtimeId: string;
-  state: { pause(): void; resume(): void; stop(): Promise<void> };
+  state: { pause(): void; resume(): void; stop(): Promise<void>; stopSession(sessionId: string): void; stopTab(tabId: number): void };
   status(): Promise<PanelStatus>;
   setDisconnected(value: boolean): Promise<void>;
   isMarked(tabId: number): boolean;
+  /** True when the session is marked on that tab. */
+  isSessionMarked(tabId: number, sessionId: string): boolean;
   /** Grants a user's tab group to a live session. */
   grant(groupId: number, sessionId: string): Promise<GrantResult>;
   revoke(groupId: number): Promise<void>;
   updater?: { check(): Promise<unknown>; update(): Promise<void>; setAuto(enabled: boolean): Promise<void> };
 }
 
+const CONTENT_TYPES = new Set(["ais-stop", "ais-stop-session", "ais-stop-tab"]);
+
 /**
  * Returns true when `reply` will be called asynchronously.
  *
  * Only this extension may talk to the worker. Everything needs an extension-page origin (side panel), with one exception:
- * the in-page Stop button, which comes from our content script in the top frame of a tab we are currently controlling.
+ * the in-page Stop buttons, which come from our content script in the top frame of a tab we are currently controlling.
  */
 export function handleMessage(msg: unknown, sender: MessageSender, reply: (r: unknown) => void, deps: MessageDeps): boolean {
   if (typeof msg !== "object" || msg === null) return false;
@@ -29,11 +33,26 @@ export function handleMessage(msg: unknown, sender: MessageSender, reply: (r: un
   const type = (msg as { type?: unknown }).type;
   if (!fromExtensionPage) {
     const tabId = sender.tab?.id;
-    if (type !== "ais-stop" || sender.frameId !== 0 || tabId === undefined || !deps.isMarked(tabId)) return false;
+    if (!CONTENT_TYPES.has(type as string) || sender.frameId !== 0 || tabId === undefined || !deps.isMarked(tabId)) return false;
+    // A content script may stop only sessions marked on its own tab. The tab id is the sender's, never one from the body.
+    if (type === "ais-stop-session") {
+      const sessionId = (msg as { sessionId?: unknown }).sessionId;
+      if (typeof sessionId !== "string" || !deps.isSessionMarked(tabId, sessionId)) return false;
+    }
   }
   switch (type) {
     case "ais-pause": deps.state.pause(); reply({ ok: true }); return false;
     case "ais-resume": deps.state.resume(); reply({ ok: true }); return false;
+    case "ais-stop-session": {
+      const { sessionId } = msg as { sessionId?: unknown };
+      if (typeof sessionId !== "string") { reply({ ok: false, error: "bad_args" }); return false; }
+      deps.state.stopSession(sessionId); reply({ ok: true }); return false;
+    }
+    case "ais-stop-tab": {
+      const tabId = sender.tab?.id;
+      if (tabId === undefined) { reply({ ok: false, error: "bad_args" }); return false; }
+      deps.state.stopTab(tabId); reply({ ok: true }); return false;
+    }
     case "ais-stop": void deps.state.stop().then(() => reply({ ok: true })); return true;
     case "ais-disconnect": void deps.setDisconnected(true).then(() => reply({ ok: true })); return true;
     case "ais-connect": void deps.setDisconnected(false).then(() => reply({ ok: true })); return true;

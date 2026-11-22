@@ -7,10 +7,11 @@ function setup() {
   const calls: string[] = [];
   const deps: MessageDeps = {
     runtimeId: ID,
-    state: { pause: () => { calls.push("pause"); }, resume: () => { calls.push("resume"); }, stop: async () => { calls.push("stop"); } },
+    state: { pause: () => { calls.push("pause"); }, resume: () => { calls.push("resume"); }, stop: async () => { calls.push("stop"); }, stopSession: s => { calls.push(`stopSession:${s}`); }, stopTab: t => { calls.push(`stopTab:${t}`); } },
     status: async () => { calls.push("status"); return { status: "idle", paused: false, inflight: 0, signedIn: false, sessions: [] }; },
     setDisconnected: async v => { calls.push(`disconnected:${v}`); },
     isMarked: id => id === 7,
+    isSessionMarked: (tab, s) => tab === 7 && s === "s1",
     grant: async (g, sid) => { calls.push(`grant:${g}:${sid}`); return "ok"; },
     revoke: async g => { calls.push(`revoke:${g}`); },
     updater: { check: async () => { calls.push("check"); }, update: async () => { calls.push("update"); }, setAuto: async e => { calls.push(`auto:${e}`); } },
@@ -48,6 +49,63 @@ describe("runtime message sender checks", () => {
     expect(t.send("ais-stop", content(undefined))).toBe(false); // no tab
     expect(t.send("ais-stop", content(7, 3))).toBe(false); // subframe
     for (const m of ["ais-resume", "ais-pause", "ais-status", "ais-disconnect", "ais-connect"]) expect(t.send(m, content(7))).toBe(false);
+    expect(t.calls).toEqual([]);
+  });
+});
+
+describe("per-agent stop messages", () => {
+  const stopSession = (t: ReturnType<typeof setup>, sender: MessageSender, sessionId: unknown) => handleMessage({ type: "ais-stop-session", sessionId }, sender, v => t.replies.push(v), t.deps);
+
+  test("ais-stop-session from a marked tab stops that session only", () => {
+    const t = setup();
+    expect(stopSession(t, content(7), "s1")).toBe(false);
+    expect(t.calls).toEqual(["stopSession:s1"]);
+  });
+
+  test("ais-stop-session from a content script of an unmarked tab is refused", () => {
+    const t = setup();
+    stopSession(t, content(8), "s1");
+    stopSession(t, content(undefined), "s1");
+    stopSession(t, content(7, 2), "s1");
+    expect(t.calls).toEqual([]);
+  });
+
+  test("ais-stop-session naming a session not marked on that tab is refused", () => {
+    const t = setup();
+    stopSession(t, content(7), "other");
+    stopSession(t, content(7), 5);
+    handleMessage({ type: "ais-stop-session", sessionId: "s1", tabId: 8 }, content(8), () => {}, t.deps);
+    expect(t.calls).toEqual([]);
+  });
+
+  test("ais-stop-tab uses the sender tab, never the body", () => {
+    const t = setup();
+    handleMessage({ type: "ais-stop-tab", tabId: 99 }, content(7), () => {}, t.deps);
+    handleMessage({ type: "ais-stop-tab" }, content(8), () => {}, t.deps);
+    expect(t.calls).toEqual(["stopTab:7"]);
+  });
+
+  test("side panel may stop a session or a tab without the tab guard", () => {
+    const t = setup();
+    stopSession(t, page, "s9");
+    expect(t.calls).toEqual(["stopSession:s9"]);
+  });
+
+  test("ais-stop from a content script still pauses everything (legacy single-agent pill)", async () => {
+    const t = setup();
+    expect(t.send("ais-stop", content(7))).toBe(true);
+    await Bun.sleep(5);
+    expect(t.calls).toEqual(["stop"]);
+  });
+
+  test("a message from a web page origin is ignored", () => {
+    const t = setup();
+    const web: MessageSender = { origin: "https://site.test", tab: { id: 7 }, frameId: 0 };
+    const webWithId: MessageSender = { id: "someone-else", origin: "https://site.test", tab: { id: 7 }, frameId: 0 };
+    for (const m of ["ais-stop", "ais-stop-session", "ais-stop-tab"]) {
+      expect(handleMessage({ type: m, sessionId: "s1" }, web, () => {}, t.deps)).toBe(false);
+      expect(handleMessage({ type: m, sessionId: "s1" }, webWithId, () => {}, t.deps)).toBe(false);
+    }
     expect(t.calls).toEqual([]);
   });
 });

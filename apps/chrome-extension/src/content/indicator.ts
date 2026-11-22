@@ -14,6 +14,10 @@ export const INDICATOR_CSS = `
 .pill .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--c); box-shadow: 0 0 0 0 var(--c); animation: ais-pulse 2s ease-out infinite; }
 @keyframes ais-pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c) 70%, transparent); } 80%, 100% { box-shadow: 0 0 0 8px transparent; } }
 .pill .brand { font-weight: 700; letter-spacing: .06em; font-size: 11px; padding: 1px 6px; border-radius: 6px; background: color-mix(in srgb, var(--c) 28%, transparent); color: #fff; }
+.pill.multi { flex-wrap: wrap; border-radius: 18px; row-gap: 4px; }
+.pill .dots { display: flex; gap: 4px; flex: none; }
+.pill .dots .dot { width: 8px; height: 8px; }
+.pill .stops { display: flex; flex-wrap: wrap; gap: 4px; }
 .pill .text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #d4d4d8; }
 .pill .text b { color: #fff; font-weight: 600; }
 .pill button { all: unset; box-sizing: border-box; cursor: pointer; padding: 3px 13px; border-radius: 999px; font-weight: 600; font-size: 12.5px; color: #fecaca;
@@ -23,10 +27,22 @@ export const INDICATOR_CSS = `
 @media (prefers-reduced-motion: reduce) { .glow.on, .pill .dot { animation: none; } .pill { transition: opacity 120ms; } }
 `;
 
+export interface PillAgent { sessionId: string; label: string; color: string }
+
 export interface Indicator {
-  show(identity: string, label: string, color: string): void;
+  /** `agents` are in mark order. The glow takes the colour of the agent whose id is `lastActive`. */
+  show(agents: PillAgent[], lastActive: string): void;
   hide(): void;
   destroy(): void;
+}
+
+export interface IndicatorHandlers {
+  /** One agent: the legacy profile-wide Stop. */
+  stopAll(): void;
+  /** Several agents: stop one agent only. */
+  stopSession(sessionId: string): void;
+  /** Several agents: stop every agent on this tab. */
+  stopTab(): void;
 }
 
 /** Pool sessions carry `pool:<name>`; the pill shows just the pool name. */
@@ -34,32 +50,66 @@ export function displayIdentity(identity: string): string {
   return identity.startsWith("pool:") ? identity.slice(5) : identity;
 }
 
-export function createIndicator(root: ShadowRoot, onStop: () => void): Indicator {
+/** The first `max` agents show as dots and names. The rest are only counted. */
+export function pillSummary(agents: PillAgent[], max = 3): { dots: PillAgent[]; names: string; more: number } {
+  const dots = agents.slice(0, max);
+  return { dots, names: dots.map(a => a.label).join(", "), more: agents.length - dots.length };
+}
+
+export function createIndicator(root: ShadowRoot, handlers: IndicatorHandlers): Indicator {
   const glow = document.createElement("div");
   glow.className = "glow";
   const pill = document.createElement("div");
   pill.className = "pill";
   pill.setAttribute("role", "status");
-  pill.innerHTML = `<span class="dot"></span><span class="brand">AIS</span><span class="text"></span><button type="button">Stop</button>`;
-  const text = pill.querySelector<HTMLElement>(".text")!;
-  const button = pill.querySelector<HTMLButtonElement>("button")!;
-  // Only a real user click counts: page scripts can dispatch synthetic events, but never trusted ones.
-  button.addEventListener("click", ev => { ev.stopPropagation(); if (ev.isTrusted) onStop(); });
   let shown = false;
 
+  // Only a real user click counts: page scripts can dispatch synthetic events, but never trusted ones.
+  function stopButton(text: string, name: string, act: () => void): HTMLButtonElement {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = text;
+    b.setAttribute("aria-label", name);
+    b.addEventListener("click", ev => { ev.stopPropagation(); if (ev.isTrusted) act(); });
+    return b;
+  }
+  const span = (cls: string): HTMLSpanElement => { const e = document.createElement("span"); e.className = cls; return e; };
+
   return {
-    show(rawIdentity, label, color) {
-      const identity = displayIdentity(rawIdentity);
+    show(agents, lastActive) {
+      if (agents.length === 0) return;
+      const active = agents.find(a => a.sessionId === lastActive) ?? agents[agents.length - 1]!;
       if (!glow.isConnected) root.append(glow, pill);
-      for (const n of [glow, pill]) n.style.setProperty("--c", color);
-      text.replaceChildren();
-      const b = document.createElement("b");
-      // The session's chat name, never the identity; the identity is only the fallback for an older shim with no label.
-      const name = label.trim() || identity;
-      b.textContent = name;
-      text.append(b, " is controlling this tab");
-      pill.title = label;
-      button.setAttribute("aria-label", `Stop ${name} controlling this tab`);
+      for (const n of [glow, pill]) n.style.setProperty("--c", active.color);
+      pill.replaceChildren();
+      pill.classList.toggle("multi", agents.length > 1);
+      const brand = span("brand");
+      brand.textContent = "AIS";
+      const text = span("text");
+      if (agents.length === 1) {
+        const only = agents[0]!;
+        const dot = span("dot");
+        const b = document.createElement("b");
+        // The session's chat name, never the identity.
+        b.textContent = only.label;
+        text.append(b, " is controlling this tab");
+        pill.title = only.label;
+        pill.append(dot, brand, text, stopButton("Stop", `Stop ${only.label} controlling this tab`, handlers.stopAll));
+      } else {
+        const sum = pillSummary(agents);
+        const dots = span("dots");
+        for (const a of sum.dots) { const d = span("dot"); d.style.setProperty("--c", a.color); dots.append(d); }
+        const b = document.createElement("b");
+        b.textContent = sum.names;
+        text.append(b);
+        if (sum.more > 0) text.append(` and ${sum.more} more`);
+        text.append(" are controlling this tab");
+        pill.title = agents.map(a => a.label).join(", ");
+        const stops = span("stops");
+        for (const a of agents) stops.append(stopButton(`Stop ${a.label}`, `Stop ${a.label}`, () => handlers.stopSession(a.sessionId)));
+        stops.append(stopButton("Stop all", "Stop all agents on this tab", handlers.stopTab));
+        pill.append(dots, brand, text, stops);
+      }
       if (!shown) {
         shown = true;
         // Next frame so the entry transition runs.
