@@ -116,4 +116,10 @@ describe("chat protocol", () => {
     expect(parseChatFromExt({ t: "chat.catalog", reqId: "q", provider: "bash" })).toBeUndefined();
     expect(parseChatFromExt({ t: "chat.permission", chatId: "c", requestId: "r" })).toEqual({ t: "chat.permission", chatId: "c", requestId: "r" });
   });
+
+  test("an unknown error code reads as acp, so a newer gateway never makes a panel drop the frame", () => {
+    expect(parseChatToExt({ t: "chat.event", chatId: "c-1", seq: 1, ts: 1, body: { k: "error", code: "future_code", message: "m" } })).toEqual({ t: "chat.event", chatId: "c-1", seq: 1, ts: 1, body: { k: "error", code: "acp", message: "m" } });
+    expect(parseChatToExt({ t: "chat.reject", chatId: "c-1", code: "future_code", message: "m" })).toEqual({ t: "chat.reject", chatId: "c-1", code: "acp", message: "m" });
+    expect(parseChatToExt({ t: "chat.reject", code: 5, message: "m" })).toBeUndefined();
+  });
 });

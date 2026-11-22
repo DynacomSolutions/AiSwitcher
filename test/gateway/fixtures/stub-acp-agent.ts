@@ -53,6 +53,7 @@ async function runPrompt(id: string | number, sessionId: string, text: string, f
     return done();
   }
   if (text === "limit") return send({ jsonrpc: "2.0", id, error: { code: -32000, message: "Rate limit reached. Resets at 2023-11-15T00:00:00Z" } });
+  if (text === "weekly") return send({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: You've hit your weekly limit \u00b7 resets Nov 26, 2am (Asia/Bangkok)", data: { errorKind: "rate_limit" } } });
   if (text === "hang") return;
   if (text === "lateask") {
     done();

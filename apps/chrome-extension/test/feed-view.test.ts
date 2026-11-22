@@ -75,6 +75,11 @@ describe("renderFeed", () => {
   test("parseCached returns the same blocks for the same text", () => {
     expect(parseCached("hello **x**")).toBe(parseCached("hello **x**"));
   });
+  test("a limit error line reads as a usage limit notice with the provider text", () => {
+    const s = setup();
+    s.render([{ kind: "error", seq: 1, code: "limit", message: "You've hit your weekly limit · resets Nov 26, 2am (Asia/Bangkok)" }]);
+    expect(s.root.textContent).toBe("Usage limit reached: You've hit your weekly limit · resets Nov 26, 2am (Asia/Bangkok)");
+  });
   test("hostile tool, permission and error text becomes text nodes only", () => {
     const s = setup();
     const evil = '<img src=x onerror=alert(1)><script>alert(1)</script>[x](javascript:alert(1))';

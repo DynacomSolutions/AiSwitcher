@@ -13,7 +13,7 @@ const ARGS_MAX = 120;
 const RESULT_MAX = 400;
 const ERROR_LABELS: Record<string, string> = {
   pod_start: "Agent did not start", attach: "Could not connect", agent_exit: "Agent stopped", acp: "Agent error", timeout: "Timed out",
-  limit: "Usage limit reached", busy: "Agent is busy", window_cap: "Too many chats", bad_request: "Bad request", unavailable: "Not available",
+  limit: "Usage limit reached:", busy: "Agent is busy", window_cap: "Too many chats", bad_request: "Bad request", unavailable: "Not available",
   resume_failed: "Could not resume", expired: "Chat expired",
 };
 export const errorLabel = (code: string): string => ERROR_LABELS[code] ?? "Error";

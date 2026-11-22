@@ -219,6 +219,17 @@ test("a rate-limit failure text becomes an error item with code limit and the re
   await idleState(store, rec.id);
 });
 
+test("an agent usage limit becomes a limit error item with the provider text", async () => {
+  const { broker, store, metrics } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "weekly");
+  await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
+  const err = (await bodies(store, rec.id)).find((b) => b.k === "error") as Extract<ChatBody, { k: "error" }>;
+  expect(err).toEqual({ k: "error", code: "limit", message: "You've hit your weekly limit \u00b7 resets Nov 26, 2am (Asia/Bangkok)" });
+  expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="rate_limit"} 1');
+  await idleState(store, rec.id);
+});
+
 test("any other prompt error becomes an acp error item with fixed copy", async () => {
   const { broker, store } = setup();
   const rec = await made(broker);

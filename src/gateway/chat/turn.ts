@@ -76,8 +76,14 @@ export function mergeTool(prev: ToolBody | undefined, u: Extract<AcpUpdate, { ki
   return next;
 }
 
-/** The error item for a failed prompt. The agent's own text never reaches the feed. */
-export function promptFailure(message: string, code: number, nowMs: number): { code: "limit" | "acp"; message: string; kind: "limit" | "acp" } {
+/** The error item for a failed prompt. Other agent text never reaches the feed. Only the text of a usage limit does, because it names the reset time. */
+export function promptFailure(message: string, code: number, nowMs: number, data?: unknown): { code: "limit" | "acp"; message: string; kind: "limit" | "rate_limit" | "acp" } {
+  // The agent names a usage limit in `data.errorKind`. Its text holds the reset time in the user's own words, so the feed shows it.
+  // The code stays `limit`: panels from before v0.5.95 drop a frame with an unknown code, and the feed would stall.
+  if (typeof data === "object" && data !== null && (data as { errorKind?: unknown }).errorKind === "rate_limit") {
+    const text = shortField(message.replace(/^Internal error: /, ""));
+    return { code: "limit", message: text === "" ? "Your usage limit is reached. Try again later." : text, kind: "rate_limit" };
+  }
   const reset = resetFromText(message, nowMs);
   if (reset || isLimitFailure({ text: message, code: String(code) })) {
     return {

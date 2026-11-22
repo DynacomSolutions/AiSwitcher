@@ -1288,7 +1288,7 @@ export class ChatBroker implements ChatAuth {
       metrics.chatTurn(r.stopReason === "cancelled" || ctx.cancelRequested ? "cancelled" : "ok");
     } catch (e) {
       if (e instanceof AcpError) {
-        const f = promptFailure(e.message, e.code, this.d.now());
+        const f = promptFailure(e.message, e.code, this.d.now(), e.data);
         metrics.chatError(f.kind);
         metrics.chatTurn("error");
         this.push(ctx, { k: "error", code: f.code, message: f.message });
