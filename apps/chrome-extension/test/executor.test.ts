@@ -224,6 +224,7 @@ describe("args and tools", () => {
       beforeAction: (tabId, p) => { events.push(`before:${tabId}:${p.kind}:${p.x},${p.y}`); },
       markControlled: (tabId, s) => { events.push(`mark:${tabId}:${s.id}`); },
       unmark() {},
+      unmarkSession() {},
       unmarkAll() {},
       suspend() {},
       restore() {},
@@ -340,6 +341,7 @@ describe("visuals and abort hygiene", () => {
       beforeAction: (_t, _p, s) => { signal = s; log.push("before"); },
       markControlled: (t) => { log.push(`mark:${t}`); },
       unmark: (t) => { log.push(`unmark:${t}`); },
+      unmarkSession: () => {},
       unmarkAll: () => { log.push("unmarkAll"); },
       suspend: t => { log.push(`suspend:${t}`); },
       restore: t => { log.push(`restore:${t}`); },
@@ -356,6 +358,20 @@ describe("visuals and abort hygiene", () => {
     api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
     await executor.run(call("screenshot", { tabId: tab.id }));
     expect((await executor.run(call("hover", { tabId: tab.id, coordinate: [10, 10] }))).ok).toBe(true);
+  });
+
+  test("beforeAction receives the acting session's id", async () => {
+    const r = recordingUi();
+    const ids: string[] = [];
+    r.ui.beforeAction = (_t, p) => { ids.push(p.sessionId); };
+    const { api, tabs, executor } = setup(r.ui);
+    const tab = await tabs.create(session);
+    api.cdpResults["Page.getLayoutMetrics"] = { cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 } };
+    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
+    await executor.run(call("screenshot", { tabId: tab.id }));
+    await executor.run(call("hover", { tabId: tab.id, coordinate: [10, 10] }));
+    expect(ids.length).toBeGreaterThan(0);
+    expect(new Set(ids)).toEqual(new Set([session.id]));
   });
 
   test("unmark on close_tab, tab removal, stop and pause", async () => {

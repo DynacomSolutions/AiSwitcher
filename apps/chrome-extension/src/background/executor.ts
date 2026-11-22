@@ -368,13 +368,13 @@ export class Executor {
       case "find": return text(await this.find(sig, tabId, a("find").query));
       case "click": {
         const p = await this.target(sig, tabId, a("click"));
-        await this.input(sig, tabId, p, "click");
+        await this.input(sig, tabId, p, "click", session.id);
         await this.press(sig, tabId, p, a("click").button ?? "left", a("click").clickCount ?? 1);
         return text(`Clicked at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
       case "hover": {
         const p = await this.target(sig, tabId, a("hover"));
-        await this.input(sig, tabId, p, "hover");
+        await this.input(sig, tabId, p, "hover", session.id);
         await this.hidden(sig, tabId, () => this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y }), true);
         return text(`Hovered at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
@@ -386,14 +386,14 @@ export class Executor {
           p = { x: r.x, y: r.y };
           await this.cdp(sig, tabId, "DOM.focus", { backendNodeId: r.backendNodeId });
         }
-        await this.input(sig, tabId, p, "type");
+        await this.input(sig, tabId, p, "type", session.id);
         await this.cdp(sig, tabId, "Input.insertText", { text: value });
         return text(`Typed ${value.length} characters.`);
       }
       case "key": {
         let specs;
         try { specs = parseKeys(a("key").key); } catch (e) { throw new ToolError("bad_args", (e as Error).message); }
-        await this.input(sig, tabId, this.lastPoint.get(tabId) ?? { x: 0, y: 0 }, "key");
+        await this.input(sig, tabId, this.lastPoint.get(tabId) ?? { x: 0, y: 0 }, "key", session.id);
         for (let n = 0; n < (a("key").repeat ?? 1); n++) {
           for (const k of specs) {
             const common = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
@@ -408,11 +408,11 @@ export class Executor {
         if (!s.direction) {
           if (!s.ref) throw new ToolError("bad_args", "scroll needs a direction or a ref");
           const p = await this.refPoint(sig, tabId, s.ref);
-          await this.input(sig, tabId, p, "scroll");
+          await this.input(sig, tabId, p, "scroll", session.id);
           return text("Scrolled element into view.");
         }
         const p = s.ref || s.coordinate ? await this.target(sig, tabId, s) : await this.viewportCentre(sig, tabId);
-        await this.input(sig, tabId, p, "scroll");
+        await this.input(sig, tabId, p, "scroll", session.id);
         const delta = (s.amount ?? 3) * 100;
         const dx = s.direction === "left" ? -delta : s.direction === "right" ? delta : 0;
         const dy = s.direction === "up" ? -delta : s.direction === "down" ? delta : 0;
@@ -420,7 +420,7 @@ export class Executor {
         return text(`Scrolled ${s.direction}.`);
       }
       case "form_input": return this.formInput(sig, tabId, a("form_input").ref, a("form_input").value);
-      case "upload_file": return this.uploadFile(sig, tabId, a("upload_file"));
+      case "upload_file": return this.uploadFile(sig, tabId, a("upload_file"), session.id);
       case "javascript": {
         const r = (await this.cdp(sig, tabId, "Runtime.evaluate", { expression: a("javascript").code, awaitPromise: true, returnByValue: true, userGesture: true })) as { result?: { value?: unknown; description?: string }; exceptionDetails?: { text?: string; exception?: { description?: string } } };
         if (r.exceptionDetails) throw new ToolError("internal", `JavaScript error: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "unknown"}`);
@@ -925,9 +925,9 @@ export class Executor {
     throw new ToolError("bad_args", "Give either ref or coordinate.");
   }
 
-  private async input(sig: AbortSignal, tabId: number, p: { x: number; y: number }, kind: ActionKind): Promise<void> {
+  private async input(sig: AbortSignal, tabId: number, p: { x: number; y: number }, kind: ActionKind, sessionId: string): Promise<void> {
     this.lastPoint.set(tabId, { x: p.x, y: p.y });
-    try { await this.ui.beforeAction(tabId, { x: p.x, y: p.y, kind }, sig); } catch { /* visuals never fail a tool call */ }
+    try { await this.ui.beforeAction(tabId, { x: p.x, y: p.y, kind, sessionId }, sig); } catch { /* visuals never fail a tool call */ }
     this.throwIfAborted(sig);
   }
 
@@ -948,14 +948,14 @@ export class Executor {
    * is read from the disk of this machine. A ref to a file input is filled directly; any other target is clicked and the
    * file chooser it opens is held back (no dialog appears) to learn which input asked for files.
    */
-  private async uploadFile(sig: AbortSignal, tabId: number, args: ToolArgs["upload_file"]): Promise<Content> {
+  private async uploadFile(sig: AbortSignal, tabId: number, args: ToolArgs["upload_file"], sessionId: string): Promise<Content> {
     let input: { backendNodeId: number; sessionId?: string } | undefined;
     if (args.ref) {
       const backendNodeId = this.refTable(tabId).byRef.get(args.ref);
       if (backendNodeId === undefined) throw new ToolError("bad_args", `Unknown ref ${args.ref}; call read_page or find first.`);
       if (await this.isFileInput(sig, tabId, backendNodeId)) input = { backendNodeId };
     }
-    input ??= await this.openChooser(sig, tabId, args);
+    input ??= await this.openChooser(sig, tabId, args, sessionId);
     await this.setFiles(sig, tabId, input, args.files);
     return text(`Uploaded ${args.files.map(f => f.name).join(", ")}.`);
   }
@@ -975,12 +975,12 @@ export class Executor {
   }
 
   /** Clicks the target with file chooser interception on, in the page and in every cross-origin iframe, and returns the input that asked for files. */
-  private async openChooser(sig: AbortSignal, tabId: number, target: { ref?: string; coordinate?: [number, number] }): Promise<{ backendNodeId: number; sessionId?: string }> {
+  private async openChooser(sig: AbortSignal, tabId: number, target: { ref?: string; coordinate?: [number, number] }, actingSession: string): Promise<{ backendNodeId: number; sessionId?: string }> {
     const p = await this.target(sig, tabId, target);
     const armed = await this.interceptChoosers(sig, tabId);
     const opened = this.waitForEvent(tabId, ["Page.fileChooserOpened"], this.chooserWait, true);
     try {
-      await this.input(sig, tabId, p, "click");
+      await this.input(sig, tabId, p, "click", actingSession);
       await this.press(sig, tabId, p);
       const chooser = await opened.promise;
       this.throwIfAborted(sig);

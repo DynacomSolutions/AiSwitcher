@@ -2,7 +2,7 @@
 import { colorForIdentity } from "./tabs.ts";
 
 export type ActionKind = "click" | "hover" | "type" | "scroll" | "key";
-export interface ActionPoint { x: number; y: number; kind: ActionKind }
+export interface ActionPoint { x: number; y: number; kind: ActionKind; sessionId: string }
 export interface UiSession { id: string; identity: string; label: string; color?: string }
 
 export interface Ui {
@@ -13,7 +13,7 @@ export interface Ui {
   /** Clears cursor and indicator from one tab (tab released, closed or session ended). */
   unmark(tabId: number): Promise<void> | void;
   /** Clears one session from one tab. The other sessions on the tab stay marked. */
-  unmarkSession?(tabId: number, sessionId: string): Promise<void> | void;
+  unmarkSession(tabId: number, sessionId: string): Promise<void> | void;
   /** Clears every marked tab (Stop, Pause). */
   unmarkAll(): Promise<void> | void;
   /** Hides the overlay so it is neither captured by a screenshot nor hit by synthetic mouse input. Best effort, capped at SUSPEND_MAX_MS. */
@@ -83,9 +83,8 @@ const withTimeout = <T>(p: Promise<T>, ms: number, signal?: AbortSignal): Promis
 
 /** In-page overlay: cursor, ripple, border glow and the controlling pill. Everything is best effort. */
 export class OverlayUi implements Ui {
-  /** tabId -> sessions marked on it. Map order is mark order; the acting session is `acting`. */
+  /** tabId -> sessions marked on it, in mark order. */
   private readonly marked = new Map<number, Map<string, UiSession>>();
-  private readonly acting = new Map<number, string>();
   private readonly lastActive = new Map<number, number>();
 
   constructor(private readonly scripting: Scripting = realScripting(), private readonly now: () => number = Date.now) {}
@@ -121,16 +120,15 @@ export class OverlayUi implements Ui {
     let m = this.marked.get(tabId);
     if (!m) this.marked.set(tabId, m = new Map());
     m.set(session.id, session);
-    this.acting.set(tabId, session.id);
     this.lastActive.set(tabId, this.now());
     await this.run(tabId, "mark", this.payload(session), true, () => this.marked.has(tabId));
   }
 
   async beforeAction(tabId: number, point: ActionPoint, signal?: AbortSignal): Promise<void> {
-    const session = this.marked.get(tabId)?.get(this.acting.get(tabId) ?? "");
+    const session = this.marked.get(tabId)?.get(point.sessionId);
     if (!session || signal?.aborted) return;
     this.lastActive.set(tabId, this.now());
-    await withTimeout(this.run(tabId, "action", { ...point, ...this.payload(session) }, true, () => this.marked.has(tabId)), BEFORE_ACTION_MAX_MS, signal);
+    await withTimeout(this.run(tabId, "action", { x: point.x, y: point.y, kind: point.kind, ...this.payload(session) }, true, () => this.marked.has(tabId)), BEFORE_ACTION_MAX_MS, signal);
   }
 
   async suspend(tabId: number): Promise<void> {
@@ -145,7 +143,6 @@ export class OverlayUi implements Ui {
 
   async unmark(tabId: number): Promise<void> {
     this.lastActive.delete(tabId);
-    this.acting.delete(tabId);
     if (!this.marked.delete(tabId)) return;
     await this.run(tabId, "unmark", null, false);
   }
@@ -155,10 +152,7 @@ export class OverlayUi implements Ui {
     if (!m?.delete(sessionId)) return;
     if (m.size === 0) {
       this.marked.delete(tabId);
-      this.acting.delete(tabId);
       this.lastActive.delete(tabId);
-    } else if (this.acting.get(tabId) === sessionId) {
-      this.acting.set(tabId, [...m.keys()].at(-1)!);
     }
     await this.run(tabId, "unmark", { sessionId }, false);
   }
@@ -166,7 +160,6 @@ export class OverlayUi implements Ui {
   async unmarkAll(): Promise<void> {
     const ids = [...this.marked.keys()];
     this.marked.clear();
-    this.acting.clear();
     this.lastActive.clear();
     await Promise.all(ids.map(id => this.run(id, "unmark", null, false)));
   }
@@ -177,7 +170,6 @@ export class OverlayUi implements Ui {
     if (!m) return;
     if (this.now() - (this.lastActive.get(tabId) ?? 0) > SESSION_IDLE_MS) {
       this.marked.delete(tabId);
-      this.acting.delete(tabId);
       this.lastActive.delete(tabId);
       return;
     }

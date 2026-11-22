@@ -37,20 +37,20 @@ describe("OverlayUi", () => {
     const ui = new OverlayUi(f.s);
     await ui.markControlled(4, session);
     const t0 = Date.now();
-    await ui.beforeAction(4, { x: 1, y: 2, kind: "click" });
+    await ui.beforeAction(4, { x: 1, y: 2, kind: "click", sessionId: "s" });
     const took = Date.now() - t0;
     expect(took).toBeGreaterThanOrEqual(300);
     expect(took).toBeLessThan(700);
     const ac = new AbortController();
     const t1 = Date.now();
-    const p = ui.beforeAction(4, { x: 1, y: 2, kind: "click" }, ac.signal);
+    const p = ui.beforeAction(4, { x: 1, y: 2, kind: "click", sessionId: "s" }, ac.signal);
     setTimeout(() => ac.abort(), 20);
     await p;
     expect(Date.now() - t1).toBeLessThan(200);
     const pre = new AbortController();
     pre.abort();
     const n = f.calls.length;
-    await ui.beforeAction(4, { x: 1, y: 2, kind: "click" }, pre.signal);
+    await ui.beforeAction(4, { x: 1, y: 2, kind: "click", sessionId: "s" }, pre.signal);
     expect(f.calls.length).toBe(n);
   });
 
@@ -70,7 +70,7 @@ describe("OverlayUi", () => {
   test("scripting failures (chrome:// pages) are swallowed", async () => {
     const ui = new OverlayUi(fakeScripting({ fail: true }).s);
     await ui.markControlled(1, session);
-    await ui.beforeAction(1, { x: 0, y: 0, kind: "hover" });
+    await ui.beforeAction(1, { x: 0, y: 0, kind: "hover", sessionId: "s" });
     await ui.unmarkAll();
   });
 });
@@ -89,14 +89,19 @@ describe("OverlayUi per-session cursors", () => {
     expect(ui.has(1)).toBe(true);
   });
 
-  test("beforeAction sends the acting session's id and colour", async () => {
+  test("beforeAction moves the acting session's cursor even after another session was marked last", async () => {
     const f = fakeScripting();
     const ui = new OverlayUi(f.s);
     await ui.markControlled(1, a);
     await ui.markControlled(1, b);
-    await ui.beforeAction(1, { x: 1, y: 2, kind: "click" });
+    await ui.beforeAction(1, { x: 1, y: 2, kind: "click", sessionId: "a" });
     const act = f.calls.filter(c => c.method === "action").at(-1)!;
-    expect(act.arg).toMatchObject({ sessionId: "b", color: "#22c55e", tag: "Chat B" });
+    expect(act.arg).toMatchObject({ sessionId: "a", color: "#f97316", tag: "Chat A" });
+    await ui.beforeAction(1, { x: 1, y: 2, kind: "click", sessionId: "b" });
+    expect(f.calls.filter(c => c.method === "action").at(-1)!.arg).toMatchObject({ sessionId: "b", color: "#22c55e", tag: "Chat B" });
+    const n = f.calls.length;
+    await ui.beforeAction(1, { x: 1, y: 2, kind: "click", sessionId: "gone" });
+    expect(f.calls.length).toBe(n);
   });
 
   test("unmarkSession removes one session and keeps the other marked", async () => {
@@ -156,7 +161,7 @@ describe("OverlayUi session end and races", () => {
     t = 80_000;
     await ui.refresh(3);
     expect(f.calls.filter(c => c.method === "mark")).toHaveLength(2);
-    await ui.beforeAction(3, { x: 1, y: 1, kind: "click" });
+    await ui.beforeAction(3, { x: 1, y: 1, kind: "click", sessionId: "s" });
     t = 80_000 + 89_000;
     await ui.refresh(3);
     expect(f.calls.filter(c => c.method === "mark")).toHaveLength(3);
@@ -178,7 +183,7 @@ describe("OverlayUi session end and races", () => {
     await ui2.markControlled(6, session);
     f2.navigate(); // the page navigated: overlay gone, next call must re-inject
     f2.s.inject = async () => { await ui2.unmark(6); };
-    await ui2.beforeAction(6, { x: 1, y: 1, kind: "click" });
+    await ui2.beforeAction(6, { x: 1, y: 1, kind: "click", sessionId: "s" });
     expect(f2.calls.filter(c => c.method === "action")).toHaveLength(0);
   });
 
