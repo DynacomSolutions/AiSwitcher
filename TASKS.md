@@ -392,11 +392,9 @@ ETA: 2026-11-25 18:00 ICT
 
 - Faster CI feedback: cache the host app Rust build, fit job timeouts to measured p99, fix flaky tests, then measure.
 
-ETA: 2026-11-23 20:00 ICT
-
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 280 | Cache the host app Rust build output | in_progress | claude | ci-speed | | 2026-11-23 20:00 ICT | `native` p50 16.2 min Linux, 12.6 min macOS.<br>Cause: the target dir was not the cached path. |
-| 281 | Fit every job timeout to its p99 | in_progress | claude | ci-speed | | 2026-11-23 20:00 ICT | |
-| 282 | Fix the flaky CI tests | in_progress | claude | ci-flaky | | 2026-11-23 20:00 ICT | affected.test.ts null diff in shallow checkouts.<br>Two 5 s timeouts on node spawn and backup lock. |
-| 283 | Measure before and after p50 and p90 | in_progress | claude | ci-speed | 19.280, 19.281 | 2026-11-23 20:00 ICT | |
+| 280 | Cache the host app Rust build output | done | claude | ci-speed | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/714.<br>Cause: Cargo built outside the cached target dir.<br>Warm: Linux 8.9, macOS 5.7 to 6.1, Windows build 4.4 to 4.6 min. |
+| 281 | Fit every job timeout to its p99 | done | claude | ci-speed | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/714.<br>Every job has a limit. apt calls can no longer hang. |
+| 282 | Fix the flaky CI tests | done | claude | ci-flaky | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/715.<br>affected.test.ts null diff in shallow checkouts.<br>Two 5 s timeouts on node spawn and backup lock. |
+| 283 | Measure before and after p50 and p90 | done | claude | ci-speed | 19.280, 19.281 | | Before p50/p90: Linux 16.2/19.1, macOS 12.6/14.7, Windows build 8.0/9.5 min.<br>After, 2 warm runs: Linux 8.9/8.9, macOS 5.9/6.1, Windows build 4.5/4.6 min. |
