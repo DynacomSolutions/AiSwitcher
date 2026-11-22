@@ -4,7 +4,7 @@ import type { BrowserBinding } from "../../src/browser/types.ts";
 import { createGatewayApp } from "../../src/gateway/app.ts";
 import { BrowserHub, type HubSocket } from "../../src/gateway/browser/hub.ts";
 import { browserPoolMembersAcross, browserPoolMemberNames } from "../../src/gateway/serve.ts";
-import { allowedBindings } from "../../src/gateway/browser/routing.ts";
+import { allowedBindings, createBrowserCaller } from "../../src/gateway/browser/routing.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { generateToken, hashSecret, parseToken } from "../../src/gateway/tokens.ts";
 
@@ -273,5 +273,48 @@ describe("POST /browser/call", () => {
     await connect(b("p", { kind: "pool", pool: "main" }));
     expect((await call({ session, tool: "screenshot", browser: "p" }, tokB)).status).toBe(403);
     expect(await (await call({ session, tool: "screenshot" }, tokB)).json()).toMatchObject({ ok: false, error: "no_browser" });
+  });
+});
+
+describe("chat scope", () => {
+  const seen: Array<{ session: Record<string, unknown>; args: Record<string, unknown> }> = [];
+  const hub = {
+    connected: () => [b("w", { kind: "identity", identity: "id1" })],
+    call: async (_n: string, req: { id: string; session: Record<string, unknown>; args: Record<string, unknown> }) => { seen.push(req); return { id: req.id, ok: true as const, content: [{ type: "text" as const, text: "ok" }] }; },
+    abort: () => {}, revoke: () => {}, extensionVersion: () => undefined,
+  };
+  const caller = createBrowserCaller({ store: new MemoryGatewayStore(), now: () => new Date(), hub } as never);
+  const body = (id: string, tool: string, args: Record<string, unknown>) => ({ session: { id, identity: "x", label: "L" }, tool, args });
+
+  test("two chat principals may both hold the same tab", async () => {
+    seen.length = 0;
+    const a = await caller("id1", body("chat:a", "read_page", { tabId: 7 }), undefined, { binding: "w", color: "red", linked: new Set([7]) });
+    const c = await caller("id1", body("chat:c", "read_page", { tabId: 7 }), undefined, { binding: "w", color: "blue", linked: new Set([7, 8]) });
+    expect(a.body).toMatchObject({ ok: true });
+    expect(c.body).toMatchObject({ ok: true });
+    expect(seen.map((s) => s.session.color)).toEqual(["red", "blue"]);
+  });
+
+  test("a scope on a binding that is not connected is no_browser, and a bad tabId is forbidden_tab", async () => {
+    seen.length = 0;
+    expect((await caller("id1", body("chat:a", "tabs_context", {}), undefined, { binding: "gone", color: "red", linked: new Set() })).body).toMatchObject({ ok: false, error: "no_browser" });
+    for (const tabId of [9, "7", null, 7.5]) {
+      expect((await caller("id1", body("chat:a", "read_page", { tabId }), undefined, { binding: "w", color: "red", linked: new Set([7]) })).body).toMatchObject({ ok: false, error: "forbidden_tab" });
+    }
+    expect((await caller("id1", body("chat:a", "tabs_create", { groupId: 3 }), undefined, { binding: "w", color: "red", linked: new Set([7]) })).body).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(seen).toHaveLength(0);
+  });
+
+  test("list_browsers under a scope shows only the scoped binding", async () => {
+    const out = await caller("id1", body("chat:a", "list_browsers", {}), undefined, { binding: "w", color: "red", linked: new Set() });
+    expect(JSON.stringify(out.body)).toContain('\\"name\\":\\"w\\"');
+  });
+
+  test("an external exclusive group is unaffected: no colour, no chat flag, the identity as before", async () => {
+    seen.length = 0;
+    const out = await caller("id1", body("s1", "read_page", { tabId: 9 }));
+    expect(out.body).toMatchObject({ ok: true });
+    expect(seen[0]?.session).toEqual({ id: "s1", identity: "id1", label: "L" });
+    expect((await caller("id1", body("chat:s1", "read_page", { tabId: 9 }))).status).toBe(400);
   });
 });

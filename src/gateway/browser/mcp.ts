@@ -3,7 +3,10 @@ import { Hono } from "hono";
 import { BROWSER_TOOLS, SESSION_END_TOOL } from "../../browser/protocol.ts";
 import { BROWSER_INSTRUCTIONS, LATEST_VERSION, SUPPORTED_VERSIONS, errorResult, mapCallResult, type McpContent } from "../../browser/mcp-core.ts";
 import { mcpTools } from "../../browser/tool-schemas.ts";
-import { agentFromRequest, createBrowserCaller, type CallDeps } from "./routing.ts";
+import { sessionIdForChat } from "../../browser/chat-protocol.ts";
+import { CHAT_TOKEN_HEAD } from "../chat/token.ts";
+import type { ChatPrincipal } from "./chat-auth.ts";
+import { agentFromRequest, createBrowserCaller, usesReservedSessionId, type CallDeps, type CallScope } from "./routing.ts";
 
 /**
  * The shared AIS Browser MCP server: MCP Streamable HTTP with JSON replies, served by the gateway at `/browser/mcp`.
@@ -84,6 +87,11 @@ export function cancelKey(identity: string, sessionId: string, requestId: string
   return createHash("sha256").update(JSON.stringify([identity, sessionId, requestId])).digest("hex");
 }
 
+/** Who is calling: an agent token, or a chat token with its principal. Undefined when the token is not valid. */
+type Caller = { identity: string; chat?: ChatPrincipal };
+
+const RESERVED = "reserved session id prefix";
+
 function methodLabel(m: RpcMessage): string {
   if (typeof m.method !== "string") return "other";
   if (m.id === undefined || m.id === null) return "notification";
@@ -99,26 +107,37 @@ export function createMcpRoutes(deps: CallDeps): Hono {
   const inflight = new Map<string, AbortController>();
   deps.hub.onCancel?.((key) => inflight.get(key)?.abort());
 
+  /** Resolves the bearer token. A chat token never falls back to the agent token path. */
+  async function callerFromRequest(req: Request): Promise<Caller | undefined> {
+    const m = /^Bearer (.+)$/i.exec(req.headers.get("authorization") ?? "");
+    const raw = m?.[1]?.trim();
+    if (raw?.startsWith(CHAT_TOKEN_HEAD)) {
+      const principal = await deps.chat?.principal(raw).catch(() => undefined);
+      return principal ? { identity: principal.identity, chat: principal } : undefined;
+    }
+    return agentFromRequest(deps, req);
+  }
+
   /** The pool named in `X-AIS-Pool` must list the token's identity as a live member, as for `/browser/call` bindings. */
   async function poolAllows(pool: string | undefined, identity: string): Promise<boolean> {
     if (!pool) return true;
     return ((await deps.browserPoolMembers?.(pool)) ?? []).includes(identity);
   }
 
-  async function toolCall(identity: string, h: McpHeaders, sessionId: string | undefined, p: Record<string, unknown>, signal: AbortSignal): Promise<{ isError?: true; content: McpContent[] }> {
+  async function toolCall(identity: string, h: McpHeaders, sessionId: string | undefined, p: Record<string, unknown>, signal: AbortSignal, scope?: CallScope): Promise<{ isError?: true; content: McpContent[] }> {
     const name = String(p.name ?? "");
     if (!(BROWSER_TOOLS as readonly string[]).includes(name)) return errorResult(`bad_args: unknown tool ${name}`);
     if (!sessionId) return errorResult("bad_args: no session id. Send the X-AIS-Session-Id header or the Mcp-Session-Id header.");
     if (!(await poolAllows(h.pool, identity))) return errorResult(`forbidden: this token is not a member of pool ${h.pool}. The launch uses the token it started with: if the member was removed, retired or got a new token, restart the session to pick up the new token.`);
     const { browser, ...args } = (typeof p.arguments === "object" && p.arguments !== null && !Array.isArray(p.arguments) ? p.arguments : {}) as Record<string, unknown>;
     if (name === "upload_file" && args.paths !== undefined) return errorResult(uploadPathsError(sessionId, { ...args, ...(typeof browser === "string" ? { browser } : {}) }, h.label));
-    const out = await caller(identity, { ...(typeof browser === "string" ? { browser } : {}), session: { id: sessionId, identity, label: h.label }, tool: name, args }, signal);
+    const out = await caller(identity, { ...(typeof browser === "string" ? { browser } : {}), session: { id: sessionId, identity, label: h.label }, tool: name, args }, signal, scope);
     if ("error" in out.body && !("ok" in out.body)) return errorResult(`${out.status === 400 ? "bad_args" : out.status === 403 ? "forbidden" : "internal"}: ${out.body.error}`);
     return mapCallResult(out.body as Parameters<typeof mapCallResult>[0]);
   }
 
   /** Handles one JSON-RPC message; undefined for notifications. `outcome` is set for the metric. */
-  async function rpc(msg: RpcMessage, identity: string, h: McpHeaders, sessionId: string | undefined, signal: AbortSignal): Promise<{ reply?: object; outcome: string }> {
+  async function rpc(msg: RpcMessage, identity: string, h: McpHeaders, sessionId: string | undefined, signal: AbortSignal, scope?: CallScope): Promise<{ reply?: object; outcome: string }> {
     const reply = (result: unknown): object => ({ jsonrpc: "2.0", id: msg.id ?? null, result });
     if (msg.method === "notifications/cancelled") {
       const rid = msg.params?.requestId;
@@ -144,7 +163,7 @@ export function createMcpRoutes(deps: CallDeps): Hono {
         const key = sessionId ? cancelKey(identity, sessionId, msg.id) : undefined;
         if (key) inflight.set(key, ac);
         try {
-          const result = await toolCall(identity, h, sessionId, msg.params ?? {}, AbortSignal.any([signal, ac.signal]));
+          const result = await toolCall(identity, h, sessionId, msg.params ?? {}, AbortSignal.any([signal, ac.signal]), scope);
           return { outcome: result.isError ? "tool_error" : "ok", reply: reply(result) };
         } finally {
           if (key && inflight.get(key) === ac) inflight.delete(key);
@@ -162,17 +181,25 @@ export function createMcpRoutes(deps: CallDeps): Hono {
 
   hono.post("/mcp", async (c) => {
     const req = c.req.raw;
-    const a = await agentFromRequest(deps, req);
+    const a = await callerFromRequest(req);
     if (!a) {
       count("other", "unauthorised");
       return json(401, { error: UNAUTHORISED }, { "www-authenticate": "Bearer" });
     }
-    const parsedHeaders = parseMcpHeaders((n) => req.headers.get(n));
+    // A chat token fixes the session id and label. Its headers are ignored.
+    const parsedHeaders: ParsedMcpHeaders = a.chat
+      ? { ok: true, value: { sessionId: sessionIdForChat(a.chat.chatId), fromMcpSession: false, label: a.chat.label } }
+      : parseMcpHeaders((n) => req.headers.get(n));
     if (!parsedHeaders.ok) {
       count("other", "bad_request");
       return json(400, { error: parsedHeaders.error });
     }
     const h = parsedHeaders.value;
+    if (!a.chat && h.sessionId !== undefined && usesReservedSessionId(h.sessionId)) {
+      count("other", "bad_request");
+      return json(400, { error: RESERVED });
+    }
+    const scope: CallScope | undefined = a.chat ? { binding: a.chat.binding, color: a.chat.color, linked: a.chat.linked } : undefined;
     // Refuse on the declared length before reading, then count bytes (not characters) of what was read.
     const declared = Number(req.headers.get("content-length"));
     const text = declared > MAX_BODY_BYTES ? undefined : await req.text();
@@ -197,7 +224,7 @@ export function createMcpRoutes(deps: CallDeps): Hono {
     const sessionId = h.sessionId ?? issued;
     const replies: object[] = [];
     await Promise.all((messages as RpcMessage[]).map(async (msg) => {
-      const out = await rpc(msg, a.identity, h, sessionId, req.signal).catch((e: unknown) => ({ outcome: "error", reply: { jsonrpc: "2.0", id: msg.id ?? null, error: { code: -32603, message: e instanceof Error ? e.message : String(e) } } }));
+      const out = await rpc(msg, a.identity, h, sessionId, req.signal, scope).catch((e: unknown) => ({ outcome: "error", reply: { jsonrpc: "2.0", id: msg.id ?? null, error: { code: -32603, message: e instanceof Error ? e.message : String(e) } } }));
       count(methodLabel(msg), out.outcome);
       if (out.reply) replies.push(out.reply);
     }));
@@ -209,10 +236,15 @@ export function createMcpRoutes(deps: CallDeps): Hono {
 
   hono.delete("/mcp", async (c) => {
     const req = c.req.raw;
-    const a = await agentFromRequest(deps, req);
+    const a = await callerFromRequest(req);
     if (!a) {
       count("delete", "unauthorised");
       return json(401, { error: UNAUTHORISED }, { "www-authenticate": "Bearer" });
+    }
+    // The tabs of a chat end on `chat.close`, so a chat token has nothing to end here.
+    if (a.chat) {
+      count("delete", "ok");
+      return new Response(null, { status: 204 });
     }
     const parsedHeaders = parseMcpHeaders((n) => req.headers.get(n));
     if (!parsedHeaders.ok || !parsedHeaders.value.sessionId) {
@@ -220,6 +252,10 @@ export function createMcpRoutes(deps: CallDeps): Hono {
       return json(400, { error: parsedHeaders.ok ? "no session id: send X-AIS-Session-Id or Mcp-Session-Id" : parsedHeaders.error });
     }
     const h = parsedHeaders.value;
+    if (usesReservedSessionId(h.sessionId ?? "")) {
+      count("delete", "bad_request");
+      return json(400, { error: RESERVED });
+    }
     if (!(await poolAllows(h.pool, a.identity))) {
       count("delete", "forbidden");
       return json(403, { error: "not a member of that pool. Restart the session to pick up the new token." });

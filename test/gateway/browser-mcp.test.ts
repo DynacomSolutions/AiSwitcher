@@ -379,3 +379,92 @@ describe("uploadPathsError", () => {
     expect(uploadPathsError("s1", { paths: 5 })).toContain("--tab <tabId> (--ref <ref> | --coordinate <x,y>)");
   });
 });
+
+describe("chat token", () => {
+  const CHAT_TOKEN = "aisc1.fake.fake";
+  let linked: Set<number>;
+  let live: boolean;
+  let chatApp: ReturnType<typeof createGatewayApp>;
+  type Sent = { t: string; req?: { id: string; tool: string; args: Record<string, unknown>; session: { id: string; identity: string; label: string; color?: string; chat?: boolean } } };
+
+  const chatCall = (name: string, args: unknown, headers: Record<string, string> = {}) =>
+    chatApp.request("http://gw.test/browser/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${CHAT_TOKEN}`, ...headers },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+    });
+  const chatRpc = (body: unknown, headers: Record<string, string> = {}, method = "POST") =>
+    chatApp.request("http://gw.test/browser/mcp", { method, headers: { "content-type": "application/json", authorization: `Bearer ${CHAT_TOKEN}`, ...headers }, ...(method === "POST" ? { body: JSON.stringify(body) } : {}) });
+  const calls = (ws: Ws): Sent[] => (ws.sent as Sent[]).filter((m) => m.t === "call");
+  const text = async (res: Response): Promise<string> => JSON.stringify(await res.json());
+
+  beforeEach(() => {
+    linked = new Set([5]);
+    live = true;
+    const chat = { principal: async (t: string) => (live && t === CHAT_TOKEN ? { chatId: "c1", binding: "mine", identity: "id1", label: "Chat one", color: "blue", linked } : undefined) };
+    chatApp = createGatewayApp({ store, now: () => new Date(), browserPoolMembers: async (p: string) => members[p], metrics, browserHub: hub, chat } as never);
+  });
+
+  test("a chat token reaches only its own binding", async () => {
+    const mine = await connect(binding("mine", { kind: "identity", identity: "nobody" }));
+    const other = await connect(binding("other", { kind: "identity", identity: "id1" }));
+    const stop = answerAll(mine);
+    const res = await chatCall("read_page", { tabId: 5 });
+    stop();
+    expect(await text(res)).toContain("done");
+    expect(calls(other)).toHaveLength(0);
+  });
+
+  test("a chat token cannot pick another browser through the browser argument", async () => {
+    const mine = await connect(binding("mine", { kind: "identity", identity: "id1" }));
+    const other = await connect(binding("other", { kind: "identity", identity: "id1" }));
+    const stop = answerAll(mine);
+    await chatCall("read_page", { tabId: 5, browser: "other" });
+    stop();
+    expect(calls(other)).toHaveLength(0);
+  });
+
+  test("a chat tools/call on an unlinked tab returns forbidden_tab and the hub is not called", async () => {
+    const mine = await connect(binding("mine", { kind: "identity", identity: "id1" }));
+    const res = await chatCall("click", { tabId: 6, ref: "ref_1" });
+    expect(await text(res)).toContain("Tab 6 is not linked to this chat");
+    expect(calls(mine)).toHaveLength(0);
+  });
+
+  test("the forwarded session has chat true, the chat colour and the id chat:<id>", async () => {
+    const mine = await connect(binding("mine", { kind: "identity", identity: "id1" }));
+    const stop = answerAll(mine);
+    let seen: Sent | undefined;
+    const orig = mine.send.bind(mine);
+    mine.send = (d: string) => { const m = JSON.parse(d) as Sent; if (m.t === "call") seen = m; orig(d); };
+    await chatCall("tabs_context", {}, { "X-AIS-Session-Id": "evil", "X-AIS-Pool": "main" });
+    stop();
+    expect(seen?.req?.session).toMatchObject({ id: "chat:c1", identity: "id1", label: "Chat one", color: "blue", chat: true });
+  });
+
+  test("DELETE with a chat token is 204 and sends no session_end", async () => {
+    const mine = await connect(binding("mine", { kind: "identity", identity: "id1" }));
+    const res = await chatRpc({}, { "X-AIS-Session-Id": "x" }, "DELETE");
+    expect(res.status).toBe(204);
+    expect(calls(mine)).toHaveLength(0);
+  });
+
+  test("an agent token using session id chat:x gets 400", async () => {
+    const mine = await connect(binding("w", { kind: "identity", identity: "id1" }));
+    const res = await call("tabs_context", {}, { "X-AIS-Session-Id": "chat:x" });
+    expect(res.status).toBe(400);
+    expect(await text(res)).toContain("reserved session id prefix");
+    expect(calls(mine)).toHaveLength(0);
+    expect((await rpc({}, { "X-AIS-Session-Id": "chat:x" }, token, "DELETE")).status).toBe(400);
+  });
+
+  test("a closed chat's token gets 401", async () => {
+    live = false;
+    expect((await chatCall("tabs_context", {})).status).toBe(401);
+    expect((await chatRpc({}, {}, "DELETE")).status).toBe(401);
+  });
+
+  test("a chat token is 401 when the gateway has no chat auth", async () => {
+    expect((await rpc({ jsonrpc: "2.0", id: 1, method: "ping" }, {}, CHAT_TOKEN)).status).toBe(401);
+  });
+});
