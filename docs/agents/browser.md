@@ -156,6 +156,38 @@ Known limit: the headless Chromium used in CI cannot reproduce headful backgroun
 
 `ais_gateway_browsers_connected`, `ais_gateway_browser_sessions_active`, `ais_gateway_browser_calls_total`, `ais_gateway_browser_call_seconds` (histogram: `_bucket`, `_count`, `_sum`), `ais_gateway_browser_pairings_total`, `ais_gateway_browser_mcp_requests_total` (`method`, `outcome`).
 
+## Side-panel chat
+
+The side panel can run chats with an agent. The agent runs as an `AgentSession` pod. The gateway talks to it over ACP and gives it the browser tools of the tabs the user linked to the chat. The code lives in `src/gateway/chat/` (broker, store, bus, pod transport, frames, catalogue). The frame types are in `src/browser/chat-protocol.ts`, shared with the extension.
+
+Chat is off unless `AIS_GATEWAY_CHAT_GROUP` and `AIS_GATEWAY_CHAT_MCP_URL` are set (see "Side-panel chat" in `docs/agents/gateway.md`). With chat off, every chat frame gets `chat.reject` with code `unavailable`.
+
+A chat belongs to one browser binding. Another binding cannot read it, prompt it or take its id. The extension socket carries these frames:
+
+| Frame | Direction | Meaning |
+| --- | --- | --- |
+| `chat.list` | gateway to extension | The chats of the binding. Sent after the welcome. The extension then sends `chat.resume` for each chat. |
+| `chat.list` | extension to gateway | Ask for the chats of the binding, or of one window. |
+| `chat.create` | extension to gateway | New chat. The gateway answers `chat.state` with state `starting`. No pod runs until the first prompt. |
+| `chat.prompt`, `chat.cancel`, `chat.permission`, `chat.link`, `chat.config`, `chat.rename`, `chat.close` | extension to gateway | Commands for one chat. A command for a chat of another binding gets `chat.reject` with `bad_request`. A permission answer with an unknown request id is ignored. |
+| `chat.resume` (`afterSeq`) | extension to gateway | Replay the events after `afterSeq` in order, then the current state. Live events follow. An unknown chat gets `expired`. |
+| `chat.event` | gateway to extension | One feed item with its number (`seq`). The panel drops a number it has. |
+| `chat.state` | gateway to extension | The state and summary of a chat. Sent when the state, name, tabs or selection change. |
+| `chat.catalog` | both | The picker list: providers, identities and pools, models. A list that cannot be read gives `chat.reject` with the `reqId`. |
+| `chat.reject` | gateway to extension | A refused or failed command, with a code and fixed copy. |
+
+A frame over the size caps (65 536 characters of text, 32 tabs, 80 characters of name) or with a bad shape is dropped. The socket stays open.
+
+Caps. A window holds at most 6 open chats (`window_cap`). The gateway holds at most `AIS_GATEWAY_CHAT_MAX` open chats (default 12). Over it, the panel gets `chat.reject` with code `limit` and the text "Too many chats are open. Close one, then try again."
+
+Catalogue. The identities and pools come from the `agent-runtime-config` ConfigMap (`providers.<provider>.identities`). The models come from the gateway app of the identity (`identityApps[<identity>]`, else `app`), as the union over a pool or the list of a pin. An identity that is a known browser pool has kind `pool`. A model list that fails gives an empty list and the text "Models are unavailable. The agent's default will be used." The catalogue reads the ConfigMap at most once in 30 seconds. A good model list is kept 5 minutes and a failed one 30 seconds. `chat.create` refuses an identity that the ConfigMap does not list, and a model outside a non-empty list (`bad_request`); `chat.config` refuses such a model too. The store enforces the gateway-wide cap in the same step as the insert, so replicas cannot overshoot it. Chat frames get `unavailable` until the chat bus is listening; the gateway retries that start in the background. Efforts are known only after the pod starts: the first `config` item of the feed lists them.
+
+Rollouts. A chat resumes after a rollout. It does not reattach. On SIGTERM the replica refuses new prompts, ends open permission asks as cancelled, lets turns in flight finish, then ends each pod and frees each lease. The extension sockets close with code 1012 and reconnect. The next prompt, on any replica, starts a new pod and sends ACP `session/load`. If the agent cannot load the session, the feed says that the chat restarted. No timer ends a turn in flight: the pod grace period is the only limit.
+
+Replicas. A chat has one owner replica at a time (a database lease). Events go through the database. A notice on the bus tells every replica, and the replica that holds the socket of the chat's binding sends the frame. Commands for a chat that another replica owns travel over the bus to it.
+
+Metrics: `ais_gateway_chat_sessions_total` (`event`), `ais_gateway_chat_turns_total` (`outcome`), `ais_gateway_chat_errors_total` (`kind`), `ais_gateway_chat_pod_start_seconds` (histogram) and `ais_gateway_chats_active` (agents running on this replica).
+
 ## Release
 
 `.github/workflows/release.yml` builds the extension (`bun run build` in `apps/chrome-extension`, `dist/` zipped with `manifest.json` at the root) and uploads `ais-browser-extension.zip` with the other assets. CI builds and tests it when the extension or `src/browser/` changes.

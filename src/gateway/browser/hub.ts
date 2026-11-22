@@ -1,4 +1,5 @@
 import { BROWSER_ERROR_CODES, MAX_ERROR_MESSAGE, SESSION_END_TOOL, type BrowserErrorCode, type BrowserTool, type CallRequest, type CallResult, type ExtToGateway, type GatewayToExt } from "../../browser/protocol.ts";
+import { parseChatFromExt, type ChatFromExt, type ChatToExt } from "../../browser/chat-protocol.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import { noopMetrics, type GatewayMetrics } from "../metrics.ts";
 
@@ -62,6 +63,13 @@ export interface HubOptions {
   now?: () => number;
   /** Called after a binding attaches or detaches, or its paused state changes (cluster presence hook). */
   onChange?: () => void;
+  /**
+   * A valid chat frame from the bound extension. `reply` answers on the same socket. Without this option every chat frame
+   * gets a `chat.reject` with code `unavailable`. A frame that does not pass the parser (shape or size caps) is dropped.
+   */
+  onChat?(binding: BrowserBinding, msg: ChatFromExt, reply: (f: ChatToExt) => void): void | Promise<void>;
+  /** Called after a binding attached and got its `welcome`. The chat code sends the chat list from here. */
+  onAttach?(binding: BrowserBinding): void | Promise<void>;
 }
 
 /** A locally connected binding as shown to the cluster presence table. */
@@ -147,6 +155,7 @@ export class BrowserHub {
       conn.authenticating = false;
       this.attach(ws, binding);
       this.send(ws, { t: "welcome", binding: binding.name, target: binding.target });
+      this.guard(() => this.opts.onAttach?.(binding));
       return;
     }
     this.touch(conn);
@@ -166,7 +175,44 @@ export class BrowserHub {
         return;
       }
       default:
+        if (typeof msg.t === "string" && msg.t.startsWith("chat.")) this.chatFrame(ws, conn.binding, msg);
         return;
+    }
+  }
+
+  /** Runs a chat callback. A throw or a rejection never reaches the socket loop. */
+  private guard(fn: () => void | Promise<void>): void {
+    try {
+      Promise.resolve(fn()).catch(() => undefined);
+    } catch {
+      // chat is best effort here
+    }
+  }
+
+  private chatFrame(ws: HubSocket, binding: BrowserBinding, raw: unknown): void {
+    const frame = parseChatFromExt(raw);
+    // A frame over the caps or with a bad shape is dropped. The socket stays open.
+    if (!frame) return;
+    const reply = (f: ChatToExt): void => this.send(ws, f);
+    if (!this.opts.onChat) {
+      const r: Extract<ChatToExt, { t: "chat.reject" }> = { t: "chat.reject", code: "unavailable", message: "Chat is not available on this gateway." };
+      if ("chatId" in frame) r.chatId = frame.chatId;
+      if (frame.t === "chat.catalog") r.reqId = frame.reqId;
+      reply(r);
+      return;
+    }
+    this.guard(() => this.opts.onChat?.(binding, frame, reply));
+  }
+
+  /** Sends a message to the live local socket of a binding. False when this replica holds no such socket or the send failed. */
+  sendTo(binding: string, msg: GatewayToExt): boolean {
+    const conn = this.byBinding.get(binding);
+    if (!conn) return false;
+    try {
+      // Bun returns 0 for a dropped message and -1 for one queued behind backpressure, which is still delivered.
+      return conn.ws.send(JSON.stringify(msg)) !== 0;
+    } catch {
+      return false;
     }
   }
 

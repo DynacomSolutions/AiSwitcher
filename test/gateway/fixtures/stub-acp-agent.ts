@@ -1,5 +1,5 @@
 // A stand-in ACP agent for tests. It speaks JSON lines on stdio.
-// Environment: STUB_ACP_STATE (file that stores session ids), STUB_ACP_LOAD ("0" turns loadSession off).
+// Environment: STUB_ACP_STATE (file that stores session ids), STUB_ACP_LOAD ("0" turns loadSession off), STUB_ACP_HTTP ("0" turns HTTP MCP off), STUB_ACP_NEW_ERROR ("1" makes session/new fail), STUB_ACP_NEW_HANG ("1" never answers session/new).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createLineReader } from "../../../src/gateway/chat/acp.ts";
 
@@ -37,6 +37,33 @@ async function runPrompt(id: string | number, sessionId: string, text: string) {
     update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "tc1", status: "completed", content: [{ type: "content", content: { type: "text", text: "file body" } }] });
     return done();
   }
+  if (text === "big") {
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: "tc3", title: "Big", status: "pending" });
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "tc3", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(1_000_000) } }] });
+    return done();
+  }
+  if (text === "image") {
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: "tc4", title: "Shot", status: "pending" });
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "tc4", status: "completed", content: [{ type: "content", content: { type: "image", data: "AAAAIMAGEDATA", mimeType: "image/png" } }, { type: "content", content: { type: "text", text: "caption" } }] });
+    return done();
+  }
+  if (text === "limit") return send({ jsonrpc: "2.0", id, error: { code: -32000, message: "Rate limit reached. Resets at 2023-11-15T00:00:00Z" } });
+  if (text === "hang") return;
+  if (text === "lateask") {
+    done();
+    const rpcId = `perm-${nextOut++}`;
+    send({ jsonrpc: "2.0", id: rpcId, method: "session/request_permission", params: { sessionId, toolCall: { toolCallId: "tc9", title: "Late" }, options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }] } });
+    return;
+  }
+  if (text === "longask") {
+    const long = "o".repeat(300);
+    const rpcId = `perm-${nextOut++}`;
+    const answer = new Promise<any>((resolve) => replies.set(rpcId, resolve));
+    send({ jsonrpc: "2.0", id: rpcId, method: "session/request_permission", params: { sessionId, toolCall: { toolCallId: "tc8", title: "Long" }, options: [{ optionId: long, name: "n".repeat(300), kind: "allow_once" }] } });
+    const r = await answer;
+    chunk(sessionId, r?.outcome?.outcome === "selected" ? `chose:${r.outcome.optionId}` : "cancelled");
+    return done();
+  }
   if (text === "ask") {
     const rpcId = `perm-${nextOut++}`;
     const answer = new Promise<any>((resolve) => replies.set(rpcId, resolve));
@@ -54,6 +81,23 @@ async function runPrompt(id: string | number, sessionId: string, text: string) {
   if (text === "exit") {
     process.stderr.write("stub exiting\n");
     process.exit(3);
+  }
+  if (text.startsWith("wait:")) {
+    await new Promise((r) => setTimeout(r, Number(text.slice(5)) || 0));
+    chunk(sessionId, "waited");
+    return done();
+  }
+  if (text === "mcp-tabs") {
+    const server = (mcpByS.get(sessionId) ?? [])[0];
+    if (!server) {
+      chunk(sessionId, "no mcp server");
+      return done();
+    }
+    const headers: Record<string, string> = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+    for (const h of server.headers ?? []) headers[h.name] = h.value;
+    const res = await fetch(server.url, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "tabs_context", arguments: {} } }) });
+    chunk(sessionId, `tabs:${res.status}:${await res.text()}`);
+    return done();
   }
   if (text === "mcp") {
     const server = (mcpByS.get(sessionId) ?? [])[0];
@@ -88,8 +132,10 @@ function handle(m: any): void {
   const reply = (result: unknown) => send({ jsonrpc: "2.0", id: m.id, result });
   switch (m.method) {
     case "initialize":
-      return reply({ protocolVersion: 1, agentCapabilities: { mcpCapabilities: { http: true }, loadSession: process.env.STUB_ACP_LOAD !== "0" } });
+      return reply({ protocolVersion: 1, agentCapabilities: { mcpCapabilities: { http: process.env.STUB_ACP_HTTP !== "0" }, loadSession: process.env.STUB_ACP_LOAD !== "0" } });
     case "session/new": {
+      if (process.env.STUB_ACP_NEW_HANG === "1") return;
+      if (process.env.STUB_ACP_NEW_ERROR === "1") return send({ jsonrpc: "2.0", id: m.id, error: { code: -32000, message: "no session for you" } });
       const sessionId = `stub-${crypto.randomUUID().slice(0, 8)}`;
       if (statePath) appendFileSync(statePath, `${sessionId}\n`);
       mcpByS.set(sessionId, m.params?.mcpServers ?? []);

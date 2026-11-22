@@ -248,6 +248,10 @@ src/
                              the gateway: src/gateway/browser/mcp.ts (`POST|DELETE /browser/mcp`),
                              call path in gateway/browser/routing.ts; shared parts in
                              src/browser/mcp-core.ts, header builder in src/browser/mcp-launch.ts. No launcher wiring: the server entry comes from the .ais plugin.
+                             Side-panel chat: src/gateway/chat/ (broker.ts turns and leases, store.ts and
+                             pg-chat-store.ts, bus.ts, pod-transport.ts and kube-http.ts for the AgentSession
+                             pods, acp.ts, frames.ts extension frames, catalog.ts picker list, token.ts per-chat
+                             MCP token), frame types in src/browser/chat-protocol.ts, wiring in src/gateway/serve.ts.
                              Feature guide: docs/agents/browser.md
     version.ts               `ais version` (reads package.json)
     help.ts                   `ais help` / bare `ais` / `--help`/`-h`

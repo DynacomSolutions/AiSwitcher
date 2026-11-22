@@ -14,6 +14,8 @@ export interface ChatRecord {
   canLoad?: boolean;
   ownerReplica?: string;
   leaseUntil?: number;
+  /** Set by the store on read: the lease is live by the store's own clock. Never compare leaseUntil with another clock. */
+  leaseLive?: boolean;
   /** Grows by one on each acquireLease. A stale owner holds an old epoch. */
   epoch: number;
   lastSeq: number;
@@ -59,9 +61,9 @@ export interface ChatOwner { replica: string; ttlMs: number }
  * The memory store judges expiry with its own clock (default Date.now) and ignores nowMs, in the same way.
  */
 export interface ChatStore {
-  /** Atomic count of the open chats of (binding, windowId). Returns "cap" when the window is full. Throws ChatExistsError on a used id, even when the window is full.
+  /** Atomic count of the open chats of (binding, windowId). Returns "cap" when the window is full, and "global" when `globalCap` open chats exist over all bindings (the check and the insert are one atomic step). Throws ChatExistsError on a used id, even when the window is full.
    * With owner, the same step sets the owner, the lease and epoch 1, so the caller has the fence ({ replica, epoch: record.epoch }) at once. */
-  create(rec: ChatCreate, cap: number, owner?: ChatOwner): Promise<ChatRecord | "cap">;
+  create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number): Promise<ChatRecord | "cap" | "global">;
   get(id: string): Promise<ChatRecord | undefined>;
   listByBinding(binding: string, opts?: { windowId?: number; includeClosed?: boolean }): Promise<ChatRecord[]>;
   /** Throws ChatLeaseLostError when the fence is stale or expired, ChatClosedError on a move from closed to an open state. Returns undefined for an unknown chat. */
@@ -72,6 +74,8 @@ export interface ChatStore {
    */
   appendEvent(id: string, body: ChatBody, fence?: LeaseFence): Promise<number>;
   events(id: string, afterSeq: number, limit: number): Promise<ChatEventRow[]>;
+  /** True when the chat has a turn_end event with a number above afterSeq. No row cap. */
+  hasTurnEnd(id: string, afterSeq: number): Promise<boolean>;
   /** Returns the new epoch when the lease was free, already owned by this replica, or expired. Returns undefined otherwise. */
   acquireLease(id: string, replica: string, ttlMs: number, nowMs: number): Promise<number | undefined>;
   /** Throws ChatLeaseLostError when the fence is stale or the lease has expired. */
@@ -81,6 +85,8 @@ export interface ChatStore {
   ownedBy(replica: string): Promise<ChatRecord[]>;
   /** Deletes chats closed before the cut-off, with their events, in batches of 500. Returns the number of chats removed. */
   pruneClosed(beforeMs: number): Promise<number>;
+  /** Number of chats that are not closed, over all bindings. The gateway-wide cap reads it. */
+  countOpen(): Promise<number>;
   /** Deletes open chats without a live lease whose updatedAt is before the cut-off, with their events, in batches of 500. Returns the number removed. */
   pruneIdle(cutMs: number): Promise<number>;
 }

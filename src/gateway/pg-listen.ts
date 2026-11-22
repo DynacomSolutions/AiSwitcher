@@ -20,6 +20,8 @@ export type OpenListenConn = (onNotify: (channel: string, payload: string) => vo
 /** What components use: subscribe to a channel and get back an unsubscribe function. */
 export interface PgListener {
   listen(channel: string, onPayload: (payload: string) => void): Promise<() => Promise<void>>;
+  /** Runs after the connection came back and every channel is listened on again. Returns a function that removes the handler. */
+  onReconnect?(h: () => void): () => void;
 }
 
 type Subscriber = (payload: string) => void;
@@ -29,10 +31,17 @@ export class SharedListener implements PgListener {
   private opening: Promise<ListenConn> | undefined;
   private generation = 0;
   private closed = false;
+  private everConnected = false;
+  private readonly reconnectHandlers = new Set<() => void>();
   private retry: ReturnType<typeof setTimeout> | undefined;
   private readonly subs = new Map<string, Set<Subscriber>>();
 
   constructor(private readonly open: OpenListenConn, private readonly warn: (message: string) => void = (m) => console.warn(`gateway listener: ${m}`), private readonly retryMs = 2_000) {}
+
+  onReconnect(h: () => void): () => void {
+    this.reconnectHandlers.add(h);
+    return () => void this.reconnectHandlers.delete(h);
+  }
 
   /** Number of channels with at least one subscriber (tests and metrics). */
   get channels(): number {
@@ -91,6 +100,18 @@ export class SharedListener implements PgListener {
         throw new Error("listener closed");
       }
       this.conn = conn;
+      const again = this.everConnected;
+      this.everConnected = true;
+      // Notices sent while the connection was down are gone. Tell the components, so they read their state again.
+      if (again) {
+        for (const h of [...this.reconnectHandlers]) {
+          try {
+            h();
+          } catch (err) {
+            this.warn(`reconnect handler threw: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      }
       return conn;
     })().finally(() => {
       this.opening = undefined;

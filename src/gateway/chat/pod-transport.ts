@@ -1,7 +1,9 @@
 // Pod transport: create an AgentSession, wait for Running, attach to its stdio and send heartbeats.
 // Pod output and controller messages are untrusted. Raw controller text never leaves this file.
+import { randomUUID } from "node:crypto";
 import { redactText } from "../upstream-error.ts";
 import { createLineReader } from "./acp.ts";
+import { KubeHttpError } from "./kube-http.ts";
 import { buildChatSession, sessionName } from "./kube.ts";
 import type { AgentRuntimeConfig, KubeApi, KubeConfigEnv, KubeSession, KubeSocket, PodHandle, PodPhaseNotice, PodSpecInput, PodStream, PodTransport } from "./kube.ts";
 
@@ -37,6 +39,21 @@ const GENERIC_FAILURE = "The agent could not start.";
 
 /** A reason is a short code. Anything else is replaced, so odd text cannot pass through. */
 const reasonCode = (r: string | undefined): string => (r && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(r) ? r : "Unknown");
+
+export class CatalogError extends Error {
+  constructor() {
+    super("The agent runtime config is not valid JSON.");
+    this.name = "CatalogError";
+  }
+}
+
+const capBytes = (s: string, max: number): string => {
+  const b = new TextEncoder().encode(s);
+  if (b.length <= max) return s;
+  let i = max;
+  while (i > 0 && (b[i]! & 0xc0) === 0x80) i--;
+  return new TextDecoder().decode(b.subarray(0, i));
+};
 
 export class PodStartError extends Error {
   readonly code = "pod_start";
@@ -98,7 +115,7 @@ class SocketPodStream implements PodStream {
   }
 
   private emitStderr(text: string): void {
-    const safe = redactText(text, STDERR_LINE_MAX);
+    const safe = capBytes(redactText(text, STDERR_LINE_MAX), STDERR_LINE_MAX);
     if (safe === "") return;
     for (const cb of this.stderrCbs) cb(safe);
   }
@@ -166,7 +183,7 @@ export interface KubePodTransportDeps {
   maxLineBytes?: number;
 }
 
-interface Live { stop(): void }
+interface Live { name: string; cancelled: boolean; ac: AbortController; stream?: PodStream; stop(): void }
 
 export class KubePodTransport implements PodTransport {
   private readonly now: () => number;
@@ -192,12 +209,14 @@ export class KubePodTransport implements PodTransport {
     const data = await this.d.api.getConfigMap(this.d.env.configMap);
     const raw = data["config.json"];
     if (!raw) return {};
+    let v: unknown;
     try {
-      const v = JSON.parse(raw) as unknown;
-      return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as AgentRuntimeConfig) : {};
+      v = JSON.parse(raw);
     } catch {
-      return {};
+      throw new CatalogError();
     }
+    if (typeof v !== "object" || v === null || Array.isArray(v)) throw new CatalogError();
+    return v as AgentRuntimeConfig;
   }
 
   async stop(chatId: string): Promise<void> {
@@ -205,6 +224,11 @@ export class KubePodTransport implements PodTransport {
     const { group } = this.d.env;
     const sessions = await this.d.api.listSessions(`${group}/created-by=ais-gateway,${group}/chat-id=${chatId}`);
     await Promise.all(sessions.map((s) => this.d.api.deleteSession(s.metadata.name)));
+  }
+
+  async stopSession(session: string): Promise<void> {
+    for (const set of [...this.live.values()]) for (const l of [...set]) if (l.name === session) l.stop();
+    await this.d.api.deleteSession(session);
   }
 
   async start(input: PodSpecInput, signal: AbortSignal, onPhase: (n: PodPhaseNotice) => void): Promise<PodHandle> {
@@ -216,15 +240,36 @@ export class KubePodTransport implements PodTransport {
       return attached ? { [`${g}/client-seen`]: s, [`${g}/attached`]: s } : { [`${g}/client-seen`]: s };
     };
     const beat = this.heartbeat(name, notes);
-    const live = { stream: undefined as PodStream | undefined, stop: () => { beat.stop(); live.stream?.close(); } };
+    const startId = randomUUID();
+    const live: Live = { name, cancelled: false, ac: new AbortController(), stream: undefined, stop: () => { live.cancelled = true; live.ac.abort(); beat.stop(); live.stream?.close(); } };
+    const waitSignal = AbortSignal.any([signal, live.ac.signal]);
     const untrack = this.track(input.chatId, live);
     let streamed = false;
+    let created = false;
+    let createSent = false;
+    let conflict = false;
+    const check = () => {
+      if (live.cancelled) throw new Error("cancelled");
+    };
     try {
       if (signal.aborted) throw new Error("aborted");
-      await api.createSession(buildChatSession(input, env, Math.floor(this.now() / 1000)), signal);
+      createSent = true;
+      try {
+        await api.createSession(buildChatSession(input, env, Math.floor(this.now() / 1000), startId), signal);
+      } catch (e) {
+        if (e instanceof KubeHttpError && e.status === 409) conflict = true;
+        throw e;
+      }
+      created = true;
+      check();
       beat.begin();
-      const ready = await this.waitRunning(name, signal, onPhase);
-      const socket = await api.openAttach(ready.pod, signal);
+      const ready = await this.waitRunning(name, waitSignal, onPhase);
+      check();
+      const socket = await api.openAttach(ready.pod, waitSignal);
+      if (live.cancelled) {
+        socket.close();
+        check();
+      }
       const stream = new SocketPodStream(socket, this.d.maxLineBytes);
       streamed = true;
       live.stream = stream;
@@ -238,11 +283,21 @@ export class KubePodTransport implements PodTransport {
       if (!streamed) {
         beat.stop();
         untrack();
-        // The session may exist. A failed delete must not hide the first error.
-        await api.deleteSession(name).catch(() => undefined);
+        // Delete only a session that this call made. A failed delete must not hide the first error.
+        await this.cleanup(name, startId, created, createSent && !conflict).catch(() => undefined);
       }
-      throw e;
+      throw live.cancelled ? new Error("cancelled") : e;
     }
+  }
+
+  private async cleanup(name: string, startId: string, created: boolean, unknown: boolean): Promise<void> {
+    const { api } = this.d;
+    const { group } = this.d.env;
+    if (created) return api.deleteSession(name);
+    if (!unknown) return;
+    // The create may have worked although the call failed. Delete only a session that holds our start nonce.
+    const s = await api.getSession(name);
+    if (s?.metadata.annotations?.[`${group}/start-id`] === startId) await api.deleteSession(name);
   }
 
   /** client-seen every 15 s before the attach, then client-seen and attached every 30 s. A failed beat repeats after 10 s. */
@@ -328,7 +383,8 @@ export class KubePodTransport implements PodTransport {
         if (phase === "Running") {
           return finish(() => resolve({ pod: s.status?.pod || `agent-${name}`, cwd: s.status?.worktreePath ?? "" }));
         }
-        if (s.status?.reason && s.status.reason !== lastReason) {
+        if (!s.status?.reason) lastReason = undefined;
+        else if (s.status.reason !== lastReason) {
           lastReason = s.status.reason;
           onPhase({ reason, text: NOTICE_TEXT[reason] ?? GENERIC_NOTICE });
         }
@@ -346,8 +402,9 @@ export class KubePodTransport implements PodTransport {
               retry = timers.setTimeout(connect, WATCH_RETRY_MS);
             });
           },
-          () => {
+          (e: unknown) => {
             if (done) return;
+            if (e instanceof KubeHttpError && (e.status === 401 || e.status === 403)) return finish(() => reject(new PodStartError(e.status === 401 ? "Unauthorised" : "Forbidden")));
             retry = timers.setTimeout(connect, WATCH_RETRY_MS);
           },
         );

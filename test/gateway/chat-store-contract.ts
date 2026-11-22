@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { cut } from "../../src/gateway/chat/turn.ts";
 import type { ChatBody } from "../../src/browser/chat-protocol.ts";
 import {
   ChatClosedError,
@@ -55,6 +56,28 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect(await s.listByBinding("b1", { windowId: 1, includeClosed: true })).toHaveLength(7);
   });
 
+  test("two parallel creates at the gateway cap minus one: exactly one succeeds", async () => {
+    const s = await make();
+    const max = (await s.countOpen()) + 1;
+    const results = await Promise.all([s.create(mk({ binding: "b-g1", windowId: 11 }), 6, undefined, max), s.create(mk({ binding: "b-g2", windowId: 12 }), 6, undefined, max)]);
+    expect(results.filter((r) => r === "global")).toHaveLength(1);
+    expect(results.filter((r) => typeof r === "object")).toHaveLength(1);
+    expect(await s.countOpen()).toBe(max);
+    // A third create is refused for the gateway, not for its window.
+    expect(await s.create(mk({ binding: "b-g3", windowId: 13 }), 6, undefined, max)).toBe("global");
+  });
+
+  test("a full window gives cap, never global, and without a global cap global is never returned", async () => {
+    const s = await make();
+    for (let i = 0; i < 2; i += 1) await s.create(mk({ binding: "b-v", windowId: 21 }), 2);
+    expect(await s.create(mk({ binding: "b-v", windowId: 21 }), 2)).toBe("cap");
+    // The gateway is full too: the window is the first reason.
+    const full = (await s.countOpen());
+    expect(await s.create(mk({ binding: "b-v", windowId: 21 }), 2, undefined, full)).toBe("cap");
+    expect(await s.create(mk({ binding: "b-v", windowId: 22 }), 2, undefined, full)).toBe("global");
+    expect(await s.create(mk({ binding: "b-v", windowId: 22 }), 2)).not.toBe("global");
+  });
+
   test("10 concurrent creates for one window with cap 6 give exactly 6 successes", async () => {
     const s = await make();
     const results = await Promise.all(Array.from({ length: 10 }, () => s.create(mk({ binding: "b-race", windowId: 7 }), 6)));
@@ -74,6 +97,16 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect(await s.events(id, 0, 10)).toHaveLength(1);
   });
 
+  test("multibyte text and cut text round-trip unchanged", async () => {
+    const s = await make();
+    const { id, fence } = await owned(s);
+    const texts = ["😀漢字é".repeat(2000), cut(`${"a".repeat(8001)}${"😀".repeat(100)}`), cut("x\u0000y".repeat(10)), cut("漢".repeat(6000))];
+    for (const text of texts) await s.appendEvent(id, { k: "text", text }, fence);
+    const rows = await s.events(id, 0, 10);
+    expect(rows.map((r) => (r.body as { text: string }).text)).toEqual(texts);
+    expect(texts[2]).not.toContain("\u0000");
+  });
+
   test("appendEvent returns 1, 2, 3 under 20 concurrent appends with no duplicate", async () => {
     const s = await make();
     const { id, fence } = await owned(s);
@@ -84,6 +117,27 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect(new Set(seqs).size).toBe(20);
     expect([...seqs].sort((a, b) => a - b)).toEqual(Array.from({ length: 20 }, (_, i) => i + 4));
     expect((await s.get(id))?.lastSeq).toBe(23);
+  });
+
+  test("hasTurnEnd finds a turn_end after a number, however far away it is", async () => {
+    const s = await make();
+    const { id, fence } = await owned(s);
+    await s.appendEvent(id, user("m1"), fence);
+    for (let i = 0; i < 250; i += 1) await s.appendEvent(id, { k: "text", text: `t${i}` }, fence);
+    expect(await s.hasTurnEnd(id, 1)).toBe(false);
+    await s.appendEvent(id, { k: "turn_end", stopReason: "end_turn" }, fence);
+    expect(await s.hasTurnEnd(id, 1)).toBe(true);
+    expect(await s.hasTurnEnd(id, 252)).toBe(false);
+  });
+
+  test("countOpen counts the chats that are not closed, over all bindings", async () => {
+    const s = await make();
+    const before = await s.countOpen();
+    const a = await owned(s);
+    await owned(s, { binding: "b2", windowId: 2 });
+    expect(await s.countOpen()).toBe(before + 2);
+    await s.update(a.id, { state: "closed" }, a.fence);
+    expect(await s.countOpen()).toBe(before + 1);
   });
 
   test("events(afterSeq) returns the rest in order and honours limit", async () => {

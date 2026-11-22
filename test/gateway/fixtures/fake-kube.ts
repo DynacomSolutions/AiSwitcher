@@ -24,6 +24,21 @@ export class FakeKubeServer {
   readonly attachAuth: string[] = [];
   readonly stubStderr: string[] = [];
   failAnnotate = 0;
+  /** The only bearer token the server accepts. */
+  token = FAKE_TOKEN;
+  /** Status code for session GET calls (0 = normal). */
+  getStatusCode = 0;
+  /** Delay before a create (POST) is handled. */
+  postDelayMs = 0;
+  /** Ends each watch after this many ms (0 = use the timeoutSeconds query). */
+  watchEndMs = 0;
+  /** Wait this long before the attach upgrade is answered. */
+  attachDelayMs = 0;
+  /** The watch sends no events and ignores timeoutSeconds. */
+  silentWatch = false;
+  /** List and delete answer 500. */
+  failListDelete = false;
+  readonly watchQueries: string[] = [];
   rejectAttach = false;
   readonly server: ReturnType<typeof Bun.serve>;
   private readonly watchers = new Set<Watcher>();
@@ -74,6 +89,11 @@ export class FakeKubeServer {
     return this.sockets.get(pod) ?? 0;
   }
 
+  /** Close stdin of every stub so it exits with code 0 (a normal exit). */
+  endStdin(): void {
+    for (const p of this.procs) (p.stdin as { end(): void }).end();
+  }
+
   /** Stop the stub process of a pod and close its socket from the server side. */
   killPod(): void {
     for (const p of this.procs) p.kill();
@@ -91,20 +111,24 @@ export class FakeKubeServer {
 
   private async handle(req: Request, srv: ReturnType<typeof Bun.serve>): Promise<Response | undefined> {
     const url = new URL(req.url);
-    if (req.headers.get("authorization") !== `Bearer ${FAKE_TOKEN}`) return this.json({ message: "unauthorised" }, 401);
+    if (req.headers.get("authorization") !== `Bearer ${this.token}`) return this.json({ message: "unauthorised" }, 401);
     const base = `/apis/${FAKE_GROUP}/v1alpha1/namespaces/${FAKE_NAMESPACE}/agentsessions`;
     const attach = /^\/api\/v1\/namespaces\/[^/]+\/pods\/([^/]+)\/attach$/.exec(url.pathname);
     if (attach) {
       this.attachPaths.push(`${url.pathname}${url.search}`);
       this.attachAuth.push(req.headers.get("authorization") ?? "");
+      if (this.attachDelayMs > 0) await new Promise((r) => setTimeout(r, this.attachDelayMs));
       if (this.rejectAttach) return new Response("no", { status: 403 });
-      const ok = srv.upgrade(req, { data: { pod: attach[1]! }, headers: { "sec-websocket-protocol": "v4.channel.k8s.io" } });
+      // Echo a subprotocol only when the client offered it.
+      const offered = (req.headers.get("sec-websocket-protocol") ?? "").split(",").map((p) => p.trim());
+      const ok = srv.upgrade(req, { data: { pod: attach[1]! }, headers: offered.includes("v4.channel.k8s.io") ? { "sec-websocket-protocol": "v4.channel.k8s.io" } : {} });
       return ok ? undefined : new Response("upgrade failed", { status: 400 });
     }
     const cm = /^\/api\/v1\/namespaces\/[^/]+\/configmaps\/([^/]+)$/.exec(url.pathname);
     if (cm) return this.json({ data: this.configMap });
     if (url.pathname === base) {
       if (req.method === "POST") {
+        if (this.postDelayMs > 0) await new Promise((r) => setTimeout(r, this.postDelayMs));
         const obj = (await req.json()) as KubeSession;
         const name = obj.metadata.name;
         if (this.sessions.has(name)) return this.json({ message: "exists" }, 409);
@@ -113,6 +137,7 @@ export class FakeKubeServer {
         return this.json(obj, 201);
       }
       if (url.searchParams.get("watch")) return this.watch(req, url);
+      if (this.failListDelete) return this.json({ message: "boom" }, 500);
       const sel = (url.searchParams.get("labelSelector") ?? "").split(",").filter(Boolean).map((p) => p.split("="));
       const items = [...this.sessions.values()].filter((s) => sel.every(([k, v]) => s.metadata.labels?.[k!] === v));
       return this.json({ items });
@@ -120,9 +145,11 @@ export class FakeKubeServer {
     if (url.pathname.startsWith(`${base}/`)) {
       const name = decodeURIComponent(url.pathname.slice(base.length + 1));
       const s = this.sessions.get(name);
+      if (req.method === "GET" && this.getStatusCode) return this.json({ message: "refused" }, this.getStatusCode);
       if (!s) return this.json({ message: "not found" }, 404);
-      if (req.method === "GET") return this.json(s);
+      if (req.method === "GET") return this.getStatusCode ? this.json({ message: "refused" }, this.getStatusCode) : this.json(s);
       if (req.method === "DELETE") {
+        if (this.failListDelete) return this.json({ message: "boom" }, 500);
         this.sessions.delete(name);
         for (const w of this.watchers) if (w.name === name) w.send({ type: "DELETED", object: s });
         return this.json({ status: "Success" });
@@ -144,6 +171,8 @@ export class FakeKubeServer {
   }
 
   private watch(req: Request, url: URL): Response {
+    this.watchQueries.push(url.search);
+    const ms = this.silentWatch ? 0 : this.watchEndMs || Number(url.searchParams.get("timeoutSeconds") ?? 0) * 1000;
     const name = /metadata\.name=(.+)$/.exec(url.searchParams.get("fieldSelector") ?? "")?.[1] ?? "";
     const enc = new TextEncoder();
     let w: Watcher;
@@ -171,6 +200,7 @@ export class FakeKubeServer {
         const cur = this.sessions.get(name);
         if (cur) w.send({ type: "ADDED", object: cur });
         req.signal.addEventListener("abort", () => this.watchers.delete(w));
+        if (ms > 0) setTimeout(() => w.close(), ms).unref?.();
       },
       cancel: () => {
         this.watchers.delete(w);
@@ -198,12 +228,13 @@ export class FakeKubeServer {
         }
       }
     };
+    ws.send(new Uint8Array([1])); // a real server may send an empty first stdout frame
     void pump(proc.stdout as ReadableStream<Uint8Array>, 1);
     void pump(proc.stderr as ReadableStream<Uint8Array>, 2);
-    void proc.exited.then(() => {
+    void proc.exited.then((code) => {
       this.procs.delete(proc);
       try {
-        ws.send(new Uint8Array([3, ...new TextEncoder().encode(JSON.stringify({ status: "Failure" }))]));
+        ws.send(new Uint8Array([3, ...new TextEncoder().encode(JSON.stringify({ status: code === 0 ? "Success" : "Failure" }))]));
         ws.close(1000);
       } catch {
         // closed

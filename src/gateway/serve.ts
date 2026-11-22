@@ -3,6 +3,7 @@ import { parseToken, verifyToken } from "./tokens.ts";
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { DEAD_REFRESH_CODES, DEFAULT_ACCESS_TOKEN_LIFETIME_S, effectiveGrantPaths, GATEWAY_RENEW_FRACTION, KIMI_RENEW_BELOW_S, OAuthRefreshError, type IdentityGrantRefresh, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { ClusterBrowserHub, RELAY_PATH } from "./browser/cluster.ts";
 import { HomeMirror } from "./home-mirror.ts";
@@ -26,7 +27,21 @@ import { createWarmGate, positiveIntEnv } from "../shared/warm-gate.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
 import { createGatewayApp, markGatewayResponse, styleForPath, type GatewayDeps } from "./app.ts";
 import { authBrowserToken } from "./browser/auth.ts";
-import { BrowserHub } from "./browser/hub.ts";
+import { BrowserHub, type HubOptions } from "./browser/hub.ts";
+import { SESSION_END_TOOL } from "../browser/protocol.ts";
+import { MAX_CHATS_PER_WINDOW } from "../browser/chat-protocol.ts";
+import { ChatBroker, chatIdleMsFromEnv } from "./chat/broker.ts";
+import { MemoryChatBus, PgChatBus, type ChatBus } from "./chat/bus.ts";
+import { ChatCatalog } from "./chat/catalog.ts";
+import { ChatFrames } from "./chat/frames.ts";
+import { HttpKubeApi, inClusterKube } from "./chat/kube-http.ts";
+import type { KubeApi, KubeConfigEnv, PodTransport } from "./chat/kube.ts";
+import { PgChatStore } from "./chat/pg-chat-store.ts";
+import { KubePodTransport } from "./chat/pod-transport.ts";
+import { MemoryChatStore } from "./chat/store.ts";
+import { chatTokenKey } from "./chat/token.ts";
+import type { ChatStore } from "./chat/types.ts";
+import { listAppModels } from "./models-union.ts";
 import { CachedGatewayStore } from "./cache-store.ts";
 import { CredentialCache, GatewayCredentialError, loginCommand, type RefreshFn } from "./credentials.ts";
 import { providerError } from "./errors.ts";
@@ -140,6 +155,47 @@ export interface GatewayHooks {
   leaderTryMs?: number;
   overlapMs?: number;
   exit?(code: number): void;
+  /**
+   * Tests: the pod transport of the side-panel chat. Giving it turns chat on without the cluster env, with an in-memory
+   * chat store and bus, and an MCP URL on this gateway's own port.
+   */
+  chatTransport?: PodTransport;
+  /** Tests: the Kubernetes API of the chat pod transport. The chat env (`AIS_GATEWAY_CHAT_*`) is still read. Also turns the in-memory chat store and bus on. */
+  chatKubeApi?: KubeApi;
+  /** Tests: the chat bus (in-memory store mode only). */
+  chatBus?: ChatBus;
+}
+
+/** What `AIS_GATEWAY_CHAT_*` configures. */
+export interface ChatEnvConfig { kube: KubeConfigEnv; mcpUrl: string; maxLive: number; startTimeoutMs: number }
+
+const CHAT_MAX_DEFAULT = 12;
+/** Closed chats are kept this long, then pruned. */
+const CHAT_RETENTION_MS = 30 * 86_400_000;
+const CHAT_START_TIMEOUT_DEFAULT_MS = 240_000;
+const posInt = (v: string | undefined, fallback: number): number => {
+  const n = v === undefined || v.trim() === "" ? Number.NaN : Number(v);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+};
+
+/**
+ * The chat settings from the environment. Chat is off (undefined) unless `AIS_GATEWAY_CHAT_GROUP` and `AIS_GATEWAY_CHAT_MCP_URL` are set.
+ * With both set, the namespace and the node must be set too: a missing one throws, and the caller turns chat off with a warning.
+ */
+export function chatConfigFromEnv(env: Record<string, string | undefined>): ChatEnvConfig | undefined {
+  const group = env.AIS_GATEWAY_CHAT_GROUP?.trim();
+  const mcpUrl = env.AIS_GATEWAY_CHAT_MCP_URL?.trim();
+  if (!group || !mcpUrl) return undefined;
+  const namespace = env.AIS_GATEWAY_CHAT_NAMESPACE?.trim();
+  const node = env.AIS_GATEWAY_CHAT_NODE?.trim();
+  if (!namespace) throw new Error("AIS_GATEWAY_CHAT_NAMESPACE is not set");
+  if (!node) throw new Error("AIS_GATEWAY_CHAT_NODE is not set");
+  return {
+    kube: { group, namespace, node, configMap: env.AIS_GATEWAY_CHAT_CONFIG_MAP?.trim() || "agent-runtime-config", class: env.AIS_GATEWAY_CHAT_CLASS?.trim() || "chat" },
+    mcpUrl,
+    maxLive: posInt(env.AIS_GATEWAY_CHAT_MAX, CHAT_MAX_DEFAULT),
+    startTimeoutMs: posInt(env.AIS_GATEWAY_CHAT_START_TIMEOUT_MS, CHAT_START_TIMEOUT_DEFAULT_MS),
+  };
 }
 
 export interface RunningGateway {
@@ -660,12 +716,28 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const browserPoolMembers = hooks.browserPoolMembers ?? defaultBrowserPoolMembers;
   const browserIdentityExists = hooks.browserIdentityExists ?? defaultBrowserIdentityExists;
 
-  const hub = new BrowserHub({ authToken: async (t) => {
+  // Side-panel chat is on when the cluster env is complete, or when a test gives a pod transport.
+  let chatEnv: ChatEnvConfig | undefined;
+  if (!hooks.chatTransport) {
+    try {
+      chatEnv = chatConfigFromEnv(process.env);
+    } catch (err) {
+      console.warn(`gateway: side-panel chat is off (${describe(err)})`);
+    }
+  }
+  // A test transport or test Kubernetes API also selects the in-memory chat store and bus.
+  const chatTesting = hooks.chatTransport !== undefined || hooks.chatKubeApi !== undefined;
+  const chatOn = hooks.chatTransport !== undefined || chatEnv !== undefined;
+  let chatBroker: ChatBroker | undefined;
+  // The hub reads `onChat` and `onAttach` from this same object when a frame arrives. The chat stack sets them after it is built (below),
+  // so a gateway with chat off or failed answers every chat frame with `chat.reject` unavailable.
+  const hubOpts: HubOptions = { authToken: async (t) => {
       const b = await authBrowserToken(store, t);
       if (b) await store.touchBrowserBinding(b.name, new Date().toISOString()).catch(() => {});
       return b;
     },
-    metrics });
+    metrics };
+  const hub = new BrowserHub(hubOpts);
   // Several replicas: a call for a browser whose socket another replica holds is forwarded there (browser/cluster.ts).
   const relay = opts.replicaUrl
     ? new ClusterBrowserHub({ hub, databaseUrl: opts.databaseUrl, replicaId: `${process.env.HOSTNAME ?? "gateway"}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`, replicaUrl: opts.replicaUrl, adminToken: opts.adminToken, sql: sharedSql, listener: sharedListener })
@@ -673,7 +745,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const browser = relay ?? hub;
   metrics.browserGauges = { connected: () => hub.connected().length, sessions: () => hub.activeSessions() };
 
-  const proxy = createGatewayApp({
+  const appDeps: GatewayDeps = {
     store,
     ledger,
     creds,
@@ -685,10 +757,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     browserPoolMembers,
     browserIdentityExists,
     browserHub: browser,
+    ...(chatOn ? { chat: { principal: async (token: string) => chatBroker?.principal(token) } } : {}),
     fetch: hooks.fetch ?? fetch,
     now,
     metrics: recoverOnSuccess(metrics, alerter),
-  });
+  };
+  const proxy = createGatewayApp(appDeps);
   /** The active app of one of the given providers that a gateway token belongs to, for the CONNECT proxy. */
   const appForToken = async (token: string, providers: GatewayProvider[]): Promise<{ name: string; provider: GatewayProvider; style: ApiStyle } | undefined> => {
     if (!warmed || !parseToken(token)) return undefined;
@@ -1125,10 +1199,112 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       });
   }, hooks.keepAliveMs ?? KEEP_ALIVE_TICK_MS);
   keepAliveTimer.unref?.();
+  // Side-panel chat: broker, frames, catalogue. Built after the server, because a test's MCP URL needs the bound port.
+  let chat: { broker: ChatBroker; frames: ChatFrames; store: ChatStore } | undefined;
+  if (chatOn) {
+    try {
+      const testing = chatTesting;
+      const transport =
+        hooks.chatTransport ??
+        (() => {
+          const cfg = chatEnv as ChatEnvConfig;
+          const api =
+            hooks.chatKubeApi ??
+            (() => {
+              const kube = inClusterKube(process.env, (p) => readFileSync(p, "utf8"));
+              return new HttpKubeApi({ baseUrl: kube.baseUrl, token: kube.token, ca: kube.ca, env: cfg.kube });
+            })();
+          return new KubePodTransport({ api, env: cfg.kube });
+        })();
+      const chatStore: ChatStore = testing ? new MemoryChatStore() : new PgChatStore(opts.databaseUrl, { sql: sharedSql });
+      const bus: ChatBus = testing ? (hooks.chatBus ?? new MemoryChatBus()) : new PgChatBus(sharedSql, sharedListener);
+      const mcpUrl = chatEnv?.mcpUrl ?? `http://127.0.0.1:${server.port}/browser/mcp`;
+      const replicaId = `${process.env.HOSTNAME ?? "gateway"}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`;
+      const identityOf = async (binding: string): Promise<string | undefined> => {
+        const b = await store.getBrowserBinding(binding);
+        if (!b || b.state !== "active") return undefined;
+        return b.target.kind === "identity" ? b.target.identity : b.target.pool;
+      };
+      let frames: ChatFrames | undefined;
+      const broker = new ChatBroker({
+        store: chatStore,
+        transport,
+        mcpUrl,
+        tokenKey: chatTokenKey(opts.adminToken),
+        replicaId,
+        metrics,
+        now: Date.now,
+        idleMs: chatIdleMsFromEnv(process.env),
+        ...(chatEnv ? { startTimeoutMs: chatEnv.startTimeoutMs } : {}),
+        bus,
+        publish: (chatId) => void frames?.poke(chatId),
+        rejectChat: (chatId, code, message) => frames?.rejectChat(chatId, code, message),
+        watchedChats: () => frames?.watchedChats() ?? [],
+        identityOf,
+        endBrowserSession: async (binding, sessionId) => {
+          const identity = (await identityOf(binding)) ?? "chat";
+          await browser.call(binding, { id: crypto.randomUUID(), session: { id: sessionId, identity, label: "", chat: true }, tool: SESSION_END_TOOL, args: {} }, 5_000).catch(() => undefined);
+        },
+      });
+      const catalog = new ChatCatalog({
+        transport,
+        appFor: async (_provider, _identity, appName) => (appName ? store.getApp(appName) : undefined),
+        models: (a) => listAppModels(a, appDeps, AbortSignal.timeout(8_000)),
+        isPool: async (name) => (await browserPoolMembers(name)) !== undefined,
+      });
+      frames = new ChatFrames({ broker, store: chatStore, bus, catalog, hub, maxPerWindow: MAX_CHATS_PER_WINDOW, maxLive: chatEnv?.maxLive ?? CHAT_MAX_DEFAULT, metrics });
+      const live = frames;
+      chatBroker = broker;
+      chat = { broker, frames: live, store: chatStore };
+      // The bus needs the database. A database that is down at boot must not turn chat off, so a failed start tries again with a growing wait.
+      // Chat frames get `chat.reject` unavailable until the start worked: only then the hub gets its chat handlers.
+      let brokerStarted = false;
+      let framesStarted = false;
+      let tries = 0;
+      /** A start that ends after stop() must leave nothing running: it undoes its own listeners. */
+      const abandon = async (): Promise<void> => {
+        await live.stop().catch(() => undefined);
+        await broker.dispose().catch(() => undefined);
+      };
+      const startChat = async (): Promise<void> => {
+        if (draining) return;
+        try {
+          if (!brokerStarted) {
+            await broker.start();
+            brokerStarted = true;
+            if (draining) return abandon();
+          }
+          if (!framesStarted) {
+            await live.start();
+            framesStarted = true;
+            if (draining) return abandon();
+          }
+          hubOpts.onChat = (b, m, r) => live.handle(b, m, r);
+          hubOpts.onAttach = (b) => live.onAttach(b);
+          // Panels that attached before the start worked got no list: send it now, as onAttach does.
+          for (const b of hub.connected()) void live.onAttach(b).catch(() => undefined);
+        } catch (err) {
+          if (draining) return abandon();
+          metrics.chatError("other");
+          const wait = Math.min((hooks.warmBackoff?.initialMs ?? 5_000) * 2 ** tries, hooks.warmBackoff?.maxMs ?? 60_000);
+          tries += 1;
+          console.warn(`gateway: side-panel chat could not listen yet (${describe(err)}); retrying in ${wait} ms`);
+          setTimeout(() => void startChat(), wait).unref?.();
+        }
+      };
+      const first = startChat();
+      if (testing) await first;
+      metrics.chatGauges = { active: () => broker.active() };
+    } catch (err) {
+      console.warn(`gateway: side-panel chat is off (${describe(err)})`);
+    }
+  }
   // Refresh-journal retention: old resolved rows go, the newest per account and any rotated-out evidence stay.
   const pruneJournal = (): void => void Promise.resolve(refreshBackend.prune?.(JOURNAL_RETENTION_MS)).catch(() => undefined);
   const pruneTimer = setInterval(() => {
-    if (warmed && !draining) pruneJournal();
+    if (!warmed || draining) return;
+    pruneJournal();
+    if (chat) void chat.store.pruneClosed(Date.now() - CHAT_RETENTION_MS).catch(() => metrics.chatError("store"));
   }, 6 * 3_600_000);
   pruneTimer.unref?.();
 
@@ -1143,6 +1319,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       draining = true;
+      // The chat drain starts at once: new prompts are refused and asks end as cancelled. Turns in flight finish. It is awaited below, after the servers stop.
+      const chatDrain = chat?.broker.drain().catch(() => undefined);
       usageGate.drain();
       hub.closeAll(1012);
       wake?.();
@@ -1162,6 +1340,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       await Promise.race([Promise.allSettled([keepAliveRun]), new Promise<void>((r) => setTimeout(r, hooks.stopCeilingMs ?? 10_000).unref?.())]);
       // A keep-alive account that was already past its stop check may have started a refresh meanwhile: wait for it too.
       await Promise.allSettled([...inflightRefreshes]);
+      await chatDrain;
+      await chat?.frames.stop().catch(() => undefined);
+      await chat?.broker.dispose().catch(() => undefined);
       await ledger.close();
       await relay?.stop().catch(() => undefined);
       await mirror?.stop().catch(() => undefined);
