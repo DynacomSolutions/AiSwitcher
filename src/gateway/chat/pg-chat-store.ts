@@ -1,6 +1,6 @@
 import { SQL } from "bun";
 import type { ChatBody, ChatSelection, ChatState } from "../../browser/chat-protocol.ts";
-import { ChatClosedError, ChatExistsError, ChatLeaseLostError, type ChatCreate, type ChatEventRow, type ChatPatch, type ChatRecord, type ChatStore, type LeaseFence } from "./types.ts";
+import { ChatClosedError, ChatExistsError, ChatFenceRequiredError, ChatLeaseLostError, type ChatCreate, type ChatOwner, type ChatEventRow, type ChatPatch, type ChatRecord, type ChatStore, type LeaseFence } from "./types.ts";
 
 const BATCH = 500;
 
@@ -52,19 +52,21 @@ export class PgChatStore implements ChatStore {
     if (this.ownsSql) await this.sql.close();
   }
 
-  async create(rec: ChatCreate, cap: number): Promise<ChatRecord | "cap"> {
+  async create(rec: ChatCreate, cap: number, owner?: ChatOwner): Promise<ChatRecord | "cap"> {
     // The advisory lock serialises creates of one window, so the count and the insert never race.
     let rows: Row[];
     try {
       rows = await this.sql.begin(async (t) => {
         await t`SELECT pg_advisory_xact_lock(hashtextextended(${`${rec.binding}:${rec.windowId}`}, 0))`;
         return t.unsafe(
-          `INSERT INTO gateway_chats (id, binding, window_id, name, color, selection, state, tab_ids, acp_session_id, pod_session, can_load, created_at, updated_at)
-           SELECT $1, $2, $3, $4, $5, $6::jsonb, 'starting', $7::jsonb, $8, $9, $10, $11::bigint, $11::bigint
+          `INSERT INTO gateway_chats (id, binding, window_id, name, color, selection, state, tab_ids, acp_session_id, pod_session, can_load, created_at, updated_at, owner_replica, epoch, lease_until)
+           SELECT $1, $2, $3, $4, $5, $6::jsonb, 'starting', $7::jsonb, $8, $9, $10, $11::bigint, $11::bigint, $13::text,
+             CASE WHEN $13::text IS NULL THEN 0 ELSE 1 END,
+             CASE WHEN $13::text IS NULL THEN NULL ELSE clock_timestamp() + make_interval(secs => $14::double precision / 1000.0) END
            WHERE (SELECT count(*) FROM gateway_chats WHERE binding = $2 AND window_id = $3 AND state <> 'closed') < $12
            RETURNING ${COLS}`,
           [rec.id, rec.binding, rec.windowId, rec.name, rec.color, JSON.stringify(rec.selection), JSON.stringify(rec.tabIds),
-            rec.acpSessionId ?? null, rec.podSession ?? null, rec.canLoad ?? null, rec.createdAt, cap],
+            rec.acpSessionId ?? null, rec.podSession ?? null, rec.canLoad ?? null, rec.createdAt, cap, owner?.replica ?? null, owner?.ttlMs ?? null],
         );
       });
     } catch (err) {
@@ -72,7 +74,10 @@ export class PgChatStore implements ChatStore {
       if (e?.errno === "23505" || e?.code === "23505") throw new ChatExistsError(rec.id);
       throw err;
     }
-    return rows.length === 0 ? "cap" : toRecord(rows[0] as Row);
+    if (rows.length > 0) return toRecord(rows[0] as Row);
+    // No row: the window is full. A used id must still report ChatExistsError.
+    if (await this.get(rec.id)) throw new ChatExistsError(rec.id);
+    return "cap";
   }
 
   async get(id: string): Promise<ChatRecord | undefined> {
@@ -131,21 +136,22 @@ export class PgChatStore implements ChatStore {
     throw new ChatClosedError(id);
   }
 
-  async appendEvent(id: string, body: ChatBody, fence: LeaseFence): Promise<number> {
+  async appendEvent(id: string, body: ChatBody, fence?: LeaseFence): Promise<number> {
+    if (fence === undefined && body.k !== "user") throw new ChatFenceRequiredError(id);
     // One statement: the counter bump and the event insert commit together.
     const now = Date.now();
     const rows = await this.sql.unsafe(
       `WITH n AS (
          UPDATE gateway_chats SET last_seq = last_seq + 1, updated_at = $2::bigint
-         WHERE id = $1 AND owner_replica = $4 AND epoch = $5::bigint AND lease_until > clock_timestamp()
+         WHERE id = $1 AND (NOT $4::boolean OR (owner_replica = $5::text AND epoch = $6::bigint AND lease_until > clock_timestamp()))
          RETURNING id, last_seq)
        INSERT INTO gateway_chat_events (chat_id, seq, ts, body)
        SELECT id, last_seq, $2::bigint, $3::jsonb FROM n
        RETURNING seq`,
-      [id, now, JSON.stringify(body), fence.replica, fence.epoch],
+      [id, now, JSON.stringify(body), fence !== undefined, fence?.replica ?? null, fence?.epoch ?? null],
     );
     if (rows[0]) return Number((rows[0] as Row).seq);
-    if ((await this.diagnose(id, fence)).exists) throw new ChatLeaseLostError(id);
+    if (fence !== undefined && (await this.diagnose(id, fence)).exists) throw new ChatLeaseLostError(id);
     throw new Error(`unknown chat ${id}`);
   }
 
@@ -178,8 +184,11 @@ export class PgChatStore implements ChatStore {
     if (rows.length === 0) throw new ChatLeaseLostError(id);
   }
 
-  async releaseLease(id: string, replica: string): Promise<void> {
-    await this.sql.unsafe("UPDATE gateway_chats SET owner_replica = NULL, lease_until = NULL WHERE id = $1 AND owner_replica = $2", [id, replica]);
+  async releaseLease(id: string, fence: LeaseFence): Promise<void> {
+    await this.sql.unsafe(
+      "UPDATE gateway_chats SET owner_replica = NULL, lease_until = NULL WHERE id = $1 AND owner_replica = $2 AND epoch = $3::bigint",
+      [id, fence.replica, fence.epoch],
+    );
   }
 
   async ownedBy(replica: string): Promise<ChatRecord[]> {
@@ -204,6 +213,6 @@ export class PgChatStore implements ChatStore {
   }
 
   async pruneIdle(cutMs: number): Promise<number> {
-    return this.prune("state <> 'closed' AND updated_at < $1::bigint", cutMs);
+    return this.prune("state <> 'closed' AND updated_at < $1::bigint AND (lease_until IS NULL OR lease_until <= clock_timestamp())", cutMs);
   }
 }

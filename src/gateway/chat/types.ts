@@ -35,6 +35,10 @@ export class ChatExistsError extends Error {
 export class ChatLeaseLostError extends Error {
   constructor(readonly chatId: string) { super(`lease lost for chat ${chatId}`); this.name = "ChatLeaseLostError"; }
 }
+/** appendEvent got no fence for a body that is not a user event. */
+export class ChatFenceRequiredError extends Error {
+  constructor(readonly chatId: string) { super(`a fence is required to append to chat ${chatId}`); this.name = "ChatFenceRequiredError"; }
+}
 /** A closed chat cannot open again. */
 export class ChatClosedError extends Error {
   constructor(readonly chatId: string) { super(`chat ${chatId} is closed`); this.name = "ChatClosedError"; }
@@ -42,29 +46,41 @@ export class ChatClosedError extends Error {
 export type ChatPatch = Partial<Pick<ChatRecord, "name" | "state" | "selection" | "tabIds" | "acpSessionId" | "podSession" | "canLoad" | "generation">>;
 export interface ChatEventRow { seq: number; ts: number; body: ChatBody }
 
+/** Lease taken in the same step as create: the chat starts at epoch 1. */
+export interface ChatOwner { replica: string; ttlMs: number }
+
 /**
+ * Broker rule: inside one replica, acquire and start of a chat must run single-flight per chat.
+ * A second acquireLease by the same replica bumps the epoch, so the older code path then fails safe with ChatLeaseLostError.
+ * Task 13 carries this rule.
+ *
  * Lease rules. acquireLease, renewLease, appendEvent and update need a live lease.
  * The Postgres store judges expiry with the database clock (clock_timestamp()) and ignores nowMs.
- * The memory store judges expiry with nowMs in acquireLease and with its own clock (default Date.now) in the fenced calls.
+ * The memory store judges expiry with its own clock (default Date.now) and ignores nowMs, in the same way.
  */
 export interface ChatStore {
-  /** Atomic count of the open chats of (binding, windowId). Returns "cap" when the window is full. Throws ChatExistsError on a used id. */
-  create(rec: ChatCreate, cap: number): Promise<ChatRecord | "cap">;
+  /** Atomic count of the open chats of (binding, windowId). Returns "cap" when the window is full. Throws ChatExistsError on a used id, even when the window is full.
+   * With owner, the same step sets the owner, the lease and epoch 1, so the caller has the fence ({ replica, epoch: record.epoch }) at once. */
+  create(rec: ChatCreate, cap: number, owner?: ChatOwner): Promise<ChatRecord | "cap">;
   get(id: string): Promise<ChatRecord | undefined>;
   listByBinding(binding: string, opts?: { windowId?: number; includeClosed?: boolean }): Promise<ChatRecord[]>;
   /** Throws ChatLeaseLostError when the fence is stale or expired, ChatClosedError on a move from closed to an open state. Returns undefined for an unknown chat. */
   update(id: string, patch: ChatPatch, fence: LeaseFence): Promise<ChatRecord | undefined>;
-  /** Atomic sequence number: the first event of a chat gets 1. Throws ChatLeaseLostError when the fence is stale or expired. */
-  appendEvent(id: string, body: ChatBody, fence: LeaseFence): Promise<number>;
+  /**
+   * Atomic sequence number: the first event of a chat gets 1. Throws ChatLeaseLostError when the fence is stale or expired.
+   * The fence is optional for a user event only, so any replica can store a prompt. Other kinds without a fence throw ChatFenceRequiredError.
+   */
+  appendEvent(id: string, body: ChatBody, fence?: LeaseFence): Promise<number>;
   events(id: string, afterSeq: number, limit: number): Promise<ChatEventRow[]>;
   /** Returns the new epoch when the lease was free, already owned by this replica, or expired. Returns undefined otherwise. */
   acquireLease(id: string, replica: string, ttlMs: number, nowMs: number): Promise<number | undefined>;
   /** Throws ChatLeaseLostError when the fence is stale or the lease has expired. */
   renewLease(id: string, fence: LeaseFence, ttlMs: number, nowMs: number): Promise<void>;
-  releaseLease(id: string, replica: string): Promise<void>;
+  /** Frees the lease only when the fence still matches. A stale epoch does nothing. */
+  releaseLease(id: string, fence: LeaseFence): Promise<void>;
   ownedBy(replica: string): Promise<ChatRecord[]>;
   /** Deletes chats closed before the cut-off, with their events, in batches of 500. Returns the number of chats removed. */
   pruneClosed(beforeMs: number): Promise<number>;
-  /** Deletes open chats whose updatedAt is before the cut-off, with their events, in batches of 500. Returns the number removed. */
+  /** Deletes open chats without a live lease whose updatedAt is before the cut-off, with their events, in batches of 500. Returns the number removed. */
   pruneIdle(cutMs: number): Promise<number>;
 }

@@ -1,4 +1,4 @@
-import { afterAll, describe, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
 import { MemoryChatStore } from "../../src/gateway/chat/store.ts";
 import { PgChatStore } from "../../src/gateway/chat/pg-chat-store.ts";
@@ -10,6 +10,20 @@ const optOut = process.env.AIS_GATEWAY_TEST_NO_DATABASE === "1";
 
 describe("MemoryChatStore contract", () => {
   chatStoreContract(async () => new MemoryChatStore());
+
+  test("the memory store uses its own clock and ignores nowMs", async () => {
+    let t = 1_000_000;
+    const s = new MemoryChatStore(() => t);
+    const c = (await s.create({ id: "c1", binding: "b", windowId: 1, name: "n", color: "#000", selection: { provider: "claude", identity: "i" }, tabIds: [], createdAt: t }, 6)) as { id: string };
+    const epoch = (await s.acquireLease(c.id, "r1", 1_000, 0)) as number;
+    expect((await s.get(c.id))?.leaseUntil).toBe(1_001_000);
+    expect(await s.acquireLease(c.id, "r2", 1_000, 99_999_999)).toBeUndefined();
+    t += 1_500;
+    expect(await s.acquireLease(c.id, "r2", 1_000, 0)).toBe(epoch + 1);
+    expect((await s.get(c.id))?.leaseUntil).toBe(t + 1_000);
+    await s.renewLease(c.id, { replica: "r2", epoch: epoch + 1 }, 5_000, 0);
+    expect((await s.get(c.id))?.leaseUntil).toBe(t + 5_000);
+  });
 });
 
 if (!url && process.env.CI && !optOut) {

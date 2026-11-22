@@ -1,5 +1,5 @@
 import type { ChatBody } from "../../browser/chat-protocol.ts";
-import { ChatClosedError, ChatExistsError, ChatLeaseLostError, type ChatCreate, type ChatEventRow, type ChatPatch, type ChatRecord, type ChatStore, type LeaseFence } from "./types.ts";
+import { ChatClosedError, ChatExistsError, ChatFenceRequiredError, ChatLeaseLostError, type ChatCreate, type ChatOwner, type ChatEventRow, type ChatPatch, type ChatRecord, type ChatStore, type LeaseFence } from "./types.ts";
 
 const copy = (r: ChatRecord): ChatRecord => structuredClone(r);
 const PATCH_KEYS = ["name", "state", "selection", "tabIds", "acpSessionId", "podSession", "canLoad", "generation"] as const;
@@ -15,7 +15,7 @@ export class MemoryChatStore implements ChatStore {
     return r.ownerReplica === f.replica && r.epoch === f.epoch && r.leaseUntil !== undefined && r.leaseUntil > this.now();
   }
 
-  async create(rec: ChatCreate, cap: number): Promise<ChatRecord | "cap"> {
+  async create(rec: ChatCreate, cap: number, owner?: ChatOwner): Promise<ChatRecord | "cap"> {
     if (this.chats.has(rec.id)) throw new ChatExistsError(rec.id);
     let open = 0;
     for (const c of this.chats.values()) {
@@ -23,6 +23,11 @@ export class MemoryChatStore implements ChatStore {
     }
     if (open >= cap) return "cap";
     const row: ChatRecord = { ...structuredClone(rec), state: "starting", epoch: 0, lastSeq: 0, generation: 0, updatedAt: rec.createdAt };
+    if (owner) {
+      row.ownerReplica = owner.replica;
+      row.leaseUntil = this.now() + owner.ttlMs;
+      row.epoch = 1;
+    }
     this.chats.set(row.id, row);
     this.log.set(row.id, []);
     return copy(row);
@@ -51,18 +56,19 @@ export class MemoryChatStore implements ChatStore {
     for (const k of PATCH_KEYS) {
       if (patch[k] !== undefined) target[k] = structuredClone(patch[k]);
     }
-    const now = Date.now();
+    const now = this.now();
     if (patch.state === "closed" && r.closedAt === undefined) r.closedAt = now;
     r.updatedAt = now;
     return copy(r);
   }
 
-  async appendEvent(id: string, body: ChatBody, fence: LeaseFence): Promise<number> {
+  async appendEvent(id: string, body: ChatBody, fence?: LeaseFence): Promise<number> {
     const r = this.chats.get(id);
     if (!r) throw new Error(`unknown chat ${id}`);
-    if (!this.holds(r, fence)) throw new ChatLeaseLostError(id);
+    if (fence === undefined && body.k !== "user") throw new ChatFenceRequiredError(id);
+    if (fence !== undefined && !this.holds(r, fence)) throw new ChatLeaseLostError(id);
     r.lastSeq += 1;
-    r.updatedAt = Date.now();
+    r.updatedAt = this.now();
     this.log.get(id)?.push({ seq: r.lastSeq, ts: r.updatedAt, body: structuredClone(body) });
     return r.lastSeq;
   }
@@ -71,26 +77,26 @@ export class MemoryChatStore implements ChatStore {
     return (this.log.get(id) ?? []).filter((e) => e.seq > afterSeq).slice(0, Math.max(0, limit)).map((e) => structuredClone(e));
   }
 
-  async acquireLease(id: string, replica: string, ttlMs: number, nowMs: number): Promise<number | undefined> {
+  async acquireLease(id: string, replica: string, ttlMs: number, _nowMs: number): Promise<number | undefined> {
     const r = this.chats.get(id);
     if (!r) return undefined;
-    const free = r.ownerReplica === undefined || r.leaseUntil === undefined || r.leaseUntil <= nowMs;
+    const free = r.ownerReplica === undefined || r.leaseUntil === undefined || r.leaseUntil <= this.now();
     if (!free && r.ownerReplica !== replica) return undefined;
     r.ownerReplica = replica;
-    r.leaseUntil = nowMs + ttlMs;
+    r.leaseUntil = this.now() + ttlMs;
     r.epoch += 1;
     return r.epoch;
   }
 
-  async renewLease(id: string, fence: LeaseFence, ttlMs: number, nowMs: number): Promise<void> {
+  async renewLease(id: string, fence: LeaseFence, ttlMs: number, _nowMs: number): Promise<void> {
     const r = this.chats.get(id);
     if (!r || !this.holds(r, fence)) throw new ChatLeaseLostError(id);
-    r.leaseUntil = nowMs + ttlMs;
+    r.leaseUntil = this.now() + ttlMs;
   }
 
-  async releaseLease(id: string, replica: string): Promise<void> {
+  async releaseLease(id: string, fence: LeaseFence): Promise<void> {
     const r = this.chats.get(id);
-    if (!r || r.ownerReplica !== replica) return;
+    if (!r || r.ownerReplica !== fence.replica || r.epoch !== fence.epoch) return;
     delete r.ownerReplica;
     delete r.leaseUntil;
   }
@@ -116,6 +122,6 @@ export class MemoryChatStore implements ChatStore {
   }
 
   async pruneIdle(cutMs: number): Promise<number> {
-    return this.prune((c) => c.state !== "closed" && c.updatedAt < cutMs);
+    return this.prune((c) => c.state !== "closed" && c.updatedAt < cutMs && (c.leaseUntil === undefined || c.leaseUntil <= this.now()));
   }
 }

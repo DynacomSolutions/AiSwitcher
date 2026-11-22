@@ -3,6 +3,7 @@ import type { ChatBody } from "../../src/browser/chat-protocol.ts";
 import {
   ChatClosedError,
   ChatExistsError,
+  ChatFenceRequiredError,
   ChatLeaseLostError,
   type ChatCreate,
   type ChatStore,
@@ -109,8 +110,8 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
   test("an expired lease can be taken and the epoch grows", async () => {
     const s = await make();
     const c = (await s.create(mk(), 6)) as { id: string };
-    const e1 = (await s.acquireLease(c.id, "r1", 40, Date.now())) as number;
-    await sleep(120);
+    const e1 = (await s.acquireLease(c.id, "r1", 300, Date.now())) as number;
+    await sleep(600);
     const e2 = await s.acquireLease(c.id, "r2", 60_000, Date.now());
     expect(e2).toBeGreaterThan(e1);
     expect((await s.get(c.id))?.ownerReplica).toBe("r2");
@@ -125,27 +126,27 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect(await s.renewLease(id, { replica: "r1", epoch: fence.epoch + 1 }, 1_000, Date.now()).then(() => "ok", (e) => e)).toBeInstanceOf(ChatLeaseLostError);
     await s.renewLease(id, fence, 60_000, Date.now());
     const c = (await s.create(mk(), 6)) as { id: string };
-    const epoch = (await s.acquireLease(c.id, "r1", 30, Date.now())) as number;
-    await sleep(100);
+    const epoch = (await s.acquireLease(c.id, "r1", 300, Date.now())) as number;
+    await sleep(600);
     expect(await s.renewLease(c.id, { replica: "r1", epoch }, 1_000, Date.now()).then(() => "ok", (e) => e)).toBeInstanceOf(ChatLeaseLostError);
   });
 
   test("releaseLease frees it", async () => {
     const s = await make();
-    const { id } = await owned(s);
-    await s.releaseLease(id, "r2");
+    const { id, fence } = await owned(s);
+    await s.releaseLease(id, { replica: "r2", epoch: fence.epoch });
     expect(await s.acquireLease(id, "r2", 60_000, Date.now())).toBeUndefined();
-    await s.releaseLease(id, "r1");
+    await s.releaseLease(id, fence);
     expect(await s.acquireLease(id, "r2", 60_000, Date.now())).toBeNumber();
   });
 
   test("a replaced owner cannot append or update", async () => {
     const s = await make();
     const c = (await s.create(mk(), 6)) as { id: string };
-    const e1 = (await s.acquireLease(c.id, "r1", 40, Date.now())) as number;
+    const e1 = (await s.acquireLease(c.id, "r1", 300, Date.now())) as number;
     const old: LeaseFence = { replica: "r1", epoch: e1 };
     await s.appendEvent(c.id, user("before"), old);
-    await sleep(120);
+    await sleep(600);
     // Expired, and nobody took it yet: the old owner already fails.
     expect(await s.appendEvent(c.id, user("late"), old).then(() => "ok", (e) => e)).toBeInstanceOf(ChatLeaseLostError);
     const e2 = (await s.acquireLease(c.id, "r2", 60_000, Date.now())) as number;
@@ -199,6 +200,8 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     await s.appendEvent(idle.id, user("old"), idle.fence);
     const fresh = await owned(s, { binding: "b-idle", createdAt: 5_000 });
     await s.appendEvent(fresh.id, user("new"), fresh.fence);
+    await s.releaseLease(idle.id, idle.fence);
+    await s.releaseLease(fresh.id, fresh.fence);
     // An append moves updatedAt to now, so only the untouched chat is idle.
     const quiet = (await s.create(mk({ binding: "b-idle", createdAt: 5_000 }), 6)) as { id: string };
     expect(await s.pruneIdle(6_000)).toBe(1);
@@ -208,6 +211,49 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect(await s.pruneIdle(Date.now() + 60_000)).toBeGreaterThanOrEqual(2);
     expect(await s.get(idle.id)).toBeUndefined();
     expect(await s.events(idle.id, 0, 10)).toEqual([]);
+  });
+
+  test("pruneIdle keeps a chat with a live lease", async () => {
+    const s = await make();
+    const { id, fence } = await owned(s, { binding: "b-live", createdAt: 5_000 });
+    expect(await s.pruneIdle(Date.now() + 60_000)).toBe(0);
+    expect(await s.get(id)).toBeDefined();
+    await s.releaseLease(id, fence);
+    expect(await s.pruneIdle(Date.now() + 60_000)).toBe(1);
+  });
+
+  test("create with an owner sets the lease and epoch 1 at once", async () => {
+    const s = await make();
+    const c = (await s.create(mk(), 6, { replica: "r1", ttlMs: 60_000 })) as { id: string; epoch: number; ownerReplica?: string };
+    expect(c.epoch).toBe(1);
+    expect(c.ownerReplica).toBe("r1");
+    expect(await s.appendEvent(c.id, user("hi"), { replica: "r1", epoch: c.epoch })).toBe(1);
+    expect(await s.acquireLease(c.id, "r2", 60_000, Date.now())).toBeUndefined();
+  });
+
+  test("a full window still reports ChatExistsError for a used id", async () => {
+    const s = await make();
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i += 1) ids.push(((await s.create(mk({ binding: "b-full", windowId: 3 }), 6)) as { id: string }).id);
+    const err = await s.create(mk({ binding: "b-full", windowId: 3, id: ids[0] as string }), 6).then(() => undefined, (e) => e);
+    expect(err).toBeInstanceOf(ChatExistsError);
+  });
+
+  test("a stale-epoch release does not free the lease", async () => {
+    const s = await make();
+    const { id, fence } = await owned(s);
+    await s.releaseLease(id, { replica: "r1", epoch: fence.epoch - 1 });
+    expect((await s.get(id))?.ownerReplica).toBe("r1");
+    expect(await s.acquireLease(id, "r2", 60_000, Date.now())).toBeUndefined();
+  });
+
+  test("any replica can append a user event, but other kinds need a fence", async () => {
+    const s = await make();
+    const { id } = await owned(s);
+    expect(await s.appendEvent(id, user("from b"))).toBe(1);
+    const err = await s.appendEvent(id, { k: "text", text: "x" } satisfies ChatBody).then(() => "ok", (e) => e);
+    expect(err).toBeInstanceOf(ChatFenceRequiredError);
+    expect((await s.get(id))?.lastSeq).toBe(1);
   });
 
   test("prunes work through more than one batch of 500", async () => {
