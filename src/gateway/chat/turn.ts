@@ -7,16 +7,40 @@ import type { AcpUpdate } from "./acp.ts";
 export const MAX_ITEM_CHARS = 8192;
 export const TRUNCATED_MARK = "\n[truncated]";
 
-/** Cut a long value. The marker shows the cut. */
-export function cut(text: string): string {
-  return text.length <= MAX_ITEM_CHARS ? text : `${text.slice(0, MAX_ITEM_CHARS - TRUNCATED_MARK.length)}${TRUNCATED_MARK}`;
+/** Remove NUL characters. Postgres text and jsonb cannot hold them. */
+export const clean = (text: string): string => (text.includes("\u0000") ? text.replaceAll("\u0000", "") : text);
+
+const bytesOf = (cp: string): number => Buffer.byteLength(cp);
+
+/** The longest start of `text` that fits `maxBytes` of UTF-8, cut between code points. */
+function headFitting(text: string, maxBytes: number): string {
+  let bytes = 0;
+  let end = 0;
+  for (const cp of text) {
+    const n = bytesOf(cp);
+    if (bytes + n > maxBytes) break;
+    bytes += n;
+    end += cp.length;
+  }
+  return text.slice(0, end);
 }
 
-/** Split a long chunk into pieces that each fit one event. */
-export function pieces(text: string): string[] {
-  if (text.length <= MAX_ITEM_CHARS) return text === "" ? [] : [text];
+/** Cut a long value to 8 KiB of UTF-8, between code points. The marker shows the cut. */
+export function cut(raw: string): string {
+  const text = clean(raw);
+  if (text.length * 3 <= MAX_ITEM_CHARS || Buffer.byteLength(text) <= MAX_ITEM_CHARS) return text;
+  return `${headFitting(text, MAX_ITEM_CHARS - Buffer.byteLength(TRUNCATED_MARK))}${TRUNCATED_MARK}`;
+}
+
+/** Split a long chunk into pieces that each fit 8 KiB of UTF-8, between code points. */
+export function pieces(raw: string): string[] {
+  let rest = clean(raw);
   const out: string[] = [];
-  for (let i = 0; i < text.length; i += MAX_ITEM_CHARS) out.push(text.slice(i, i + MAX_ITEM_CHARS));
+  while (rest !== "") {
+    const head = rest.length * 3 <= MAX_ITEM_CHARS ? rest : headFitting(rest, MAX_ITEM_CHARS);
+    out.push(head);
+    rest = rest.slice(head.length);
+  }
   return out;
 }
 
@@ -29,8 +53,8 @@ export type ToolBody = Extract<ChatBody, { k: "tool" }>;
 export function mergeTool(prev: ToolBody | undefined, u: Extract<AcpUpdate, { kind: "tool" }>): ToolBody {
   const next: ToolBody = {
     k: "tool",
-    toolCallId: u.toolCallId.slice(0, 256),
-    title: (u.title ?? prev?.title ?? "Tool").slice(0, 512),
+    toolCallId: Array.from(clean(u.toolCallId)).slice(0, 256).join(""),
+    title: Array.from(clean(u.title ?? prev?.title ?? "Tool")).slice(0, 512).join(""),
     status: (u.status !== undefined ? STATUS[u.status] : undefined) ?? prev?.status ?? "pending",
   };
   const args = u.args !== undefined ? cut(u.args) : prev?.args;

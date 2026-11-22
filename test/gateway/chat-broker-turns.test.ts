@@ -5,9 +5,11 @@ import { join } from "node:path";
 import type { ChatBody } from "../../src/browser/chat-protocol.ts";
 import type { BrowserBinding } from "../../src/browser/types.ts";
 import { createBrowserCaller } from "../../src/gateway/browser/routing.ts";
+import { cut, pieces } from "../../src/gateway/chat/turn.ts";
 import { ChatBroker, type BrokerDeps } from "../../src/gateway/chat/broker.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { MemoryChatStore } from "../../src/gateway/chat/store.ts";
+import { sessionName } from "../../src/gateway/chat/kube.ts";
 import { chatTokenKey, mintChatToken } from "../../src/gateway/chat/token.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 import { StubPodTransport, type StubTransportOptions } from "./fixtures/stub-transport.ts";
@@ -232,10 +234,11 @@ test("sweepIdle ends the pod after idleMs, keeps the chat idle, and the next pro
   await turnEnded(store, rec.id);
   await idleState(store, rec.id);
   await broker.sweepIdle();
-  expect(transport.stopped).toEqual([]);
+  expect(transport.stoppedSessions).toEqual([]);
   clock.t += 2000;
   await broker.sweepIdle();
-  expect(transport.stopped).toEqual([rec.id]);
+  expect(transport.stoppedSessions).toEqual([sessionName(rec.id, 1)]);
+  expect(transport.stopped).toEqual([]);
   expect((await store.get(rec.id))?.state).toBe("idle");
   expect(metrics.render()).toContain('ais_gateway_chat_sessions_total{event="idle_closed"} 1');
   await send(broker, rec.id, "say:again");
@@ -253,7 +256,7 @@ test("the idle limit never passes three hours", async () => {
   await idleState(store, rec.id);
   clock.t += 3 * 3_600_000 + 1000;
   await broker.sweepIdle();
-  expect(transport.stopped).toEqual([rec.id]);
+  expect(transport.stoppedSessions).toEqual([sessionName(rec.id, 1)]);
 });
 
 test("configure applies the model through session/set_config_option and appends a config item", async () => {
@@ -332,4 +335,281 @@ test("a full turn flow produces no other label series", async () => {
   const out = metrics.render();
   expect(out).toContain("ais_gateway_chat_turns_total");
   expect(out).not.toContain('="other"');
+});
+
+// ---- Round 1 ----
+
+class FakeTimers {
+  private n = 0;
+  readonly items = new Map<number, { fn: () => void; ms: number }>();
+  setTimeout(fn: () => void, ms: number): unknown {
+    this.items.set(++this.n, { fn, ms });
+    return this.n;
+  }
+  clearTimeout(h: unknown): void {
+    this.items.delete(h as number);
+  }
+  fire(ms: number): void {
+    const hit = [...this.items.entries()].find(([, i]) => i.ms === ms);
+    if (!hit) throw new Error(`no timer of ${ms} ms`);
+    this.items.delete(hit[0]);
+    hit[1].fn();
+  }
+}
+const permissionOf = async (s: MemoryChatStore, id: string) => {
+  await until(async () => (await bodies(s, id)).some((b) => b.k === "permission"), "permission");
+  return (await bodies(s, id)).find((b) => b.k === "permission") as Extract<ChatBody, { k: "permission" }>;
+};
+const HUNG = "The agent did not stop. It was restarted. Send a message to continue.";
+
+test("a cleanup that stops its pod slowly never deletes the new pod", async () => {
+  const { broker, store, transport } = setup({ stopSessionDelayMs: 300 });
+  const rec = await made(broker);
+  await send(broker, rec.id, "exit");
+  await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
+  await send(broker, rec.id, "say:back");
+  await turnEnded(store, rec.id);
+  await Bun.sleep(500);
+  expect(transport.stopped).toEqual([]);
+  expect(transport.cluster.has(sessionName(rec.id, 2))).toBe(true);
+  expect(transport.cluster.has(sessionName(rec.id, 1))).toBe(false);
+});
+
+test("close on a dormant chat while a prompt starts ends closed with no pod left", async () => {
+  const { broker, store, transport } = setup();
+  const rec = await made(broker);
+  const p = broker.prompt(rec.id, "bind-1", "say:hi");
+  await broker.close(rec.id, "user");
+  await p;
+  await Bun.sleep(300);
+  expect((await store.get(rec.id))?.state).toBe("closed");
+  expect(transport.cluster.size).toBe(0);
+});
+
+test("a state write that fails keeps the chat usable and is counted", async () => {
+  const { broker, store, metrics } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "say:one");
+  await turnEnded(store, rec.id);
+  await idleState(store, rec.id);
+  const real = store.update.bind(store);
+  let fails = 0;
+  store.update = async (id, patch, fence) => {
+    if (patch.state === "idle" && fails < 3) {
+      fails += 1;
+      throw new Error("db down");
+    }
+    return real(id, patch, fence);
+  };
+  await send(broker, rec.id, "say:two");
+  await turnEnded(store, rec.id, 2);
+  await Bun.sleep(400);
+  expect(fails).toBe(3);
+  expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="store"} 1');
+  expect((await store.get(rec.id))?.state).toBe("thinking");
+  expect(await broker.prompt(rec.id, "bind-1", "say:three")).toBeUndefined();
+  await turnEnded(store, rec.id, 3);
+});
+
+test("cuts never split a surrogate pair, count UTF-8 bytes and strip NUL", () => {
+  const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+  for (const lead of [8000, 8001, 8002, 8003, 8004, 8005]) {
+    const out = cut(`${"a".repeat(lead)}${"😀".repeat(100)}`);
+    expect(Buffer.byteLength(out)).toBeLessThanOrEqual(8192);
+    expect(lone.test(out)).toBe(false);
+    expect(out.endsWith("[truncated]")).toBe(true);
+  }
+  const cjk = cut("漢".repeat(5000));
+  expect(Buffer.byteLength(cjk)).toBeLessThanOrEqual(8192);
+  expect(cut("a\u0000b")).toBe("ab");
+  const text = `${"漢".repeat(5000)}${"😀".repeat(3000)}\u0000end`;
+  const parts = pieces(text);
+  expect(parts.every((x) => Buffer.byteLength(x) <= 8192 && !lone.test(x) && !x.includes("\u0000"))).toBe(true);
+  expect(parts.join("")).toBe(text.replaceAll("\u0000", ""));
+});
+
+test("a cancel that the agent ignores restarts the agent, shows fixed copy and the next prompt resumes", async () => {
+  const { broker, store, transport, metrics } = setup({}, { cancelGraceMs: 100 });
+  const rec = await made(broker);
+  await send(broker, rec.id, "hang");
+  await until(async () => (await store.get(rec.id))?.state === "thinking", "thinking");
+  await broker.cancel(rec.id);
+  await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
+  expect((await bodies(store, rec.id)).find((b) => b.k === "error")).toEqual({ k: "error", code: "agent_exit", message: HUNG });
+  await idleState(store, rec.id);
+  await send(broker, rec.id, "say:back");
+  await turnEnded(store, rec.id);
+  expect(transport.starts).toHaveLength(2);
+  expect(transport.written.some((l) => l.includes('"session/load"'))).toBe(true);
+  expect(metrics.render()).toContain('ais_gateway_chat_turns_total{outcome="error"} 1');
+});
+
+test("a turn with no sign of life for stallMs is restarted, and our writes count as life", async () => {
+  const { broker, store, clock } = setup({}, { stallMs: 1000, leaseTtlMs: 10 * 3_600_000, cancelGraceMs: 1_000_000_000 });
+  const rec = await made(broker);
+  await send(broker, rec.id, "hang");
+  await until(async () => (await store.get(rec.id))?.state === "thinking", "thinking");
+  clock.t += 900;
+  await broker.cancel(rec.id);
+  clock.t += 900;
+  await broker.sweepIdle();
+  expect((await bodies(store, rec.id)).some((b) => b.k === "error")).toBe(false);
+  clock.t += 200;
+  await broker.sweepIdle();
+  await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
+  expect((await bodies(store, rec.id)).find((b) => b.k === "error")).toMatchObject({ code: "agent_exit", message: HUNG });
+});
+
+test("a stalled turn with an open ask is not restarted", async () => {
+  const { broker, store, clock } = setup({}, { stallMs: 1000, leaseTtlMs: 10 * 3_600_000 });
+  const rec = await made(broker);
+  await send(broker, rec.id, "ask");
+  await permissionOf(store, rec.id);
+  clock.t += 5000;
+  await broker.sweepIdle();
+  expect((await bodies(store, rec.id)).some((b) => b.k === "error")).toBe(false);
+});
+
+test("a lease lost during an ask still marks the ask cancelled", async () => {
+  const ft = new FakeTimers();
+  const { broker, store, clock } = setup({}, { timers: ft });
+  const rec = await made(broker);
+  await send(broker, rec.id, "ask");
+  const perm = await permissionOf(store, rec.id);
+  clock.t += 61_000;
+  ft.fire(20_000);
+  await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
+  expect(await bodies(store, rec.id)).toContainEqual({ k: "permission_resolved", requestId: perm.requestId, cancelled: true });
+});
+
+test("an ask outside a turn returns the state to idle after the answer", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "lateask");
+  await turnEnded(store, rec.id);
+  const perm = await permissionOf(store, rec.id);
+  await until(async () => (await store.get(rec.id))?.state === "waiting", "waiting");
+  await broker.answerPermission(rec.id, perm.requestId, "allow");
+  await until(async () => (await store.get(rec.id))?.state === "idle", "idle again");
+});
+
+test("configure during a start reaches the new pod", async () => {
+  const { broker, store, transport } = setup({ beforeSpawn: () => Bun.sleep(150) });
+  const rec = await made(broker);
+  await send(broker, rec.id, "say:hi");
+  await broker.configure(rec.id, { model: "stub-deep" });
+  await turnEnded(store, rec.id);
+  expect(transport.starts).toHaveLength(1);
+  expect(transport.written.some((l) => l.includes('"session/set_config_option"') && l.includes("stub-deep"))).toBe(true);
+  expect((await store.get(rec.id))?.selection.model).toBe("stub-deep");
+});
+
+test("a cancel while the pod starts ends the turn and sends no session/prompt", async () => {
+  const { broker, store, transport, metrics } = setup({ beforeSpawn: () => Bun.sleep(150) });
+  const rec = await made(broker);
+  await send(broker, rec.id, "say:hi");
+  await broker.cancel(rec.id);
+  await turnEnded(store, rec.id);
+  expect(await bodies(store, rec.id)).toContainEqual({ k: "turn_end", stopReason: "cancelled" });
+  expect(transport.written.some((l) => l.includes('"session/prompt"'))).toBe(false);
+  expect(metrics.render()).toContain('ais_gateway_chat_turns_total{outcome="cancelled"} 1');
+  await send(broker, rec.id, "say:next");
+  await turnEnded(store, rec.id, 2);
+  expect(transport.written.filter((l) => l.includes('"session/prompt"'))).toHaveLength(1);
+});
+
+test("a permission option id and name are cut to 256 characters and the cut id still answers", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "longask");
+  const perm = await permissionOf(store, rec.id);
+  expect(perm.options[0]?.id).toHaveLength(256);
+  expect(perm.options[0]?.name).toHaveLength(256);
+  await broker.answerPermission(rec.id, perm.requestId, perm.options[0]?.id);
+  await turnEnded(store, rec.id);
+  expect(await bodies(store, rec.id)).toContainEqual({ k: "text", text: `chose:${"o".repeat(300)}` });
+});
+
+test("resume loads the session by the capability of the new pod, not the stored flag", async () => {
+  const { broker, store, transport } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "exit");
+  await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
+  await idleState(store, rec.id);
+  const epoch = (await store.acquireLease(rec.id, "replica-a", 60_000, 0)) as number;
+  await store.update(rec.id, { canLoad: false }, { replica: "replica-a", epoch });
+  await store.releaseLease(rec.id, { replica: "replica-a", epoch });
+  await send(broker, rec.id, "say:back");
+  await turnEnded(store, rec.id);
+  expect(transport.written.some((l) => l.includes('"session/load"'))).toBe(true);
+  expect(JSON.stringify(await bodies(store, rec.id))).not.toContain("This chat restarted");
+});
+
+test("every fenced state write is followed by a publish", async () => {
+  const order: string[] = [];
+  const { broker, store, clock } = setup({}, { idleMs: 1000, publish: () => void order.push("publish") });
+  const real = store.update.bind(store);
+  store.update = async (id, patch, fence) => {
+    const r = await real(id, patch, fence);
+    if (patch.state) order.push(`update:${patch.state}`);
+    return r;
+  };
+  const after = (mark: string): string | undefined => order[order.lastIndexOf(mark) + 1];
+  const a = await made(broker);
+  await send(broker, a.id, "exit");
+  await until(async () => (await bodies(store, a.id)).some((b) => b.k === "error"), "error item");
+  await idleState(store, a.id);
+  await Bun.sleep(100);
+  expect(after("update:idle")).toBe("publish");
+  await send(broker, a.id, "say:hi");
+  await turnEnded(store, a.id);
+  await idleState(store, a.id);
+  clock.t += 2000;
+  await broker.sweepIdle();
+  expect(after("update:idle")).toBe("publish");
+  await broker.close(a.id, "user");
+  expect(order.lastIndexOf("update:closed")).toBeGreaterThan(-1);
+  expect(after("update:closed")).toBe("publish");
+});
+
+test("cancel during an ask resolves the ask as cancelled and ends the turn", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "ask");
+  const perm = await permissionOf(store, rec.id);
+  await broker.cancel(rec.id);
+  await turnEnded(store, rec.id);
+  const all = await bodies(store, rec.id);
+  expect(all).toContainEqual({ k: "permission_resolved", requestId: perm.requestId, cancelled: true });
+  expect(all).toContainEqual({ k: "text", text: "cancelled" });
+  await idleState(store, rec.id);
+});
+
+test("an agent that exits during an ask resolves the ask as cancelled and shows agent_exit", async () => {
+  const { broker, store, transport } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "ask");
+  const perm = await permissionOf(store, rec.id);
+  transport.killAll();
+  await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
+  const all = await bodies(store, rec.id);
+  expect(all).toContainEqual({ k: "permission_resolved", requestId: perm.requestId, cancelled: true });
+  expect(all.find((b) => b.k === "error")).toMatchObject({ code: "agent_exit" });
+  await idleState(store, rec.id);
+});
+
+test("an unknown or already answered requestId changes nothing", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "ask");
+  const perm = await permissionOf(store, rec.id);
+  const before = (await bodies(store, rec.id)).length;
+  await broker.answerPermission(rec.id, "9-99", "allow");
+  await broker.answerPermission(rec.id, perm.requestId, "not-an-option-id");
+  await turnEnded(store, rec.id);
+  const resolved = (await bodies(store, rec.id)).filter((b) => b.k === "permission_resolved");
+  expect(resolved).toEqual([{ k: "permission_resolved", requestId: perm.requestId, cancelled: true }]);
+  await broker.answerPermission(rec.id, perm.requestId, "allow");
+  expect((await bodies(store, rec.id)).filter((b) => b.k === "permission_resolved")).toHaveLength(1);
+  expect(before).toBeGreaterThan(0);
 });

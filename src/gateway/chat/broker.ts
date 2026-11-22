@@ -4,7 +4,7 @@ import { CHAT_ERROR_CODES, MAX_CHATS_PER_WINDOW, sessionIdForChat, type ChatBody
 import type { ChatAuth, ChatPrincipal } from "../browser/chat-auth.ts";
 import type { GatewayMetrics } from "../metrics.ts";
 import { AcpClient, AcpError, type AcpPermission, type AcpUpdate } from "./acp.ts";
-import { cut, mergeTool, pieces, promptFailure, type ToolBody } from "./turn.ts";
+import { clean, cut, mergeTool, pieces, promptFailure, type ToolBody } from "./turn.ts";
 import { KubeHttpError } from "./kube-http.ts";
 import { sessionName, type PodHandle, type PodTransport } from "./kube.ts";
 import { PodStartError, type Timers } from "./pod-transport.ts";
@@ -21,6 +21,13 @@ const DEFAULT_LEASE_TTL_MS = 60_000;
 const DEFAULT_IDLE_MS = 2 * 3_600_000;
 const MAX_IDLE_MS = 3 * 3_600_000;
 const MAX_TOOLS_KEPT = 500;
+const DEFAULT_CANCEL_GRACE_MS = 15_000;
+const DEFAULT_STALL_MS = 30 * 60_000;
+/** The parser of the extension accepts at most this many characters in a short field. */
+const MAX_SHORT = 256;
+const HUNG_MESSAGE = "The agent did not stop. It was restarted. Send a message to continue.";
+const STATE_TRIES = 3;
+const STATE_BACKOFF_MS = 50;
 const RESTART_NOTICE = "This chat restarted. The agent does not remember earlier messages.";
 const DEFAULT_START_TIMEOUT_MS = 5 * 60_000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -40,6 +47,10 @@ export interface BrokerDeps {
   leaseTtlMs?: number;
   /** Idle time before a chat pod stops. Default 2 hours, at most 3 hours (see DEFAULT_IDLE_MS). */
   idleMs?: number;
+  /** Time after a cancel in which the agent must end the turn. Then the agent restarts. Default 15 seconds. */
+  cancelGraceMs?: number;
+  /** A turn without an ask, an update or a write to the agent for this long counts as hung. Default 30 minutes. Checked by sweepIdle. */
+  stallMs?: number;
   /** Tell the browser of a binding that a chat session ended (SESSION_END). Best effort. */
   endBrowserSession?(binding: string, sessionId: string): Promise<void>;
   /** Time limit of one pod start, from the call to the new ACP session. Default 5 minutes. */
@@ -76,6 +87,9 @@ interface Ctx {
   /** The agent ended by itself while the chat ran. */
   exited: boolean;
   cancelRequested: boolean;
+  /** Copy for the agent_exit item when the broker restarts a hung agent. */
+  exitMessage?: string;
+  cancelTimer?: unknown;
   /** True while session/load runs: the agent may replay old messages, which the feed already holds. */
   replaying: boolean;
   perms: Map<string, { options: AcpPermission["options"]; resolve(a: { optionId?: string }): void }>;
@@ -137,6 +151,10 @@ export class ChatBroker implements ChatAuth {
   private readonly starting = new Map<string, { promise: Promise<ChatRuntime | undefined>; ac: AbortController; ending?: boolean }>();
   /** Chats with a prompt that was accepted and has not ended. A second prompt gets "busy". */
   private readonly turning = new Set<string>();
+  /** Chats that a user asked to cancel while the pod was still starting. */
+  private readonly cancelledEarly = new Set<string>();
+  /** One write path per chat on this replica: starts, close, link, configure and rename run one after the other. */
+  private readonly locks = new Map<string, Promise<void>>();
   private readonly timers: Timers;
 
   constructor(private readonly d: BrokerDeps) {
@@ -145,6 +163,37 @@ export class ChatBroker implements ChatAuth {
 
   private get leaseTtl(): number {
     return this.d.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
+  }
+
+  private locked<T>(chatId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.locks.get(chatId) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.locks.set(chatId, tail);
+    void tail.then(() => {
+      if (this.locks.get(chatId) === tail) this.locks.delete(chatId);
+    });
+    return run;
+  }
+
+  /** Run a clean-up as an ending entry: a new start on this replica waits for it, so the clean-up cannot hit the new pod. */
+  private registerEnding(chatId: string, run: () => Promise<void>): void {
+    const promise: Promise<ChatRuntime | undefined> = run()
+      .catch(() => undefined)
+      .then(() => undefined)
+      .finally(() => {
+        if (this.starting.get(chatId)?.promise === promise) this.starting.delete(chatId);
+      });
+    this.starting.set(chatId, { promise, ac: new AbortController(), ending: true });
+  }
+
+  /** Write the state of a chat and tell the listeners, so the summary follows. */
+  private async writeState(chatId: string, patch: Parameters<ChatStore["update"]>[1], fence: LeaseFence): Promise<void> {
+    const rec = await this.d.store.update(chatId, patch, fence);
+    if (rec) this.d.publish(chatId, rec.lastSeq);
   }
 
   /** Events always go through the store, then out to the listeners. Returns false when the lease is lost. */
@@ -211,7 +260,7 @@ export class ChatBroker implements ChatAuth {
     if (pending?.ending) return pending.promise.then(() => this.startPod(chatId));
     if (pending) return pending.promise;
     const ac = new AbortController();
-    const promise = this.runStart(chatId, ac)
+    const promise = this.locked(chatId, () => this.runStart(chatId, ac))
       .catch(() => {
         this.d.metrics.chatError("other");
         return undefined;
@@ -282,7 +331,7 @@ export class ChatBroker implements ChatAuth {
       generation = chat.generation + 1;
       name = sessionName(chatId, generation);
       if (this.d.now() > chat.createdAt + (this.d.maxAgeMs ?? 7 * DAY_MS)) throw new ExpiredError();
-      await store.update(chatId, { state: "starting", generation }, fence);
+      await this.writeState(chatId, { state: "starting", generation }, fence);
       generationSet = true;
       // A pod from before a gateway restart must not stay next to the new one. The calls run together and end with the start deadline.
       const olds: Array<Promise<void>> = [];
@@ -298,8 +347,17 @@ export class ChatBroker implements ChatAuth {
         closedReason = r;
       });
       const ctx: Ctx = { chatId, fence, generation, chain: Promise.resolve(), busy: false, exited: false, cancelRequested: false, replaying: false, perms: new Map(), permSeq: 0, tools: new Map(), lastActive: this.d.now() };
+      // Our writes count as activity: the kubelet idle limit counts client data only.
+      const io = {
+        write: (line: string) => {
+          ctx.lastActive = this.d.now();
+          stream.write(line);
+        },
+        onLine: (cb: (line: string) => void) => stream.onLine(cb),
+        onClose: (cb: (reason: string) => void) => stream.onClose(cb),
+      };
       const acp = new AcpClient(
-        stream,
+        io,
         { onUpdate: (_s, u) => this.onUpdate(ctx, u), onPermission: (_s, p) => this.onPermission(ctx, p) },
         this.d.acpTimeoutMs === undefined ? {} : { requestTimeoutMs: this.d.acpTimeoutMs },
       );
@@ -324,7 +382,7 @@ export class ChatBroker implements ChatAuth {
       // A chat that had a session before is dormant. Load the session when the agent can, else say so and start a new one.
       if (chat.acpSessionId !== undefined) {
         let loaded = false;
-        if (chat.canLoad === true) {
+        if (caps.loadSession) {
           ctx.replaying = true;
           try {
             await acp.loadSession({ sessionId: chat.acpSessionId, cwd: handle.cwd, mcpServers });
@@ -358,18 +416,16 @@ export class ChatBroker implements ChatAuth {
       }
       await ctx.chain;
       this.timers.clearTimeout(startTimer);
-      await store.update(chatId, { state: "idle", acpSessionId: sessionId, podSession: handle.session, canLoad: caps.loadSession }, fence);
+      await this.writeState(chatId, { state: "idle", acpSessionId: sessionId, podSession: handle.session, canLoad: caps.loadSession }, fence);
       const rt: ChatRuntime = { chatId, fence, acp, handle, sessionId, generation, lease, ctx };
       lease.onLost = () => {
         const gone = this.drop(chatId);
         if (!gone) return;
-        const promise: Promise<ChatRuntime | undefined> = this.endLost(chatId, gone.handle.session, gone.generation)
-          .catch(() => undefined)
-          .then(() => undefined)
-          .finally(() => {
-            if (this.starting.get(chatId)?.promise === promise) this.starting.delete(chatId);
-          });
-        this.starting.set(chatId, { promise, ac: new AbortController(), ending: true });
+        // Answer open asks now. The items follow once the lease is back, because this fence is gone.
+        const asks = [...gone.ctx.perms.keys()];
+        for (const id of asks) gone.ctx.perms.get(id)?.resolve({});
+        gone.ctx.perms.clear();
+        this.registerEnding(chatId, () => this.endLost(chatId, gone.handle.session, gone.generation, asks));
       };
       this.runtimes.set(chatId, rt);
       kept = true;
@@ -410,7 +466,7 @@ export class ChatBroker implements ChatAuth {
    * The lease is gone. Try to take it again. With the lease back, show the failure.
    * When another replica owns the chat, end quietly and stop only our own session.
    */
-  private async endLost(chatId: string, session: string, generation: number): Promise<void> {
+  private async endLost(chatId: string, session: string, generation: number, asks: string[] = []): Promise<void> {
     const { store, transport } = this.d;
     const epoch = await store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now()).catch(() => undefined);
     if (epoch === undefined) {
@@ -421,6 +477,8 @@ export class ChatBroker implements ChatAuth {
     try {
       // A newer start or a close may have run while the lease was gone. Then this clean-up shows nothing and stops only its own session.
       const chat = await store.get(chatId);
+      // The asks that were open stay open in the feed until they are marked cancelled.
+      for (const requestId of asks) await this.emit(chatId, { k: "permission_resolved", requestId, cancelled: true }, fence).catch(() => false);
       const newer = !chat || chat.state === "closed" || (generation > 0 && (chat.generation > generation || chat.state === "failed"));
       if (newer) {
         if (session) await transport.stopSession(session).catch(() => undefined);
@@ -459,7 +517,7 @@ export class ChatBroker implements ChatAuth {
     try {
       metrics.chatError(f.kind);
       wrote = await this.emit(chatId, { k: "error", code: f.code, message: f.message }, fence);
-      if (wrote) await store.update(chatId, { state: "failed" }, fence);
+      if (wrote) await this.writeState(chatId, { state: "failed" }, fence);
       else lost = true;
     } catch (e) {
       if (e instanceof ChatLeaseLostError || e instanceof ChatClosedError) lost = true;
@@ -472,7 +530,7 @@ export class ChatBroker implements ChatAuth {
 
   /**
    * The agent ended while the chat was running. The chat stays open and goes idle: the next prompt starts a new pod and loads the session.
-   * It writes only with the lease of the runtime, and stops the whole chat only after a fenced write worked.
+   * The clean-up is an ending entry. A new start waits for it, and it stops only its own session.
    */
   private onAgentClosed(rt: ChatRuntime, reason: string): void {
     if (this.runtimes.get(rt.chatId) !== rt) return;
@@ -481,24 +539,20 @@ export class ChatBroker implements ChatAuth {
     const { ctx } = rt;
     const { store, transport, metrics } = this.d;
     ctx.exited = true;
+    this.timers.clearTimeout(ctx.cancelTimer);
     metrics.chatError("agent_exit");
     if (ctx.busy) metrics.chatTurn("error");
     this.cancelPerms(ctx);
-    const message = `The agent stopped (reason: ${EXIT_REASONS[reason] ?? "closed"}).`;
-    void (async () => {
-      let wrote = false;
+    const message = ctx.exitMessage ?? `The agent stopped (reason: ${EXIT_REASONS[reason] ?? "closed"}).`;
+    this.registerEnding(rt.chatId, async () => {
       try {
         await ctx.chain;
-        wrote = await this.emit(rt.chatId, { k: "error", code: "agent_exit", message }, rt.fence);
-        if (wrote) await store.update(rt.chatId, { state: "idle" }, rt.fence);
-      } catch {
-        wrote = false;
+        if (await this.emit(rt.chatId, { k: "error", code: "agent_exit", message }, rt.fence)) await this.writeState(rt.chatId, { state: "idle" }, rt.fence);
       } finally {
-        if (wrote) await transport.stop(rt.chatId).catch(() => undefined);
-        else await transport.stopSession(rt.handle.session).catch(() => undefined);
+        await transport.stopSession(rt.handle.session).catch(() => undefined);
         await store.releaseLease(rt.chatId, rt.fence).catch(() => undefined);
       }
-    })();
+    });
   }
 
   /** Run one write after the earlier ones of the chat. A failing write never breaks the chain. */
@@ -514,10 +568,22 @@ export class ChatBroker implements ChatAuth {
     this.queue(ctx, () => this.emit(ctx.chatId, body, ctx.fence));
   }
 
+  /** Write the state. A failed write is tried again, then counted. A lost lease or a closed chat ends the tries. */
   private setState(ctx: Ctx, state: ChatState): void {
     this.queue(ctx, async () => {
-      const rec = await this.d.store.update(ctx.chatId, { state }, ctx.fence);
-      if (rec) this.d.publish(ctx.chatId, rec.lastSeq);
+      for (let i = 1; i <= STATE_TRIES; i++) {
+        try {
+          await this.writeState(ctx.chatId, { state }, ctx.fence);
+          return;
+        } catch (e) {
+          if (e instanceof ChatLeaseLostError || e instanceof ChatClosedError) return;
+          if (i === STATE_TRIES) {
+            this.d.metrics.chatError("store");
+            return;
+          }
+          await new Promise((r) => setTimeout(r, STATE_BACKOFF_MS * i));
+        }
+      }
     });
   }
 
@@ -544,20 +610,23 @@ export class ChatBroker implements ChatAuth {
     return new Promise((resolve) => {
       const requestId = `${ctx.generation}-${++ctx.permSeq}`;
       ctx.perms.set(requestId, { options: p.options, resolve });
-      this.push(ctx, { k: "permission", requestId, rpcId: p.rpcId, title: cut(p.title), options: p.options.slice(0, 64) });
+      const short = (x: string): string => Array.from(clean(x)).slice(0, MAX_SHORT).join("");
+      const options = p.options.slice(0, 64).map((o) => ({ id: short(o.id), name: short(o.name), kind: short(o.kind) }));
+      this.push(ctx, { k: "permission", requestId, rpcId: p.rpcId, title: cut(p.title), options });
       this.setState(ctx, "waiting");
     });
   }
 
-  /** Close one permission ask. A missing or unknown option means cancelled. */
+  /** Close one permission ask. A missing or unknown option means cancelled. The panel sees option ids cut to the parser limit. */
   private resolvePerm(ctx: Ctx, requestId: string, optionId: string | undefined): void {
     const ask = ctx.perms.get(requestId);
     if (!ask) return;
     ctx.perms.delete(requestId);
-    const chosen = optionId !== undefined && ask.options.some((o) => o.id === optionId) ? optionId : undefined;
-    ask.resolve(chosen === undefined ? {} : { optionId: chosen });
-    this.push(ctx, chosen === undefined ? { k: "permission_resolved", requestId, cancelled: true } : { k: "permission_resolved", requestId, optionId: chosen });
-    if (ctx.perms.size === 0 && ctx.busy) this.setState(ctx, "thinking");
+    const short = (x: string): string => Array.from(clean(x)).slice(0, MAX_SHORT).join("");
+    const found = optionId === undefined ? undefined : ask.options.find((o) => o.id === optionId || short(o.id) === optionId);
+    ask.resolve(found === undefined ? {} : { optionId: found.id });
+    this.push(ctx, found === undefined ? { k: "permission_resolved", requestId, cancelled: true } : { k: "permission_resolved", requestId, optionId: short(found.id) });
+    if (ctx.perms.size === 0 && !ctx.exited) this.setState(ctx, ctx.busy ? "thinking" : "idle");
   }
 
   private cancelPerms(ctx: Ctx): void {
@@ -570,21 +639,29 @@ export class ChatBroker implements ChatAuth {
    */
   async prompt(chatId: string, binding: string, text: string): Promise<BrokerReject | undefined> {
     const busy: BrokerReject = { code: "busy", message: "The agent is still working on the last message." };
-    if (this.turning.has(chatId) || this.starting.has(chatId)) return busy;
+    const st = this.starting.get(chatId);
+    if (this.turning.has(chatId) || (st && !st.ending)) return busy;
     // Claim the chat before the first await, so two prompts cannot both pass.
     this.turning.add(chatId);
+    this.cancelledEarly.delete(chatId);
     let handed = false;
     try {
       const chat = await this.d.store.get(chatId);
       if (!chat || chat.binding !== binding) return { code: "bad_request", message: "This chat does not exist." };
       if (chat.state === "closed") return { code: "bad_request", message: "This chat is closed." };
-      // Another replica may run a turn. A dead replica leaves a stale state, so only a live lease counts.
-      const leased = chat.ownerReplica !== undefined && chat.leaseUntil !== undefined && chat.leaseUntil > this.d.now();
-      if ((chat.state === "thinking" || chat.state === "waiting") && leased) return busy;
-      const seq = await this.d.store.appendEvent(chatId, { k: "user", text });
+      const local = this.runtimes.get(chatId);
+      if (local) {
+        // This replica runs the agent, so its own flag is the truth. A stored state can be stale after a failed write.
+        if (local.ctx.busy) return busy;
+      } else {
+        // Another replica may run a turn. A dead replica leaves a stale state, so only a live lease counts.
+        const leased = chat.ownerReplica !== undefined && chat.leaseUntil !== undefined && chat.leaseUntil > this.d.now();
+        if ((chat.state === "thinking" || chat.state === "waiting") && leased) return busy;
+      }
+      const seq = await this.d.store.appendEvent(chatId, { k: "user", text: clean(text) });
       this.d.publish(chatId, seq);
       handed = true;
-      void this.runPrompt(chatId, text).finally(() => this.turning.delete(chatId));
+      void this.runPrompt(chatId, clean(text)).finally(() => this.turning.delete(chatId));
       return undefined;
     } finally {
       if (!handed) this.turning.delete(chatId);
@@ -594,9 +671,18 @@ export class ChatBroker implements ChatAuth {
   private async runPrompt(chatId: string, text: string): Promise<void> {
     try {
       const rt = await this.startPod(chatId);
-      if (rt) await this.runTurn(rt, text);
+      // A cancel that came while the pod started ends the turn before it begins.
+      const early = this.cancelledEarly.delete(chatId);
+      if (!rt) return;
+      if (early) {
+        this.push(rt.ctx, { k: "turn_end", stopReason: "cancelled" });
+        this.d.metrics.chatTurn("cancelled");
+        await rt.ctx.chain;
+      } else await this.runTurn(rt, text);
     } catch {
       this.d.metrics.chatError("other");
+    } finally {
+      this.cancelledEarly.delete(chatId);
     }
   }
 
@@ -625,24 +711,37 @@ export class ChatBroker implements ChatAuth {
         if (!ctx.exited) metrics.chatTurn("cancelled");
       }
     } finally {
+      this.timers.clearTimeout(ctx.cancelTimer);
       ctx.busy = false;
       ctx.cancelRequested = false;
-      if (this.runtimes.get(rt.chatId) === rt) {
-        this.cancelPerms(ctx);
-        this.setState(ctx, "idle");
-      }
+      // An ask that came after the end of the turn stays open. The answer then sets the state idle.
+      if (this.runtimes.get(rt.chatId) === rt) this.setState(ctx, ctx.perms.size > 0 ? "waiting" : "idle");
       ctx.lastActive = this.d.now();
       await ctx.chain;
     }
   }
 
-  /** Stop the current turn with ACP session/cancel. The pod stays. */
+  /** Stop the current turn with ACP session/cancel. The pod stays, unless the agent ignores the cancel (see cancelGraceMs). */
   async cancel(chatId: string): Promise<void> {
     const rt = this.runtimes.get(chatId);
-    if (!rt || !rt.ctx.busy) return;
-    rt.ctx.cancelRequested = true;
-    this.cancelPerms(rt.ctx);
+    if (!rt || !rt.ctx.busy) {
+      // The prompt is accepted but the turn has not begun: the pod is still starting.
+      if (this.turning.has(chatId)) this.cancelledEarly.add(chatId);
+      return;
+    }
+    const { ctx } = rt;
+    ctx.cancelRequested = true;
+    this.cancelPerms(ctx);
     rt.acp.cancel(rt.sessionId);
+    this.timers.clearTimeout(ctx.cancelTimer);
+    ctx.cancelTimer = this.timers.setTimeout(() => this.restartHung(rt), this.d.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS);
+  }
+
+  /** The agent did not end its turn. Close its stream: the agent_exit path sets the chat idle, and the next prompt resumes. */
+  private restartHung(rt: ChatRuntime): void {
+    if (this.runtimes.get(rt.chatId) !== rt || !rt.ctx.busy) return;
+    rt.ctx.exitMessage = HUNG_MESSAGE;
+    rt.handle.stream.close();
   }
 
   async answerPermission(chatId: string, requestId: string, optionId: string | undefined): Promise<void> {
@@ -656,47 +755,50 @@ export class ChatBroker implements ChatAuth {
     if (!rt) return undefined;
     this.runtimes.delete(chatId);
     this.stopLease(rt.lease);
+    this.timers.clearTimeout(rt.ctx.cancelTimer);
     rt.handle.stream.close();
     return rt;
   }
 
-  /** The lease of a chat for one write. A running chat uses its own fence. Another replica that owns the chat makes this throw ChatLeaseLostError. */
-  private async withFence<T>(chatId: string, fn: (fence: LeaseFence) => Promise<T>): Promise<T> {
-    const pending = this.starting.get(chatId);
-    if (pending) await pending.promise.catch(() => undefined);
-    const rt = this.runtimes.get(chatId);
-    if (rt) return fn(rt.fence);
-    const epoch = await this.d.store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now());
-    if (epoch === undefined) throw new ChatLeaseLostError(chatId);
-    const fence: LeaseFence = { replica: this.d.replicaId, epoch };
-    try {
-      return await fn(fence);
-    } finally {
-      await this.d.store.releaseLease(chatId, fence).catch(() => undefined);
-    }
+  /**
+   * The lease of a chat for one write, inside the per-chat lock. A running chat uses its own fence.
+   * Another replica that owns the chat makes this throw ChatLeaseLostError. `fn` gets the runtime as it is after the lock, so a start in progress is done.
+   */
+  private withFence<T>(chatId: string, fn: (fence: LeaseFence, rt: ChatRuntime | undefined) => Promise<T>): Promise<T> {
+    return this.locked(chatId, async () => {
+      const rt = this.runtimes.get(chatId);
+      if (rt) return fn(rt.fence, rt);
+      const epoch = await this.d.store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now());
+      if (epoch === undefined) throw new ChatLeaseLostError(chatId);
+      const fence: LeaseFence = { replica: this.d.replicaId, epoch };
+      try {
+        return await fn(fence, undefined);
+      } finally {
+        await this.d.store.releaseLease(chatId, fence).catch(() => undefined);
+      }
+    });
   }
 
   /** Set the model or effort. A running agent gets it now. A dormant chat gets it at the next start. */
   async configure(chatId: string, patch: { model?: string; effort?: string }): Promise<void> {
-    const clean = { ...(patch.model !== undefined ? { model: patch.model } : {}), ...(patch.effort !== undefined ? { effort: patch.effort } : {}) };
-    if (Object.keys(clean).length === 0) return;
-    const rt = this.runtimes.get(chatId);
-    if (rt) {
-      try {
-        await rt.acp.setConfig(rt.sessionId, clean);
-      } catch {
-        this.d.metrics.chatError("acp");
-        this.push(rt.ctx, { k: "error", code: "acp", message: "The agent did not accept this setting." });
-        return;
-      }
-    }
-    await this.withFence(chatId, async (fence) => {
+    const want = { ...(patch.model !== undefined ? { model: patch.model } : {}), ...(patch.effort !== undefined ? { effort: patch.effort } : {}) };
+    if (Object.keys(want).length === 0) return;
+    await this.withFence(chatId, async (fence, rt) => {
       const chat = await this.d.store.get(chatId);
       if (!chat || chat.state === "closed") return;
-      await this.d.store.update(chatId, { selection: { ...chat.selection, ...clean } }, fence);
+      if (rt) {
+        try {
+          await rt.acp.setConfig(rt.sessionId, want);
+        } catch {
+          this.d.metrics.chatError("acp");
+          this.push(rt.ctx, { k: "error", code: "acp", message: "The agent did not accept this setting." });
+          return;
+        }
+      }
+      await this.d.store.update(chatId, { selection: { ...chat.selection, ...want } }, fence);
       if (rt) {
         const base = rt.ctx.config ?? { k: "config" as const, models: [], efforts: [], current: {} };
-        const body = { ...base, current: { ...base.current, ...clean } };
+        const body = { ...base, current: { ...base.current, ...want } };
         rt.ctx.config = body;
         this.push(rt.ctx, body);
         await rt.ctx.chain;
@@ -724,62 +826,73 @@ export class ChatBroker implements ChatAuth {
       pending.ac.abort();
       await pending.promise.catch(() => undefined);
     }
-    const rt = this.runtimes.get(chatId);
-    await this.withFence(chatId, async (fence) => {
-      const chat = await this.d.store.get(chatId);
-      if (!chat || chat.state === "closed") return;
-      if (rt) {
-        this.cancelPerms(rt.ctx);
-        await rt.ctx.chain;
-        this.drop(chatId);
-      }
+    await this.withFence(chatId, async (fence, rt) => {
       try {
-        if (reason !== "user") await this.emit(chatId, { k: "notice", text: reason === "idle" ? "This chat closed after a long time without use." : "This chat is too old and was closed." }, fence);
-        await this.d.store.update(chatId, { state: "closed" }, fence);
-      } catch (e) {
-        // No proof of ownership: stop only our own pod.
-        if (rt) await this.d.transport.stopSession(rt.handle.session).catch(() => undefined);
-        throw e;
+        const chat = await this.d.store.get(chatId);
+        if (!chat || chat.state === "closed") return;
+        if (rt) {
+          this.cancelPerms(rt.ctx);
+          await rt.ctx.chain;
+          this.drop(chatId);
+        }
+        try {
+          if (reason !== "user") await this.emit(chatId, { k: "notice", text: reason === "idle" ? "This chat closed after a long time without use." : "This chat is too old and was closed." }, fence);
+          await this.writeState(chatId, { state: "closed" }, fence);
+        } catch (e) {
+          // No proof of ownership: stop only our own pod.
+          if (rt) await this.d.transport.stopSession(rt.handle.session).catch(() => undefined);
+          throw e;
+        }
+        await this.d.transport.stop(chatId).catch(() => undefined);
+        await this.d.endBrowserSession?.(chat.binding, sessionIdForChat(chatId)).catch(() => undefined);
+        this.d.metrics.chatSession("session_closed");
+      } finally {
+        if (rt) await this.d.store.releaseLease(chatId, rt.fence).catch(() => undefined);
       }
-      await this.d.transport.stop(chatId).catch(() => undefined);
-      await this.d.endBrowserSession?.(chat.binding, sessionIdForChat(chatId)).catch(() => undefined);
-      this.d.metrics.chatSession("session_closed");
-    }).finally(async () => {
-      if (rt) await this.d.store.releaseLease(chatId, rt.fence).catch(() => undefined);
     });
   }
 
   /**
    * End the pod of every chat that was idle for idleMs. The chat stays open and goes dormant: the next prompt starts a pod and loads the session.
-   * A chat with a turn, a start or a pending ask is never swept.
+   * A chat with a turn, a start or a pending ask is never swept for idleness.
+   * A turn that shows no sign of life for stallMs is restarted like a hung cancel.
    */
   async sweepIdle(): Promise<void> {
     const limit = Math.min(this.d.idleMs ?? DEFAULT_IDLE_MS, MAX_IDLE_MS);
+    const stall = this.d.stallMs ?? DEFAULT_STALL_MS;
+    const ending: Array<Promise<unknown>> = [];
     for (const rt of [...this.runtimes.values()]) {
       const { ctx } = rt;
-      if (ctx.busy || ctx.perms.size > 0 || this.turning.has(rt.chatId) || this.starting.has(rt.chatId)) continue;
-      if (this.d.now() - ctx.lastActive < limit) continue;
-      await this.idleEnd(rt);
+      const quiet = this.d.now() - ctx.lastActive;
+      if (ctx.busy) {
+        if (ctx.perms.size === 0 && quiet >= stall) this.restartHung(rt);
+        continue;
+      }
+      if (ctx.perms.size > 0 || this.turning.has(rt.chatId) || this.starting.has(rt.chatId)) continue;
+      if (quiet < limit) continue;
+      this.idleEnd(rt);
+      const e = this.starting.get(rt.chatId);
+      if (e) ending.push(e.promise);
     }
+    await Promise.all(ending);
+    // A restarted agent ends through its stream close. Wait for the clean-up that it started.
+    await Promise.all([...this.starting.values()].filter((e) => e.ending).map((e) => e.promise));
   }
 
-  private async idleEnd(rt: ChatRuntime): Promise<void> {
+  private idleEnd(rt: ChatRuntime): void {
     if (this.runtimes.get(rt.chatId) !== rt) return;
     const { store, transport, metrics } = this.d;
-    await rt.ctx.chain;
     this.drop(rt.chatId);
-    let wrote = false;
-    try {
-      wrote = await this.emit(rt.chatId, { k: "notice", text: "The agent stopped after a long time without use. Send a message to continue." }, rt.fence);
-      if (wrote) await store.update(rt.chatId, { state: "idle" }, rt.fence);
-    } catch {
-      wrote = false;
-    } finally {
-      if (wrote) await transport.stop(rt.chatId).catch(() => undefined);
-      else await transport.stopSession(rt.handle.session).catch(() => undefined);
-      await store.releaseLease(rt.chatId, rt.fence).catch(() => undefined);
-    }
     metrics.chatSession("idle_closed");
+    this.registerEnding(rt.chatId, async () => {
+      try {
+        await rt.ctx.chain;
+        if (await this.emit(rt.chatId, { k: "notice", text: "The agent stopped after a long time without use. Send a message to continue." }, rt.fence)) await this.writeState(rt.chatId, { state: "idle" }, rt.fence);
+      } finally {
+        await transport.stopSession(rt.handle.session).catch(() => undefined);
+        await store.releaseLease(rt.chatId, rt.fence).catch(() => undefined);
+      }
+    });
   }
 
   /** Stop all work of this broker: running starts, streams and lease timers. */

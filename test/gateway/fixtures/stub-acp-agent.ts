@@ -48,6 +48,22 @@ async function runPrompt(id: string | number, sessionId: string, text: string) {
     return done();
   }
   if (text === "limit") return send({ jsonrpc: "2.0", id, error: { code: -32000, message: "Rate limit reached. Resets at 2023-11-15T00:00:00Z" } });
+  if (text === "hang") return;
+  if (text === "lateask") {
+    done();
+    const rpcId = `perm-${nextOut++}`;
+    send({ jsonrpc: "2.0", id: rpcId, method: "session/request_permission", params: { sessionId, toolCall: { toolCallId: "tc9", title: "Late" }, options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }] } });
+    return;
+  }
+  if (text === "longask") {
+    const long = "o".repeat(300);
+    const rpcId = `perm-${nextOut++}`;
+    const answer = new Promise<any>((resolve) => replies.set(rpcId, resolve));
+    send({ jsonrpc: "2.0", id: rpcId, method: "session/request_permission", params: { sessionId, toolCall: { toolCallId: "tc8", title: "Long" }, options: [{ optionId: long, name: "n".repeat(300), kind: "allow_once" }] } });
+    const r = await answer;
+    chunk(sessionId, r?.outcome?.outcome === "selected" ? `chose:${r.outcome.optionId}` : "cancelled");
+    return done();
+  }
   if (text === "ask") {
     const rpcId = `perm-${nextOut++}`;
     const answer = new Promise<any>((resolve) => replies.set(rpcId, resolve));

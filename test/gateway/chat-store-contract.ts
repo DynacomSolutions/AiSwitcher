@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { cut } from "../../src/gateway/chat/turn.ts";
 import type { ChatBody } from "../../src/browser/chat-protocol.ts";
 import {
   ChatClosedError,
@@ -72,6 +73,16 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect(err).toBeInstanceOf(ChatExistsError);
     expect(await s.get(id)).toEqual(first);
     expect(await s.events(id, 0, 10)).toHaveLength(1);
+  });
+
+  test("multibyte text and cut text round-trip unchanged", async () => {
+    const s = await make();
+    const { id, fence } = await owned(s);
+    const texts = ["😀漢字é".repeat(2000), cut(`${"a".repeat(8001)}${"😀".repeat(100)}`), cut("x\u0000y".repeat(10)), cut("漢".repeat(6000))];
+    for (const text of texts) await s.appendEvent(id, { k: "text", text }, fence);
+    const rows = await s.events(id, 0, 10);
+    expect(rows.map((r) => (r.body as { text: string }).text)).toEqual(texts);
+    expect(texts[2]).not.toContain("\u0000");
   });
 
   test("appendEvent returns 1, 2, 3 under 20 concurrent appends with no duplicate", async () => {

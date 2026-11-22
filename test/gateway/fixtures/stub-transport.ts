@@ -27,6 +27,8 @@ export interface StubTransportOptions {
   failStopSession?: boolean;
   /** stopSession never finishes. */
   hangStopSession?: boolean;
+  /** stopSession waits this long before it deletes the session. */
+  stopSessionDelayMs?: number;
 }
 
 export class StubPodTransport implements PodTransport {
@@ -116,6 +118,7 @@ export class StubPodTransport implements PodTransport {
 
   async stopSession(session: string): Promise<void> {
     this.stoppedSessions.push(session);
+    if (this.opts.stopSessionDelayMs) await new Promise((r) => setTimeout(r, this.opts.stopSessionDelayMs));
     if (this.opts.hangStopSession) await new Promise<void>(() => undefined);
     if (this.opts.failStopSession) throw new Error("stop failed");
     this.cluster.delete(session);
