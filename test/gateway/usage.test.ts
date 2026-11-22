@@ -162,6 +162,77 @@ describe("usage tap edge cases", () => {
   });
 });
 
+describe("errors inside a 200 body", () => {
+  const enc = new TextEncoder();
+  const feed = (style: UsageStyle, text: string, ct = "text/event-stream", size = 7) => {
+    const t = new UsageTap(style, ct);
+    const b = enc.encode(text);
+    for (let i = 0; i < b.length; i += size) t.write(b.subarray(i, i + size));
+    return t;
+  };
+
+  test("responses `error` event keeps type, code and message", () => {
+    const t = feed("openai-responses", 'event: error\ndata: {"type":"error","code":"server_error","message":"The model failed SYNTHETIC_FIXTURE","param":null}\n\n');
+    expect(t.streamError()).toEqual({ event: "error", code: "server_error", message: "The model failed SYNTHETIC_FIXTURE" });
+  });
+
+  test("responses `response.failed` reads the nested error and the response id", () => {
+    const t = feed("openai-responses", 'data: {"type":"response.failed","response":{"id":"resp_abc","status":"failed","error":{"code":"rate_limit_exceeded","message":"Slow down"}}}\n\n');
+    expect(t.streamError()).toEqual({ event: "response.failed", code: "rate_limit_exceeded", message: "Slow down", requestId: "resp_abc" });
+  });
+
+  test("responses `response.failed` without an error object is still an error", () => {
+    expect(feed("openai-responses", 'data: {"type":"response.failed","response":{"status":"failed"}}\n\n').streamError()).toEqual({ event: "response.failed" });
+  });
+
+  test("an error event with no message is still found", () => {
+    expect(feed("openai-responses", 'data: {"type":"error"}\n\n').streamError()).toEqual({ event: "error" });
+    expect(feed("anthropic", 'event: error\ndata: {"type":"error"}\n\n').streamError()).toEqual({ event: "error" });
+    expect(feed("openai-chat", 'data: {"error":{"code":"x"}}\n\n').streamError()).toEqual({ event: "error", code: "x" });
+  });
+
+  test("anthropic `event: error` keeps error type, message and request id", () => {
+    const t = feed("anthropic", 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_123"}\n\n');
+    expect(t.streamError()).toEqual({ event: "error", type: "overloaded_error", message: "Overloaded", requestId: "req_123" });
+  });
+
+  test("anthropic error event named only by its SSE event line", () => {
+    expect(feed("anthropic", 'event: error\ndata: {"error":{"type":"api_error","message":"boom"}}\n\n').streamError()).toMatchObject({ event: "error", type: "api_error", message: "boom" });
+  });
+
+  test("chat completions error chunk", () => {
+    const t = feed("openai-chat", 'data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"hi"}}]}\n\ndata: {"error":{"message":"upstream timeout","type":"server_error","code":"timeout"}}\n\n');
+    expect(t.streamError()).toEqual({ event: "error", type: "server_error", code: "timeout", message: "upstream timeout" });
+  });
+
+  test("chat completions error as a plain string, and a failed non-streamed responses body", () => {
+    expect(feed("openai-chat", 'data: {"error":"bad gateway"}\n\n').streamError()).toEqual({ event: "error", message: "bad gateway" });
+    const body = '{"object":"response","status":"failed","error":{"code":"server_error","message":"x"}}';
+    expect(feed("openai-responses", body, "application/json", 11).streamError()).toEqual({ event: "response.failed", code: "server_error", message: "x" });
+  });
+
+  test("healthy streams and null errors are not errors", () => {
+    expect(feed("openai-responses", 'data: {"type":"response.completed","response":{"model":"gpt-5","error":null,"usage":{"input_tokens":1,"output_tokens":1}}}\n\n').streamError()).toBeUndefined();
+    expect(feed("openai-chat", 'data: {"error":null,"choices":[]}\n\ndata: [DONE]\n\n').streamError()).toBeUndefined();
+    expect(feed("openai-chat", 'data: {"error":{}}\n\n').streamError()).toBeUndefined();
+    expect(feed("anthropic", 'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n').streamError()).toBeUndefined();
+  });
+
+  test("the first error wins, the message is redacted and cut, and counts stay readable", () => {
+    const long = `${"word ".repeat(200)}Bearer SYNTHETIC_FIXTURE_abcdefgh`;
+    const t = feed("openai-responses", `data: {"type":"error","message":${JSON.stringify(long)}}\n\ndata: {"type":"error","message":"second"}\n\n`);
+    const e = t.streamError()!;
+    expect(e.message!.length).toBeLessThanOrEqual(300);
+    expect(e.message).not.toContain("second");
+    expect(feed("openai-responses", 'data: {"type":"error","message":"auth Bearer SYNTHETIC_FIXTURE_abcdefgh"}\n\n').streamError()!.message).toBe("auth Bearer [redacted]");
+  });
+
+  test("an event name does not leak into the next event", () => {
+    expect(feed("anthropic", 'event: error\ndata: {"type":"error"}\n\nevent: ping\ndata: {"type":"ping"}\n\n').streamError()).toEqual({ event: "error" });
+    expect(feed("anthropic", 'event: ping\ndata: {"type":"ping"}\n\n').streamError()).toBeUndefined();
+  });
+});
+
 describe("estimateCost", () => {
   const c = { model: "glm-4.6", inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0 };
   test("unknown model or missing model is undefined", () => {

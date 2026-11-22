@@ -1949,3 +1949,58 @@ describe("upstream errors in the request log", () => {
     expect(logs.join("\n")).not.toContain("192.0.2.1");
   });
 });
+
+describe("errors inside a 200 stream", () => {
+  const events = (name: string): Array<Record<string, unknown>> => logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return {}; } }).filter((l) => l.event === name);
+  let counted: Array<{ app: string; provider: string; event: string; errorType?: string | undefined }>;
+  let requested: Array<{ status: string; httpStatus: number }>;
+  beforeEach(() => {
+    counted = [];
+    requested = [];
+    deps.metrics = { ...noopMetrics, request: (e) => void requested.push({ status: e.status, httpStatus: e.httpStatus }), streamError: (e) => void counted.push(e) };
+  });
+
+  const cases: Array<[string, Partial<GatewayApp>, string, string, Record<string, unknown>]> = [
+    ["responses error", { provider: "codex", style: "responses" as never }, "/s/v1/responses", 'event: error\ndata: {"type":"error","code":"server_error","message":"The model failed"}\n\n', { type: "error", code: "server_error", message: "The model failed" }],
+    ["responses response.failed", { provider: "codex", style: "responses" as never }, "/s/v1/responses", 'data: {"type":"response.created","response":{"model":"gpt-6.2-sol"}}\n\ndata: {"type":"response.failed","response":{"id":"resp_1","error":{"code":"rate_limit_exceeded","message":"Slow down"}}}\n\n', { type: "response.failed", code: "rate_limit_exceeded", message: "Slow down", requestId: "resp_1" }],
+    ["responses error without message", { provider: "codex", style: "responses" as never }, "/s/v1/responses", 'data: {"type":"error"}\n\n', { type: "error" }],
+    ["chat completions error chunk", { provider: "kimi", style: "openai" }, "/s/v1/chat/completions", 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: {"error":{"message":"upstream timeout","type":"server_error","code":"timeout"}}\n\n', { type: "error", errorType: "server_error", code: "timeout", message: "upstream timeout" }],
+    ["anthropic event: error", { provider: "claude", style: "anthropic" }, "/s/v1/messages", 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_9"}\n\n', { type: "error", errorType: "overloaded_error", message: "Overloaded", requestId: "req_9" }],
+  ];
+
+  for (const [name, over, path, sse, want] of cases) {
+    test(`${name}: bytes unchanged, one log line, a metric, status stream_error`, async () => {
+      const t = await addApp(baseApp({ name: "s", ...over }));
+      handler = () => new Response(sse, { headers: { "content-type": "text/event-stream", "x-request-id": "up-123" } });
+      const res = await call(path, t, { method: "POST", body: JSON.stringify({ model: "m1", stream: true, messages: [{ role: "user", content: "PROMPT_SECRET_TEXT" }] }) });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(sse);
+      const lines = events("stream_error");
+      expect(lines.length).toBe(1);
+      expect(lines[0]).toMatchObject({ app: "s", upstream: over.provider, http: 200, requestId: "up-123", ...want });
+      expect(JSON.stringify(logs)).not.toContain("PROMPT_SECRET_TEXT");
+      expect(counted.length).toBe(1);
+      expect(counted[0]).toMatchObject({ app: "s", provider: over.provider, event: want.type });
+      expect(requested).toEqual([{ status: "stream_error", httpStatus: 200 }]);
+      expect((await rows())[0]).toMatchObject({ status: "stream_error", httpStatus: 200 });
+      expect(events("request")[0]).toMatchObject({ status: "stream_error", http: 200 });
+    });
+  }
+
+  test("a healthy stream stays ok and logs no stream error", async () => {
+    const t = await addApp(baseApp({ name: "s" }));
+    handler = () => new Response('event: message_start\ndata: {"type":"message_start","message":{"model":"m","usage":{"input_tokens":1,"output_tokens":1}}}\n\n', { headers: { "content-type": "text/event-stream" } });
+    await call("/s/v1/messages", t, { method: "POST", body: "{}" });
+    expect(events("stream_error").length).toBe(0);
+    expect(counted.length).toBe(0);
+    expect(requested).toEqual([{ status: "ok", httpStatus: 200 }]);
+  });
+
+  test("an HTTP error body is an upstream_error, not a stream error", async () => {
+    const t = await addApp(baseApp({ name: "s" }));
+    handler = () => new Response('{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}', { status: 400, headers: { "content-type": "application/json" } });
+    await call("/s/v1/messages", t, { method: "POST", body: "{}" });
+    expect(events("stream_error").length).toBe(0);
+    expect(requested).toEqual([{ status: "upstream_error", httpStatus: 400 }]);
+  });
+});

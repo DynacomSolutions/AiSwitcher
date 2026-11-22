@@ -29,6 +29,8 @@ export interface GatewayMetrics {
   browserPairing(): void;
   /** Media parts replaced by a text note because the provider refused the file they name (media-recovery.ts). */
   mediaRemoved?(app: string, parts: number): void;
+  /** An error event inside a response that began with HTTP 200 (stream or body). Labels are bounded by the implementation. */
+  streamError?(e: { app: string; provider: string; event: string; errorType?: string | undefined }): void;
   /** Requests currently queued for request-body budget. */
   bodyBudgetWaiting?(n: number): void;
   /** Seconds a request waited for body budget (0 when it did not have to wait). */
@@ -109,6 +111,8 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly failOpens = new Counter("ais_gateway_fail_open_total", "Safety checks skipped so the request could proceed.");
   private readonly mediaRemovals = new Counter("ais_gateway_media_removed_total", "Media parts replaced by a text note because the provider refused the file they name.");
   private readonly unreadable = new Counter("ais_gateway_credential_unreadable_total", "Credential reads that failed at warm-up, per app identity.");
+  private readonly streamErrors = new Counter("ais_gateway_stream_errors_total", "Error events inside a response that began with HTTP 200, by app, provider, event and error type.");
+  private readonly streamErrorTypes = new Set<string>();
   private readonly browserCalls = new Counter("ais_gateway_browser_calls_total", "Browser tool calls by tool and outcome.");
   private readonly browserMcpRequests = new Counter("ais_gateway_browser_mcp_requests_total", "Browser MCP endpoint requests by JSON-RPC method and outcome.");
   private readonly browserPairings = new Counter("ais_gateway_browser_pairings_total", "Browser pairings completed.");
@@ -131,7 +135,10 @@ export class PrometheusMetrics implements GatewayMetrics {
   private durationCount = 0;
   private durationSum = 0;
 
-  constructor(private readonly gauges: { ledgerDepth(): number; ledgerDropped(): number }) {}
+  constructor(private readonly gauges: { ledgerDepth(): number; ledgerDropped(): number }) {
+    // A zero sample, so the series exists (and its first real increase is visible to rate()) before any stream fails.
+    this.streamErrors.inc({ app: "-", provider: "-", event: "none", error_type: "none" }, 0);
+  }
 
   request(e: Parameters<GatewayMetrics["request"]>[0]): void {
     const base = { app: e.app, provider: e.provider, identity: e.identity };
@@ -164,6 +171,17 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   failOpen(app: string, reason: "cap_check_failed" | "side_count_failed"): void {
     this.failOpens.inc({ app, reason });
+  }
+  /** `event` and `errorType` come from the provider; both are cut to a safe label, and past 40 distinct error types the rest count as "other". */
+  streamError(e: { app: string; provider: string; event: string; errorType?: string | undefined }): void {
+    const safe = (v: string | undefined, fallback: string): string => (v && /^[A-Za-z0-9_.-]{1,40}$/.test(v) ? v.toLowerCase() : fallback);
+    const event = safe(e.event, "other");
+    let errorType = safe(e.errorType, e.errorType ? "other" : "none");
+    if (!this.streamErrorTypes.has(errorType)) {
+      if (this.streamErrorTypes.size >= 40) errorType = "other";
+      else this.streamErrorTypes.add(errorType);
+    }
+    this.streamErrors.inc({ app: e.app, provider: e.provider, event, error_type: errorType });
   }
   mediaRemoved(app: string, parts: number): void {
     this.mediaRemovals.inc({ app }, parts);
@@ -263,7 +281,7 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings]) out.push(...c.render());
     for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));

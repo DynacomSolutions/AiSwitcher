@@ -522,6 +522,30 @@ describe("error shapes", () => {
   });
 });
 
+describe("stream error metric", () => {
+  const metrics = () => new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+
+  test("a zero series exists before any error, then counts per app, provider, event and error type", () => {
+    const m = metrics();
+    expect(m.render()).toContain('ais_gateway_stream_errors_total{app="-",provider="-",event="none",error_type="none"} 0');
+    m.streamError({ app: "headlamp-agent-codex2", provider: "codex", event: "response.failed", errorType: undefined });
+    m.streamError({ app: "headlamp-agent-codex2", provider: "codex", event: "response.failed", errorType: undefined });
+    m.streamError({ app: "k", provider: "claude", event: "error", errorType: "overloaded_error" });
+    const out = m.render();
+    expect(out).toContain('ais_gateway_stream_errors_total{app="headlamp-agent-codex2",provider="codex",event="response.failed",error_type="none"} 2');
+    expect(out).toContain('ais_gateway_stream_errors_total{app="k",provider="claude",event="error",error_type="overloaded_error"} 1');
+  });
+
+  test("provider text never becomes an unbounded label", () => {
+    const m = metrics();
+    m.streamError({ app: "a", provider: "codex", event: "error", errorType: 'bad "type" with spaces\nand a very long tail'.repeat(5) });
+    for (let i = 0; i < 60; i++) m.streamError({ app: "a", provider: "codex", event: "error", errorType: `t${i}` });
+    const out = m.render();
+    expect(out).toContain('error_type="other"');
+    expect(out.split("\n").filter((l) => l.startsWith("ais_gateway_stream_errors_total{")).length).toBeLessThanOrEqual(43);
+  });
+});
+
 describe("alert recovery", () => {
   test("a 200 for the identity clears its alert, so a later failure alerts again", () => {
     const seen: string[] = [];

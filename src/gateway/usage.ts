@@ -2,6 +2,7 @@ import "../identities/model-price-source.ts";
 import { estimateChatModelTokenCost, estimateDetailedModelTokenCost } from "../identities/model-pricing.ts";
 import type { UsageStyle } from "./providers/index.ts";
 import type { GatewayProvider } from "./types.ts";
+import { redactText, summariseErrorJson, type UpstreamErrorSummary } from "./upstream-error.ts";
 
 /**
  * Token counts for one upstream response.
@@ -37,6 +38,20 @@ type Obj = Record<string, unknown>;
 
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
 
+/**
+ * An error the provider reported inside a response that began with HTTP 200 (the status is already sent, so the
+ * stream carries the failure instead). `event` is the event's own type (`error`, `response.failed`), else its SSE
+ * event name, else `error`. Fields come from the provider's error object only, cut short and redacted; no prompt
+ * or output text is ever held.
+ */
+export interface StreamErrorEvent extends UpstreamErrorSummary {
+  event: string;
+  requestId?: string;
+}
+
+const EVENT_NAME_MAX = 40;
+const text = (v: unknown): string | undefined => (typeof v === "string" && v.trim() !== "" ? v : undefined);
+
 function num(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined;
 }
@@ -69,6 +84,8 @@ export class UsageTap {
   private data: string[] = [];
   private dataBytes = 0;
   private eventTooBig = false;
+  private eventName = "";
+  private streamErr: StreamErrorEvent | undefined;
 
   constructor(private readonly style: UsageStyle, contentType: string) {
     const ct = contentType.toLowerCase();
@@ -88,6 +105,12 @@ export class UsageTap {
     } catch {
       // Observation must never affect the response.
     }
+  }
+
+  /** The first error the response carried inside its body (HTTP 200 with an `error` or `response.failed` event, a Chat Completions error chunk, an Anthropic `event: error`). */
+  streamError(): StreamErrorEvent | undefined {
+    this.result();
+    return this.streamErr;
   }
 
   /** True when the body is being read as SSE (named by the upstream or sniffed). */
@@ -214,7 +237,11 @@ export class UsageTap {
       this.dispatch();
       return;
     }
-    if (!line.startsWith("data:")) return; // comments, event:, id:, retry:
+    if (line.startsWith("event:")) {
+      this.eventName = line.slice(6).trim().slice(0, EVENT_NAME_MAX);
+      return;
+    }
+    if (!line.startsWith("data:")) return; // comments, id:, retry:
     let v = line.slice(5);
     if (v.startsWith(" ")) v = v.slice(1);
     this.dataBytes += v.length + 1; // count the newline so empty lines are bounded too
@@ -230,6 +257,8 @@ export class UsageTap {
   private dispatch(): void {
     const data = this.data;
     const skip = this.eventTooBig;
+    const eventName = this.eventName;
+    this.eventName = "";
     this.data = [];
     this.dataBytes = 0;
     this.eventTooBig = false;
@@ -237,20 +266,49 @@ export class UsageTap {
     const joined = data.join("\n");
     if (joined === "[DONE]") return;
     try {
-      this.apply(JSON.parse(joined));
+      this.apply(JSON.parse(joined), eventName);
     } catch {
       this.bad = true; // Not JSON: ignore the event.
     }
   }
 
-  private apply(root: unknown): void {
+  private apply(root: unknown, eventName = ""): void {
     if (!isObj(root)) {
       this.bad = true;
       return;
     }
+    this.noteError(root, eventName);
     if (this.style === "anthropic") this.applyAnthropic(root);
     else if (this.style === "openai-responses") this.applyResponses(root);
     else this.applyChat(root);
+  }
+
+  /**
+   * Remembers the first error event, whatever the API style: Responses `{type:"error",code,message}` and
+   * `{type:"response.failed",response:{error}}`, Anthropic `event: error` with `{type:"error",error:{type,message}}`,
+   * and Chat Completions `{error:{message,type,code}}` (also a failed non-streamed Responses body). A null or empty
+   * `error` field is not an error.
+   */
+  private noteError(root: Obj, eventName: string): void {
+    if (this.streamErr) return;
+    const type = text(root.type);
+    let source: Obj | undefined;
+    let event: string;
+    if (type === "error" || eventName === "error") {
+      source = root;
+      event = type ?? "error";
+    } else if (type === "response.failed") {
+      const r = isObj(root.response) ? root.response : undefined;
+      source = r && (isObj(r.error) || text(r.error)) ? { error: r.error } : {};
+      event = type;
+    } else if (type === undefined && (isObj(root.error) || text(root.error) !== undefined) && !(isObj(root.error) && Object.keys(root.error).length === 0)) {
+      source = root;
+      event = eventName || (root.object === "response" ? "response.failed" : "error");
+    } else return;
+    const found: StreamErrorEvent = { event: redactText(event, EVENT_NAME_MAX), ...(summariseErrorJson(source) ?? {}) };
+    const rid = text(root.request_id) ?? (isObj(root.response) ? text(root.response.id) : undefined) ?? text(root.id);
+    if (rid) found.requestId = redactText(rid, 80);
+    this.streamErr = found;
   }
 
   private setModel(v: unknown): void {

@@ -411,6 +411,15 @@ async function discard(res: Response): Promise<void> {
   }
 }
 
+/** The upstream's own id for the request, from its response headers, for the stream error log line. */
+function upstreamRequestId(h: Headers): string | undefined {
+  for (const name of ["x-request-id", "request-id", "openai-request-id", "x-oai-request-id"]) {
+    const v = h.get(name);
+    if (v) return redactText(v, 80);
+  }
+  return undefined;
+}
+
 /** Set on every response the gateway app itself produces. A 5xx without it came from an edge in front (for example "no healthy upstream" during a restart). */
 export const GATEWAY_MARK_HEADER = "x-ais-gateway";
 
@@ -1209,7 +1218,19 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const finish = (status: string): void => {
     req.signal.removeEventListener("abort", onAbort);
     const counts = tap.result();
-    record(identity, status, httpStatus, counts, tap.isSse(), tap.status(), model, mediaRemoved > 0 ? "media_removed" : undefined, errorPeek?.summary());
+    // An error inside a 200 answer: the status line said success, the body said otherwise. It is logged and counted, and
+    // a request that would have been "ok" is recorded as "stream_error" (the bytes the client got are unchanged).
+    const inBody = httpStatus < 400 && !recorded ? tap.streamError() : undefined;
+    if (inBody) {
+      try {
+        const requestId = inBody.requestId ?? upstreamRequestId(up.headers);
+        deps.metrics.streamError?.({ app: app.name, provider: app.provider, event: inBody.event, errorType: inBody.type });
+        log(JSON.stringify({ event: "stream_error", app: app.name, upstream: app.provider, style: adapter.usageStyle(style), ...(counts.model ?? model ? { model: counts.model ?? model } : {}), http: httpStatus, type: inBody.event, ...(inBody.type ? { errorType: inBody.type } : {}), ...(inBody.code ? { code: inBody.code } : {}), ...(inBody.message ? { message: inBody.message } : {}), ...(requestId ? { requestId } : {}) }));
+      } catch {
+        // Observation must never affect the response.
+      }
+    }
+    record(identity, inBody && status === "ok" ? "stream_error" : status, httpStatus, counts, tap.isSse(), tap.status(), model, mediaRemoved > 0 ? "media_removed" : undefined, errorPeek?.summary());
   };
 
   if (!up.body) {
