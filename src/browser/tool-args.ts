@@ -18,8 +18,10 @@ export const MAX_UPLOAD_FILES = 10;
 
 export interface ToolArgs {
   tabs_context: Record<string, never>;
-  tabs_create: { url?: string; groupId?: number };
+  tabs_create: { url?: string; groupId?: number; splitWithTabId?: number };
   adopt_tab: TabArgs;
+  split_tabs: { tabIds: [number, number] };
+  unsplit_tabs: TabArgs;
   navigate: TabArgs & { url: string };
   screenshot: TabArgs;
   read_page: TabArgs & { filter?: "interactive" | "all" };
@@ -65,8 +67,10 @@ function obj(properties: Record<string, JsonSchema>, required: string[] = []): J
 
 export const TOOL_SCHEMAS: Record<ExtensionTool, { description: string; inputSchema: JsonSchema }> = {
   tabs_context: { description: "List the tabs this session owns or was granted (actionable; scope own or granted) and the user's other tabs (read-only, adopt with adopt_tab).", inputSchema: obj({}) },
-  tabs_create: { description: "Open a new tab in this session's tab group and return its tabId. Pass groupId to open it inside a tab group the user granted to this session instead. Keep the tab open while the user must act in it. Close it with close_tab only when the work in it is finished.", inputSchema: obj({ url: { type: "string", description: "Optional URL to open." }, groupId: { type: "number", description: "Optional id of a granted group (see grantedGroups in tabs_context)." } }) },
+  tabs_create: { description: "Open a new tab in this session's tab group and return its tabId. Pass groupId to open it inside a tab group the user granted to this session instead. Keep the tab open while the user must act in it. Close it with close_tab only when the work in it is finished.", inputSchema: obj({ url: { type: "string", description: "Optional URL to open." }, groupId: { type: "number", description: "Optional id of a granted group (see grantedGroups in tabs_context)." }, splitWithTabId: { type: "number", description: "Optional id of a tab of this session. The new tab opens next to it in a split view (two tabs side by side), in the same group, and stays in the background. Needs Chrome 155 or later. Do not use together with groupId." } }) },
   adopt_tab: { description: "Move one of the user's tabs into this session's tab group so it can be controlled.", inputSchema: obj({ tabId }, ["tabId"]) },
+  split_tabs: { description: "Show two tabs side by side in one split view. Both tabs must be in this session (or in a group granted to it), in the same window and tab group, with the same pinned state, and not in a split view yet. If they are not next to each other, the second tab moves to sit after the first one. It stays in its group and is not reloaded. Needs Chrome 155 or later. Returns splitViewId and tabIds.", inputSchema: obj({ tabIds: { type: "array", items: { type: "number" }, minItems: 2, maxItems: 2, description: "The two tab ids, from tabs_context or tabs_create." } }, ["tabIds"]) },
+  unsplit_tabs: { description: "End a split view. Pass any tab of the split view. Every tab of the split view must be in this session. The tabs stay open. Needs Chrome 155 or later.", inputSchema: obj({ tabId }, ["tabId"]) },
   navigate: { description: "Navigate a tab to a URL, or go \"back\" or \"forward\" in its history.", inputSchema: obj({ tabId, url: { type: "string", description: "http(s) URL, or the literal \"back\" or \"forward\"." } }, ["tabId", "url"]) },
   screenshot: { description: "Capture a JPEG screenshot of the tab viewport, scaled to at most 1568 px on the long edge. Coordinates passed to click, hover and scroll are in this image's pixel space.", inputSchema: obj({ tabId }, ["tabId"]) },
   read_page: { description: "Return the accessibility tree of the page as text with element refs (ref_N) usable by click, type, form_input and scroll.", inputSchema: obj({ tabId, filter: { type: "string", enum: ["interactive", "all"], description: "interactive (default) lists only actionable elements." } }, ["tabId"]) },

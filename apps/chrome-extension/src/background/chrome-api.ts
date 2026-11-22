@@ -1,6 +1,21 @@
 // Small injectable facade over the chrome.* APIs the extension uses. Tests fake it.
 
-export interface TabInfo { id: number; windowId: number; groupId: number; url: string; title: string; active: boolean }
+/** `splitViewId` is -1 when the tab is not in a split view (Chrome 140 and later report it). */
+export interface TabInfo { id: number; windowId: number; groupId: number; url: string; title: string; active: boolean; splitViewId: number; index: number; pinned: boolean }
+
+/** The Chrome in use lacks an API (split view needs Chrome 155). The message is fit to show to an agent. */
+export class UnsupportedApiError extends Error {}
+
+export function splitUnsupported(userAgent: string = typeof navigator === "undefined" ? "" : navigator.userAgent): UnsupportedApiError {
+  const version = /Chrome\/([\d.]+)/.exec(userAgent)?.[1];
+  return new UnsupportedApiError(`Split view needs Chrome 155 or later. This Chrome is ${version ?? "of an unknown version"}.`);
+}
+
+interface SplitTabsApi {
+  createSplit?: (tabIds: [number, number]) => Promise<unknown>;
+  unsplit?: (splitViewId: number) => Promise<void>;
+  SPLIT_VIEW_ID_NONE?: number;
+}
 
 export interface GroupInfo { id: number; title: string }
 
@@ -21,7 +36,13 @@ export interface ChromeApi {
     get(tabId: number): Promise<TabInfo | undefined>;
     query(): Promise<TabInfo[]>;
     /** Opens a tab in the current window. Agents never open or switch to a tab in the foreground, so it is always created inactive. */
-    create(url?: string): Promise<TabInfo>;
+    create(url?: string, opts?: { splitWithTabId?: number }): Promise<TabInfo>;
+    /** Moves the tab to this index in its window. Group and window stay as they are. */
+    move(tabId: number, index: number): Promise<void>;
+    /** Joins two adjacent tabs into a split view and returns the splitViewId. Throws UnsupportedApiError before Chrome 155. */
+    createSplit(tabIds: [number, number]): Promise<number>;
+    /** Throws UnsupportedApiError before Chrome 155. */
+    unsplit(splitViewId: number): Promise<void>;
     remove(tabId: number): Promise<void>;
     group(tabIds: number[], groupId?: number): Promise<number>;
     ungroup(tabIds: number[]): Promise<void>;
@@ -50,7 +71,10 @@ export interface ChromeApi {
 }
 
 function toTab(t: chrome.tabs.Tab): TabInfo {
-  return { id: t.id ?? -1, windowId: t.windowId, groupId: t.groupId ?? -1, url: t.url ?? t.pendingUrl ?? "", title: t.title ?? "", active: t.active };
+  const split = (t as { splitViewId?: unknown }).splitViewId;
+  const none = (chrome.tabs as unknown as SplitTabsApi).SPLIT_VIEW_ID_NONE ?? -1;
+  const splitViewId = typeof split === "number" && split !== none ? split : -1;
+  return { id: t.id ?? -1, windowId: t.windowId, groupId: t.groupId ?? -1, url: t.url ?? t.pendingUrl ?? "", title: t.title ?? "", active: t.active, splitViewId, index: t.index, pinned: t.pinned };
 }
 
 export function realChromeApi(): ChromeApi {
@@ -69,7 +93,36 @@ export function realChromeApi(): ChromeApi {
         try { return toTab(await chrome.tabs.get(tabId)); } catch { return undefined; }
       },
       query: async () => (await chrome.tabs.query({})).map(toTab),
-      create: async url => toTab(await chrome.tabs.create(url ? { url, active: false } : { active: false })),
+      create: async (url, opts) => {
+        const props: Record<string, unknown> = { active: false };
+        if (url) props.url = url;
+        if (opts?.splitWithTabId !== undefined) {
+          if (typeof (chrome.tabs as unknown as SplitTabsApi).createSplit !== "function") throw splitUnsupported();
+          props.splitWithTabId = opts.splitWithTabId;
+        }
+        try {
+          return toTab(await chrome.tabs.create(props as chrome.tabs.CreateProperties));
+        } catch (e) {
+          if (opts?.splitWithTabId !== undefined && /splitWithTabId/.test(String((e as Error)?.message))) throw splitUnsupported();
+          throw e;
+        }
+      },
+      move: async (tabId, index) => { await chrome.tabs.move(tabId, { index }); },
+      createSplit: async tabIds => {
+        const api = chrome.tabs as unknown as SplitTabsApi;
+        if (typeof api.createSplit !== "function") throw splitUnsupported();
+        const made = await api.createSplit(tabIds);
+        if (typeof made === "number" && made !== (api.SPLIT_VIEW_ID_NONE ?? -1)) return made;
+        // The call may return nothing: read the id back from the tab.
+        const id = toTab(await chrome.tabs.get(tabIds[0])).splitViewId;
+        if (id === -1) throw new Error("Chrome did not report a split view for the tabs.");
+        return id;
+      },
+      unsplit: async splitViewId => {
+        const api = chrome.tabs as unknown as SplitTabsApi;
+        if (typeof api.unsplit !== "function") throw splitUnsupported();
+        await api.unsplit(splitViewId);
+      },
       remove: async tabId => { await chrome.tabs.remove(tabId); },
       group: (tabIds, groupId) => { const ids = tabIds as [number, ...number[]]; return chrome.tabs.group(groupId === undefined ? { tabIds: ids } : { tabIds: ids, groupId }); },
       ungroup: async tabIds => { await chrome.tabs.ungroup(tabIds as [number, ...number[]]); },

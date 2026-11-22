@@ -140,10 +140,10 @@ export class TabManager {
   }
 
   /** Opens a tab inside a granted group. The group keeps its title and colour. */
-  createInGranted(ref: SessionRef, groupId: number, url?: string): Promise<TabInfo | undefined> {
+  createInGranted(ref: SessionRef, groupId: number, url?: string, opts?: { splitWithTabId?: number }): Promise<TabInfo | undefined> {
     return this.serial(ref.id, async () => {
       if (this.grants.get(groupId) !== ref.id || !(await this.api.tabGroups.get(groupId))) return undefined;
-      const tab = await this.api.tabs.create(url);
+      const tab = await this.api.tabs.create(url, opts);
       const s = this.session(ref);
       s.tabIds.add(tab.id);
       s.adopted.add(tab.id); // sits in the user's group: stays open when the session ends
@@ -304,9 +304,9 @@ export class TabManager {
     return owner;
   }
 
-  async create(ref: SessionRef, url?: string): Promise<TabInfo> {
+  async create(ref: SessionRef, url?: string, opts?: { splitWithTabId?: number }): Promise<TabInfo> {
     // Inactive: an agent must never pull the owner away from the tab they are using.
-    const tab = await this.api.tabs.create(url);
+    const tab = await this.api.tabs.create(url, opts);
     await this.addToSession(ref, tab.id, false);
     return tab;
   }
