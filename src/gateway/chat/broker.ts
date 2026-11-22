@@ -60,6 +60,7 @@ export interface ChatRuntime {
   acp: AcpClient;
   handle: PodHandle;
   sessionId: string;
+  generation: number;
   lease: Lease;
 }
 
@@ -100,7 +101,7 @@ const OLD_GENERATIONS = 10;
 
 export class ChatBroker implements ChatAuth {
   private readonly runtimes = new Map<string, ChatRuntime>();
-  private readonly starting = new Map<string, { promise: Promise<ChatRuntime | undefined>; ac: AbortController }>();
+  private readonly starting = new Map<string, { promise: Promise<ChatRuntime | undefined>; ac: AbortController; ending?: boolean }>();
   private readonly timers: Timers;
 
   constructor(private readonly d: BrokerDeps) {
@@ -171,6 +172,8 @@ export class ChatBroker implements ChatAuth {
     const live = this.runtimes.get(chatId);
     if (live) return Promise.resolve(live);
     const pending = this.starting.get(chatId);
+    // A lost-lease clean-up is running. A new start waits for it, so the clean-up cannot hit the new pod.
+    if (pending?.ending) return pending.promise.then(() => this.startPod(chatId));
     if (pending) return pending.promise;
     const ac = new AbortController();
     const promise = this.runStart(chatId, ac)
@@ -286,10 +289,17 @@ export class ChatBroker implements ChatAuth {
       });
       this.timers.clearTimeout(startTimer);
       await store.update(chatId, { state: "idle", acpSessionId: sessionId, podSession: handle.session, canLoad: caps.loadSession }, fence);
-      const rt: ChatRuntime = { chatId, fence, acp, handle, sessionId, lease };
+      const rt: ChatRuntime = { chatId, fence, acp, handle, sessionId, generation, lease };
       lease.onLost = () => {
         const gone = this.drop(chatId);
-        if (gone) void this.endLost(chatId, gone.handle.session).catch(() => undefined);
+        if (!gone) return;
+        const promise: Promise<ChatRuntime | undefined> = this.endLost(chatId, gone.handle.session, gone.generation)
+          .catch(() => undefined)
+          .then(() => undefined)
+          .finally(() => {
+            if (this.starting.get(chatId)?.promise === promise) this.starting.delete(chatId);
+          });
+        this.starting.set(chatId, { promise, ac: new AbortController(), ending: true });
       };
       this.runtimes.set(chatId, rt);
       kept = true;
@@ -305,7 +315,7 @@ export class ChatBroker implements ChatAuth {
         return undefined;
       }
       if (leaseLost || e instanceof ChatLeaseLostError) {
-        await this.endLost(chatId, own);
+        await this.endLost(chatId, own, generation);
         return undefined;
       }
       if (ac.signal.aborted && !timedOut) {
@@ -330,7 +340,7 @@ export class ChatBroker implements ChatAuth {
    * The lease is gone. Try to take it again. With the lease back, show the failure.
    * When another replica owns the chat, end quietly and stop only our own session.
    */
-  private async endLost(chatId: string, session: string): Promise<void> {
+  private async endLost(chatId: string, session: string, generation: number): Promise<void> {
     const { store, transport } = this.d;
     const epoch = await store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now()).catch(() => undefined);
     if (epoch === undefined) {
@@ -339,6 +349,13 @@ export class ChatBroker implements ChatAuth {
     }
     const fence: LeaseFence = { replica: this.d.replicaId, epoch };
     try {
+      // A newer start or a close may have run while the lease was gone. Then this clean-up shows nothing and stops only its own session.
+      const chat = await store.get(chatId);
+      const newer = !chat || chat.state === "closed" || (generation > 0 && (chat.generation > generation || chat.state === "failed"));
+      if (newer) {
+        if (session) await transport.stopSession(session).catch(() => undefined);
+        return;
+      }
       await this.fail(chatId, fence, LOST_FAILURE, session);
     } finally {
       await store.releaseLease(chatId, fence).catch(() => undefined);

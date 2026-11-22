@@ -539,3 +539,59 @@ test("a hung stopSession of an old generation cannot hold the start past its dea
   expect(await p).toBeUndefined();
   expect((await bodies(first.store, rec.id)).at(-1)).toMatchObject({ k: "error", code: "timeout" });
 });
+
+test("a late lost-lease clean-up leaves a newer generation alone and adds no second error", async () => {
+  const clock = { t: 1_700_000_000_000 };
+  const store = new MemoryChatStore(() => clock.t);
+  const cluster = new Set<string>();
+  const timers = new FakeTimers();
+  const a = setup({ cluster }, { replicaId: "replica-a", timers }, { store, clock });
+  const b = setup({ cluster }, { replicaId: "replica-b" }, { store, clock });
+  const rec = await made(a.broker);
+  expect(await a.broker.startPod(rec.id)).toBeDefined();
+  clock.t += 120_000;
+  expect(await b.broker.startPod(rec.id)).toBeDefined();
+  await b.broker.dispose(); // the lease is free and the pod of B stays
+  timers.fire(20_000);
+  await Bun.sleep(50);
+  expect(cluster.has(sessionName(rec.id, 2))).toBe(true);
+  expect(JSON.stringify(await bodies(store, rec.id))).not.toContain('"error"');
+  expect(a.transport.stopped).toEqual([]);
+  expect((await store.get(rec.id))?.state).toBe("idle");
+});
+
+test("a start during a lost-lease clean-up waits for it and keeps its pod", async () => {
+  const clock = { t: 1_700_000_000_000 };
+  const inner = new MemoryChatStore(() => clock.t);
+  const store = Object.create(inner) as MemoryChatStore;
+  let gate: Promise<void> | undefined;
+  let waiting = false;
+  store.acquireLease = async (id, replica, ttl, now) => {
+    if (gate) {
+      waiting = true;
+      await gate;
+    }
+    return inner.acquireLease(id, replica, ttl, now);
+  };
+  const cluster = new Set<string>();
+  const timers = new FakeTimers();
+  const { broker, transport } = setup({ cluster }, { timers }, { store, clock });
+  const rec = await made(broker);
+  expect(await broker.startPod(rec.id)).toBeDefined();
+  let open!: () => void;
+  gate = new Promise<void>((r) => (open = r));
+  clock.t += 70_000;
+  timers.fire(20_000);
+  for (let i = 0; i < 100 && !waiting; i++) await Bun.sleep(5);
+  const again = broker.startPod(rec.id);
+  await tick();
+  expect(transport.starts).toHaveLength(1);
+  gate = undefined;
+  open();
+  expect(await again).toBeDefined();
+  expect(transport.starts).toHaveLength(2);
+  expect([...cluster]).toEqual([sessionName(rec.id, 2)]);
+  const errors = (await bodies(inner, rec.id)).filter((x) => x.k === "error");
+  expect(errors).toHaveLength(1);
+  expect((await inner.get(rec.id))?.state).toBe("idle");
+});
