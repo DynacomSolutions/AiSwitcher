@@ -1,5 +1,5 @@
 import { GroupPrompt } from "./group-prompt.ts";
-import { DEFAULT_CALL_TIMEOUT_MS, SESSION_END_TOOL, WAIT_CALL_TIMEOUT_MS } from "../../../../src/browser/protocol.ts";
+import { DEFAULT_CALL_TIMEOUT_MS, REQUEST_GROUP_CALL_TIMEOUT_MS, SESSION_END_TOOL, WAIT_CALL_TIMEOUT_MS } from "../../../../src/browser/protocol.ts";
 import type { BrowserErrorCode, CallRequest, CallResult } from "../../../../src/browser/protocol.ts";
 import { TOOL_SCHEMAS, validateToolArgs } from "../../../../src/browser/tool-args.ts";
 import type { ExtensionTool, ToolArgs, UploadFile } from "../../../../src/browser/tool-args.ts";
@@ -211,7 +211,7 @@ export class Executor {
     await this.tabs.reclaim(req.session).catch(() => {});
     const controller = this.state.track(id, req.session.id, req.session.identity);
     this.tabs.callStarted(req.session.id);
-    const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : this.defaultTimeout;
+    const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : tool === "request_group" ? REQUEST_GROUP_CALL_TIMEOUT_MS : this.defaultTimeout;
     const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
     const aborted = new Promise<never>((_, reject) => {
       const onAbort = () => reject(new ToolError(this.abortCode(controller.signal.reason), this.abortMessage(controller.signal.reason)));
@@ -386,14 +386,14 @@ export class Executor {
         try {
           answer = await this.groupPrompt.ask({
             title: "AIS Browser: allow an agent to use a tab group?",
-            message: `Agent "${session.label}" (identity ${session.identity}) asks to use the group "${first.title}" with ${first.tabCount} tabs. The agent can read and use these tabs. It never closes them.`,
+            message: `Agent "${session.label}" (identity ${session.identity}) asks to use the group "${first.title}" with ${first.tabCount} tabs.${first.shared ? " Another agent session made this group." : ""} The agent can read and use these tabs. It never closes them.`,
           }, sig, this.groupPromptMs);
         } finally {
           this.tabs.endRequest(groupId);
         }
         this.throwIfAborted(sig);
         if (answer !== "approve") throw new ToolError("forbidden_tab", answer === "timeout" ? "The user did not answer in time. Do not ask again unless the user asks." : answer === "deny" ? "The user denied access to this group. Do not ask again." : "The user closed the question without an answer. Do not ask again unless the user asks.");
-        const done = await this.tabs.takeGroup(session, groupId);
+        const done = await this.tabs.takeGroup(session, groupId, first.tabIds);
         if (!done.ok) throw new ToolError(done.code, done.message);
         return text(JSON.stringify({ groupId, approved: true, tabCount: done.tabCount, note: "The group is now your own group and every tab is adopted. The session end closes and ungroups none of them." }));
       }

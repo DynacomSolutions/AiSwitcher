@@ -112,6 +112,9 @@ A group that a session created stays with the chat that made it. The chat is the
 - Only one request per group waits at a time.
 - After the click, every refusal rule runs again. A group that was granted or saved while the prompt was open is not taken.
 - Approve: the group becomes the own group of the session. Every tab is adopted and approved. No tab is moved, closed, reloaded or activated. The agent record is written at once. `close_tab` refuses an approved tab, and the session end neither closes nor ungroups it.
+- The approval is kept per tab in the agent record. A later session of the chat that reclaims the group, also after a browser restart, still cannot close or ungroup those tabs.
+- The call limit of `request_group` is 150 seconds (gateway and extension), so the 120 second prompt fits.
+- Only the tabs counted in the prompt are taken. A tab added while the prompt is open gives `forbidden_tab` ("Ask again"). A group of another session of the same identity shows "Another agent session made this group." in the prompt. A group of a session of another identity is refused.
 - The extension needs the `notifications` permission. It gives no install warning.
 
 ### Saved tab groups

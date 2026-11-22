@@ -80,6 +80,19 @@ describe("POST /browser/call", () => {
     agent = t.token;
   });
 
+  test("request_group gets a call limit that fits its 120 second prompt", async () => {
+    const ws = await connect(b("w", { kind: "identity", identity: "id1" }));
+    const limits: number[] = [];
+    const orig = hub.call.bind(hub);
+    hub.call = ((name: string, req: never, ms: number) => { limits.push(ms); return orig(name, req, ms); }) as typeof hub.call;
+    answer(ws);
+    await call({ session, tool: "request_group", args: { groupId: 1 } });
+    answer(ws);
+    await call({ session, tool: "tabs_context" });
+    expect(limits[0]).toBe(150_000);
+    expect(limits[1]).toBe(30_000);
+  });
+
   test("rejects a missing or wrong agent token", async () => {
     expect((await call({ session, tool: "navigate" }, "aisg_nope_nope")).status).toBe(401);
   });

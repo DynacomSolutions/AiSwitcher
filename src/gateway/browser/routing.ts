@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { BROWSER_TOOLS, SESSION_END_TOOL, DEFAULT_CALL_TIMEOUT_MS, UPLOAD_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallRequest, type CallResult } from "../../browser/protocol.ts";
+import { BROWSER_TOOLS, SESSION_END_TOOL, DEFAULT_CALL_TIMEOUT_MS, REQUEST_GROUP_CALL_TIMEOUT_MS, UPLOAD_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallRequest, type CallResult } from "../../browser/protocol.ts";
 import { shortSessionId } from "../../browser/session-label.ts";
 import { validateToolArgs } from "../../browser/tool-args.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
@@ -144,7 +144,7 @@ export function createBrowserCaller(deps: CallDeps): (identity: string, body: un
     const result = await deps.hub.call(
       chosen.name,
       { id, session: session(chosen, body.session.id), tool: tool as BrowserTool, args },
-      tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : tool === "upload_file" ? UPLOAD_CALL_TIMEOUT_MS : DEFAULT_CALL_TIMEOUT_MS,
+      tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : tool === "upload_file" ? UPLOAD_CALL_TIMEOUT_MS : tool === "request_group" ? REQUEST_GROUP_CALL_TIMEOUT_MS : DEFAULT_CALL_TIMEOUT_MS,
     );
     signal?.removeEventListener("abort", onAbort);
     if (scope && tool === "tabs_context" && result.ok) return { status: 200, body: scopeTabsContext(result, scope.linked) };

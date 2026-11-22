@@ -408,4 +408,23 @@ describe("review fixes", () => {
     expect((t.api.store.agentGroups as Array<{ label: string }>).some(r => r.label === "Job board")).toBe(true);
     expect((t.api.store.agentGroups as unknown[]).length).toBe(stored);
   });
+
+  test("P7: a new group of the chat does not replace an unlinked record, so the restored tabs still link", async () => {
+    const { t, ids } = await ownerCase();
+    const idMap = t.api.restart();
+    const newIds = ids.map(id => idMap.get(id)!);
+    const real = newIds.map(id => t.api.tabList.get(id)!.url);
+    for (const id of newIds) t.api.tabList.get(id)!.url = "";
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    const made = await fresh.create(B, "https://new.example.com/");
+    await fresh.tabs.refreshAgents();
+    const records = fresh.api.store.agentGroups as Array<{ groupId: number; tabs: Array<{ url: string }> }>;
+    expect(records.length).toBe(2);
+    expect(records.some(r => r.groupId === t.api.tabList.get(made)!.groupId)).toBe(true);
+    newIds.forEach((id, i) => { t.api.tabList.get(id)!.url = real[i]!; });
+    expect(await fresh.tabs.retryRelink()).toBe(true);
+    const gid = t.api.tabList.get(newIds[0]!)!.groupId;
+    expect((fresh.api.store.agentGroups as Array<{ groupId: number }>).some(r => r.groupId === gid)).toBe(true);
+  });
 });

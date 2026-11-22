@@ -40,7 +40,7 @@ export function colorForIdentity(identity: string): GroupColor {
   return COLORS[h % COLORS.length]!;
 }
 
-export type RequestCheck = { ok: true; already: boolean; title: string; tabCount: number } | { ok: false; code: "forbidden_tab" | "bad_args"; message: string };
+export type RequestCheck = { ok: true; already: boolean; title: string; tabCount: number; tabIds: number[]; /** Another session made or holds this group. */ shared: boolean } | { ok: false; code: "forbidden_tab" | "bad_args"; message: string };
 export type GrantResult = "ok" | "no_session" | "no_group" | "in_use";
 
 /** One tab of a saved group. `split` is a pair label (1, 2, ...) shared by the two tabs of a split view; absent when the tab is not in one. */
@@ -48,7 +48,7 @@ export interface SavedTab { url: string; title: string; split?: number }
 /** A named tab group that outlives the agent session. `groupId` is -1 while the group is closed. `tabIds` are the live tab ids, used to check that a group id still means this group. */
 export interface SavedGroup { name: string; title: string; color: GroupColor; groupId: number; identity: string; tabIds: number[]; tabs: SavedTab[]; /** The session that last held the group: it regains the grant after idling out. */ holder?: string }
 /** One tab of an agent group record. `owned` is false for a tab that sits in the group but never belonged to the session (a tab the user added). */
-export interface AgentTab { id: number; url: string; adopted: boolean; owned: boolean }
+export interface AgentTab { id: number; url: string; adopted: boolean; owned: boolean; /** A tab of a group the user approved with request_group: no session of the chat closes or ungroups it. */ approved?: true }
 /** A group that an agent session created. It outlives the session and the browser run, and stays with the chat (identity plus label). */
 export interface AgentGroup { identity: string; label: string; title: string; color: GroupColor; groupId: number; tabs: AgentTab[]; /** The session that last held the group. */ holder: string; updatedAt: number }
 export interface GroupOverview { groupId: number; title: string; tabCount: number; scope: "own" | "granted" | "saved" | "other" }
@@ -438,7 +438,23 @@ export class TabManager {
 
   // ---- agent groups ------------------------------------------------------
 
+  private static agentTab(t: TabInfo, owned: boolean, adopted: boolean, approved: boolean): AgentTab {
+    return { id: t.id, url: t.url, owned, adopted, ...(approved ? { approved: true as const } : {}) };
+  }
+
   private static agentKey(identity: string, label: string): string { return `${identity}\u0000${label}`; }
+
+  /** A key for a record: one chat may have several records (an unlinked old one next to a new one). */
+  private freeKey(r: { identity: string; label: string }): string {
+    const base = TabManager.agentKey(r.identity, r.label);
+    let key = base;
+    for (let i = 2; this.agents.has(key); i++) key = `${base}\u0000#${i}`;
+    return key;
+  }
+
+  private chatRecords(identity: string, label: string): AgentGroup[] {
+    return [...this.agents.values()].filter(r => r.identity === identity && r.label === label);
+  }
 
   /** True when the session made a call within HOLDER_LIVE_MS. A session that is unknown (after a reload), ended or expired is not live. */
   private holderLive(sessionId: string): boolean {
@@ -481,7 +497,7 @@ export class TabManager {
       const r: AgentGroup = { ...e, updatedAt, title: typeof e.title === "string" ? e.title : e.label, color: e.color ?? colorForIdentity(e.identity), groupId: typeof e.groupId === "number" ? e.groupId : -1 };
       // After a browser restart the ids are new: the record only counts as live when its id still names a group with the stored title.
       const info = r.groupId === -1 ? undefined : await this.api.tabGroups.get(r.groupId);
-      if (!info || info.title !== r.title || !(await this.liveAgent(r))) { r.groupId = -1; this.agents.set(TabManager.agentKey(r.identity, r.label), r); } else this.agents.set(TabManager.agentKey(r.identity, r.label), r);
+      if (!info || info.title !== r.title || !(await this.liveAgent(r))) { r.groupId = -1; this.agents.set(this.freeKey(r), r); } else this.agents.set(this.freeKey(r), r);
     }
     await this.persistAgents();
   }
@@ -497,21 +513,22 @@ export class TabManager {
     const all = await this.api.tabs.query(); // one query for the whole pass
     for (const [sid, s] of this.sessions) {
       if (s.chat || s.label === "" || s.groupId === -1 || this.grants.has(s.groupId) || this.savedClaims(s.groupId)) continue;
-      const key = TabManager.agentKey(s.identity, s.label);
-      let r = this.agents.get(key);
-      if (r && r.groupId !== s.groupId) {
-        if (r.holder !== sid && await this.liveAgent(r, all)) continue; // another session of the same chat holds a live group
-        this.agents.delete(key);
-        r = undefined;
-      }
+      let r = this.chatRecords(s.identity, s.label).find(x => x.groupId === s.groupId);
       if (!r) {
+        const main = this.agents.get(TabManager.agentKey(s.identity, s.label));
+        if (main) {
+          const live = await this.liveAgent(main, all);
+          if (live && main.holder !== sid) continue; // another session of the same chat holds a live group
+          if (live) { this.agents.delete(TabManager.agentKey(s.identity, s.label)); } // this session moved to a new group
+          // An unlinked record of the chat stays: its restored tabs can still link later.
+        }
         const info = await this.api.tabGroups.get(s.groupId);
         if (!info) continue;
         for (const [k, o] of [...this.agents]) if (o.groupId === s.groupId) this.agents.delete(k); // the chat was renamed
         const members = all.filter(t => t.groupId === s.groupId).sort((x, y) => x.windowId - y.windowId || x.index - y.index);
         if (members.length === 0) continue;
-        r = { identity: s.identity, label: s.label, title: info.title, color: info.color ?? colorForIdentity(s.identity), groupId: s.groupId, tabs: members.map(t => ({ id: t.id, url: t.url, owned: s.tabIds.has(t.id), adopted: s.adopted.has(t.id) })), holder: sid, updatedAt: this.now() };
-        this.agents.set(key, r);
+        r = { identity: s.identity, label: s.label, title: info.title, color: info.color ?? colorForIdentity(s.identity), groupId: s.groupId, tabs: members.map(t => TabManager.agentTab(t, s.tabIds.has(t.id), s.adopted.has(t.id), s.approved?.has(t.id) === true)), holder: sid, updatedAt: this.now() };
+        this.agents.set(this.freeKey(r), r);
         changed = true;
       }
       r.holder = sid;
@@ -525,7 +542,7 @@ export class TabManager {
         const prev = r.tabs.find(x => x.id === t.id);
         const inSession = mine?.tabIds.has(t.id) === true;
         const owned = inSession || (prev?.owned ?? false); // a tab once owned stays owned while it lives: a join by title must not clear it
-        return { id: t.id, url: t.url, owned, adopted: inSession ? mine!.adopted.has(t.id) : (prev?.adopted ?? false) };
+        return TabManager.agentTab(t, owned, inSession ? mine!.adopted.has(t.id) : (prev?.adopted ?? false), mine?.approved?.has(t.id) === true || prev?.approved === true);
       });
       const info = await this.api.tabGroups.get(r.groupId);
       if (info) { r.title = info.title; if (info.color) r.color = info.color; }
@@ -555,8 +572,13 @@ export class TabManager {
     {
       this.lastSeen.set(ref.id, this.now());
       if (ref.label === "" || ref.chat === true) return false;
-      const r = this.agents.get(TabManager.agentKey(ref.identity, ref.label));
-      if (!r) return false;
+      for (const r of this.chatRecords(ref.identity, ref.label)) if (await this.reclaimRecord(ref, r)) return true;
+      return false;
+    }
+  }
+
+  private async reclaimRecord(ref: SessionRef, r: AgentGroup): Promise<boolean> {
+    {
       if (r.holder !== ref.id && this.holderLive(r.holder)) return false;
       let live = await this.liveAgent(r);
       if (!live && (await this.relinkPool()).has(r)) live = await this.liveAgent(r);
@@ -577,8 +599,10 @@ export class TabManager {
       s.groupId = r.groupId;
       s.tabIds = new Set(owned.map(x => x.id));
       s.adopted = new Set(owned.filter(x => x.adopted).map(x => x.id));
+      const approved = owned.filter(x => x.approved).map(x => x.id);
+      if (approved.length > 0) s.approved = new Set(approved); else delete s.approved;
       r.holder = ref.id;
-      r.tabs = live.map(t => ({ id: t.id, url: t.url, owned: s.tabIds.has(t.id), adopted: s.adopted.has(t.id) }));
+      r.tabs = live.map(t => TabManager.agentTab(t, s.tabIds.has(t.id), s.adopted.has(t.id), s.approved?.has(t.id) === true));
       r.updatedAt = this.now();
       this.persist();
       await this.persistAgents();
@@ -632,34 +656,43 @@ export class TabManager {
   /** Every refusal rule of request_group. It runs before the prompt and again after the click. */
   async checkRequest(ref: SessionRef, groupId: number): Promise<RequestCheck> {
     const s = this.sessions.get(ref.id);
-    if (s && s.groupId === groupId && await this.api.tabGroups.get(groupId)) return { ok: true, already: true, title: s.label, tabCount: s.tabIds.size };
+    if (s && s.groupId === groupId && await this.api.tabGroups.get(groupId)) return { ok: true, already: true, title: s.label, tabCount: s.tabIds.size, tabIds: [...s.tabIds], shared: false };
     const info = await this.api.tabGroups.get(groupId);
     if (!info) return { ok: false, code: "bad_args", message: `Group ${groupId} no longer exists.` };
     if (this.grants.has(groupId)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} is granted to a session. It cannot be given to another one.` };
     if (this.savedClaims(groupId)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} is a saved group. Use open_group.` };
     for (const [id, o] of this.sessions) if (id !== ref.id && o.groupId === groupId && this.holderLive(id)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} is the own group of another live session.` };
     for (const r of this.agents.values()) if (r.groupId === groupId && !(r.identity === ref.identity && r.label === ref.label)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} belongs to another chat.` };
+    let shared = false;
+    for (const [id, o] of this.sessions) {
+      if (id === ref.id || o.groupId !== groupId) continue;
+      if (o.identity !== ref.identity) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} was made by a session of another identity.` };
+      shared = true;
+    }
+    for (const r of this.agents.values()) if (r.groupId === groupId && r.holder !== ref.id) shared = true;
     if (s && s.groupId !== -1 && s.tabIds.size > 0 && await this.api.tabGroups.get(s.groupId)) return { ok: false, code: "bad_args", message: "This session already has an own group with tabs. One session has one own group." };
-    const tabCount = (await this.api.tabs.query()).filter(t => t.groupId === groupId).length;
-    return { ok: true, already: false, title: info.title, tabCount };
+    const tabIds = (await this.api.tabs.query()).filter(t => t.groupId === groupId).map(t => t.id);
+    return { ok: true, already: false, title: info.title, tabCount: tabIds.length, tabIds, shared };
   }
 
   /**
    * The user approved: checks every rule again, then the group becomes the own group of the session. Every tab is adopted and approved.
    * No tab is moved, closed, reloaded or activated. The agent record is written at once.
    */
-  takeGroup(ref: SessionRef, groupId: number): Promise<RequestCheck> {
-    const run = this.reclaiming.then(() => this.serial(ref.id, () => this.takeNow(ref, groupId)), () => this.serial(ref.id, () => this.takeNow(ref, groupId)));
+  takeGroup(ref: SessionRef, groupId: number, counted: number[]): Promise<RequestCheck> {
+    const run = this.reclaiming.then(() => this.serial(ref.id, () => this.takeNow(ref, groupId, counted)), () => this.serial(ref.id, () => this.takeNow(ref, groupId, counted)));
     this.reclaiming = run.then(() => {}, () => {});
     return run;
   }
 
-  private async takeNow(ref: SessionRef, groupId: number): Promise<RequestCheck> {
+  private async takeNow(ref: SessionRef, groupId: number, counted: number[]): Promise<RequestCheck> {
     this.session(ref);
     const c = await this.checkRequest(ref, groupId);
     if (!c.ok || c.already) return c;
     const members = (await this.api.tabs.query()).filter(t => t.groupId === groupId);
     if (members.length === 0) return { ok: false, code: "bad_args", message: `Group ${groupId} has no tab.` };
+    // Only the tabs the user saw in the prompt may be taken. Removed tabs are fine. A new tab means the user approved something else.
+    if (members.some(t => !counted.includes(t.id))) return { ok: false, code: "forbidden_tab", message: "The group changed while the prompt was open. Ask again." };
     for (const [id, o] of [...this.sessions]) {
       if (id === ref.id) continue;
       if (o.groupId === groupId) o.groupId = -1;

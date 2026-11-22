@@ -1,16 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import type { BrowserTool, CallRequest } from "../../../src/browser/protocol.ts";
 import { Executor } from "../src/background/executor.ts";
 import { State } from "../src/background/state.ts";
-import { TabManager } from "../src/background/tabs.ts";
+import { HOLDER_LIVE_MS, TabManager } from "../src/background/tabs.ts";
 import { FakeChrome } from "./fakes.ts";
 
 const AG = { id: "agent-1", identity: "alice", label: "ContractFinder" };
 const OTHER = { id: "agent-2", identity: "alice", label: "Another chat" };
 let n = 0;
-const clock = 9_000_000;
+let clock = 9_000_000;
 
-function setup(api = new FakeChrome(), groupPromptMs = 120_000) {
+function setup(api = new FakeChrome(), groupPromptMs?: number) {
   const tabs = new TabManager(api, () => clock);
   const state = new State(api.storage);
   const executor = new Executor({ api, tabs, state, groupPromptMs });
@@ -198,5 +198,110 @@ describe("request_group", () => {
     expect(t.tabs.grantee(gid)).toBe("agent-2");
     expect(t.tabs.ownerOf(ids[0]!)).toBeUndefined();
     expect(t.api.shown.size).toBe(0);
+  });
+
+  async function approved(t: ReturnType<typeof setup>, gid: number): Promise<void> {
+    const pending = t.call("request_group", { groupId: gid });
+    await until(() => t.api.shown.size === 1);
+    t.api.clickNotification(0);
+    expect((await pending).ok).toBe(true);
+  }
+
+  test("R1: a new session of the chat that reclaims the approved group still cannot close or ungroup its tabs", async () => {
+    const t = setup();
+    const { ids, gid } = await userGroup(t.api);
+    await approved(t, gid);
+    clock += HOLDER_LIVE_MS + 1000;
+    const B = { id: "agent-3", identity: "alice", label: "ContractFinder" };
+    expect(t.json(await t.call("tabs_context", {}, B)).sessionTabs.length).toBe(4);
+    expect(await t.call("close_tab", { tabId: ids[0]! }, B)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    await t.call("session_end", {}, B);
+    expect(t.api.tabList.size).toBe(4);
+    for (const id of ids) expect(t.api.tabList.get(id)!.groupId).toBe(gid);
+  });
+
+  test("R1: the approval survives a browser restart", async () => {
+    const t = setup();
+    const { ids, gid } = await userGroup(t.api);
+    await approved(t, gid);
+    await t.tabs.refreshAgents();
+    const idMap = t.api.restart();
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    const B = { id: "agent-4", identity: "alice", label: "ContractFinder" };
+    const ctx = fresh.json(await fresh.call("tabs_context", {}, B));
+    const newIds = ids.map(id => idMap.get(id)!);
+    expect(ctx.sessionTabs.map((x: { tabId: number }) => x.tabId)).toEqual(newIds);
+    expect(await fresh.call("close_tab", { tabId: newIds[0]! }, B)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    await fresh.call("session_end", {}, B);
+    expect(t.api.tabList.size).toBe(4);
+    const newGid = t.api.tabList.get(newIds[0]!)!.groupId;
+    for (const id of newIds) expect(t.api.tabList.get(id)!.groupId).toBe(newGid);
+  });
+
+  test("R2: with the production timeouts a click after 31 seconds still approves", async () => {
+    jest.useFakeTimers();
+    try {
+      const t = setup();
+      const { gid } = await userGroup(t.api);
+      const flush = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
+      const pending = t.call("request_group", { groupId: gid });
+      await flush();
+      expect(t.api.shown.size).toBe(1);
+      jest.advanceTimersByTime(31_000);
+      await flush();
+      t.api.clickNotification(0);
+      expect(await pending).toMatchObject({ ok: true });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("Q4: a tab added while the prompt is open is refused, a tab removed is not", async () => {
+    const t = setup();
+    const { ids, gid } = await userGroup(t.api);
+    const added = t.call("request_group", { groupId: gid });
+    await until(() => t.api.shown.size === 1);
+    const extra = t.api.addTab(90, "https://late.example.com/");
+    await t.api.tabs.group([extra.id], gid);
+    t.api.clickNotification(0);
+    const r = await added;
+    expect(r).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(r.ok ? "" : r.message).toContain("The group changed while the prompt was open. Ask again.");
+    expect(t.tabs.sessions.get("agent-1")?.tabIds.size ?? 0).toBe(0);
+    t.api.closeTab(extra.id);
+    const removed = t.call("request_group", { groupId: gid });
+    await until(() => t.api.shown.size === 1);
+    t.api.closeTab(ids[0]!);
+    t.api.clickNotification(0);
+    expect(await removed).toMatchObject({ ok: true });
+    expect(t.tabs.sessions.get("agent-1")!.tabIds.size).toBe(3);
+  });
+
+  test("Q3: a group of another session of the same identity is said so in the prompt, another identity is refused", async () => {
+    const t = setup();
+    const a = await t.tabs.create(OTHER, "https://a.example.com/");
+    const gid = t.api.tabList.get(a.id)!.groupId;
+    await t.call("tabs_context", {}, OTHER);
+    clock += HOLDER_LIVE_MS + 1000; // the holder is idle
+    const pending = t.call("request_group", { groupId: gid });
+    await until(() => t.api.shown.size === 1);
+    expect(t.api.everShown[0]!.message).toContain("Another agent session made this group.");
+    t.api.clickNotification(1);
+    await pending;
+    const shown = t.api.everShown.length;
+    const BOB = { id: "bob-1", identity: "bob", label: "Bob chat" };
+    expect(await t.call("request_group", { groupId: gid }, BOB)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.api.everShown.length).toBe(shown);
+  });
+
+  test("Q3: a plain user group has no such sentence", async () => {
+    const t = setup();
+    const { gid } = await userGroup(t.api);
+    const pending = t.call("request_group", { groupId: gid });
+    await until(() => t.api.shown.size === 1);
+    expect(t.api.everShown[0]!.message).not.toContain("Another agent session");
+    t.api.clickNotification(1);
+    await pending;
   });
 });
