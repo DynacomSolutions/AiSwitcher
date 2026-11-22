@@ -7,7 +7,7 @@ function setup() {
   const calls: string[] = [];
   const deps: MessageDeps = {
     runtimeId: ID,
-    state: { pause: () => { calls.push("pause"); }, resume: () => { calls.push("resume"); }, stop: async () => { calls.push("stop"); }, stopSession: s => { calls.push(`stopSession:${s}`); }, stopTab: t => { calls.push(`stopTab:${t}`); } },
+    state: { pause: () => { calls.push("pause"); }, resume: () => { calls.push("resume"); }, stop: async () => { calls.push("stop"); }, stopSession: s => { calls.push(`stopSession:${s}`); }, resumeSession: s => { calls.push(`resumeSession:${s}`); }, stopTab: t => { calls.push(`stopTab:${t}`); } },
     status: async () => { calls.push("status"); return { status: "idle", paused: false, inflight: 0, signedIn: false, sessions: [] }; },
     setDisconnected: async v => { calls.push(`disconnected:${v}`); },
     isMarked: id => id === 7,
@@ -85,10 +85,18 @@ describe("per-agent stop messages", () => {
     expect(t.calls).toEqual(["stopTab:7"]);
   });
 
-  test("side panel may stop a session or a tab without the tab guard", () => {
+  test("side panel may stop a session without the tab guard", () => {
     const t = setup();
     stopSession(t, page, "s9");
     expect(t.calls).toEqual(["stopSession:s9"]);
+  });
+
+  test("ais-resume-session is for the side panel only", () => {
+    const t = setup();
+    handleMessage({ type: "ais-resume-session", sessionId: "s1" }, content(7), () => {}, t.deps);
+    expect(t.calls).toEqual([]);
+    handleMessage({ type: "ais-resume-session", sessionId: "s1" }, page, () => {}, t.deps);
+    expect(t.calls).toEqual(["resumeSession:s1"]);
   });
 
   test("ais-stop from a content script still pauses everything (legacy single-agent pill)", async () => {

@@ -96,6 +96,8 @@ chrome.alarms.onAlarm.addListener(() => {
   void startup.then(async () => { tabs.expireIdle(); if (connection.needsRestart()) await connect(); await updater.tick().catch(() => {}); });
 });
 
+// A stopped agent leaves the page at once. Its next call is rejected until the user resumes it.
+state.onSessionStop(sessionId => { for (const tabId of ui.markedTabs(sessionId)) void ui.unmarkSession(tabId, sessionId); });
 state.setSessionsOnTab(tabId => ui.sessionsOn(tabId));
 
 // Control messages from the side panel and the in-page Stop button (see messages.ts for who may send what).

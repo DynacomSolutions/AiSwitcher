@@ -6,7 +6,7 @@ export interface MessageSender { id?: string; origin?: string; frameId?: number;
 
 export interface MessageDeps {
   runtimeId: string;
-  state: { pause(): void; resume(): void; stop(): Promise<void>; stopSession(sessionId: string): void; stopTab(tabId: number): void };
+  state: { pause(): void; resume(): void; stop(): Promise<void>; stopSession(sessionId: string): void; resumeSession(sessionId: string): void; stopTab(tabId: number): void };
   status(): Promise<PanelStatus>;
   setDisconnected(value: boolean): Promise<void>;
   isMarked(tabId: number): boolean;
@@ -47,6 +47,11 @@ export function handleMessage(msg: unknown, sender: MessageSender, reply: (r: un
       const { sessionId } = msg as { sessionId?: unknown };
       if (typeof sessionId !== "string") { reply({ ok: false, error: "bad_args" }); return false; }
       deps.state.stopSession(sessionId); reply({ ok: true }); return false;
+    }
+    case "ais-resume-session": {
+      const { sessionId } = msg as { sessionId?: unknown };
+      if (typeof sessionId !== "string") { reply({ ok: false, error: "bad_args" }); return false; }
+      deps.state.resumeSession(sessionId); reply({ ok: true }); return false;
     }
     case "ais-stop-tab": {
       const tabId = sender.tab?.id;

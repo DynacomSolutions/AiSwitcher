@@ -38,3 +38,12 @@ describe("per-session and per-tab stop", () => {
     expect(s.paused).toBe(true);
   });
 });
+
+test("after stopSession a new call of that session is blocked until resume", () => {
+  const s = new State();
+  s.stopSession("sa");
+  expect(s.isStopped("sa")).toBe(true);
+  expect(s.isStopped("sb")).toBe(false);
+  s.resumeSession("sa");
+  expect(s.isStopped("sa")).toBe(false);
+});

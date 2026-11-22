@@ -153,6 +153,24 @@ describe("pause and stop", () => {
     expect(api.store.paused).toBe(true);
   });
 
+  test("stopSession aborts only that session's in-flight call, blocks its next call, and resume clears it", async () => {
+    const { api, state, tabs, executor } = setup();
+    const other = { id: "s2", identity: "dyn", label: "dyn / s2" };
+    await tabs.create(session, "https://example.test/");
+    await tabs.create(other, "https://example.test/");
+    const a = executor.run(call("wait", { seconds: 100 }));
+    const b = executor.run(call("wait", { seconds: 0.05 }, other));
+    await new Promise(r => setTimeout(r, 5));
+    state.stopSession("s1");
+    expect(await a).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(await b).toMatchObject({ ok: true });
+    expect(state.paused).toBe(false);
+    expect(await executor.run(call("tabs_context", {}))).toMatchObject({ ok: false, error: "stopped_by_user", message: "You stopped this agent on this page." });
+    expect(await executor.run(call("tabs_context", {}, other))).toMatchObject({ ok: true });
+    state.resumeSession("s1");
+    expect(await executor.run(call("tabs_context", {}))).toMatchObject({ ok: true });
+  });
+
   test("stop during a multi-step click dispatches no input and leaves nothing attached", async () => {
     const { api, state, tabs, executor } = setup();
     const tab = await tabs.create(session, "https://example.test/");

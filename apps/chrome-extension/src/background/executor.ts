@@ -186,6 +186,10 @@ export class Executor {
     const fail = (error: BrowserErrorCode, message: string): CallResult => ({ id, ok: false, error, message });
     if (req.tool === SESSION_END_TOOL) return this.endSession(req);
     if (this.state.paused) return fail("paused_by_user", "The user paused this browser. Do not retry until they resume it.");
+    if (this.state.isStopped(req.session.id)) {
+      for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void Promise.resolve(this.ui.unmarkSession(tabId, req.session.id)).catch(() => {});
+      return fail("stopped_by_user", "You stopped this agent on this page.");
+    }
     if (req.tool === "list_browsers") return fail("bad_args", "list_browsers is answered by the gateway");
     if (!Object.hasOwn(TOOL_SCHEMAS, req.tool)) return fail("bad_args", `Unknown tool ${String(req.tool)}`);
     const tool: ExtensionTool = req.tool;
@@ -219,6 +223,7 @@ export class Executor {
   /** The agent session ended: closes the tabs it created, releases the rest. Works while paused, so a pause never leaves a dead session's tabs behind. */
   private async endSession(req: CallRequest): Promise<CallResult> {
     const s = this.tabs.sessions.get(req.session.id);
+    if (!s || s.identity === req.session.identity) this.state.resumeSession(req.session.id);
     if (s && s.identity !== req.session.identity) return { id: req.id, ok: true, content: [{ type: "text", text: "no such session" }] };
     const tabIds = s ? [...s.tabIds] : [];
     await this.tabs.closeSession(req.session.id);

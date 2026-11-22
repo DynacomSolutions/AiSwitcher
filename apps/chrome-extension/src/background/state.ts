@@ -7,6 +7,8 @@ export class State {
   private _paused = false;
   private readonly inflight = new Map<string, AbortController>();
   private readonly sessionOf = new Map<string, string>();
+  private readonly stopped = new Set<string>();
+  private readonly sessionStopListeners = new Set<(sessionId: string) => void>();
   private sessionsOnTab: (tabId: number) => string[] = () => [];
   private readonly changeListeners = new Set<(paused: boolean) => void>();
   private readonly stopListeners = new Set<() => void | Promise<void>>();
@@ -47,11 +49,21 @@ export class State {
 
   untrack(id: string): void { this.inflight.delete(id); this.sessionOf.delete(id); }
 
+  /** True after the user stopped this session and until it resumes or ends. The executor rejects its new calls. */
+  isStopped(sessionId: string): boolean { return this.stopped.has(sessionId); }
+
+  /** Clears the block set by stopSession. Called when the user prompts that chat again, and when the session ends. */
+  resumeSession(sessionId: string): void { this.stopped.delete(sessionId); }
+
+  onSessionStop(listener: (sessionId: string) => void): void { this.sessionStopListeners.add(listener); }
+
   /** Lookup of the sessions marked on a tab. Used by stopTab. */
   setSessionsOnTab(fn: (tabId: number) => string[]): void { this.sessionsOnTab = fn; }
 
-  /** Abort the in-flight calls of one session with stopped_by_user. Does not pause and does not detach. */
+  /** Abort the in-flight calls of one session with stopped_by_user and block its new calls. Does not pause and does not detach. */
   stopSession(sessionId: string): void {
+    this.stopped.add(sessionId);
+    for (const l of this.sessionStopListeners) { try { l(sessionId); } catch { /* best effort */ } }
     for (const [id, c] of [...this.inflight]) {
       if (this.sessionOf.get(id) !== sessionId) continue;
       c.abort("stopped");

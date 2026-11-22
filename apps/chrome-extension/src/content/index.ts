@@ -116,7 +116,7 @@ function init(): void {
         cursors?.remove(a.sessionId);
         agents.delete(a.sessionId);
         if (!sessions.remove(a.sessionId)) {
-          if (indicator && agents.size > 0) indicator.show([...agents.values()], [...agents.keys()].pop()!);
+          if (indicator && agents.size > 0) indicator.show([...agents.values()], agents.has(lastActive) ? lastActive : [...agents.keys()].pop()!);
           return "ok";
         }
       }
