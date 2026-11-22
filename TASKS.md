@@ -227,7 +227,7 @@ ETA: 2026-11-20 14:00 ICT
 | 246 | Kimi and Grok threads snooze at a usage limit and resume at the reset | blocked | agent | acp-limit-snooze | 5.229 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/657 (8141866).<br>Host runs v0.5.85.<br>Waits on the first real Kimi or Grok usage limit to prove snooze and resume. |
 | 255 | Usage collector: Grok log re-read (~0.9 GB per cycle) | todo | | | 5.133 | | Split from 5.133.<br>Each cycle re-reads the whole Grok log. |
 ## 6. Browser control extension
-ETA: 2026-11-18 18:30 ICT
+ETA: 2026-11-22 16:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -254,6 +254,8 @@ ETA: 2026-11-18 18:30 ICT
 | 228 | AIS Browser: T3 gateway folders get browser tools; tab groups show the thread title, never an id | done | claude | | | | Fix: [#616](https://github.com/DynacomSolutions/AiSwitcher/pull/616) (4745d07), release v0.5.76 [#619](https://github.com/DynacomSolutions/AiSwitcher/pull/619).<br>Proof: `ais browser wiring` shows the T3 pool folder wired, and a resumed T3 session lists all 22 browser tools.<br>Proof: owner saw the thread title on a new tab group (20 Nov).<br>MCP registration timeout under load: moved to the shared MCP service task. |
 | 240 | AIS Browser: one shared MCP service for every session, started on demand | done | claude | browser-mcp-gateway | | | The AIS gateway serves the AIS Browser MCP server at `<gateway>/browser/mcp`: one shared, stateless endpoint, no host process.<br>Launches wire it by HTTP with the agent token in env. Host daemon and unit removed.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/646, shipped in v0.5.79, gateway rolled out.<br>Live proof 20 Nov: two parallel sessions listed the browsers, a resumed session got the tools back. |
 | 253 | AIS Browser server entry comes from the .ais plugin, not from the AIS launcher | done | claude | browser-mcp-no-launcher | 6.240 | | Was 246 (id taken by 5.246).<br> The ais-browser MCP entry comes from the shared .ais Claude plugin (headersHelper `ais browser headers --tool=claude`, timeout 135 s), not the launcher.<br>Codex folders get it from `ais browser codex-config`.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/656, shipped in v0.5.81, plugin installed on all Claude folders except Kimi and Z.ai.<br>Live proof 20 Nov: two parallel sessions listed the browsers, a resumed session kept the tools, a 70 s wait passed. |
+| 266 | AIS Browser: agents show two tabs side by side (Chrome split view) | done | claude | browser-split-view | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/688, released v0.5.87 (gateway and extension).<br>Live proof 22 Nov: split_tabs on 50 pairs in the owner Chrome, tabs_context shows 50 splitViewIds, 2 tabs each.<br>Session end closed the earlier agent-opened tabs (not split view): owner asked. |
+| 267 | AIS Browser: agents save a named tab group that outlives the session and reopen it | in_progress | claude | browser-keep-tabs | | 2026-11-22 20:00 ICT | Owner ask: session end closed 100 agent-opened tabs.<br>Tools save_group, open_group, forget_group; savedGroups in tabs_context.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/693, released v0.5.88 (gateway live).<br>Next: owner Chrome self-updates to 0.5.88, then save the ContractFinder group as live proof. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-15 23:00 ICT
@@ -375,8 +377,8 @@ ETA: 2026-11-25 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 261 | Scratch-only chat pods, gateway RBAC and attach policy in .cluster | in_progress | claude | ais-chat-pods | | 2026-11-22 18:00 ICT | `workspace: chat` mounts only session scratch.<br>Gateway may attach only to sessions it created. |
-| 262 | Gateway chat broker: AgentSession pods over ACP, per-chat browser token | in_progress | claude | sidepanel-chat-gateway | 18.261 | 2026-11-23 18:00 ICT | chat.* frames, Postgres lease between replicas, transcripts, metrics, drain. |
-| 263 | Extension: per-chat tab grants, split-view context, one cursor per agent | todo | claude | | 18.262 | | Several chats share tabs; pill lists every agent on the tab. |
-| 264 | Side panel Chat view with T3-style provider and model picker | todo | claude | | 18.262, 18.263 | | Chat list, feed, tool and permission cards, linked-tab chips. |
+| 261 | Scratch-only chat pods, gateway RBAC and attach policy in .cluster | done | claude | ais-chat-pods | | | Merged https://github.com/DynacomSolutions/.cluster/pull/3125 (25d8b36e).<br>Chat policies live on the cluster. |
+| 262 | Gateway chat broker: AgentSession pods over ACP, per-chat browser token | done | claude | sidepanel-chat-gateway | 18.261 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/690 (4b983b0d).<br>CI 5549 pass, Postgres store contract green. |
+| 263 | Extension: per-chat tab grants, split-view context, one cursor per agent | in_progress | claude | sidepanel-chat-extension | 18.262 | 2026-11-23 00:00 ICT | Built and reviewed; real Chromium e2e running. |
+| 264 | Side panel Chat view with T3-style provider and model picker | in_progress | claude | sidepanel-chat-extension | 18.262, 18.263 | 2026-11-23 00:00 ICT | Built and reviewed; e2e, then one real pod chat on the cluster. |
 | 265 | Prove a real pod chat from Chromium on the cluster, then release | todo | claude | | 18.264 | | Real pod chat plus Chromium e2e; release.yml after the version bump. |

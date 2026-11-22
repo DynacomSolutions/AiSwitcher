@@ -2,6 +2,7 @@ import { DEFAULT_CALL_TIMEOUT_MS, SESSION_END_TOOL, WAIT_CALL_TIMEOUT_MS } from 
 import type { BrowserErrorCode, CallRequest, CallResult } from "../../../../src/browser/protocol.ts";
 import { TOOL_SCHEMAS, validateToolArgs } from "../../../../src/browser/tool-args.ts";
 import type { ExtensionTool, ToolArgs, UploadFile } from "../../../../src/browser/tool-args.ts";
+import { splitUnsupported, UnsupportedApiError } from "./chrome-api.ts";
 import type { ChromeApi, TabInfo } from "./chrome-api.ts";
 import { parseKeys } from "./keys.ts";
 import type { State } from "./state.ts";
@@ -199,6 +200,7 @@ export class Executor {
     if (this.tabs.touch(req.session)) {
       for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void this.markControlled(tabId, req.session);
     }
+    await this.tabs.regrant(req.session).catch(() => {});
     const controller = this.state.track(id, req.session.id, req.session.identity);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : this.defaultTimeout;
     const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
@@ -250,7 +252,7 @@ export class Executor {
       case "tabs_context": {
         if (session.chat === true) return this.chatContext(session.id);
         const { own, granted, other } = await this.tabs.list(session.id);
-        const view = (t: TabInfo) => ({ tabId: t.id, url: t.url, title: t.title, active: t.active });
+        const view = (t: TabInfo) => ({ tabId: t.id, url: t.url, title: t.title, active: t.active, ...(t.splitViewId !== undefined && t.splitViewId !== -1 ? { splitViewId: t.splitViewId } : {}) });
         const dialog = (t: TabInfo) => {
           const d = this.dialogs.get(t.id);
           return d ? { dialog: { type: d.type, message: d.message, url: d.url, ...(d.defaultPrompt !== undefined ? { defaultPrompt: d.defaultPrompt } : {}) } } : {};
@@ -260,13 +262,29 @@ export class Executor {
         const mineGroup = this.tabs.sessions.get(session.id)?.groupId;
         // `scope` and `grantedGroups` are additive: "own" tabs are in this session's own group, "granted" tabs sit in a group the user granted.
         const ownView = (t: TabInfo) => (t.groupId !== -1 && t.groupId !== mineGroup && this.tabs.grantee(t.groupId) === session.id ? grantedView(t) : { ...actionable(t), scope: "own" });
-        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), note: "otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
+        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), savedGroups: await this.tabs.savedGroups(session.identity), note: "otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group. savedGroups are named groups that outlive a session: open one with open_group. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
       }
       case "tabs_create": {
         this.throwIfAborted(sig);
-        const { url, groupId } = a("tabs_create");
+        const { url, groupId, splitWithTabId } = a("tabs_create");
         const target = url ? this.normaliseUrl(url) : undefined;
         if (session.chat === true && groupId !== undefined) throw new ToolError("forbidden_tab", "A chat cannot open tabs in a granted group.");
+        if (splitWithTabId !== undefined) {
+          if (groupId !== undefined) throw new ToolError("bad_args", "Use either groupId or splitWithTabId, not both. The new tab opens in the group of the tab it splits with.");
+          this.requireSplit();
+          const base = await this.ownedTab(req, splitWithTabId);
+          if (base.splitViewId !== -1) throw new ToolError("bad_args", `Tab ${splitWithTabId} is already in a split view. Use unsplit_tabs first.`);
+          const made = await this.splitError(async () => {
+            const opts = { splitWithTabId, windowId: base.windowId };
+            if (this.tabs.inGrantedGroup(session.id, session.identity, base)) return this.tabs.createInGranted(session, base.groupId, target, opts);
+            if (base.groupId === -1 || base.groupId !== this.tabs.sessions.get(session.id)?.groupId) throw new ToolError("bad_args", `Tab ${splitWithTabId} is not in this session's tab group, so a split tab cannot join its group.`);
+            return this.tabs.create(session, target, opts);
+          });
+          if (!made) throw new ToolError("forbidden_tab", `Group ${base.groupId} is not granted to this session.`);
+          await this.markControlled(made.id, session);
+          const now = await this.api.tabs.get(made.id);
+          return text(JSON.stringify({ tabId: made.id, url: made.url, ...(base.groupId !== -1 ? { groupId: base.groupId } : {}), splitViewId: now?.splitViewId ?? -1 }));
+        }
         if (groupId !== undefined) {
           const made = await this.tabs.createInGranted(session, groupId, target);
           if (!made) throw new ToolError("forbidden_tab", `Group ${groupId} is not granted to this session.`);
@@ -283,6 +301,69 @@ export class Executor {
         await this.markControlled(tab.id, session);
         return text(JSON.stringify({ tabId: tab.id, url: tab.url }));
       }
+      case "split_tabs": {
+        this.throwIfAborted(sig);
+        const [idA, idB] = a("split_tabs").tabIds;
+        if (idA === idB) throw new ToolError("bad_args", "split_tabs needs two different tabs.");
+        this.requireSplit();
+        const first = await this.ownedTab(req, idA);
+        const second = await this.ownedTab(req, idB);
+        if (first.splitViewId !== -1 && first.splitViewId === second.splitViewId) return text(JSON.stringify({ splitViewId: first.splitViewId, tabIds: [idA, idB] }));
+        for (const t of [first, second]) if (t.splitViewId !== -1) throw new ToolError("bad_args", `Tab ${t.id} is already in another split view. Use unsplit_tabs first.`);
+        if (first.windowId !== second.windowId) throw new ToolError("bad_args", "The two tabs are in different windows. A split view needs one window.");
+        if (first.pinned !== second.pinned) throw new ToolError("bad_args", "One tab is pinned and the other is not. A split view needs the same pinned state.");
+        if (first.groupId !== second.groupId) throw new ToolError("bad_args", "The two tabs are in different tab groups. A split view needs the same group.");
+        const splitViewId = await this.splitError(async () => {
+          let moved = false;
+          const originalIndex = second.index;
+          if (Math.abs(first.index - second.index) !== 1) {
+            // Move the second tab to sit right after the first. Moving removes it first, so the target index depends on the side it comes from.
+            await this.api.tabs.move(idB, originalIndex > first.index ? first.index + 1 : first.index);
+            moved = true;
+          }
+          try {
+            return await this.api.tabs.createSplit([idA, idB]);
+          } catch (e) {
+            if (moved) await this.api.tabs.move(idB, originalIndex).catch(() => {}); // best effort: put the tab back where the user had it
+            throw e;
+          }
+        });
+        return text(JSON.stringify({ splitViewId, tabIds: [idA, idB] }));
+      }
+      case "unsplit_tabs": {
+        this.throwIfAborted(sig);
+        const { tabId } = a("unsplit_tabs");
+        this.requireSplit();
+        const tab = await this.ownedTab(req, tabId);
+        if (tab.splitViewId === -1) throw new ToolError("bad_args", `Tab ${tabId} is not in a split view.`);
+        const members = (await this.api.tabs.query()).filter(t => t.splitViewId === tab.splitViewId);
+        for (const t of members) {
+          if (!this.tabs.owns(session.id, t.id, session.identity) && !this.tabs.inGrantedGroup(session.id, session.identity, t)) throw new ToolError("forbidden_tab", `Tab ${t.id} in this split view is not in this session, so the split view cannot be removed.`);
+        }
+        await this.splitError(() => this.api.tabs.unsplit(tab.splitViewId));
+        return text(JSON.stringify({ unsplit: true, splitViewId: tab.splitViewId, tabIds: members.map(t => t.id) }));
+      }
+      case "save_group": {
+        this.throwIfAborted(sig);
+        const { name, groupId } = a("save_group");
+        const key = this.groupName(name);
+        const r = await this.tabs.save(session, key, groupId);
+        if (!r.ok) throw new ToolError(r.code, r.message);
+        return text(JSON.stringify({ name: key, groupId: r.groupId, tabCount: r.tabCount, saved: true, note: "The tabs stay open after the session ends. Use open_group to open the group again." }));
+      }
+      case "open_group": {
+        this.throwIfAborted(sig);
+        const key = this.groupName(a("open_group").name);
+        const r = await this.tabs.open(session, key);
+        if (!r.ok) throw new ToolError(r.code, r.message);
+        return text(JSON.stringify({ name: r.name, groupId: r.groupId, tabs: r.tabs, ...(r.warnings.length > 0 ? { warnings: r.warnings } : {}) }));
+      }
+      case "forget_group": {
+        const key = this.groupName(a("forget_group").name);
+        const r = await this.tabs.forgetSaved(session, key);
+        if (!r.ok) throw new ToolError(r.code, r.message);
+        return text(JSON.stringify({ name: key, forgotten: true, open: r.wasOpen, note: "No tab was closed." }));
+      }
       case "adopt_tab": {
         const { tabId } = a("adopt_tab");
         if (session.chat === true && !this.tabs.chatLinked(session.id, tabId) && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", "Only tabs you linked to this chat can be used. Link it in the side panel.");
@@ -293,6 +374,8 @@ export class Executor {
         }
         if (this.tabs.inGrantedGroup(session.id, session.identity, tab)) return text(`Tab ${tabId} is in a group granted to this session and is already usable.`);
         if (this.tabs.grantee(tab.groupId) !== undefined) throw new ToolError("forbidden_tab", `Tab ${tabId} is in a group the user granted to another session.`);
+        const savedName = await this.tabs.savedNameOfGroup(tab.groupId);
+        if (savedName !== undefined) throw new ToolError("forbidden_tab", `Tab ${tabId} is in the saved group "${savedName}". Use open_group to use it.`);
         const owner = this.tabs.ownerOf(tabId);
         if (owner !== undefined && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} belongs to another session.`);
         this.throwIfAborted(sig);
@@ -485,6 +568,25 @@ export class Executor {
       }
       default:
         throw new ToolError("bad_args", `Unsupported tool ${tool}`);
+    }
+  }
+
+  /** Fails before anything changes when this Chrome has no split view. */
+  private groupName(name: string): string {
+    const key = name.trim();
+    if (key === "" || key.length > 100) throw new ToolError("bad_args", "name must have 1 to 100 characters.");
+    return key;
+  }
+
+  private requireSplit(): void {
+    if (!this.api.tabs.splitSupported()) throw new ToolError("bad_args", splitUnsupported().message);
+  }
+
+  /** Runs a split view call: a Chrome without the API becomes a ToolError the agent can read. */
+  private async splitError<T>(work: () => Promise<T>): Promise<T> {
+    try { return await work(); } catch (e) {
+      if (e instanceof UnsupportedApiError) throw new ToolError("bad_args", e.message);
+      throw e;
     }
   }
 

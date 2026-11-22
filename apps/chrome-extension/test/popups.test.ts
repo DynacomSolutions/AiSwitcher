@@ -30,7 +30,7 @@ describe("tabs opened by a page in an agent tab", () => {
 
   test("works whichever of onCreated and onActivated Chrome fires first", async () => {
     const { api, mine, agent } = await setup();
-    const t = { id: 500, windowId: 1, groupId: -1, url: "https://opened.example.com/", title: "", active: true };
+    const t = { id: 500, windowId: 1, groupId: -1, url: "https://opened.example.com/", title: "", active: true, splitViewId: -1, index: 5, pinned: false };
     api.emit(agent.id, "Page.windowOpen", {});
     api.tabList.set(t.id, t);
     api.setActive(t.id); // activation reported first

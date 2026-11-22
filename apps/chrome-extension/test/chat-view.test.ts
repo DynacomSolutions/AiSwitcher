@@ -12,7 +12,7 @@ const view = (id: string, over: Partial<ChatView["summary"]> = {}, items: ChatVi
   items,
 });
 const stateOf = (chats: ChatView[], over: Partial<ChatPanelState> = {}): ChatPanelState => ({ windowId: 1, connected: true, chats, cap: 6, ...over });
-const tab = (id: number, over: Partial<TabInfo> = {}): TabInfo => ({ id, windowId: 1, groupId: -1, url: `https://t${id}.test/`, title: `T${id}`, active: false, ...over });
+const tab = (id: number, over: Partial<TabInfo> = {}): TabInfo => ({ id, windowId: 1, groupId: -1, url: `https://t${id}.test/`, title: `T${id}`, active: false, splitViewId: -1, index: 0, pinned: false, ...over });
 
 function setup(chats: ChatView[], opts: { tabs?: TabInfo[]; result?: () => ChatCommandResult | undefined; seen?: Record<string, number> } = {}) {
   const doc = fakeDoc();

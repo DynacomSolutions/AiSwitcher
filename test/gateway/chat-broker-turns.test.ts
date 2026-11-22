@@ -687,3 +687,59 @@ test("an open ask outside a turn is cancelled when the chat is idle past idleMs,
   expect(await bodies(store, rec.id)).toContainEqual({ k: "permission_resolved", requestId: perm.requestId, cancelled: true });
   expect((await store.get(rec.id))?.state).toBe("idle");
 });
+
+test("a drain that waits for a claimed prompt does not spin", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  const realGet = store.get.bind(store);
+  store.get = async (id: string) => {
+    await Bun.sleep(300);
+    return realGet(id);
+  };
+  const real = globalThis.setImmediate;
+  let calls = 0;
+  (globalThis as { setImmediate: unknown }).setImmediate = ((fn: () => void, ...a: unknown[]) => {
+    calls += 1;
+    return real(fn, ...a);
+  }) as typeof setImmediate;
+  try {
+    const p = broker.prompt(rec.id, "bind-1", "hi");
+    await Bun.sleep(5);
+    await broker.drain();
+    await p;
+  } finally {
+    globalThis.setImmediate = real;
+  }
+  expect(calls).toBeLessThan(20);
+});
+
+test("the gateway-wide cap counts as a limit error", async () => {
+  const { broker, metrics } = setup();
+  await made(broker);
+  const r = await broker.create({ chatId: crypto.randomUUID(), binding: "bind-1", windowId: 2, name: "n", color: "#aabbcc", selection: SELECTION, tabIds: [], maxLive: 1 });
+  expect(r).toEqual({ code: "limit", message: "Too many chats are open. Close one, then try again." });
+  expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="limit"} 1');
+});
+
+test("a prompt starts no pod when the identity is no longer listed, and fails closed when the list cannot be read", async () => {
+  let verdict: "ok" | "identity" | "throw" = "identity";
+  const { broker, store, transport } = setup({}, {
+    checkSelection: async () => {
+      if (verdict === "throw") throw new Error("configmap down");
+      return verdict;
+    },
+  });
+  const rec = await made(broker);
+  await send(broker, rec.id, "hi");
+  await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
+  let errs = (await bodies(store, rec.id)).filter((b) => b.k === "error");
+  expect(errs).toEqual([{ k: "error", code: "bad_request", message: "This identity is no longer available. Start a new chat." }]);
+  expect(transport.starts).toHaveLength(0);
+  verdict = "throw";
+  await until(async () => (await store.get(rec.id))?.state !== "thinking" && (await store.get(rec.id))?.state !== "starting", "idle");
+  await send(broker, rec.id, "again");
+  await until(async () => (await bodies(store, rec.id)).filter((b) => b.k === "error").length === 2, "second error");
+  errs = (await bodies(store, rec.id)).filter((b) => b.k === "error");
+  expect(errs[1]).toMatchObject({ code: "unavailable" });
+  expect(transport.starts).toHaveLength(0);
+});

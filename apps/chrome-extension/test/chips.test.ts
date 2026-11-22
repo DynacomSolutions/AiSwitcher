@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { TabInfo } from "../src/background/chrome-api.ts";
 import { addableTabs, chipsFor } from "../src/sidepanel/chat/chips.ts";
 
-const tab = (id: number, url: string, windowId = 1, title = `T${id}`): TabInfo => ({ id, windowId, groupId: -1, url, title, active: false });
+const tab = (id: number, url: string, windowId = 1, title = `T${id}`): TabInfo => ({ id, windowId, groupId: -1, url, title, active: false, splitViewId: -1, index: 0, pinned: false });
 
 describe("chips", () => {
   test("chipsFor marks a closed tab missing", () => {

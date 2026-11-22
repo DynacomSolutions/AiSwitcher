@@ -89,6 +89,8 @@ export interface BrokerDeps {
   /** Time between idle sweeps. Default 60 seconds. */
   sweepMs?: number;
   identityOf(binding: string): Promise<string | undefined>;
+  /** Checks the stored provider and identity against the picker list before a pod starts. A throw fails the start closed. */
+  checkSelection?(provider: ChatSelection["provider"], identity: string): Promise<"ok" | "identity" | "model">;
   /** Time limit of one ACP request in the start path. */
   acpTimeoutMs?: number;
   timers?: Timers;
@@ -148,6 +150,10 @@ export interface ChatRuntime {
 class NoHttpError extends Error {}
 /** The chat is older than maxAgeMs. */
 class ExpiredError extends Error {}
+/** The ConfigMap no longer lists the identity of the chat. */
+class SelectionGoneError extends Error {}
+/** The ConfigMap could not be read, so the start fails closed. */
+class SelectionUnreadableError extends Error {}
 
 type Failure = { code: (typeof CHAT_ERROR_CODES)[number]; message: string; kind: string };
 
@@ -370,6 +376,7 @@ export class ChatBroker implements ChatAuth {
       if (e instanceof ChatExistsError) return { code: "bad_request", message: "A chat with this id exists." };
       throw e;
     }
+    if (rec === "global") this.d.metrics.chatError("limit");
     if (rec === "global") return { code: "limit", message: GATEWAY_CAP_MESSAGE };
     if (rec === "cap") return { code: "window_cap", message: `A window holds at most ${MAX_CHATS_PER_WINDOW} chats.` };
     const fence = { replica: this.d.replicaId, epoch: rec.epoch };
@@ -488,6 +495,15 @@ export class ChatBroker implements ChatAuth {
       generation = chat.generation + 1;
       name = sessionName(chatId, generation);
       if (this.d.now() > chat.createdAt + (this.d.maxAgeMs ?? 7 * DAY_MS)) throw new ExpiredError();
+      if (this.d.checkSelection) {
+        let verdict: "ok" | "identity" | "model";
+        try {
+          verdict = await this.d.checkSelection(chat.selection.provider, chat.selection.identity);
+        } catch {
+          throw new SelectionUnreadableError();
+        }
+        if (verdict === "identity") throw new SelectionGoneError();
+      }
       await this.writeState(chatId, { state: "starting", generation }, fence);
       generationSet = true;
       // A pod from before a gateway restart must not stay next to the new one. The calls run together and end with the start deadline.
@@ -652,6 +668,8 @@ export class ChatBroker implements ChatAuth {
   /** Fixed copy by cause. The text of the error itself never reaches the feed. */
   private classify(e: unknown, s: { timedOut: boolean; handle: PodHandle | undefined; closedReason: string | undefined; named: boolean }): Failure {
     if (s.timedOut) return { code: "timeout", message: "The agent did not start in time.", kind: "timeout" };
+    if (e instanceof SelectionGoneError) return { code: "bad_request", message: "This identity is no longer available. Start a new chat.", kind: "other" };
+    if (e instanceof SelectionUnreadableError) return { code: "unavailable", message: "The chat service is not available.", kind: "other" };
     if (e instanceof ExpiredError) return { code: "expired", message: "This chat is too old. Open a new chat.", kind: "limit" };
     if (e instanceof PodStartError) return { code: "pod_start", message: e.message, kind: "pod_start" };
     if (e instanceof NoHttpError) return { code: "acp", message: "This agent cannot use HTTP tools", kind: "acp" };
@@ -1214,7 +1232,9 @@ export class ChatBroker implements ChatAuth {
       for (const rt of this.runtimes.values()) this.cancelPerms(rt.ctx);
       const waits = [...this.starting.values()].map((e) => e.promise.catch(() => undefined) as Promise<unknown>).concat([...this.turnDone.values()]);
       if (waits.length === 0 && this.turning.size === 0) break;
-      await (waits.length > 0 ? Promise.all(waits) : new Promise((r) => setImmediate(r)));
+      // A prompt that holds its claim and waits on the store settles by itself. Wait for the claims, or a short pause: nothing here cuts work.
+      const claims = [...this.claims.values()];
+      await (waits.length > 0 ? Promise.all(waits) : claims.length > 0 ? Promise.all(claims) : new Promise((r) => setTimeout(r, 10)));
     }
     for (const rt of [...this.runtimes.values()]) {
       await rt.ctx.chain;

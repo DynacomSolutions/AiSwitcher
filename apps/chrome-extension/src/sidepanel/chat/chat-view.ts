@@ -603,7 +603,7 @@ export function initChatTab(root: HTMLElement, windowId: number, paused: () => P
       const port = chrome.runtime.connect({ name: "ais-chat" });
       return { postMessage: m => port.postMessage(m), onMessage: l => port.onMessage.addListener(l), onDisconnect: l => port.onDisconnect.addListener(l) };
     },
-    queryTabs: async () => (await chrome.tabs.query({ windowId })).filter(t => t.id !== undefined).map(t => ({ id: t.id!, windowId: t.windowId, groupId: t.groupId, url: t.url ?? "", title: t.title ?? "", active: t.active, ...(t.splitViewId !== undefined ? { splitViewId: t.splitViewId } : {}) })),
+    queryTabs: async () => (await chrome.tabs.query({ windowId })).filter(t => t.id !== undefined).map(t => ({ id: t.id!, windowId: t.windowId, groupId: t.groupId, url: t.url ?? "", title: t.title ?? "", active: t.active, splitViewId: typeof t.splitViewId === "number" ? t.splitViewId : -1, index: t.index, pinned: t.pinned })),
     send: async c => { try { return (await chrome.runtime.sendMessage(c)) as ChatCommandResult | undefined; } catch { return undefined; } },
     loadSeen: async () => ((await chrome.storage.session.get(seenKey))[seenKey] as Record<string, number> | undefined) ?? {},
     saveSeen: seen => { void chrome.storage.session.set({ [seenKey]: seen }); },

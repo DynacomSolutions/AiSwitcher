@@ -8,6 +8,7 @@ import { chatTokenKey, mintChatToken } from "../../src/gateway/chat/token.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { chatConfigFromEnv, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
+import type { UsageRow } from "../../src/gateway/types.ts";
 import { generateToken } from "../../src/gateway/tokens.ts";
 import { StubPodTransport } from "./fixtures/stub-transport.ts";
 
@@ -61,7 +62,15 @@ class Client {
   }
 }
 
-let store: MemoryGatewayStore;
+class CapturingStore extends MemoryGatewayStore {
+  readonly written: UsageRow[] = [];
+  override async appendUsage(rows: UsageRow[]): Promise<void> {
+    this.written.push(...rows);
+    await super.appendUsage(rows);
+  }
+}
+
+let store: CapturingStore;
 let started: Array<{ stop(): Promise<void> }>;
 let transports: StubPodTransport[];
 let origWarn: typeof console.warn;
@@ -69,7 +78,7 @@ let origInfo: typeof console.info;
 const savedEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
-  store = new MemoryGatewayStore();
+  store = new CapturingStore();
   started = [];
   transports = [];
   origWarn = console.warn;
@@ -389,4 +398,44 @@ test("a panel that is already attached when the chat start first works gets the 
   early.send(create(crypto.randomUUID()));
   await early.until(() => early.of("chat.state").length === 1);
   expect(early.closeCode).toBeUndefined();
+});
+
+test("stop() flushes the ledger while a chat turn still runs", async () => {
+  const token = await pair();
+  await store.putApp({ name: "web", owner: "o", namespace: "ns", provider: "claude", style: "anthropic", target: { kind: "pin", identity: "id1" }, state: "active", createdAt: "2026-11-01T00:00:00.000Z" });
+  const t = generateToken();
+  await store.addToken({ app: "web", prefix: t.prefix, hash: t.hash, createdAt: "2026-11-01T00:00:00.000Z" });
+  let turnEnded = false;
+  class Spy extends StubPodTransport {
+    override async start(input: PodSpecInput, signal: AbortSignal, onPhase: (n: PodPhaseNotice) => void): Promise<PodHandle> {
+      const h = await super.start(input, signal, onPhase);
+      h.stream.onLine((l) => {
+        if (l.includes("stopReason")) turnEnded = true;
+      });
+      return h;
+    }
+  }
+  const spy = new Spy({ env: { STUB_ACP_STATE: join(root, `${crypto.randomUUID()}.state`) } });
+  transports.push(spy);
+  const g = await boot({
+    chatTransport: spy,
+    fetch: (async () => new Response('{"ok":true,"usage":{"input_tokens":2,"output_tokens":4}}', { headers: { "content-type": "application/json" } })) as unknown as typeof fetch,
+  });
+  const res = await fetch(`http://127.0.0.1:${g.port}/web/v1/messages`, { method: "POST", headers: { authorization: `Bearer ${t.token}`, "content-type": "application/json" }, body: JSON.stringify({ model: "m", messages: [] }) });
+  expect(res.status).toBe(200);
+  const c = await Client.open(g.port, token);
+  const chatId = crypto.randomUUID();
+  c.send(create(chatId));
+  await c.until(() => c.of("chat.state").length > 0);
+  c.send({ t: "chat.prompt", chatId, text: "wait:1200" });
+  await c.until(() => spy.written.some((l) => l.includes("session/prompt")));
+  expect(store.written).toHaveLength(0);
+  const stopping = g.stop();
+  const end = Date.now() + 800;
+  while (store.written.length === 0 && Date.now() < end) await Bun.sleep(10);
+  // The ledger is flushed and the turn is still running.
+  expect(store.written.length).toBeGreaterThan(0);
+  expect(turnEnded).toBe(false);
+  await stopping;
+  expect(turnEnded).toBe(true);
 });

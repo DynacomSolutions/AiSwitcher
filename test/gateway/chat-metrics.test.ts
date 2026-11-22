@@ -35,6 +35,15 @@ describe("chat metrics", () => {
     expect(out).not.toContain("bogus");
   });
 
+  test("limit is its own error kind and unavailable is its own MCP outcome", () => {
+    const m = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    m.chatError("limit");
+    m.browserMcpRequest("delete", "unavailable");
+    const out = m.render();
+    expect(out).toContain('ais_gateway_chat_errors_total{kind="limit"} 1');
+    expect(out).toContain('outcome="unavailable"');
+  });
+
   test("noopMetrics has the four methods", () => {
     expect(() => {
       noopMetrics.chatSession("session_created");

@@ -40,7 +40,7 @@ export class PopupGuard {
   }
 
   windowOpen(tabId: number): void {
-    if (this.tabs.ownerOf(tabId) !== undefined) this.pending.push({ source: tabId, at: this.now() });
+    if (this.tabs.ownerOf(tabId) !== undefined || this.tabs.inSavedGroup(tabId)) this.pending.push({ source: tabId, at: this.now() });
   }
 
   private take(): number | undefined {

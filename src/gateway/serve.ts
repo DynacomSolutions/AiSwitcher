@@ -1228,6 +1228,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         return b.target.kind === "identity" ? b.target.identity : b.target.pool;
       };
       let frames: ChatFrames | undefined;
+      let catalogRef: ChatCatalog | undefined;
       const broker = new ChatBroker({
         store: chatStore,
         transport,
@@ -1243,6 +1244,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         rejectChat: (chatId, code, message) => frames?.rejectChat(chatId, code, message),
         watchedChats: () => frames?.watchedChats() ?? [],
         identityOf,
+        checkSelection: (provider, identity) => catalogRef?.check(provider, identity) ?? Promise.resolve("ok"),
         endBrowserSession: async (binding, sessionId) => {
           const identity = (await identityOf(binding)) ?? "chat";
           await browser.call(binding, { id: crypto.randomUUID(), session: { id: sessionId, identity, label: "", chat: true }, tool: SESSION_END_TOOL, args: {} }, 5_000).catch(() => undefined);
@@ -1254,6 +1256,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         models: (a) => listAppModels(a, appDeps, AbortSignal.timeout(8_000)),
         isPool: async (name) => (await browserPoolMembers(name)) !== undefined,
       });
+      catalogRef = catalog;
       frames = new ChatFrames({ broker, store: chatStore, bus, catalog, hub, maxPerWindow: MAX_CHATS_PER_WINDOW, maxLive: chatEnv?.maxLive ?? CHAT_MAX_DEFAULT, metrics });
       const live = frames;
       chatBroker = broker;
@@ -1342,13 +1345,15 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       await Promise.race([Promise.allSettled([keepAliveRun]), new Promise<void>((r) => setTimeout(r, hooks.stopCeilingMs ?? 10_000).unref?.())]);
       // A keep-alive account that was already past its stop check may have started a refresh meanwhile: wait for it too.
       await Promise.allSettled([...inflightRefreshes]);
+      // The ledger flush, the relay and the leader lock do not wait for chat turns: a long turn must not hold them until the kill ceiling.
+      await ledger.close();
+      await relay?.stop().catch(() => undefined);
+      await leader?.stop().catch(() => undefined);
+      // The chat drain needs only the shared SQL pool, the listener and the chat store, which stay open until the end.
       await chatDrain;
       await chat?.frames.stop().catch(() => undefined);
       await chat?.broker.dispose().catch(() => undefined);
-      await ledger.close();
-      await relay?.stop().catch(() => undefined);
       await mirror?.stop().catch(() => undefined);
-      await leader?.stop().catch(() => undefined);
       if (mirror) setLocalWriteHook(undefined);
       // Last pushes (a heartbeat written during the pass) need the store open until here.
       await homeStore?.close().catch(() => undefined);
