@@ -44,6 +44,12 @@ describe("composerMode", () => {
     expect(composerMode(chat("a", "waiting"), false)).toMatchObject({ send: false, stop: true });
     expect(composerMode(chat("a", "idle"), false)).toMatchObject({ send: true, stop: false });
   });
+  test("composerMode allows the first prompt of a new chat that still reads starting, and waits once the user has prompted", () => {
+    expect(composerMode(chat("a", "starting"), false)).toMatchObject({ send: true, stop: false });
+    const prompted: ChatView = { ...chat("a", "starting"), items: [{ seq: 1, ts: 0, body: { k: "user", text: "hello" } }] };
+    expect(composerMode(prompted, false)).toMatchObject({ send: false, stop: false });
+    expect(composerMode(chat("a", "closed"), false).send).toBe(false);
+  });
   test("composerMode with no links gives the no-pages hint", () => {
     expect(composerMode(chat("a", "idle", { tabIds: [] }), false).hint).toBe("No pages are linked. The agent cannot see any tab.");
   });

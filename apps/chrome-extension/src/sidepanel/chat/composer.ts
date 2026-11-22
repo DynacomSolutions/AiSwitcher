@@ -9,8 +9,11 @@ export function composerMode(c: ChatView | undefined, paused: boolean): { send: 
   if (!c) return { send: false, stop: false };
   const s = c.summary.state;
   const running = s === "thinking" || s === "waiting";
+  // A new chat reads "starting" until its first prompt: the gateway starts the agent then. So that first prompt must be possible.
+  // Once the user has prompted, "starting" means the agent is on its way up, and Send waits.
+  const starting = s === "starting" && c.items.some(i => i.body.k === "user");
   const hint = paused ? PAUSED_HINT : c.summary.tabIds.length === 0 ? NO_PAGES_HINT : undefined;
-  return { send: !running && s !== "starting" && s !== "closed", stop: running, ...(hint ? { hint } : {}) };
+  return { send: !running && !starting && s !== "closed", stop: running, ...(hint ? { hint } : {}) };
 }
 
 export interface ComposerHandlers {
