@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { MAX_CHAT_NAME, MAX_CHAT_TEXT } from "../../../src/browser/chat-protocol.ts";
+import { MAX_CHAT_NAME, MAX_CHAT_TABS, MAX_CHAT_TEXT } from "../../../src/browser/chat-protocol.ts";
 import type { TabInfo } from "../src/background/chrome-api.ts";
 import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../src/shared/chat.ts";
-import { AGENT_TAB, ChatTab, LOADING_PROVIDERS, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
+import { AGENT_TAB, ChatTab, LOADING_PROVIDERS, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
 import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
 import type { FakeNode } from "./fake-dom.ts";
 
@@ -224,5 +224,181 @@ describe("chat tab", () => {
     await t2.flush();
     t2.push(stateOf(s.chats));
     expect(byClass(t2.root, "chat-row")[0]!.className).not.toContain("unread");
+  });
+
+  test("N1: the close confirm moves focus to Cancel, Escape returns it, Close moves it to the next row", async () => {
+    const chats = [view("a", { state: "thinking" }), view("b"), view("c")];
+    const s = setup(chats);
+    s.push(stateOf(chats));
+    await s.flush();
+    byLabel(s.root, "Close Chat a")!.click();
+    const confirm = byClass(s.root, "inline-form").find(f => f.textContent.includes("Close this chat?") && !f.hidden)!;
+    expect(confirm.attrs.role).toBe("alert");
+    expect(s.doc.activeElement).toBe(byText(confirm, "button", "Cancel"));
+    confirm.dispatch("keydown", { key: "Escape" });
+    expect(confirm.hidden).toBe(true);
+    expect(s.doc.activeElement).toBe(byLabel(s.root, "Close Chat a"));
+    byLabel(s.root, "Close Chat a")!.click();
+    byText(confirm, "button", "Close")!.click();
+    expect(s.doc.activeElement).toBe(byClass(s.root, "row-open")[1]);
+    // The last row has no next row: focus goes to New chat.
+    byLabel(s.root, "Close Chat c")!.click();
+    expect(s.doc.activeElement).toBe(byText(s.root, "button", "New chat"));
+  });
+
+  test("N2: a tab title change keeps the same option nodes and adds only the new one", async () => {
+    const s = setup([view("a")], { tabs: [tab(5), tab(6), tab(7)] });
+    s.push(stateOf([view("a")]));
+    s.t.select("a");
+    await s.flush();
+    const select = byClass(s.root, "chip-add")[0]!;
+    const opt = (id: string) => select.children.find(o => o.value === id)!;
+    const six = opt("6"), seven = opt("7");
+    expect(six.textContent).toBe("T6");
+    (s as unknown as { t: ChatTab }).t.refreshTabs();
+    await s.flush();
+    // Same options after a refresh.
+    expect(opt("6")).toBe(six);
+    expect(opt("7")).toBe(seven);
+  });
+
+  test("N2: a title change patches the text in place, also while the menu has focus", async () => {
+    let tabs = [tab(5), tab(6), tab(7)];
+    const doc = fakeDoc();
+    const root = doc.createElement("section");
+    let push: (m: unknown) => void = () => {};
+    const t = new ChatTab({
+      doc: asDoc(doc), windowId: 1,
+      connect: () => ({ postMessage: () => {}, onMessage: l => { push = l; }, onDisconnect: () => {} }),
+      queryTabs: async () => tabs, send: async () => ({ ok: true }), loadSeen: async () => ({}), saveSeen: () => {},
+    }, asEl(root));
+    t.start();
+    push(stateOf([view("a")]));
+    t.select("a");
+    await new Promise(r => setTimeout(r, 0));
+    const select = byClass(root, "chip-add")[0]!;
+    const six = select.children.find(o => o.value === "6")!;
+    tabs = [tab(5), tab(6, { title: "New title" }), tab(7), tab(8)];
+    select.focus();
+    await t.refreshTabs();
+    expect(select.children.find(o => o.value === "6")).toBe(six);
+    expect(six.textContent).toBe("New title");
+    expect(select.children.some(o => o.value === "8")).toBe(false); // structure waits for blur
+    doc.activeElement = undefined;
+    select.dispatch("blur");
+    expect(select.children.some(o => o.value === "8")).toBe(true);
+    expect(select.children.find(o => o.value === "6")).toBe(six);
+  });
+
+  test("N3: Enter during IME composition does not save the rename", async () => {
+    const s = setup([view("a")]);
+    s.push(stateOf([view("a")]));
+    await s.flush();
+    byLabel(s.root, "Rename Chat a")!.click();
+    const box = byClass(s.root, "rename-box")[0]!;
+    box.value = "Nom";
+    box.dispatch("keydown", { key: "Enter", isComposing: true });
+    expect(s.sent.length).toBe(0);
+    box.dispatch("keydown", { key: "Enter", isComposing: false });
+    expect(s.sent).toEqual([{ type: "ais-chat-rename", chatId: "a", name: "Nom" }]);
+  });
+
+  test("N4: a removed chat loses its seen mark, and saves are debounced", async () => {
+    const s = setup([view("a"), view("b")], { seen: { a: 0, b: 0, gone: 4 } });
+    await s.flush();
+    s.push(stateOf([view("a", { lastSeq: 1 }), view("b")]));
+    s.push(stateOf([view("a", { lastSeq: 1 }), view("b")]));
+    s.t.select("a");
+    s.push(stateOf([view("a", { lastSeq: 2 }), view("b")]));
+    expect(s.saved.length).toBe(0);
+    await new Promise(r => setTimeout(r, 320));
+    expect(s.saved.length).toBe(1);
+    expect(s.saved[0]).toEqual({ a: 2, b: 0 });
+    s.push(stateOf([view("a", { lastSeq: 2 })]));
+    await new Promise(r => setTimeout(r, 320));
+    expect(s.saved.at(-1)).toEqual({ a: 2 });
+  });
+
+  test("N5: a reorder moves one row, not all of them, and a moved focused row keeps focus", async () => {
+    const abc = [view("a"), view("b"), view("c")];
+    const s = setup(abc);
+    s.push(stateOf(abc));
+    await s.flush();
+    const ul = byClass(s.root, "chat-rows")[0]!;
+    let moves = 0;
+    const orig = ul.insertBefore.bind(ul);
+    ul.insertBefore = (n, ref) => { moves++; return orig(n, ref); };
+    const closeA = byLabel(s.root, "Close Chat a")!;
+    closeA.focus();
+    s.push(stateOf([view("b"), view("c"), view("a")]));
+    expect(moves).toBe(1);
+    expect(ul.children.map(r => r.textContent.includes("Chat a"))).toEqual([false, false, true]);
+    expect(s.doc.activeElement).toBe(closeA);
+    moves = 0;
+    s.push(stateOf([view("b"), view("c"), view("a")]));
+    expect(moves).toBe(0);
+  });
+
+  test("N6: the agent-tab note waits for the link reply, then shows when the chip is still present", async () => {
+    let release: (r: ChatCommandResult) => void = () => {};
+    const doc = fakeDoc();
+    const root = doc.createElement("section");
+    let push: (m: unknown) => void = () => {};
+    const t = new ChatTab({
+      doc: asDoc(doc), windowId: 1,
+      connect: () => ({ postMessage: () => {}, onMessage: l => { push = l; }, onDisconnect: () => {} }),
+      queryTabs: async () => [tab(5), tab(6)],
+      send: () => new Promise(r => { release = r; }), loadSeen: async () => ({}), saveSeen: () => {},
+    }, asEl(root));
+    t.start();
+    push(stateOf([view("a", { tabIds: [5, 6] })]));
+    t.select("a");
+    await new Promise(r => setTimeout(r, 0));
+    byLabel(root, "Unlink T6")!.click();
+    push(stateOf([view("a", { tabIds: [5, 6] })]));
+    expect(byClass(root, "banner").some(b => b.textContent === AGENT_TAB)).toBe(false);
+    release({ ok: true });
+    await new Promise(r => setTimeout(r, 0));
+    expect(byClass(root, "banner").some(b => b.textContent === AGENT_TAB && !b.hidden)).toBe(true);
+  });
+
+  test("N6: no note when the chip is gone after the reply", async () => {
+    const s = setup([view("a", { tabIds: [5, 6] })], { tabs: [tab(5), tab(6)] });
+    s.push(stateOf([view("a", { tabIds: [5, 6] })]));
+    s.t.select("a");
+    await s.flush();
+    byLabel(s.root, "Unlink T6")!.click();
+    s.push(stateOf([view("a", { tabIds: [5] })]));
+    await s.flush();
+    expect(byClass(s.root, "banner").some(b => b.textContent === AGENT_TAB)).toBe(false);
+  });
+
+  test("N7: the tab limit shows a message instead of dropping tabs", async () => {
+    const many = Array.from({ length: MAX_CHAT_TABS }, (_, i) => i + 100);
+    const s = setup([view("a", { tabIds: many })], { tabs: [tab(5), ...many.map(i => tab(i))] });
+    s.push(stateOf([view("a", { tabIds: many })]));
+    s.t.select("a");
+    await s.flush();
+    const select = byClass(s.root, "chip-add")[0]!;
+    select.value = "5";
+    select.dispatch("change");
+    expect(s.sent.length).toBe(0);
+    expect(byClass(s.root, "banner").some(b => b.textContent === `A chat can use up to ${MAX_CHAT_TABS} pages.`)).toBe(true);
+  });
+
+  test("N8: opening a chat focuses its message box and Back focuses the row left", async () => {
+    const s = setup([view("a"), view("b")]);
+    s.push(stateOf([view("a"), view("b")]));
+    await s.flush();
+    byClass(s.root, "row-open")[1]!.click();
+    expect(s.doc.activeElement).toBe(byClass(s.root, "composer-box")[0]);
+    byText(s.root, "button", "Back")!.click();
+    expect(s.doc.activeElement).toBe(byClass(s.root, "row-open")[1]);
+  });
+
+  test("N9: storage changes of the panel's own keys do not count", () => {
+    expect(onlyOwnKeys({ "chatSeen:1": {} }, ["chatSeen:1", "chatSelection"])).toBe(true);
+    expect(onlyOwnKeys({ "chatSeen:1": {}, paused: {} }, ["chatSeen:1", "chatSelection"])).toBe(false);
+    expect(onlyOwnKeys({}, ["chatSeen:1"])).toBe(false);
   });
 });

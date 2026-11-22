@@ -19,6 +19,8 @@ export class FakeNode {
   }
   get textContent(): string { return this.tag === "#text" ? this.text : this.text + this.children.map((c) => c.textContent).join(""); }
   set textContent(v: string) { this.children.forEach((c) => { c.parent = undefined; }); this.children = []; this.text = v; }
+  get parentNode(): FakeNode | null { return this.parent ?? null; }
+  contains(n: FakeNode | null | undefined): boolean { return n === this || this.children.some((c) => c.contains(n)); }
   get firstChild(): FakeNode | null { return this.children[0] ?? null; }
   get nextSibling(): FakeNode | null { const i = this.parent ? this.parent.children.indexOf(this) : -1; return i < 0 ? null : (this.parent!.children[i + 1] ?? null); }
   private adopt(n: FakeNode): void { n.remove(); n.parent = this; }
