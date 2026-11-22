@@ -32,7 +32,8 @@ export interface KubeConfigEnv { group: string; namespace: string; node: string;
 export const sessionName = (chatId: string, generation: number): string => `chat-${chatId.replace(/-/g, "").slice(0, 8)}-${generation}`;
 export const ACP_ARGS: Record<ChatProvider, string[]> = { claude: ["claude-code-acp"], codex: ["codex-acp"], kimi: [], grok: [], zai: [], opencode: [] };
 
-export function buildChatSession(i: PodSpecInput, env: KubeConfigEnv, nowS: number): object {
+/** `startId` is a nonce for one start call. It lets cleanup tell its own session from another start of the same chat. */
+export function buildChatSession(i: PodSpecInput, env: KubeConfigEnv, nowS: number, startId?: string): object {
   const g = env.group;
   return {
     apiVersion: `${g}/v1alpha1`,
@@ -41,7 +42,7 @@ export function buildChatSession(i: PodSpecInput, env: KubeConfigEnv, nowS: numb
       name: sessionName(i.chatId, i.generation),
       namespace: env.namespace,
       labels: { [`${g}/created-by`]: "ais-gateway", [`${g}/chat-id`]: i.chatId },
-      annotations: { [`${g}/client-seen`]: String(nowS) },
+      annotations: { [`${g}/client-seen`]: String(nowS), ...(startId ? { [`${g}/start-id`]: startId } : {}) },
     },
     spec: { workspace: "chat", provider: i.provider, identity: i.identity, node: env.node, args: ACP_ARGS[i.provider] },
   };

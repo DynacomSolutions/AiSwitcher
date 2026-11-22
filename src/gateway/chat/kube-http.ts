@@ -49,6 +49,8 @@ export interface HttpKubeOptions {
   watchTimeoutSeconds?: number;
   /** Time allowed for the attach upgrade. Default 30 s. */
   attachOpenTimeoutMs?: number;
+  /** Extra time past the server limit before the client ends a silent watch. Default 30 s. */
+  watchGraceMs?: number;
 }
 
 export class HttpKubeApi implements KubeApi {
@@ -114,7 +116,13 @@ export class HttpKubeApi implements KubeApi {
   watchSession(name: string, onEvent: (s: KubeSession | undefined) => void, onEnd: (reason: string) => void): { close(): void } {
     const ctl = new AbortController();
     let ended = false;
+    const limit = setTimeout(() => {
+      if (ended) return;
+      ctl.abort();
+      end("watch timed out");
+    }, (this.o.watchTimeoutSeconds ?? 300) * 1000 + (this.o.watchGraceMs ?? 30_000));
     const end = (reason: string) => {
+      clearTimeout(limit);
       if (ended) return;
       ended = true;
       onEnd(reason);
@@ -154,6 +162,7 @@ export class HttpKubeApi implements KubeApi {
     })();
     return {
       close() {
+        clearTimeout(limit);
         ended = true;
         ctl.abort();
       },

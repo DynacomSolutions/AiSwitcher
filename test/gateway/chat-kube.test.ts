@@ -52,7 +52,7 @@ afterEach(async () => {
   for (const s of servers.splice(0)) await s.stop();
 });
 
-function setup(opts: ConstructorParameters<typeof FakeKubeServer>[0] = {}, extra: { timers?: Timers; maxLineBytes?: number; api?: { watchTimeoutSeconds?: number; attachOpenTimeoutMs?: number } } = {}) {
+function setup(opts: ConstructorParameters<typeof FakeKubeServer>[0] = {}, extra: { timers?: Timers; maxLineBytes?: number; api?: { watchTimeoutSeconds?: number; attachOpenTimeoutMs?: number; watchGraceMs?: number } } = {}) {
   const server = new FakeKubeServer(opts);
   servers.push(server);
   const api = new HttpKubeApi({ baseUrl: server.baseUrl, token: () => FAKE_TOKEN, env, ...extra.api });
@@ -386,6 +386,45 @@ test("a silent watch ends at its time limit and start asks again", async () => {
   const h = await p;
   expect(h.cwd).toBe("/w");
   h.stream.close();
+});
+
+test("a silent watch that ignores its limit ends at the client limit", async () => {
+  const timers = new FakeTimers();
+  const { server, transport } = setup({ initialPhase: "Pending" }, { timers, api: { watchTimeoutSeconds: 1, watchGraceMs: 200 } });
+  server.silentWatch = true;
+  const p = transport.start(input(), new AbortController().signal, () => {});
+  await until(() => server.watcherCount() === 1);
+  server.setStatus(name1, { phase: "Pending" });
+  await until(() => timers.pending.includes(2_000), 3000);
+  server.setStatus(name1, { phase: "Running", pod: `agent-${name1}`, worktreePath: "/w" });
+  timers.fire(2_000);
+  const h = await p;
+  expect(server.watchQueries.length).toBe(1);
+  h.stream.close();
+});
+
+test("stop interrupts the wait even when list and delete fail", async () => {
+  const { server, transport } = setup({ initialPhase: "Pending" });
+  const failed = transport.start(input(), new AbortController().signal, () => {}).then(() => undefined, (e: unknown) => e);
+  await until(() => server.watcherCount() === 1);
+  server.failListDelete = true;
+  const t0 = Date.now();
+  await expect(transport.stop(CHAT)).rejects.toThrow();
+  expect(((await failed) as Error).message).toBe("cancelled");
+  expect(Date.now() - t0).toBeLessThan(1000);
+});
+
+test("cleanup after an aborted create keeps a same-chat session of another start", async () => {
+  const { server, transport } = setup();
+  server.sessions.set(name1, { metadata: { name: name1, labels: { [`${FAKE_GROUP}/chat-id`]: CHAT }, annotations: { [`${FAKE_GROUP}/start-id`]: "other-start" } }, status: { phase: "Running", pod: "p" } });
+  server.postDelayMs = 300;
+  const ac = new AbortController();
+  const failed = transport.start(input(), ac.signal, () => {}).then(() => undefined, (e: unknown) => e);
+  await new Promise((r) => setTimeout(r, 50));
+  ac.abort();
+  expect(await failed).toBeInstanceOf(Error);
+  await new Promise((r) => setTimeout(r, 500));
+  expect(server.sessions.get(name1)!.metadata.annotations![`${FAKE_GROUP}/start-id`]).toBe("other-start");
 });
 
 test("the attach has an open timeout", async () => {

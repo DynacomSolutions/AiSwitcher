@@ -1,5 +1,6 @@
 // Pod transport: create an AgentSession, wait for Running, attach to its stdio and send heartbeats.
 // Pod output and controller messages are untrusted. Raw controller text never leaves this file.
+import { randomUUID } from "node:crypto";
 import { redactText } from "../upstream-error.ts";
 import { createLineReader } from "./acp.ts";
 import { KubeHttpError } from "./kube-http.ts";
@@ -182,7 +183,7 @@ export interface KubePodTransportDeps {
   maxLineBytes?: number;
 }
 
-interface Live { cancelled: boolean; stream?: PodStream; stop(): void }
+interface Live { cancelled: boolean; ac: AbortController; stream?: PodStream; stop(): void }
 
 export class KubePodTransport implements PodTransport {
   private readonly now: () => number;
@@ -234,7 +235,9 @@ export class KubePodTransport implements PodTransport {
       return attached ? { [`${g}/client-seen`]: s, [`${g}/attached`]: s } : { [`${g}/client-seen`]: s };
     };
     const beat = this.heartbeat(name, notes);
-    const live: Live = { cancelled: false, stream: undefined, stop: () => { live.cancelled = true; beat.stop(); live.stream?.close(); } };
+    const startId = randomUUID();
+    const live: Live = { cancelled: false, ac: new AbortController(), stream: undefined, stop: () => { live.cancelled = true; live.ac.abort(); beat.stop(); live.stream?.close(); } };
+    const waitSignal = AbortSignal.any([signal, live.ac.signal]);
     const untrack = this.track(input.chatId, live);
     let streamed = false;
     let created = false;
@@ -247,7 +250,7 @@ export class KubePodTransport implements PodTransport {
       if (signal.aborted) throw new Error("aborted");
       createSent = true;
       try {
-        await api.createSession(buildChatSession(input, env, Math.floor(this.now() / 1000)), signal);
+        await api.createSession(buildChatSession(input, env, Math.floor(this.now() / 1000), startId), signal);
       } catch (e) {
         if (e instanceof KubeHttpError && e.status === 409) conflict = true;
         throw e;
@@ -255,9 +258,9 @@ export class KubePodTransport implements PodTransport {
       created = true;
       check();
       beat.begin();
-      const ready = await this.waitRunning(name, signal, onPhase);
+      const ready = await this.waitRunning(name, waitSignal, onPhase);
       check();
-      const socket = await api.openAttach(ready.pod, signal);
+      const socket = await api.openAttach(ready.pod, waitSignal);
       if (live.cancelled) {
         socket.close();
         check();
@@ -276,20 +279,20 @@ export class KubePodTransport implements PodTransport {
         beat.stop();
         untrack();
         // Delete only a session that this call made. A failed delete must not hide the first error.
-        await this.cleanup(name, input.chatId, created, createSent && !conflict).catch(() => undefined);
+        await this.cleanup(name, startId, created, createSent && !conflict).catch(() => undefined);
       }
-      throw e;
+      throw live.cancelled ? new Error("cancelled") : e;
     }
   }
 
-  private async cleanup(name: string, chatId: string, created: boolean, unknown: boolean): Promise<void> {
+  private async cleanup(name: string, startId: string, created: boolean, unknown: boolean): Promise<void> {
     const { api } = this.d;
     const { group } = this.d.env;
     if (created) return api.deleteSession(name);
     if (!unknown) return;
-    // The create may have worked although the call failed. Delete only a session with our chat id.
+    // The create may have worked although the call failed. Delete only a session that holds our start nonce.
     const s = await api.getSession(name);
-    if (s?.metadata.labels?.[`${group}/chat-id`] === chatId) await api.deleteSession(name);
+    if (s?.metadata.annotations?.[`${group}/start-id`] === startId) await api.deleteSession(name);
   }
 
   /** client-seen every 15 s before the attach, then client-seen and attached every 30 s. A failed beat repeats after 10 s. */

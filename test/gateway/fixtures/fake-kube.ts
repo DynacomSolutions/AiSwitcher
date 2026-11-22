@@ -34,6 +34,10 @@ export class FakeKubeServer {
   watchEndMs = 0;
   /** Wait this long before the attach upgrade is answered. */
   attachDelayMs = 0;
+  /** The watch sends no events and ignores timeoutSeconds. */
+  silentWatch = false;
+  /** List and delete answer 500. */
+  failListDelete = false;
   readonly watchQueries: string[] = [];
   rejectAttach = false;
   readonly server: ReturnType<typeof Bun.serve>;
@@ -133,6 +137,7 @@ export class FakeKubeServer {
         return this.json(obj, 201);
       }
       if (url.searchParams.get("watch")) return this.watch(req, url);
+      if (this.failListDelete) return this.json({ message: "boom" }, 500);
       const sel = (url.searchParams.get("labelSelector") ?? "").split(",").filter(Boolean).map((p) => p.split("="));
       const items = [...this.sessions.values()].filter((s) => sel.every(([k, v]) => s.metadata.labels?.[k!] === v));
       return this.json({ items });
@@ -144,6 +149,7 @@ export class FakeKubeServer {
       if (!s) return this.json({ message: "not found" }, 404);
       if (req.method === "GET") return this.getStatusCode ? this.json({ message: "refused" }, this.getStatusCode) : this.json(s);
       if (req.method === "DELETE") {
+        if (this.failListDelete) return this.json({ message: "boom" }, 500);
         this.sessions.delete(name);
         for (const w of this.watchers) if (w.name === name) w.send({ type: "DELETED", object: s });
         return this.json({ status: "Success" });
@@ -166,7 +172,7 @@ export class FakeKubeServer {
 
   private watch(req: Request, url: URL): Response {
     this.watchQueries.push(url.search);
-    const ms = this.watchEndMs || Number(url.searchParams.get("timeoutSeconds") ?? 0) * 1000;
+    const ms = this.silentWatch ? 0 : this.watchEndMs || Number(url.searchParams.get("timeoutSeconds") ?? 0) * 1000;
     const name = /metadata\.name=(.+)$/.exec(url.searchParams.get("fieldSelector") ?? "")?.[1] ?? "";
     const enc = new TextEncoder();
     let w: Watcher;
