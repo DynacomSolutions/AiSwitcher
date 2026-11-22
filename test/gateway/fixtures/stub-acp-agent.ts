@@ -1,6 +1,7 @@
 // A stand-in ACP agent for tests. It speaks JSON lines on stdio.
 // Environment: STUB_ACP_STATE (file that stores session ids), STUB_ACP_LOAD ("0" turns loadSession off).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { createLineReader } from "../../../src/gateway/chat/acp.ts";
 
 const statePath = process.env.STUB_ACP_STATE ?? "";
 const send = (o: unknown): void => {
@@ -11,6 +12,7 @@ const update = (sessionId: string, u: Record<string, unknown>) => send({ jsonrpc
 const chunk = (sessionId: string, text: string) => update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
 
 const cancels = new Map<string, () => void>();
+const earlyCancel = new Set<string>();
 const replies = new Map<string | number, (result: any) => void>();
 let nextOut = 1;
 
@@ -44,7 +46,8 @@ async function runPrompt(id: string | number, sessionId: string, text: string) {
     return done();
   }
   if (text === "slow") {
-    await new Promise<void>((resolve) => cancels.set(sessionId, resolve));
+    if (!earlyCancel.delete(sessionId)) await new Promise<void>((resolve) => cancels.set(sessionId, resolve));
+    cancels.delete(sessionId);
     return done("cancelled");
   }
   if (text === "fail") return send({ jsonrpc: "2.0", id, error: { code: -32000, message: "stub failure", data: { why: "requested" } } });
@@ -73,6 +76,7 @@ async function runPrompt(id: string | number, sessionId: string, text: string) {
 const mcpByS = new Map<string, Array<{ url: string; headers: Array<{ name: string; value: string }> }>>();
 
 function handle(m: any): void {
+  if (typeof m !== "object" || m === null) return;
   if (m.method === undefined) {
     const r = replies.get(m.id);
     if (r) {
@@ -94,7 +98,7 @@ function handle(m: any): void {
     case "session/load": {
       if (!stored().includes(m.params?.sessionId)) return send({ jsonrpc: "2.0", id: m.id, error: { code: -32002, message: "unknown session" } });
       mcpByS.set(m.params.sessionId, m.params?.mcpServers ?? []);
-      return reply(null);
+      return reply({ configOptions: configOptions() });
     }
     case "session/set_config_option":
     case "session/set_model":
@@ -105,21 +109,26 @@ function handle(m: any): void {
       return;
     }
     case "session/cancel":
-      cancels.get(m.params?.sessionId)?.();
+      if (cancels.has(m.params?.sessionId)) cancels.get(m.params.sessionId)?.();
+      else earlyCancel.add(m.params?.sessionId);
       return;
     default:
       if (m.id !== undefined) send({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "method not found" } });
   }
 }
 
-let buf = "";
-process.stdin.on("data", (d) => {
-  buf += d;
-  for (let nl = buf.indexOf("\n"); nl !== -1; nl = buf.indexOf("\n")) {
-    const line = buf.slice(0, nl);
-    buf = buf.slice(nl + 1);
-    if (line.trim() === "") continue;
-    handle(JSON.parse(line));
-  }
+const reader = createLineReader({
+  onLine: (line) => {
+    if (line.trim() === "") return;
+    let m: unknown;
+    try {
+      m = JSON.parse(line);
+    } catch {
+      return;
+    }
+    handle(m);
+  },
+  onOverflow: () => process.exit(4),
 });
+process.stdin.on("data", (d: Buffer) => reader.push(d));
 process.stdin.on("end", () => process.exit(0));
