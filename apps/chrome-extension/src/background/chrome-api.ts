@@ -75,6 +75,17 @@ export interface ChromeApi {
   };
 }
 
+/**
+ * Joins tab lists and keeps the first copy of each tab id. The real query reads both chrome.tabs.query and every window,
+ * so one tab of a split view can never hide the other.
+ */
+export function mergeTabLists(...lists: TabInfo[][]): TabInfo[] {
+  const seen = new Set<number>();
+  const out: TabInfo[] = [];
+  for (const list of lists) for (const t of list) if (t.id !== -1 && !seen.has(t.id)) { seen.add(t.id); out.push(t); }
+  return out;
+}
+
 function toTab(t: chrome.tabs.Tab): TabInfo {
   const split = (t as { splitViewId?: unknown }).splitViewId;
   const none = (chrome.tabs as unknown as SplitTabsApi).SPLIT_VIEW_ID_NONE ?? -1;
@@ -97,7 +108,12 @@ export function realChromeApi(): ChromeApi {
       get: async tabId => {
         try { return toTab(await chrome.tabs.get(tabId)); } catch { return undefined; }
       },
-      query: async () => (await chrome.tabs.query({})).map(toTab),
+      query: async () => {
+        const base = (await chrome.tabs.query({})).map(toTab);
+        let perWindow: TabInfo[] = [];
+        try { perWindow = (await chrome.windows.getAll({ populate: true })).flatMap(w => (w.tabs ?? []).map(toTab)); } catch { /* the plain query stands alone */ }
+        return mergeTabLists(base, perWindow);
+      },
       create: async (url, opts) => {
         const props: Record<string, unknown> = { active: false };
         if (url) props.url = url;

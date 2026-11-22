@@ -47,6 +47,37 @@ export class FakeChrome implements ChromeApi {
     this.tabList.set(id, t);
     return t;
   }
+  /**
+   * A browser restart: storage.session is empty, every listener is gone, and Chrome restores the same tabs and groups
+   * (URLs, titles, colours, order, split views) under new tab, group and split view ids. Returns old tab id -> new tab id.
+   */
+  restart(): Map<number, number> {
+    this.session = {};
+    this.removedListeners = []; this.eventListeners = []; this.createdListeners = []; this.activatedListeners = []; this.groupUpdatedListeners = []; this.detachListeners = [];
+    this.attachedTabs.clear();
+    const tabMap = new Map<number, number>();
+    const groupMap = new Map<number, number>();
+    const splitMap = new Map<number, number>();
+    let nextTab = this.nextTab + 700;
+    let nextGroup = this.nextGroup + 40;
+    let nextSplit = this.nextSplit + 40;
+    const restored = new Map<number, TabInfo>();
+    for (const t of [...this.tabList.values()].sort((x, y) => x.windowId - y.windowId || x.index - y.index)) {
+      if (t.groupId !== -1 && !groupMap.has(t.groupId)) groupMap.set(t.groupId, nextGroup++);
+      if (t.splitViewId !== -1 && !splitMap.has(t.splitViewId)) splitMap.set(t.splitViewId, nextSplit++);
+      const id = nextTab++;
+      tabMap.set(t.id, id);
+      restored.set(id, { ...t, id, groupId: t.groupId === -1 ? -1 : groupMap.get(t.groupId)!, splitViewId: t.splitViewId === -1 ? -1 : splitMap.get(t.splitViewId)!, active: false });
+    }
+    const groups = new Map<number, { title: string; color: string }>();
+    for (const [old, fresh] of groupMap) { const g = this.groups.get(old); if (g) groups.set(fresh, g); }
+    this.tabList = restored;
+    this.groups = groups;
+    this.nextTab = nextTab;
+    this.nextGroup = nextGroup;
+    this.nextSplit = nextSplit;
+    return tabMap;
+  }
   /** Tab ids of one window in tab-strip order. */
   order(windowId = 1): number[] {
     return [...this.tabList.values()].filter(t => t.windowId === windowId).sort((x, y) => x.index - y.index).map(t => t.id);
