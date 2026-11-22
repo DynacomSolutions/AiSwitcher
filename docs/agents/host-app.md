@@ -249,7 +249,7 @@ cargo clippy --manifest-path apps/host/Cargo.toml --locked --workspace --all-tar
 ```
 
 Run the frontend typecheck, build and browser smoke from `apps/host`.
-The workflow sets isolated build directories, installs pinned tools, then
+The workflow sets the build directories (Cargo builds in the cached `apps/host/target`), installs pinned tools, then
 runs `scripts/host/build-release.ts`. Production builds require
 `--production` and the reviewed image trust key. Missing macOS credentials
 permit unsigned development checks but prevent release creation.

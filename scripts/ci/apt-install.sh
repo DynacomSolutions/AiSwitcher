@@ -6,14 +6,26 @@
 # apt-get update only warns on a failed fetch, so the install then fails on
 # missing indexes. When the default mirrors cannot be fetched, this points apt
 # at a public mirror outside the Ubuntu archive domain and tries again.
+#
+# A stalled apt-get once hung a job for 90 minutes. Every apt-get call has
+# fetch retries, network timeouts and an overall time limit, so a stall fails
+# the attempt instead of the job.
 set -euo pipefail
 
 FALLBACK_MIRROR="${APT_FALLBACK_MIRROR:-https://mirrors.edge.kernel.org/ubuntu/}"
+APT_UPDATE_LIMIT="${APT_UPDATE_LIMIT:-300}"
+APT_INSTALL_LIMIT="${APT_INSTALL_LIMIT:-900}"
+APT_OPTIONS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
 
 update() {
   local log
   log="$(mktemp)"
-  sudo apt-get update 2>&1 | tee "$log"
+  # A stall or other failure (timeout exits 124) fails this attempt.
+  if ! sudo timeout -k 30 "$APT_UPDATE_LIMIT" apt-get "${APT_OPTIONS[@]}" update 2>&1 | tee "$log"; then
+    echo "::warning::apt-get update failed or exceeded ${APT_UPDATE_LIMIT} s"
+    rm -f "$log"
+    return 1
+  fi
   # A partial update exits 0 with "W: Failed to fetch"; treat it as a failure.
   if grep -qE '^(W|E): (Failed to fetch|Some index files failed)' "$log"; then
     rm -f "$log"
@@ -51,4 +63,4 @@ until update; do
   attempt=$((attempt + 1))
 done
 
-sudo apt-get install -y "$@"
+sudo timeout -k 30 "$APT_INSTALL_LIMIT" apt-get "${APT_OPTIONS[@]}" install -y "$@"

@@ -80,7 +80,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.affected != 'false' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
