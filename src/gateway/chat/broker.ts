@@ -94,6 +94,9 @@ export interface BrokerDeps {
   timers?: Timers;
 }
 
+/** Copy of the gateway-wide cap refusal. */
+export const GATEWAY_CAP_MESSAGE = "Too many chats are open. Close one, then try again.";
+
 export type BrokerReject = { code: (typeof CHAT_ERROR_CODES)[number]; message: string };
 
 /** Renews the lease of one chat while a start or a running agent needs it. */
@@ -352,20 +355,22 @@ export class ChatBroker implements ChatAuth {
     }
   }
 
-  async create(i: { chatId: string; binding: string; windowId: number; name: string; color: string; selection: ChatSelection; tabIds: number[] }): Promise<ChatRecord | BrokerReject> {
+  async create(i: { chatId: string; binding: string; windowId: number; name: string; color: string; selection: ChatSelection; tabIds: number[]; maxLive?: number }): Promise<ChatRecord | BrokerReject> {
     // The pod name and the admission rule use the first eight hex digits. A hostile id could collide on them.
     if (!UUID_RE.test(i.chatId)) return { code: "bad_request", message: "The chat id is not valid." };
-    let rec: ChatRecord | "cap";
+    let rec: ChatRecord | "cap" | "global";
     try {
       rec = await this.d.store.create(
         { id: i.chatId, binding: i.binding, windowId: i.windowId, name: i.name, color: i.color, selection: i.selection, tabIds: i.tabIds, createdAt: this.d.now() },
         MAX_CHATS_PER_WINDOW,
         { replica: this.d.replicaId, ttlMs: this.leaseTtl },
+        i.maxLive,
       );
     } catch (e) {
       if (e instanceof ChatExistsError) return { code: "bad_request", message: "A chat with this id exists." };
       throw e;
     }
+    if (rec === "global") return { code: "limit", message: GATEWAY_CAP_MESSAGE };
     if (rec === "cap") return { code: "window_cap", message: `A window holds at most ${MAX_CHATS_PER_WINDOW} chats.` };
     const fence = { replica: this.d.replicaId, epoch: rec.epoch };
     try {

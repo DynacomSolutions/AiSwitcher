@@ -4,7 +4,7 @@ import type { ChatErrorCode, ChatFromExt, ChatSummary, ChatToExt } from "../../b
 import type { BrowserBinding } from "../../browser/types.ts";
 import type { BrowserHub } from "../browser/hub.ts";
 import type { GatewayMetrics } from "../metrics.ts";
-import type { BrokerReject, ChatBroker } from "./broker.ts";
+import { GATEWAY_CAP_MESSAGE as CAP_COPY, type BrokerReject, type ChatBroker } from "./broker.ts";
 import type { ChatBus } from "./bus.ts";
 import type { ChatCatalog } from "./catalog.ts";
 import type { ChatRecord, ChatStore } from "./types.ts";
@@ -13,7 +13,10 @@ import type { ChatRecord, ChatStore } from "./types.ts";
 const PAGE = 200;
 const MAX_WATCHES = 2000;
 const MAX_LIST = 256;
-export const GATEWAY_CAP_MESSAGE = "Too many chats are open. Close one, then try again.";
+export const GATEWAY_CAP_MESSAGE = CAP_COPY;
+const DEFAULT_LOCK_WAIT_MS = 30_000;
+const UNLISTED = "This agent is not available.";
+const MODEL_UNLISTED = "This model is not available.";
 const NOT_FOUND = "This chat does not exist.";
 const EXPIRED = "This chat has expired.";
 const SERVICE_BUSY = "The chat service is busy. Try again in a moment.";
@@ -23,12 +26,14 @@ export interface ChatFramesDeps {
   broker: Pick<ChatBroker, "create" | "dispatch">;
   store: ChatStore;
   bus: ChatBus;
-  catalog: Pick<ChatCatalog, "get">;
+  catalog: Pick<ChatCatalog, "get" | "check">;
   hub: Pick<BrowserHub, "sendTo">;
   /** Open chats of one window of one browser. */
   maxPerWindow: number;
   /** Open chats on the whole gateway. Default 12. */
   maxLive?: number;
+  /** Longest a create waits for the create before it. Only the wait for the lock is bound, never a create in flight. Default 30 s. */
+  createLockWaitMs?: number;
   metrics?: Pick<GatewayMetrics, "chatError">;
 }
 
@@ -39,6 +44,8 @@ interface Watch {
   /** The last state that went out. An empty key forces the next state frame. */
   key: string;
   dirty: boolean;
+  /** Grows when a resume resets the cursor. A sync loop of an older generation stops. */
+  gen: number;
   running?: Promise<void>;
 }
 
@@ -100,7 +107,7 @@ export class ChatFrames {
   /** A command failed on a path with no reply (a forwarded command). The panel of the chat's binding shows it. */
   rejectChat(chatId: string, code: ChatErrorCode, message: string): void {
     const w = this.watches.get(chatId);
-    if (w) this.out(chatId, w.binding, { t: "chat.reject", chatId, code, message });
+    if (w) this.out(chatId, w, { t: "chat.reject", chatId, code, message });
   }
 
   /** A binding attached: send its chat list. The extension then sends `chat.resume` for each chat. */
@@ -177,6 +184,7 @@ export class ChatFrames {
         r = await this.d.broker.dispatch({ ...base, cmd: "link", args: { tabIds: f.tabIds } });
         break;
       case "chat.config":
+        if (f.model !== undefined && (await this.d.catalog.check(rec.selection.provider, rec.selection.identity, f.model)) === "model") return reject("bad_request", MODEL_UNLISTED);
         r = await this.d.broker.dispatch({ ...base, cmd: "configure", args: { ...(f.model !== undefined ? { model: f.model } : {}), ...(f.effort !== undefined ? { effort: f.effort } : {}) } });
         break;
       case "chat.rename":
@@ -186,10 +194,31 @@ export class ChatFrames {
     if (r) reject(r.code, r.message);
   }
 
-  /** Creates are one at a time on this replica, so the gateway-wide count is exact here. */
+  /** Creates are one at a time on this replica. A create waits for the lock at most `createLockWaitMs`. */
   private create(binding: BrowserBinding, f: Extract<ChatFromExt, { t: "chat.create" }>, reply: (f: ChatToExt) => void): Promise<void> {
-    const run = this.createLock.then(() => this.doCreate(binding, f, reply));
-    this.createLock = run.catch(() => undefined);
+    const prev = this.createLock;
+    let release!: () => void;
+    const mine = new Promise<void>((r) => (release = r));
+    this.createLock = prev.then(() => mine);
+    const run = (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const got = await Promise.race([
+        prev.then(() => true),
+        new Promise<boolean>((r) => {
+          timer = setTimeout(() => r(false), this.d.createLockWaitMs ?? DEFAULT_LOCK_WAIT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+      try {
+        if (!got) {
+          reply({ t: "chat.reject", chatId: f.chatId, code: "unavailable", message: SERVICE_BUSY });
+          return;
+        }
+        await this.doCreate(binding, f, reply);
+      } finally {
+        release();
+      }
+    })();
     const tracked = run.catch(() => undefined).finally(() => {
       if (this.pendingCreate.get(f.chatId) === tracked) this.pendingCreate.delete(f.chatId);
     });
@@ -199,10 +228,13 @@ export class ChatFrames {
 
   private async doCreate(binding: BrowserBinding, f: Extract<ChatFromExt, { t: "chat.create" }>, reply: (f: ChatToExt) => void): Promise<void> {
     const reject = (code: ChatErrorCode, message: string): void => reply({ t: "chat.reject", chatId: f.chatId, code, message });
+    const verdict = await this.d.catalog.check(f.selection.provider, f.selection.identity, f.selection.model);
+    if (verdict === "identity") return reject("bad_request", UNLISTED);
+    if (verdict === "model") return reject("bad_request", MODEL_UNLISTED);
     const inWindow = await this.d.store.listByBinding(binding.name, { windowId: f.windowId });
     if (inWindow.length >= this.d.maxPerWindow) return reject("window_cap", `A window holds at most ${this.d.maxPerWindow} chats.`);
-    if ((await this.d.store.countOpen()) >= (this.d.maxLive ?? 12)) return reject("limit", GATEWAY_CAP_MESSAGE);
-    const r = await this.d.broker.create({ chatId: f.chatId, binding: binding.name, windowId: f.windowId, name: f.name, color: f.color, selection: f.selection, tabIds: f.tabIds });
+    // The store checks the gateway-wide cap in the same step as the insert, so replicas cannot overshoot it.
+    const r = await this.d.broker.create({ chatId: f.chatId, binding: binding.name, windowId: f.windowId, name: f.name, color: f.color, selection: f.selection, tabIds: f.tabIds, maxLive: this.d.maxLive ?? 12 });
     if ("code" in r) return reject(r.code, r.message);
     reply({ t: "chat.state", chatId: r.id, state: r.state, summary: summaryOf(r) });
     const w = this.watch(r.id, binding.name, 0);
@@ -215,9 +247,10 @@ export class ChatFrames {
     if (w && w.binding === binding) {
       w.cursor = cursor;
       w.key = "";
+      w.gen += 1;
       return w;
     }
-    w = { binding, cursor, key: "", dirty: false };
+    w = { binding, cursor, key: "", dirty: false, gen: 0 };
     this.watches.set(chatId, w);
     while (this.watches.size > MAX_WATCHES) {
       const k = this.watches.keys().next();
@@ -246,16 +279,21 @@ export class ChatFrames {
     return w.running;
   }
 
-  private out(chatId: string, binding: string, frame: ChatToExt): boolean {
-    if (this.d.hub.sendTo(binding, frame)) return true;
+  /** Sends a frame for watch `w`. False when `w` is no longer the live watch of its chat, or when the socket is gone. */
+  private out(chatId: string, w: Watch, frame: ChatToExt, gen = w.gen): boolean {
+    if (this.watches.get(chatId) !== w || w.gen !== gen) return false;
+    if (this.d.hub.sendTo(w.binding, frame)) return true;
     // This replica holds no socket for the binding. A panel that connects again sends a resume.
     this.watches.delete(chatId);
     return false;
   }
 
-  /** New events first, then the state when it changed. */
+  /** New events first, then the state when it changed. A newer watch or a newer resume of the same chat stops this loop. */
   private async sync(chatId: string, w: Watch): Promise<void> {
+    const gen = w.gen;
+    const live = (): boolean => this.watches.get(chatId) === w && w.gen === gen;
     const rec = await this.d.store.get(chatId);
+    if (!live()) return;
     if (!rec || rec.binding !== w.binding) {
       this.watches.delete(chatId);
       return;
@@ -263,16 +301,17 @@ export class ChatFrames {
     for (;;) {
       const rows = await this.d.store.events(chatId, w.cursor, PAGE);
       for (const e of rows) {
-        if (!this.out(chatId, w.binding, { t: "chat.event", chatId, seq: e.seq, ts: e.ts, body: e.body })) return;
+        if (!this.out(chatId, w, { t: "chat.event", chatId, seq: e.seq, ts: e.ts, body: e.body }, gen)) return;
         w.cursor = e.seq;
       }
+      if (!live()) return;
       if (rows.length < PAGE) break;
     }
     const key = stateKey(rec);
     if (key !== w.key) {
       w.key = key;
-      if (!this.out(chatId, w.binding, { t: "chat.state", chatId, state: rec.state, summary: summaryOf(rec) })) return;
+      if (!this.out(chatId, w, { t: "chat.state", chatId, state: rec.state, summary: summaryOf(rec) }, gen)) return;
     }
-    if (rec.state === "closed") this.watches.delete(chatId);
+    if (rec.state === "closed" && live()) this.watches.delete(chatId);
   }
 }

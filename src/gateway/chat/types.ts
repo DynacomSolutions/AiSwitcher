@@ -61,9 +61,9 @@ export interface ChatOwner { replica: string; ttlMs: number }
  * The memory store judges expiry with its own clock (default Date.now) and ignores nowMs, in the same way.
  */
 export interface ChatStore {
-  /** Atomic count of the open chats of (binding, windowId). Returns "cap" when the window is full. Throws ChatExistsError on a used id, even when the window is full.
+  /** Atomic count of the open chats of (binding, windowId). Returns "cap" when the window is full, and "global" when `globalCap` open chats exist over all bindings (the check and the insert are one atomic step). Throws ChatExistsError on a used id, even when the window is full.
    * With owner, the same step sets the owner, the lease and epoch 1, so the caller has the fence ({ replica, epoch: record.epoch }) at once. */
-  create(rec: ChatCreate, cap: number, owner?: ChatOwner): Promise<ChatRecord | "cap">;
+  create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number): Promise<ChatRecord | "cap" | "global">;
   get(id: string): Promise<ChatRecord | undefined>;
   listByBinding(binding: string, opts?: { windowId?: number; includeClosed?: boolean }): Promise<ChatRecord[]>;
   /** Throws ChatLeaseLostError when the fence is stale or expired, ChatClosedError on a move from closed to an open state. Returns undefined for an unknown chat. */

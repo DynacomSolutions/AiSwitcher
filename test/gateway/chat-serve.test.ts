@@ -2,7 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
-import { buildChatSession, type PodHandle, type PodPhaseNotice, type PodSpecInput } from "../../src/gateway/chat/kube.ts";
+import { MemoryChatBus } from "../../src/gateway/chat/bus.ts";
+import { buildChatSession, type KubeApi, type PodHandle, type PodPhaseNotice, type PodSpecInput } from "../../src/gateway/chat/kube.ts";
+import { chatTokenKey, mintChatToken } from "../../src/gateway/chat/token.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { chatConfigFromEnv, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
@@ -85,6 +87,8 @@ afterEach(async () => {
   for (const t of transports) t.killAll();
   console.warn = origWarn;
   console.info = origInfo;
+  for (const [k, v] of Object.entries(savedEnv)) if (v !== undefined) process.env[k] = v;
+  for (const k of Object.keys(process.env)) if (k.startsWith("AIS_GATEWAY_CHAT_")) delete process.env[k];
   for (const [k, v] of Object.entries(savedEnv)) if (v !== undefined) process.env[k] = v;
   process.removeAllListeners("SIGTERM");
   process.removeAllListeners("SIGINT");
@@ -245,7 +249,8 @@ test("with the env unset no chat route or frame is active (chat.create gets chat
   ]);
   expect(c.of("chat.list")).toEqual([]);
   // A chat token gets no access to the MCP route.
-  const res = await fetch(`http://127.0.0.1:${g.port}/browser/mcp`, { method: "POST", headers: { authorization: `Bearer ${["aisc1", "x", "y"].join(".")}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+  const real = mintChatToken(chatTokenKey(ADMIN), { chatId, binding: "work", exp: Date.now() + 60_000, gen: 0 });
+  const res = await fetch(`http://127.0.0.1:${g.port}/browser/mcp`, { method: "POST", headers: { authorization: `Bearer ${real}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
   expect(res.status).toBe(401);
   expect(c.closeCode).toBeUndefined();
 });
@@ -270,4 +275,68 @@ test("chat is off unless the group and the MCP URL are set, and a missing namesp
   const both = { AIS_GATEWAY_CHAT_GROUP: "agents.example.test", AIS_GATEWAY_CHAT_MCP_URL: "http://gateway.example.test/browser/mcp" };
   expect(() => chatConfigFromEnv(both)).toThrow("AIS_GATEWAY_CHAT_NAMESPACE");
   expect(() => chatConfigFromEnv({ ...both, AIS_GATEWAY_CHAT_NAMESPACE: "ns-a" })).toThrow("AIS_GATEWAY_CHAT_NODE");
+});
+
+test("the class from the environment reaches the AgentSession that serve creates", async () => {
+  const token = await pair();
+  Object.assign(process.env, { AIS_GATEWAY_CHAT_GROUP: "agents.example.test", AIS_GATEWAY_CHAT_MCP_URL: "http://gateway.example.test/browser/mcp", AIS_GATEWAY_CHAT_NAMESPACE: "ns-a", AIS_GATEWAY_CHAT_NODE: "node-a", AIS_GATEWAY_CHAT_CLASS: "heavy" });
+  const created: Array<{ metadata: { namespace: string }; spec: Record<string, unknown>; apiVersion: string }> = [];
+  const api: KubeApi = {
+    createSession: async (obj) => {
+      created.push(obj as never);
+      throw new Error("stop here");
+    },
+    getSession: async () => undefined,
+    listSessions: async () => [],
+    watchSession: () => ({ close() {} }),
+    annotate: async () => undefined,
+    deleteSession: async () => undefined,
+    getConfigMap: async () => ({ "config.json": JSON.stringify({ providers: { claude: { identities: ["alpha"] } } }) }),
+    openAttach: async () => {
+      throw new Error("no attach");
+    },
+  };
+  const g = await boot({ chatKubeApi: api });
+  const c = await Client.open(g.port, token);
+  const chatId = crypto.randomUUID();
+  c.send(create(chatId));
+  await c.until(() => c.of("chat.state").length > 0);
+  c.send({ t: "chat.prompt", chatId, text: "hi" });
+  await c.until(() => created.length > 0);
+  expect(created[0]?.spec).toMatchObject({ class: "heavy", node: "node-a", workspace: "chat", provider: "claude", identity: "alpha" });
+  expect(created[0]?.apiVersion).toBe("agents.example.test/v1alpha1");
+  expect(created[0]?.metadata.namespace).toBe("ns-a");
+});
+
+test("chat frames are refused until the chat bus is listening, and the start is retried with a log and a metric", async () => {
+  const token = await pair();
+  class FlakyBus extends MemoryChatBus {
+    attempts = 0;
+    override async subscribe(h: Parameters<MemoryChatBus["subscribe"]>[0]) {
+      this.attempts += 1;
+      if (this.attempts <= 2) throw new Error("listen down");
+      return super.subscribe(h);
+    }
+  }
+  const bus = new FlakyBus();
+  const warnings: string[] = [];
+  console.warn = (m: unknown) => void warnings.push(String(m));
+  const g = await boot({ chatTransport: stub(), chatBus: bus });
+  const early = await Client.open(g.port, token);
+  const chatId = crypto.randomUUID();
+  early.send(create(chatId));
+  await early.until(() => early.of("chat.reject").length === 1);
+  expect(early.of("chat.reject")[0]).toMatchObject({ chatId, code: "unavailable" });
+  expect(early.of("chat.list")).toEqual([]);
+  // The retry succeeds on the third try. A new connection then gets the list and a working chat.
+  const end = Date.now() + 5000;
+  while (bus.attempts < 3 && Date.now() < end) await Bun.sleep(10);
+  await Bun.sleep(50);
+  const late = await Client.open(g.port, token);
+  await late.until(() => late.of("chat.list").length === 1);
+  late.send(create(chatId));
+  await late.until(() => late.of("chat.state").length === 1);
+  expect(warnings.some((w) => w.includes("could not listen"))).toBe(true);
+  const body = await (await fetch(`http://127.0.0.1:${g.port}/metrics`)).text();
+  expect(body).toMatch(/ais_gateway_chat_errors_total\{kind="other"\} [2-9]/);
 });

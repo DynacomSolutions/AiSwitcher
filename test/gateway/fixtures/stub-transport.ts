@@ -27,6 +27,8 @@ export interface StubTransportOptions {
   failStopSession?: boolean;
   /** stopSession never finishes. */
   hangStopSession?: boolean;
+  /** What catalog() returns. Default: provider claude with the identity alpha. */
+  config?: AgentRuntimeConfig;
   /** stopSession waits this long before it deletes the session. */
   stopSessionDelayMs?: number;
 }
@@ -125,7 +127,7 @@ export class StubPodTransport implements PodTransport {
   }
 
   async catalog(): Promise<AgentRuntimeConfig> {
-    return {};
+    return this.opts.config ?? { providers: { claude: { identities: ["alpha"], app: "claude-chat" } } };
   }
 
   /** Kill every agent process. Call it after each test. */

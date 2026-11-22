@@ -34,8 +34,18 @@ afterEach(async () => {
   for (const c of cleanups.splice(0).reverse()) await c();
 });
 
-async function setup(over: { maxLive?: number; catalog?: { get(p?: string): Promise<never[]> } } = {}) {
+type FakeCatalog = { get(p?: string): Promise<never[]>; check(p: string, i: string, m?: string): Promise<"ok" | "identity" | "model"> };
+const okCatalog: FakeCatalog = { get: async () => [], check: async () => "ok" };
+
+async function setup(over: { maxLive?: number; catalog?: FakeCatalog; slowEventsMs?: number; wrapBroker?: (b: ChatBroker) => Pick<ChatBroker, "create" | "dispatch">; lockWaitMs?: number } = {}) {
   const store = new MemoryChatStore();
+  if (over.slowEventsMs) {
+    const real = store.events.bind(store);
+    store.events = async (...a) => {
+      await Bun.sleep(over.slowEventsMs as number);
+      return real(...a);
+    };
+  }
   const bus = new MemoryChatBus();
   const transport = new StubPodTransport();
   const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
@@ -61,12 +71,13 @@ async function setup(over: { maxLive?: number; catalog?: { get(p?: string): Prom
     identityOf: async (b) => (b.startsWith("bind-") ? "alpha" : undefined),
   });
   frames = new ChatFrames({
-    broker,
+    broker: over.wrapBroker ? over.wrapBroker(broker) : broker,
     store,
     bus,
-    catalog: over.catalog ?? { get: async () => [] },
+    catalog: over.catalog ?? okCatalog,
     hub,
     maxPerWindow: 6,
+    ...(over.lockWaitMs !== undefined ? { createLockWaitMs: over.lockWaitMs } : {}),
     ...(over.maxLive !== undefined ? { maxLive: over.maxLive } : {}),
   });
   await broker.start();
@@ -278,12 +289,13 @@ test("onAttach sends chat.list for the binding", async () => {
 });
 
 test("chat.catalog answers with the catalogue and a failing ConfigMap gives chat.reject unavailable", async () => {
-  const good = await setup({ catalog: { get: async () => [] } });
+  const good = await setup();
   const ws = await good.connect("tok-a");
   await good.send(ws, { t: "chat.catalog", reqId: "r1" });
   expect(ws.of("chat.catalog")).toEqual([{ t: "chat.catalog", reqId: "r1", providers: [] }]);
   const bad = await setup({
     catalog: {
+      ...okCatalog,
       get: async () => {
         throw new Error("down");
       },
@@ -303,4 +315,78 @@ test("a forwarded command that failed reaches the panel as chat.reject through r
   s.frames.rejectChat(f.chatId, "unavailable", "The chat did not answer. Try again in a moment.");
   expect(ws.of("chat.reject")).toEqual([{ t: "chat.reject", chatId: f.chatId, code: "unavailable", message: "The chat did not answer. Try again in a moment." }]);
   expect(s.frames.watchedChats()).toContain(f.chatId);
+});
+
+test("a reconnect during a replay never sends events out of order to the new socket", async () => {
+  const s = await setup({ slowEventsMs: 25 });
+  const first = await s.connect("tok-a");
+  const f = createFrame();
+  await s.send(first, f);
+  for (let i = 2; i <= 500; i += 1) await s.store.appendEvent(f.chatId, { k: "user", text: `m${i}` });
+  // The replay of 500 events takes three pages. The browser reconnects while it runs.
+  void s.hub.message(first, JSON.stringify({ t: "chat.resume", chatId: f.chatId, afterSeq: 0 }));
+  await Bun.sleep(40);
+  const second = await s.connect("tok-a");
+  await s.hub.message(second, JSON.stringify({ t: "chat.resume", chatId: f.chatId, afterSeq: 0 }));
+  await until(() => second.of("chat.event").length >= 500, 8000);
+  await settle();
+  const seqs = second.of("chat.event").map((e) => e.seq);
+  expect(seqs).toEqual(Array.from({ length: 500 }, (_, i) => i + 1));
+  // The watch of the new socket survived: live events still arrive.
+  await s.store.appendEvent(f.chatId, { k: "user", text: "live" });
+  await s.bus.publish({ t: "event", chatId: f.chatId, seq: 501 });
+  await until(() => second.of("chat.event").length === 501);
+  expect(second.of("chat.event").at(-1)?.seq).toBe(501);
+});
+
+test("create refuses a provider and identity that the ConfigMap does not list, and config refuses a model outside the list", async () => {
+  const catalog: FakeCatalog = { get: async () => [], check: async (_p, i, m) => (i !== "alpha" ? "identity" : m === "not-listed" ? "model" : "ok") };
+  const s = await setup({ catalog });
+  const ws = await s.connect("tok-a");
+  const bad = createFrame({ selection: { provider: "claude", identity: "stranger" } });
+  await s.send(ws, bad);
+  expect(ws.of("chat.reject")).toEqual([expect.objectContaining({ chatId: bad.chatId, code: "bad_request" })]);
+  expect(await s.store.get(bad.chatId)).toBeUndefined();
+  const badModel = createFrame({ selection: { provider: "claude", identity: "alpha", model: "not-listed" } });
+  await s.send(ws, badModel);
+  expect(ws.of("chat.reject")).toHaveLength(2);
+  const good = createFrame({ selection: { provider: "claude", identity: "alpha", model: "listed" } });
+  await s.send(ws, good);
+  expect(ws.of("chat.state")).toHaveLength(1);
+  expect((await s.store.get(good.chatId))?.selection.model).toBe("listed");
+  ws.sent.length = 0;
+  await s.send(ws, { t: "chat.config", chatId: good.chatId, model: "not-listed" });
+  expect(ws.of("chat.reject")).toEqual([expect.objectContaining({ chatId: good.chatId, code: "bad_request" })]);
+});
+
+test("a create that waits more than the lock limit for another create gets chat.reject unavailable", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let first = true;
+  const s = await setup({
+    lockWaitMs: 60,
+    wrapBroker: (b) => ({
+      dispatch: (c) => b.dispatch(c),
+      create: async (i) => {
+        if (first) {
+          first = false;
+          await gate;
+        }
+        return b.create(i);
+      },
+    }),
+  });
+  const ws = await s.connect("tok-a");
+  const slow = createFrame();
+  const late = createFrame();
+  void s.hub.message(ws, JSON.stringify(slow));
+  await Bun.sleep(10);
+  await s.send(ws, late);
+  await Bun.sleep(120);
+  expect(ws.of("chat.reject")).toEqual([expect.objectContaining({ chatId: late.chatId, code: "unavailable" })]);
+  expect(await s.store.get(late.chatId)).toBeUndefined();
+  // The create in flight is not cut: it finishes once released.
+  release();
+  await until(() => ws.of("chat.state").length === 1);
+  expect(ws.of("chat.state")[0]?.chatId).toBe(slow.chatId);
 });

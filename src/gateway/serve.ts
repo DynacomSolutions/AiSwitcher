@@ -35,7 +35,7 @@ import { MemoryChatBus, PgChatBus, type ChatBus } from "./chat/bus.ts";
 import { ChatCatalog } from "./chat/catalog.ts";
 import { ChatFrames } from "./chat/frames.ts";
 import { HttpKubeApi, inClusterKube } from "./chat/kube-http.ts";
-import type { KubeConfigEnv, PodTransport } from "./chat/kube.ts";
+import type { KubeApi, KubeConfigEnv, PodTransport } from "./chat/kube.ts";
 import { PgChatStore } from "./chat/pg-chat-store.ts";
 import { KubePodTransport } from "./chat/pod-transport.ts";
 import { MemoryChatStore } from "./chat/store.ts";
@@ -160,6 +160,10 @@ export interface GatewayHooks {
    * chat store and bus, and an MCP URL on this gateway's own port.
    */
   chatTransport?: PodTransport;
+  /** Tests: the Kubernetes API of the chat pod transport. The chat env (`AIS_GATEWAY_CHAT_*`) is still read. Also turns the in-memory chat store and bus on. */
+  chatKubeApi?: KubeApi;
+  /** Tests: the chat bus (in-memory store mode only). */
+  chatBus?: ChatBus;
 }
 
 /** What `AIS_GATEWAY_CHAT_*` configures. */
@@ -721,6 +725,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       console.warn(`gateway: side-panel chat is off (${describe(err)})`);
     }
   }
+  // A test transport or test Kubernetes API also selects the in-memory chat store and bus.
+  const chatTesting = hooks.chatTransport !== undefined || hooks.chatKubeApi !== undefined;
   const chatOn = hooks.chatTransport !== undefined || chatEnv !== undefined;
   let chatBroker: ChatBroker | undefined;
   // The hub reads `onChat` and `onAttach` from this same object when a frame arrives. The chat stack sets them after it is built (below),
@@ -1197,16 +1203,21 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   let chat: { broker: ChatBroker; frames: ChatFrames; store: ChatStore } | undefined;
   if (chatOn) {
     try {
-      const testing = hooks.chatTransport !== undefined;
+      const testing = chatTesting;
       const transport =
         hooks.chatTransport ??
         (() => {
           const cfg = chatEnv as ChatEnvConfig;
-          const kube = inClusterKube(process.env, (p) => readFileSync(p, "utf8"));
-          return new KubePodTransport({ api: new HttpKubeApi({ baseUrl: kube.baseUrl, token: kube.token, ca: kube.ca, env: cfg.kube }), env: cfg.kube });
+          const api =
+            hooks.chatKubeApi ??
+            (() => {
+              const kube = inClusterKube(process.env, (p) => readFileSync(p, "utf8"));
+              return new HttpKubeApi({ baseUrl: kube.baseUrl, token: kube.token, ca: kube.ca, env: cfg.kube });
+            })();
+          return new KubePodTransport({ api, env: cfg.kube });
         })();
       const chatStore: ChatStore = testing ? new MemoryChatStore() : new PgChatStore(opts.databaseUrl, { sql: sharedSql });
-      const bus: ChatBus = testing ? new MemoryChatBus() : new PgChatBus(sharedSql, sharedListener);
+      const bus: ChatBus = testing ? (hooks.chatBus ?? new MemoryChatBus()) : new PgChatBus(sharedSql, sharedListener);
       const mcpUrl = chatEnv?.mcpUrl ?? `http://127.0.0.1:${server.port}/browser/mcp`;
       const replicaId = `${process.env.HOSTNAME ?? "gateway"}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`;
       const identityOf = async (binding: string): Promise<string | undefined> => {
@@ -1245,9 +1256,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       const live = frames;
       chatBroker = broker;
       chat = { broker, frames: live, store: chatStore };
-      // The bus needs the database. A database that is down at boot must not turn chat off, so a failed start tries again.
+      // The bus needs the database. A database that is down at boot must not turn chat off, so a failed start tries again with a growing wait.
+      // Chat frames get `chat.reject` unavailable until the start worked: only then the hub gets its chat handlers.
       let brokerStarted = false;
       let framesStarted = false;
+      let tries = 0;
       const startChat = async (): Promise<void> => {
         if (draining) return;
         try {
@@ -1259,15 +1272,18 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
             await live.start();
             framesStarted = true;
           }
+          hubOpts.onChat = (b, m, r) => live.handle(b, m, r);
+          hubOpts.onAttach = (b) => live.onAttach(b);
         } catch (err) {
-          console.warn(`gateway: side-panel chat could not listen yet (${describe(err)}); retrying in 5 s`);
-          setTimeout(() => void startChat(), hooks.warmBackoff?.initialMs ?? 5_000).unref?.();
+          metrics.chatError("other");
+          const wait = Math.min((hooks.warmBackoff?.initialMs ?? 5_000) * 2 ** tries, hooks.warmBackoff?.maxMs ?? 60_000);
+          tries += 1;
+          console.warn(`gateway: side-panel chat could not listen yet (${describe(err)}); retrying in ${wait} ms`);
+          setTimeout(() => void startChat(), wait).unref?.();
         }
       };
       const first = startChat();
       if (testing) await first;
-      hubOpts.onChat = (b, m, r) => live.handle(b, m, r);
-      hubOpts.onAttach = (b) => live.onAttach(b);
       metrics.chatGauges = { active: () => broker.active() };
     } catch (err) {
       console.warn(`gateway: side-panel chat is off (${describe(err)})`);

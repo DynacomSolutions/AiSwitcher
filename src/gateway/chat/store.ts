@@ -23,13 +23,19 @@ export class MemoryChatStore implements ChatStore {
     return r.ownerReplica === f.replica && r.epoch === f.epoch && r.leaseUntil !== undefined && r.leaseUntil > this.now();
   }
 
-  async create(rec: ChatCreate, cap: number, owner?: ChatOwner): Promise<ChatRecord | "cap"> {
+  async create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number): Promise<ChatRecord | "cap" | "global"> {
     if (this.chats.has(rec.id)) throw new ChatExistsError(rec.id);
     let open = 0;
     for (const c of this.chats.values()) {
       if (c.binding === rec.binding && c.windowId === rec.windowId && c.state !== "closed") open += 1;
     }
     if (open >= cap) return "cap";
+    if (globalCap !== undefined) {
+      // No await between this count and the insert below, so two creates cannot both pass.
+      let all = 0;
+      for (const c of this.chats.values()) if (c.state !== "closed") all += 1;
+      if (all >= globalCap) return "global";
+    }
     const row: ChatRecord = { ...structuredClone(rec), state: "starting", epoch: 0, lastSeq: 0, generation: 0, updatedAt: rec.createdAt };
     if (owner) {
       row.ownerReplica = owner.replica;

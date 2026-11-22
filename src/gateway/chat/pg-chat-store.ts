@@ -53,21 +53,24 @@ export class PgChatStore implements ChatStore {
     if (this.ownsSql) await this.sql.close();
   }
 
-  async create(rec: ChatCreate, cap: number, owner?: ChatOwner): Promise<ChatRecord | "cap"> {
+  async create(rec: ChatCreate, cap: number, owner?: ChatOwner, globalCap?: number): Promise<ChatRecord | "cap" | "global"> {
     // The advisory lock serialises creates of one window, so the count and the insert never race.
+    // A second lock on a constant key serialises the gateway-wide count over all replicas. The order is always window, then global.
     let rows: Row[];
     try {
       rows = await this.sql.begin(async (t) => {
         await t`SELECT pg_advisory_xact_lock(hashtextextended(${`${rec.binding}:${rec.windowId}`}, 0))`;
+        await t`SELECT pg_advisory_xact_lock(hashtextextended('gateway_chat_global_cap', 0))`;
         return t.unsafe(
           `INSERT INTO gateway_chats (id, binding, window_id, name, color, selection, state, tab_ids, acp_session_id, pod_session, can_load, created_at, updated_at, owner_replica, epoch, lease_until)
            SELECT $1, $2, $3, $4, $5, $6::jsonb, 'starting', $7::jsonb, $8, $9, $10, $11::bigint, $11::bigint, $13::text,
              CASE WHEN $13::text IS NULL THEN 0 ELSE 1 END,
              CASE WHEN $13::text IS NULL THEN NULL ELSE clock_timestamp() + make_interval(secs => $14::double precision / 1000.0) END
            WHERE (SELECT count(*) FROM gateway_chats WHERE binding = $2 AND window_id = $3 AND state <> 'closed') < $12
+             AND ($15::int IS NULL OR (SELECT count(*) FROM gateway_chats WHERE state <> 'closed') < $15::int)
            RETURNING ${COLS}`,
           [rec.id, rec.binding, rec.windowId, rec.name, rec.color, JSON.stringify(rec.selection), JSON.stringify(rec.tabIds),
-            rec.acpSessionId ?? null, rec.podSession ?? null, rec.canLoad ?? null, rec.createdAt, cap, owner?.replica ?? null, owner?.ttlMs ?? null],
+            rec.acpSessionId ?? null, rec.podSession ?? null, rec.canLoad ?? null, rec.createdAt, cap, owner?.replica ?? null, owner?.ttlMs ?? null, globalCap ?? null],
         );
       });
     } catch (err) {
@@ -76,9 +79,10 @@ export class PgChatStore implements ChatStore {
       throw err;
     }
     if (rows.length > 0) return toRecord(rows[0] as Row);
-    // No row: the window is full. A used id must still report ChatExistsError.
+    // No row: the window or the gateway is full. A used id must still report ChatExistsError.
     if (await this.get(rec.id)) throw new ChatExistsError(rec.id);
-    return "cap";
+    const inWindow = await this.listByBinding(rec.binding, { windowId: rec.windowId });
+    return inWindow.length >= cap ? "cap" : "global";
   }
 
   async get(id: string): Promise<ChatRecord | undefined> {

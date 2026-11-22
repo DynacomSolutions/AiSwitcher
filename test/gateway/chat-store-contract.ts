@@ -56,6 +56,17 @@ export function chatStoreContract(make: () => Promise<ChatStore>): void {
     expect(await s.listByBinding("b1", { windowId: 1, includeClosed: true })).toHaveLength(7);
   });
 
+  test("two parallel creates at the gateway cap minus one: exactly one succeeds", async () => {
+    const s = await make();
+    const max = (await s.countOpen()) + 1;
+    const results = await Promise.all([s.create(mk({ binding: "b-g1", windowId: 11 }), 6, undefined, max), s.create(mk({ binding: "b-g2", windowId: 12 }), 6, undefined, max)]);
+    expect(results.filter((r) => r === "global")).toHaveLength(1);
+    expect(results.filter((r) => typeof r === "object")).toHaveLength(1);
+    expect(await s.countOpen()).toBe(max);
+    // A third create is refused for the gateway, not for its window.
+    expect(await s.create(mk({ binding: "b-g3", windowId: 13 }), 6, undefined, max)).toBe("global");
+  });
+
   test("10 concurrent creates for one window with cap 6 give exactly 6 successes", async () => {
     const s = await make();
     const results = await Promise.all(Array.from({ length: 10 }, () => s.create(mk({ binding: "b-race", windowId: 7 }), 6)));
