@@ -17,9 +17,9 @@ interface SplitTabsApi {
   SPLIT_VIEW_ID_NONE?: number;
 }
 
-export interface GroupInfo { id: number; title: string }
-
 export type GroupColor = "grey" | "blue" | "red" | "yellow" | "green" | "pink" | "purple" | "cyan" | "orange";
+
+export interface GroupInfo { id: number; title: string; color?: GroupColor }
 
 export interface ChromeApi {
   storage: {
@@ -46,7 +46,8 @@ export interface ChromeApi {
     /** Throws UnsupportedApiError before Chrome 155. */
     unsplit(splitViewId: number): Promise<void>;
     remove(tabId: number): Promise<void>;
-    group(tabIds: number[], groupId?: number): Promise<number>;
+    /** A new group is made in `windowId` when given (the window that holds the tabs). Ignored when `groupId` is given. */
+    group(tabIds: number[], groupId?: number, windowId?: number): Promise<number>;
     ungroup(tabIds: number[]): Promise<void>;
     onRemoved(listener: (tabId: number) => void): void;
     /** Makes the tab the active one in its window. Only used to give the owner back the tab they were on. */
@@ -60,6 +61,8 @@ export interface ChromeApi {
     get(groupId: number): Promise<GroupInfo | undefined>;
     /** Live groups with exactly this title. */
     queryByTitle(title: string): Promise<GroupInfo[]>;
+    /** A group's title or colour changed. */
+    onUpdated(listener: (groupId: number) => void): void;
   };
   debugger: {
     attach(tabId: number): Promise<void>;
@@ -101,8 +104,8 @@ export function realChromeApi(): ChromeApi {
         if (opts?.splitWithTabId !== undefined) {
           if (typeof (chrome.tabs as unknown as SplitTabsApi).createSplit !== "function") throw splitUnsupported();
           props.splitWithTabId = opts.splitWithTabId;
-          if (opts.windowId !== undefined) props.windowId = opts.windowId; // the base tab's window, not the focused one
         }
+        if (opts?.windowId !== undefined) props.windowId = opts.windowId; // the base tab's window (split) or the window of a restored group, not the focused one
         try {
           return toTab(await chrome.tabs.create(props as chrome.tabs.CreateProperties));
         } catch (e) {
@@ -128,7 +131,11 @@ export function realChromeApi(): ChromeApi {
         await api.unsplit(splitViewId);
       },
       remove: async tabId => { await chrome.tabs.remove(tabId); },
-      group: (tabIds, groupId) => { const ids = tabIds as [number, ...number[]]; return chrome.tabs.group(groupId === undefined ? { tabIds: ids } : { tabIds: ids, groupId }); },
+      group: (tabIds, groupId, windowId) => {
+        const ids = tabIds as [number, ...number[]];
+        if (groupId !== undefined) return chrome.tabs.group({ tabIds: ids, groupId });
+        return chrome.tabs.group(windowId === undefined ? { tabIds: ids } : { tabIds: ids, createProperties: { windowId } });
+      },
       ungroup: async tabIds => { await chrome.tabs.ungroup(tabIds as [number, ...number[]]); },
       onRemoved: listener => chrome.tabs.onRemoved.addListener(listener),
       activate: async tabId => { await chrome.tabs.update(tabId, { active: true }); },
@@ -138,9 +145,10 @@ export function realChromeApi(): ChromeApi {
     tabGroups: {
       update: async (groupId, props) => { await chrome.tabGroups.update(groupId, props); },
       get: async groupId => {
-        try { const g = await chrome.tabGroups.get(groupId); return { id: g.id, title: g.title ?? "" }; } catch { return undefined; }
+        try { const g = await chrome.tabGroups.get(groupId); return { id: g.id, title: g.title ?? "", color: g.color }; } catch { return undefined; }
       },
-      queryByTitle: async title => (await chrome.tabGroups.query({ title })).map(g => ({ id: g.id, title: g.title ?? "" })),
+      queryByTitle: async title => (await chrome.tabGroups.query({ title })).map(g => ({ id: g.id, title: g.title ?? "", color: g.color })),
+      onUpdated: listener => chrome.tabGroups.onUpdated.addListener(g => listener(g.id)),
     },
     debugger: {
       attach: tabId => chrome.debugger.attach({ tabId }, "1.3"),
