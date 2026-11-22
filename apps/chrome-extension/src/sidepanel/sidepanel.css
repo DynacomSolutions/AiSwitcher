@@ -137,3 +137,5 @@ select.chip-add { flex: 0 1 auto; font-size: 12px; padding: 3px 8px; }
 textarea.composer-box { flex: 1; font: inherit; font-size: 14px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; resize: vertical; min-width: 0; }
 textarea.composer-box:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .composer-hint { margin: 0; }
+button.secondary { background: var(--card); color: var(--ink); border-color: var(--line); }
+button.secondary:hover { background: var(--idle-bg); }

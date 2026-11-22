@@ -6,6 +6,7 @@ export type MdBlock = { t: "p"; inline: MdInline[] } | { t: "code"; lang?: strin
 
 export const MAX_MARKDOWN_CHARS = 200_000;
 const MAX_DEPTH = 4;
+const MAX_LABEL = 2000;
 const TRUNCATED = "This message is too long. The rest is hidden.";
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
@@ -45,10 +46,12 @@ function parseInline(s: string, depth = 0): MdInline[] {
     } else if (c === "[" && depth < MAX_DEPTH) {
       const close = f.next("](", i + 1);
       const paren = close === -1 ? -1 : f.next(")", close + 2);
-      if (close > i + 1 && paren !== -1) {
+      // A label with another "[" or a very long label is not a link here: this "[" stays text and a later one may start the link.
+      if (close > i + 1 && close - i <= MAX_LABEL && paren !== -1 && !s.slice(i + 1, close).includes("[")) {
         const label = s.slice(i + 1, close);
-        const href = label.includes("[") ? undefined : safeHref(s.slice(close + 2, paren));
-        if (href && !/\s/.test(s.slice(close + 2, paren).trim())) {
+        const target = s.slice(close + 2, paren);
+        const href = /\s/.test(target.trim()) ? undefined : safeHref(target);
+        if (href) {
           flush();
           out.push({ t: "a", href, v: parseInline(label, depth + 1) });
         } else {
@@ -78,39 +81,41 @@ function parseInline(s: string, depth = 0): MdInline[] {
   return out;
 }
 
-const FENCE = /^\s*```\s*([A-Za-z0-9_+.#-]{0,32})\s*$/;
-const HEADING = /^(#{1,6})\s+(.*)$/;
-const ITEM = /^\s*([-*+]|\d{1,9}[.)])\s+(.*)$/;
-const QUOTE = /^\s*>\s?(.*)$/;
+// Block patterns use [ \t] and never overlap with the group after them, so no input makes them backtrack.
+const FENCE = /^[ \t]*```[ \t]*([A-Za-z0-9_+.#-]{0,32})[ \t]*$/;
+const HEADING = /^(#{1,6})[ \t]+(\S.*)?$/;
+const ITEM = /^[ \t]*([-*+]|\d{1,9}[.)])[ \t]+(\S.*)?$/;
+const QUOTE = /^[ \t]*>[ \t]?(.*)$/;
+const LINE_BREAK = /\r\n?|\n|\u2028|\u2029/;
 
 export function parseMarkdown(src: string): MdBlock[] {
   const truncated = src.length > MAX_MARKDOWN_CHARS;
-  const lines = (truncated ? src.slice(0, MAX_MARKDOWN_CHARS) : src).split("\n");
+  const lines = (truncated ? src.slice(0, MAX_MARKDOWN_CHARS) : src).split(LINE_BREAK);
   const blocks: MdBlock[] = [];
   let para: string[] = [];
   let list: { t: "ul" | "ol"; items: MdInline[][] } | undefined;
   const endPara = (): void => { if (para.length) { blocks.push({ t: "p", inline: parseInline(para.join("\n")) }); para = []; } };
   const end = (): void => { endPara(); list = undefined; };
   for (let n = 0; n < lines.length; n++) {
-    const line = lines[n]!.replace(/\r$/, "");
+    const line = lines[n]!;
     const fence = FENCE.exec(line);
     if (fence) {
       end();
       const body: string[] = [];
       n++;
-      while (n < lines.length && !FENCE.test(lines[n]!.replace(/\r$/, ""))) body.push(lines[n++]!.replace(/\r$/, ""));
+      while (n < lines.length && !FENCE.test(lines[n]!)) body.push(lines[n++]!);
       blocks.push(fence[1] ? { t: "code", lang: fence[1], text: body.join("\n") } : { t: "code", text: body.join("\n") });
       continue;
     }
     if (line.trim() === "") { end(); continue; }
     const h = HEADING.exec(line);
-    if (h) { end(); blocks.push({ t: "h", level: Math.min(3, h[1]!.length) as 1 | 2 | 3, inline: parseInline(h[2]!.trim()) }); continue; }
+    if (h) { end(); blocks.push({ t: "h", level: Math.min(3, h[1]!.length) as 1 | 2 | 3, inline: parseInline((h[2] ?? "").trim()) }); continue; }
     const item = ITEM.exec(line);
     if (item) {
       endPara();
       const t = /^\d/.test(item[1]!) ? "ol" : "ul";
       if (!list || list.t !== t) { list = { t, items: [] }; blocks.push(list); }
-      list.items.push(parseInline(item[2]!));
+      list.items.push(parseInline(item[2] ?? ""));
       continue;
     }
     const q = QUOTE.exec(line);

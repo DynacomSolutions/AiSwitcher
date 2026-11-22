@@ -11,6 +11,10 @@ type Assistant = Extract<FeedItem, { kind: "assistant" }>;
 type Tool = Extract<FeedItem, { kind: "tool" }>;
 type Permission = Extract<FeedItem, { kind: "permission" }>;
 
+/** Same cap as the hub keeps. */
+export const MAX_FEED_ITEMS = 500;
+export const OLDER_HIDDEN = "Older messages are hidden.";
+
 export function buildFeed(items: ChatItem[]): FeedItem[] {
   const sorted = [...items].sort((a, b) => a.seq - b.seq);
   const out: FeedItem[] = [];
@@ -18,6 +22,7 @@ export function buildFeed(items: ChatItem[]): FeedItem[] {
   const perms = new Map<string, Permission>();
   let open: Assistant | undefined;
   let lastSeq = -1;
+  const end = (): void => { if (open) open.streaming = false; open = undefined; };
   for (const { seq, body } of sorted) {
     if (seq === lastSeq) continue; // a replayed event
     lastSeq = seq;
@@ -32,9 +37,8 @@ export function buildFeed(items: ChatItem[]): FeedItem[] {
         open = undefined;
         for (const a of out) if (a.kind === "assistant") a.streaming = false;
         break;
-      case "user": open = undefined; out.push({ kind: "user", seq, text: body.text }); break;
+      case "user": end(); out.push({ kind: "user", seq, text: body.text }); break;
       case "tool": {
-        open = undefined;
         const prev = tools.get(body.toolCallId);
         if (prev) {
           prev.title = body.title;
@@ -42,6 +46,7 @@ export function buildFeed(items: ChatItem[]): FeedItem[] {
           if (body.args !== undefined) prev.args = body.args;
           if (body.result !== undefined) prev.result = body.result;
         } else {
+          end();
           const card: Tool = { kind: "tool", seq, toolCallId: body.toolCallId, title: body.title, status: body.status };
           if (body.args !== undefined) card.args = body.args;
           if (body.result !== undefined) card.result = body.result;
@@ -51,7 +56,7 @@ export function buildFeed(items: ChatItem[]): FeedItem[] {
         break;
       }
       case "permission": {
-        open = undefined;
+        end();
         const card: Permission = { kind: "permission", seq, requestId: body.requestId, title: body.title, options: body.options };
         perms.set(body.requestId, card);
         out.push(card);
@@ -66,9 +71,10 @@ export function buildFeed(items: ChatItem[]): FeedItem[] {
         }
         break;
       }
-      case "error": open = undefined; out.push({ kind: "error", seq, code: body.code, message: body.message }); break;
-      case "notice": open = undefined; out.push({ kind: "notice", seq, text: body.text }); break;
+      case "error": end(); out.push({ kind: "error", seq, code: body.code, message: body.message }); break;
+      case "notice": end(); out.push({ kind: "notice", seq, text: body.text }); break;
     }
   }
+  if (out.length > MAX_FEED_ITEMS) return [{ kind: "notice", seq: -1, text: OLDER_HIDDEN }, ...out.slice(-MAX_FEED_ITEMS)];
   return out;
 }

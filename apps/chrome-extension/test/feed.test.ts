@@ -48,3 +48,24 @@ describe("buildFeed", () => {
     expect(buildFeed([...items, ...items])).toEqual(buildFeed(items));
   });
 });
+
+describe("buildFeed streaming and cap", () => {
+  test("only the last assistant item streams: a later tool or error ends it", () => {
+    const feed = buildFeed([it({ k: "text", text: "a" }, 1), it({ k: "tool", toolCallId: "t", title: "T", status: "running" }, 2), it({ k: "text", text: "b" }, 3)]);
+    expect(feed.filter((f) => f.kind === "assistant").map((f) => (f as { streaming: boolean }).streaming)).toEqual([false, true]);
+    const after = buildFeed([it({ k: "text", text: "a" }, 1), it({ k: "error", code: "limit", message: "m" }, 2)]);
+    expect((after[0] as { streaming: boolean }).streaming).toBe(false);
+  });
+  test("a tool update after later text does not split that text", () => {
+    const feed = buildFeed([it({ k: "tool", toolCallId: "t", title: "T", status: "running" }, 1), it({ k: "text", text: "a" }, 2), it({ k: "tool", toolCallId: "t", title: "T", status: "done" }, 3), it({ k: "text", text: "b" }, 4)]);
+    expect(feed.filter((f) => f.kind === "assistant")).toEqual([{ kind: "assistant", seq: 2, text: "ab", streaming: true }]);
+  });
+  test("a feed over 500 items drops the oldest and shows one notice at the top", () => {
+    const many = Array.from({ length: 600 }, (_, i) => it({ k: "user", text: `m${i}` }, i + 1));
+    const feed = buildFeed(many);
+    expect(feed).toHaveLength(501);
+    expect(feed[0]).toEqual({ kind: "notice", seq: -1, text: "Older messages are hidden." });
+    expect(feed[1]).toMatchObject({ text: "m100" });
+    expect(feed.filter((f) => f.kind === "notice")).toHaveLength(1);
+  });
+});

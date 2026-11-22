@@ -12,25 +12,8 @@ const links = (blocks: MdBlock[]): string[] => {
   return out;
 };
 
-// A tiny Document stand-in: the tests run without a DOM.
-class FakeNode {
-  children: FakeNode[] = [];
-  attrs: Record<string, string> = {};
-  textContent = "";
-  constructor(public tag: string) {}
-  append(...n: FakeNode[]): void { this.children.push(...n); }
-  appendChild(n: FakeNode): FakeNode { this.children.push(n); return n; }
-  setAttribute(k: string, v: string): void { this.attrs[k] = v; }
-  get innerHTML(): string { throw new Error("innerHTML used"); }
-  set innerHTML(_v: string) { throw new Error("innerHTML used"); }
-}
-const fakeDoc = (): Document => ({
-  createElement: (t: string) => new FakeNode(t),
-  createTextNode: (v: string) => { const n = new FakeNode("#text"); n.textContent = v; return n; },
-  createDocumentFragment: () => new FakeNode("#frag"),
-}) as unknown as Document;
-const walk = (n: FakeNode, out: FakeNode[] = []): FakeNode[] => { out.push(n); n.children.forEach((c) => walk(c, out)); return out; };
-const render = (src: string): FakeNode[] => walk(renderBlocks(fakeDoc(), parseMarkdown(src)) as unknown as FakeNode);
+import { asDoc, fakeDoc, walk, type FakeNode } from "./fake-dom.ts";
+const render = (src: string): FakeNode[] => walk(renderBlocks(asDoc(fakeDoc()), parseMarkdown(src)) as unknown as FakeNode);
 
 describe("parseMarkdown", () => {
   test("<script>alert(1)</script> stays text", () => {
@@ -95,5 +78,27 @@ describe("parseMarkdown", () => {
     const b = parseMarkdown(src);
     expect(performance.now() - t).toBeLessThan(500);
     expect(b.length).toBe(10_000);
+  });
+  test("block patterns stay linear on long runs of spaces", () => {
+    for (const src of ["#" + " ".repeat(200_000) + "a b", "-" + " ".repeat(200_000) + "a b", "-" + " ".repeat(199_990), "#" + " ".repeat(199_990) + "\u2028x", "\t".repeat(100_000) + "x", "```" + " ".repeat(100_000) + "x", ">" + " ".repeat(190_000) + "x"]) {
+      const t = performance.now();
+      parseMarkdown(src);
+      expect(performance.now() - t).toBeLessThan(100);
+    }
+  });
+  test("inline scans stay linear on hostile input", () => {
+    for (const src of ["[".repeat(100_000), "[a](".repeat(40_000), "*a ".repeat(60_000), "`".repeat(150_000), "[".repeat(1000) + "](x)" + "[".repeat(100_000)]) {
+      const t = performance.now();
+      parseMarkdown(src);
+      expect(performance.now() - t).toBeLessThan(300);
+    }
+  });
+  test("every line terminator splits lines", () => {
+    expect(parseMarkdown("- a\u2028- b\r- c\r\n- d").map((b) => b.t)).toEqual(["ul"]);
+    expect((parseMarkdown("- a\u2028- b\r- c\r\n- d")[0] as { items: unknown[] }).items).toHaveLength(4);
+  });
+  test("a stray [ before a valid link does not hide the link", () => {
+    expect(links(parseMarkdown("arr[0] see [d](https://x.test)"))).toEqual(["https://x.test/"]);
+    expect(links(parseMarkdown("[a [d](https://x.test)"))).toEqual(["https://x.test/"]);
   });
 });
