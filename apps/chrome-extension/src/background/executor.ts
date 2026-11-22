@@ -152,6 +152,7 @@ export class Executor {
     this.state = deps.state;
     this.ui = deps.ui ?? noopUi;
     this.onLinks = deps.onLinks ?? (() => {});
+    if (deps.onLinks) this.tabs.onLinksChanged = deps.onLinks;
     this.sleepFn = deps.sleep ?? ((ms, signal) => new Promise<void>((resolve, reject) => {
       const t = setTimeout(resolve, ms);
       signal.addEventListener("abort", () => { clearTimeout(t); reject(new Error("aborted")); }, { once: true });
@@ -271,7 +272,7 @@ export class Executor {
         if (session.chat === true) {
           // The gateway must accept the new tab before the agent can use it.
           const links = [...new Set([...this.tabs.chatLinks(session.id), tab.id])];
-          this.tabs.setChatLinks(session.id, links);
+          this.tabs.setChatLinks(session.id, links, true);
           await this.onLinks(session.id, links);
         }
         await this.markControlled(tab.id, session);
@@ -279,10 +280,10 @@ export class Executor {
       }
       case "adopt_tab": {
         const { tabId } = a("adopt_tab");
+        if (session.chat === true && !this.tabs.chatLinked(session.id, tabId) && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", "Only tabs you linked to this chat can be used. Link it in the side panel.");
         const tab = await this.api.tabs.get(tabId);
         if (!tab) throw new ToolError("tab_closed", `Tab ${tabId} no longer exists.`);
         if (session.chat === true) {
-          if (!this.tabs.chatLinked(session.id, tabId) && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", "Only tabs you linked to this chat can be used. Link it in the side panel.");
           return text(`Tab ${tabId} is linked to this chat and is already usable.`);
         }
         if (this.tabs.inGrantedGroup(session.id, session.identity, tab)) return text(`Tab ${tabId} is in a group granted to this session and is already usable.`);
@@ -312,25 +313,30 @@ export class Executor {
     }
     const { tabId } = a("screenshot");
     const tab = await this.ownedTab(req, tabId);
-    const open = this.dialogs.get(tabId);
-    if (open && !DIALOG_SAFE.has(tool)) throw this.dialogError(tabId, open);
     // A page blocked by a dialog answers neither CDP input nor script injection: a dialog that opens mid-call ends the call at once.
-    const work = () => this.watchDialogs(tabId, tool, async () => {
-      // Attached before anything touches the page: a page that does not answer (a dialog Chrome never reported) ends the call here.
-      await this.ensureAttached(sig, tabId);
-      if (open) void this.markControlled(tabId, session); else await this.markControlled(tabId, session);
-      this.throwIfAborted(sig);
-      if (tool !== "hover") await this.releaseHold(tabId);
-      return this.tabTool(tool, req, sig, tab);
-    });
-    return session.chat === true ? this.withTabLock(tabId, work) : work();
+    // The dialog is read inside `work`, after a chat has the tab lock: an earlier call may have opened one.
+    const work = async (): Promise<Content> => {
+      const open = this.dialogs.get(tabId);
+      if (open && !DIALOG_SAFE.has(tool)) throw this.dialogError(tabId, open);
+      return this.watchDialogs(tabId, tool, async () => {
+        // Attached before anything touches the page: a page that does not answer (a dialog Chrome never reported) ends the call here.
+        await this.ensureAttached(sig, tabId);
+        if (open) void this.markControlled(tabId, session); else await this.markControlled(tabId, session);
+        this.throwIfAborted(sig);
+        if (tool !== "hover") await this.releaseHold(tabId);
+        return this.tabTool(tool, req, sig, tab);
+      });
+    };
+    return session.chat === true ? this.withTabLock(tabId, work, sig) : work();
   }
 
   /** Runs `work` after every earlier chat call on the same tab has ended. */
-  private async withTabLock<T>(tabId: number, work: () => Promise<T>): Promise<T> {
+  private async withTabLock<T>(tabId: number, work: () => Promise<T>, sig: AbortSignal): Promise<T> {
     const prev = this.tabLocks.get(tabId) ?? Promise.resolve();
     const run = prev.then(work, work);
-    const tail = run.then(() => {}, () => {});
+    // The lock also ends when the call is aborted (timeout or stop), so a hung call never blocks the other chats.
+    const aborted = new Promise<void>(resolve => { if (sig.aborted) resolve(); else sig.addEventListener("abort", () => resolve(), { once: true }); });
+    const tail = Promise.race([run.then(() => {}, () => {}), aborted]);
     this.tabLocks.set(tabId, tail);
     void tail.then(() => { if (this.tabLocks.get(tabId) === tail) this.tabLocks.delete(tabId); });
     return run;

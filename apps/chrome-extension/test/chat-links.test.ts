@@ -3,7 +3,7 @@ import type { BrowserTool, CallRequest } from "../../../src/browser/protocol.ts"
 import { Executor } from "../src/background/executor.ts";
 import type { ExecutorDeps } from "../src/background/executor.ts";
 import { State } from "../src/background/state.ts";
-import { TabManager } from "../src/background/tabs.ts";
+import { colorForIdentity, TabManager } from "../src/background/tabs.ts";
 import { FakeChrome } from "./fakes.ts";
 
 const chatA = { id: "chat:a", identity: "chat", label: "Chat A", chat: true as const };
@@ -168,5 +168,72 @@ describe("chat links", () => {
     expect(api.tabList.has(made)).toBe(false);
     expect(api.tabList.has(5)).toBe(true);
     expect(tabs.chatLinks(chatA.id)).toEqual([]);
+  });
+  test("a hung call releases the tab lock when it times out", async () => {
+    const { api, tabs, executor } = setup({ defaultTimeoutMs: 100 });
+    api.addTab(5);
+    tabs.setChatLinks(chatA.id, [5]);
+    tabs.setChatLinks(chatB.id, [5]);
+    api.cdpResults["Runtime.evaluate"] = () => new Promise(() => {});
+    const a = executor.run(call("javascript", { tabId: 5, code: "A" }, chatA));
+    const b = await executor.run(call("get_console", { tabId: 5 }, chatB));
+    expect(b.ok).toBe(true);
+    expect(await a).toMatchObject({ ok: false, error: "timeout" });
+  });
+
+  test("a dialog opened by an earlier call is seen by the next chat call on the tab", async () => {
+    const { api, tabs, executor } = setup();
+    api.addTab(5);
+    tabs.setChatLinks(chatA.id, [5]);
+    tabs.setChatLinks(chatB.id, [5]);
+    api.cdpResults["Runtime.evaluate"] = async () => {
+      api.emit(5, "Page.javascriptDialogOpening", { type: "alert", message: "hi", url: "https://example.test/" });
+      await new Promise(r => setTimeout(r, 10));
+      return { result: { value: 1 } };
+    };
+    const rs = await Promise.all([
+      executor.run(call("javascript", { tabId: 5, code: "A" }, chatA)),
+      executor.run(call("javascript", { tabId: 5, code: "B" }, chatB)),
+    ]);
+    expect(rs[1]).toMatchObject({ ok: false, error: "dialog_open" });
+    const h = await executor.run(call("handle_dialog", { tabId: 5, accept: true }, chatA));
+    expect(h.ok).toBe(true);
+  });
+
+  test("a chat group takes the mapped palette colour and an external session keeps its identity colour", async () => {
+    const { api, executor } = setup();
+    const coloured = { ...chatA, color: "#f97316" };
+    const made = JSON.parse(textOf(await executor.run(call("tabs_create", {}, coloured)))).tabId as number;
+    expect(api.groups.get(api.tabList.get(made)!.groupId)!.color).toBe("orange");
+    const ext = JSON.parse(textOf(await executor.run(call("tabs_create", {}, external)))).tabId as number;
+    expect(api.groups.get(api.tabList.get(ext)!.groupId)!.color).toBe(colorForIdentity("ext"));
+  });
+
+  test("a popup opened from a chat-created tab is linked and reported through onLinks", async () => {
+    const seen: Array<[string, number[]]> = [];
+    const { api, tabs, executor } = setup({ onLinks: (id, ids) => { seen.push([id, ids]); } });
+    const opener = JSON.parse(textOf(await executor.run(call("tabs_create", {}, chatA)))).tabId as number;
+    seen.length = 0;
+    const popup = api.addTab(300);
+    await tabs.claimOpened(popup, api.tabList.get(opener)!);
+    expect(tabs.chatLinks(chatA.id)).toContain(300);
+    expect(seen.at(-1)).toEqual([chatA.id, [opener, 300]]);
+  });
+
+  test("closing a linked tab reports the reduced link set", async () => {
+    const seen: Array<[string, number[]]> = [];
+    const { api, tabs } = setup({ onLinks: (id, ids) => { seen.push([id, ids]); } });
+    api.addTab(5);
+    api.addTab(6);
+    tabs.setChatLinks(chatA.id, [5, 6]);
+    seen.length = 0;
+    api.closeTab(5);
+    expect(seen).toEqual([[chatA.id, [6]]]);
+  });
+
+  test("adopt_tab of a missing unlinked tab is forbidden_tab", async () => {
+    const { executor } = setup();
+    const r = await executor.run(call("adopt_tab", { tabId: 999 }, chatA));
+    expect(r).toMatchObject({ ok: false, error: "forbidden_tab" });
   });
 });

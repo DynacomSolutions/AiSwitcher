@@ -1,9 +1,10 @@
 // Tab ownership: Map<sessionId, {groupId, tabIds}>, one Chrome tab group per agent session.
+import { CHAT_PALETTE } from "../shared/chat-palette.ts";
 import type { ChromeApi, GroupColor, TabInfo } from "./chrome-api.ts";
 
 /** `adopted` is the subset of `tabIds` the session did not create itself (adopt_tab, or tabs opened inside a user-granted group): they outlive it. */
-export interface SessionTabs { groupId: number; tabIds: Set<number>; adopted: Set<number>; identity: string; label: string }
-export interface SessionRef { id: string; identity: string; label: string }
+export interface SessionTabs { groupId: number; tabIds: Set<number>; adopted: Set<number>; identity: string; label: string; chat?: true; color?: string }
+export interface SessionRef { id: string; identity: string; label: string; chat?: true; color?: string }
 
 const SESSIONS_KEY = "sessions";
 const GRANTS_KEY = "grants";
@@ -35,9 +36,18 @@ export class TabManager {
   // ---- chat links --------------------------------------------------------
 
   /** Replaces the link set of a chat session. */
-  setChatLinks(sessionId: string, tabIds: number[]): void {
+  setChatLinks(sessionId: string, tabIds: number[], silent = false): void {
     if (tabIds.length === 0) this.links.delete(sessionId); else this.links.set(sessionId, new Set(tabIds));
     this.persist();
+    if (!silent) this.linksChanged(sessionId);
+  }
+
+  /** Called with the new link set of a chat on every change. Set by the executor. */
+  onLinksChanged?: (sessionId: string, tabIds: number[]) => void | Promise<void>;
+
+  private linksChanged(sessionId: string): void {
+    if (!this.onLinksChanged) return;
+    try { void Promise.resolve(this.onLinksChanged(sessionId, this.chatLinks(sessionId))).catch(() => {}); } catch { /* a failing sender never breaks tab handling */ }
   }
 
   chatLinks(sessionId: string): number[] { return [...(this.links.get(sessionId) ?? [])]; }
@@ -46,7 +56,7 @@ export class TabManager {
 
   /** The chat ended: its links go. */
   dropChat(sessionId: string): void {
-    if (this.links.delete(sessionId)) this.persist();
+    if (this.links.delete(sessionId)) { this.persist(); this.linksChanged(sessionId); }
   }
 
   constructor(private readonly api: ChromeApi, private readonly now: () => number = Date.now) {
@@ -140,7 +150,7 @@ export class TabManager {
       const s = this.sessions.get(ref.id);
       if (!s || s.groupId === -1 || this.grants.has(s.groupId)) return;
       if (!(await this.api.tabGroups.get(s.groupId))) return;
-      await this.api.tabGroups.update(s.groupId, { title: ref.label, color: colorForIdentity(ref.identity) });
+      await this.api.tabGroups.update(s.groupId, { title: ref.label, color: this.groupColour(ref, this.sessions.get(ref.id)) });
     });
   }
 
@@ -190,8 +200,10 @@ export class TabManager {
       s.adopted.delete(tabId);
       if (s.tabIds.size === 0 && !this.queues.has(id) && this.grantedGroups(id).length === 0) this.sessions.delete(id); // session over: Chrome drops the empty group itself
     }
-    for (const [id, set] of this.links) if (set.delete(tabId) && set.size === 0) this.links.delete(id);
+    const changed: string[] = [];
+    for (const [id, set] of this.links) if (set.delete(tabId)) { changed.push(id); if (set.size === 0) this.links.delete(id); }
     this.persist();
+    for (const id of changed) this.linksChanged(id);
   }
 
   private snapshot(): Record<string, unknown> {
@@ -233,6 +245,7 @@ export class TabManager {
         if (typeof e.sessionId !== "string" || !Array.isArray(e.tabIds)) continue;
         const ids = e.tabIds.filter((t): t is number => typeof t === "number" && live.has(t));
         if (ids.length > 0) this.links.set(e.sessionId, new Set(ids));
+        if (ids.length !== e.tabIds.length) this.linksChanged(e.sessionId);
       }
     }
     const grants = Array.isArray(stored[GRANTS_KEY]) ? stored[GRANTS_KEY] as Array<{ groupId: number; sessionId: string }> : [];
@@ -252,12 +265,21 @@ export class TabManager {
       this.sessions.set(ref.id, s);
     }
     if (ref.label !== "") s.label = ref.label;
+    if (ref.chat === true) s.chat = true;
+    if (ref.color !== undefined) s.color = ref.color;
     return s;
+  }
+
+  /** A chat group takes the chat's palette colour. Every other session keeps its identity colour. */
+  private groupColour(ref: SessionRef, s?: SessionTabs): GroupColor {
+    const chat = ref.chat === true || s?.chat === true;
+    const hex = ref.color ?? s?.color;
+    return (chat && hex !== undefined ? CHAT_PALETTE.find(p => p.hex === hex)?.group : undefined) ?? colorForIdentity(ref.identity);
   }
 
   private async newGroup(ref: SessionRef, s: SessionTabs, tabId: number): Promise<void> {
     s.groupId = await this.api.tabs.group([tabId]);
-    await this.api.tabGroups.update(s.groupId, { title: ref.label || s.label, color: colorForIdentity(ref.identity) });
+    await this.api.tabGroups.update(s.groupId, { title: ref.label || s.label, color: this.groupColour(ref, s) });
   }
 
   /** One queue per session id: group creation for a session is strictly serial, so concurrent first calls cannot make two groups. */
@@ -330,7 +352,11 @@ export class TabManager {
       });
       return owner;
     }
-    await this.addToSession({ id: owner, identity: s.identity, label: s.label }, tab.id, false);
+    await this.addToSession({ id: owner, identity: s.identity, label: s.label, ...(s.chat ? { chat: true as const } : {}), ...(s.color !== undefined ? { color: s.color } : {}) }, tab.id, false);
+    if (s.chat) {
+      // A page of a chat opened this tab: the chat may use it, so the gateway must hear of it.
+      this.setChatLinks(owner, [...new Set([...this.chatLinks(owner), tab.id])]);
+    }
     return owner;
   }
 
