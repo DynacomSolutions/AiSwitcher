@@ -385,7 +385,7 @@ test("an agent error on session/new is classified as acp", async () => {
   expect((await bodies(store, rec.id)).at(-1)).toMatchObject({ k: "error", code: "acp" });
 });
 
-test("a store error while reporting a failure still stops the pod and never rejects", async () => {
+test("a store error while reporting a failure stops only the own session and never rejects", async () => {
   const clock = { t: 1_700_000_000_000 };
   const inner = new MemoryChatStore(() => clock.t);
   const store = Object.create(inner) as MemoryChatStore;
@@ -396,7 +396,8 @@ test("a store error while reporting a failure still stops the pod and never reje
   const { broker, transport } = setup({ failStart: new PodStartError("InitFailed") }, {}, { store, clock });
   const rec = await made(broker);
   expect(await broker.startPod(rec.id)).toBeUndefined();
-  expect(transport.stopped).toContain(rec.id);
+  expect(transport.stopped).toEqual([]);
+  expect(transport.stoppedSessions).toContain(sessionName(rec.id, 1));
 });
 
 test("a store error at the start of a start gives undefined, not a rejection", async () => {
@@ -456,4 +457,85 @@ test("create frees its lease even when the notice cannot be stored", async () =>
   const id = crypto.randomUUID();
   await expect(broker.create(input({ chatId: id }))).rejects.toThrow();
   expect(await inner.acquireLease(id, "replica-z", 1000, clock.t)).toBeDefined();
+});
+
+test("a generic store error in fail() after the lease moved leaves the new owner's session", async () => {
+  const clock = { t: 1_700_000_000_000 };
+  const inner = new MemoryChatStore(() => clock.t);
+  const brokenA = Object.create(inner) as MemoryChatStore;
+  brokenA.appendEvent = async (id, body, fence) => {
+    if (body.k === "error") throw new Error("database down");
+    return inner.appendEvent(id, body, fence);
+  };
+  const cluster = new Set<string>();
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  const a = setup({ cluster, beforeSpawn: () => held, env: { STUB_ACP_NEW_ERROR: "1" } }, { replicaId: "replica-a" }, { store: brokenA, clock });
+  const b = setup({ cluster }, { replicaId: "replica-b" }, { store: inner, clock });
+  const rec = await made(a.broker);
+  const pa = a.broker.startPod(rec.id);
+  await tick();
+  clock.t += 120_000;
+  expect(await b.broker.startPod(rec.id)).toBeDefined();
+  release();
+  expect(await pa).toBeUndefined();
+  expect(a.transport.stopped).toEqual([]);
+  expect(cluster.has(sessionName(rec.id, 2))).toBe(true);
+});
+
+test("a lease that expires with no new owner ends with a visible error and state failed", async () => {
+  const timers = new FakeTimers();
+  const clock = { t: 1_700_000_000_000 };
+  const { broker, store, metrics } = setup({ hang: true }, { timers, startTimeoutMs: 300_000 }, { store: new MemoryChatStore(() => clock.t), clock });
+  const rec = await made(broker);
+  const p = broker.startPod(rec.id);
+  await tick();
+  clock.t += 70_000; // the lease has expired and nobody else took it
+  timers.fire(20_000);
+  expect(await p).toBeUndefined();
+  expect((await bodies(store, rec.id)).at(-1)).toMatchObject({ k: "error", code: "unavailable" });
+  expect((await store.get(rec.id))?.state).toBe("failed");
+  expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="other"} 1');
+});
+
+test("a running chat whose lease expires with no new owner shows an error and fails", async () => {
+  const timers = new FakeTimers();
+  const clock = { t: 1_700_000_000_000 };
+  const { broker, store } = setup({}, { timers }, { store: new MemoryChatStore(() => clock.t), clock });
+  const rec = await made(broker);
+  expect(await broker.startPod(rec.id)).toBeDefined();
+  clock.t += 70_000;
+  timers.fire(20_000);
+  await Bun.sleep(50);
+  expect((await bodies(store, rec.id)).at(-1)).toMatchObject({ k: "error", code: "unavailable" });
+  expect((await store.get(rec.id))?.state).toBe("failed");
+});
+
+test("a dispose during session/new revokes the token even when stopSession fails", async () => {
+  const { broker, store, transport } = setup({ env: { STUB_ACP_NEW_HANG: "1" }, failStopSession: true });
+  const rec = await made(broker);
+  const p = broker.startPod(rec.id);
+  for (let i = 0; i < 200 && !transport.written.some((l) => l.includes("session/new")); i++) await Bun.sleep(5);
+  const token = tokenOf(transport);
+  expect(await broker.principal(token)).toBeDefined();
+  await broker.dispose();
+  expect(await p).toBeUndefined();
+  expect(transport.stoppedSessions).toContain(sessionName(rec.id, 1));
+  expect(await broker.principal(token)).toBeUndefined();
+  expect((await store.get(rec.id))?.generation).toBe(2);
+});
+
+test("a hung stopSession of an old generation cannot hold the start past its deadline", async () => {
+  const first = setup();
+  const rec = await made(first.broker);
+  await first.broker.startPod(rec.id);
+  await first.broker.dispose();
+  const timers = new FakeTimers();
+  const second = setup({ hangStopSession: true }, { timers, startTimeoutMs: 5000 }, { store: first.store, clock: first.clock });
+  const p = second.broker.startPod(rec.id);
+  await tick();
+  expect(second.transport.starts).toHaveLength(0);
+  timers.fire(5000);
+  expect(await p).toBeUndefined();
+  expect((await bodies(first.store, rec.id)).at(-1)).toMatchObject({ k: "error", code: "timeout" });
 });

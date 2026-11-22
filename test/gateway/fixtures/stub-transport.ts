@@ -23,6 +23,10 @@ export interface StubTransportOptions {
   beforeSpawn?: () => Promise<void>;
   /** The names of the live sessions. Share one set between transports to model one cluster. */
   cluster?: Set<string>;
+  /** stopSession rejects. */
+  failStopSession?: boolean;
+  /** stopSession never finishes. */
+  hangStopSession?: boolean;
 }
 
 export class StubPodTransport implements PodTransport {
@@ -112,6 +116,8 @@ export class StubPodTransport implements PodTransport {
 
   async stopSession(session: string): Promise<void> {
     this.stoppedSessions.push(session);
+    if (this.opts.hangStopSession) await new Promise<void>(() => undefined);
+    if (this.opts.failStopSession) throw new Error("stop failed");
     this.cluster.delete(session);
   }
 

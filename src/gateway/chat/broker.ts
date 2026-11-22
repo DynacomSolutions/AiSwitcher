@@ -77,6 +77,24 @@ const exitFailure = (reason: string | undefined): Failure => ({
   message: `The agent stopped before it was ready (reason: ${EXIT_REASONS[reason ?? ""] ?? "closed"}).`,
   kind: "agent_exit",
 });
+const LOST_FAILURE: Failure = { code: "unavailable", message: "The connection to your agent was lost. Try again.", kind: "other" };
+/** Rejects when the signal aborts, so a hung call cannot hold a start past its deadline. */
+const abortable = <T>(p: Promise<T>, signal: AbortSignal): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    if (signal.aborted) return reject(new Error("aborted"));
+    const on = () => reject(new Error("aborted"));
+    signal.addEventListener("abort", on, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener("abort", on);
+        resolve(v);
+      },
+      (e: unknown) => {
+        signal.removeEventListener("abort", on);
+        reject(e);
+      },
+    );
+  });
 /** Older generations of one chat that a new start removes. Bounded, so the loop stays short. */
 const OLD_GENERATIONS = 10;
 
@@ -201,6 +219,8 @@ export class ChatBroker implements ChatAuth {
     let leaseLost = false;
     let handle: PodHandle | undefined;
     let name = "";
+    let generation = 0;
+    let generationSet = false;
     let closedReason: string | undefined;
     let kept = false;
     let startTimer: unknown;
@@ -221,12 +241,15 @@ export class ChatBroker implements ChatAuth {
       const chat = await store.get(chatId);
       if (!chat || chat.state === "closed") return undefined;
       // The generation lives in the store and only grows, so a pod name is never used twice.
-      const generation = chat.generation + 1;
+      generation = chat.generation + 1;
       name = sessionName(chatId, generation);
       if (this.d.now() > chat.createdAt + (this.d.maxAgeMs ?? 7 * DAY_MS)) throw new ExpiredError();
       await store.update(chatId, { state: "starting", generation }, fence);
-      // A pod from before a gateway restart must not stay next to the new one.
-      for (let g = Math.max(1, generation - OLD_GENERATIONS); g < generation; g++) await transport.stopSession(sessionName(chatId, g)).catch(() => undefined);
+      generationSet = true;
+      // A pod from before a gateway restart must not stay next to the new one. The calls run together and end with the start deadline.
+      const olds: Array<Promise<void>> = [];
+      for (let g = Math.max(1, generation - OLD_GENERATIONS); g < generation; g++) olds.push(transport.stopSession(sessionName(chatId, g)));
+      await abortable(Promise.allSettled(olds), ac.signal);
       handle = await transport.start(
         { chatId, generation, provider: chat.selection.provider, identity: chat.selection.identity },
         ac.signal,
@@ -264,7 +287,10 @@ export class ChatBroker implements ChatAuth {
       this.timers.clearTimeout(startTimer);
       await store.update(chatId, { state: "idle", acpSessionId: sessionId, podSession: handle.session, canLoad: caps.loadSession }, fence);
       const rt: ChatRuntime = { chatId, fence, acp, handle, sessionId, lease };
-      lease.onLost = () => void this.drop(chatId);
+      lease.onLost = () => {
+        const gone = this.drop(chatId);
+        if (gone) void this.endLost(chatId, gone.handle.session).catch(() => undefined);
+      };
       this.runtimes.set(chatId, rt);
       kept = true;
       void acp.closed.then((reason) => this.onAgentClosed(rt, reason));
@@ -274,13 +300,18 @@ export class ChatBroker implements ChatAuth {
       const f = this.classify(e, { timedOut, handle, closedReason, named: name !== "" });
       handle?.stream.close();
       const own = handle?.session ?? name;
-      if (leaseLost || e instanceof ChatLeaseLostError || e instanceof ChatClosedError) {
-        // Another owner took the chat. Stop only our own session, never the session of the new owner.
+      if (e instanceof ChatClosedError) {
         if (own) await transport.stopSession(own).catch(() => undefined);
+        return undefined;
+      }
+      if (leaseLost || e instanceof ChatLeaseLostError) {
+        await this.endLost(chatId, own);
         return undefined;
       }
       if (ac.signal.aborted && !timedOut) {
         // The broker is shutting down. This is not a failure, and the chat can start again later.
+        // A newer generation makes the token of this start useless, even when the stop below fails.
+        if (generationSet) await store.update(chatId, { generation: generation + 1 }, fence).catch(() => undefined);
         if (own) await transport.stopSession(own).catch(() => undefined);
         return undefined;
       }
@@ -292,6 +323,25 @@ export class ChatBroker implements ChatAuth {
         this.stopLease(lease);
         await store.releaseLease(chatId, fence).catch(() => undefined);
       }
+    }
+  }
+
+  /**
+   * The lease is gone. Try to take it again. With the lease back, show the failure.
+   * When another replica owns the chat, end quietly and stop only our own session.
+   */
+  private async endLost(chatId: string, session: string): Promise<void> {
+    const { store, transport } = this.d;
+    const epoch = await store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now()).catch(() => undefined);
+    if (epoch === undefined) {
+      if (session) await transport.stopSession(session).catch(() => undefined);
+      return;
+    }
+    const fence: LeaseFence = { replica: this.d.replicaId, epoch };
+    try {
+      await this.fail(chatId, fence, LOST_FAILURE, session);
+    } finally {
+      await store.releaseLease(chatId, fence).catch(() => undefined);
     }
   }
 
@@ -318,16 +368,18 @@ export class ChatBroker implements ChatAuth {
   private async fail(chatId: string, fence: LeaseFence, f: Failure, session: string): Promise<void> {
     const { store, transport, metrics } = this.d;
     let lost = false;
+    let wrote = false;
     try {
       metrics.chatError(f.kind);
-      lost = !(await this.emit(chatId, { k: "error", code: f.code, message: f.message }, fence));
-      if (!lost) await store.update(chatId, { state: "failed" }, fence);
+      wrote = await this.emit(chatId, { k: "error", code: f.code, message: f.message }, fence);
+      if (wrote) await store.update(chatId, { state: "failed" }, fence);
+      else lost = true;
     } catch (e) {
       if (e instanceof ChatLeaseLostError || e instanceof ChatClosedError) lost = true;
     } finally {
-      if (lost) {
-        if (session) await transport.stopSession(session).catch(() => undefined);
-      } else await transport.stop(chatId).catch(() => undefined);
+      // Stop every session of the chat only after a fenced write proved that we own it.
+      if (wrote && !lost) await transport.stop(chatId).catch(() => undefined);
+      else if (session) await transport.stopSession(session).catch(() => undefined);
     }
   }
 
