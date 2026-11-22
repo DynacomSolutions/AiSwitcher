@@ -26,8 +26,12 @@ export class FakeChrome implements ChromeApi {
   /** Simulates a Chrome before 155: no createSplit, unsplit or splitWithTabId. */
   oldChrome = false;
   nextSplit = 1;
+  /** When set, createSplit throws this message. */
+  splitFailure: string | undefined;
   splitCalls: Array<[number, number]> = [];
   unsplitCalls: number[] = [];
+  /** The windowId each tabs.create call was given (undefined when none). */
+  createWindowIds: Array<number | undefined> = [];
   moveCalls: Array<{ tabId: number; index: number }> = [];
 
   addTab(id: number, url = "https://example.test/", title = "T", windowId = 1): TabInfo {
@@ -73,12 +77,13 @@ export class FakeChrome implements ChromeApi {
   tabs = {
     get: async (id: number) => this.tabList.get(id),
     query: async () => [...this.tabList.values()],
-    create: async (url?: string, opts?: { splitWithTabId?: number }) => {
-      if (opts?.splitWithTabId !== undefined && this.oldChrome) throw splitUnsupported("Mozilla/5.0 Chrome/140.0.7339 Safari/537.36");
+    create: async (url?: string, opts?: { splitWithTabId?: number; windowId?: number }) => {
+      this.createWindowIds.push(opts?.windowId);
+      if (opts?.splitWithTabId !== undefined && this.oldChrome) throw splitUnsupported("Mozilla/5.0 Chrome/140 Safari/537.36");
       this.createdActive.push(false);
       const base = opts?.splitWithTabId === undefined ? undefined : this.tabList.get(opts.splitWithTabId);
       if (opts?.splitWithTabId !== undefined && (!base || base.splitViewId !== -1)) throw new Error("Cannot split with this tab.");
-      const t = this.addTab(this.nextTab++, url ?? "chrome://newtab/", "T", base?.windowId ?? 1);
+      const t = this.addTab(this.nextTab++, url ?? "chrome://newtab/", "T", base ? (opts?.windowId ?? 1) : 1);
       if (base) {
         // Chrome opens the new tab right after the base tab, in its group, in a split with it.
         const ids = this.order(base.windowId).filter(id => id !== t.id);
@@ -90,6 +95,7 @@ export class FakeChrome implements ChromeApi {
       }
       return t;
     },
+    splitSupported: () => !this.oldChrome,
     move: async (id: number, index: number) => {
       const t = this.tabList.get(id);
       if (!t) throw new Error("No tab with id");
@@ -99,7 +105,8 @@ export class FakeChrome implements ChromeApi {
       this.reindex(ids);
     },
     createSplit: async (ids: [number, number]) => {
-      if (this.oldChrome) throw splitUnsupported("Mozilla/5.0 Chrome/140.0.7339 Safari/537.36");
+      if (this.splitFailure) throw new Error(this.splitFailure);
+      if (this.oldChrome) throw splitUnsupported("Mozilla/5.0 Chrome/140 Safari/537.36");
       this.splitCalls.push([ids[0], ids[1]]);
       const [a, b] = ids.map(id => this.tabList.get(id));
       if (!a || !b || a === b) throw new Error("Invalid tabs for a split view.");
@@ -112,7 +119,7 @@ export class FakeChrome implements ChromeApi {
       return a.splitViewId;
     },
     unsplit: async (splitViewId: number) => {
-      if (this.oldChrome) throw splitUnsupported("Mozilla/5.0 Chrome/140.0.7339 Safari/537.36");
+      if (this.oldChrome) throw splitUnsupported("Mozilla/5.0 Chrome/140 Safari/537.36");
       this.unsplitCalls.push(splitViewId);
       const members = this.splitMembers(splitViewId);
       if (members.length === 0) throw new Error("No split view with this id.");

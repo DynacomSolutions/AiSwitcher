@@ -2,7 +2,7 @@ import { DEFAULT_CALL_TIMEOUT_MS, SESSION_END_TOOL, WAIT_CALL_TIMEOUT_MS } from 
 import type { BrowserErrorCode, CallRequest, CallResult } from "../../../../src/browser/protocol.ts";
 import { TOOL_SCHEMAS, validateToolArgs } from "../../../../src/browser/tool-args.ts";
 import type { ExtensionTool, ToolArgs, UploadFile } from "../../../../src/browser/tool-args.ts";
-import { UnsupportedApiError } from "./chrome-api.ts";
+import { splitUnsupported, UnsupportedApiError } from "./chrome-api.ts";
 import type { ChromeApi, TabInfo } from "./chrome-api.ts";
 import { parseKeys } from "./keys.ts";
 import type { State } from "./state.ts";
@@ -255,12 +255,14 @@ export class Executor {
         const target = url ? this.normaliseUrl(url) : undefined;
         if (splitWithTabId !== undefined) {
           if (groupId !== undefined) throw new ToolError("bad_args", "Use either groupId or splitWithTabId, not both. The new tab opens in the group of the tab it splits with.");
+          this.requireSplit();
           const base = await this.ownedTab(req, splitWithTabId);
           if (base.splitViewId !== -1) throw new ToolError("bad_args", `Tab ${splitWithTabId} is already in a split view. Use unsplit_tabs first.`);
           const made = await this.splitError(async () => {
-            if (this.tabs.inGrantedGroup(session.id, session.identity, base)) return this.tabs.createInGranted(session, base.groupId, target, { splitWithTabId });
-            if (base.groupId !== (this.tabs.sessions.get(session.id)?.groupId ?? -1)) throw new ToolError("bad_args", `Tab ${splitWithTabId} is not in this session's tab group, so a split tab cannot join its group.`);
-            return this.tabs.create(session, target, { splitWithTabId });
+            const opts = { splitWithTabId, windowId: base.windowId };
+            if (this.tabs.inGrantedGroup(session.id, session.identity, base)) return this.tabs.createInGranted(session, base.groupId, target, opts);
+            if (base.groupId === -1 || base.groupId !== this.tabs.sessions.get(session.id)?.groupId) throw new ToolError("bad_args", `Tab ${splitWithTabId} is not in this session's tab group, so a split tab cannot join its group.`);
+            return this.tabs.create(session, target, opts);
           });
           if (!made) throw new ToolError("forbidden_tab", `Group ${base.groupId} is not granted to this session.`);
           await this.markControlled(made.id, session);
@@ -281,6 +283,7 @@ export class Executor {
         this.throwIfAborted(sig);
         const [idA, idB] = a("split_tabs").tabIds;
         if (idA === idB) throw new ToolError("bad_args", "split_tabs needs two different tabs.");
+        this.requireSplit();
         const first = await this.ownedTab(req, idA);
         const second = await this.ownedTab(req, idB);
         if (first.splitViewId !== -1 && first.splitViewId === second.splitViewId) return text(JSON.stringify({ splitViewId: first.splitViewId, tabIds: [idA, idB] }));
@@ -289,17 +292,26 @@ export class Executor {
         if (first.pinned !== second.pinned) throw new ToolError("bad_args", "One tab is pinned and the other is not. A split view needs the same pinned state.");
         if (first.groupId !== second.groupId) throw new ToolError("bad_args", "The two tabs are in different tab groups. A split view needs the same group.");
         const splitViewId = await this.splitError(async () => {
+          let moved = false;
+          const originalIndex = second.index;
           if (Math.abs(first.index - second.index) !== 1) {
             // Move the second tab to sit right after the first. Moving removes it first, so the target index depends on the side it comes from.
-            await this.api.tabs.move(idB, second.index > first.index ? first.index + 1 : first.index);
+            await this.api.tabs.move(idB, originalIndex > first.index ? first.index + 1 : first.index);
+            moved = true;
           }
-          return this.api.tabs.createSplit([idA, idB]);
+          try {
+            return await this.api.tabs.createSplit([idA, idB]);
+          } catch (e) {
+            if (moved) await this.api.tabs.move(idB, originalIndex).catch(() => {}); // best effort: put the tab back where the user had it
+            throw e;
+          }
         });
         return text(JSON.stringify({ splitViewId, tabIds: [idA, idB] }));
       }
       case "unsplit_tabs": {
         this.throwIfAborted(sig);
         const { tabId } = a("unsplit_tabs");
+        this.requireSplit();
         const tab = await this.ownedTab(req, tabId);
         if (tab.splitViewId === -1) throw new ToolError("bad_args", `Tab ${tabId} is not in a split view.`);
         const members = (await this.api.tabs.query()).filter(t => t.splitViewId === tab.splitViewId);
@@ -466,6 +478,11 @@ export class Executor {
       default:
         throw new ToolError("bad_args", `Unsupported tool ${tool}`);
     }
+  }
+
+  /** Fails before anything changes when this Chrome has no split view. */
+  private requireSplit(): void {
+    if (!this.api.tabs.splitSupported()) throw new ToolError("bad_args", splitUnsupported().message);
   }
 
   /** Runs a split view call: a Chrome without the API becomes a ToolError the agent can read. */

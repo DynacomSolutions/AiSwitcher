@@ -119,7 +119,31 @@ describe("split_tabs", () => {
     const b = await t.create();
     t.api.oldChrome = true;
     const r = await t.call("split_tabs", { tabIds: [a, b] });
-    expect(r).toMatchObject({ ok: false, error: "bad_args", message: expect.stringContaining("Split view needs Chrome 155 or later. This Chrome is 140.0.7339.") });
+    expect(r).toMatchObject({ ok: false, error: "bad_args", message: expect.stringContaining("Split view needs Chrome 155 or later.") });
+    expect(t.api.moveCalls).toHaveLength(0);
+    expect(t.api.order()).toEqual([a, 50, b]);
+    expect(await t.call("unsplit_tabs", { tabId: a })).toMatchObject({ ok: false, error: "bad_args", message: expect.stringContaining("Chrome 155") });
+  });
+
+  test("a createSplit failure after a move puts the tab back", async () => {
+    const t = setup();
+    const a = await t.create();
+    const x = t.api.addTab(50).id;
+    const b = await t.create();
+    t.api.splitFailure = "Chrome refused";
+    expect((await t.call("split_tabs", { tabIds: [a, b] })).ok).toBe(false);
+    expect(t.api.moveCalls).toHaveLength(2);
+    expect(t.api.order()).toEqual([a, x, b]);
+  });
+
+  test("the move back also works when the second tab was first", async () => {
+    const t = setup();
+    const b = await t.create();
+    const x = t.api.addTab(50).id;
+    const a = await t.create();
+    t.api.splitFailure = "Chrome refused";
+    await t.call("split_tabs", { tabIds: [a, b] });
+    expect(t.api.order()).toEqual([b, x, a]);
   });
 });
 
@@ -180,6 +204,23 @@ describe("tabs_create splitWithTabId", () => {
     expect(t.api.tabList.get(out.tabId)!.groupId).toBe(group);
     expect(t.api.tabList.get(out.tabId)!.splitViewId).toBe(t.api.tabList.get(1)!.splitViewId);
     expect(t.tabs.sessions.get("s1")!.adopted.has(out.tabId)).toBe(true);
+  });
+
+  test("the new tab is created in the base tab's window", async () => {
+    const t = setup();
+    const a = await t.create();
+    t.api.tabList.get(a)!.windowId = 4;
+    await t.call("tabs_create", { splitWithTabId: a });
+    expect(t.api.createWindowIds.at(-1)).toBe(4);
+  });
+
+  test("a base tab outside any group is refused, so its partner is never regrouped", async () => {
+    const t = setup();
+    const a = await t.create();
+    t.api.tabList.get(a)!.groupId = -1;
+    const before = t.api.tabList.size;
+    expect(await t.call("tabs_create", { splitWithTabId: a })).toMatchObject({ ok: false, error: "bad_args" });
+    expect(t.api.tabList.size).toBe(before);
   });
 
   test("forbidden for a base tab outside the session; bad_args with groupId; old Chrome error", async () => {

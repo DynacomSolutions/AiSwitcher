@@ -36,7 +36,9 @@ export interface ChromeApi {
     get(tabId: number): Promise<TabInfo | undefined>;
     query(): Promise<TabInfo[]>;
     /** Opens a tab in the current window. Agents never open or switch to a tab in the foreground, so it is always created inactive. */
-    create(url?: string, opts?: { splitWithTabId?: number }): Promise<TabInfo>;
+    create(url?: string, opts?: { splitWithTabId?: number; windowId?: number }): Promise<TabInfo>;
+    /** True when this Chrome has split view (Chrome 155 or later). */
+    splitSupported(): boolean;
     /** Moves the tab to this index in its window. Group and window stay as they are. */
     move(tabId: number, index: number): Promise<void>;
     /** Joins two adjacent tabs into a split view and returns the splitViewId. Throws UnsupportedApiError before Chrome 155. */
@@ -99,6 +101,7 @@ export function realChromeApi(): ChromeApi {
         if (opts?.splitWithTabId !== undefined) {
           if (typeof (chrome.tabs as unknown as SplitTabsApi).createSplit !== "function") throw splitUnsupported();
           props.splitWithTabId = opts.splitWithTabId;
+          if (opts.windowId !== undefined) props.windowId = opts.windowId; // the base tab's window, not the focused one
         }
         try {
           return toTab(await chrome.tabs.create(props as chrome.tabs.CreateProperties));
@@ -107,6 +110,7 @@ export function realChromeApi(): ChromeApi {
           throw e;
         }
       },
+      splitSupported: () => typeof (chrome.tabs as unknown as SplitTabsApi).createSplit === "function",
       move: async (tabId, index) => { await chrome.tabs.move(tabId, { index }); },
       createSplit: async tabIds => {
         const api = chrome.tabs as unknown as SplitTabsApi;
