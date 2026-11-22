@@ -31,8 +31,42 @@ export function inClusterKube(env: NodeJS.ProcessEnv, readFile: (p: string) => s
   return { baseUrl: `https://${h}:${port}`, token, ca: readFile(`${SA_DIR}/ca.crt`) };
 }
 
+/** A reason is a short code. Anything else is replaced, so odd text cannot pass through. */
+export const reasonCode = (r: string | undefined): string => (r && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(r) ? r : "Unknown");
+
+const STATUS_PEEK_BYTES = 8192;
+
+/** Read at most 8192 bytes of a Kubernetes Status reply and keep only its short `reason` code. Never throws. */
+async function statusReason(res: Response): Promise<string | undefined> {
+  try {
+    const reader = res.body?.getReader();
+    if (!reader) return undefined;
+    const parts: Uint8Array[] = [];
+    let got = 0;
+    while (got < STATUS_PEEK_BYTES) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      parts.push(value);
+      got += value.length;
+    }
+    await reader.cancel().catch(() => undefined);
+    const buf = new Uint8Array(got);
+    let at = 0;
+    for (const p of parts) {
+      buf.set(p, at);
+      at += p.length;
+    }
+    const text = new TextDecoder().decode(buf.subarray(0, STATUS_PEEK_BYTES));
+    // The cap can cut the JSON. Read the reason field from the text, only when it is a short code.
+    const m = /"reason"\s*:\s*"([A-Za-z][A-Za-z0-9]{0,39})"/.exec(text);
+    return m ? reasonCode(m[1]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class KubeHttpError extends Error {
-  constructor(readonly status: number, op: string) {
+  constructor(readonly status: number, readonly op: string, readonly kubeReason?: string) {
     super(`kube ${op} failed with status ${status}`);
     this.name = "KubeHttpError";
   }
@@ -80,8 +114,7 @@ export class HttpKubeApi implements KubeApi {
       return undefined;
     }
     if (!res.ok) {
-      await res.body?.cancel();
-      throw new KubeHttpError(res.status, op);
+      throw new KubeHttpError(res.status, op, await statusReason(res));
     }
     return (await res.json()) as T;
   }

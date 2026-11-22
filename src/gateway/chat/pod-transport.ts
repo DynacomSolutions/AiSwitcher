@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { redactText } from "../upstream-error.ts";
 import { createLineReader } from "./acp.ts";
-import { KubeHttpError } from "./kube-http.ts";
+import { KubeHttpError, reasonCode } from "./kube-http.ts";
 import { buildChatSession, sessionName } from "./kube.ts";
 import type { AgentRuntimeConfig, KubeApi, KubeConfigEnv, KubeSession, KubeSocket, PodHandle, PodPhaseNotice, PodSpecInput, PodStream, PodTransport } from "./kube.ts";
 
@@ -36,9 +36,6 @@ const FAILURE_TEXT: Record<string, string> = {
   ClientGone: "The agent ended because the gateway stopped sending heartbeats.",
 };
 const GENERIC_FAILURE = "The agent could not start.";
-
-/** A reason is a short code. Anything else is replaced, so odd text cannot pass through. */
-const reasonCode = (r: string | undefined): string => (r && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(r) ? r : "Unknown");
 
 export class CatalogError extends Error {
   constructor() {
