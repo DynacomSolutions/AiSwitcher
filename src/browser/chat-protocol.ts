@@ -13,6 +13,7 @@ export const MAX_CHAT_NAME = 80;
 
 export interface ChatSelection { provider: ChatProvider; identity: string; model?: string; effort?: string }
 export interface ChatSummary { chatId: string; name: string; color: string; windowId: number; state: ChatState; selection: ChatSelection; tabIds: number[]; lastSeq: number; updatedAt: number }
+/** The gateway truncates tool args, tool result and text chunks to 8 KiB before it sends them (Task 12). A body over MAX_CHAT_TEXT is rejected by the parser. */
 export type ChatBody =
   | { k: "user"; text: string } | { k: "text"; text: string } | { k: "thought"; text: string }
   | { k: "tool"; toolCallId: string; title: string; status: "pending" | "running" | "done" | "failed"; args?: string; result?: string }
@@ -39,83 +40,204 @@ export const sessionIdForChat = (chatId: string): string => `chat:${chatId}`;
 
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const COLOR_RE = /^#[0-9a-f]{6}$/;
+const SEL_RE = /^[A-Za-z0-9._:/@+-]{1,128}$/;
 const MAX_SHORT = 256;
+const MAX_MODELS = 4096;
+const MAX_SMALL_LIST = 64;
 const MAX_LIST = 256;
 const TOOL_STATUS = ["pending", "running", "done", "failed"] as const;
 
 type Rec = Record<string, unknown>;
 const isRec = (v: unknown): v is Rec => typeof v === "object" && v !== null && !Array.isArray(v);
-const isStr = (v: unknown, max = MAX_SHORT): v is string => typeof v === "string" && v.length <= max;
-const isInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
-const isId = (v: unknown): v is string => typeof v === "string" && ID_RE.test(v);
-const oneOf = <T extends string>(set: readonly T[], v: unknown): v is T => typeof v === "string" && (set as readonly string[]).includes(v);
-const optStr = (v: unknown, max = MAX_SHORT): boolean => v === undefined || isStr(v, max);
-const isText = (v: unknown): v is string => isStr(v, MAX_CHAT_TEXT);
-const isTabIds = (v: unknown): v is number[] => Array.isArray(v) && v.length <= MAX_CHAT_TABS && v.every(isInt);
-const isName = (v: unknown): v is string => typeof v === "string" && v.length >= 1 && v.length <= MAX_CHAT_NAME;
-const isModels = (v: unknown): v is Array<{ id: string; name: string }> => Array.isArray(v) && v.length <= MAX_LIST && v.every((m) => isRec(m) && isStr(m.id) && isStr(m.name));
-const isStrList = (v: unknown): v is string[] => Array.isArray(v) && v.length <= MAX_LIST && v.every((s) => isStr(s));
+const str = (v: unknown, max = MAX_SHORT): string | undefined => (typeof v === "string" && v.length <= max ? v : undefined);
+const int = (v: unknown): number | undefined => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined);
+const id = (v: unknown): string | undefined => (typeof v === "string" && ID_RE.test(v) ? v : undefined);
+const sel = (v: unknown): string | undefined => (typeof v === "string" && SEL_RE.test(v) ? v : undefined);
+const oneOf = <T extends string>(set: readonly T[], v: unknown): T | undefined => (typeof v === "string" && (set as readonly string[]).includes(v) ? (v as T) : undefined);
+const text = (v: unknown): string | undefined => str(v, MAX_CHAT_TEXT);
+const name = (v: unknown): string | undefined => (typeof v === "string" && v.length >= 1 && v.length <= MAX_CHAT_NAME ? v : undefined);
+const color = (v: unknown): string | undefined => (typeof v === "string" && COLOR_RE.test(v) ? v : undefined);
+/** An optional field: absent gives a defined result of undefined, a bad value fails. */
+const opt = <T>(v: unknown, check: (x: unknown) => T | undefined): { ok: true; v: T | undefined } | { ok: false } => {
+  if (v === undefined) return { ok: true, v: undefined };
+  const r = check(v);
+  return r === undefined ? { ok: false } : { ok: true, v: r };
+};
+const withOpt = <T extends object>(base: T, extra: Rec): T => {
+  for (const [k, val] of Object.entries(extra)) if (val !== undefined) (base as Rec)[k] = val;
+  return base;
+};
+function list<T>(v: unknown, max: number, one: (x: unknown) => T | undefined): T[] | undefined {
+  if (!Array.isArray(v) || v.length > max) return undefined;
+  const out: T[] = [];
+  for (const x of v) {
+    const r = one(x);
+    if (r === undefined) return undefined;
+    out.push(r);
+  }
+  return out;
+}
+const tabIds = (v: unknown): number[] | undefined => list(v, MAX_CHAT_TABS, int);
+const strList = (v: unknown): string[] | undefined => list(v, MAX_SMALL_LIST, (x) => str(x));
+const models = (v: unknown): Array<{ id: string; name: string }> | undefined =>
+  list(v, MAX_MODELS, (m) => {
+    if (!isRec(m)) return undefined;
+    const mid = str(m.id), mname = str(m.name);
+    return mid === undefined || mname === undefined ? undefined : { id: mid, name: mname };
+  });
 
-function isSelection(v: unknown): v is ChatSelection {
-  return isRec(v) && oneOf(CHAT_PROVIDERS, v.provider) && isStr(v.identity) && v.identity.length > 0 && optStr(v.model) && optStr(v.effort);
+function selection(v: unknown): ChatSelection | undefined {
+  if (!isRec(v)) return undefined;
+  const provider = oneOf(CHAT_PROVIDERS, v.provider), identity = sel(v.identity);
+  const model = opt(v.model, sel), effort = opt(v.effort, sel);
+  if (!provider || !identity || !model.ok || !effort.ok) return undefined;
+  return withOpt({ provider, identity } as ChatSelection, { model: model.v, effort: effort.v });
 }
 
-function isSummary(v: unknown): v is ChatSummary {
-  return isRec(v) && isId(v.chatId) && isName(v.name) && typeof v.color === "string" && COLOR_RE.test(v.color) && isInt(v.windowId)
-    && oneOf(CHAT_STATES, v.state) && isSelection(v.selection) && isTabIds(v.tabIds) && isInt(v.lastSeq) && typeof v.updatedAt === "number" && Number.isFinite(v.updatedAt);
+function summary(v: unknown): ChatSummary | undefined {
+  if (!isRec(v)) return undefined;
+  const chatId = id(v.chatId), n = name(v.name), c = color(v.color), windowId = int(v.windowId), state = oneOf(CHAT_STATES, v.state);
+  const s = selection(v.selection), tabs = tabIds(v.tabIds), lastSeq = int(v.lastSeq), updatedAt = int(v.updatedAt);
+  if (chatId === undefined || n === undefined || c === undefined || windowId === undefined || !state || !s || !tabs || lastSeq === undefined || updatedAt === undefined) return undefined;
+  return { chatId, name: n, color: c, windowId, state, selection: s, tabIds: tabs, lastSeq, updatedAt };
 }
 
-function isBody(v: unknown): v is ChatBody {
-  if (!isRec(v)) return false;
+function body(v: unknown): ChatBody | undefined {
+  if (!isRec(v)) return undefined;
   switch (v.k) {
-    case "user": case "text": case "thought": case "notice": return isText(v.text);
-    case "tool": return isStr(v.toolCallId) && isStr(v.title, MAX_CHAT_TEXT) && oneOf(TOOL_STATUS, v.status) && optStr(v.args, MAX_CHAT_TEXT) && optStr(v.result, MAX_CHAT_TEXT);
-    case "permission": return isStr(v.requestId) && (isStr(v.rpcId) || typeof v.rpcId === "number") && isStr(v.title, MAX_CHAT_TEXT)
-      && Array.isArray(v.options) && v.options.length <= MAX_LIST && v.options.every((o) => isRec(o) && isStr(o.id) && isStr(o.name) && isStr(o.kind));
-    case "permission_resolved": return isStr(v.requestId) && optStr(v.optionId) && (v.cancelled === undefined || typeof v.cancelled === "boolean");
-    case "error": return oneOf(CHAT_ERROR_CODES, v.code) && isStr(v.message, MAX_CHAT_TEXT);
-    case "turn_end": return isStr(v.stopReason);
-    case "config": return isModels(v.models) && isStrList(v.efforts) && isRec(v.current) && optStr(v.current.model) && optStr(v.current.effort);
-    default: return false;
+    case "user": case "text": case "thought": case "notice": {
+      const t = text(v.text);
+      return t === undefined ? undefined : ({ k: v.k, text: t } as ChatBody);
+    }
+    case "tool": {
+      const toolCallId = str(v.toolCallId), title = str(v.title, MAX_CHAT_TEXT), status = oneOf(TOOL_STATUS, v.status);
+      const args = opt(v.args, text), result = opt(v.result, text);
+      if (toolCallId === undefined || title === undefined || !status || !args.ok || !result.ok) return undefined;
+      return withOpt({ k: "tool", toolCallId, title, status } as ChatBody, { args: args.v, result: result.v });
+    }
+    case "permission": {
+      const requestId = str(v.requestId), title = str(v.title, MAX_CHAT_TEXT);
+      const rpcId = typeof v.rpcId === "number" && Number.isSafeInteger(v.rpcId) ? v.rpcId : str(v.rpcId);
+      const options = list(v.options, MAX_SMALL_LIST, (o) => {
+        if (!isRec(o)) return undefined;
+        const oid = str(o.id), on = str(o.name), kind = str(o.kind);
+        return oid === undefined || on === undefined || kind === undefined ? undefined : { id: oid, name: on, kind };
+      });
+      if (requestId === undefined || title === undefined || rpcId === undefined || !options) return undefined;
+      return { k: "permission", requestId, rpcId, title, options };
+    }
+    case "permission_resolved": {
+      const requestId = str(v.requestId), optionId = opt(v.optionId, (x) => str(x));
+      const cancelled = opt(v.cancelled, (x) => (typeof x === "boolean" ? x : undefined));
+      if (requestId === undefined || !optionId.ok || !cancelled.ok) return undefined;
+      return withOpt({ k: "permission_resolved", requestId } as ChatBody, { optionId: optionId.v, cancelled: cancelled.v });
+    }
+    case "error": {
+      const code = oneOf(CHAT_ERROR_CODES, v.code), message = str(v.message, MAX_CHAT_TEXT);
+      return code && message !== undefined ? { k: "error", code, message } : undefined;
+    }
+    case "turn_end": {
+      const stopReason = str(v.stopReason);
+      return stopReason === undefined ? undefined : { k: "turn_end", stopReason };
+    }
+    case "config": {
+      const m = models(v.models), efforts = strList(v.efforts);
+      if (!m || !efforts || !isRec(v.current)) return undefined;
+      const cm = opt(v.current.model, (x) => str(x)), ce = opt(v.current.effort, (x) => str(x));
+      if (!cm.ok || !ce.ok) return undefined;
+      return { k: "config", models: m, efforts, current: withOpt({}, { model: cm.v, effort: ce.v }) };
+    }
+    default: return undefined;
   }
 }
 
-function isCatalogProvider(v: unknown): v is ChatCatalogProvider {
-  return isRec(v) && oneOf(CHAT_PROVIDERS, v.provider) && isStrList(v.efforts) && Array.isArray(v.identities) && v.identities.length <= MAX_LIST
-    && v.identities.every((i) => isRec(i) && isStr(i.name) && (i.kind === "identity" || i.kind === "pool") && isModels(i.models) && optStr(i.modelsError, MAX_CHAT_TEXT));
+function catalogProvider(v: unknown): ChatCatalogProvider | undefined {
+  if (!isRec(v)) return undefined;
+  const provider = oneOf(CHAT_PROVIDERS, v.provider), efforts = strList(v.efforts);
+  const identities = list(v.identities, MAX_LIST, (i) => {
+    if (!isRec(i)) return undefined;
+    const n = str(i.name), kind = i.kind === "identity" || i.kind === "pool" ? i.kind : undefined, m = models(i.models);
+    const err = opt(i.modelsError, (x) => str(x, MAX_CHAT_TEXT));
+    if (n === undefined || !kind || !m || !err.ok) return undefined;
+    return withOpt({ name: n, kind, models: m } as ChatCatalogProvider["identities"][number], { modelsError: err.v });
+  });
+  return provider && efforts && identities ? { provider, identities, efforts } : undefined;
 }
 
 export function parseChatFromExt(v: unknown): ChatFromExt | undefined {
-  if (!isRec(v) || typeof v.t !== "string") return undefined;
-  const ok = ((): boolean => {
-    switch (v.t) {
-      case "chat.create": return isId(v.chatId) && isName(v.name) && typeof v.color === "string" && COLOR_RE.test(v.color) && isInt(v.windowId) && isSelection(v.selection) && isTabIds(v.tabIds);
-      case "chat.prompt": return isId(v.chatId) && isText(v.text);
-      case "chat.cancel": case "chat.close": return isId(v.chatId);
-      case "chat.permission": return isId(v.chatId) && isStr(v.requestId) && optStr(v.optionId);
-      case "chat.link": return isId(v.chatId) && isTabIds(v.tabIds);
-      case "chat.config": return isId(v.chatId) && optStr(v.model) && optStr(v.effort);
-      case "chat.rename": return isId(v.chatId) && isName(v.name);
-      case "chat.resume": return isId(v.chatId) && isInt(v.afterSeq);
-      case "chat.list": return v.windowId === undefined || isInt(v.windowId);
-      case "chat.catalog": return isId(v.reqId) && (v.provider === undefined || oneOf(CHAT_PROVIDERS, v.provider));
-      default: return false;
+  if (!isRec(v)) return undefined;
+  const chatId = id(v.chatId);
+  switch (v.t) {
+    case "chat.create": {
+      const n = name(v.name), c = color(v.color), windowId = int(v.windowId), s = selection(v.selection), tabs = tabIds(v.tabIds);
+      if (!chatId || n === undefined || c === undefined || windowId === undefined || !s || !tabs) return undefined;
+      return { t: "chat.create", chatId, name: n, color: c, windowId, selection: s, tabIds: tabs };
     }
-  })();
-  return ok ? (v as unknown as ChatFromExt) : undefined;
+    case "chat.prompt": {
+      const t = text(v.text);
+      return chatId && t !== undefined && t.length >= 1 ? { t: "chat.prompt", chatId, text: t } : undefined;
+    }
+    case "chat.cancel": return chatId ? { t: "chat.cancel", chatId } : undefined;
+    case "chat.close": return chatId ? { t: "chat.close", chatId } : undefined;
+    case "chat.permission": {
+      const requestId = str(v.requestId), optionId = opt(v.optionId, (x) => str(x));
+      if (!chatId || requestId === undefined || !optionId.ok) return undefined;
+      return withOpt({ t: "chat.permission", chatId, requestId } as ChatFromExt, { optionId: optionId.v });
+    }
+    case "chat.link": {
+      const tabs = tabIds(v.tabIds);
+      return chatId && tabs ? { t: "chat.link", chatId, tabIds: tabs } : undefined;
+    }
+    case "chat.config": {
+      const m = opt(v.model, sel), e = opt(v.effort, sel);
+      if (!chatId || !m.ok || !e.ok) return undefined;
+      return withOpt({ t: "chat.config", chatId } as ChatFromExt, { model: m.v, effort: e.v });
+    }
+    case "chat.rename": {
+      const n = name(v.name);
+      return chatId && n !== undefined ? { t: "chat.rename", chatId, name: n } : undefined;
+    }
+    case "chat.resume": {
+      const afterSeq = int(v.afterSeq);
+      return chatId && afterSeq !== undefined ? { t: "chat.resume", chatId, afterSeq } : undefined;
+    }
+    case "chat.list": {
+      const w = opt(v.windowId, int);
+      return w.ok ? withOpt({ t: "chat.list" } as ChatFromExt, { windowId: w.v }) : undefined;
+    }
+    case "chat.catalog": {
+      const reqId = id(v.reqId), p = opt(v.provider, (x) => oneOf(CHAT_PROVIDERS, x));
+      if (!reqId || !p.ok) return undefined;
+      return withOpt({ t: "chat.catalog", reqId } as ChatFromExt, { provider: p.v });
+    }
+    default: return undefined;
+  }
 }
 
 export function parseChatToExt(v: unknown): ChatToExt | undefined {
-  if (!isRec(v) || typeof v.t !== "string") return undefined;
-  const ok = ((): boolean => {
-    switch (v.t) {
-      case "chat.event": return isId(v.chatId) && isInt(v.seq) && typeof v.ts === "number" && Number.isFinite(v.ts) && isBody(v.body);
-      case "chat.state": return isId(v.chatId) && oneOf(CHAT_STATES, v.state) && isSummary(v.summary);
-      case "chat.list": return Array.isArray(v.chats) && v.chats.length <= MAX_LIST && v.chats.every(isSummary);
-      case "chat.reject": return (v.chatId === undefined || isId(v.chatId)) && (v.reqId === undefined || isId(v.reqId)) && oneOf(CHAT_ERROR_CODES, v.code) && isStr(v.message, MAX_CHAT_TEXT);
-      case "chat.catalog": return isId(v.reqId) && Array.isArray(v.providers) && v.providers.length <= MAX_LIST && v.providers.every(isCatalogProvider);
-      default: return false;
+  if (!isRec(v)) return undefined;
+  switch (v.t) {
+    case "chat.event": {
+      const chatId = id(v.chatId), seq = int(v.seq), ts = int(v.ts), b = body(v.body);
+      return chatId && seq !== undefined && ts !== undefined && b ? { t: "chat.event", chatId, seq, ts, body: b } : undefined;
     }
-  })();
-  return ok ? (v as unknown as ChatToExt) : undefined;
+    case "chat.state": {
+      const chatId = id(v.chatId), state = oneOf(CHAT_STATES, v.state), sm = summary(v.summary);
+      return chatId && state && sm && sm.chatId === chatId ? { t: "chat.state", chatId, state, summary: sm } : undefined;
+    }
+    case "chat.list": {
+      const chats = list(v.chats, MAX_LIST, summary);
+      return chats ? { t: "chat.list", chats } : undefined;
+    }
+    case "chat.reject": {
+      const chatId = opt(v.chatId, id), reqId = opt(v.reqId, id), code = oneOf(CHAT_ERROR_CODES, v.code), message = str(v.message, MAX_CHAT_TEXT);
+      if (!chatId.ok || !reqId.ok || !code || message === undefined) return undefined;
+      return withOpt({ t: "chat.reject", code, message } as ChatToExt, { chatId: chatId.v, reqId: reqId.v });
+    }
+    case "chat.catalog": {
+      const reqId = id(v.reqId), providers = list(v.providers, MAX_LIST, catalogProvider);
+      return reqId && providers ? { t: "chat.catalog", reqId, providers } : undefined;
+    }
+    default: return undefined;
+  }
 }

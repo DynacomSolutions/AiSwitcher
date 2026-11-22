@@ -65,4 +65,55 @@ describe("chat protocol", () => {
     expect(sessionIdForChat("a-1")).toBe("chat:a-1");
     expect(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionIdForChat("a-1"))).toBe(true);
   });
+
+  test("list caps", () => {
+    const models = Array.from({ length: 300 }, (_, i) => ({ id: `m${i}`, name: `M${i}` }));
+    const cat = { t: "chat.catalog", reqId: "q", providers: [{ provider: "claude", identities: [{ name: "a", kind: "pool", models }], efforts: ["low"] }] };
+    expect(parseChatToExt(cat)).toBeDefined();
+    expect(parseChatToExt({ ...cat, providers: [{ provider: "claude", identities: [], efforts: Array.from({ length: 65 }, () => "e") }] })).toBeUndefined();
+  });
+  test("rejects an oversize result", () => {
+    const body = { k: "tool", toolCallId: "t", title: "T", status: "done", result: "x".repeat(70000) };
+    expect(parseChatToExt({ t: "chat.event", chatId: "c", seq: 1, ts: 1, body })).toBeUndefined();
+    expect(parseChatToExt({ t: "chat.event", chatId: "c", seq: 1, ts: 1, body: { k: "text", text: "x".repeat(MAX_CHAT_TEXT + 1) } })).toBeUndefined();
+  });
+  test("rejects unsafe integers", () => {
+    for (const n of [1e21, 1e300, 2 ** 53, 1.5, -1]) {
+      expect(parseChatToExt({ t: "chat.event", chatId: "c", seq: n, ts: 1, body: { k: "text", text: "x" } })).toBeUndefined();
+      expect(parseChatToExt({ t: "chat.event", chatId: "c", seq: 1, ts: n, body: { k: "text", text: "x" } })).toBeUndefined();
+      expect(parseChatFromExt({ t: "chat.resume", chatId: "c", afterSeq: n })).toBeUndefined();
+      expect(parseChatFromExt({ t: "chat.link", chatId: "c", tabIds: [n] })).toBeUndefined();
+      expect(parseChatFromExt({ ...(fromExt[0] as object), windowId: n })).toBeUndefined();
+    }
+  });
+  test("strips unknown keys, nested too", () => {
+    const c = parseChatFromExt({ ...(fromExt[0] as object), extra: 1, selection: { ...selection, extra: 2 } }) as Record<string, unknown>;
+    expect(c).toEqual(fromExt[0] as never);
+    const st = parseChatToExt({ t: "chat.state", chatId: "c-1", state: "idle", x: 1, summary: { ...summary, y: 2, selection: { ...summary.selection, z: 3 } } });
+    expect(st).toEqual({ t: "chat.state", chatId: "c-1", state: "idle", summary } as never);
+    const ev = parseChatToExt({ t: "chat.event", chatId: "c", seq: 1, ts: 1, body: { k: "text", text: "x", extra: 1 } });
+    expect(ev).toEqual({ t: "chat.event", chatId: "c", seq: 1, ts: 1, body: { k: "text", text: "x" } } as never);
+    const cfg = parseChatToExt({ t: "chat.event", chatId: "c", seq: 1, ts: 1, body: { k: "config", models: [{ id: "m", name: "M", q: 1 }], efforts: [], current: { model: "m", q: 1 } } });
+    expect(cfg).toEqual({ t: "chat.event", chatId: "c", seq: 1, ts: 1, body: { k: "config", models: [{ id: "m", name: "M" }], efforts: [], current: { model: "m" } } } as never);
+    const cat = parseChatToExt({ t: "chat.catalog", reqId: "q", providers: [{ provider: "claude", q: 1, efforts: [], identities: [{ name: "a", kind: "pool", models: [], q: 1 }] }] });
+    expect(cat).toEqual({ t: "chat.catalog", reqId: "q", providers: [{ provider: "claude", efforts: [], identities: [{ name: "a", kind: "pool", models: [] }] }] } as never);
+  });
+  test("rejects an empty prompt", () => expect(parseChatFromExt({ t: "chat.prompt", chatId: "c", text: "" })).toBeUndefined());
+  test("rejects a chat.state with a different chat id", () => {
+    expect(parseChatToExt({ t: "chat.state", chatId: "other", state: "idle", summary })).toBeUndefined();
+  });
+  test("selection charset", () => {
+    const base = fromExt[0] as Record<string, unknown>;
+    for (const bad of ["a b", "a\nb", "", "x".repeat(129)]) {
+      for (const key of ["identity", "model", "effort"]) expect(parseChatFromExt({ ...base, selection: { ...selection, [key]: bad } })).toBeUndefined();
+    }
+    expect(parseChatFromExt({ ...base, selection: { provider: "claude", identity: "a.b:c/d@e+f-g_h".replace("_", "") } })).toBeDefined();
+  });
+  test("other negative cases", () => {
+    expect(parseChatToExt({ t: "chat.event", chatId: "c", seq: 1, ts: 1, body: { k: "bogus" } })).toBeUndefined();
+    expect(parseChatToExt({ t: "chat.event", chatId: "bad id", seq: 1, ts: 1, body: { k: "text", text: "x" } })).toBeUndefined();
+    expect(parseChatFromExt({ t: "chat.cancel", chatId: "x".repeat(65) })).toBeUndefined();
+    expect(parseChatFromExt({ t: "chat.catalog", reqId: "q", provider: "bash" })).toBeUndefined();
+    expect(parseChatFromExt({ t: "chat.permission", chatId: "c", requestId: "r" })).toEqual({ t: "chat.permission", chatId: "c", requestId: "r" });
+  });
 });
