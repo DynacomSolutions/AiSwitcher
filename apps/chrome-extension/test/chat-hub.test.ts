@@ -86,6 +86,23 @@ describe("chat hub", () => {
     expect(await e.hub.command(create(2))).toEqual({ ok: true });
   });
 
+  test("a closed chat leaves the list and the cap, and does not come back after a worker restart", async () => {
+    const e = setup();
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "idle", summary: summary("a") });
+    e.hub.handleFrame({ t: "chat.state", chatId: "b", state: "idle", summary: summary("b", { name: "Chat 2" }) });
+    e.hub.handleFrame({ t: "chat.state", chatId: "a", state: "closed", summary: summary("a", { state: "closed" }) });
+    expect(e.hub.state(1).chats.map(c => c.summary.chatId)).toEqual(["b"]);
+    // A closed chat in a list from the gateway is skipped too.
+    e.hub.handleFrame({ t: "chat.list", chats: [summary("b", { name: "Chat 2" }), summary("z", { state: "closed" })] });
+    expect(e.hub.state(1).chats.map(c => c.summary.chatId)).toEqual(["b"]);
+    await e.hub.flush();
+    // An older copy on disk may still hold a closed chat. It is dropped on load.
+    await e.api.sessionStorage.set({ chatHub: { chats: [{ view: { summary: summary("b", { name: "Chat 2" }), items: [] } }, { view: { summary: summary("a", { state: "closed" }), items: [] } }] } });
+    const again = e.make();
+    await again.load();
+    expect(again.state(1).chats.map(c => c.summary.chatId)).toEqual(["b"]);
+  });
+
   test("create reuses the colour of a closed chat", async () => {
     const e = setup();
     await e.hub.command(create());

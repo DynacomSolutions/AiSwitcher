@@ -56,7 +56,7 @@ export class ChatHub {
     if (!raw || !Array.isArray(raw.chats)) return;
     for (const c of raw.chats) {
       const id = c?.view?.summary?.chatId;
-      if (typeof id !== "string" || !Array.isArray(c.view.items) || this.chats.has(id)) continue;
+      if (typeof id !== "string" || !Array.isArray(c.view.items) || this.chats.has(id) || c.view.summary.state === "closed") continue; // a closed chat never comes back
       this.chats.set(id, { view: c.view, provisional: false });
     }
   }
@@ -190,9 +190,15 @@ export class ChatHub {
   }
 
   private onState(summary: ChatSummary): void {
+    if (summary.state === "closed") {
+      // A closed chat leaves the list and the cap at once, and is not stored.
+      this.chats.delete(summary.chatId);
+      this.d.tabs.setChatLinks(sessionIdForChat(summary.chatId), [], true);
+      this.changed(summary.windowId);
+      return;
+    }
     const e = this.chats.get(summary.chatId);
     if (e) { e.view = { ...e.view, summary }; e.provisional = false; } else this.chats.set(summary.chatId, { view: { summary, items: [] }, provisional: false });
-    if (summary.state === "closed") this.d.tabs.setChatLinks(sessionIdForChat(summary.chatId), [], true);
     this.catchUp(summary.chatId);
     this.changed(summary.windowId);
   }
@@ -200,6 +206,7 @@ export class ChatHub {
   private onList(list: ChatSummary[]): void {
     const seen = new Set<string>();
     for (const summary of list) {
+      if (summary.state === "closed") continue;
       seen.add(summary.chatId);
       const e = this.chats.get(summary.chatId);
       if (e) { e.view = { ...e.view, summary }; e.provisional = false; } else this.chats.set(summary.chatId, { view: { summary, items: [] }, provisional: false });

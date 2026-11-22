@@ -266,7 +266,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
     await say(P, "Chat 1", "tool");
     await until("tool card", () => P.eval<boolean>(`document.querySelector(".chat-detail:not([hidden]) .msg.tool") !== null`), 90_000);
     await turnDone("Chat 1");
-    await shot("chat-feed", P);
+    await shot("chat-feed-v2", P);
   });
 
   it("the linked chip shows the active tab, removing it makes the agent's tabs_context empty", async () => {
@@ -331,7 +331,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
     await activate(tabA);
     await pageA.send("Page.bringToFront");
     await sleep(700);
-    await save("two-cursors.png", await pageA.screenshot());
+    await save("two-cursors-v2.png", await pageA.screenshot());
   });
 
   it("pill Stop on one agent aborts only that chat's call; Stop all aborts both (real CDP clicks)", async () => {
@@ -444,7 +444,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
     // The worker refuses a seventh create too, whatever the panel does.
     const refused = await P.eval<{ ok: boolean; error?: string }>(`chrome.windows.getCurrent().then(w => chrome.runtime.sendMessage({ type: "ais-chat-create", windowId: w.id, selection: { provider: "claude", identity: "alpha" }, tabIds: [] }))`);
     expect(refused).toEqual({ ok: false, error: CAP_MESSAGE });
-    await shot("chat-cap", P);
+    await shot("chat-cap-v2", P);
     // Close the extra chats again.
     for (const n of [6, 5, 4]) {
       const id = (await hubChat(`Chat ${n}`))!.summary.chatId;
@@ -465,7 +465,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
     await until("menu open", async () => (await expanded()) === "true");
     expect(await P.eval<boolean>(`document.activeElement?.getAttribute("role") === "menuitemradio"`)).toBe(true);
     await sleep(300);
-    await shot("picker", P);
+    await shot("picker-v2", P);
     await key(P, "ArrowDown");
     await key(P, "Enter");
     await until("menu closed after Enter", async () => (await expanded()) === "false");
@@ -504,6 +504,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
     const split = await until(`${name} in the worker`, () => hubChat(name));
     expect([...split.summary.tabIds].sort()).toEqual([one.id, two.id].sort());
     expect((await chips(P)).sort()).toEqual(["Split one", "Split two"]);
+    await shot("split-view-v2", P);
     const id = split.summary.chatId;
     await P.eval(`chrome.runtime.sendMessage({ type: "ais-chat-close", chatId: ${JSON.stringify(id)} })`);
   });

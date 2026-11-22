@@ -4,6 +4,7 @@
 import { CHAT_PROVIDERS, MAX_CHAT_NAME, MAX_CHAT_TABS, selectable } from "../../../../../src/browser/chat-protocol.ts";
 import type { ChatCatalogProvider, ChatSelection } from "../../../../../src/browser/chat-protocol.ts";
 import type { TabInfo } from "../../background/chrome-api.ts";
+import { CAP_MESSAGE } from "../../shared/chat.ts";
 import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../../shared/chat.ts";
 import { defaultChatTabs, splitPartners } from "../../shared/split-view.ts";
 import { addableTabs, chipsFor } from "./chips.ts";
@@ -365,7 +366,9 @@ export class ChatTab {
     this.loading.hidden = s !== undefined;
     if (!s) return;
     const chat = this.selected ? s.chats.find(c => c.summary.chatId === this.selected) : undefined;
-    const error = this.localError ?? s.error;
+    const raw = this.localError ?? s.error;
+    // In the list the cap message already shows next to the disabled New chat. The banner is for a different error.
+    const error = raw === CAP_MESSAGE && chat === undefined ? undefined : raw;
     this.connBanner.hidden = s.connected;
     this.errBanner.hidden = !error;
     if (this.errBanner.textContent !== (error ?? "")) this.errBanner.textContent = error ?? "";

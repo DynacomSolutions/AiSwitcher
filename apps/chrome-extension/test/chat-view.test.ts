@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { MAX_CHAT_NAME, MAX_CHAT_TABS, MAX_CHAT_TEXT } from "../../../src/browser/chat-protocol.ts";
 import type { TabInfo } from "../src/background/chrome-api.ts";
+import { CAP_MESSAGE } from "../src/shared/chat.ts";
 import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../src/shared/chat.ts";
 import { AGENT_TAB, LINK_PROMPT, ChatTab, checkSelection, parseSelection, LOADING_PROVIDERS, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
 import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
@@ -36,6 +37,18 @@ const byText = (root: FakeNode, tag: string, text: string): FakeNode | undefined
 const byLabel = (root: FakeNode, label: string): FakeNode | undefined => all(root).find(n => n.attrs["aria-label"] === label);
 
 describe("chat tab", () => {
+  test("the cap message shows once in the list (the hint), and the banner stays for other errors", async () => {
+    const chats = ["a", "b", "c", "d", "e", "f"].map(i => view(i));
+    const s = setup(chats);
+    s.push(stateOf(chats, { error: CAP_MESSAGE }));
+    await s.flush();
+    const banner = byClass(s.root, "banner").find(n => n.attrs.role === "alert" && n.textContent === CAP_MESSAGE);
+    expect(banner === undefined || banner.hidden).toBe(true);
+    expect(byClass(s.root, "hint").filter(n => !n.hidden && n.textContent === CAP_MESSAGE)).toHaveLength(1);
+    s.push(stateOf(chats, { error: "Something else failed." }));
+    expect(byClass(s.root, "banner").some(n => !n.hidden && n.textContent === "Something else failed.")).toBe(true);
+  });
+
   test("a focused row Close button keeps focus across a state update", async () => {
     const s = setup([view("a"), view("b")]);
     s.push(stateOf([view("a"), view("b")]));
