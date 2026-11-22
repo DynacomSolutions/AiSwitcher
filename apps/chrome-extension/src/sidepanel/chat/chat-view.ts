@@ -1,7 +1,8 @@
 // Chat tab assembly: the chat list, the chat view, linked-tab chips and the composer.
 // It talks to the background hub over the "ais-chat" port. Chat names and agent text go in through textContent only.
 // The DOM is built once and patched in place, so focus, an open menu and a draft survive every state update.
-import { MAX_CHAT_NAME, MAX_CHAT_TABS } from "../../../../../src/browser/chat-protocol.ts";
+import { CHAT_PROVIDERS, MAX_CHAT_NAME, MAX_CHAT_TABS } from "../../../../../src/browser/chat-protocol.ts";
+import type { ChatSelection } from "../../../../../src/browser/chat-protocol.ts";
 import type { TabInfo } from "../../background/chrome-api.ts";
 import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../../shared/chat.ts";
 import { defaultChatTabs, splitPartners } from "../../shared/split-view.ts";
@@ -10,6 +11,9 @@ import { composerMode, createComposer } from "./composer.ts";
 import type { Composer } from "./composer.ts";
 import { buildFeed } from "./feed.ts";
 import { renderFeed } from "./feed-view.ts";
+import { buildPicker, choose } from "./picker.ts";
+import { createPicker } from "./picker-view.ts";
+import type { Picker } from "./picker-view.ts";
 import { capState, openChats, rowFor, STATE_LABEL, turnRunning } from "./list.ts";
 
 const RECONNECT_MS = 500;
@@ -55,6 +59,17 @@ export interface ChatViewDeps {
   /** Last seen seq of each chat. Kept in session storage, so a reload keeps it. */
   loadSeen(): Promise<Record<string, number>>;
   saveSeen(seen: Record<string, number>): void;
+  /** The last selection used for a new chat. Kept in local storage. */
+  loadSelection?(): Promise<unknown>;
+  saveSelection?(s: ChatSelection): void;
+}
+
+/** Accepts a stored selection only when it has the right shape. */
+export function parseSelection(v: unknown): ChatSelection | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const r = v as Record<string, unknown>;
+  if (!(CHAT_PROVIDERS as readonly unknown[]).includes(r.provider) || typeof r.identity !== "string" || r.identity === "") return undefined;
+  return { provider: r.provider as ChatSelection["provider"], identity: r.identity, ...(typeof r.model === "string" ? { model: r.model } : {}), ...(typeof r.effort === "string" ? { effort: r.effort } : {}) };
 }
 
 interface Row {
@@ -80,6 +95,8 @@ export class ChatTab {
   private removal: { chatId: string; tabId: number } | undefined;
   private shown: string | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastUsed: ChatSelection | undefined;
+  private catalogAsked = false;
 
   private readonly rows = new Map<string, Row>();
   private readonly feeds = new Map<string, HTMLElement>();
@@ -104,6 +121,8 @@ export class ChatTab {
   private addSig = "";
   private readonly feedSlot: HTMLElement;
   private readonly composerSlot: HTMLElement;
+  private readonly listPicker: Picker;
+  private readonly detailPicker: Picker;
 
   constructor(private readonly d: ChatViewDeps, private readonly root: HTMLElement) {
     const doc = d.doc;
@@ -119,7 +138,12 @@ export class ChatTab {
     this.capHint = el(doc, "p", "hint");
     this.empty = el(doc, "p", "empty", "No chats yet. Start one to ask an agent about your open pages.");
     this.ul = el(doc, "ul", "sessions chat-rows");
-    this.listEl.append(head, this.capHint, this.empty, this.ul);
+    this.listPicker = createPicker(doc, {
+      onOpen: () => this.askCatalog(),
+      onPick: p => this.pickNew(p),
+      onEffort: effort => { const cur = this.newSelection(); if (cur) this.setNew({ ...cur, effort }); },
+    }, "Provider and model for new chats");
+    this.listEl.append(head, this.listPicker.root, this.capHint, this.empty, this.ul);
 
     this.detailEl = el(doc, "div", "chat-detail");
     const dhead = el(doc, "div", "list-head");
@@ -131,9 +155,14 @@ export class ChatTab {
     this.addSelect = el(doc, "select", "chip-add");
     this.addSelect.setAttribute("aria-label", "Link a page");
     this.addSelect.addEventListener("change", () => this.addTab());
+    this.detailPicker = createPicker(doc, {
+      onOpen: () => this.askCatalog(),
+      onPick: p => { const c = this.selectedChat(); if (c && p.model !== undefined) void this.run({ type: "ais-chat-config", chatId: c.summary.chatId, model: p.model }); },
+      onEffort: effort => { const c = this.selectedChat(); if (c) void this.run({ type: "ais-chat-config", chatId: c.summary.chatId, effort }); },
+    }, "Model for this chat");
     this.feedSlot = el(doc, "div", "feed-slot");
     this.composerSlot = el(doc, "div", "composer-slot");
-    this.detailEl.append(dhead, this.chipsEl, this.feedSlot, this.composerSlot);
+    this.detailEl.append(dhead, this.chipsEl, this.feedSlot, this.detailPicker.root, this.composerSlot);
     this.detailEl.hidden = true;
     this.listEl.hidden = true;
   }
@@ -141,8 +170,39 @@ export class ChatTab {
   start(): void {
     this.root.replaceChildren(this.loading, this.connBanner, this.errBanner, this.listEl, this.detailEl);
     void this.d.loadSeen().then(s => { this.seen = { ...s }; this.seenLoaded = true; this.noteSeen(); this.paint(); }, () => { this.seenLoaded = true; });
+    void this.d.loadSelection?.().then(v => { this.lastUsed = parseSelection(v); this.paint(); }, () => { /* no stored selection */ });
     this.open();
     void this.refreshTabs();
+  }
+
+  private selectedChat(): ChatView | undefined { return this.selected ? this.state?.chats.find(x => x.summary.chatId === this.selected) : undefined; }
+
+  /** Asks for the catalogue once per panel session, when a menu first opens. */
+  private askCatalog(): void {
+    if (this.catalogAsked || this.state?.catalog) return;
+    this.catalogAsked = true;
+    void this.d.send({ type: "ais-chat-catalog" });
+  }
+
+  /** The selection for a new chat: the last one used when it still exists, else the last chat, else the first identity. */
+  private newSelection(): ChatSelection | undefined {
+    const s = this.state;
+    if (!s) return undefined;
+    const catalog = s.catalog;
+    const exists = (x: ChatSelection | undefined): x is ChatSelection => x !== undefined && (catalog === undefined || catalog.some(p => p.provider === x.provider && p.identities.some(i => i.name === x.identity)));
+    const mine = openChats(s.chats, this.d.windowId).at(-1)?.summary.selection;
+    const first = catalog?.find(p => p.identities.length > 0);
+    return [this.lastUsed, mine].find(exists) ?? (first ? { provider: first.provider, identity: first.identities[0]!.name } : undefined);
+  }
+
+  private setNew(sel: ChatSelection): void {
+    this.lastUsed = sel;
+    this.d.saveSelection?.(sel);
+    this.paint();
+  }
+
+  private pickNew(p: { provider: ChatSelection["provider"]; identity: string; model?: string }): void {
+    this.setNew(choose(this.newSelection(), p, this.state?.catalog ?? []));
   }
 
   setPaused(paused: boolean): void {
@@ -249,6 +309,7 @@ export class ChatTab {
     this.newBtn.disabled = cap.full || this.creating;
     this.capHint.hidden = cap.message === undefined;
     this.setText(this.capHint, cap.message ?? "");
+    this.listPicker.update(buildPicker(s.catalog, this.newSelection()));
     const chats = openChats(s.chats, this.d.windowId);
     this.empty.hidden = chats.length > 0;
     const byId = new Map(chats.map(c => [c.summary.chatId, c]));
@@ -352,6 +413,11 @@ export class ChatTab {
     this.paintChips(c);
     renderFeed(this.d.doc, feed, buildFeed(c.items), { expanded: this.expanded, onPermission: (requestId, optionId) => void this.run({ type: "ais-chat-permission", chatId, requestId, ...(optionId !== undefined ? { optionId } : {}) }) });
     composer.update(composerMode(c, this.paused));
+    const sel = c.summary.selection;
+    const group = this.state?.catalog?.find(p => p.provider === sel.provider);
+    const own = group ? [{ ...group, identities: group.identities.filter(i => i.name === sel.identity) }] : this.state?.catalog === undefined ? undefined : [];
+    const cfg = [...c.items].reverse().find(i => i.body.k === "config")?.body;
+    this.detailPicker.update(buildPicker(own, sel, cfg && cfg.k === "config" ? cfg : undefined));
   }
 
   // ---- chips --------------------------------------------------------------
@@ -419,10 +485,7 @@ export class ChatTab {
   private async newChat(): Promise<void> {
     const s = this.state;
     if (!s || this.creating) return;
-    const mine = openChats(s.chats, this.d.windowId);
-    const last = mine.at(-1)?.summary.selection;
-    const first = s.catalog?.find(p => p.identities.length > 0);
-    const selection = last ?? (first ? { provider: first.provider, identity: first.identities[0]!.name } : undefined);
+    const selection = this.newSelection();
     if (!selection) {
       this.localError = LOADING_PROVIDERS;
       void this.d.send({ type: "ais-chat-catalog" });
@@ -431,6 +494,7 @@ export class ChatTab {
     }
     const active = this.tabs.find(t => t.active && t.windowId === this.d.windowId);
     const tabIds = active ? defaultChatTabs(this.tabs.filter(t => t.windowId === this.d.windowId), active.id) : [];
+    this.d.saveSelection?.(selection);
     this.openNew = true;
     this.creating = true;
     this.paint();
@@ -466,6 +530,8 @@ export function initChatTab(root: HTMLElement, windowId: number, paused: () => P
     send: async c => { try { return (await chrome.runtime.sendMessage(c)) as ChatCommandResult | undefined; } catch { return undefined; } },
     loadSeen: async () => ((await chrome.storage.session.get(seenKey))[seenKey] as Record<string, number> | undefined) ?? {},
     saveSeen: seen => { void chrome.storage.session.set({ [seenKey]: seen }); },
+    loadSelection: async () => (await chrome.storage.local.get("chatSelection")).chatSelection,
+    saveSelection: sel => { void chrome.storage.local.set({ chatSelection: sel }); },
   }, root);
   const refreshPaused = (): void => { void paused().then(p => tab.setPaused(p)); };
   const refreshTabs = (): void => { void tab.refreshTabs(); };

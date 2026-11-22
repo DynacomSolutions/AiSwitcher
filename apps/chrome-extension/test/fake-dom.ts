@@ -12,6 +12,7 @@ export class FakeNode {
   maxLength = -1;
   className = "";
   hidden = false;
+  tabIndex = 0;
   private text = "";
   constructor(public tag: string, private doc?: FakeDoc) {
     for (const k of BANNED) Object.defineProperty(this, k, { set() { throw new Error(`${k} written`); }, get() { throw new Error(`${k} read`); } });
@@ -37,6 +38,7 @@ export class FakeNode {
   }
   remove(): void { if (this.parent) { this.parent.children = this.parent.children.filter((c) => c !== this); this.parent = undefined; } }
   setAttribute(k: string, v: string): void { this.attrs[k] = v; }
+  getAttribute(k: string): string | null { return this.attrs[k] ?? null; }
   removeAttribute(k: string): void { delete this.attrs[k]; }
   addEventListener(t: string, fn: (e?: any) => void): void { (this.listeners[t] ??= []).push(fn); }
   dispatch(t: string, e: Record<string, unknown> = {}): void { for (const fn of this.listeners[t] ?? []) fn({ preventDefault() {}, ...e }); }
@@ -47,6 +49,9 @@ export class FakeNode {
 
 export class FakeDoc {
   activeElement?: FakeNode;
+  listeners: Record<string, Array<(e?: any) => void>> = {};
+  addEventListener(t: string, fn: (e?: any) => void): void { (this.listeners[t] ??= []).push(fn); }
+  dispatch(t: string, e: Record<string, unknown> = {}): void { for (const fn of this.listeners[t] ?? []) fn({ preventDefault() {}, ...e }); }
   createElement(t: string): FakeNode { return new FakeNode(t, this); }
   createTextNode(v: string): FakeNode { const n = new FakeNode("#text", this); n.textContent = v; return n; }
   createDocumentFragment(): FakeNode { return new FakeNode("#frag", this); }
