@@ -8,6 +8,7 @@ export interface SessionRef { id: string; identity: string; label: string }
 const SESSIONS_KEY = "sessions";
 const GRANTS_KEY = "grants";
 const HANDOVER_KEY = "handover";
+const CHAT_LINKS_KEY = "chatLinks";
 /** A handover older than this is from an earlier browser run: tab ids no longer mean anything. */
 const HANDOVER_MAX_AGE_MS = 5 * 60_000;
 /** No call for this long: the session is treated as ended, its grants are revoked and it is dropped when it holds no tabs. */
@@ -28,6 +29,25 @@ export class TabManager {
   /** User-granted tab groups: groupId -> session id. The group is never renamed, recoloured or closed by the session. */
   private readonly grants = new Map<number, string>();
   private readonly lastSeen = new Map<string, number>();
+  /** Tabs the user linked to each chat session. A tab may be linked to several chats. */
+  private readonly links = new Map<string, Set<number>>();
+
+  // ---- chat links --------------------------------------------------------
+
+  /** Replaces the link set of a chat session. */
+  setChatLinks(sessionId: string, tabIds: number[]): void {
+    if (tabIds.length === 0) this.links.delete(sessionId); else this.links.set(sessionId, new Set(tabIds));
+    this.persist();
+  }
+
+  chatLinks(sessionId: string): number[] { return [...(this.links.get(sessionId) ?? [])]; }
+
+  chatLinked(sessionId: string, tabId: number): boolean { return this.links.get(sessionId)?.has(tabId) ?? false; }
+
+  /** The chat ended: its links go. */
+  dropChat(sessionId: string): void {
+    if (this.links.delete(sessionId)) this.persist();
+  }
 
   constructor(private readonly api: ChromeApi, private readonly now: () => number = Date.now) {
     api.tabs.onRemoved(tabId => this.forget(tabId));
@@ -170,13 +190,15 @@ export class TabManager {
       s.adopted.delete(tabId);
       if (s.tabIds.size === 0 && !this.queues.has(id) && this.grantedGroups(id).length === 0) this.sessions.delete(id); // session over: Chrome drops the empty group itself
     }
+    for (const [id, set] of this.links) if (set.delete(tabId) && set.size === 0) this.links.delete(id);
     this.persist();
   }
 
   private snapshot(): Record<string, unknown> {
     const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted] }));
     const grants = [...this.grants].map(([groupId, sessionId]) => ({ groupId, sessionId }));
-    return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants };
+    const chatLinks = [...this.links].map(([sessionId, tabIds]) => ({ sessionId, tabIds: [...tabIds] }));
+    return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants, [CHAT_LINKS_KEY]: chatLinks };
   }
 
   private persist(): void {
@@ -193,18 +215,26 @@ export class TabManager {
 
   /** Rebuild ownership and grants after a service-worker restart or a self-update reload; tabs and groups that no longer exist are dropped. */
   async load(): Promise<void> {
-    let stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY]);
+    let stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY, CHAT_LINKS_KEY]);
     const handed = (await this.api.storage.get([HANDOVER_KEY]))[HANDOVER_KEY] as ({ at?: number } & Record<string, unknown>) | undefined;
     if (handed) {
       await this.api.storage.remove([HANDOVER_KEY]);
       if (!Array.isArray(stored[SESSIONS_KEY]) && typeof handed.at === "number" && this.now() - handed.at < HANDOVER_MAX_AGE_MS) {
         stored = handed;
-        await this.api.sessionStorage.set({ [SESSIONS_KEY]: handed[SESSIONS_KEY], [GRANTS_KEY]: handed[GRANTS_KEY] });
+        await this.api.sessionStorage.set({ [SESSIONS_KEY]: handed[SESSIONS_KEY], [GRANTS_KEY]: handed[GRANTS_KEY], [CHAT_LINKS_KEY]: handed[CHAT_LINKS_KEY] ?? [] });
       }
     }
     const raw = stored[SESSIONS_KEY];
     if (!Array.isArray(raw)) return;
     const live = new Set((await this.api.tabs.query()).map(t => t.id));
+    const storedLinks = stored[CHAT_LINKS_KEY];
+    if (Array.isArray(storedLinks)) {
+      for (const e of storedLinks as Array<{ sessionId?: unknown; tabIds?: unknown }>) {
+        if (typeof e.sessionId !== "string" || !Array.isArray(e.tabIds)) continue;
+        const ids = e.tabIds.filter((t): t is number => typeof t === "number" && live.has(t));
+        if (ids.length > 0) this.links.set(e.sessionId, new Set(ids));
+      }
+    }
     const grants = Array.isArray(stored[GRANTS_KEY]) ? stored[GRANTS_KEY] as Array<{ groupId: number; sessionId: string }> : [];
     for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; tabIds: number[]; adoptedTabIds?: number[] }>) {
       const tabIds = new Set(e.tabIds.filter(id => live.has(id)));

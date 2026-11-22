@@ -110,6 +110,8 @@ export interface ExecutorDeps {
   fileChooserWaitMs?: number;
   /** How long a fresh attach waits for the page to answer (tests shorten it). */
   attachAnswerMs?: number;
+  /** A chat session's link set changed (a tab it created): the gateway must hear of it before the call result. */
+  onLinks?: (sessionId: string, tabIds: number[]) => void | Promise<void>;
 }
 
 export class Executor {
@@ -117,6 +119,9 @@ export class Executor {
   private readonly tabs: TabManager;
   private readonly state: State;
   private readonly ui: Ui;
+  private readonly onLinks: (sessionId: string, tabIds: number[]) => void | Promise<void>;
+  /** Per tab: the tail of the calls of chat sessions, so chats that share a tab never run on it at the same time. */
+  private readonly tabLocks = new Map<number, Promise<void>>();
   private readonly attached = new Set<number>();
   /** Per tab: the domain enables of an attach the page has not answered yet. */
   private readonly enabling = new Map<number, Promise<void>>();
@@ -146,6 +151,7 @@ export class Executor {
     this.tabs = deps.tabs;
     this.state = deps.state;
     this.ui = deps.ui ?? noopUi;
+    this.onLinks = deps.onLinks ?? (() => {});
     this.sleepFn = deps.sleep ?? ((ms, signal) => new Promise<void>((resolve, reject) => {
       const t = setTimeout(resolve, ms);
       signal.addEventListener("abort", () => { clearTimeout(t); reject(new Error("aborted")); }, { once: true });
@@ -215,6 +221,7 @@ export class Executor {
     if (s && s.identity !== req.session.identity) return { id: req.id, ok: true, content: [{ type: "text", text: "no such session" }] };
     const tabIds = s ? [...s.tabIds] : [];
     await this.tabs.closeSession(req.session.id);
+    if (req.session.chat === true) this.tabs.dropChat(req.session.id);
     await Promise.all(tabIds.map(async tabId => { await this.detach(tabId); await this.unmark(tabId); }));
     return { id: req.id, ok: true, content: [{ type: "text", text: "session ended" }] };
   }
@@ -235,6 +242,7 @@ export class Executor {
     const a = <T extends ExtensionTool>(_t: T): ToolArgs[T] => args as ToolArgs[T];
     switch (tool) {
       case "tabs_context": {
+        if (session.chat === true) return this.chatContext(session.id);
         const { own, granted, other } = await this.tabs.list(session.id);
         const view = (t: TabInfo) => ({ tabId: t.id, url: t.url, title: t.title, active: t.active });
         const dialog = (t: TabInfo) => {
@@ -252,6 +260,7 @@ export class Executor {
         this.throwIfAborted(sig);
         const { url, groupId } = a("tabs_create");
         const target = url ? this.normaliseUrl(url) : undefined;
+        if (session.chat === true && groupId !== undefined) throw new ToolError("forbidden_tab", "A chat cannot open tabs in a granted group.");
         if (groupId !== undefined) {
           const made = await this.tabs.createInGranted(session, groupId, target);
           if (!made) throw new ToolError("forbidden_tab", `Group ${groupId} is not granted to this session.`);
@@ -259,6 +268,12 @@ export class Executor {
           return text(JSON.stringify({ tabId: made.id, url: made.url, groupId }));
         }
         const tab = await this.tabs.create(session, target);
+        if (session.chat === true) {
+          // The gateway must accept the new tab before the agent can use it.
+          const links = [...new Set([...this.tabs.chatLinks(session.id), tab.id])];
+          this.tabs.setChatLinks(session.id, links);
+          await this.onLinks(session.id, links);
+        }
         await this.markControlled(tab.id, session);
         return text(JSON.stringify({ tabId: tab.id, url: tab.url }));
       }
@@ -266,6 +281,10 @@ export class Executor {
         const { tabId } = a("adopt_tab");
         const tab = await this.api.tabs.get(tabId);
         if (!tab) throw new ToolError("tab_closed", `Tab ${tabId} no longer exists.`);
+        if (session.chat === true) {
+          if (!this.tabs.chatLinked(session.id, tabId) && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", "Only tabs you linked to this chat can be used. Link it in the side panel.");
+          return text(`Tab ${tabId} is linked to this chat and is already usable.`);
+        }
         if (this.tabs.inGrantedGroup(session.id, session.identity, tab)) return text(`Tab ${tabId} is in a group granted to this session and is already usable.`);
         if (this.tabs.grantee(tab.groupId) !== undefined) throw new ToolError("forbidden_tab", `Tab ${tabId} is in a group the user granted to another session.`);
         const owner = this.tabs.ownerOf(tabId);
@@ -296,7 +315,7 @@ export class Executor {
     const open = this.dialogs.get(tabId);
     if (open && !DIALOG_SAFE.has(tool)) throw this.dialogError(tabId, open);
     // A page blocked by a dialog answers neither CDP input nor script injection: a dialog that opens mid-call ends the call at once.
-    return this.watchDialogs(tabId, tool, async () => {
+    const work = () => this.watchDialogs(tabId, tool, async () => {
       // Attached before anything touches the page: a page that does not answer (a dialog Chrome never reported) ends the call here.
       await this.ensureAttached(sig, tabId);
       if (open) void this.markControlled(tabId, session); else await this.markControlled(tabId, session);
@@ -304,6 +323,37 @@ export class Executor {
       if (tool !== "hover") await this.releaseHold(tabId);
       return this.tabTool(tool, req, sig, tab);
     });
+    return session.chat === true ? this.withTabLock(tabId, work) : work();
+  }
+
+  /** Runs `work` after every earlier chat call on the same tab has ended. */
+  private async withTabLock<T>(tabId: number, work: () => Promise<T>): Promise<T> {
+    const prev = this.tabLocks.get(tabId) ?? Promise.resolve();
+    const run = prev.then(work, work);
+    const tail = run.then(() => {}, () => {});
+    this.tabLocks.set(tabId, tail);
+    void tail.then(() => { if (this.tabLocks.get(tabId) === tail) this.tabLocks.delete(tabId); });
+    return run;
+  }
+
+  /** What a chat sees: its linked tabs and the tabs it created. Nothing else. */
+  private async chatContext(sessionId: string): Promise<Content> {
+    const all = await this.api.tabs.query();
+    const live = new Set(all.map(t => t.id));
+    const links = this.tabs.chatLinks(sessionId);
+    const dead = links.filter(id => !live.has(id));
+    if (dead.length > 0) this.tabs.setChatLinks(sessionId, links.filter(id => live.has(id)));
+    const created = this.tabs.sessions.get(sessionId)?.tabIds ?? new Set<number>();
+    const mine = all.filter(t => created.has(t.id) || this.tabs.chatLinked(sessionId, t.id));
+    const row = (t: TabInfo) => {
+      const d = this.dialogs.get(t.id);
+      return {
+        tabId: t.id, url: t.url, title: t.title, active: t.active,
+        ...(d ? { dialog: { type: d.type, message: d.message, url: d.url, ...(d.defaultPrompt !== undefined ? { defaultPrompt: d.defaultPrompt } : {}) } } : {}),
+        scope: created.has(t.id) ? "own" : "linked",
+      };
+    };
+    return text(JSON.stringify({ sessionTabs: mine.map(row), otherTabs: [], grantedGroups: [], note: "You can use only the tabs listed here: tabs the user linked to this chat and tabs you created. A tab with \"dialog\" has a JavaScript dialog open: other calls on it fail with dialog_open until you answer it with handle_dialog." }));
   }
 
   private async tabTool(tool: ExtensionTool, req: CallRequest, sig: AbortSignal, tab: TabInfo): Promise<Content> {
@@ -425,6 +475,16 @@ export class Executor {
 
   private async ownedTab(req: CallRequest, tabId: number): Promise<TabInfo> {
     const own = this.tabs.owns(req.session.id, tabId, req.session.identity);
+    if (req.session.chat === true) {
+      if (!own && !this.tabs.chatLinked(req.session.id, tabId)) throw new ToolError("forbidden_tab", `Tab ${tabId} is not linked to this chat. Only tabs you linked to this chat can be used. Link it in the side panel.`);
+      const linked = await this.api.tabs.get(tabId);
+      if (!linked) {
+        this.tabs.forget(tabId);
+        this.dropTab(tabId);
+        throw new ToolError("tab_closed", `Tab ${tabId} was closed.`);
+      }
+      return linked;
+    }
     const forbidden = (): ToolError => new ToolError("forbidden_tab", `Tab ${tabId} is not in this session. Use tabs_create, or adopt_tab to take one of the user's tabs.`);
     if (!own && this.tabs.grantedGroups(req.session.id).length === 0) throw forbidden();
     const tab = await this.api.tabs.get(tabId);
