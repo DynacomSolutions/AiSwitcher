@@ -500,6 +500,17 @@ describe("a dead restored session never counts as live", () => {
     expect(gidB).not.toBe(gidA);
   });
 
+  test("session_end never closes or ungroups a tab that request_group approved, also one a dead session created", async () => {
+    const { t, a, gidA } = await reloaded();
+    const SD = { id: "new-d", identity: "alice", label: "Third chat" };
+    const pending = t.call("request_group", { groupId: gidA }, SD);
+    await until(() => t.api.shown.size === 1);
+    t.api.clickNotification(0);
+    expect((await pending).ok).toBe(true);
+    await t.call("session_end", {}, SD);
+    for (const id of a) { expect(t.api.tabList.has(id)).toBe(true); expect(t.api.tabList.get(id)!.groupId).toBe(gidA); }
+  });
+
   test("a live holder keeps its group", async () => {
     const { t, b } = await reloaded();
     await t.call("tabs_context", {}, SB); // B calls again after the reload: live

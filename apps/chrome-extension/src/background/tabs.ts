@@ -708,6 +708,7 @@ export class TabManager {
     if (this.grants.has(groupId)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} is granted to a session. It cannot be given to another one.` };
     if (this.savedClaims(groupId)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} is a saved group. Use open_group.` };
     for (const [id, o] of this.sessions) if (id !== ref.id && o.groupId === groupId && this.holderLive(id)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} is the own group of another live session.` };
+    // Safe only because the live-holder refusal above runs first: every other session that owns this group is not live. Keep that order.
     const deadSameIdentity = [...this.sessions].some(([id, o]) => id !== ref.id && o.groupId === groupId && o.identity === ref.identity && !o.chat);
     for (const r of this.agents.values()) if (r.groupId === groupId && !(r.identity === ref.identity && (r.label === ref.label || deadSameIdentity))) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} belongs to another chat.` };
     let shared = false;
@@ -826,7 +827,7 @@ export class TabManager {
           }
           if (release.length > 0) await this.api.tabs.ungroup(release).catch(() => {});
         }
-        for (const tabId of created) await this.api.tabs.remove(tabId).catch(() => {}); // already closed by the user: fine
+        for (const tabId of created) if (!s.approved?.has(tabId)) await this.api.tabs.remove(tabId).catch(() => {}); // an approved tab is never closed; a tab the user already closed is fine
       }
       this.sessions.delete(id);
       this.endSession(id);
