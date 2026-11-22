@@ -149,6 +149,7 @@ function init(): void {
           cursor: rect(root.querySelector(".cursor")),
           cursors: (cursors?.entries() ?? []).map(([sessionId, c]) => ({ sessionId, rect: rect(c.el), colour: sessions.info(sessionId)?.colour ?? "", tag: sessions.info(sessionId)?.tag ?? "" })),
           stop: rect(stopButton),
+          stops: [...root.querySelectorAll("button")].map(b => ({ label: b.getAttribute("aria-label") ?? "", text: b.textContent ?? "", rect: rect(b) })),
         };
       },
       /** Pauses the cursor glide once it is at least `ms` in, so a test can capture it mid-move. */
@@ -162,8 +163,12 @@ function init(): void {
         });
       },
       resumeAnimations(): string { root?.getAnimations().forEach(a => { if (a.playState === "paused") a.play(); }); return "ok"; },
-      /** A synthetic (untrusted) click on Stop, to prove the guard ignores it. */
-      untrustedStopClick(): string { root?.querySelector("button")?.click(); return "ok"; }
+      /** A synthetic (untrusted) click on Stop (the first button, or the one with this accessible name), to prove the guard ignores it. */
+      untrustedStopClick(label?: string | null): string {
+        const all = [...(root?.querySelectorAll("button") ?? [])];
+        (label ? all.find(b => b.getAttribute("aria-label") === label) : all[0])?.click();
+        return "ok";
+      }
     });
   }
   g.__aisOverlay = api;

@@ -4,7 +4,7 @@
   "version": "0.5.86",
   "scripts": {
     "test": "bun test",
-    "test:e2e": "bun test ./apps/chrome-extension/test/e2e/extension.e2e.ts",
+    "test:e2e": "bun test ./apps/chrome-extension/test/e2e/extension.e2e.ts ./apps/chrome-extension/test/e2e/chat.e2e.ts",
     "test:e2e:web": "bun test ./apps/web/test/mobile-layout.e2e.ts",
     "privacy:check": "bun run scripts/privacy-check.ts",
     "privacy:install": "bun run scripts/install-privacy-hooks.ts",

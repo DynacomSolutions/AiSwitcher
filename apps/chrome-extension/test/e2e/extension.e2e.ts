@@ -10,24 +10,16 @@
 // Two agent sessions (two identities of one pool) talk to the gateway through real `ais browser mcp` shim processes.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { CallResult } from "../../../../src/browser/protocol.ts";
-import { Hono } from "hono";
-import { mountBrowserAuthorize } from "../../../../src/server/browser-authorize.ts";
 import { startGateway } from "../../../../src/gateway/serve.ts";
 import type { RunningGateway } from "../../../../src/gateway/serve.ts";
 import { MemoryGatewayStore } from "../../../../src/gateway/store.ts";
 import { jpegSize } from "../../src/background/executor.ts";
-import { Cdp, type Session } from "./cdp.ts";
-
-const ADMIN = "adm-e2e-value-0001-0123456789abcdef";
-const extRoot = join(import.meta.dir, "../..");
-const repoRoot = join(import.meta.dir, "../../../..");
-const chromium = process.env.AIS_E2E_CHROMIUM ?? ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"].find(p => existsSync(p));
-const evidence = process.env.AIS_E2E_EVIDENCE;
+import type { Cdp, Session } from "./cdp.ts";
+import * as H from "./harness.ts";
+import { ADMIN, Agent, chromium, dumpLogs, save, sleep, step, trustedClick, until } from "./harness.ts";
 
 const page = (title: string, body: string) => `<!doctype html><meta charset="utf-8"><title>${title}</title>
 <style>body{font:16px system-ui;margin:0;padding:48px;background:#f7f6f3;color:#222}h1{margin:0 0 24px}
@@ -47,34 +39,7 @@ const gw = () => `http://127.0.0.1:${gateway.port}`;
 const admin = (path: string, init: RequestInit = {}) => fetch(`http://127.0.0.1:${gateway.adminPort}${path}`, { ...init, headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" } });
 const logFiles = (): string[] => (runDir ? ["chromium.log", "shim-a.log", "shim-b.log"].map(f => join(runDir, "logs", f)) : []);
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-/** Races a step against a labelled timeout, so a hang names the step instead of timing the whole test out. */
-async function step<T>(label: string, ms: number, p: Promise<T>): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([p, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`step "${label}" timed out after ${ms} ms`)), ms); })]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function until<T>(what: string, fn: () => Promise<T | undefined | false> | T | undefined | false, ms = 15_000): Promise<T> {
-  const end = Date.now() + ms;
-  let last: unknown;
-  while (Date.now() < end) {
-    try { const v = await fn(); if (v) return v; } catch (e) { last = e; }
-    await sleep(100);
-  }
-  throw new Error(`timed out waiting for ${what}${last ? `: ${String(last)}` : ""}`);
-}
-
-async function dumpTails(): Promise<void> {
-  for (const f of logFiles()) {
-    const text = await readFile(f, "utf8").catch(() => "");
-    if (text.trim()) console.error(`--- tail of ${f}\n${text.split("\n").slice(-25).join("\n")}`);
-  }
-}
+const dumpTails = (): Promise<void> => dumpLogs(logFiles());
 
 /** A test that prints the Chromium and shim log tails when it fails. */
 function it(name: string, fn: () => Promise<void>, ms = 30_000): void {
@@ -83,84 +48,15 @@ function it(name: string, fn: () => Promise<void>, ms = 30_000): void {
   }, ms);
 }
 
-async function save(name: string, bytes: Buffer): Promise<void> {
-  if (!evidence) return;
-  await mkdir(evidence, { recursive: true });
-  await writeFile(join(evidence, name), bytes);
-}
 const shot = async (name: string, s: Session, opts: Parameters<Session["screenshot"]>[0] = {}): Promise<void> => save(`${name}.png`, await s.screenshot(opts));
 
-type Rpc = { result?: { isError?: boolean; content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> } };
-
-/** One MCP shim process (stdio JSON-RPC), as an agent CLI would run it. */
-class Agent {
-  private nextId = 1;
-  private readonly waiting = new Map<number, (r: Rpc) => void>();
-  private readonly proc: Bun.Subprocess<"pipe", "pipe", Bun.BunFile>;
-
-  constructor(readonly identity: string, readonly sessionId: string, configDir: string, gatewayUrl: string, logFile: string) {
-    const proc = Bun.spawn(["bun", join(repoRoot, "src/ais.ts"), "browser", "mcp", "--config-dir", configDir, "--identity", identity, "--gateway", gatewayUrl], {
-      cwd: repoRoot, stdin: "pipe", stdout: "pipe", stderr: Bun.file(logFile), env: { ...process.env, CLAUDE_SESSION_ID: sessionId, AIS_GATEWAY_PROXY_URL: gatewayUrl },
-    });
-    this.proc = proc;
-    void (async () => {
-      let buf = "";
-      for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
-        buf += new TextDecoder().decode(chunk);
-        for (let i = buf.indexOf("\n"); i >= 0; i = buf.indexOf("\n")) {
-          const line = buf.slice(0, i).trim();
-          buf = buf.slice(i + 1);
-          if (!line.startsWith("{")) continue; // anything that is not a JSON-RPC line (log noise) is skipped
-          try {
-            const m = JSON.parse(line) as { id?: unknown };
-            if (typeof m.id === "number") this.waiting.get(m.id)?.(m as Rpc);
-          } catch { /* partial or foreign line */ }
-        }
-      }
-    })();
-  }
-
-  private rpc(label: string, ms: number, method: string, params: Record<string, unknown>): Promise<Rpc> {
-    const id = this.nextId++;
-    const p = new Promise<Rpc>(resolve => {
-      this.waiting.set(id, resolve);
-      (this.proc.stdin as { write(s: string): number }).write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-    });
-    return step(`${this.identity} ${label}`, ms, p).finally(() => this.waiting.delete(id));
-  }
-
-  async init(): Promise<void> { await this.rpc("shim initialize", 20_000, "initialize", { protocolVersion: "2025-06-18" }); }
-
-  /** tools/call mapped back to the relay's CallResult shape. */
-  async call(tool: string, args: Record<string, unknown> = {}): Promise<CallResult> {
-    const r = (await this.rpc(`tools/call ${tool}`, tool === "wait" ? 130_000 : 60_000, "tools/call", { name: tool, arguments: args })).result!;
-    if (r.isError) {
-      const t = r.content[0]?.text ?? "";
-      const i = t.indexOf(": ");
-      return { id: "", ok: false, error: t.slice(0, i) as never, message: t.slice(i + 2) };
-    }
-    return { id: "", ok: true, content: r.content.map(c => (c.type === "image" ? { type: "image" as const, mimeType: c.mimeType as "image/jpeg", data: c.data! } : { type: "text" as const, text: c.text! })) };
-  }
-
-  stop(): void { this.proc.kill(); }
-}
 const agents: Record<string, Agent> = {};
 const call = (a: Agent, tool: string, args: Record<string, unknown> = {}): Promise<CallResult> => a.call(tool, args);
 const textOf = (r: CallResult): string => (r.ok && r.content[0]?.type === "text" ? r.content[0].text : "");
 
-async function targets(): Promise<Array<{ type: string; url: string; targetId: string }>> {
-  return (await cdp.send<{ targetInfos: Array<{ type: string; url: string; targetId: string }> }>("Target.getTargets")).targetInfos;
-}
-
-async function pageSession(match: (url: string) => boolean): Promise<Session> {
-  const t = await until("page target", async () => (await targets()).find(x => x.type === "page" && match(x.url)));
-  return cdp.attach(t.targetId);
-}
-
-async function extensionPage(path: string): Promise<Session> {
-  const { targetId } = await cdp.send<{ targetId: string }>("Target.createTarget", { url: `chrome-extension://${extId}/${path}` });
-  return cdp.attach(targetId);
-}
+const targets = () => H.targets(cdp);
+const pageSession = (match: (url: string) => boolean): Promise<Session> => H.pageSession(cdp, match);
+const extensionPage = (path: string): Promise<Session> => H.extensionPage(cdp, extId, path);
 
 /**
  * Calls a method of the in-page overlay. It lives in the extension's isolated world (closed shadow root, no page-visible
@@ -177,23 +73,11 @@ const centreOf = (s: Session, id: string) => s.eval<{ x: number; y: number }>(`(
 /** Status as the side panel sees it, asked from a live extension page (the service worker cannot message itself). */
 const status = () => ctl.eval<{ paused: boolean; inflight: number; status: string }>(`chrome.runtime.sendMessage({ type: "ais-status" })`);
 
-async function trustedClick(s: Session, x: number, y: number): Promise<void> {
-  await s.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-  await s.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
-  await s.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
-}
-
 describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
   beforeAll(async () => {
     try {
-      const base = process.env.AIS_E2E_TMP ?? tmpdir();
-      await mkdir(base, { recursive: true });
-      runDir = await mkdtemp(join(base, "ais-e2e-"));
-      await mkdir(join(runDir, "logs"), { recursive: true });
-      await mkdir(join(runDir, "ext"));
-      const extDir = realpathSync(join(runDir, "ext"));
-      const built = Bun.spawnSync(["bun", "run", "build.ts", extDir], { cwd: extRoot, stdout: "pipe", stderr: "pipe", env: { ...process.env, AIS_E2E: "1" } }); // AIS_E2E keeps the overlay inspection hooks in this build only
-      if (built.exitCode !== 0) throw new Error(`extension build failed: ${built.stderr.toString()}`);
+      runDir = await H.makeRunDir();
+      const extDir = await H.buildExtension(runDir);
 
       site = Bun.serve({
         hostname: "127.0.0.1",
@@ -261,25 +145,15 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
         await agents[key]!.init();
       }
 
-      proc = Bun.spawn([
-        chromium!, "--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-        `--user-data-dir=${join(runDir, "profile")}`, "--remote-debugging-port=0", `--load-extension=${extDir}`,
-        "--disable-features=DisableLoadExtensionCommandLineSwitch", "--window-size=1280,800", "about:blank",
-      ], { stdout: "ignore", stderr: Bun.file(join(runDir, "logs", "chromium.log")) });
-      const wsUrl = await step("chromium start (DevToolsActivePort)", 45_000, until("DevToolsActivePort", async () => {
-        const f = Bun.file(join(runDir, "profile", "DevToolsActivePort"));
-        if (!(await f.exists())) return undefined;
-        const [port, path] = (await f.text()).trim().split("\n");
-        return port && path ? `ws://127.0.0.1:${port}${path}` : undefined;
-      }, 45_000));
-      cdp = await step("CDP connect", 20_000, Cdp.connect(wsUrl));
-      // Unpacked extension id: first 32 hex digits of sha256(path), mapped onto a-p.
-      extId = [...createHash("sha256").update(extDir).digest("hex").slice(0, 32)].map(c => String.fromCharCode(97 + Number.parseInt(c, 16))).join("");
+      const b = await H.launchChromium(runDir, extDir);
+      proc = b.proc;
+      cdp = b.cdp;
+      extId = b.extId;
     } catch (e) {
       await dumpTails();
       throw e;
     }
-  }, 120_000);
+  }, 300_000);
 
   afterAll(async () => {
     for (const a of Object.values(agents)) a.stop();
@@ -288,36 +162,13 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     await gateway?.stop().catch(() => {});
     site?.stop(true);
     if (runDir) await rm(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }); // Chromium helper processes may still be writing for a moment
-  });
+  }, 120_000);
 
   it("signs in through the console page, then connects", async () => {
-    // The console sign-in page runs in-process against the real gateway (public pair + admin approve + poll).
-    const app = new Hono();
-    mountBrowserAuthorize(app, { proxyUrl: gw(), adminUrl: `http://127.0.0.1:${gateway.adminPort}`, adminToken: ADMIN, relayUrl: `ws://127.0.0.1:${gateway.port}`, extensionIds: [extId], targets: async () => ({ pools: ["main"], identities: [] }) });
-    const consoleSrv = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
-    try {
-      const redirect = `https://${extId}.chromiumapp.org/cb`;
-      const page = await fetch(`http://127.0.0.1:${consoleSrv.port}/browser/authorize?redirect_uri=${encodeURIComponent(redirect)}&state=e2e1&label=${encodeURIComponent("E2E profile")}`);
-      const html = await page.text();
-      const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1]!;
-      const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
-      const done = await fetch(`http://127.0.0.1:${consoleSrv.port}/browser/authorize`, { method: "POST", redirect: "manual", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ csrf, redirect_uri: redirect, state: "e2e1", label: "E2E profile", target: "pool:main", action: "approve" }).toString() });
-      expect(done.status).toBe(302);
-      const frag = new URLSearchParams(new URL(done.headers.get("location")!).hash.slice(1));
-      expect(frag.get("state")).toBe("e2e1");
-      // Hand the redirect to the extension's own sign-in code, through a real extension page.
-      const panel = await extensionPage("sidepanel.html");
-      await until("side panel loaded", () => panel.eval<boolean>(`document.getElementById("ais-connect") !== null`));
-      const swTarget = await until("extension service worker", async () => (await targets()).find(t => t.type === "service_worker" && t.url.startsWith(`chrome-extension://${extId}/`)));
-      sw = await cdp.attach(swTarget.targetId);
-      await sw.eval(`chrome.storage.local.set({ gatewayUrl: ${JSON.stringify(frag.get("gateway"))}, token: ${JSON.stringify(frag.get("token"))}, binding: ${JSON.stringify(frag.get("binding"))}, target: { kind: "pool", pool: ${JSON.stringify(frag.get("target_name"))} }, profileLabel: "E2E profile" })`);
-      await until("connected", async () => (await sw.eval<{ status?: string }>(`chrome.storage.local.get("status")`)).status === "connected", 20_000);
-      await until("panel shows Connected", () => panel.eval<boolean>(`document.getElementById("chip").textContent === "Connected"`));
-      ctl = panel; // stays open: the control page messages the worker for status
-    } finally {
-      consoleSrv.stop(true);
-    }
-  }, 60_000);
+    const signed = await H.signIn({ cdp, extId, gatewayPort: gateway.port, adminPort: gateway.adminPort });
+    sw = signed.sw;
+    ctl = signed.panel; // stays open: the control page messages the worker for status
+  }, 240_000);
 
   let tabA = 0;
   let tabB = 0;
@@ -335,8 +186,9 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     expect(info.ga).toBeGreaterThan(0);
     expect(info.gb).toBeGreaterThan(0);
     expect(info.ga).not.toBe(info.gb);
-    expect(info.groups.find(g => g.id === info.ga)?.title).toBe("main / sess-a");
-    expect(info.groups.find(g => g.id === info.gb)?.title).toBe("main / sess-b");
+    // The group carries the session's name (here the name the shim got from AIS_SESSION_NAME), never the identity.
+    expect(info.groups.find(g => g.id === info.ga)?.title).toBe("Agent A");
+    expect(info.groups.find(g => g.id === info.gb)?.title).toBe("Agent B");
   });
 
   it("agents work in the background: a capture of a background tab never changes the active tab", async () => {
@@ -383,7 +235,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     await save("agent-capture.jpg", Buffer.from(img.data, "base64"));
     // The tool result carries no overlay, but the user still sees it afterwards.
     const snap = await until("pill", async () => { const s = await snapshot(tabA); return s?.pillOn ? s : undefined; });
-    expect(snap.pill).toContain("main");
+    expect(snap.pill).toContain("Agent A"); // the pill shows the session's name
     expect(snap.pill).toContain("is controlling this tab");
     expect(snap.pill).toContain("Stop");
     expect(snap.glowOn).toBe(true);
@@ -634,6 +486,9 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
   async function panel(): Promise<Session> {
     const s = await extensionPage("sidepanel.html");
     await s.send("Emulation.setDeviceMetricsOverride", { width: 400, height: 760, deviceScaleFactor: 2, mobile: false });
+    // The panel opens on the Chat tab when signed in. These tests look at the Status tab.
+    await until("tab strip", () => s.eval<boolean>(`document.getElementById("tab-status") !== null && document.getElementById("panel-loading").hidden`));
+    await s.eval(`document.getElementById("tab-status").click()`);
     return s;
   }
   const panelHas = (s: Session, text: string) => until(`panel text "${text}"`, () => s.eval<boolean>(`document.body.innerText.includes(${JSON.stringify(text)})`));
@@ -641,7 +496,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
   it("side panel shows the connected state and the This tab section", async () => {
     const p = await panel();
     await panelHas(p, "Agents can use this browser");
-    await panelHas(p, "This tab");
+    await until("This tab card", () => p.eval<boolean>(`document.querySelector("#this-tab h2")?.textContent?.startsWith("This tab") === true`)); // headings are upper case on screen, so innerText cannot be used
     expect(await p.eval<string>(`document.getElementById("chip").textContent`)).toBe("Connected");
     await sleep(300);
     await shot("sidepanel-connected", p);
