@@ -1,5 +1,5 @@
 // A stand-in ACP agent for tests. It speaks JSON lines on stdio.
-// Prompts: say:<text>, tool, ask, slow, wait:<ms>, mcp, mcp-tabs, run:<json> (browser tool calls), and a few failure scripts. Anything else echoes.
+// Prompts: say:<text>, tool, ask, slow, wait:<ms>, mcp, mcp-tabs, ctx (says back the first text block), run:<json> (browser tool calls), and a few failure scripts. Anything else echoes.
 // Environment: STUB_ACP_STATE (file that stores session ids), STUB_ACP_LOAD ("0" turns loadSession off), STUB_ACP_HTTP ("0" turns HTTP MCP off), STUB_ACP_NEW_ERROR ("1" makes session/new fail), STUB_ACP_NEW_HANG ("1" never answers session/new).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createLineReader } from "../../../src/gateway/chat/acp.ts";
@@ -24,13 +24,17 @@ function configOptions() {
   ];
 }
 
-async function runPrompt(id: string | number, sessionId: string, text: string) {
+async function runPrompt(id: string | number, sessionId: string, text: string, first = "") {
   const done = (stopReason = "end_turn") => send({ jsonrpc: "2.0", id, result: { stopReason } });
   if (text.startsWith("say:")) {
     const t = text.slice(4);
     const mid = Math.ceil(t.length / 2);
     chunk(sessionId, t.slice(0, mid));
     chunk(sessionId, t.slice(mid));
+    return done();
+  }
+  if (text === "ctx") {
+    chunk(sessionId, first);
     return done();
   }
   if (text === "tool") {
@@ -190,8 +194,10 @@ function handle(m: any): void {
     case "session/set_model":
       return reply({});
     case "session/prompt": {
-      const text = m.params?.prompt?.[0]?.text ?? "";
-      void runPrompt(m.id, m.params.sessionId, text);
+      // Scripts match on the LAST text block. The gateway may put a context block before the user's text.
+      const blocks = ((m.params?.prompt ?? []) as Array<{ type?: string; text?: string }>).filter((b) => b.type === "text");
+      const text = blocks[blocks.length - 1]?.text ?? "";
+      void runPrompt(m.id, m.params.sessionId, text, blocks[0]?.text ?? "");
       return;
     }
     case "session/cancel":

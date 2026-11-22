@@ -743,3 +743,56 @@ test("a prompt starts no pod when the identity is no longer listed, and fails cl
   expect(errs[1]).toMatchObject({ code: "unavailable" });
   expect(transport.starts).toHaveLength(0);
 });
+
+const agentText = async (s: MemoryChatStore, id: string, n: number): Promise<string> => {
+  await turnEnded(s, id, n);
+  const all = await bodies(s, id);
+  const ends: number[] = [];
+  all.forEach((b, i) => b.k === "turn_end" && ends.push(i));
+  const from = n === 1 ? 0 : ends[n - 2]! + 1;
+  return all.slice(from, ends[n - 1]).filter((b) => b.k === "text").map((b) => (b as { text: string }).text).join("");
+};
+
+test("the prompt carries a context block with the linked tab ids, then the user text", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await broker.link(rec.id, [7, 8]);
+  await send(broker, rec.id, "ctx");
+  const said = await agentText(store, rec.id, 1);
+  expect(said).toContain("tab ids 7, 8");
+  expect(said).toContain("ais-browser");
+  expect(said).toContain("tabs_context");
+  expect(said).not.toContain("no Chrome tab is linked");
+});
+
+test("after chat.link changes the tabs the next prompt uses the new ids", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "ctx");
+  expect(await agentText(store, rec.id, 1)).toContain("tab ids 7.");
+  await idleState(store, rec.id);
+  await broker.link(rec.id, [21, 22]);
+  await send(broker, rec.id, "ctx");
+  const said = await agentText(store, rec.id, 2);
+  expect(said).toContain("tab ids 21, 22.");
+  expect(said).not.toContain("7");
+});
+
+test("no linked tabs gives the no-tab context", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await broker.link(rec.id, []);
+  await send(broker, rec.id, "ctx");
+  expect(await agentText(store, rec.id, 1)).toContain("no Chrome tab is linked to this chat");
+});
+
+test("the feed holds the user text only, never the context block", async () => {
+  const { broker, store } = setup();
+  const rec = await made(broker);
+  await send(broker, rec.id, "say:hi");
+  await turnEnded(store, rec.id);
+  const all = await bodies(store, rec.id);
+  expect(all.filter((b) => b.k === "user")).toEqual([expect.objectContaining({ k: "user", text: "say:hi" })]);
+  expect(JSON.stringify(all)).not.toContain("Browser context");
+  expect(JSON.stringify(await store.get(rec.id))).not.toContain("Browser context");
+});
