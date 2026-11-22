@@ -97,16 +97,21 @@ export class TabManager {
     return members.sort((x, y) => x.windowId - y.windowId || x.index - y.index);
   }
 
-  /** Finds the live group of a saved group whose id is stale: same title and at least one saved URL. Never takes a group another saved entry or a grant holds. */
+  /**
+   * Finds the live group of a saved group whose id is stale. It links only a group that is certainly the same one: the title matches,
+   * the tab URLs equal the saved URLs (same count, same order), and no session, grant or other saved group claims it.
+   * A user's own group that merely shares a title or a URL is never linked. The saved tab list is not changed.
+   */
   private async relink(g: SavedGroup): Promise<boolean> {
+    if (g.tabs.length === 0) return false;
     const taken = new Set([...this.saved.values()].filter(x => x !== g && x.groupId !== -1).map(x => x.groupId));
     for (const gid of this.grants.keys()) taken.add(gid);
-    const urls = new Set(g.tabs.map(t => t.url).filter(u => u !== ""));
+    for (const s of this.sessions.values()) if (s.groupId !== -1) taken.add(s.groupId);
     const all = await this.api.tabs.query();
     for (const info of await this.api.tabGroups.queryByTitle(g.title)) {
-      if (taken.has(info.id)) continue;
-      const members = all.filter(t => t.groupId === info.id);
-      if (!members.some(t => urls.has(t.url))) continue;
+      if (taken.has(info.id) || info.title !== g.title) continue;
+      const members = all.filter(t => t.groupId === info.id).sort((x, y) => x.windowId - y.windowId || x.index - y.index);
+      if (members.length !== g.tabs.length || members.some((t, i) => t.url !== g.tabs[i]!.url)) continue;
       g.groupId = info.id;
       g.tabIds = members.map(t => t.id);
       return true;
@@ -505,7 +510,11 @@ export class TabManager {
 
   /** Rebuild ownership and grants after a service-worker restart or a self-update reload; tabs and groups that no longer exist are dropped. */
   async load(): Promise<void> {
-    await this.loadSaved();
+    await this.loadSessions();
+    await this.loadSaved(); // after the sessions, so a session's own group is never linked to a saved group
+  }
+
+  private async loadSessions(): Promise<void> {
     let stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY]);
     const handed = (await this.api.storage.get([HANDOVER_KEY]))[HANDOVER_KEY] as ({ at?: number } & Record<string, unknown>) | undefined;
     if (handed) {

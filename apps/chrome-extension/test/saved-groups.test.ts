@@ -389,7 +389,7 @@ describe("review fixes", () => {
     expect(await t.tabs.savedGroups()).toEqual([{ name: "docs", groupId: gid, open: true, tabCount: 1 }]);
   });
 
-  test("at load, a stale id is re-linked to the live group with the same title and a saved URL", async () => {
+  test("at load, a stale id is re-linked to a live group with the same title and the same URLs in the same order", async () => {
     const t = setup();
     const a = await t.create(S1, { url: "https://a.example.com/" });
     await t.call("save_group", { name: "docs" });
@@ -459,5 +459,76 @@ describe("review fixes", () => {
     expect(t.json(await t.call("tabs_context", {}, S3)).savedGroups).toEqual([]);
     expect(t.json(await t.call("tabs_context", {}, S2)).savedGroups).toHaveLength(1);
     expect(await t.tabs.savedGroups()).toHaveLength(1);
+  });
+});
+
+describe("relink safety", () => {
+  async function closedSaved(urls: string[]) {
+    const t = setup();
+    const ids: number[] = [];
+    for (const url of urls) ids.push(await t.create(S1, { url }));
+    await t.call("save_group", { name: "docs" });
+    await t.call("session_end");
+    for (const id of ids) t.api.closeTab(id);
+    return t;
+  }
+
+  test("a user group with the same title and one shared URL is not linked, granted or changed", async () => {
+    const t = await closedSaved(["https://a.example.com/", "https://b.example.com/"]);
+    const u = t.api.addTab(800, "https://a.example.com/");
+    const userGroup = await t.api.tabs.group([u.id]);
+    t.api.groups.set(userGroup, { title: "docs", color: "red" });
+    const r = await t.call("open_group", { name: "docs" }, S2);
+    expect(r.ok).toBe(true);
+    expect(t.json(r).groupId).not.toBe(userGroup);
+    expect(t.json(r).tabs).toHaveLength(2);
+    expect(t.tabs.grantee(userGroup)).toBeUndefined();
+    expect(t.api.tabList.get(800)!.groupId).toBe(userGroup);
+    expect(t.api.groups.get(userGroup)).toEqual({ title: "docs", color: "red" });
+    await t.tabs.refreshSaved();
+    expect((t.api.store.savedGroups as Array<{ tabs: unknown[] }>)[0]!.tabs).toHaveLength(2);
+  });
+
+  test("load() never links a saved group to a live session's own group with the same title", async () => {
+    const t = await closedSaved(["https://a.example.com/"]);
+    // A session whose own group has the saved title and the saved URL, as after a service-worker restart.
+    const own = await t.create(S2, { url: "https://a.example.com/" });
+    const ownGroup = t.api.tabList.get(own)!.groupId;
+    t.api.groups.set(ownGroup, { title: "docs", color: "blue" });
+    const tabsOf = () => JSON.stringify((t.api.store.savedGroups as Array<{ tabs: unknown }>).map(g => g.tabs));
+    const saved = tabsOf();
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    expect(await fresh.tabs.savedGroups()).toEqual([{ name: "docs", groupId: -1, open: false, tabCount: 1 }]);
+    expect(fresh.tabs.owns("s2", own, "alice")).toBe(true);
+    await fresh.tabs.refreshSaved();
+    expect(tabsOf()).toBe(saved);
+    await fresh.call("session_end", {}, S2);
+    expect(t.api.tabList.has(own)).toBe(false); // the session's own tab closes as usual, nothing else changed
+  });
+
+  test("a restored group with identical URLs in order and a new id is linked without a duplicate", async () => {
+    const t = await closedSaved(["https://a.example.com/", "https://b.example.com/"]);
+    const x = t.api.addTab(900, "https://a.example.com/");
+    const y = t.api.addTab(901, "https://b.example.com/");
+    const gid = await t.api.tabs.group([x.id, y.id]);
+    t.api.groups.set(gid, { title: "docs", color: "blue" });
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    expect(await fresh.tabs.savedGroups()).toEqual([{ name: "docs", groupId: gid, open: true, tabCount: 2 }]);
+    const before = t.api.tabList.size;
+    expect(fresh.json(await fresh.call("open_group", { name: "docs" }, S2)).groupId).toBe(gid);
+    expect(t.api.tabList.size).toBe(before);
+  });
+
+  test("a group with the same title but different URLs or order is not linked", async () => {
+    const t = await closedSaved(["https://a.example.com/", "https://b.example.com/"]);
+    const x = t.api.addTab(900, "https://b.example.com/");
+    const y = t.api.addTab(901, "https://a.example.com/");
+    const gid = await t.api.tabs.group([x.id, y.id]);
+    t.api.groups.set(gid, { title: "docs", color: "blue" });
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    expect(await fresh.tabs.savedGroups()).toEqual([{ name: "docs", groupId: -1, open: false, tabCount: 2 }]);
   });
 });
