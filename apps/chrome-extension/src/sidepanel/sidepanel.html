@@ -14,10 +14,11 @@
   </header>
   <div class="tabs" role="tablist" aria-label="Panel">
     <button type="button" role="tab" id="tab-chat" aria-selected="false" aria-controls="chat" tabindex="-1">Chat</button>
-    <button type="button" role="tab" id="tab-status" aria-selected="true" aria-controls="status" tabindex="0">Status</button>
+    <button type="button" role="tab" id="tab-status" aria-selected="false" aria-controls="status" tabindex="-1">Status</button>
   </div>
   <section id="chat" class="panel" role="tabpanel" aria-labelledby="tab-chat" hidden></section>
-  <main id="status" class="panel" role="tabpanel" aria-labelledby="tab-status" aria-live="polite"></main>
+  <p id="panel-loading" class="hint loading">Loading</p>
+  <main id="status" class="panel" role="tabpanel" aria-labelledby="tab-status" aria-live="polite" hidden></main>
   <footer id="ver" class="ver"></footer>
   <script type="module" src="sidepanel.js"></script>
 </body>

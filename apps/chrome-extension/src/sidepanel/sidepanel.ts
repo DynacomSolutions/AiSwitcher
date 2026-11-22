@@ -7,6 +7,7 @@ import type { PanelTab } from "./tabs.ts";
 export { viewFor, updateView, render } from "./status.ts";
 
 function select(tab: PanelTab, focus = false): void {
+  document.getElementById("panel-loading")?.setAttribute("hidden", "");
   for (const t of PANEL_TABS) {
     const btn = document.getElementById(`tab-${t}`) as HTMLButtonElement | null;
     const panel = document.getElementById(t);
@@ -37,11 +38,11 @@ async function initTabs(): Promise<void> {
       }
     });
   }
-  select(chosen ?? "status");
-  if (chosen) return;
-  // No saved choice: pick the default once the status is known.
-  const s = (await chrome.runtime.sendMessage({ type: "ais-status" })) as PanelStatus | undefined;
-  if (s && !chosen) select(defaultTab(s));
+  // Show no panel until the saved tab or the status is known.
+  if (chosen) { select(chosen); return; }
+  let status: PanelStatus | undefined;
+  try { status = (await chrome.runtime.sendMessage({ type: "ais-status" })) as PanelStatus | undefined; } catch { status = undefined; }
+  if (!chosen) select(status ? defaultTab(status) : "status");
 }
 
 if (typeof chrome !== "undefined" && chrome.runtime?.id) {
