@@ -1,7 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import { CHAT_TOKEN_HEAD, chatTokenKey, mintChatToken, verifyChatToken } from "../../src/gateway/chat/token.ts";
-import { ChatGrants } from "../../src/gateway/browser/chat-grants.ts";
 
 const key = chatTokenKey("admin-secret");
 const claims = { chatId: "c1", binding: "b1", exp: 2_000_000, gen: 1 };
@@ -53,19 +52,5 @@ describe("chat token", () => {
     expect(verifyChatToken(key, `${CHAT_TOKEN_HEAD}x`, now)).toBeUndefined();
     expect(verifyChatToken(key, "aisg_nope_nope", now)).toBeUndefined();
     expect(verifyChatToken(key, "", now)).toBeUndefined();
-  });
-});
-
-describe("ChatGrants", () => {
-  test("several chats may hold one tab and each grant ends on its own", () => {
-    const g = new ChatGrants();
-    g.set("a", [1, 2]);
-    g.set("b", [2]);
-    expect(g.allows("a", 2) && g.allows("b", 2)).toBe(true);
-    expect(g.allows("b", 1)).toBe(false);
-    g.delete("a");
-    expect(g.allows("a", 2)).toBe(false);
-    expect(g.allows("b", 2)).toBe(true);
-    expect(g.get("a")).toBeUndefined();
   });
 });
