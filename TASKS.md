@@ -375,8 +375,8 @@ ETA: 2026-11-25 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 261 | Scratch-only chat pods, gateway RBAC and attach policy in .cluster | todo | claude | | | | `workspace: chat` mounts only session scratch.<br>Gateway may attach only to sessions it created. |
-| 262 | Gateway chat broker: AgentSession pods over ACP, per-chat browser token | todo | claude | | 18.261 | | chat.* frames, Postgres lease between replicas, transcripts, metrics, drain. |
+| 261 | Scratch-only chat pods, gateway RBAC and attach policy in .cluster | in_progress | claude | ais-chat-pods | | 2026-11-22 18:00 ICT | `workspace: chat` mounts only session scratch.<br>Gateway may attach only to sessions it created. |
+| 262 | Gateway chat broker: AgentSession pods over ACP, per-chat browser token | in_progress | claude | sidepanel-chat-gateway | 18.261 | 2026-11-23 18:00 ICT | chat.* frames, Postgres lease between replicas, transcripts, metrics, drain. |
 | 263 | Extension: per-chat tab grants, split-view context, one cursor per agent | todo | claude | | 18.262 | | Several chats share tabs; pill lists every agent on the tab. |
 | 264 | Side panel Chat view with T3-style provider and model picker | todo | claude | | 18.262, 18.263 | | Chat list, feed, tool and permission cards, linked-tab chips. |
 | 265 | Prove a real pod chat from Chromium on the cluster, then release | todo | claude | | 18.264 | | Real pod chat plus Chromium e2e; release.yml after the version bump. |
