@@ -377,8 +377,8 @@ ETA: 2026-11-25 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 261 | Scratch-only chat pods, gateway RBAC and attach policy in .cluster | in_progress | claude | ais-chat-pods | | 2026-11-22 18:00 ICT | `workspace: chat` mounts only session scratch.<br>Gateway may attach only to sessions it created. |
-| 262 | Gateway chat broker: AgentSession pods over ACP, per-chat browser token | in_progress | claude | sidepanel-chat-gateway | 18.261 | 2026-11-23 18:00 ICT | chat.* frames, Postgres lease between replicas, transcripts, metrics, drain. |
-| 263 | Extension: per-chat tab grants, split-view context, one cursor per agent | todo | claude | | 18.262 | | Several chats share tabs; pill lists every agent on the tab. |
-| 264 | Side panel Chat view with T3-style provider and model picker | todo | claude | | 18.262, 18.263 | | Chat list, feed, tool and permission cards, linked-tab chips. |
+| 261 | Scratch-only chat pods, gateway RBAC and attach policy in .cluster | done | claude | ais-chat-pods | | | Merged https://github.com/DynacomSolutions/.cluster/pull/3125 (25d8b36e).<br>Chat policies live on the cluster. |
+| 262 | Gateway chat broker: AgentSession pods over ACP, per-chat browser token | done | claude | sidepanel-chat-gateway | 18.261 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/690 (4b983b0d).<br>CI 5549 pass, Postgres store contract green. |
+| 263 | Extension: per-chat tab grants, split-view context, one cursor per agent | in_progress | claude | sidepanel-chat-extension | 18.262 | 2026-11-23 00:00 ICT | Built and reviewed; real Chromium e2e running. |
+| 264 | Side panel Chat view with T3-style provider and model picker | in_progress | claude | sidepanel-chat-extension | 18.262, 18.263 | 2026-11-23 00:00 ICT | Built and reviewed; e2e, then one real pod chat on the cluster. |
 | 265 | Prove a real pod chat from Chromium on the cluster, then release | todo | claude | | 18.264 | | Real pod chat plus Chromium e2e; release.yml after the version bump. |
