@@ -51,7 +51,7 @@ export interface SavedGroup { name: string; title: string; color: GroupColor; gr
 export interface AgentTab { id: number; url: string; adopted: boolean; owned: boolean; /** A tab of a group the user approved with request_group: no session of the chat closes or ungroups it. */ approved?: true }
 /** A group that an agent session created. It outlives the session and the browser run, and stays with the chat (identity plus label). */
 export interface AgentGroup { identity: string; label: string; title: string; color: GroupColor; groupId: number; tabs: AgentTab[]; /** The session that last held the group. */ holder: string; updatedAt: number }
-export interface GroupOverview { groupId: number; title: string; tabCount: number; scope: "own" | "granted" | "saved" | "other" }
+export interface GroupOverview { groupId: number; title: string; tabCount: number; scope: "own" | "granted" | "saved" | "other"; /** Only for the own group of another session with the same identity. */ holderLabel?: string; holderLive?: boolean; /** Tabs of the group that no list in the response shows, because another session owns them. */ hiddenTabCount: number }
 export type SaveResult = { ok: true; groupId: number; tabCount: number } | { ok: false; code: "bad_args" | "forbidden_tab" | "internal"; message: string };
 export type OpenResult =
   | { ok: true; name: string; groupId: number; tabs: Array<{ tabId: number; url: string; splitViewId?: number }>; warnings: string[] }
@@ -62,7 +62,10 @@ export class TabManager {
   readonly sessions = new Map<string, SessionTabs>();
   /** User-granted tab groups: groupId -> session id. The group is never renamed, recoloured or closed by the session. */
   private readonly grants = new Map<number, string>();
+  /** Expiry bookkeeping only: set by a call and by expireIdle. Never read for liveness. */
   private readonly lastSeen = new Map<string, number>();
+  /** Time of the last real call of each session (call start, call end, touch, reclaim). The only input of holderLive. */
+  private readonly lastCall = new Map<string, number>();
   /** Tabs the user linked to each chat session. A tab may be linked to several chats. */
   private readonly links = new Map<string, Set<number>>();
 
@@ -459,7 +462,7 @@ export class TabManager {
   /** True when the session made a call within HOLDER_LIVE_MS. A session that is unknown (after a reload), ended or expired is not live. */
   private holderLive(sessionId: string): boolean {
     if ((this.busy.get(sessionId) ?? 0) > 0) return true;
-    const seen = this.lastSeen.get(sessionId);
+    const seen = this.lastCall.get(sessionId);
     return seen !== undefined && this.now() - seen <= HOLDER_LIVE_MS;
   }
 
@@ -570,11 +573,49 @@ export class TabManager {
 
   private async reclaimNow(ref: SessionRef): Promise<boolean> {
     {
-      this.lastSeen.set(ref.id, this.now());
+      this.markCall(ref.id);
       if (ref.label === "" || ref.chat === true) return false;
+      if (await this.reclaimSession(ref)) return true;
       for (const r of this.chatRecords(ref.identity, ref.label)) if (await this.reclaimRecord(ref, r)) return true;
       return false;
     }
+  }
+
+  /** A call happened: the session is live and is not idle. */
+  private markCall(id: string): void {
+    this.lastCall.set(id, this.now());
+    this.lastSeen.set(id, this.now());
+  }
+
+  /**
+   * Reclaim from known session state: the caller has no own group with tabs, and another session of the same identity and label
+   * has an own group with tabs and is not live. The caller takes that group over with the adopted, approved and owned flags.
+   * The old session is dropped. No tab is closed, moved, ungrouped, reloaded or activated.
+   */
+  private async reclaimSession(ref: SessionRef): Promise<boolean> {
+    const s = this.session(ref);
+    if (s.groupId !== -1 && s.tabIds.size > 0 && await this.api.tabGroups.get(s.groupId)) return false;
+    for (const [oid, o] of [...this.sessions]) {
+      if (oid === ref.id || o.chat || o.identity !== ref.identity || o.label !== ref.label || o.groupId === -1 || o.tabIds.size === 0) continue;
+      if (this.holderLive(oid) || this.queues.has(oid) || this.grantedGroups(oid).length > 0) continue;
+      if (this.grants.has(o.groupId) || this.savedClaims(o.groupId)) continue;
+      if (!(await this.api.tabGroups.get(o.groupId))) continue;
+      const members = new Set((await this.api.tabs.query()).filter(t => t.groupId === o.groupId).map(t => t.id));
+      const ids = [...o.tabIds].filter(id => members.has(id));
+      if (ids.length === 0) continue;
+      s.groupId = o.groupId;
+      s.tabIds = new Set(ids);
+      s.adopted = new Set(ids.filter(id => o.adopted.has(id)));
+      const approved = ids.filter(id => o.approved?.has(id));
+      if (approved.length > 0) s.approved = new Set(approved); else delete s.approved;
+      this.sessions.delete(oid);
+      this.lastSeen.delete(oid);
+      this.lastCall.delete(oid);
+      this.persist();
+      await this.refreshAgents();
+      return true;
+    }
+    return false;
   }
 
   private async reclaimRecord(ref: SessionRef, r: AgentGroup): Promise<boolean> {
@@ -629,13 +670,18 @@ export class TabManager {
     const all = await this.api.tabs.query();
     const ids = new Map<number, number>();
     for (const t of all) if (t.groupId !== -1) ids.set(t.groupId, (ids.get(t.groupId) ?? 0) + 1);
-    const mine = this.sessions.get(sessionId)?.groupId;
+    const me = this.sessions.get(sessionId);
+    const mine = me?.groupId;
+    const grantedMine = new Set(this.grantedGroups(sessionId));
     const out: GroupOverview[] = [];
     for (const [groupId, tabCount] of ids) {
       const info = await this.api.tabGroups.get(groupId);
       const members = all.filter(t => t.groupId === groupId);
       const scope = groupId === mine ? "own" : this.grants.get(groupId) === sessionId ? "granted" : [...this.saved.values()].some(g => g.groupId === groupId && members.some(t => g.tabIds.includes(t.id))) ? "saved" : "other";
-      out.push({ groupId, title: info?.title ?? "", tabCount, scope });
+      let holder: { label: string; live: boolean } | undefined;
+      if (me && groupId !== mine) for (const [oid, o] of this.sessions) if (oid !== sessionId && o.groupId === groupId && o.identity === me.identity && !o.chat) { holder = { label: o.label, live: this.holderLive(oid) }; break; }
+      const hiddenTabCount = grantedMine.has(groupId) ? 0 : members.filter(t => { const o = this.ownerOf(t.id); return o !== undefined && o !== sessionId; }).length;
+      out.push({ groupId, title: info?.title ?? "", tabCount, scope, ...(holder ? { holderLabel: holder.label, holderLive: holder.live } : {}), hiddenTabCount });
     }
     return out;
   }
@@ -662,7 +708,9 @@ export class TabManager {
     if (this.grants.has(groupId)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} is granted to a session. It cannot be given to another one.` };
     if (this.savedClaims(groupId)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} is a saved group. Use open_group.` };
     for (const [id, o] of this.sessions) if (id !== ref.id && o.groupId === groupId && this.holderLive(id)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} is the own group of another live session.` };
-    for (const r of this.agents.values()) if (r.groupId === groupId && !(r.identity === ref.identity && r.label === ref.label)) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} belongs to another chat.` };
+    // Safe only because the live-holder refusal above runs first: every other session that owns this group is not live. Keep that order.
+    const deadSameIdentity = [...this.sessions].some(([id, o]) => id !== ref.id && o.groupId === groupId && o.identity === ref.identity && !o.chat);
+    for (const r of this.agents.values()) if (r.groupId === groupId && !(r.identity === ref.identity && (r.label === ref.label || deadSameIdentity))) return { ok: false, code: "forbidden_tab", message: `Group ${groupId} belongs to another chat.` };
     let shared = false;
     for (const [id, o] of this.sessions) {
       if (id === ref.id || o.groupId !== groupId) continue;
@@ -670,7 +718,7 @@ export class TabManager {
       shared = true;
     }
     for (const r of this.agents.values()) if (r.groupId === groupId && r.holder !== ref.id) shared = true;
-    if (s && s.groupId !== -1 && s.tabIds.size > 0 && await this.api.tabGroups.get(s.groupId)) return { ok: false, code: "bad_args", message: "This session already has an own group with tabs. One session has one own group." };
+    if (s && s.groupId !== -1 && s.tabIds.size > 0 && await this.api.tabGroups.get(s.groupId)) return { ok: false, code: "bad_args", message: "This session already has an own group with tabs. This session already has its own group. Save it with save_group, then use another chat for the other group." };
     const tabIds = (await this.api.tabs.query()).filter(t => t.groupId === groupId).map(t => t.id);
     return { ok: true, already: false, title: info.title, tabCount: tabIds.length, tabIds, shared };
   }
@@ -693,8 +741,10 @@ export class TabManager {
     if (members.length === 0) return { ok: false, code: "bad_args", message: `Group ${groupId} has no tab.` };
     // Only the tabs the user saw in the prompt may be taken. Removed tabs are fine. A new tab means the user approved something else.
     if (members.some(t => !counted.includes(t.id))) return { ok: false, code: "forbidden_tab", message: "The group changed while the prompt was open. Ask again." };
+    const created = new Set<number>(); // tabs the old own-group session made itself: they stay owned, not adopted
     for (const [id, o] of [...this.sessions]) {
       if (id === ref.id) continue;
+      if (o.groupId === groupId && o.identity === ref.identity) for (const t of members) if (o.tabIds.has(t.id) && !o.adopted.has(t.id)) created.add(t.id);
       if (o.groupId === groupId) o.groupId = -1;
       for (const t of members) { o.tabIds.delete(t.id); o.adopted.delete(t.id); o.approved?.delete(t.id); }
       if (o.tabIds.size === 0 && o.groupId === -1 && !this.queues.has(id) && this.grantedGroups(id).length === 0) this.sessions.delete(id);
@@ -702,7 +752,7 @@ export class TabManager {
     const s = this.session(ref);
     s.groupId = groupId;
     s.approved ??= new Set();
-    for (const t of members) { s.tabIds.add(t.id); s.adopted.add(t.id); s.approved.add(t.id); }
+    for (const t of members) { s.tabIds.add(t.id); if (!created.has(t.id)) s.adopted.add(t.id); s.approved.add(t.id); }
     this.persist();
     await this.refreshAgents();
     return c;
@@ -754,6 +804,7 @@ export class TabManager {
     }
     if (this.sessions.get(id)?.tabIds.size === 0) this.sessions.delete(id);
     this.lastSeen.delete(id);
+    this.lastCall.delete(id);
     this.persist();
   }
 
@@ -776,7 +827,7 @@ export class TabManager {
           }
           if (release.length > 0) await this.api.tabs.ungroup(release).catch(() => {});
         }
-        for (const tabId of created) await this.api.tabs.remove(tabId).catch(() => {}); // already closed by the user: fine
+        for (const tabId of created) if (!s.approved?.has(tabId)) await this.api.tabs.remove(tabId).catch(() => {}); // an approved tab is never closed; a tab the user already closed is fine
       }
       this.sessions.delete(id);
       this.endSession(id);
@@ -790,18 +841,18 @@ export class TabManager {
   /** A call of the session starts: the session is live until the call ends, however long it runs. */
   callStarted(sessionId: string): void {
     this.busy.set(sessionId, (this.busy.get(sessionId) ?? 0) + 1);
-    this.lastSeen.set(sessionId, this.now());
+    this.markCall(sessionId);
   }
 
   callEnded(sessionId: string): void {
     const n = (this.busy.get(sessionId) ?? 1) - 1;
     if (n <= 0) this.busy.delete(sessionId); else this.busy.set(sessionId, n);
-    this.lastSeen.set(sessionId, this.now());
+    this.markCall(sessionId);
   }
 
   /** Records a call from the session. Returns true when the session's name changed (e.g. after /rename). */
   touch(ref: SessionRef): boolean {
-    this.lastSeen.set(ref.id, this.now());
+    this.markCall(ref.id);
     const before = this.sessions.get(ref.id)?.label;
     this.session(ref);
     // An empty label (a caller that does not know the name) never renames the group.
