@@ -75,6 +75,62 @@ describe("OverlayUi", () => {
   });
 });
 
+describe("OverlayUi per-session cursors", () => {
+  const a = { id: "a", identity: "dyn", label: "Chat A", color: "#f97316" };
+  const b = { id: "b", identity: "dyn", label: "Chat B", color: "#22c55e" };
+
+  test("OverlayUi keeps two sessions on one tab and markedTabs works for each", async () => {
+    const ui = new OverlayUi(fakeScripting().s);
+    await ui.markControlled(1, a);
+    await ui.markControlled(1, b);
+    await ui.markControlled(2, a);
+    expect(ui.markedTabs("a").sort()).toEqual([1, 2]);
+    expect(ui.markedTabs("b")).toEqual([1]);
+    expect(ui.has(1)).toBe(true);
+  });
+
+  test("beforeAction sends the acting session's id and colour", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s);
+    await ui.markControlled(1, a);
+    await ui.markControlled(1, b);
+    await ui.beforeAction(1, { x: 1, y: 2, kind: "click" });
+    const act = f.calls.filter(c => c.method === "action").at(-1)!;
+    expect(act.arg).toMatchObject({ sessionId: "b", color: "#22c55e", tag: "Chat B" });
+  });
+
+  test("unmarkSession removes one session and keeps the other marked", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s);
+    await ui.markControlled(1, a);
+    await ui.markControlled(1, b);
+    await ui.unmarkSession(1, "b");
+    expect(f.calls.filter(c => c.method === "unmark").map(c => c.arg)).toEqual([{ sessionId: "b" }]);
+    expect(ui.markedTabs("a")).toEqual([1]);
+    expect(ui.markedTabs("b")).toEqual([]);
+    expect(ui.has(1)).toBe(true);
+    await ui.unmarkSession(1, "a");
+    expect(ui.has(1)).toBe(false);
+  });
+
+  test("a session with no colour falls back to the identity colour (external agents unchanged)", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s);
+    await ui.markControlled(1, session);
+    expect(f.calls[0]!.arg).toMatchObject({ sessionId: "s", color: hexForIdentity("dyn"), tag: "dyn" });
+  });
+
+  test("refresh re-marks every session still active on the tab", async () => {
+    const f = fakeScripting();
+    const ui = new OverlayUi(f.s, () => 0);
+    await ui.markControlled(1, a);
+    await ui.markControlled(1, b);
+    await ui.refresh(1);
+    const marks = f.calls.filter(c => c.method === "mark").slice(2).map(c => (c.arg as { sessionId: string }).sessionId).sort();
+    expect(marks).toEqual(["a", "b"]);
+  });
+});
+
 describe("side panel view", () => {
   const base: PanelStatus = { status: "connected", paused: false, inflight: 0, signedIn: true, sessions: [] };
   test("paused shows Resume as the primary action", () => {

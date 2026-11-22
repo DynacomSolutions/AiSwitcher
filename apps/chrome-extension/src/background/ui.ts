@@ -3,7 +3,7 @@ import { colorForIdentity } from "./tabs.ts";
 
 export type ActionKind = "click" | "hover" | "type" | "scroll" | "key";
 export interface ActionPoint { x: number; y: number; kind: ActionKind }
-export interface UiSession { id: string; identity: string; label: string }
+export interface UiSession { id: string; identity: string; label: string; color?: string }
 
 export interface Ui {
   /** Called before the executor dispatches input; x,y are viewport CSS pixels. Awaited; must settle within BEFORE_ACTION_MAX_MS and honour the signal. */
@@ -12,6 +12,8 @@ export interface Ui {
   markControlled(tabId: number, session: UiSession): Promise<void> | void;
   /** Clears cursor and indicator from one tab (tab released, closed or session ended). */
   unmark(tabId: number): Promise<void> | void;
+  /** Clears one session from one tab. The other sessions on the tab stay marked. */
+  unmarkSession?(tabId: number, sessionId: string): Promise<void> | void;
   /** Clears every marked tab (Stop, Pause). */
   unmarkAll(): Promise<void> | void;
   /** Hides the overlay so it is neither captured by a screenshot nor hit by synthetic mouse input. Best effort, capped at SUSPEND_MAX_MS. */
@@ -31,6 +33,7 @@ export const noopUi: Ui = {
   beforeAction() {},
   markControlled() {},
   unmark() {},
+  unmarkSession() {},
   unmarkAll() {},
   suspend() {},
   restore() {},
@@ -80,7 +83,9 @@ const withTimeout = <T>(p: Promise<T>, ms: number, signal?: AbortSignal): Promis
 
 /** In-page overlay: cursor, ripple, border glow and the controlling pill. Everything is best effort. */
 export class OverlayUi implements Ui {
-  private readonly marked = new Map<number, UiSession>();
+  /** tabId -> sessions marked on it. Map order is mark order; the acting session is `acting`. */
+  private readonly marked = new Map<number, Map<string, UiSession>>();
+  private readonly acting = new Map<number, string>();
   private readonly lastActive = new Map<number, number>();
 
   constructor(private readonly scripting: Scripting = realScripting(), private readonly now: () => number = Date.now) {}
@@ -89,7 +94,7 @@ export class OverlayUi implements Ui {
 
   /** Tabs currently marked as controlled by the given session. */
   markedTabs(sessionId: string): number[] {
-    return [...this.marked].filter(([, s]) => s.id === sessionId).map(([id]) => id);
+    return [...this.marked].filter(([, m]) => m.has(sessionId)).map(([id]) => id);
   }
 
   /** `inject` allows a first-time content script injection; `wanted` is re-checked after it so a concurrent unmark wins. */
@@ -107,18 +112,22 @@ export class OverlayUi implements Ui {
     }
   }
 
-  private payload(s: UiSession): { identity: string; label: string; color: string } {
-    return { identity: s.identity, label: s.label, color: hexForIdentity(s.identity) };
+  /** A chat session has its own colour and shows its chat name. An external agent keeps the identity colour and tag. */
+  private payload(s: UiSession): { sessionId: string; identity: string; label: string; color: string; tag: string } {
+    return { sessionId: s.id, identity: s.identity, label: s.label, color: s.color ?? hexForIdentity(s.identity), tag: s.color ? s.label : s.identity };
   }
 
   async markControlled(tabId: number, session: UiSession): Promise<void> {
-    this.marked.set(tabId, session);
+    let m = this.marked.get(tabId);
+    if (!m) this.marked.set(tabId, m = new Map());
+    m.set(session.id, session);
+    this.acting.set(tabId, session.id);
     this.lastActive.set(tabId, this.now());
     await this.run(tabId, "mark", this.payload(session), true, () => this.marked.has(tabId));
   }
 
   async beforeAction(tabId: number, point: ActionPoint, signal?: AbortSignal): Promise<void> {
-    const session = this.marked.get(tabId);
+    const session = this.marked.get(tabId)?.get(this.acting.get(tabId) ?? "");
     if (!session || signal?.aborted) return;
     this.lastActive.set(tabId, this.now());
     await withTimeout(this.run(tabId, "action", { ...point, ...this.payload(session) }, true, () => this.marked.has(tabId)), BEFORE_ACTION_MAX_MS, signal);
@@ -136,26 +145,42 @@ export class OverlayUi implements Ui {
 
   async unmark(tabId: number): Promise<void> {
     this.lastActive.delete(tabId);
+    this.acting.delete(tabId);
     if (!this.marked.delete(tabId)) return;
     await this.run(tabId, "unmark", null, false);
+  }
+
+  async unmarkSession(tabId: number, sessionId: string): Promise<void> {
+    const m = this.marked.get(tabId);
+    if (!m?.delete(sessionId)) return;
+    if (m.size === 0) {
+      this.marked.delete(tabId);
+      this.acting.delete(tabId);
+      this.lastActive.delete(tabId);
+    } else if (this.acting.get(tabId) === sessionId) {
+      this.acting.set(tabId, [...m.keys()].at(-1)!);
+    }
+    await this.run(tabId, "unmark", { sessionId }, false);
   }
 
   async unmarkAll(): Promise<void> {
     const ids = [...this.marked.keys()];
     this.marked.clear();
+    this.acting.clear();
     this.lastActive.clear();
     await Promise.all(ids.map(id => this.run(id, "unmark", null, false)));
   }
 
   /** A controlled tab finished loading a new page: the overlay died with the old document, so draw it again, unless the session went quiet. */
   async refresh(tabId: number): Promise<void> {
-    const s = this.marked.get(tabId);
-    if (!s) return;
+    const m = this.marked.get(tabId);
+    if (!m) return;
     if (this.now() - (this.lastActive.get(tabId) ?? 0) > SESSION_IDLE_MS) {
       this.marked.delete(tabId);
+      this.acting.delete(tabId);
       this.lastActive.delete(tabId);
       return;
     }
-    await this.run(tabId, "mark", this.payload(s), true, () => this.marked.has(tabId));
+    for (const s of [...m.values()]) await this.run(tabId, "mark", this.payload(s), true, () => this.marked.has(tabId));
   }
 }

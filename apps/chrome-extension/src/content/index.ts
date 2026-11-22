@@ -1,13 +1,13 @@
 // Content script injected on demand into controlled tabs. Exposes globalThis.__aisOverlay, which lives in the extension's
 // isolated world: page scripts cannot see it. The shadow root is closed and kept in this closure for the same reason.
-import { createCursor, CURSOR_CSS, type CursorKind } from "./cursor.ts";
+import { createCursors, CURSOR_CSS, type CursorKind } from "./cursor.ts";
 import { createIndicator, INDICATOR_CSS } from "./indicator.ts";
 
 const HOST_ID = "ais-browser-overlay";
 /** No tool call for this long: the session is treated as over and the overlay goes away. */
 const SESSION_IDLE_MS = 90_000;
 
-interface MarkArg { identity: string; label: string; color: string }
+interface MarkArg { sessionId: string; identity: string; label: string; color: string; tag?: string }
 interface ActionArg extends MarkArg { x: number; y: number; kind: CursorKind }
 
 /** Injected by build.ts: true only in the e2e build. */
@@ -18,7 +18,8 @@ const g = globalThis as unknown as { __aisOverlay?: unknown };
 function init(): void {
   let host: HTMLElement | null = null;
   let root: ShadowRoot | undefined;
-  let cursor: ReturnType<typeof createCursor> | undefined;
+  let cursors: ReturnType<typeof createCursors> | undefined;
+  const meta = new Map<string, { colour: string; tag: string }>();
   let indicator: ReturnType<typeof createIndicator> | undefined;
   let expiry: ReturnType<typeof setTimeout> | undefined;
   let suspended = false;
@@ -39,8 +40,8 @@ function init(): void {
     }
   }
 
-  function ensure(): { cursor: NonNullable<typeof cursor>; indicator: NonNullable<typeof indicator> } {
-    if (host?.isConnected && root && cursor && indicator) return { cursor, indicator };
+  function ensure(): { cursors: NonNullable<typeof cursors>; indicator: NonNullable<typeof indicator> } {
+    if (host?.isConnected && root && cursors && indicator) return { cursors, indicator };
     document.getElementById(HOST_ID)?.remove();
     host = document.createElement("div");
     host.id = HOST_ID;
@@ -50,11 +51,11 @@ function init(): void {
     const style = document.createElement("style");
     style.textContent = `${CURSOR_CSS}\n${INDICATOR_CSS}`;
     root.append(style);
-    cursor = createCursor(root);
+    cursors = createCursors(root);
     indicator = createIndicator(root, requestStop);
     applySuspended();
     (document.documentElement ?? document).append(host);
-    return { cursor, indicator };
+    return { cursors, indicator };
   }
 
   function touch(): void {
@@ -81,22 +82,33 @@ function init(): void {
       o.indicator.show(a.identity, a.label, a.color);
       touch();
       if (a.kind !== "key") {
-        await o.cursor.moveTo(a.x, a.y, a.identity, a.color);
-        o.cursor.ripple(a.x, a.y, a.kind, a.color);
+        const tag = a.tag ?? a.identity;
+        meta.set(a.sessionId, { colour: a.color, tag });
+        o.cursors.hideOthers(a.sessionId);
+        const c = o.cursors.for(a.sessionId);
+        await c.moveTo(a.x, a.y, tag, a.color);
+        c.ripple(a.x, a.y, a.kind, a.color);
       }
       return "ok";
     },
     /** Hide while the agent captures the page or sends synthetic mouse input. */
     suspend(): string { suspended = true; applySuspended(); return "ok"; },
     restore(): string { suspended = false; applySuspended(); return "ok"; },
-    unmark(): string {
+    /** With a session id: remove that session's cursor only. Without: clear everything. */
+    unmark(a?: { sessionId?: string } | null): string {
+      if (a?.sessionId) {
+        cursors?.remove(a.sessionId);
+        meta.delete(a.sessionId);
+        if (cursors && cursors.entries().length > 0) return "ok";
+      }
       clearTimeout(expiry);
-      cursor?.destroy();
+      cursors?.destroy();
+      meta.clear();
       indicator?.destroy();
       host?.remove();
       host = null;
       root = undefined;
-      cursor = undefined;
+      cursors = undefined;
       indicator = undefined;
       suspended = false;
       return "ok";
@@ -115,6 +127,7 @@ function init(): void {
           pillOn: root.querySelector(".pill.on") !== null,
           glowOn: root.querySelector(".glow.on") !== null,
           cursor: rect(root.querySelector(".cursor")),
+          cursors: (cursors?.entries() ?? []).map(([sessionId, c]) => ({ sessionId, rect: rect(c.el), colour: meta.get(sessionId)?.colour ?? "", tag: meta.get(sessionId)?.tag ?? "" })),
           stop: rect(stopButton),
         };
       },
