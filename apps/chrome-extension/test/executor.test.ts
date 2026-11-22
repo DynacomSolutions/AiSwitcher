@@ -210,7 +210,7 @@ describe("args and tools", () => {
   });
 
   test("every tool except list_browsers has a schema", () => {
-    expect(Object.keys(TOOL_SCHEMAS)).toHaveLength(21);
+    expect(Object.keys(TOOL_SCHEMAS)).toHaveLength(23);
     expect(Object.keys(TOOL_SCHEMAS)).toContain("handle_dialog");
     expect(Object.keys(TOOL_SCHEMAS)).toContain("upload_file");
     expect(validateToolArgs("click", { tabId: 1, coordinate: [1, 2] })).toBeUndefined();

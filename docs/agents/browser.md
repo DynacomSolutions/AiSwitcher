@@ -84,7 +84,14 @@ Deploy: the gateway image must contain this code. No new config is needed. The d
 
 ## Tools
 
-`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
+`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `split_tabs`, `unsplit_tabs`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
+
+Split view (two tabs side by side) needs Chrome 155 or later. Older Chrome versions fail these calls with `bad_args` and the message "Split view needs Chrome 155 or later. This Chrome is <version>."
+
+- `split_tabs {tabIds: [a, b]}` joins two tabs into one split view and returns `{splitViewId, tabIds}`. Both tabs must be in the session or in a group granted to it, else `forbidden_tab`. They must share one window, one tab group and one pinned state, and neither may be in another split view. If they are not next to each other, the second tab moves to sit right after the first. It keeps its group and window and is not reloaded or activated. Calling it again for tabs already in the same split view succeeds with the same `splitViewId`.
+- `unsplit_tabs {tabId}` ends the split view that holds the tab. Every tab of that split view must be in the session or a granted group, else `forbidden_tab`. The tabs stay open.
+- `tabs_create {splitWithTabId}` opens the new tab in a split view with a tab of the session. The new tab stays in the background and joins the group of that tab: tracked as a created tab in the session group, or as a tab in the granted group (it stays open when the session ends). It cannot be combined with `groupId`.
+- `tabs_context` adds `splitViewId` to each tab that is in a split view.
 
 `resize` emulates the tab's viewport over CDP (`Emulation.setDeviceMetricsOverride`, like DevTools responsive mode). It never resizes or moves the browser window. The override ends when the session detaches.
 
