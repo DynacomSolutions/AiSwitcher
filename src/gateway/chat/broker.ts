@@ -9,6 +9,7 @@ import { KubeHttpError } from "./kube-http.ts";
 import { sessionName, type PodHandle, type PodTransport } from "./kube.ts";
 import { PodStartError, type Timers } from "./pod-transport.ts";
 import { ChatClosedError, ChatExistsError, ChatLeaseLostError, type ChatRecord, type ChatStore, type LeaseFence } from "./types.ts";
+import type { ChatBus, ChatBusMsg } from "./bus.ts";
 import { mintChatToken, verifyChatToken } from "./token.ts";
 
 const DAY_MS = 86_400_000;
@@ -27,10 +28,25 @@ const HUNG_MESSAGE = "The agent did not stop. It was restarted. Send a message t
 const STATE_TRIES = 3;
 const STATE_BACKOFF_MS = 50;
 const RESTART_NOTICE = "This chat restarted. The agent does not remember earlier messages.";
+const RESUMED_NOTICE = "The agent resumed this chat.";
+const BUSY_NOTICE = "The agent was still working, so it did not take your last message. Send it again.";
+const UNREACHABLE_MESSAGE = "Your message could not reach the agent. Send it again.";
+const DRAINING_MESSAGE = "The gateway is restarting. Try again in a moment.";
+const DEFAULT_FORWARD_ACK_MS = 10_000;
+const DEFAULT_FORWARD_ACK_TRIES = 8;
+const DEFAULT_SWEEP_MS = 60_000;
 const DEFAULT_START_TIMEOUT_MS = 5 * 60_000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** The agent may use the browser tools only through this MCP server name. */
 const MCP_NAME = "ais-browser";
+
+/** The idle limit from AIS_GATEWAY_CHAT_IDLE_MINUTES: default 2 hours, at most 3 hours, a bad value means the default. */
+export function chatIdleMsFromEnv(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.AIS_GATEWAY_CHAT_IDLE_MINUTES;
+  const minutes = raw === undefined || raw.trim() === "" ? Number.NaN : Number(raw);
+  if (!Number.isFinite(minutes) || minutes <= 0) return DEFAULT_IDLE_MS;
+  return Math.min(Math.round(minutes * 60_000), MAX_IDLE_MS);
+}
 
 const realTimers: Timers = { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>) };
 
@@ -56,6 +72,14 @@ export interface BrokerDeps {
   /** A chat older than this gets no principal. Default 7 days. */
   maxAgeMs?: number;
   publish(chatId: string, seq: number): void;
+  /** Talks to the other replicas. Without it this replica works alone. */
+  bus?: ChatBus;
+  /** After a prompt went to another replica, wait this long for the chat to move on. Then check again. Default 10 seconds. */
+  forwardAckMs?: number;
+  /** Checks of a forwarded prompt before it counts as unreachable. Default 8. */
+  forwardAckTries?: number;
+  /** Time between idle sweeps. Default 60 seconds. */
+  sweepMs?: number;
   identityOf(binding: string): Promise<string | undefined>;
   /** Time limit of one ACP request in the start path. */
   acpTimeoutMs?: number;
@@ -144,6 +168,10 @@ const abortable = <T>(p: Promise<T>, signal: AbortSignal): Promise<T> =>
 /** Older generations of one chat that a new start removes. Bounded, so the loop stays short. */
 const OLD_GENERATIONS = 10;
 
+const clearTimeoutSafe = (t: Timers, h: unknown): void => {
+  if (h !== undefined) t.clearTimeout(h);
+};
+
 export class ChatBroker implements ChatAuth {
   private readonly runtimes = new Map<string, ChatRuntime>();
   private readonly starting = new Map<string, { promise: Promise<ChatRuntime | undefined>; ac: AbortController; ending?: boolean }>();
@@ -154,9 +182,46 @@ export class ChatBroker implements ChatAuth {
   /** One write path per chat on this replica: starts, close, link, configure and rename run one after the other. */
   private readonly locks = new Map<string, Promise<void>>();
   private readonly timers: Timers;
+  /** The turn of each chat with an accepted prompt, until it ends. Drain waits for them. */
+  private readonly turnDone = new Map<string, Promise<void>>();
+  /** Chats whose start found a live lease of another replica. The prompt then goes to that replica. */
+  private readonly denied = new Set<string>();
+  /** Highest event number this replica told its own listeners about, per chat. */
+  private readonly notified = new Map<string, number>();
+  private readonly watches = new Set<unknown>();
+  private draining = false;
+  private unsubscribe: (() => Promise<void>) | undefined;
+  private sweepTimer: unknown;
+  private stopped = false;
 
   constructor(private readonly d: BrokerDeps) {
     this.timers = d.timers ?? realTimers;
+  }
+
+  /** Listen to the bus and sweep idle chats on a timer. Call once. */
+  async start(): Promise<void> {
+    if (this.d.bus && !this.unsubscribe) this.unsubscribe = await this.d.bus.subscribe((m) => this.onBus(m));
+    this.armSweep();
+  }
+
+  private armSweep(): void {
+    if (this.stopped || this.draining) return;
+    this.sweepTimer = this.timers.setTimeout(() => {
+      void this.sweepIdle()
+        .catch(() => this.d.metrics.chatError("other"))
+        .finally(() => this.armSweep());
+    }, this.d.sweepMs ?? DEFAULT_SWEEP_MS);
+  }
+
+  /** Tell the listeners of this replica, and the other replicas, that a chat has a new event. */
+  private notify(chatId: string, seq: number): void {
+    if (seq > (this.notified.get(chatId) ?? 0)) this.notified.set(chatId, seq);
+    this.d.publish(chatId, seq);
+    this.send({ t: "event", chatId, seq });
+  }
+
+  private send(m: ChatBusMsg): Promise<void> {
+    return (this.d.bus?.publish(m) ?? Promise.resolve()).catch(() => this.d.metrics.chatError("other"));
   }
 
   private get leaseTtl(): number {
@@ -191,14 +256,17 @@ export class ChatBroker implements ChatAuth {
   /** Write the state of a chat and tell the listeners, so the summary follows. */
   private async writeState(chatId: string, patch: Parameters<ChatStore["update"]>[1], fence: LeaseFence): Promise<void> {
     const rec = await this.d.store.update(chatId, patch, fence);
-    if (rec) this.d.publish(chatId, rec.lastSeq);
+    if (rec) {
+      this.d.publish(chatId, rec.lastSeq);
+      void this.send({ t: "state", chatId });
+    }
   }
 
   /** Events always go through the store, then out to the listeners. Returns false when the lease is lost. */
   private async emit(chatId: string, body: ChatBody, fence: LeaseFence): Promise<boolean> {
     try {
       const seq = await this.d.store.appendEvent(chatId, body, fence);
-      this.d.publish(chatId, seq);
+      this.notify(chatId, seq);
       return true;
     } catch (e) {
       if (e instanceof ChatLeaseLostError) return false;
@@ -296,7 +364,10 @@ export class ChatBroker implements ChatAuth {
     const pre = await store.get(chatId);
     if (!pre || pre.state === "closed") return undefined;
     const epoch = await store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now());
-    if (epoch === undefined) return undefined;
+    if (epoch === undefined) {
+      this.denied.add(chatId);
+      return undefined;
+    }
     const fence: LeaseFence = { replica: this.d.replicaId, epoch };
     const lease: Lease = { chatId, fence, timer: undefined, stopped: false, onLost: () => undefined };
 
@@ -396,6 +467,7 @@ export class ChatBroker implements ChatAuth {
         if (loaded) {
           sessionId = chat.acpSessionId;
           metrics.chatSession("session_resumed");
+          this.queue(ctx, () => this.emit(chatId, { k: "notice", text: RESUMED_NOTICE }, fence));
         } else {
           this.queue(ctx, () => this.emit(chatId, { k: "notice", text: RESTART_NOTICE }, fence));
         }
@@ -616,6 +688,8 @@ export class ChatBroker implements ChatAuth {
       const options = p.options.slice(0, 64).map((o) => ({ id: short(o.id), name: short(o.name), kind: short(o.kind) }));
       this.push(ctx, { k: "permission", requestId, rpcId: typeof p.rpcId === "string" ? shortField(p.rpcId) : p.rpcId, title: cut(p.title), options });
       this.setState(ctx, "waiting");
+      // A draining replica answers every ask as cancelled at once, so the turn can end.
+      if (this.draining) queueMicrotask(() => this.resolvePerm(ctx, requestId, undefined));
     });
   }
 
@@ -640,6 +714,7 @@ export class ChatBroker implements ChatAuth {
    * A dormant chat gets a new pod first. Failures show in the feed.
    */
   async prompt(chatId: string, binding: string, text: string): Promise<BrokerReject | undefined> {
+    if (this.draining) return { code: "unavailable", message: DRAINING_MESSAGE };
     const busy: BrokerReject = { code: "busy", message: "The agent is still working on the last message." };
     const st = this.starting.get(chatId);
     if (this.turning.has(chatId) || (st && !st.ending)) return busy;
@@ -661,30 +736,251 @@ export class ChatBroker implements ChatAuth {
         if ((chat.state === "thinking" || chat.state === "waiting") && leased) return busy;
       }
       const seq = await this.d.store.appendEvent(chatId, { k: "user", text: clean(text) });
-      this.d.publish(chatId, seq);
+      this.notify(chatId, seq);
       handed = true;
-      void this.runPrompt(chatId, clean(text)).finally(() => this.turning.delete(chatId));
+      this.launch(chatId, clean(text), seq);
       return undefined;
     } finally {
       if (!handed) this.turning.delete(chatId);
     }
   }
 
-  private async runPrompt(chatId: string, text: string): Promise<void> {
+  /** Start the turn of an accepted prompt. The chat must be in `turning`. */
+  private launch(chatId: string, text: string, seq: number): void {
+    const done = this.runPrompt(chatId, text, seq).finally(() => {
+      this.turning.delete(chatId);
+      if (this.turnDone.get(chatId) === done) this.turnDone.delete(chatId);
+    });
+    this.turnDone.set(chatId, done);
+  }
+
+  private async runPrompt(chatId: string, text: string, seq: number): Promise<void> {
     try {
-      const rt = await this.startPod(chatId);
-      // A cancel that came while the pod started ends the turn before it begins.
-      const early = this.cancelledEarly.delete(chatId);
-      if (!rt) return;
-      if (early) {
-        this.push(rt.ctx, { k: "turn_end", stopReason: "cancelled" });
-        this.d.metrics.chatTurn("cancelled");
-        await rt.ctx.chain;
-      } else await this.runTurn(rt, text);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const rt = await this.startPod(chatId);
+        // A cancel that came while the pod started ends the turn before it begins.
+        const early = this.cancelledEarly.delete(chatId);
+        if (rt) {
+          if (early) {
+            this.push(rt.ctx, { k: "turn_end", stopReason: "cancelled" });
+            this.d.metrics.chatTurn("cancelled");
+            await rt.ctx.chain;
+          } else await this.runTurn(rt, text);
+          return;
+        }
+        // A start that failed shows its error in the feed. A start that met another owner sends the prompt there.
+        if (!this.denied.delete(chatId)) return;
+        const chat = await this.d.store.get(chatId);
+        if (!chat || chat.state === "closed") return;
+        const owner = this.liveOwner(chat);
+        if (owner !== undefined) {
+          await this.send({ t: "cmd", to: owner, chatId, cmd: "prompt", seq });
+          this.watch(chatId, seq, 1);
+          return;
+        }
+      }
+      this.d.metrics.chatError("owner_unreachable");
+      await this.feedNotice(chatId, UNREACHABLE_MESSAGE);
     } catch {
       this.d.metrics.chatError("other");
     } finally {
       this.cancelledEarly.delete(chatId);
+    }
+  }
+
+  /** The replica that holds a live lease of the chat, when it is not this one. */
+  private liveOwner(chat: ChatRecord): string | undefined {
+    if (chat.ownerReplica === undefined || chat.ownerReplica === this.d.replicaId) return undefined;
+    return chat.leaseUntil !== undefined && chat.leaseUntil > this.d.now() ? chat.ownerReplica : undefined;
+  }
+
+  /** Put an error item in the feed. It needs the lease, so it takes the lease for the write. It never throws. */
+  private async feedNotice(chatId: string, message: string): Promise<void> {
+    try {
+      const epoch = await this.d.store.acquireLease(chatId, this.d.replicaId, this.leaseTtl, this.d.now());
+      if (epoch === undefined) return;
+      const fence: LeaseFence = { replica: this.d.replicaId, epoch };
+      try {
+        await this.emit(chatId, { k: "error", code: "unavailable", message }, fence);
+      } finally {
+        await this.d.store.releaseLease(chatId, fence).catch(() => undefined);
+      }
+    } catch {
+      // The metric already counted it.
+    }
+  }
+
+  /**
+   * After a prompt went to another replica, check that the chat moved on. When nothing followed the prompt and no replica holds
+   * a live lease, this replica runs the prompt itself. A live owner that stays silent is counted.
+   */
+  private watch(chatId: string, seq: number, tries: number): void {
+    if (this.stopped) return;
+    const handle = this.timers.setTimeout(() => {
+      this.watches.delete(handle);
+      void this.checkForwarded(chatId, seq, tries).catch(() => this.d.metrics.chatError("other"));
+    }, this.d.forwardAckMs ?? DEFAULT_FORWARD_ACK_MS);
+    this.watches.add(handle);
+  }
+
+  private async checkForwarded(chatId: string, seq: number, tries: number): Promise<void> {
+    if (this.stopped || this.draining) return;
+    const chat = await this.d.store.get(chatId);
+    if (!chat || chat.state === "closed" || chat.lastSeq !== seq) return;
+    if (this.liveOwner(chat) !== undefined) {
+      if (tries >= (this.d.forwardAckTries ?? DEFAULT_FORWARD_ACK_TRIES)) this.d.metrics.chatError("owner_unreachable");
+      else this.watch(chatId, seq, tries + 1);
+      return;
+    }
+    const row = (await this.d.store.events(chatId, seq - 1, 1))[0];
+    if (row?.seq === seq && row.body.k === "user") await this.acceptStored(chatId, row.body.text, seq);
+  }
+
+  /** Run a prompt whose user event is already in the store. A busy chat gets a feed item, so the prompt is never lost. */
+  private async acceptStored(chatId: string, text: string, seq: number): Promise<void> {
+    if (this.draining) return;
+    const st = this.starting.get(chatId);
+    const rt = this.runtimes.get(chatId);
+    if (this.turning.has(chatId) || (st && !st.ending) || rt?.ctx.busy) {
+      await this.busyNotice(chatId);
+      return;
+    }
+    const chat = await this.d.store.get(chatId);
+    if (!chat || chat.state === "closed") return;
+    this.turning.add(chatId);
+    this.cancelledEarly.delete(chatId);
+    this.launch(chatId, text, seq);
+  }
+
+  private async busyNotice(chatId: string): Promise<void> {
+    const st = this.starting.get(chatId);
+    if (st) await st.promise.catch(() => undefined);
+    const rt = this.runtimes.get(chatId);
+    if (rt) this.push(rt.ctx, { k: "notice", text: BUSY_NOTICE });
+  }
+
+  /**
+   * One entry for every user command. The replica that owns the chat runs it. Another replica sends it over the bus.
+   * A chat that nobody owns is taken by this replica for a prompt. Returns a reject when the command cannot run.
+   */
+  async dispatch(c: { chatId: string; binding: string; cmd: Extract<ChatBusMsg, { t: "cmd" }>["cmd"]; args?: Record<string, unknown> }): Promise<BrokerReject | undefined> {
+    const chat = await this.d.store.get(c.chatId);
+    if (!chat || chat.binding !== c.binding) return { code: "bad_request", message: "This chat does not exist." };
+    if (chat.state === "closed") return c.cmd === "close" ? undefined : { code: "bad_request", message: "This chat is closed." };
+    if (this.draining && c.cmd === "prompt") return { code: "unavailable", message: DRAINING_MESSAGE };
+    const owner = this.liveOwner(chat);
+    if (owner === undefined) return this.runLocal(c);
+    return this.forward(chat, owner, c);
+  }
+
+  private async forward(chat: ChatRecord, owner: string, c: { chatId: string; cmd: Extract<ChatBusMsg, { t: "cmd" }>["cmd"]; args?: Record<string, unknown> }): Promise<BrokerReject | undefined> {
+    if (!this.d.bus) return { code: "unavailable", message: "Another gateway replica runs this chat." };
+    const msg: Extract<ChatBusMsg, { t: "cmd" }> = { t: "cmd", to: owner, chatId: c.chatId, cmd: c.cmd };
+    if (c.args) msg.args = c.args;
+    if (c.cmd === "prompt") {
+      const text = typeof c.args?.text === "string" ? clean(c.args.text) : "";
+      if (chat.state === "thinking" || chat.state === "waiting") return { code: "busy", message: "The agent is still working on the last message." };
+      const seq = await this.d.store.appendEvent(c.chatId, { k: "user", text });
+      this.notify(c.chatId, seq);
+      // The text stays in the store. The bus carries only its number.
+      delete msg.args;
+      msg.seq = seq;
+      await this.send(msg);
+      this.watch(c.chatId, seq, 1);
+      return undefined;
+    }
+    await this.send(msg);
+    return undefined;
+  }
+
+  private async runLocal(c: { chatId: string; binding: string; cmd: Extract<ChatBusMsg, { t: "cmd" }>["cmd"]; args?: Record<string, unknown> }): Promise<BrokerReject | undefined> {
+    const a = c.args ?? {};
+    try {
+      switch (c.cmd) {
+        case "prompt":
+          return await this.prompt(c.chatId, c.binding, typeof a.text === "string" ? a.text : "");
+        case "cancel":
+          await this.cancel(c.chatId);
+          return undefined;
+        case "permission":
+          if (typeof a.requestId === "string") await this.answerPermission(c.chatId, a.requestId, typeof a.optionId === "string" ? a.optionId : undefined);
+          return undefined;
+        case "configure":
+          if (typeof a.name === "string") await this.rename(c.chatId, a.name);
+          await this.configure(c.chatId, { ...(typeof a.model === "string" ? { model: a.model } : {}), ...(typeof a.effort === "string" ? { effort: a.effort } : {}) });
+          return undefined;
+        case "link":
+          if (Array.isArray(a.tabIds)) await this.link(c.chatId, a.tabIds.filter((n): n is number => typeof n === "number"));
+          return undefined;
+        case "close":
+          await this.close(c.chatId, "user");
+          return undefined;
+      }
+    } catch (e) {
+      if (!(e instanceof ChatLeaseLostError)) throw e;
+      // Another replica took the lease between the read and the write. Send the command there once.
+      const chat = await this.d.store.get(c.chatId);
+      const owner = chat ? this.liveOwner(chat) : undefined;
+      if (chat && owner !== undefined && c.cmd !== "prompt") return this.forward(chat, owner, c);
+      this.d.metrics.chatError("owner_unreachable");
+      return { code: "unavailable", message: UNREACHABLE_MESSAGE };
+    }
+  }
+
+  private onBus(m: ChatBusMsg): void {
+    if (m.t === "event") {
+      if (m.seq <= (this.notified.get(m.chatId) ?? 0)) return;
+      this.notified.set(m.chatId, m.seq);
+      this.d.publish(m.chatId, m.seq);
+      return;
+    }
+    if (m.t === "state") {
+      void this.d.store.get(m.chatId).then((r) => r && this.d.publish(m.chatId, r.lastSeq), () => undefined);
+      return;
+    }
+    if (m.t !== "cmd" || m.to !== this.d.replicaId) return;
+    void this.onCmd(m).catch(() => this.d.metrics.chatError("other"));
+  }
+
+  private async onCmd(m: Extract<ChatBusMsg, { t: "cmd" }>): Promise<void> {
+    if (m.cmd === "prompt") {
+      if (m.seq === undefined) return;
+      const row = (await this.d.store.events(m.chatId, m.seq - 1, 1))[0];
+      if (row?.seq !== m.seq || row.body.k !== "user") return;
+      await this.acceptStored(m.chatId, row.body.text, m.seq);
+      return;
+    }
+    const chat = await this.d.store.get(m.chatId);
+    if (!chat) return;
+    try {
+      await this.runLocal({ chatId: m.chatId, binding: chat.binding, cmd: m.cmd, ...(m.args ? { args: m.args } : {}) });
+    } catch {
+      this.d.metrics.chatError("other");
+    }
+  }
+
+  /**
+   * Finish this replica's work for a rollout. New prompts are refused. Asks end as cancelled. Turns in flight end by themselves:
+   * there is no timer here, the pod grace period is the only ceiling. Then each pod detaches, each chat goes idle and each lease is released,
+   * so another replica resumes the chat with session/load.
+   */
+  async drain(): Promise<void> {
+    this.draining = true;
+    clearTimeoutSafe(this.timers, this.sweepTimer);
+    for (const h of this.watches) this.timers.clearTimeout(h);
+    this.watches.clear();
+    for (let i = 0; ; i++) {
+      for (const rt of this.runtimes.values()) this.cancelPerms(rt.ctx);
+      const waits = [...this.starting.values()].map((e) => e.promise.catch(() => undefined) as Promise<unknown>).concat([...this.turnDone.values()]);
+      if (waits.length === 0 && this.turning.size === 0) break;
+      await (waits.length > 0 ? Promise.all(waits) : new Promise((r) => setImmediate(r)));
+    }
+    for (const rt of [...this.runtimes.values()]) {
+      await rt.ctx.chain;
+      await this.writeState(rt.chatId, { state: "idle" }, rt.fence).catch(() => undefined);
+      this.drop(rt.chatId);
+      await this.d.transport.stopSession(rt.handle.session).catch(() => undefined);
+      await this.d.store.releaseLease(rt.chatId, rt.fence).catch(() => undefined);
     }
   }
 
@@ -903,6 +1199,12 @@ export class ChatBroker implements ChatAuth {
 
   /** Stop all work of this broker: running starts, streams and lease timers. */
   async dispose(): Promise<void> {
+    this.stopped = true;
+    clearTimeoutSafe(this.timers, this.sweepTimer);
+    for (const h of this.watches) this.timers.clearTimeout(h);
+    this.watches.clear();
+    await this.unsubscribe?.().catch(() => undefined);
+    this.unsubscribe = undefined;
     const waits = [...this.starting.values()].map((s) => {
       s.ac.abort();
       return s.promise.catch(() => undefined);
