@@ -34,9 +34,9 @@ export function inClusterKube(env: NodeJS.ProcessEnv, readFile: (p: string) => s
 /** A reason is a short code. Anything else is replaced, so odd text cannot pass through. */
 export const reasonCode = (r: string | undefined): string => (r && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(r) ? r : "Unknown");
 
-const STATUS_PEEK_BYTES = 300;
+const STATUS_PEEK_BYTES = 8192;
 
-/** Read at most 300 bytes of a Kubernetes Status reply and keep only its short `reason` code. Never throws. */
+/** Read at most 8192 bytes of a Kubernetes Status reply and keep only its short `reason` code. Never throws. */
 async function statusReason(res: Response): Promise<string | undefined> {
   try {
     const reader = res.body?.getReader();

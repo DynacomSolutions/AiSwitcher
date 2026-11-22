@@ -508,7 +508,8 @@ test("inClusterKube reads the token and CA from the given file reader", () => {
 test("a failed request keeps only the short reason of a Status reply on KubeHttpError", async () => {
   const bodies = [
     JSON.stringify({ kind: "Status", reason: "Forbidden", message: "secret-marker-xyz" }),
-    JSON.stringify({ message: "x".repeat(400), reason: "Invalid" }),
+    JSON.stringify({ kind: "Status", apiVersion: "v1", status: "Failure", message: "x".repeat(2000), reason: "Forbidden", code: 403 }),
+    JSON.stringify({ message: "x".repeat(9000), reason: "Invalid" }),
     "plain text secret-marker-xyz",
     JSON.stringify({ reason: "not a code!" }),
   ];
@@ -521,7 +522,7 @@ test("a failed request keeps only the short reason of a Status reply on KubeHttp
       const e = await api.createSession({}).then(() => undefined, (x: any) => x);
       got.push({ status: e.status, op: e.op, kubeReason: e.kubeReason, message: e.message });
     }
-    expect(got.map((g) => g.kubeReason)).toEqual(["Forbidden", undefined, undefined, undefined]);
+    expect(got.map((g) => g.kubeReason)).toEqual(["Forbidden", "Forbidden", undefined, undefined, undefined]);
     expect(got.every((g) => g.status === 403 && g.op === "create" && !g.message.includes("secret-marker"))).toBe(true);
   } finally {
     await server.stop(true);
