@@ -182,3 +182,12 @@ test("check accepts a listed identity and refuses an unlisted one or a model out
   const down = make({ models: async () => { throw new Error("down"); } }).catalog;
   expect(await down.check("claude", "alpha", "anything")).toBe("ok");
 });
+
+test("pools() lists the pools of every provider by their real names, and throws when the ConfigMap cannot be read", async () => {
+  const { catalog } = make();
+  expect(await catalog.pools()).toEqual([{ provider: "claude", name: "team" }]);
+  const down = make({ transport: { catalog: async () => { throw new Error("no ConfigMap"); } } });
+  await expect(down.catalog.pools()).rejects.toThrow("no ConfigMap");
+  const flaky = make({ isPool: async (n) => { if (n === "alpha") throw new Error("lookup"); return n === "beta"; } });
+  expect(await flaky.catalog.pools()).toEqual([{ provider: "codex", name: "beta" }]);
+});

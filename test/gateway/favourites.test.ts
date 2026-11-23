@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import type { FavKey } from "../../src/browser/chat-protocol.ts";
 import { createAdminApp } from "../../src/gateway/admin.ts";
 import { favouritesToken } from "../../src/gateway/favourites-token.ts";
 import type { BrowserBinding } from "../../src/browser/types.ts";
@@ -33,7 +34,7 @@ afterEach(async () => {
 });
 
 /** One gateway replica: hub, service and frames over a shared store and bus. */
-async function replica(shared: { store: MemoryFavouriteStore; bus: MemoryChatBus }, names: Record<string, string>, metrics?: PrometheusMetrics, extra: { maxWaiters?: number } = {}) {
+async function replica(shared: { store: MemoryFavouriteStore; bus: MemoryChatBus }, names: Record<string, string>, metrics?: PrometheusMetrics, extra: Pick<ConstructorParameters<typeof FavouritesService>[0], "maxWaiters" | "pools" | "migrateRetryMs"> = {}) {
   const bindings: Record<string, BrowserBinding> = Object.fromEntries(Object.entries(names).map(([tok, n]) => [tok, binding(n)]));
   let frames!: ChatFrames;
   const hub = new BrowserHub({ authToken: async (t) => bindings[t], onChat: (b, m, r) => frames.handle(b, m, r), onAttach: (b) => frames.onAttach(b) });
@@ -317,4 +318,62 @@ test("the metrics count the calls, the changes and the pushes", async () => {
   await settle();
   const text = h.metrics.render();
   for (const ev of ["socket_list", "socket_set", "http_post", "http_get", "change", "push"]) expect(text).toMatch(new RegExp(`ais_gateway_favourites_total\\{event="${ev}"\\} [1-9]`));
+});
+
+// ---- pool stars: the old form under a pool's real name moves to the pool key ---------------------------------------
+
+const POOLS = [{ provider: "claude" as const, name: "swap-a" }, { provider: "grok" as const, name: "swap-g" }];
+const KEY = (provider: FavKey["provider"], identity: string, model: string): FavKey => ({ provider, identity, model });
+const items = async (store: MemoryFavouriteStore) => (await store.list()).items.map((i) => `${i.provider}/${i.identity}/${i.model}`).sort();
+
+test("the migration moves a star under a pool's name to the pool key in one step, loses none and keeps other stars", async () => {
+  const shared = newShared();
+  const before = Date.now() - 5000;
+  await shared.store.apply([{ ...KEY("claude", "swap-a", "m1"), op: "add", at: before }, { ...KEY("grok", "swap-g", "g1"), op: "add", at: before + 1 }, { ...KEY("claude", "work", "m2"), op: "add", at: before + 2 }, { ...KEY("codex", "swap-a", "x"), op: "add", at: before + 3 }], "t3", Date.now());
+  const seqBefore = (await shared.store.list()).seq;
+  const r = await replica(shared, { a: "bind-a" }, undefined, { pools: async () => POOLS });
+  const ws = await r.connect("a");
+  await settle();
+  // A star of another provider under the same name is not a pool star of that provider.
+  expect(await items(shared.store)).toEqual(["claude/@pool/m1", "claude/work/m2", "codex/swap-a/x", "grok/@pool/g1"]);
+  // The new keys keep the time of the old stars, so the order of the list is the same.
+  expect((await shared.store.list()).items.map((i) => i.model)).toEqual(["m1", "g1", "m2", "x"]);
+  expect((await shared.store.list()).seq).toBeGreaterThan(seqBefore);
+  // The panel that was attached got the new list pushed.
+  expect(ws.of("chat.fav.list").at(-1)!.items.map((i: any) => `${i.identity}/${i.model}`).sort()).toEqual(["@pool/g1", "@pool/m1", "swap-a/x", "work/m2"]);
+  // A second run changes nothing.
+  const seq = (await shared.store.list()).seq;
+  await r.favourites.migratePools();
+  expect((await shared.store.list()).seq).toBe(seq);
+});
+
+test("the migration is idempotent across replicas and keeps a pool key that already exists", async () => {
+  const shared = newShared();
+  await shared.store.apply([{ ...KEY("claude", "swap-a", "m1"), op: "add" }, { ...KEY("claude", "@pool", "m1"), op: "add" }], "t3", Date.now());
+  const a = await replica(shared, {}, undefined, { pools: async () => POOLS });
+  const b = await replica(shared, {}, undefined, { pools: async () => POOLS });
+  await Promise.all([a.favourites.migratePools(), b.favourites.migratePools()]);
+  expect(await items(shared.store)).toEqual(["claude/@pool/m1"]);
+});
+
+test("a change under a pool's name from an older host or panel is stored under the pool key", async () => {
+  const shared = newShared();
+  const r = await replica(shared, { a: "bind-a" }, undefined, { pools: async () => POOLS });
+  const ws = await r.connect("a");
+  await r.send(ws, { t: "chat.fav.set", changes: [{ ...KEY("claude", "swap-a", "m1"), op: "add" }, { ...KEY("claude", "work", "m2"), op: "add" }] });
+  expect(await items(shared.store)).toEqual(["claude/@pool/m1", "claude/work/m2"]);
+  await r.send(ws, { t: "chat.fav.set", changes: [{ ...KEY("claude", "swap-a", "m1"), op: "remove", at: Date.now() + 10 }] });
+  expect(await items(shared.store)).toEqual(["claude/work/m2"]);
+});
+
+test("when the pool names are not known the stars stay as they are, and the migration runs again until it works", async () => {
+  const shared = newShared();
+  await shared.store.apply([{ ...KEY("claude", "swap-a", "m1"), op: "add" }], "t3", Date.now());
+  let up = false;
+  const r = await replica(shared, { a: "bind-a" }, undefined, { pools: async () => { if (!up) throw new Error("no catalogue"); return POOLS; }, migrateRetryMs: 20 });
+  await r.connect("a");
+  expect(await items(shared.store)).toEqual(["claude/swap-a/m1"]);
+  up = true;
+  for (let i = 0; i < 40 && (await items(shared.store))[0] !== "claude/@pool/m1"; i += 1) await Bun.sleep(20);
+  expect(await items(shared.store)).toEqual(["claude/@pool/m1"]);
 });
