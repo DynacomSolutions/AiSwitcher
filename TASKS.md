@@ -392,6 +392,7 @@ ETA: 2026-11-25 18:00 ICT
 | 271 | Chat: keep Codex start warnings out of the reply | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>The warning shows as a notice.<br>Released in v0.5.95. |
 | 272 | Chat: close a binding's chats when its pairing is revoked | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>Chats are visible only to the approval they were made under.<br>Released in v0.5.95. |
 | 273 | Chat: composer with the model picker inside, matching T3 | done | claude | sidepanel-chat-composer | 18.264 | | Input card with the picker inside, on the new-chat screen too (#724).<br>Picker follows the T3 picker.<br>Released in v0.5.99. |
+| 274 | Chat: real provider icons in the picker | in_progress | claude | sidepanel-chat-icons | 18.273 | 2026-11-23 17:00 ICT | Owner: Claude, Codex and the others must show their real icons, as in T3.<br>Reuse the web UI provider icons. |
 
 ## 19. CI speed and flaky tests
 
