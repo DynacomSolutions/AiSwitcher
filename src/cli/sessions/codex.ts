@@ -80,7 +80,7 @@ export function parseMetaLine(line: string | undefined): CodexMeta | undefined {
  * ALSO injects synthetic user messages (`# AGENTS.md instructions` and `<environment_context>` blocks, see isCodexInjectedUserText) that
  * must never become a title or a turn. Returns the first real user text in
  * the file. */
-function userTextFromLine(line: string): string | undefined {
+export function userTextFromLine(line: string): string | undefined {
   const entry = safeJsonParse(line);
   if (!entry) return undefined;
   const payload = entry.payload as Record<string, unknown> | undefined;
