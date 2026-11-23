@@ -332,7 +332,8 @@ describe("the long-running mode", () => {
 });
 
 describe("metrics", () => {
-  test("the snapshot file renders as Prometheus text without a path", () => {
+  const hk = homeKey("/some/t3/home");
+  test("the snapshot file renders as Prometheus text without a path, labelled with the role and the process", () => {
     const dir = scratch();
     cleanups.push(dir);
     const m = new FavSyncMetrics(metricsPathOf("/some/t3/home", dir));
@@ -343,12 +344,47 @@ describe("metrics", () => {
     m.s.refused = 2;
     m.persist();
     const text = renderSnapshots(readSnapshots(dir));
-    for (const name of ["pulls_total", "pushes_total", "writes_total", "errors_total", "last_success_timestamp_seconds"]) expect(text).toContain(`ais_t3_favourites_sync_${name}{home="${homeKey("/some/t3/home")}"}`);
-    expect(text).toContain(`ais_t3_favourites_sync_pulls_total{home="${homeKey("/some/t3/home")}"} 4`);
-    expect(text).toContain(`ais_t3_favourites_sync_errors_total{home="${homeKey("/some/t3/home")}"} 3`);
-    expect(text).toContain(`ais_t3_favourites_sync_refused_total{home="${homeKey("/some/t3/home")}"} 2`);
+    const labels = `{home="${hk}",role="cli",pid="${process.pid}"}`;
+    for (const name of ["pulls_total", "pushes_total", "writes_total", "errors_total", "last_success_timestamp_seconds"]) expect(text).toContain(`ais_t3_favourites_sync_${name}${labels}`);
+    expect(text).toContain(`ais_t3_favourites_sync_pulls_total${labels} 4`);
+    expect(text).toContain(`ais_t3_favourites_sync_errors_total${labels} 3`);
+    expect(text).toContain(`ais_t3_favourites_sync_refused_total${labels} 2`);
     expect(text).not.toContain("/some/t3/home");
     expect(renderSnapshots([])).toBe("");
     expect(readSnapshots(join(dir, "missing"))).toEqual([]);
+  });
+
+  test("two processes for one home write two files and keep two series", () => {
+    const dir = scratch();
+    cleanups.push(dir);
+    expect(metricsPathOf("/h", dir, "daemon", 11)).not.toBe(metricsPathOf("/h", dir, "cli", 11));
+    expect(metricsPathOf("/h", dir, "cli", 11)).not.toBe(metricsPathOf("/h", dir, "cli", 12));
+    const daemon = new FavSyncMetrics(metricsPathOf("/some/t3/home", dir, "daemon"), Date.now, "daemon");
+    const cli = new FavSyncMetrics(metricsPathOf("/some/t3/home", dir, "cli"), Date.now, "cli");
+    daemon.s.pulls = 40;
+    cli.s.pulls = 3;
+    daemon.persist();
+    cli.persist();
+    cli.s.pulls = 4;
+    cli.persist();
+    const text = renderSnapshots(readSnapshots(dir));
+    expect(text).toContain(`ais_t3_favourites_sync_pulls_total{home="${hk}",role="daemon",pid="${process.pid}"} 40`);
+    expect(text).toContain(`ais_t3_favourites_sync_pulls_total{home="${hk}",role="cli",pid="${process.pid}"} 4`);
+  });
+
+  test("a process that exits cleanly removes its file, and a file of a dead process is not served", () => {
+    const dir = scratch();
+    cleanups.push(dir);
+    const m = new FavSyncMetrics(metricsPathOf("/some/t3/home", dir));
+    m.persist();
+    expect(readSnapshots(dir)).toHaveLength(1);
+    m.remove();
+    expect(readSnapshots(dir)).toEqual([]);
+    m.persist();
+    expect(readSnapshots(dir)).toEqual([]);
+    // A crashed process leaves its file. Its pid is gone, so the console does not serve its counters.
+    const dead = new FavSyncMetrics(metricsPathOf("/some/t3/home", dir, "cli", 4_194_303), Date.now, "cli", 4_194_303);
+    dead.persist();
+    expect(readSnapshots(dir)).toEqual([]);
   });
 });

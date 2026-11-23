@@ -56,7 +56,8 @@ export async function runT3Command(positionals: string[], flags: ParsedArgs["fla
       metrics.s.errors += 1;
       throw err;
     } finally {
-      metrics.persist();
+      // A one-shot run keeps no file: its counters are gone with it, and its exit status tells the result.
+      metrics.remove();
     }
   }
 
@@ -76,6 +77,7 @@ export async function runT3Command(positionals: string[], flags: ParsedArgs["fla
     d.out(`t3 favourites sync: following ${homeKey(t3Home)}`);
     await runFavouritesSync(sync, { signal: ctl.signal, ...(fallbackMs !== undefined ? { fallbackMs } : {}) });
   } finally {
+    metrics.remove();
     process.off("SIGTERM", stop);
     process.off("SIGINT", stop);
     await server?.stop(true);

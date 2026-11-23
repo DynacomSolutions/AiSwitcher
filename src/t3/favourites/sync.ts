@@ -7,7 +7,7 @@ import { CHAT_PROVIDERS, favId, MAX_FAVOURITES, parseChatToExt, type ChatProvide
 import type { FavouritesApi } from "./client.ts";
 import { applyGateway, localChanges, sameFavs } from "./merge.ts";
 import type { MapContext } from "./mapping.ts";
-import { favouritesStateDir, type FavSyncMetrics } from "./metrics.ts";
+import { favouritesStateDir, type FavSyncMetrics, type FavSyncRole } from "./metrics.ts";
 import { readT3Settings, settingsPathOf, writeT3Favourites } from "./settings.ts";
 
 /** The name context of the host: the pool name of a provider and the canonical name of an identity. The instances come from settings.json. */
@@ -31,7 +31,8 @@ export interface SyncState { version: 1; seq: number; epoch?: string; synced: Fa
 /** A short, stable name of a T3 home. It is used in file names, in the origin label and in metric labels, so no path leaks. */
 export const homeKey = (t3Home: string): string => createHash("sha256").update(t3Home).digest("hex").slice(0, 8);
 const statePath = (d: Pick<FavSyncDeps, "t3Home" | "stateDir">): string => join(d.stateDir ?? favouritesStateDir(), `${homeKey(d.t3Home)}.json`);
-export const metricsPathOf = (t3Home: string, stateDir = favouritesStateDir()): string => join(stateDir, `${homeKey(t3Home)}.metrics.json`);
+/** The counters file of one process: the role and the pid are in the name, so two processes of one home never share a file. */
+export const metricsPathOf = (t3Home: string, stateDir = favouritesStateDir(), role: FavSyncRole = "cli", pid: number = process.pid): string => join(stateDir, `${homeKey(t3Home)}.${role}-${pid}.metrics.json`);
 
 export async function readState(d: Pick<FavSyncDeps, "t3Home" | "stateDir">): Promise<SyncState | undefined> {
   try {

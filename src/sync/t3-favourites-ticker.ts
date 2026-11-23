@@ -52,11 +52,12 @@ export function createT3FavouritesTicker(deps: T3FavouritesTickerDeps = {}): T3F
 
   const start = (home: string, a: { url: string; token: string }): void => {
     const startedAt = now();
+    const metrics = new FavSyncMetrics(metricsPathOf(home, deps.stateDir, "daemon"), now, "daemon");
     const d: FavSyncDeps = {
       t3Home: home,
       client: makeClient(a),
       names: deps.names ?? hostNames,
-      metrics: new FavSyncMetrics(metricsPathOf(home, deps.stateDir)),
+      metrics,
       ...(deps.stateDir ? { stateDir: deps.stateDir } : {}),
       log,
     };
@@ -64,6 +65,8 @@ export function createT3FavouritesTicker(deps: T3FavouritesTickerDeps = {}): T3F
     const p = run(d, { signal: ctl.signal, ...(deps.runOptions ?? {}) })
       .catch((err: unknown) => log(`t3 favourites sync: stopped (${err instanceof Error ? err.message : String(err)})`))
       .finally(() => {
+        // The loop ended (stop, or a failure that the next start follows): its file must not outlive it.
+        metrics.remove();
         loops.delete(home);
         if (stopped) return;
         // A loop that ran for ten minutes starts over with the short pause.

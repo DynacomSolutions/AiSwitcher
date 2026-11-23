@@ -601,7 +601,7 @@ Instance mapping (a name context gives the pool name of each provider and the ca
 | `t3-kimi-pool-acp`, `t3-grok-pool`, `t3-opencode-pool` | kimi, grok, opencode | the pool |
 | `claudeAgent`, `codex`, `t3-claude-kimi-*`, `t3-claude-zai-*`, `t3-zcode-*` | none | not synced |
 
-Metrics of the host sync: `ais_t3_favourites_sync_{pulls,pushes,writes,refused,errors}_total` and `..._last_success_timestamp_seconds`, `..._last_write_timestamp_seconds`, `..._started_timestamp_seconds`, labelled `home` (a short hash, never a path). The console `/metrics` serves the snapshot files that every sync process writes to `~/.ais/state/t3-favourites/`, and `--metrics-listen` serves them from the process.
+Metrics of the host sync: `ais_t3_favourites_sync_{pulls,pushes,writes,refused,errors}_total` and `..._last_success_timestamp_seconds`, `..._last_write_timestamp_seconds`, `..._started_timestamp_seconds`, labelled `home` (a short hash, never a path), `role` (`daemon` or `cli`) and `pid`. Each sync process writes its own snapshot file, `~/.ais/state/t3-favourites/<home hash>.<role>-<pid>.metrics.json`, so two processes for one home never overwrite each other and no counter runs backwards. A process that ends clean removes its file; the console skips a file whose pid is gone. The console `/metrics` serves these files, and `--metrics-listen` serves the counters from the process.
 
 ## Refresh guard
 

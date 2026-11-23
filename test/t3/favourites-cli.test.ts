@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { readdirSync, rmSync } from "node:fs";
 import { runT3Command } from "../../src/cli/t3/dispatch.ts";
 import { HELP, helpText } from "../../src/cli/help.ts";
 import { createT3FavouritesTicker } from "../../src/sync/t3-favourites-ticker.ts";
@@ -100,6 +100,8 @@ describe("ais t3 favourites sync", () => {
       await run;
     }
     expect(out[0]).toContain("following");
+    // A clean stop removes the counters file of this process.
+    expect(readdirSync(h.stateDir).filter((n) => n.endsWith(".metrics.json"))).toEqual([]);
   });
 
   test("help lists the command", () => {
@@ -123,6 +125,17 @@ describe("the daemon ticker", () => {
     expect(started).toHaveLength(1);
     t.stop();
     await until(() => t.running().length === 0);
+  });
+
+  test("the loop of a home writes a daemon metrics file and removes it when the loop ends", async () => {
+    const h = home();
+    const t = createT3FavouritesTicker({ homes: () => [h.home], admin, client: () => fakeGateway().api, stateDir: h.stateDir, run: async (d, o) => { d.metrics?.persist(); await new Promise<void>((r) => o.signal?.addEventListener("abort", () => r())); }, log: () => {} });
+    await t.tick();
+    const files = () => readdirSync(h.stateDir).filter((n) => n.endsWith(".metrics.json"));
+    await until(() => files().length === 1);
+    expect(files()[0]).toContain(`.daemon-${process.pid}.`);
+    t.stop();
+    await until(() => files().length === 0);
   });
 
   test("starts nothing without the gateway admin address and token", async () => {
