@@ -55,22 +55,19 @@ export function reserveUtilisationOf(usage: PoolUsage | undefined): number | und
   return usage?.stale ? undefined : utilisationOf(usage);
 }
 
-/** The members an app may use: the pin, or the pool members narrowed by the app's identity list. */
-export async function allowedMembers(app: GatewayApp, deps: Pick<GatewayDeps, "poolMembers" | "canonical">): Promise<string[]> {
+/**
+ * The members an app may use: the pin, or every live pool member of the provider.
+ * A pool app follows the live pool. A member list on an old stored row is ignored.
+ */
+export async function allowedMembers(app: GatewayApp, deps: Pick<GatewayDeps, "poolMembers">): Promise<string[]> {
   if (app.target.kind === "pin") return [app.target.identity];
-  let names = await deps.poolMembers(app.provider);
-  if (app.target.identities && app.target.identities.length > 0) {
-    const canon = deps.canonical;
-    const allowed = new Set(await Promise.all(app.target.identities.map((n) => (canon ? canon(app.provider, n).catch(() => n) : n))));
-    names = names.filter((n) => allowed.has(n));
-  }
-  return names;
+  return deps.poolMembers(app.provider);
 }
 
 /** The usage readings of the members an app may use, for the native limit answer (reset times), as they apply to `model`; `unfiltered` keeps every per-model window. */
 export async function memberUsages(
   app: GatewayApp,
-  deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">,
+  deps: Pick<GatewayDeps, "usageFor" | "poolMembers">,
   model?: string,
   unfiltered = false,
 ): Promise<Array<PoolUsage | undefined>> {
@@ -90,7 +87,7 @@ export async function memberUsages(
  */
 export async function pickIdentity(
   app: GatewayApp,
-  deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">,
+  deps: Pick<GatewayDeps, "usageFor" | "poolMembers">,
   exclude?: string | ReadonlySet<string>,
   model?: string,
 ): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" | "no-identities" }> {

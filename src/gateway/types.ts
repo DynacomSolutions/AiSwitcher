@@ -9,7 +9,7 @@ export interface GatewayApp {
   namespace: string;
   provider: GatewayProvider;
   style: ApiStyle;
-  target: { kind: "pin"; identity: string } | { kind: "pool"; identities?: string[] };
+  target: { kind: "pin"; identity: string } | { kind: "pool" };
   models?: string[];
   dailyTokens?: number;
   reservePercent?: number;

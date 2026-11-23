@@ -168,9 +168,27 @@ describe("admin api", () => {
       checked.request("http://admin.test/apps/ident", { method: "PUT", headers: { authorization: `Bearer ${ADMIN}` }, body: JSON.stringify({ ...body, ...b }) });
     expect((await req({ target: { kind: "pin", identity: "gone" } })).status).toBe(400);
     expect((await req({ target: { kind: "pin", identity: "old" } })).status).toBe(400);
-    expect((await req({ target: { kind: "pool", identities: ["id1", "gone"] } })).status).toBe(400);
     expect((await req({ target: { kind: "pin", identity: "id1" } })).status).toBe(201);
     expect((await req({ target: { kind: "pool" } })).status).toBe(200);
+  });
+
+  test("a pool app with a member list is refused, on create and on update", async () => {
+    for (const identities of [["id1"], [], ["id1", "gone"]]) {
+      const res = await put("poolapp", { target: { kind: "pool", identities } });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("pool apps follow the live pool; member lists are not accepted");
+    }
+    expect((await put("poolapp", { target: { kind: "pool" } })).status).toBe(201);
+    const again = await put("poolapp", { target: { kind: "pool", identities: ["id1"] } });
+    expect(again.status).toBe(400);
+  });
+
+  test("a stored legacy member list is not shown", async () => {
+    await inner.putApp({ name: "legacy", owner: "o", namespace: "ns", provider: "claude", style: "anthropic", target: { kind: "pool", identities: ["old"] } as never, state: "active", createdAt: now.toISOString() });
+    await store.warm();
+    const res = await call("/apps/legacy");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { target: unknown }).target).toEqual({ kind: "pool" });
   });
 
   test("a swap pool name is rejected as a pin; a real identity and an alias are accepted", async () => {
@@ -184,7 +202,7 @@ describe("admin api", () => {
       checked.request("http://admin.test/apps/poolpin", { method: "PUT", headers: { authorization: `Bearer ${ADMIN}` }, body: JSON.stringify({ ...body, ...b }) });
     const bad = await req({ target: { kind: "pin", identity: "shared-pool" } });
     expect(bad.status).toBe(400);
-    expect(((await bad.json()) as { error: string }).error).toContain("identities");
+    expect(((await bad.json()) as { error: string }).error).toContain("swap pool");
     expect((await req({ target: { kind: "pin", identity: "real-account" } })).status).toBe(201);
     expect((await req({ target: { kind: "pin", identity: "alias-of-real" } })).status).toBe(200);
   });

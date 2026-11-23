@@ -403,7 +403,7 @@ export interface GatewayAppDto {
   namespace: string;
   provider: string;
   style: string;
-  target: { kind: "pin"; identity: string } | { kind: "pool"; identities?: string[] };
+  target: { kind: "pin"; identity: string } | { kind: "pool" };
   models?: string[];
   dailyTokens?: number;
   reservePercent?: number;

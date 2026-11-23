@@ -38,15 +38,9 @@ function TargetCell({ app }: { app: GatewayAppDto }) {
       </span>
     );
   }
-  const members = app.target.identities;
   return (
     <span className="text-xs">
-      pool:{" "}
-      {members && members.length > 0 ? (
-        <span className="font-mono">{members.join(", ")}</span>
-      ) : (
-        <span className="text-muted-foreground">all {app.provider} identities</span>
-      )}
+      pool: <span className="text-muted-foreground">all {app.provider} identities</span>
     </span>
   );
 }
