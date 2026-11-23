@@ -73,7 +73,7 @@ test("a panel that attaches gets the list at once, and asks for it again", async
   await shared.store.apply([{ provider: "claude", identity: "work", model: "m1", op: "add" }], "t3", Date.now());
   const r = await replica(shared, { a: "bind-a" });
   const ws = await r.connect("a");
-  expect(ws.of("chat.fav.list")).toEqual([{ t: "chat.fav.list", seq: 1, items: [{ provider: "claude", identity: "work", model: "m1" }] }]);
+  expect(ws.of("chat.fav.list")).toEqual([{ t: "chat.fav.list", seq: 1, epoch: (await shared.store.list()).epoch, items: [{ provider: "claude", identity: "work", model: "m1" }] }]);
   await r.send(ws, { t: "chat.fav.list" });
   expect(ws.of("chat.fav.list")).toHaveLength(2);
   expect(ws.of("chat.reject")).toEqual([]);
@@ -150,9 +150,9 @@ test("POST applies changes and answers with the list, GET reads it", async () =>
   const h = await http();
   const res = await post(h, { origin: "host-1", changes: [star("m1"), star("m2")] });
   expect(res.status).toBe(200);
-  expect(await res.json()).toEqual({ seq: 2, items: [{ provider: "claude", identity: "work", model: "m1" }, { provider: "claude", identity: "work", model: "m2" }] });
+  expect(await res.json()).toEqual({ seq: 2, epoch: (await h.shared.store.list()).epoch, items: [{ provider: "claude", identity: "work", model: "m1" }, { provider: "claude", identity: "work", model: "m2" }] });
   const got = (await (await h.call("/favourites")).json()) as any;
-  expect(got).toMatchObject({ seq: 2, changed: true });
+  expect(got).toMatchObject({ seq: 2, changed: true, epoch: (await h.shared.store.list()).epoch });
   expect(got.items).toHaveLength(2);
   // The panels hear of a change made over HTTP.
   const ws = await h.connect("a");

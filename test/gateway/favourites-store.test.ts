@@ -1,4 +1,4 @@
-import { afterAll, describe, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
 import { MemoryFavouriteStore } from "../../src/gateway/chat/favourites-store.ts";
 import { PgFavouriteStore } from "../../src/gateway/chat/pg-favourites-store.ts";
@@ -10,6 +10,9 @@ const optOut = process.env.AIS_GATEWAY_TEST_NO_DATABASE === "1";
 
 describe("MemoryFavouriteStore contract", () => {
   favouriteStoreContract(async () => new MemoryFavouriteStore());
+  test("each new store has its own epoch", async () => {
+    expect((await new MemoryFavouriteStore().list()).epoch).not.toBe((await new MemoryFavouriteStore().list()).epoch);
+  });
 });
 
 if (!url && process.env.CI && !optOut) {

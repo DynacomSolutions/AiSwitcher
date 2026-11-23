@@ -8,10 +8,10 @@ import type { GatewayMetrics } from "./metrics.ts";
  * They sit behind the admin bearer token (admin.ts), like the credential store routes, and answer 404 until the chat stack
  * (which holds the store and the bus) is up.
  *
- * - GET  /favourites?since=N&ms=M   The list: `{seq, changed, items: [{provider, identity, model}]}`. Without `since` it answers at once.
+ * - GET  /favourites?since=N&ms=M   The list: `{seq, epoch, changed, items: [{provider, identity, model}]}`. Without `since` it answers at once.
  *                                   With `since` it answers at once when the list version differs, else when the list changes or after M ms (at most 25 s).
  * - POST /favourites                `{origin, changes: [{provider, identity, model, op: "add" | "remove", at?}]}` applies the changes
- *                                   (the newest change of a model wins) and answers with the list.
+ *                                   (the newest change of a model wins) and answers with the list (`{seq, epoch, items}`).
  */
 
 /** Longest a long poll waits. It is under the idle limit of the clients and proxies in front of the gateway. */
@@ -40,8 +40,9 @@ export function registerFavouritesAdmin(
   metrics?: Pick<GatewayMetrics, "favourite">,
 ): void {
   const service = (): FavouritesService | undefined => getService?.();
-  const body = (l: { seq: number; items: Array<{ provider: string; identity: string; model: string }> }, changed?: boolean) => ({
+  const body = (l: { seq: number; epoch?: string; items: Array<{ provider: string; identity: string; model: string }> }, changed?: boolean) => ({
     seq: l.seq,
+    ...(l.epoch ? { epoch: l.epoch } : {}),
     ...(changed !== undefined ? { changed } : {}),
     items: l.items.map(({ provider, identity, model }) => ({ provider, identity, model })),
   });

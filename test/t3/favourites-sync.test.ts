@@ -157,6 +157,36 @@ describe("one round", () => {
     expect((await fresh.store.list()).items.map((i) => i.model).sort()).toEqual(["a", "b"]);
   });
 
+  test("a gateway that was reset keeps the T3 stars even when its new version is past the old one", async () => {
+    const e = setup({ favorites: [{ provider: "t3-claude-work", model: "a" }] });
+    await e.round();
+    await e.gw.star(key("b"));
+    await e.round();
+    expect((await readState(e.deps))?.seq).toBe(2);
+    // A rebuilt store that has already gone past version 2 before the host reads it.
+    const fresh = fakeGateway();
+    for (const m of ["c", "d", "e"]) await fresh.star(key(m));
+    expect((await fresh.store.list()).seq).toBeGreaterThanOrEqual(2);
+    e.deps.client = fresh.api;
+    await syncOnce(e.deps);
+    expect(e.favs().map((f) => f.model).sort()).toEqual(["a", "b", "c", "d", "e"]);
+    expect((await fresh.store.list()).items.map((i) => i.model).sort()).toEqual(["a", "b", "c", "d", "e"]);
+    expect((await readState(e.deps))?.epoch).toBe((await fresh.store.list()).epoch);
+  });
+
+  test("a state file from before the epoch is still read, and the epoch is taken on the next round", async () => {
+    const e = setup({ favorites: [{ provider: "t3-claude-work", model: "a" }] });
+    await e.round();
+    const file = join(e.stateDir, `${homeKey(e.home.home)}.json`);
+    const s = JSON.parse(readFileSync(file, "utf8"));
+    delete s.epoch;
+    writeFileSync(file, JSON.stringify(s));
+    expect((await readState(e.deps))?.epoch).toBeUndefined();
+    await e.round();
+    expect(e.favs()).toHaveLength(1);
+    expect((await readState(e.deps))?.epoch).toBe((await e.gw.store.list()).epoch);
+  });
+
   test("a gateway that is down fails the round and changes nothing", async () => {
     const e = setup({ favorites: [{ provider: "t3-claude-work", model: "a" }] });
     await e.round();

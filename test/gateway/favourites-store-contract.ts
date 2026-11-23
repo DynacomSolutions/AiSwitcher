@@ -11,7 +11,15 @@ const models = async (s: FavouriteStore): Promise<string[]> => (await s.list()).
 export function favouriteStoreContract(make: () => Promise<FavouriteStore>): void {
   test("an empty store lists nothing at version 0", async () => {
     const s = await make();
-    expect(await s.list()).toEqual({ seq: 0, items: [] });
+    expect(await s.list()).toMatchObject({ seq: 0, items: [] });
+  });
+
+  test("the list carries a store epoch that stays the same while the store lives", async () => {
+    const s = await make();
+    const first = (await s.list()).epoch;
+    expect(first).toMatch(/^[A-Za-z0-9._:-]{8,64}$/);
+    await s.apply([add("m1", NOW - 5)], "chrome", NOW);
+    expect((await s.list()).epoch).toBe(first);
   });
 
   test("adds are listed oldest first and the version grows only when a star flips", async () => {

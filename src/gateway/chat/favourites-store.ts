@@ -2,7 +2,8 @@
 import { favId, MAX_FAVOURITES, type FavChange, type FavKey } from "../../browser/chat-protocol.ts";
 
 export interface FavouriteItem extends FavKey { at: number }
-export interface FavouriteList { seq: number; items: FavouriteItem[] }
+/** `epoch` is a random id made once with the store. A store that was reset or rebuilt has another one, so a client can tell "the list is new" from "the list is the same but changed". */
+export interface FavouriteList { epoch: string; seq: number; items: FavouriteItem[] }
 export interface FavouriteApplied { seq: number; changed: boolean }
 
 /** Stars of the owner. A change names its time; the newest change of a model decides whether it is starred. */
@@ -26,6 +27,7 @@ interface Row extends FavKey { present: boolean; at: number; seq: number; origin
 export class MemoryFavouriteStore implements FavouriteStore {
   private readonly rows = new Map<string, Row>();
   private counter = 0;
+  private readonly epoch = crypto.randomUUID();
 
   async apply(changes: FavChange[], origin: string, nowMs: number): Promise<FavouriteApplied> {
     let changed = false;
@@ -52,6 +54,6 @@ export class MemoryFavouriteStore implements FavouriteStore {
 
   async list(): Promise<FavouriteList> {
     const items = [...this.rows.values()].filter((r) => r.present).sort((a, b) => a.at - b.at || a.seq - b.seq).map((r) => ({ provider: r.provider, identity: r.identity, model: r.model, at: r.at }));
-    return { seq: this.counter, items };
+    return { epoch: this.epoch, seq: this.counter, items };
   }
 }

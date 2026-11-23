@@ -37,7 +37,7 @@ export function fakeGateway(now: () => number = Date.now) {
   let down = false;
   const list = async (): Promise<FavList> => {
     const l = await store.list();
-    return { seq: l.seq, items: l.items.map(({ provider, identity, model }) => ({ provider, identity, model })) };
+    return { seq: l.seq, epoch: l.epoch, items: l.items.map(({ provider, identity, model }) => ({ provider, identity, model })) };
   };
   const api: FavouritesApi = {
     async get(since, waitMs = 0, signal) {

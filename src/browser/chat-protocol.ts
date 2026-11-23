@@ -46,14 +46,15 @@ export type ChatToExt =
   | { t: "chat.event"; chatId: string; seq: number; ts: number; body: ChatBody } | { t: "chat.state"; chatId: string; state: ChatState; summary: ChatSummary }
   | { t: "chat.list"; chats: ChatSummary[] } | { t: "chat.reject"; chatId?: string; reqId?: string; code: ChatErrorCode; message: string }
   | { t: "chat.catalog"; reqId: string; providers: ChatCatalogProvider[] }
-  /** The starred models, oldest first. `seq` grows with each change. The gateway sends it after an attach, after a `chat.fav.list` and after every change. */
-  | { t: "chat.fav.list"; seq: number; items: FavKey[] };
+  /** The starred models, oldest first. `seq` grows with each change. `epoch` names the store: it changes when the gateway data was reset, so a client that sees a new epoch treats its last list as unknown. The gateway sends it after an attach, after a `chat.fav.list` and after every change. */
+  | { t: "chat.fav.list"; seq: number; items: FavKey[]; epoch?: string };
 
 export const sessionIdForChat = (chatId: string): string => `chat:${chatId}`;
 
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const COLOR_RE = /^#[0-9a-f]{6}$/;
 const SEL_RE = /^[A-Za-z0-9._:/@+-]{1,128}$/;
+const EPOCH_RE = /^[A-Za-z0-9._:-]{1,64}$/;
 const MAX_SHORT = 256;
 const MAX_MODELS = 4096;
 const MAX_SMALL_LIST = 64;
@@ -275,7 +276,9 @@ export function parseChatToExt(v: unknown): ChatToExt | undefined {
     }
     case "chat.fav.list": {
       const seq = int(v.seq), items = list(v.items, MAX_FAVOURITES, favKey);
-      return seq !== undefined && items ? { t: "chat.fav.list", seq, items } : undefined;
+      // A bad epoch is dropped, not fatal: the list is still good.
+      const epoch = typeof v.epoch === "string" && EPOCH_RE.test(v.epoch) ? v.epoch : undefined;
+      return seq !== undefined && items ? { t: "chat.fav.list", seq, items, ...(epoch !== undefined ? { epoch } : {}) } : undefined;
     }
     default: return undefined;
   }

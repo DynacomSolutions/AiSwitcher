@@ -53,7 +53,7 @@ export class FavouritesService {
 
   /** The frame a panel gets. The time of each star stays inside the gateway. */
   frame(l: FavouriteList): Extract<ChatToExt, { t: "chat.fav.list" }> {
-    return { t: "chat.fav.list", seq: l.seq, items: l.items.map(({ provider, identity, model }) => ({ provider, identity, model })) };
+    return { t: "chat.fav.list", seq: l.seq, ...(l.epoch ? { epoch: l.epoch } : {}), items: l.items.map(({ provider, identity, model }) => ({ provider, identity, model })) };
   }
 
   /** Applies changes and tells every replica. Returns the list after the call. */

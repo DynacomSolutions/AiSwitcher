@@ -56,11 +56,12 @@ export class PgFavouriteStore implements FavouriteStore {
 
   async list(): Promise<FavouriteList> {
     // The version is read first. A change between the two reads makes the items newer than `seq`, so a caller that waits on `seq` wakes again and reads the same list.
-    const seq = Number((await this.sql.unsafe("SELECT coalesce(max(seq), 0)::bigint AS seq FROM gateway_favourites"))[0]?.seq ?? 0);
+    const head = (await this.sql.unsafe("SELECT coalesce(max(seq), 0)::bigint AS seq, (SELECT epoch FROM gateway_favourites_meta LIMIT 1) AS epoch FROM gateway_favourites"))[0] as Row | undefined;
+    const seq = Number(head?.seq ?? 0);
     const rows = await this.sql.unsafe("SELECT provider, identity, model, at_ms FROM gateway_favourites WHERE present ORDER BY at_ms, seq");
     const items = rows
       .filter((r: Row) => (CHAT_PROVIDERS as readonly unknown[]).includes(r.provider))
       .map((r: Row) => ({ provider: r.provider as ChatProvider, identity: String(r.identity), model: String(r.model), at: Number(r.at_ms) }));
-    return { seq, items };
+    return { epoch: String(head?.epoch ?? ""), seq, items };
   }
 }

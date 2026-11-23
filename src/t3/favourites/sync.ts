@@ -25,7 +25,8 @@ export interface FavSyncDeps {
   log?: (message: string) => void;
 }
 
-export interface SyncState { version: 1; seq: number; synced: FavKey[] }
+/** `epoch` is the gateway store the list came from. Absent in a file from before the epoch existed. */
+export interface SyncState { version: 1; seq: number; epoch?: string; synced: FavKey[] }
 
 /** A short, stable name of a T3 home. It is used in file names, in the origin label and in metric labels, so no path leaks. */
 export const homeKey = (t3Home: string): string => createHash("sha256").update(t3Home).digest("hex").slice(0, 8);
@@ -34,8 +35,8 @@ export const metricsPathOf = (t3Home: string, stateDir = favouritesStateDir()): 
 
 export async function readState(d: Pick<FavSyncDeps, "t3Home" | "stateDir">): Promise<SyncState | undefined> {
   try {
-    const v = JSON.parse(await readFile(statePath(d), "utf8")) as { version?: unknown; seq?: unknown; synced?: unknown };
-    const seq = parseChatToExt({ t: "chat.fav.list", seq: v.seq, items: [] });
+    const v = JSON.parse(await readFile(statePath(d), "utf8")) as { version?: unknown; seq?: unknown; epoch?: unknown; synced?: unknown };
+    const seq = parseChatToExt({ t: "chat.fav.list", seq: v.seq, epoch: v.epoch, items: [] });
     if (v.version !== 1 || seq?.t !== "chat.fav.list" || !Array.isArray(v.synced)) return undefined;
     // One bad entry is skipped: it must not make the whole list unreadable.
     const synced: FavKey[] = [];
@@ -43,7 +44,7 @@ export async function readState(d: Pick<FavSyncDeps, "t3Home" | "stateDir">): Pr
       const one = parseChatToExt({ t: "chat.fav.list", seq: 0, items: [item] });
       if (one?.t === "chat.fav.list" && one.items[0]) synced.push(one.items[0]);
     }
-    return { version: 1, seq: seq.seq, synced };
+    return { version: 1, seq: seq.seq, ...(seq.epoch !== undefined ? { epoch: seq.epoch } : {}), synced };
   } catch {
     return undefined;
   }
@@ -76,8 +77,10 @@ export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
   const state = await readState(d);
   let gateway = await d.client.get();
   m && (m.s.pulls += 1);
-  // A list version below the remembered one means the gateway lost its data. Every star of T3 goes up again, and nothing is removed.
-  const last = state && gateway.seq >= state.seq ? state.synced : undefined;
+  // A new epoch, or a list version below the remembered one, means the gateway lost its data. Every star of T3 goes up again, and nothing is removed.
+  // The version alone is not enough: a rebuilt store may already be past the old version when the host reads it.
+  const reset = state !== undefined && (gateway.seq < state.seq || (gateway.epoch !== undefined && state.epoch !== undefined && gateway.epoch !== state.epoch));
+  const last = state && !reset ? state.synced : undefined;
   const changes = localChanges(settings.favorites, ctx, last, gateway.items);
   if (changes.length > 0) {
     gateway = await d.client.post(d.origin ?? `t3:${homeKey(d.t3Home)}`, changes);
@@ -94,7 +97,7 @@ export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
       m.s.lastWrite = Math.floor(Date.now() / 1000);
     }
   }
-  await writeState(d, { version: 1, seq: gateway.seq, synced: applied.synced.slice(0, MAX_FAVOURITES) });
+  await writeState(d, { version: 1, seq: gateway.seq, ...(gateway.epoch !== undefined ? { epoch: gateway.epoch } : {}), synced: applied.synced.slice(0, MAX_FAVOURITES) });
   if (m) m.s.lastSuccess = Math.floor(Date.now() / 1000);
   return { status: "ok", seq: gateway.seq, pushed: changes.length, wrote };
 }

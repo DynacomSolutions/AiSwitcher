@@ -19,6 +19,8 @@ const PERSIST_DELAY_MS = 250;
 /** Local storage keys of the starred models: the list the panel shows, and the list the gateway last reported. */
 export const FAVOURITES_KEY = "chatFavourites";
 export const FAVOURITES_SYNCED_KEY = "chatFavouritesSynced";
+/** The epoch of the gateway store that `chatFavouritesSynced` came from. */
+export const FAVOURITES_EPOCH_KEY = "chatFavouritesEpoch";
 
 export interface ChatHubDeps {
   /** Sends a frame to the gateway. Returns false when it cannot (offline). */
@@ -49,6 +51,8 @@ export class ChatHub {
   private favs: FavKey[] = [];
   /** The list the gateway reported last. A star in `favs` that is not here was made while offline. */
   private favsSynced: FavKey[] = [];
+  /** The store epoch of `favsSynced`. A list with another epoch means the gateway lost its data. Undefined until a gateway has named one. */
+  private favsEpoch: string | undefined;
   /** True from a welcome until the first list of the gateway has been merged with the local one. */
   private favsMerge = false;
   private connected = false;
@@ -76,14 +80,16 @@ export class ChatHub {
   private async loadFavourites(): Promise<void> {
     if (!this.d.local) return;
     try {
-      const r = await this.d.local.get([FAVOURITES_KEY, FAVOURITES_SYNCED_KEY]);
+      const r = await this.d.local.get([FAVOURITES_KEY, FAVOURITES_SYNCED_KEY, FAVOURITES_EPOCH_KEY]);
       this.favs = cleanFavs(r[FAVOURITES_KEY]);
       this.favsSynced = cleanFavs(r[FAVOURITES_SYNCED_KEY]);
+      const epoch = r[FAVOURITES_EPOCH_KEY];
+      this.favsEpoch = typeof epoch === "string" && epoch !== "" ? epoch : undefined;
     } catch { /* no cache: the gateway list fills it */ }
   }
 
   private saveFavourites(): void {
-    void this.d.local?.set({ [FAVOURITES_KEY]: this.favs, [FAVOURITES_SYNCED_KEY]: this.favsSynced }).catch(() => { /* a full store keeps the list in memory */ });
+    void this.d.local?.set({ [FAVOURITES_KEY]: this.favs, [FAVOURITES_SYNCED_KEY]: this.favsSynced, [FAVOURITES_EPOCH_KEY]: this.favsEpoch ?? "" }).catch(() => { /* a full store keeps the list in memory */ });
   }
 
   /** Writes now, without waiting for the timer. Used on chat close and when the panel disconnects. */
@@ -192,7 +198,7 @@ export class ChatHub {
         this.changed(ALL_WINDOWS, false);
         return;
       }
-      case "chat.fav.list": return this.onFavourites(f.items);
+      case "chat.fav.list": return this.onFavourites(f.items, f.epoch);
       case "chat.reject": return this.onReject(f);
     }
   }
@@ -201,23 +207,27 @@ export class ChatHub {
    * The gateway list. The first one after a connect is merged with the local one once: a star made here that the gateway
    * never reported goes up, and a star taken away here that the gateway still holds is removed there. After that the gateway list
    * is the truth, and the panel follows it live.
+   * A list with another epoch than the last one comes from a store that lost its data. It is merged like a first run with no known list:
+   * every local star goes up, and nothing is dropped or removed because the new list lacks it.
    */
-  private onFavourites(items: FavKey[]): void {
+  private onFavourites(items: FavKey[], epoch?: string): void {
     const gateway = new Set(items.map(favId));
     let shown = items;
-    if (this.favsMerge) {
+    const reset = epoch !== undefined && this.favsEpoch !== undefined && epoch !== this.favsEpoch;
+    if (this.favsMerge || reset) {
       this.favsMerge = false;
       const mine = new Set(this.favs.map(favId));
-      const known = new Set(this.favsSynced.map(favId));
+      const known = new Set((reset ? [] : this.favsSynced).map(favId));
       const at = this.d.now();
       const localOnly = this.favs.filter(f => !gateway.has(favId(f)) && !known.has(favId(f)));
-      const takenAway = this.favsSynced.filter(f => !mine.has(favId(f)) && gateway.has(favId(f)));
+      const takenAway = (reset ? [] : this.favsSynced).filter(f => !mine.has(favId(f)) && gateway.has(favId(f)));
       const changes: FavChange[] = [...localOnly.map(f => ({ ...f, op: "add" as const, at })), ...takenAway.map(f => ({ ...f, op: "remove" as const, at }))].slice(0, MAX_FAVOURITES);
       if (changes.length > 0) this.d.send({ t: "chat.fav.set", changes });
       const gone = new Set(takenAway.map(favId));
       shown = [...items.filter(f => !gone.has(favId(f))), ...localOnly].slice(-MAX_FAVOURITES);
     }
     this.favsSynced = [...items];
+    if (epoch !== undefined) this.favsEpoch = epoch;
     this.favs = shown;
     this.saveFavourites();
     this.changed(ALL_WINDOWS, false);

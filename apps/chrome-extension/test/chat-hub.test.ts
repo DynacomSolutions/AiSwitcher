@@ -471,7 +471,8 @@ describe("favourites", () => {
     });
     return { hub, sent, store, setUp: (v: boolean) => { up = v; }, sets: () => sent.filter(f => f.t === "chat.fav.set") };
   }
-  const list = (items: ReturnType<typeof fav>[], seq = 1) => ({ t: "chat.fav.list" as const, seq, items });
+  const list = (items: ReturnType<typeof fav>[], seq = 1, epoch?: string) => ({ t: "chat.fav.list" as const, seq, items, ...(epoch !== undefined ? { epoch } : {}) });
+  const EPOCH_KEY = "chatFavouritesEpoch";
 
   test("a welcome asks for the list, and the state shows what the gateway lists", () => {
     const e = withLocal();
@@ -547,6 +548,39 @@ describe("favourites", () => {
     again.hub.onWelcome();
     again.hub.handleFrame(list([]));
     expect(again.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("m1"), op: "add", at: 5000 }] }]);
+  });
+
+  test("a gateway with a new epoch is a reset: every known star goes up again and none is dropped", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("a"), fav("b")], [SYNCED_KEY]: [fav("a"), fav("b")], [EPOCH_KEY]: "e1" });
+    await e.hub.load();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([], 1, "e2"));
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("a"), op: "add", at: 5000 }, { ...fav("b"), op: "add", at: 5000 }] }]);
+    expect(e.hub.state(1).favourites).toEqual([fav("a"), fav("b")]);
+    await Bun.sleep(0);
+    expect(e.store[EPOCH_KEY]).toBe("e2");
+  });
+
+  test("a new epoch in the middle of a session is handled the same way, and the same epoch is not a reset", async () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([fav("a")], 1, "e1"));
+    e.hub.handleFrame(list([], 2, "e1"));
+    expect(e.hub.state(1).favourites).toEqual([]);
+    expect(e.sets()).toEqual([]);
+    e.hub.handleFrame(list([fav("a")], 3, "e1"));
+    e.hub.handleFrame(list([], 1, "e2"));
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("a"), op: "add", at: 5000 }] }]);
+    expect(e.hub.state(1).favourites).toEqual([fav("a")]);
+  });
+
+  test("a gateway without an epoch, or a store from before the epoch, keeps the old rules", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("m1")], [SYNCED_KEY]: [fav("m1")] });
+    await e.hub.load();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([], 1, "e1"));
+    expect(e.sets()).toEqual([]);
+    expect(e.hub.state(1).favourites).toEqual([]);
   });
 
   test("a bad stored list is dropped, and an invalid command is refused", async () => {
