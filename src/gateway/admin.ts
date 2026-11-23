@@ -239,7 +239,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
   const read = deps.readStore ?? store;
   const hono = new Hono();
-  const err = (status: 400 | 401 | 404 | 409 | 500 | 503, message: string): Response => Response.json({ error: message }, { status });
+  const err = (status: 400 | 401 | 404 | 409 | 429 | 500 | 503, message: string): Response => Response.json({ error: message }, { status, ...(status === 429 ? { headers: { "retry-after": "5" } } : {}) });
 
   hono.use("*", async (c, next) => {
     if (!deps.adminToken || !sameSecret(bearer(c.req.raw), deps.adminToken)) return err(401, "admin token required");

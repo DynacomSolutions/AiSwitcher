@@ -32,11 +32,11 @@ afterEach(async () => {
 });
 
 /** One gateway replica: hub, service and frames over a shared store and bus. */
-async function replica(shared: { store: MemoryFavouriteStore; bus: MemoryChatBus }, names: Record<string, string>, metrics?: PrometheusMetrics) {
+async function replica(shared: { store: MemoryFavouriteStore; bus: MemoryChatBus }, names: Record<string, string>, metrics?: PrometheusMetrics, extra: { maxWaiters?: number } = {}) {
   const bindings: Record<string, BrowserBinding> = Object.fromEntries(Object.entries(names).map(([tok, n]) => [tok, binding(n)]));
   let frames!: ChatFrames;
   const hub = new BrowserHub({ authToken: async (t) => bindings[t], onChat: (b, m, r) => frames.handle(b, m, r), onAttach: (b) => frames.onAttach(b) });
-  const favourites = new FavouritesService({ store: shared.store, bus: shared.bus, hub, ...(metrics ? { metrics } : {}), fallbackPollMs: 50 });
+  const favourites = new FavouritesService({ store: shared.store, bus: shared.bus, hub, ...(metrics ? { metrics } : {}), fallbackPollMs: 50, ...extra });
   frames = new ChatFrames({
     broker: { create: async () => ({ code: "unavailable", message: "x" }) as never, dispatch: async () => undefined },
     store: new MemoryChatStore(),
@@ -126,10 +126,10 @@ test("the bus carries a favourites notice and refuses a bad one", () => {
 // ---- HTTP routes ------------------------------------------------------------------------------------------------
 
 const ADMIN = "adm-test-value-0001-0123456789abcdef";
-async function http(over: { present?: boolean } = {}) {
+async function http(over: { present?: boolean; maxWaiters?: number } = {}) {
   const shared = newShared();
   const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
-  const r = await replica(shared, { a: "bind-a" }, metrics);
+  const r = await replica(shared, { a: "bind-a" }, metrics, over.maxWaiters !== undefined ? { maxWaiters: over.maxWaiters } : {});
   const app = createAdminApp({ store: new MemoryGatewayStore(), adminToken: ADMIN, now: () => new Date(), ...(over.present === false ? {} : { favourites: () => r.favourites }), metrics });
   const call = async (path: string, init: RequestInit & { token?: string | null } = {}): Promise<Response> => {
     const { token = ADMIN, ...rest } = init;
@@ -227,6 +227,37 @@ test("a long poll still wakes when the bus loses the notice", async () => {
   // The store changed and no notice came: the 50 ms fallback read sees it.
   expect(((await missed) as any).changed).toBe(true);
   expect(Date.now() - t0).toBeLessThan(2500);
+});
+
+test("a gateway holds a few long polls at once and answers 429 above that, with a metric", async () => {
+  const h = await http({ maxWaiters: 2 });
+  await post(h, { changes: [star("m1")] });
+  const held = [1, 2].map(() => h.call("/favourites?since=1&ms=3000").then((r) => r.status));
+  await Bun.sleep(40);
+  const refused = await h.call("/favourites?since=1&ms=3000");
+  expect(refused.status).toBe(429);
+  expect(refused.headers.get("retry-after")).toBeTruthy();
+  expect(h.metrics.render()).toMatch(/ais_gateway_favourites_total\{event="rate_limited"\} 1/);
+  // A call that needs no wait is not limited: the list version differs, or no wait was asked for.
+  expect((await h.call("/favourites?since=0&ms=3000")).status).toBe(200);
+  expect((await h.call("/favourites")).status).toBe(200);
+  // The held ones end with a change, and the slots are free again.
+  await post(h, { changes: [star("m2")] });
+  expect(await Promise.all(held)).toEqual([200, 200]);
+  const again = h.call("/favourites?since=2&ms=100");
+  expect((await again).status).toBe(200);
+});
+
+test("a long poll that the caller aborts frees its slot", async () => {
+  const h = await http({ maxWaiters: 1 });
+  await post(h, { changes: [star("m1")] });
+  const ctl = new AbortController();
+  const held = h.favourites.wait(1, 3000, ctl.signal);
+  await Bun.sleep(20);
+  await expect(h.favourites.wait(1, 3000)).rejects.toThrow(/too many/i);
+  ctl.abort();
+  expect((await held).changed).toBe(false);
+  expect((await h.favourites.wait(1, 30)).changed).toBe(false);
 });
 
 test("the metrics count the calls, the changes and the pushes", async () => {

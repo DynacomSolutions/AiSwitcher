@@ -1,6 +1,6 @@
 import type { Hono } from "hono";
 import { CHAT_PROVIDERS, MAX_FAVOURITES, selectable, type FavChange } from "../browser/chat-protocol.ts";
-import type { FavouritesService } from "./chat/favourites.ts";
+import { FavouritesBusyError, type FavouritesService } from "./chat/favourites.ts";
 import type { GatewayMetrics } from "./metrics.ts";
 
 /**
@@ -10,6 +10,7 @@ import type { GatewayMetrics } from "./metrics.ts";
  *
  * - GET  /favourites?since=N&ms=M   The list: `{seq, epoch, changed, items: [{provider, identity, model}]}`. Without `since` it answers at once.
  *                                   With `since` it answers at once when the list version differs, else when the list changes or after M ms (at most 25 s).
+ * - GET answers 429 (with `Retry-After`) when this gateway already holds its most long polls (32), counted as `rate_limited`.
  * - POST /favourites                `{origin, changes: [{provider, identity, model, op: "add" | "remove", at?}]}` applies the changes
  *                                   (the newest change of a model wins) and answers with the list and the changes the store refused (`{seq, epoch, items, refused: [{provider, identity, model}]}`:
  *                                   a change that lost to a newer change of the same model, or an add when the list is full).
@@ -37,7 +38,7 @@ export function parseFavouriteChanges(raw: unknown): FavChange[] | string {
 export function registerFavouritesAdmin(
   hono: Hono,
   getService: (() => FavouritesService | undefined) | undefined,
-  err: (status: 400 | 404 | 503, message: string) => Response,
+  err: (status: 400 | 404 | 429 | 503, message: string) => Response,
   metrics?: Pick<GatewayMetrics, "favourite">,
 ): void {
   const service = (): FavouritesService | undefined => getService?.();
@@ -59,7 +60,8 @@ export function registerFavouritesAdmin(
     try {
       const r = await svc.wait(since, ms, c.req.raw.signal);
       return c.json(body(r, r.changed));
-    } catch {
+    } catch (e) {
+      if (e instanceof FavouritesBusyError) return err(429, "too many waiting favourites requests: ask again in a few seconds");
       metrics?.favourite?.("error");
       return err(503, "the favourites store is unavailable");
     }

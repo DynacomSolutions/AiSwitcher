@@ -8,6 +8,16 @@ import type { FavouriteList, FavouriteStore } from "./favourites-store.ts";
 /** A waiting HTTP call looks at the store at least this often, so a lost bus notice delays an update by this much at most. */
 const FALLBACK_POLL_MS = 4_000;
 
+/** Long polls one gateway holds at the same time, by default. Each holds a timer and a request, so the number is bounded. */
+export const MAX_FAVOURITE_WAITERS = 32;
+
+/** The gateway holds as many long polls as it may. The caller should wait and ask again. */
+export class FavouritesBusyError extends Error {
+  constructor() {
+    super("too many waiting favourites requests");
+  }
+}
+
 export interface FavouritesDeps {
   store: FavouriteStore;
   bus: ChatBus;
@@ -16,11 +26,15 @@ export interface FavouritesDeps {
   now?: () => number;
   /** Tests shorten it. */
   fallbackPollMs?: number;
+  /** Most long polls held at once. Default 32. A call that needs no wait is never counted. */
+  maxWaiters?: number;
 }
 
 export class FavouritesService {
   private unsubscribe: (() => Promise<void>) | undefined;
   private readonly waiters = new Set<() => void>();
+  /** Long polls that are held now. */
+  private held = 0;
   /** The newest list version that went out to the panels of this replica. */
   private pushedSeq = -1;
   private pushing: Promise<void> | undefined;
@@ -74,8 +88,28 @@ export class FavouritesService {
     this.d.hub.sendTo(binding, this.frame(l));
   }
 
-  /** Long poll. Answers at once when the list version differs from `since`, else when it changes or after `ms`. */
+  /**
+   * Long poll. Answers at once when the list version differs from `since`, else when it changes or after `ms`.
+   * It throws `FavouritesBusyError` when it would have to be held and the gateway already holds `maxWaiters` of them.
+   */
   async wait(since: number | undefined, ms: number, signal?: AbortSignal): Promise<FavouriteList & { changed: boolean }> {
+    let admitted = false;
+    try {
+      return await this.waitInner(since, ms, signal, () => {
+        if (admitted) return;
+        if (this.held >= (this.d.maxWaiters ?? MAX_FAVOURITE_WAITERS)) {
+          this.count("rate_limited");
+          throw new FavouritesBusyError();
+        }
+        this.held += 1;
+        admitted = true;
+      });
+    } finally {
+      if (admitted) this.held -= 1;
+    }
+  }
+
+  private async waitInner(since: number | undefined, ms: number, signal: AbortSignal | undefined, admit: () => void): Promise<FavouriteList & { changed: boolean }> {
     const now = this.d.now ?? Date.now;
     const deadline = now() + ms;
     const poll = this.d.fallbackPollMs ?? FALLBACK_POLL_MS;
@@ -85,6 +119,7 @@ export class FavouritesService {
       if (l.seq !== since) return { ...l, changed: true };
       const left = deadline - now();
       if (left <= 0 || signal?.aborted) return { ...l, changed: false };
+      admit();
       await new Promise<void>((resolve) => {
         const done = (): void => {
           clearTimeout(timer);
