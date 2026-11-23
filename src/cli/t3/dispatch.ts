@@ -4,7 +4,7 @@ import { t3Paths } from "../../identities/t3-anthropic-proxy.ts";
 import { createFavouritesClient, type FavouritesApi } from "../../t3/favourites/client.ts";
 import { ADMIN_TOKEN_KEY, ADMIN_URL_KEY, FAVOURITES_TOKEN_KEY, gatewayAdmin } from "../../t3/favourites/config.ts";
 import { FavSyncMetrics } from "../../t3/favourites/metrics.ts";
-import { homeKey, hostNames, metricsPathOf, ORIGIN_LABEL, parsePoolNames, POOL_NAMES_ENV, runFavouritesSync, syncOnce, type HostNames, type PoolNames } from "../../t3/favourites/sync.ts";
+import { homeKey, hostNames, metricsPathOf, ORIGIN_LABEL, runFavouritesSync, syncOnce, type HostNames } from "../../t3/favourites/sync.ts";
 
 export interface T3CliDeps {
   out(line: string): void;
@@ -18,7 +18,7 @@ export interface T3CliDeps {
 }
 
 const ORIGIN_ENV = "AIS_T3_FAVOURITES_ORIGIN";
-const USAGE = "Usage: ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>] [--pool-names=<tool>=<name>,...] [--origin=<label>]";
+const USAGE = "Usage: ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>] [--origin=<label>]";
 
 /** `ais t3 favourites sync`: keeps the model favourites of one T3 Code home in step with the AIS gateway list, in both directions. */
 export async function runT3Command(positionals: string[], flags: ParsedArgs["flags"], deps: Partial<T3CliDeps> = {}): Promise<void> {
@@ -33,13 +33,7 @@ export async function runT3Command(positionals: string[], flags: ParsedArgs["fla
   const listen = stringFlag(flags, "metrics-listen");
   if (listen !== undefined && !/^[^:\s]+:\d{1,5}$/.test(listen)) throw new CliUsageError("--metrics-listen must be host:port");
 
-  // The flags win over the environment. A bad value stops the command here, before any round.
-  let poolNames: PoolNames;
-  try {
-    poolNames = { ...parsePoolNames(env[POOL_NAMES_ENV]), ...parsePoolNames(stringFlag(flags, "pool-names")) };
-  } catch (err) {
-    throw new CliUsageError(err instanceof Error ? err.message : String(err));
-  }
+  // `--pool-names` and AIS_T3_POOL_NAMES are no longer used: a pool favourite needs no pool name. The flag is accepted and ignored for one release, so that a pod that still passes it starts.
   const label = stringFlag(flags, "origin") ?? (env[ORIGIN_ENV]?.trim() || undefined);
   if (label !== undefined && !ORIGIN_LABEL.test(label)) throw new CliUsageError("--origin (or AIS_T3_FAVOURITES_ORIGIN) must be a short label: letters, digits, _ and -, at most 40 characters, starting with a letter or digit");
 
@@ -50,7 +44,7 @@ export async function runT3Command(positionals: string[], flags: ParsedArgs["fla
     client = createFavouritesClient(admin);
   }
   const metrics = new FavSyncMetrics(metricsPathOf(t3Home, d.stateDir, "cli", process.pid, label));
-  const sync = { t3Home, client, names: d.names ?? (() => hostNames({ poolNames, env })), metrics, ...(label ? { label } : {}), ...(d.stateDir ? { stateDir: d.stateDir } : {}), log: (m: string) => console.error(`ais: ${m}`) };
+  const sync = { t3Home, client, names: d.names ?? (() => hostNames()), metrics, ...(label ? { label } : {}), ...(d.stateDir ? { stateDir: d.stateDir } : {}), log: (m: string) => console.error(`ais: ${m}`) };
 
   if (boolFlag(flags, "once")) {
     try {

@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { FavChange, FavKey } from "../../src/browser/chat-protocol.ts";
+import { POOL_IDENTITY, type FavChange, type FavKey } from "../../src/browser/chat-protocol.ts";
 import { MemoryFavouriteStore } from "../../src/gateway/chat/favourites-store.ts";
 import type { FavouritesApi, FavList } from "../../src/t3/favourites/client.ts";
 import type { HostNames } from "../../src/t3/favourites/sync.ts";
@@ -18,7 +18,7 @@ export const INSTANCES = [
   "t3-codex-work", "t3-kimi-work-acp", "t3-kimi-pool-acp", "t3-grok-work", "t3-grok-work-acp", "t3-grok-pool", "t3-zai-work-acp", "t3-zcode-work-acp", "t3-opencode-work", "t3-opencode-pool",
 ];
 
-export const names = (over: Partial<Record<string, string>> = {}): HostNames => ({ poolName: (p) => over[p] ?? "pool", canonical: (_p, n) => (n === "wk" ? "work" : n) });
+export const names = (): HostNames => ({ canonical: (_p, n) => (n === "wk" ? "work" : n) });
 
 /** A home with a settings.json that has the given favorites and other keys. */
 export function makeHome(opts: { favorites?: Array<{ provider: string; model: string }>; instances?: string[]; indent?: number | string; extra?: Record<string, unknown>; mode?: number } = {}): { home: string; settings: string; read(): Record<string, any>; text(): string } {
@@ -64,3 +64,6 @@ export function fakeGateway(now: () => number = Date.now) {
 }
 
 export const key = (model: string, identity = "work", provider: FavKey["provider"] = "claude"): FavKey => ({ provider, identity, model });
+
+/** The key of a pool favourite: the reserved pool identity, whatever the pool is called. */
+export const poolKey = (model: string, provider: FavKey["provider"] = "claude"): FavKey => ({ provider, identity: POOL_IDENTITY, model });

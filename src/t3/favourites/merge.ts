@@ -10,7 +10,7 @@ import { favToKey, keyToFav, mappedKeys, type MapContext, type T3Fav } from "./m
  * `at` is the time of the change, for the gateway's newest-wins rule. T3 does not date its stars: the caller passes the time the settings
  * file was written, which is the latest time a change in it can have been made.
  */
-export function localChanges(t3: readonly T3Fav[], ctx: Pick<MapContext, "poolName" | "canonical">, lastSynced: readonly FavKey[] | undefined, gateway: readonly FavKey[], at?: number): FavChange[] {
+export function localChanges(t3: readonly T3Fav[], ctx: Pick<MapContext, "canonical">, lastSynced: readonly FavKey[] | undefined, gateway: readonly FavKey[], at?: number): FavChange[] {
   const local = mappedKeys(t3, ctx);
   const localIds = new Set(local.map(favId));
   const gatewayIds = new Set(gateway.map(favId));

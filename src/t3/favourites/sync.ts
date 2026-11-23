@@ -3,15 +3,15 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { watch, type FSWatcher } from "node:fs";
 import { dirname, join } from "node:path";
-import { CHAT_PROVIDERS, favId, MAX_FAVOURITES, parseChatToExt, selectable, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
+import { CHAT_PROVIDERS, favId, MAX_FAVOURITES, parseChatToExt, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
 import type { FavouritesApi } from "./client.ts";
 import { applyGateway, localChanges, sameFavs } from "./merge.ts";
-import { mappedKeys, poolProviders, type MapContext, type T3Fav } from "./mapping.ts";
+import { mappedKeys, type MapContext, type T3Fav } from "./mapping.ts";
 import { favouritesStateDir, type FavSyncMetrics, type FavSyncRole } from "./metrics.ts";
 import { readT3Settings, settingsPathOf, writeT3Favourites } from "./settings.ts";
 
-/** The name context of the host: the pool name of a provider and the canonical name of an identity. The instances come from settings.json. */
-export type HostNames = Pick<MapContext, "poolName" | "canonical">;
+/** The name context of the host: the canonical name of an identity. The instances come from settings.json. A pool needs no name: it maps to POOL_IDENTITY. */
+export type HostNames = Pick<MapContext, "canonical">;
 
 export interface FavSyncDeps {
   t3Home: string;
@@ -110,18 +110,6 @@ export type RoundResult =
   | { status: "retry" }
   | { status: "ok"; seq: number; pushed: number; wrote: boolean };
 
-const warnedPools = new WeakMap<object, Set<ChatProvider>>();
-/** A pool instance whose provider has no pool name is not synced. Say so once per provider and process, not every round. */
-function warnUnnamedPools(d: Pick<FavSyncDeps, "log">, ctx: MapContext): void {
-  const seen = warnedPools.get(d) ?? new Set<ChatProvider>();
-  warnedPools.set(d, seen);
-  for (const p of poolProviders(ctx.instances)) {
-    if (ctx.poolName(p) !== undefined || seen.has(p)) continue;
-    seen.add(p);
-    (d.log ?? ((m: string) => console.error(`ais: ${m}`)))(`t3 favourites sync: no pool name for ${p}: its pool favourites are left alone and not synced (set --pool-names=${p}=<name> or AIS_T3_POOL_NAMES)`);
-  }
-}
-
 /**
  * One round. It reads the gateway list, sends the stars made in T3 since the last round, makes T3's mapped favourites equal to the
  * gateway list, and remembers the result. A round that finds nothing to change writes nothing, so the file event that follows a
@@ -132,7 +120,6 @@ export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
   const settings = await readT3Settings(d.t3Home);
   if (!settings) return { status: "no-settings" };
   const ctx: MapContext = { ...(await d.names()), instances: settings.instances };
-  warnUnnamedPools(d, ctx);
   const state = await readState(d);
   // T3 does not date its stars, so the first read that shows a change dates it. A later read must not move that time: an unrelated save of
   // settings.json while the change waits (gateway down, failed rounds) would make an old removal look newer than a panel add.
@@ -305,61 +292,20 @@ export async function runFavouritesSync(d: FavSyncDeps, o: RunOptions = {}): Pro
   }
 }
 
-/** The pool name of each tool, by tool. */
-export type PoolNames = Partial<Record<ChatProvider, string>>;
-
-/** The environment variable with the pool names, in the format of `--pool-names`. */
-export const POOL_NAMES_ENV = "AIS_T3_POOL_NAMES";
-
-/**
- * Parses `<tool>=<name>,<tool>=<name>` (for example `claude=x,codex=x,kimi=x`). Throws an error that names the problem.
- * An empty or absent value gives no names.
- */
-export function parsePoolNames(raw: string | undefined): PoolNames {
-  const out: PoolNames = {};
-  if (raw === undefined || raw.trim() === "") return out;
-  for (const part of raw.split(",")) {
-    const [tool, name, ...more] = part.split("=").map((x) => x.trim());
-    if (!tool || !name || more.length > 0) throw new Error(`pool names must look like <tool>=<name>,<tool>=<name>, got "${part.trim()}"`);
-    if (!(CHAT_PROVIDERS as readonly string[]).includes(tool)) throw new Error(`pool names: "${tool}" is not a tool (${CHAT_PROVIDERS.join(", ")})`);
-    if (!selectable(name)) throw new Error(`pool names: "${name}" is not a valid name`);
-    out[tool as ChatProvider] = name;
-  }
-  return out;
-}
-
-export interface HostNamesOptions {
-  /** Pool names that win over the environment and the identity files (`--pool-names`). */
-  poolNames?: PoolNames;
-  /** Default: process.env. */
-  env?: Record<string, string | undefined>;
-}
-
-/**
- * The pool name of each provider and the canonical identity names.
- * A pool name comes from the first source that has it: `--pool-names`, AIS_T3_POOL_NAMES, then the AIS identity registry of this host.
- * A provider that no source names has no pool name: its pool favourites are not mapped.
- */
-export async function hostNames(opts: HostNamesOptions = {}): Promise<HostNames> {
+/** The names of this host: the canonical name of an identity, from the AIS identity registry. A host with no registry (a pod) uses the names as they are. */
+export async function hostNames(): Promise<HostNames> {
   const { TOOL_CONFIGS } = await import("../../cli/identities/resolve-tool.ts");
   const { loadIdentitiesFile } = await import("../../identities/store.ts");
-  const { poolsOf } = await import("../../identities/pool/swap-pool.ts");
-  const given: PoolNames = { ...parsePoolNames((opts.env ?? process.env)[POOL_NAMES_ENV]), ...opts.poolNames };
-  const pools = new Map<ChatProvider, string>();
   const canon = new Map<ChatProvider, Array<{ name: string; aliases: string[] }>>();
   for (const p of CHAT_PROVIDERS) {
     const cfg = (TOOL_CONFIGS as Record<string, { identitiesJsonPath: string } | undefined>)[p];
     if (!cfg) continue;
     try {
       const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
-      const found = poolsOf(file);
-      if (found.length === 1) pools.set(p, found[0]!.name);
       canon.set(p, file.identities.map((i) => ({ name: i.name, aliases: i.aliases ?? [] })));
     } catch { /* a tool with no registry (a pod): its names are used as they are */ }
   }
-  for (const [p, name] of Object.entries(given) as Array<[ChatProvider, string]>) pools.set(p, name);
   return {
-    poolName: (p) => pools.get(p),
     canonical: (p, name) => {
       const hit = canon.get(p)?.find((i) => i.name === name || i.aliases.includes(name));
       return hit?.name ?? name;

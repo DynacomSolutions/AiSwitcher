@@ -1,11 +1,11 @@
-// The options that let the favourites sync run as a sidecar in a pod: pool names, usage-only instances, an origin label, the favourites token.
+// The options that let the favourites sync run as a sidecar in a pod: pools with no configuration, usage-only instances, an origin label, the favourites token.
 import { afterEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { runT3Command } from "../../src/cli/t3/dispatch.ts";
-import { instanceToAis, keyToFav, mappedKeys, poolProviders, type MapContext } from "../../src/t3/favourites/mapping.ts";
+import { instanceToAis } from "../../src/t3/favourites/mapping.ts";
 import { gatewayAdmin } from "../../src/t3/favourites/config.ts";
-import { hostNames, homeKey, metricsPathOf, parsePoolNames, readState, syncOnce, type FavSyncDeps, type HostNames } from "../../src/t3/favourites/sync.ts";
-import { CLAUDE_POOL, fakeGateway, INSTANCES, key, makeHome, names, scratch } from "./favourites-fixtures.ts";
+import { homeKey, metricsPathOf, readState, syncOnce, type HostNames } from "../../src/t3/favourites/sync.ts";
+import { CLAUDE_POOL, CODEX_POOL, fakeGateway, INSTANCES, key, makeHome, names, poolKey, scratch } from "./favourites-fixtures.ts";
 
 const cleanups: string[] = [];
 afterEach(() => {
@@ -17,72 +17,56 @@ const home = (opts: Parameters<typeof makeHome>[0] = {}) => {
   cleanups.push(h.home, stateDir);
   return { ...h, stateDir };
 };
-const noPool = (): HostNames => ({ poolName: () => undefined, canonical: (_p, n) => n });
+/** A pod: no identity files, so no registry and no pool name. Names are used as they are. */
+const pod = (): HostNames => ({ canonical: (_p, n) => n });
 
-describe("pool names", () => {
-  test("the flag format is <tool>=<name> pairs", () => {
-    expect(parsePoolNames("claude=x,codex=y, kimi = z ")).toEqual({ claude: "x", codex: "y", kimi: "z" });
-    expect(parsePoolNames("")).toEqual({});
-    expect(parsePoolNames(undefined)).toEqual({});
-  });
+describe("pools in a pod, with no pool name", () => {
+  const POOL_FORMS = [[CLAUDE_POOL, "claude"], [CODEX_POOL, "codex"], ["t3-kimi-pool-acp", "kimi"], ["t3-grok-pool", "grok"], ["t3-opencode-pool", "opencode"]] as const;
 
-  test.each(["claude", "claude=", "=x", "claude=x=y", "nope=x", "claude=has space", "claude=x,,codex=y"])("%s is refused", (raw) => {
-    expect(() => parsePoolNames(raw)).toThrow();
-  });
-
-  test("the option, then the environment, give the pool name; no source gives none", async () => {
-    const env = { AIS_T3_POOL_NAMES: "claude=from-env,codex=from-env" };
-    const n = await hostNames({ env, poolNames: { claude: "from-flag" } });
-    expect(n.poolName("claude")).toBe("from-flag");
-    expect(n.poolName("codex")).toBe("from-env");
-  });
-
-  test("a provider with no pool name never maps to a guessed name", () => {
-    const ctx: MapContext = { ...noPool(), instances: new Set(INSTANCES) };
-    expect(instanceToAis(CLAUDE_POOL, ctx)).toBeUndefined();
-    expect(instanceToAis("t3-kimi-pool-acp", ctx)).toBeUndefined();
-    expect(instanceToAis("t3-claude-work", ctx)).toEqual({ provider: "claude", identity: "work" });
-    expect(mappedKeys([{ provider: CLAUDE_POOL, model: "m" }, { provider: "t3-claude-work", model: "m" }], ctx)).toEqual([key("m")]);
-    // A gateway star on a pool identity finds no instance.
-    expect(keyToFav(key("m", "shared-pool"), ctx)).toBeUndefined();
-    expect(poolProviders(INSTANCES).sort()).toEqual(["claude", "codex", "grok", "kimi", "opencode"]);
-  });
-
-  test("pool favourites are left alone, not synced, and the reason is logged once per provider", async () => {
-    const h = home({ favorites: [{ provider: CLAUDE_POOL, model: "pool-star" }, { provider: "t3-claude-work", model: "a" }] });
+  test("the pool favourites of every provider in the home go up under the pool key and come down again", async () => {
+    const h = home({ favorites: POOL_FORMS.map(([id, p]) => ({ provider: id, model: `t3-${p}` })) });
     const gw = fakeGateway();
-    await gw.star(key("chrome-star", "shared-pool"));
+    const deps = { t3Home: h.home, client: gw.api, names: async () => pod(), stateDir: h.stateDir, log: () => {} };
+    await syncOnce(deps);
+    expect((await gw.store.list()).items.map((i) => favLine(i)).sort()).toEqual(POOL_FORMS.map(([, p]) => `${p}/@pool/t3-${p}`).sort());
+    // A star made in the side panel on the pool row of a provider reaches the pool instance of the pod.
+    await gw.star(poolKey("from-panel", "grok"));
+    await gw.star(poolKey("from-panel", "opencode"));
+    await syncOnce(deps);
+    const favs = h.read().favorites as Array<{ provider: string; model: string }>;
+    expect(favs.filter((f) => f.model === "from-panel").map((f) => f.provider).sort()).toEqual(["t3-grok-pool", "t3-opencode-pool"]);
+  });
+
+  test("a star removed in T3 on a pool instance is removed at the gateway, and the other way round", async () => {
+    const h = home({ favorites: [{ provider: "t3-grok-pool", model: "g" }, { provider: "t3-opencode-pool", model: "o" }] });
+    const gw = fakeGateway();
+    const deps = { t3Home: h.home, client: gw.api, names: async () => pod(), stateDir: h.stateDir, log: () => {} };
+    await syncOnce(deps);
+    await gw.star(poolKey("g", "grok"), "remove", Date.now() + 1000);
+    await syncOnce(deps);
+    expect((h.read().favorites as Array<{ model: string }>).map((f) => f.model)).toEqual(["o"]);
+    const text = h.text().replace('"model": "o"', '"model": "o2"');
+    (await import("node:fs")).writeFileSync(h.settings, text);
+    await syncOnce(deps);
+    expect((await gw.store.list()).items.map((i) => favLine(i)).sort()).toEqual(["opencode/@pool/o2"]);
+  });
+
+  test("no log line says that a pool is skipped", async () => {
+    const h = home({ favorites: [{ provider: CLAUDE_POOL, model: "m" }] });
     const logs: string[] = [];
-    const deps: FavSyncDeps = { t3Home: h.home, client: gw.api, names: async () => noPool(), stateDir: h.stateDir, log: (m) => logs.push(m) };
-    await syncOnce(deps);
-    await syncOnce(deps);
-    expect((await gw.store.list()).items.map((i) => `${i.identity}/${i.model}`).sort()).toEqual(["shared-pool/chrome-star", "work/a"]);
-    expect(h.read().favorites).toEqual([{ provider: CLAUDE_POOL, model: "pool-star" }, { provider: "t3-claude-work", model: "a" }]);
-    expect(logs.filter((l) => l.includes("no pool name for claude"))).toHaveLength(1);
-    expect(logs.every((l) => l.includes("--pool-names"))).toBe(true);
+    await syncOnce({ t3Home: h.home, client: fakeGateway().api, names: async () => pod(), stateDir: h.stateDir, log: (m) => logs.push(m) });
+    expect(logs).toEqual([]);
   });
 
-  test("with a pool name given, the pool favourites sync", async () => {
-    const h = home({ favorites: [{ provider: CLAUDE_POOL, model: "pool-star" }] });
-    const gw = fakeGateway();
-    await syncOnce({ t3Home: h.home, client: gw.api, names: async () => ({ ...noPool(), poolName: (p) => (p === "claude" ? "shared-pool" : undefined) }), stateDir: h.stateDir, log: () => {} });
-    expect((await gw.store.list()).items).toMatchObject([{ provider: "claude", identity: "shared-pool", model: "pool-star" }]);
-  });
-
-  test("the command reads --pool-names and AIS_T3_POOL_NAMES, the flag winning, and refuses a bad value", async () => {
+  test("the old pool-name flag and variable are accepted and ignored", async () => {
     const h = home({ favorites: [{ provider: CLAUDE_POOL, model: "m" }] });
     const gw = fakeGateway();
-    const run = (flags: Record<string, string | boolean>, env: Record<string, string>) =>
-      runT3Command(["favourites", "sync"], { once: true, "t3-home": h.home, ...flags }, { out: () => {}, client: gw.api, stateDir: h.stateDir, env });
-    await run({}, { AIS_T3_POOL_NAMES: "claude=from-env" });
-    expect((await gw.store.list()).items.map((i) => i.identity)).toEqual(["from-env"]);
-    await gw.star(key("m2", "from-flag"));
-    await run({ "pool-names": "claude=from-flag" }, { AIS_T3_POOL_NAMES: "claude=from-env" });
-    expect(h.read().favorites.some((f: { provider: string; model: string }) => f.provider === CLAUDE_POOL && f.model === "m2")).toBe(true);
-    await expect(run({ "pool-names": "claude" }, {})).rejects.toThrow(/pool names/);
-    await expect(run({}, { AIS_T3_POOL_NAMES: "nope=x" })).rejects.toThrow(/not a tool/);
+    await runT3Command(["favourites", "sync"], { once: true, "t3-home": h.home, "pool-names": "claude=named,codex=named,kimi=named" }, { out: () => {}, client: gw.api, names: async () => pod(), stateDir: h.stateDir, env: { AIS_T3_POOL_NAMES: "nope=x" } });
+    expect((await gw.store.list()).items.map((i) => favLine(i))).toEqual(["claude/@pool/m"]);
   });
 });
+
+const favLine = (i: { provider: string; identity: string; model: string }): string => `${i.provider}/${i.identity}/${i.model}`;
 
 describe("usage-only instances", () => {
   test.each(["t3-opencode-work-usage", "t3-opencode-work-acp-usage", "t3-claude-work-usage", "t3-grok-work-usage", "t3-kimi-work-acp-usage", "t3-opencode-pool-usage"])("%s is not synced", (id) => {

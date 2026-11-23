@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { favToKey, instanceToAis, keyToFav, mappedKeys, type MapContext } from "../../src/t3/favourites/mapping.ts";
-import { CLAUDE_POOL, CODEX_POOL, INSTANCES, key, names } from "./favourites-fixtures.ts";
+import { POOL_IDENTITY } from "../../src/browser/chat-protocol.ts";
+import { CLAUDE_POOL, CODEX_POOL, INSTANCES, key, names, poolKey } from "./favourites-fixtures.ts";
 
-const ctx = (over: Partial<Record<string, string>> = {}, instances: string[] = INSTANCES): MapContext => ({ ...names(over), instances: new Set(instances) });
+const ctx = (instances: string[] = INSTANCES): MapContext => ({ ...names(), instances: new Set(instances) });
 
 describe("instance id to AIS", () => {
   test.each([
@@ -19,13 +20,18 @@ describe("instance id to AIS", () => {
     expect(instanceToAis(id, names())).toEqual({ provider, identity } as never);
   });
 
-  test("a pool instance is the pool name of its provider", () => {
-    const n = names({ claude: "main-pool", codex: "cx-pool" });
-    expect(instanceToAis(CLAUDE_POOL, n)).toEqual({ provider: "claude", identity: "main-pool" });
-    expect(instanceToAis(CODEX_POOL, n)).toEqual({ provider: "codex", identity: "cx-pool" });
-    expect(instanceToAis("t3-kimi-pool-acp", n)).toEqual({ provider: "kimi", identity: "pool" });
-    expect(instanceToAis("t3-grok-pool", n)).toEqual({ provider: "grok", identity: "pool" });
-    expect(instanceToAis("t3-opencode-pool", n)).toEqual({ provider: "opencode", identity: "pool" });
+  test("the pool instance of every provider is the fixed pool identity, with no configuration", () => {
+    for (const [id, provider] of [[CLAUDE_POOL, "claude"], [CODEX_POOL, "codex"], ["t3-kimi-pool-acp", "kimi"], ["t3-grok-pool", "grok"], ["t3-grok-pool-acp", "grok"], ["t3-zai-pool-acp", "zai"], ["t3-opencode-pool", "opencode"]] as const) {
+      expect(instanceToAis(id)).toEqual({ provider, identity: POOL_IDENTITY });
+      expect(instanceToAis(id, names())).toEqual({ provider, identity: POOL_IDENTITY });
+    }
+  });
+
+  test("the pool identity cannot be the name of a real identity", () => {
+    expect(instanceToAis("t3-claude-@pool")).toBeUndefined();
+    expect(favToKey({ provider: "t3-claude-@pool", model: "m" })).toBeUndefined();
+    // An instance id never has an `@`, so no real instance of AIS gets there.
+    expect(/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test("t3-claude-@pool")).toBe(false);
   });
 
   test("an alias becomes the canonical identity name", () => {
@@ -58,19 +64,19 @@ describe("favourites", () => {
 
   test("a key goes to the instance that exists, in order of preference", () => {
     expect(keyToFav(key("m"), ctx())).toEqual({ provider: "t3-claude-work", model: "m" });
-    expect(keyToFav(key("m", "pool"), ctx())).toEqual({ provider: CLAUDE_POOL, model: "m" });
+    expect(keyToFav(poolKey("m"), ctx())).toEqual({ provider: CLAUDE_POOL, model: "m" });
     expect(keyToFav(key("m", "work", "grok"), ctx())).toEqual({ provider: "t3-grok-work", model: "m" });
     // Without the driver instance the ACP twin holds it.
-    expect(keyToFav(key("m", "work", "grok"), ctx({}, ["t3-grok-work-acp"]))).toEqual({ provider: "t3-grok-work-acp", model: "m" });
+    expect(keyToFav(key("m", "work", "grok"), ctx(["t3-grok-work-acp"]))).toEqual({ provider: "t3-grok-work-acp", model: "m" });
     expect(keyToFav(key("m", "work", "kimi"), ctx())).toEqual({ provider: "t3-kimi-work-acp", model: "m" });
     expect(keyToFav(key("m", "work", "zai"), ctx())).toEqual({ provider: "t3-zai-work-acp", model: "m" });
     expect(keyToFav(key("m", "work", "opencode"), ctx())).toEqual({ provider: "t3-opencode-work", model: "m" });
-    expect(keyToFav(key("m", "pool", "codex"), ctx())).toEqual({ provider: CODEX_POOL, model: "m" });
+    expect(keyToFav(poolKey("m", "codex"), ctx())).toEqual({ provider: CODEX_POOL, model: "m" });
   });
 
   test("a key with no instance on this host has no T3 favourite", () => {
     expect(keyToFav(key("m", "other"), ctx())).toBeUndefined();
-    expect(keyToFav(key("m", "work", "claude"), ctx({}, [CLAUDE_POOL]))).toBeUndefined();
+    expect(keyToFav(key("m", "work", "claude"), ctx([CLAUDE_POOL]))).toBeUndefined();
   });
 
   test("the mapping is stable both ways for every instance of the host", () => {
@@ -81,5 +87,44 @@ describe("favourites", () => {
       expect(back).toBeDefined();
       expect(instanceToAis(back!.provider, names())).toEqual(a);
     }
+  });
+});
+
+describe("every instance form of all six providers", () => {
+  const providers: Array<"claude" | "codex" | "kimi" | "grok" | "zai" | "opencode"> = ["claude", "codex", "kimi", "grok", "zai", "opencode"];
+  /** The instance ids AIS makes for an identity and for the pool of a provider. */
+  const forms = (p: (typeof providers)[number], who: string): string[] => {
+    switch (p) {
+      case "claude": return [`t3-claude-${who}`];
+      case "codex": return [`t3-codex-${who}`];
+      case "kimi": return [`t3-kimi-${who}-acp`];
+      case "zai": return [`t3-zai-${who}-acp`];
+      case "grok": return [`t3-grok-${who}`, `t3-grok-${who}-acp`];
+      case "opencode": return [`t3-opencode-${who}`];
+    }
+  };
+  const poolForms = (p: (typeof providers)[number]): string[] => (p === "claude" ? [CLAUDE_POOL] : p === "codex" ? [CODEX_POOL] : forms(p, "pool"));
+
+  test.each(providers)("%s: every identity form maps to the identity and back", (p) => {
+    for (const id of forms(p, "work")) {
+      expect(favToKey({ provider: id, model: "m" })).toEqual({ provider: p, identity: "work", model: "m" });
+      expect(keyToFav({ provider: p, identity: "work", model: "m" }, { instances: new Set([id]) })).toEqual({ provider: id, model: "m" });
+    }
+  });
+
+  test.each(providers)("%s: every pool form maps to the pool key and back, with no pool name", (p) => {
+    for (const id of poolForms(p)) {
+      expect(favToKey({ provider: id, model: "m" })).toEqual(poolKey("m", p));
+      expect(keyToFav(poolKey("m", p), { instances: new Set([id]) })).toEqual({ provider: id, model: "m" });
+    }
+  });
+
+  test("a hand-made t3-<claude|codex>-pool instance also reads as the pool", () => {
+    expect(favToKey({ provider: ["t3", "claude", "pool"].join("-"), model: "m" })).toEqual(poolKey("m", "claude"));
+    expect(favToKey({ provider: ["t3", "codex", "pool"].join("-"), model: "m" })).toEqual(poolKey("m", "codex"));
+  });
+
+  test("a grok pool favourite on both of its instances is one key", () => {
+    expect(mappedKeys([{ provider: "t3-grok-pool", model: "g" }, { provider: "t3-grok-pool-acp", model: "g" }])).toEqual([poolKey("g", "grok")]);
   });
 });

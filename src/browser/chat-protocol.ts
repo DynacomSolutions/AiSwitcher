@@ -20,6 +20,11 @@ export interface FavChange extends FavKey { op: "add" | "remove"; at?: number }
 /** Why a store refused a change. `stale`: a newer change of the same model won, so the change is dead. `cap`: the list holds the most stars, so the add may be tried again after a removal. */
 export type FavRefusalReason = "stale" | "cap";
 export interface FavRefusal extends FavKey { reason: FavRefusalReason }
+/**
+ * The identity of a favourite of "the pool of this provider". It is the same on the host sync, the gateway and the side panel, so no side needs the pool's name.
+ * `@` is not valid in an identity or instance name, so it never equals a real identity. It passes `selectable`.
+ */
+export const POOL_IDENTITY = "@pool";
 /** One string per starred model. The names may hold `/` and `:`, so the id is a JSON array. */
 export const favId = (f: FavKey): string => JSON.stringify([f.provider, f.identity, f.model]);
 
