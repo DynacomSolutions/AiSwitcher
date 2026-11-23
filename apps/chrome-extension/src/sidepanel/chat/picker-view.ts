@@ -204,7 +204,7 @@ export function createPicker(doc: Document, h: PickerHandlers, label: string): P
         opt.addEventListener("mousemove", () => { if (cursor !== at) { cursor = at; paintHighlight(undefined); } });
         row.append(opt);
         if (e.model !== undefined) {
-          const fav: Fav = { provider: e.provider, identity: e.identity, model: e.model };
+          const fav: Fav = { provider: e.provider, identity: e.favIdentity, model: e.model };
           const on = stars.has(e.key);
           const star = el(doc, "button", on ? "picker-star on" : "picker-star");
           star.type = "button";

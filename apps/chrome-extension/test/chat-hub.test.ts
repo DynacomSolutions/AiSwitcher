@@ -614,6 +614,28 @@ describe("favourites", () => {
     expect(e.store["chatFavouritesSeq"]).toBe(4);
   });
 
+  test("a star cached under a pool's old name becomes the pool key when the gateway moved it, and nothing is sent back", async () => {
+    const old = fav("m", "some-pool");
+    const moved = fav("m", "@pool");
+    const e = withLocal({ [FAV_KEY]: [fav("a"), old], [SYNCED_KEY]: [fav("a"), old], [EPOCH_KEY]: "e1", ["chatFavouritesSeq"]: 4 });
+    await e.hub.load();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([fav("a"), moved], 6, "e1"));
+    expect(e.hub.state(1).favourites).toEqual([fav("a"), moved]);
+    expect(e.sets()).toEqual([]);
+    await Bun.sleep(0);
+    expect(e.store[FAV_KEY]).toEqual([fav("a"), moved]);
+    expect(e.store[SYNCED_KEY]).toEqual([fav("a"), moved]);
+  });
+
+  test("a star on a pool row is sent under the pool key", async () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([]));
+    await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("p", "@pool") });
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("p", "@pool"), op: "add", at: 5000 }] }]);
+  });
+
   test("a list version that only grows with the same epoch is no reset", () => {
     const e = withLocal();
     e.hub.onWelcome();
