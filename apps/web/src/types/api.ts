@@ -180,6 +180,21 @@ export interface RegistriesResponse {
   registries: RegistryDto[];
 }
 
+export interface AddGatewayIdentityBody {
+  name: string;
+  label: string;
+  description?: string;
+  /** Existing swap pool of the tool; the new identity joins its members. */
+  pool?: string;
+}
+
+export interface AddGatewayIdentityResponse {
+  tool: "claude" | "codex";
+  identity: { name: string; label: string; description?: string; configDir: string };
+  pool?: string;
+  registryVersion: number;
+}
+
 export interface CreateIdentityBody {
   name: string;
   label: string;

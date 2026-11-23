@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Ellipsis, Plus } from "lucide-react";
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import { AuthStateBadge, IdentityDot } from "@/components/badges";
@@ -45,8 +46,9 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { useIdentitiesQuery, useAuthQuery, qk } from "@/hooks/queries";
+import { useIdentitiesQuery, useAuthQuery, usePoolsUsageQuery, qk } from "@/hooks/queries";
 import { api } from "@/lib/api";
+import { addIdentityBody, addIdentityProblem, canAddGatewayIdentity } from "@/lib/gateway-identity";
 import type { AuthEntry, CreateIdentityBody, IdentityDto, RegistryDto, ToolName } from "@/types/api";
 
 interface IdentityRef {
@@ -528,6 +530,152 @@ function CreateIdentityDialog({ tool, onClose }: { tool: ToolName; onClose: () =
   );
 }
 
+function AddGatewayIdentityDialog({
+  registry,
+  onClose,
+}: {
+  registry: RegistryDto;
+  onClose: () => void;
+}) {
+  const tool = registry.toolName;
+  const navigate = useNavigate();
+  const invalidate = useInvalidateIdentities();
+  const poolsQuery = usePoolsUsageQuery();
+  const pools = (poolsQuery.data?.pools ?? []).filter((p) => p.tool === tool);
+  const [name, setName] = useState("");
+  const [label, setLabel] = useState("");
+  const [description, setDescription] = useState("");
+  const [pool, setPool] = useState("");
+  const [added, setAdded] = useState<string | null>(null);
+
+  const input = { name, label, description, pool };
+  const problem = addIdentityProblem(
+    input,
+    registry.identities.map((i) => i.name),
+  );
+
+  const mutation = useMutation({
+    mutationFn: () => api.addGatewayIdentity(tool, addIdentityBody(input)),
+    onSuccess: (result) => {
+      invalidate();
+      // The console picks the new entry up from the gateway store a few seconds later; look again then.
+      window.setTimeout(invalidate, 4000);
+      toast.success("Identity added", { description: `${tool}/${result.identity.name}` });
+      setAdded(result.identity.name);
+    },
+    onError: (error) => toast.error("Add failed", { description: error.message }),
+  });
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-xl">
+        {added ? (
+          <>
+            <DialogHeader>
+              <DialogTitle>Identity added</DialogTitle>
+              <DialogDescription>
+                <span className="font-mono text-xs">
+                  {tool}/{added}
+                </span>{" "}
+                is in the gateway store. It has no login yet. Open the Auth page and press Login for it.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={onClose}>
+                Close
+              </Button>
+              <Button
+                onClick={() => {
+                  onClose();
+                  navigate("/auth");
+                }}
+              >
+                Go to Auth page
+              </Button>
+            </DialogFooter>
+          </>
+        ) : (
+          <>
+            <DialogHeader>
+              <DialogTitle>Add {tool} identity</DialogTitle>
+              <DialogDescription>
+                Adds a login slot to the gateway store. No file on this host changes. Sign it in
+                afterwards with Login on the Auth page.
+              </DialogDescription>
+            </DialogHeader>
+            <form
+              id="add-gateway-identity"
+              className="grid grid-cols-1 gap-4 sm:grid-cols-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!problem && !mutation.isPending) mutation.mutate();
+              }}
+            >
+              <div className="space-y-2">
+                <Label htmlFor="add-name">Name</Label>
+                <Input
+                  id="add-name"
+                  className="font-mono text-xs"
+                  placeholder="identity-a"
+                  autoComplete="off"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="add-label">Label</Label>
+                <Input
+                  id="add-label"
+                  placeholder="Shown in lists"
+                  value={label}
+                  onChange={(e) => setLabel(e.target.value)}
+                />
+              </div>
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="add-description">Description (optional)</Label>
+                <Input
+                  id="add-description"
+                  placeholder="For example the account email"
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">Stored in the gateway store only.</p>
+              </div>
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="add-pool">Add to pool (optional)</Label>
+                <select
+                  id="add-pool"
+                  className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                  value={pool}
+                  onChange={(e) => setPool(e.target.value)}
+                >
+                  <option value="">No pool</option>
+                  {pools.map((p) => (
+                    <option key={p.name} value={p.name}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {name.trim() && problem ? (
+                <p className="text-xs text-destructive sm:col-span-2">{problem}</p>
+              ) : null}
+            </form>
+            <DialogFooter>
+              <Button variant="outline" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button type="submit" form="add-gateway-identity" disabled={mutation.isPending || !!problem}>
+                {mutation.isPending ? "Adding..." : "Add identity"}
+              </Button>
+            </DialogFooter>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function RegistryTable({ registry, authFor }: { registry: RegistryDto; authFor: (tool: string, identity: string) => AuthEntry | undefined }) {
   const [editing, setEditing] = useState<IdentityRef | null>(null);
   const [managing, setManaging] = useState<{ ref: IdentityRef; kind: "directories" | "aliases" } | null>(null);
@@ -733,6 +881,7 @@ export function IdentitiesPage() {
   const registries = query.data?.registries ?? [];
   const [activeTool, setActiveTool] = useState<string>("");
   const [creatingFor, setCreatingFor] = useState<RegistryDto | null>(null);
+  const [addingFor, setAddingFor] = useState<RegistryDto | null>(null);
 
   const authEntries = authQuery.data?.entries ?? [];
   const authFor = (tool: string, identity: string): AuthEntry | undefined =>
@@ -748,10 +897,23 @@ export function IdentitiesPage() {
         description="Every registry AiProfileSwitcher resolves identities from."
         updatedAt={query.dataUpdatedAt}
         actions={
-          <Button size="sm" disabled={!active} onClick={() => active && setCreatingFor(active)}>
-            <Plus aria-hidden />
-            New identity
-          </Button>
+          <div className="flex items-center gap-2">
+            {active && canAddGatewayIdentity(active.toolName) ? (
+              <Button size="sm" onClick={() => setAddingFor(active)}>
+                <Plus aria-hidden />
+                Add identity
+              </Button>
+            ) : null}
+            <Button
+              size="sm"
+              variant={active && canAddGatewayIdentity(active.toolName) ? "outline" : "default"}
+              disabled={!active}
+              onClick={() => active && setCreatingFor(active)}
+            >
+              <Plus aria-hidden />
+              New identity
+            </Button>
+          </div>
         }
       />
 
@@ -788,6 +950,7 @@ export function IdentitiesPage() {
         </div>
       ) : null}
 
+      {addingFor ? <AddGatewayIdentityDialog registry={addingFor} onClose={() => setAddingFor(null)} /> : null}
       {creatingFor ? (
         <CreateIdentityDialog tool={creatingFor.toolName} onClose={() => setCreatingFor(null)} />
       ) : null}
