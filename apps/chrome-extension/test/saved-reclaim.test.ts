@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { BrowserTool, CallRequest } from "../../../src/browser/protocol.ts";
 import { Executor } from "../src/background/executor.ts";
 import { State } from "../src/background/state.ts";
-import { HOLDER_LIVE_MS, TabManager } from "../src/background/tabs.ts";
+import { HOLDER_LIVE_MS, SESSION_END_MS, TabManager } from "../src/background/tabs.ts";
 import { FakeChrome } from "./fakes.ts";
 
 const OLD = { id: "old-1", identity: "alice", label: "ContractFinder" };
@@ -238,5 +238,159 @@ describe("a later session of the chat regains its saved group", () => {
     clock += HOLDER_LIVE_MS + 1000;
     await t.call("tabs_context", {}, NEW);
     expect(await t.call("close_tab", { tabId: ids[0]! }, OLD)).toMatchObject({ ok: false, error: "forbidden_tab" });
+  });
+});
+
+/** A user group of 4 tabs that the old session takes with takeGroup (allowClose false: every tab approved), then saves. */
+async function approvedCase() {
+  const t = setup();
+  const ids: number[] = [];
+  for (let i = 0; i < 4; i++) ids.push(t.api.addTab(1 + i, `https://jobs.example.com/${i}`).id);
+  const gid = await t.api.tabs.group(ids);
+  t.api.groups.set(gid, { title: "ContractFinder", color: "blue" });
+  const taken = await t.tabs.takeGroup(OLD, gid, ids, false);
+  expect(taken.ok).toBe(true);
+  expect((await t.call("save_group", { name: "ContractFinder" })).ok).toBe(true);
+  expect(t.tabs.isApproved(OLD.id, ids[0]!)).toBe(true);
+  return { t, ids, gid };
+}
+
+const refused = (r: { ok: boolean }) => expect(r).toMatchObject({ ok: false, error: "forbidden_tab" });
+
+describe("the regain keeps approved and owned flags (security)", () => {
+  test("P1: the saver idles out, a new session of the chat cannot close an approved tab", async () => {
+    const { t, ids } = await approvedCase();
+    clock += SESSION_END_MS + 1000;
+    t.tabs.expireIdle();
+    expect(t.tabs.sessions.has(OLD.id)).toBe(false);
+    const ctx = t.json(await t.call("tabs_context", {}, NEW));
+    expect(ctx.sessionTabs.map((x: { tabId: number }) => x.tabId)).toEqual(ids);
+    for (const id of ids) {
+      refused(await t.call("close_tab", { tabId: id }, NEW));
+      expect(t.api.tabList.has(id)).toBe(true);
+    }
+  });
+
+  test("P1c: the saver sends session_end, a new session of the chat cannot close an approved tab", async () => {
+    const { t, ids } = await approvedCase();
+    await t.call("session_end", {}, OLD);
+    clock += HOLDER_LIVE_MS + 1000;
+    await t.call("tabs_context", {}, NEW);
+    for (const id of ids) {
+      refused(await t.call("close_tab", { tabId: id }, NEW));
+      expect(t.api.tabList.has(id)).toBe(true);
+    }
+  });
+
+  test("P2: after a browser restart a new session of the chat cannot close an approved tab", async () => {
+    const { t, ids } = await approvedCase();
+    const map = t.api.restart();
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    clock += HOLDER_LIVE_MS + 1000;
+    const newIds = ids.map(id => map.get(id)!);
+    await fresh.call("tabs_context", {}, NEW);
+    for (const id of newIds) {
+      refused(await fresh.call("close_tab", { tabId: id }, NEW));
+      expect(fresh.api.tabList.has(id)).toBe(true);
+    }
+  });
+
+  test("an idle expiry and a later regrant of the same session keep approved tabs", async () => {
+    const { t, ids } = await approvedCase();
+    clock += SESSION_END_MS + 1000;
+    t.tabs.expireIdle();
+    await t.call("tabs_context", {}, OLD);
+    refused(await t.call("close_tab", { tabId: ids[0]! }, OLD));
+    expect(t.api.tabList.has(ids[0]!)).toBe(true);
+  });
+
+  test("an entry with no stored flags treats every tab as approved and owns none", async () => {
+    const { t, ids } = await approvedCase();
+    for (const e of t.api.store["savedGroups"] as Array<Record<string, unknown>>) delete e["flags"];
+    t.api.session = {};
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    clock += HOLDER_LIVE_MS + 1000;
+    await fresh.call("tabs_context", {}, NEW);
+    refused(await fresh.call("close_tab", { tabId: ids[0]! }, NEW));
+    expect(fresh.api.tabList.has(ids[0]!)).toBe(true);
+  });
+
+  test("P3: a tab the user drags into the saved group never becomes closable by the regain", async () => {
+    const { t, ids, gid } = await savedCase();
+    const user = t.api.addTab(777, "https://user.example.com/").id;
+    await t.api.tabs.group([user], gid);
+    expect(t.tabs.owns(OLD.id, user, OLD.identity)).toBe(false);
+    refused(await t.call("close_tab", { tabId: user }, OLD));
+    await t.tabs.refreshSaved(); // the snapshot sees the new tab
+    clock += HOLDER_LIVE_MS + 1000;
+    await t.call("tabs_context", {}, NEW);
+    expect(t.tabs.grantee(gid)).toBe(NEW.id);
+    expect(t.tabs.owns(NEW.id, user, NEW.identity)).toBe(false);
+    refused(await t.call("close_tab", { tabId: user }, NEW));
+    expect(t.api.tabList.has(user)).toBe(true);
+    expect((await t.call("close_tab", { tabId: ids[4]! }, NEW)).ok).toBe(true);
+  });
+
+  test("P3: the same holds when the snapshot did not see the dragged tab yet", async () => {
+    const { t, ids, gid } = await savedCase();
+    const user = t.api.addTab(777, "https://user.example.com/").id;
+    await t.api.tabs.group([user], gid);
+    clock += HOLDER_LIVE_MS + 1000;
+    await t.call("tabs_context", {}, NEW);
+    refused(await t.call("close_tab", { tabId: user }, NEW));
+    expect(t.api.tabList.has(user)).toBe(true);
+    expect((await t.call("close_tab", { tabId: ids[0]! }, NEW)).ok).toBe(true);
+  });
+
+  test("P3: after an idle expiry and a regrant of the same session the dragged tab is not owned", async () => {
+    const { t, gid } = await savedCase();
+    const user = t.api.addTab(777, "https://user.example.com/").id;
+    await t.api.tabs.group([user], gid);
+    await t.tabs.refreshSaved();
+    clock += SESSION_END_MS + 1000;
+    t.tabs.expireIdle();
+    await t.call("tabs_context", {}, OLD);
+    expect(t.tabs.owns(OLD.id, user, OLD.identity)).toBe(false);
+    refused(await t.call("close_tab", { tabId: user }, OLD));
+  });
+
+  test("a tab the saver opens in the saved group later is owned after the regain", async () => {
+    const { t, gid } = await savedCase();
+    const made = t.json(await t.call("tabs_create", { url: "https://later.example.com/", groupId: gid }, OLD)).tabId as number;
+    await t.tabs.refreshSaved();
+    clock += HOLDER_LIVE_MS + 1000;
+    await t.call("tabs_context", {}, NEW);
+    expect((await t.call("close_tab", { tabId: made }, NEW)).ok).toBe(true);
+  });
+
+  test("a tab the saver owns and the user dragged into the group stays foreign across an idle expiry and a browser restart", async () => {
+    const { t, gid } = await savedCase();
+    const user = t.api.addTab(777, "https://user.example.com/").id;
+    await t.api.tabs.group([user], gid);
+    await t.tabs.refreshSaved();
+    clock += SESSION_END_MS + 1000;
+    t.tabs.expireIdle();
+    const map = t.api.restart();
+    const fresh = setup(t.api);
+    await fresh.tabs.load();
+    clock += HOLDER_LIVE_MS + 1000;
+    await fresh.call("tabs_context", {}, NEW);
+    refused(await fresh.call("close_tab", { tabId: map.get(user)! }, NEW));
+    expect(fresh.api.tabList.has(map.get(user)!)).toBe(true);
+  });
+
+  test("a closed saved group of approved tabs is recreated with the tabs still approved", async () => {
+    const { t, ids } = await approvedCase();
+    for (const id of ids) await t.api.tabs.remove(id);
+    clock += SESSION_END_MS + 1000;
+    t.tabs.expireIdle();
+    const r = t.json(await t.call("open_group", { name: "ContractFinder" }, NEW));
+    expect(r.tabs).toHaveLength(4);
+    for (const x of r.tabs as Array<{ tabId: number }>) {
+      refused(await t.call("close_tab", { tabId: x.tabId }, NEW));
+      expect(t.api.tabList.has(x.tabId)).toBe(true);
+    }
   });
 });
