@@ -227,7 +227,7 @@ ETA: 2026-11-20 14:00 ICT
 | 246 | Kimi and Grok threads snooze at a usage limit and resume at the reset | blocked | agent | acp-limit-snooze | 5.229 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/657 (8141866).<br>Host runs v0.5.85.<br>Waits on the first real Kimi or Grok usage limit to prove snooze and resume. |
 | 255 | Usage collector: Grok log re-read (~0.9 GB per cycle) | todo | | | 5.133 | | Split from 5.133.<br>Each cycle re-reads the whole Grok log. |
 ## 6. Browser control extension
-ETA: 2026-11-23 14:30 ICT
+ETA: 2026-11-23 15:30 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -258,7 +258,8 @@ ETA: 2026-11-23 14:30 ICT
 | 267 | AIS Browser: agents save a named tab group that outlives the session and reopen it | done | claude | browser-keep-tabs | | | Owner ask: session end closed 100 agent-opened tabs.<br>Tools save_group, open_group, forget_group; savedGroups in tabs_context.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/693, released v0.5.88 (gateway live).<br>Next: owner Chrome self-updates to 0.5.88, then save the ContractFinder group as live proof.<br>Merged and live-verified 2026-11-23: ContractFinder group saved, 100 tabs, 50 splits. |
 | 268 | AIS Browser: a chat keeps its tab group across session and browser restarts | done | claude | browser-group-ownership | 6.267 | | Owner report: after a restart the chat's group showed only in otherTabs, so save_group failed.<br>Also: half of the tabs missing in otherTabs, no group ids in tabs_context.<br>Merged and live-verified 2026-11-23: ContractFinder group saved, 100 tabs, 50 splits. |
 | 269 | AIS Browser: a dead restored session never counts as live | done | claude | browser-stale-holder | 6.268 | | After an extension reload, dead sessions counted as live, so request_group refused.<br>A new session of the same chat now takes the group from a dead session.<br>Merged and live-verified 2026-11-23: ContractFinder group saved, 100 tabs, 50 splits. |
-| 284 | AIS Browser: keep a tab when Chrome replaces it (new tab id) | in_review | claude | browser-tab-replaced | 6.269 | 2026-11-23 14:30 ICT | Live: one ContractFinder tab got a new id and left sessionTabs.<br>The extension had no tabs.onReplaced listener.<br>request_group allowClose: an agent closes a group after the user approves it. |
+| 284 | AIS Browser: keep a tab when Chrome replaces it (new tab id) | done | claude | browser-tab-replaced | 6.269 | | Live: one ContractFinder tab got a new id and left sessionTabs.<br>The extension had no tabs.onReplaced listener.<br>request_group allowClose: an agent closes a group after the user approves it.<br>Merged in PR 717, released in v0.5.96. |
+| 285 | AIS Browser: harden tab replace and allowClose | in_review | claude | browser-replace-hardening | 6.284 | 2026-11-23 15:30 ICT | Review notes from PR 717.<br>Ignore a replace into a known tab, refuse allowClose while an approval record is unlinked. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-15 23:00 ICT
