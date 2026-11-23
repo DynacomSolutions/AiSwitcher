@@ -158,4 +158,30 @@ describe("tabs.onReplaced", () => {
     expect(JSON.stringify(t.api.session)).toBe(before);
     expect(t.tabs.ownerOf(80)).toBeUndefined();
   });
+
+  test("a replace that names a tab of another session as the added tab does nothing", async () => {
+    const t = setup();
+    const a = await t.tabs.create(AG, "https://a.example.com/");
+    const other = { id: "agent-2", identity: "alice", label: "Other" };
+    const b = await t.tabs.create(other, "https://b.example.com/");
+    const before = JSON.stringify(t.api.session);
+    for (const l of t.api.replacedListeners) l(b.id, a.id);
+    expect(t.tabs.sessions.get("agent-1")!.tabIds.has(a.id)).toBe(true);
+    expect(t.tabs.sessions.get("agent-1")!.tabIds.has(b.id)).toBe(false);
+    expect(t.tabs.ownerOf(b.id)).toBe("agent-2");
+    expect(JSON.stringify(t.api.session)).toBe(before);
+  });
+
+  test("closing an own tab and then a replace into a known user tab does not give the user tab away", async () => {
+    const t = setup();
+    const x = await t.tabs.create(AG, "https://a.example.com/");
+    const user = t.api.addTab(90, "https://user.example.com/");
+    await t.api.tabs.query(); // the manager has seen the user tab
+    for (const l of t.api.createdListeners) l({ ...user });
+    await sessionTabIds(t);
+    t.api.closeTab(x.id);
+    for (const l of t.api.replacedListeners) l(user.id, x.id);
+    expect(t.tabs.ownerOf(user.id)).toBeUndefined();
+    expect(await sessionTabIds(t)).toEqual([]);
+  });
 });

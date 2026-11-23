@@ -368,4 +368,21 @@ describe("request_group allowClose", () => {
     expect(await t.call("close_tab", { tabId: ids[0]! }, OTHER)).toMatchObject({ ok: false, error: "forbidden_tab" });
     expect(t.api.tabList.has(ids[0]!)).toBe(true);
   });
+
+  test("allowClose is refused while an unlinked record of the identity has the same title", async () => {
+    const t = setup();
+    const first = await userGroup(t.api);
+    const p1 = t.call("request_group", { groupId: first.gid });
+    await until(() => t.api.shown.size === 1);
+    t.api.clickNotification(0);
+    await p1;
+    const records = (t.tabs as unknown as { agents: Map<string, { groupId: number }> }).agents;
+    expect(records.size).toBe(1);
+    for (const r of records.values()) r.groupId = -1;
+    const second = await userGroup(t.api, "ContractFinder", 2, 20);
+    const r = await t.call("request_group", { groupId: second.gid, allowClose: true }, OTHER);
+    expect(r).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(JSON.stringify(r)).toContain("earlier approval protects");
+    expect(t.api.shown.size).toBe(0);
+  });
 });

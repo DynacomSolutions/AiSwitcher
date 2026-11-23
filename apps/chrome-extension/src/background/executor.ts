@@ -385,7 +385,7 @@ export class Executor {
         const { groupId, allowClose } = a("request_group");
         const closable = allowClose === true;
         if (session.chat === true) throw new ToolError("forbidden_tab", "A chat cannot ask for a tab group.");
-        const first = await this.tabs.checkRequest(session, groupId);
+        const first = await this.tabs.checkRequest(session, groupId, closable);
         if (!first.ok) throw new ToolError(first.code, first.message);
         if (first.already) return text(JSON.stringify({ groupId, already: true, note: "This group is already yours." }));
         if (!this.tabs.beginRequest(groupId)) throw new ToolError("forbidden_tab", `Another request for group ${groupId} is waiting for the user.`);
