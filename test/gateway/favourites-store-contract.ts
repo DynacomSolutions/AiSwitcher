@@ -107,6 +107,10 @@ export function favouriteStoreContract(make: () => Promise<FavouriteStore>): voi
     expect(effectiveAt(NOW - 30 * 24 * 3600_000, NOW)).toBe(NOW);
     expect(effectiveAt(undefined, NOW)).toBe(NOW);
     expect(effectiveAt(NOW - 1000, NOW)).toBe(NOW - 1000);
+    // A small clock skew is kept as it is, so a sender that runs a little ahead keeps its order.
+    expect(effectiveAt(NOW + 30_000, NOW)).toBe(NOW + 30_000);
+    expect(effectiveAt(NOW + 60_000, NOW)).toBe(NOW + 60_000);
+    expect(effectiveAt(NOW + 60_001, NOW)).toBe(NOW);
     const s = await make();
     await s.apply([add("m1", NOW + 3_600_000)], "x", NOW);
     // The wrong future time did not lock the star: a real later change still removes it.

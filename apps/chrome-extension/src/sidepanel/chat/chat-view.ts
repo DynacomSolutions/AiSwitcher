@@ -627,7 +627,7 @@ export function initChatTab(root: HTMLElement, windowId: number, paused: () => P
   const refreshTabs = (): void => { void tab.refreshTabs(); };
   tab.start();
   refreshPaused();
-  chrome.storage.onChanged.addListener(changes => { if (!onlyOwnKeys(changes, [seenKey, "chatSelection", "chatFavourites", "chatFavouritesSynced", "chatFavouritesEpoch"])) refreshPaused(); });
+  chrome.storage.onChanged.addListener(changes => { if (!onlyOwnKeys(changes, [seenKey, "chatSelection", "chatFavourites", "chatFavouritesSynced", "chatFavouritesEpoch", "chatFavouritesAt"])) refreshPaused(); });
   chrome.tabs.onActivated.addListener(refreshTabs);
   chrome.tabs.onUpdated.addListener((_id, info) => { if (info.status !== undefined || info.url !== undefined || info.title !== undefined) refreshTabs(); });
   chrome.tabs.onRemoved.addListener(refreshTabs);

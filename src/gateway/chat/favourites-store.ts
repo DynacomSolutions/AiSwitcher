@@ -15,11 +15,11 @@ export interface FavouriteStore {
   list(): Promise<FavouriteList>;
 }
 
-/** A sender clock may run ahead or behind. A time more than a minute ahead of the gateway, or older than a week, reads as "now". */
+/** A sender clock may run ahead or behind. A time up to a minute ahead is kept as it is (clock skew). A time more than a minute ahead of the gateway, or older than a week, reads as "now". */
 const FUTURE_SLACK_MS = 60_000;
 const PAST_LIMIT_MS = 7 * 24 * 3600_000;
 export function effectiveAt(at: number | undefined, nowMs: number): number {
-  return at !== undefined && at <= nowMs + FUTURE_SLACK_MS && at >= nowMs - PAST_LIMIT_MS ? Math.min(at, nowMs) : nowMs;
+  return at !== undefined && at <= nowMs + FUTURE_SLACK_MS && at >= nowMs - PAST_LIMIT_MS ? at : nowMs;
 }
 
 interface Row extends FavKey { present: boolean; at: number; seq: number; origin: string }

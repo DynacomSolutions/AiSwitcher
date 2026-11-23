@@ -1,6 +1,6 @@
 // Reads and writes the `favorites` key of T3 Code's settings.json. Nothing else in the file changes.
 import { randomBytes } from "node:crypto";
-import { chmod, chown, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, chown, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { T3Fav } from "./mapping.ts";
 
@@ -10,6 +10,8 @@ export interface T3Settings {
   path: string;
   /** The file as it was read. The write checks that it is still this text. */
   text: string;
+  /** When the file was last written (epoch ms), from the same handle as `text`. A change found in this read is dated with it. */
+  mtimeMs: number;
   favorites: T3Fav[];
   /** The provider instance ids of settings.json. */
   instances: Set<string>;
@@ -21,8 +23,15 @@ const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object
 export async function readT3Settings(t3Home: string): Promise<T3Settings | undefined> {
   const path = settingsPathOf(t3Home);
   let text: string;
+  let mtimeMs: number;
   try {
-    text = await readFile(path, "utf8");
+    const fh = await open(path, "r");
+    try {
+      mtimeMs = Math.floor((await fh.stat()).mtimeMs);
+      text = await fh.readFile("utf8");
+    } finally {
+      await fh.close();
+    }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw err;
@@ -37,7 +46,7 @@ export async function readT3Settings(t3Home: string): Promise<T3Settings | undef
     favorites.push(f as unknown as T3Fav);
   }
   const instances = new Set(isObj(parsed.providerInstances) ? Object.keys(parsed.providerInstances) : []);
-  return { path, text, favorites, instances };
+  return { path, text, mtimeMs, favorites, instances };
 }
 
 /** The same indent and final newline as the file had. */

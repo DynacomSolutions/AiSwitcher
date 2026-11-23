@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { FavSyncMetrics, readSnapshots, renderSnapshots } from "../../src/t3/favourites/metrics.ts";
@@ -37,6 +37,25 @@ describe("one round", () => {
     expect((await e.gw.store.list()).items.map((i) => `${i.identity}/${i.model}`).sort()).toEqual(["pool/from-chrome", "work/from-t3"]);
     expect(e.favs()).toEqual([{ provider: "t3-claude-work", model: "from-t3" }, { provider: "claudeAgent", model: "builtin" }, { provider: CLAUDE_POOL, model: "from-chrome" }]);
     expect(e.metrics.s).toMatchObject({ pulls: 1, pushes: 1, writes: 1 });
+  });
+
+  test("a change found in T3 is sent with the time the settings file was written, not the time of the push", async () => {
+    const e = setup({ favorites: [{ provider: "t3-claude-work", model: "a" }, { provider: "t3-claude-work", model: "b" }] });
+    const when = new Date(Date.now() - 3 * 3600_000);
+    utimesSync(e.home.settings, when, when);
+    const mtime = Math.floor(statSync(e.home.settings).mtimeMs);
+    expect(Math.abs(mtime - when.getTime())).toBeLessThan(2);
+    await e.round();
+    expect(e.gw.calls.posted.flat().map((c) => c.at)).toEqual([mtime, mtime]);
+    // The removal of one of them, made 2 hours ago, goes with that time.
+    const raw = e.home.read();
+    raw.favorites = [{ provider: "t3-claude-work", model: "a" }];
+    writeFileSync(e.home.settings, `${JSON.stringify(raw, null, 2)}\n`);
+    const later = new Date(Date.now() - 2 * 3600_000);
+    utimesSync(e.home.settings, later, later);
+    const laterMs = Math.floor(statSync(e.home.settings).mtimeMs);
+    await e.round();
+    expect(e.gw.calls.posted.at(-1)).toEqual([expect.objectContaining({ model: "b", op: "remove", at: laterMs })]);
   });
 
   test("a second round with no change sends nothing, writes nothing and leaves the file as it was", async () => {

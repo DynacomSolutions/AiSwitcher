@@ -81,7 +81,7 @@ export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
   // The version alone is not enough: a rebuilt store may already be past the old version when the host reads it.
   const reset = state !== undefined && (gateway.seq < state.seq || (gateway.epoch !== undefined && state.epoch !== undefined && gateway.epoch !== state.epoch));
   const last = state && !reset ? state.synced : undefined;
-  const changes = localChanges(settings.favorites, ctx, last, gateway.items);
+  const changes = localChanges(settings.favorites, ctx, last, gateway.items, settings.mtimeMs);
   // Stars that this round sent as adds and the gateway refused stay in T3 and are sent again next round.
   const keep = new Set<string>();
   if (changes.length > 0) {

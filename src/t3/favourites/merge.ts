@@ -7,15 +7,17 @@ import { favToKey, keyToFav, mappedKeys, type MapContext, type T3Fav } from "./m
  * - a key in T3 that was not in the last sync and is not at the gateway is a new star: add;
  * - a key that was in the last sync and is no longer in T3 was removed in T3: remove (only when the gateway still has it).
  * The first run has no last sync: T3 stars the gateway lacks go up, and nothing is removed.
+ * `at` is the time of the change, for the gateway's newest-wins rule. T3 does not date its stars: the caller passes the time the settings
+ * file was written, which is the latest time a change in it can have been made.
  */
-export function localChanges(t3: readonly T3Fav[], ctx: Pick<MapContext, "poolName" | "canonical">, lastSynced: readonly FavKey[] | undefined, gateway: readonly FavKey[]): FavChange[] {
+export function localChanges(t3: readonly T3Fav[], ctx: Pick<MapContext, "poolName" | "canonical">, lastSynced: readonly FavKey[] | undefined, gateway: readonly FavKey[], at?: number): FavChange[] {
   const local = mappedKeys(t3, ctx);
   const localIds = new Set(local.map(favId));
   const gatewayIds = new Set(gateway.map(favId));
   const lastIds = new Set((lastSynced ?? []).map(favId));
   const changes: FavChange[] = [];
-  for (const k of local) if (!lastIds.has(favId(k)) && !gatewayIds.has(favId(k))) changes.push({ ...k, op: "add" });
-  for (const k of lastSynced ?? []) if (!localIds.has(favId(k)) && gatewayIds.has(favId(k))) changes.push({ ...k, op: "remove" });
+  for (const k of local) if (!lastIds.has(favId(k)) && !gatewayIds.has(favId(k))) changes.push({ ...k, op: "add", ...(at !== undefined ? { at } : {}) });
+  for (const k of lastSynced ?? []) if (!localIds.has(favId(k)) && gatewayIds.has(favId(k))) changes.push({ ...k, op: "remove", ...(at !== undefined ? { at } : {}) });
   return changes.slice(0, MAX_FAVOURITES);
 }
 

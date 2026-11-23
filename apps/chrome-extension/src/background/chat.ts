@@ -21,6 +21,10 @@ export const FAVOURITES_KEY = "chatFavourites";
 export const FAVOURITES_SYNCED_KEY = "chatFavouritesSynced";
 /** The epoch of the gateway store that `chatFavouritesSynced` came from. */
 export const FAVOURITES_EPOCH_KEY = "chatFavouritesEpoch";
+/** The time of each click that the gateway has not confirmed yet, by star id. A change that waits offline keeps it, so the gateway orders it by the click and not by the reconnect. */
+export const FAVOURITES_AT_KEY = "chatFavouritesAt";
+
+interface Click { op: "add" | "remove"; at: number }
 
 export interface ChatHubDeps {
   /** Sends a frame to the gateway. Returns false when it cannot (offline). */
@@ -53,6 +57,8 @@ export class ChatHub {
   private favsSynced: FavKey[] = [];
   /** The store epoch of `favsSynced`. A list with another epoch means the gateway lost its data. Undefined until a gateway has named one. */
   private favsEpoch: string | undefined;
+  /** Clicks that wait for the gateway to confirm them. */
+  private favsClicks = new Map<string, Click>();
   /** True from a welcome until the first list of the gateway has been merged with the local one. */
   private favsMerge = false;
   private connected = false;
@@ -80,16 +86,17 @@ export class ChatHub {
   private async loadFavourites(): Promise<void> {
     if (!this.d.local) return;
     try {
-      const r = await this.d.local.get([FAVOURITES_KEY, FAVOURITES_SYNCED_KEY, FAVOURITES_EPOCH_KEY]);
+      const r = await this.d.local.get([FAVOURITES_KEY, FAVOURITES_SYNCED_KEY, FAVOURITES_EPOCH_KEY, FAVOURITES_AT_KEY]);
       this.favs = cleanFavs(r[FAVOURITES_KEY]);
       this.favsSynced = cleanFavs(r[FAVOURITES_SYNCED_KEY]);
       const epoch = r[FAVOURITES_EPOCH_KEY];
       this.favsEpoch = typeof epoch === "string" && epoch !== "" ? epoch : undefined;
+      this.favsClicks = cleanClicks(r[FAVOURITES_AT_KEY]);
     } catch { /* no cache: the gateway list fills it */ }
   }
 
   private saveFavourites(): void {
-    void this.d.local?.set({ [FAVOURITES_KEY]: this.favs, [FAVOURITES_SYNCED_KEY]: this.favsSynced, [FAVOURITES_EPOCH_KEY]: this.favsEpoch ?? "" }).catch(() => { /* a full store keeps the list in memory */ });
+    void this.d.local?.set({ [FAVOURITES_KEY]: this.favs, [FAVOURITES_SYNCED_KEY]: this.favsSynced, [FAVOURITES_EPOCH_KEY]: this.favsEpoch ?? "", [FAVOURITES_AT_KEY]: Object.fromEntries(this.favsClicks) }).catch(() => { /* a full store keeps the list in memory */ });
   }
 
   /** Writes now, without waiting for the timer. Used on chat close and when the panel disconnects. */
@@ -218,15 +225,18 @@ export class ChatHub {
       this.favsMerge = false;
       const mine = new Set(this.favs.map(favId));
       const known = new Set((reset ? [] : this.favsSynced).map(favId));
-      const at = this.d.now();
+      const now = this.d.now();
+      const clickAt = (f: FavKey, op: Click["op"]): number => { const c = this.favsClicks.get(favId(f)); return c?.op === op ? c.at : now; };
       const localOnly = this.favs.filter(f => !gateway.has(favId(f)) && !known.has(favId(f)));
       const takenAway = (reset ? [] : this.favsSynced).filter(f => !mine.has(favId(f)) && gateway.has(favId(f)));
-      const changes: FavChange[] = [...localOnly.map(f => ({ ...f, op: "add" as const, at })), ...takenAway.map(f => ({ ...f, op: "remove" as const, at }))].slice(0, MAX_FAVOURITES);
+      const changes: FavChange[] = [...localOnly.map(f => ({ ...f, op: "add" as const, at: clickAt(f, "add") })), ...takenAway.map(f => ({ ...f, op: "remove" as const, at: clickAt(f, "remove") }))].slice(0, MAX_FAVOURITES);
       if (changes.length > 0) this.d.send({ t: "chat.fav.set", changes });
       const gone = new Set(takenAway.map(favId));
       shown = [...items.filter(f => !gone.has(favId(f))), ...localOnly].slice(-MAX_FAVOURITES);
     }
     this.favsSynced = [...items];
+    // A click that the gateway list now agrees with is confirmed: drop its time.
+    for (const [id, c] of this.favsClicks) if (gateway.has(id) === (c.op === "add")) this.favsClicks.delete(id);
     if (epoch !== undefined) this.favsEpoch = epoch;
     this.favs = shown;
     this.saveFavourites();
@@ -238,6 +248,7 @@ export class ChatHub {
     const change: FavChange = { ...f, op: c.op, at: this.d.now() };
     if (!parseChatFromExt({ t: "chat.fav.set", changes: [change] })) return this.fail("The favourite is not valid.");
     const id = favId(f);
+    this.favsClicks.set(id, { op: c.op, at: change.at as number });
     this.favs = c.op === "add" ? [...this.favs.filter(x => favId(x) !== id), f].slice(-MAX_FAVOURITES) : this.favs.filter(x => favId(x) !== id);
     this.saveFavourites();
     this.changed(ALL_WINDOWS, false);
@@ -421,6 +432,18 @@ export class ChatHub {
     void this.flush();
     return r;
   }
+}
+
+/** The stored click times: only entries with a known op and a time. */
+function cleanClicks(v: unknown): Map<string, Click> {
+  const out = new Map<string, Click>();
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return out;
+  for (const [id, raw] of Object.entries(v)) {
+    const c = raw as Partial<Click> | null;
+    if (c && (c.op === "add" || c.op === "remove") && typeof c.at === "number" && Number.isSafeInteger(c.at) && c.at >= 0) out.set(id, { op: c.op, at: c.at });
+    if (out.size >= MAX_FAVOURITES * 2) break;
+  }
+  return out;
 }
 
 /** The valid stars of a stored list, without duplicates. */
