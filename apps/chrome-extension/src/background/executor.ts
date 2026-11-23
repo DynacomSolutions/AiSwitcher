@@ -636,6 +636,8 @@ export class Executor {
           // A page that does not answer the attach (UnresponsiveTab) is still closed below; a real dialog keeps the tab open and ends the call there.
           try { await this.ensureAttached(sig, tabId); } catch (e) { if (!(e instanceof PageUnresponsive)) throw e; unresponsive = true; }
         }
+        // A Stop or gateway abort during the attach (or on the discarded path) must leave the tab open.
+        this.throwIfAborted(sig);
         await this.api.tabs.remove(tabId);
         // A page that asks "Leave site?" keeps its tab open: its dialog ends this call (dialog_open) while we wait. Cancel keeps the tab, and its ownership.
         for (let waited = 0; await this.api.tabs.get(tabId); waited += CLOSE_POLL_MS) {

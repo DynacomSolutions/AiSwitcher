@@ -892,6 +892,34 @@ describe("JavaScript dialogs", () => {
       expect(tabs.owns("s1", tab.id, "dyn")).toBe(false);
     });
 
+    test("a Stop while the attach waits on a slow page leaves the tab open when the attach ends unresponsive", async () => {
+      const { api, state, tabs, executor } = setup(undefined, { defaultTimeoutMs: 5000, attachAnswerMs: 60 });
+      api.cdpResults["Page.enable"] = never;
+      const tab = await tabs.create(session);
+      const pending = executor.run(call("close_tab", { tabId: tab.id }));
+      await new Promise(r => setTimeout(r, 10)); // the attach is waiting for the page
+      await state.stop();
+      expect(await pending).toMatchObject({ ok: false, error: "stopped_by_user" });
+      await new Promise(r => setTimeout(r, 120)); // the attach gives up and the dispatch unwinds
+      expect(api.tabList.has(tab.id)).toBe(true);
+      expect(tabs.owns("s1", tab.id, "dyn")).toBe(true);
+    });
+
+    test("an abort on a discarded tab leaves it open and does not return ok", async () => {
+      const { api, state, tabs, executor } = setup();
+      const tab = await tabs.create(session);
+      api.tabList.get(tab.id)!.discarded = true;
+      const realGet = api.tabs.get;
+      const req = call("close_tab", { tabId: tab.id });
+      // The abort lands while the discarded flag is read, before the tab is removed.
+      api.tabs.get = async id => { const t = await realGet(id); if (t?.discarded) state.abort(req.id); return t; };
+      const r = await executor.run(req);
+      await new Promise(res => setTimeout(res, 20));
+      expect(r.ok).toBe(false);
+      expect(api.tabList.has(tab.id)).toBe(true);
+      expect(tabs.owns("s1", tab.id, "dyn")).toBe(true);
+    });
+
     test("a tab that stays open after remove gives the timeout error and stays owned", async () => {
       const { api, tabs, executor } = setup(undefined, { defaultTimeoutMs: 20000, attachAnswerMs: 50, sleep: async () => {} });
       api.cdpResults["Page.enable"] = never;
