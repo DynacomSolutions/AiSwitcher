@@ -12,16 +12,17 @@ import { composerMode, createComposer } from "./composer.ts";
 import type { Composer } from "./composer.ts";
 import { buildFeed } from "./feed.ts";
 import { renderFeed } from "./feed-view.ts";
-import { buildPicker, choose } from "./picker.ts";
+import { buildPicker, choose, parseFavourites, toggleFavourite } from "./picker.ts";
+import type { Fav } from "./picker.ts";
 import { createPicker } from "./picker-view.ts";
 import type { Picker } from "./picker-view.ts";
 import { capState, openChats, rowFor, STATE_LABEL, turnRunning } from "./list.ts";
 
 const RECONNECT_MS = 500;
 const SAVE_MS = 250;
-export const LOADING_PROVIDERS = "Providers are loading. Try again in a moment.";
 export const RESTARTED = "The extension restarted. Try again.";
 export const LINK_PROMPT = "Link a tab so the agent can see a page.";
+export const NEW_PLACEHOLDER = "Ask about the open pages";
 export const AGENT_TAB = "The agent opened this page. Close the tab to remove it.";
 
 function el<K extends keyof HTMLElementTagNameMap>(doc: Document, tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
@@ -94,6 +95,9 @@ export interface ChatViewDeps {
   /** The last selection used for a new chat. Kept in local storage. */
   loadSelection?(): Promise<unknown>;
   saveSelection?(s: ChatSelection): void;
+  /** The starred models of the picker. Kept in local storage. */
+  loadFavourites?(): Promise<unknown>;
+  saveFavourites?(f: Fav[]): void;
 }
 
 /** Accepts a stored selection only when it has the right shape and every field is selectable. */
@@ -139,6 +143,7 @@ export class ChatTab {
   private shown: string | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private lastUsed: ChatSelection | undefined;
+  private favourites: Fav[] = [];
   private selectionLoaded: boolean;
   private catalogAsked = false;
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -153,8 +158,7 @@ export class ChatTab {
   private readonly connBanner: HTMLElement;
   private readonly errBanner: HTMLElement;
   private readonly listEl: HTMLElement;
-  private readonly newBtn: HTMLButtonElement;
-  private readonly capHint: HTMLElement;
+  private readonly newComposer: Composer;
   private readonly empty: HTMLElement;
   private readonly ul: HTMLElement;
   private readonly detailEl: HTMLElement;
@@ -180,18 +184,21 @@ export class ChatTab {
     for (const b of [this.connBanner, this.errBanner]) { b.setAttribute("role", "alert"); b.hidden = true; }
 
     this.listEl = el(doc, "div", "chat-list");
-    this.newBtn = button(doc, "New chat", "primary-small", () => void this.newChat());
     const head = el(doc, "div", "list-head");
-    head.append(el(doc, "h2", undefined, "Chats"), this.newBtn);
-    this.capHint = el(doc, "p", "hint");
-    this.empty = el(doc, "p", "empty", "No chats yet. Start one to ask an agent about your open pages.");
+    head.append(el(doc, "h2", undefined, "Chats"));
+    this.empty = el(doc, "p", "empty", "No chats yet. Write a message below to start one.");
     this.ul = el(doc, "ul", "sessions chat-rows");
     this.listPicker = createPicker(doc, {
       onOpen: () => this.askCatalog(),
+      onFavourite: f => this.starModel(f),
       onPick: p => this.pickNew(p),
       onEffort: effort => { const cur = this.newSelection(); if (cur && selectable(effort)) this.setNew({ ...cur, effort }); },
     }, "Provider and model for new chats");
-    this.listEl.append(head, this.listPicker.root, this.capHint, this.empty, this.ul);
+    this.newComposer = createComposer(doc, { placeholder: NEW_PLACEHOLDER, onSend: text => this.newChat(text), onStop: () => { /* a new chat has nothing to stop */ } });
+    this.newComposer.tools.replaceChildren(this.listPicker.root);
+    const rows = el(doc, "div", "chat-rows-slot");
+    rows.append(this.empty, this.ul);
+    this.listEl.append(head, rows, this.newComposer.root);
 
     this.detailEl = el(doc, "div", "chat-detail");
     const dhead = el(doc, "div", "list-head");
@@ -211,12 +218,13 @@ export class ChatTab {
     this.addSelect.append(this.addFirst);
     this.detailPicker = createPicker(doc, {
       onOpen: () => this.askCatalog(),
+      onFavourite: f => this.starModel(f),
       onPick: p => { const c = this.selectedChat(); if (c && p.model !== undefined && selectable(p.model)) void this.run({ type: "ais-chat-config", chatId: c.summary.chatId, model: p.model }); },
       onEffort: effort => { const c = this.selectedChat(); if (c && selectable(effort)) void this.run({ type: "ais-chat-config", chatId: c.summary.chatId, effort }); },
     }, "Model for this chat");
     this.feedSlot = el(doc, "div", "feed-slot");
     this.composerSlot = el(doc, "div", "composer-slot");
-    this.detailEl.append(dhead, this.chipsEl, this.feedSlot, this.detailPicker.root, this.composerSlot);
+    this.detailEl.append(dhead, this.chipsEl, this.feedSlot, this.composerSlot);
     this.detailEl.hidden = true;
     this.listEl.hidden = true;
   }
@@ -224,12 +232,20 @@ export class ChatTab {
   start(): void {
     this.root.replaceChildren(this.loading, this.connBanner, this.errBanner, this.listEl, this.detailEl);
     void this.d.loadSeen().then(s => { this.seen = { ...s }; this.seenLoaded = true; this.noteSeen(); this.paint(); }, () => { this.seenLoaded = true; });
+    void this.d.loadFavourites?.().then(v => { this.favourites = parseFavourites(v); this.paint(); }, () => { /* no favourites */ });
     void this.d.loadSelection?.().then(v => { this.lastUsed = parseSelection(v); this.selectionLoaded = true; this.paint(); }, () => { this.selectionLoaded = true; this.paint(); });
     this.open();
     void this.refreshTabs();
   }
 
   private selectedChat(): ChatView | undefined { return this.selected ? this.state?.chats.find(x => x.summary.chatId === this.selected) : undefined; }
+
+  /** Stars the model, or removes the star. The list is saved, then both pickers show it. */
+  private starModel(f: Fav): void {
+    this.favourites = toggleFavourite(this.favourites, f);
+    this.d.saveFavourites?.(this.favourites);
+    this.paint();
+  }
 
   /** Asks for the catalogue once per panel session, when a menu first opens. */
   private askCatalog(): void {
@@ -245,7 +261,11 @@ export class ChatTab {
     if (!s || !catalog || !this.selectionLoaded) return undefined;
     const mine = openChats(s.chats, this.d.windowId).at(-1)?.summary.selection;
     const first = catalog.find(p => p.identities.some(i => selectable(i.name)));
-    return checkSelection(this.lastUsed, catalog) ?? checkSelection(mine, catalog) ?? (first ? { provider: first.provider, identity: first.identities.find(i => selectable(i.name))!.name } : undefined);
+    const base = checkSelection(this.lastUsed, catalog) ?? checkSelection(mine, catalog) ?? (first ? { provider: first.provider, identity: first.identities.find(i => selectable(i.name))!.name } : undefined);
+    if (!base || base.model !== undefined) return base;
+    // Like other AI tools, a new chat always starts on a model: the identity's first one.
+    const withModel = choose(undefined, base, catalog);
+    return base.effort !== undefined ? { ...withModel, effort: base.effort } : withModel;
   }
 
   private setNew(sel: ChatSelection): void {
@@ -299,7 +319,6 @@ export class ChatTab {
     }
     this.known = new Set(s.chats.map(c => c.summary.chatId));
     this.state = s;
-    if (this.localError === LOADING_PROVIDERS && s.catalog?.some(p => p.identities.length > 0)) this.localError = undefined;
     if (this.selected && !s.chats.some(c => c.summary.chatId === this.selected)) this.selected = undefined;
     this.prune(s);
     this.noteSeen();
@@ -381,10 +400,10 @@ export class ChatTab {
 
   private paintList(s: ChatPanelState): void {
     const cap = capState(s.chats, this.d.windowId);
-    this.newBtn.disabled = cap.full || this.creating;
-    this.capHint.hidden = cap.message === undefined;
-    this.setText(this.capHint, cap.message ?? "");
-    this.listPicker.update(buildPicker(s.catalog, this.newSelection()));
+    if (!s.catalog) this.askCatalog();
+    const selection = this.newSelection();
+    this.newComposer.update({ send: selection !== undefined && !cap.full && !this.creating, stop: false, ...(cap.message !== undefined ? { hint: cap.message } : {}) });
+    this.listPicker.update({ ...buildPicker(s.catalog, this.newSelection()), favourites: this.favourites });
     const chats = openChats(s.chats, this.d.windowId);
     this.empty.hidden = chats.length > 0;
     const byId = new Map(chats.map(c => [c.summary.chatId, c]));
@@ -450,7 +469,7 @@ export class ChatTab {
   private closeChat(chatId: string): void {
     const ids = [...this.rows.keys()];
     const next = this.rows.get(ids[ids.indexOf(chatId) + 1] ?? "");
-    (next ? next.open : this.newBtn).focus();
+    (next ? next.open : this.newComposer.box).focus();
     void this.run({ type: "ais-chat-close", chatId });
   }
 
@@ -494,6 +513,7 @@ export class ChatTab {
       this.shown = chatId;
       this.feedSlot.replaceChildren(feed);
       this.composerSlot.replaceChildren(composer.root);
+      composer.tools.replaceChildren(this.detailPicker.root);
       this.chips.clear();
       this.chipsEl.replaceChildren();
     }
@@ -502,7 +522,7 @@ export class ChatTab {
     composer.update(composerMode(c, this.paused));
     const sel = c.summary.selection;
     const cfg = [...c.items].reverse().find(i => i.body.k === "config")?.body;
-    this.detailPicker.update({ ...buildPicker(this.state?.catalog, sel, cfg && cfg.k === "config" ? cfg : undefined), locked: true });
+    this.detailPicker.update({ ...buildPicker(this.state?.catalog, sel, cfg && cfg.k === "config" ? cfg : undefined), locked: true, favourites: this.favourites });
   }
 
   // ---- chips --------------------------------------------------------------
@@ -567,23 +587,19 @@ export class ChatTab {
 
   // ---- new chat -----------------------------------------------------------
 
-  private async newChat(): Promise<void> {
+  /** Creates a chat with the chosen selection and sends the text as its first prompt. Resolves true when the hub accepted it. */
+  private async newChat(text: string): Promise<boolean> {
     const s = this.state;
-    if (!s || this.creating) return;
+    if (!s || this.creating) return false;
     const selection = this.newSelection();
-    if (!selection) {
-      this.localError = LOADING_PROVIDERS;
-      void this.d.send({ type: "ais-chat-catalog" });
-      this.paint();
-      return;
-    }
+    if (!selection) return false; // Send stays disabled until the catalogue and the stored selection are in
     const active = this.tabs.find(t => t.active && t.windowId === this.d.windowId);
     const tabIds = active ? defaultChatTabs(this.tabs.filter(t => t.windowId === this.d.windowId), active.id) : [];
     this.d.saveSelection?.(selection);
     this.openNew = true;
     this.creating = true;
     this.paint();
-    try { await this.run({ type: "ais-chat-create", windowId: this.d.windowId, selection, tabIds }); } finally { this.creating = false; this.paint(); }
+    try { return await this.run({ type: "ais-chat-create", windowId: this.d.windowId, selection, text, tabIds }); } finally { this.creating = false; this.paint(); }
   }
 }
 
@@ -609,12 +625,14 @@ export function initChatTab(root: HTMLElement, windowId: number, paused: () => P
     saveSeen: seen => { void chrome.storage.session.set({ [seenKey]: seen }); },
     loadSelection: async () => (await chrome.storage.local.get("chatSelection")).chatSelection,
     saveSelection: sel => { void chrome.storage.local.set({ chatSelection: sel }); },
+    loadFavourites: async () => (await chrome.storage.local.get("chatFavourites")).chatFavourites,
+    saveFavourites: f => { void chrome.storage.local.set({ chatFavourites: f }); },
   }, root);
   const refreshPaused = (): void => { void paused().then(p => tab.setPaused(p)); };
   const refreshTabs = (): void => { void tab.refreshTabs(); };
   tab.start();
   refreshPaused();
-  chrome.storage.onChanged.addListener(changes => { if (!onlyOwnKeys(changes, [seenKey, "chatSelection"])) refreshPaused(); });
+  chrome.storage.onChanged.addListener(changes => { if (!onlyOwnKeys(changes, [seenKey, "chatSelection", "chatFavourites"])) refreshPaused(); });
   chrome.tabs.onActivated.addListener(refreshTabs);
   chrome.tabs.onUpdated.addListener((_id, info) => { if (info.status !== undefined || info.url !== undefined || info.title !== undefined) refreshTabs(); });
   chrome.tabs.onRemoved.addListener(refreshTabs);

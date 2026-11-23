@@ -391,6 +391,7 @@ ETA: 2026-11-25 18:00 ICT
 | 270 | Chat: show the usage limit and its reset time | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>Sent as code limit, so released extensions accept it.<br>Released in v0.5.95. |
 | 271 | Chat: keep Codex start warnings out of the reply | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>The warning shows as a notice.<br>Released in v0.5.95. |
 | 272 | Chat: close a binding's chats when its pairing is revoked | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>Chats are visible only to the approval they were made under.<br>Released in v0.5.95. |
+| 273 | Chat: composer with the model picker inside, matching T3 | in_progress | claude | sidepanel-chat-composer | 18.264 | 2026-11-23 16:00 ICT | Owner: the input must look like other AI tools, picker inside it, on the new-chat screen too.<br>Picker must match T3 (reference: headlamp-plugins incidents ModelPicker). |
 
 ## 19. CI speed and flaky tests
 

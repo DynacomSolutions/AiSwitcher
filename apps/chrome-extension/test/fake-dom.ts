@@ -10,6 +10,7 @@ export class FakeNode {
   value = "";
   disabled = false;
   maxLength = -1;
+  placeholder = "";
   className = "";
   hidden = false;
   tabIndex = 0;
@@ -55,6 +56,7 @@ export class FakeDoc {
   addEventListener(t: string, fn: (e?: any) => void): void { (this.listeners[t] ??= []).push(fn); }
   dispatch(t: string, e: Record<string, unknown> = {}): void { for (const fn of this.listeners[t] ?? []) fn({ preventDefault() {}, ...e }); }
   createElement(t: string): FakeNode { return new FakeNode(t, this); }
+  createElementNS(_ns: string, t: string): FakeNode { return new FakeNode(t, this); }
   createTextNode(v: string): FakeNode { const n = new FakeNode("#text", this); n.textContent = v; return n; }
   createDocumentFragment(): FakeNode { return new FakeNode("#frag", this); }
   write(): never { throw new Error("document.write used"); }
