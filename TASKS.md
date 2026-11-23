@@ -331,7 +331,7 @@ Keep new codex releases working against the AIS gateway placeholder login.
 | 292 | Console: gateway row without a login shows missing | done | claude | console-auth-sessions-add | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/741, released v0.5.105. |
 | 293 | Console: add identity into the gateway store | done | claude | console-auth-sessions-add | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/741 and .cluster #3232 (store key), released v0.5.105.<br>Live form checked by screenshot. |
 | 294 | Console: first login of a new identity goes to the gateway store | done | claude | console-auth-sessions-add | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/741, released v0.5.105. |
-| 295 | Sessions in the AIS database (HoardDB) | in_progress | claude | | | | Owner decision: session index in Postgres, transcripts in HoardDB object storage.<br>Console Sessions page reads from there, not host folders.<br>Design in progress. |
+| 295 | Sessions in the AIS database (HoardDB) | in_progress | claude | | | | Owner decision: session index in Postgres, transcripts in HoardDB object storage.<br>Console Sessions page reads from there, not host folders.<br>Design done, build in epic 20. |
 
 ## 14. Gateway survives any node loss
 ETA: 2026-11-15 23:00 ICT
@@ -425,13 +425,13 @@ ETA: 2026-12-12 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 296 | Spike: corpus size, gzip ratio, free space, restic cold read | in_progress | claude | sessions-spike-corpus | | 2026-11-24 04:00 ICT | Evidence file only. |
-| 297 | Spike: age, Bun S3 client against HoardDB | in_progress | claude | sessions-spike-s3 | | 2026-11-24 04:00 ICT | Evidence file only. |
-| 298 | Migration 0014 and SessionStore | in_progress | claude | sessions-store | | 2026-11-24 08:00 ICT | Cursor, ingest rule, idempotency, tree view. |
+| 296 | Spike: corpus size, gzip ratio, free space, restic cold read | done | claude | | | | 227 GB, almost all on one node. gzip 2.3x.<br>restic cold read 25 to 180 s: not for reads.<br>Owner decisions open: copies, flush gap, objectstore memory. |
+| 297 | Spike: age, Bun S3 client against HoardDB | done | claude | | | | age and HoardDB round trip pass.<br>Shipper needs its own SigV4 signer for If-None-Match and checksum. |
+| 298 | Migration 0014 and SessionStore | done | claude | | | | PR 750 merged. |
 | 299 | Ingest routes, scoped token, metrics, flag | todo | | | 20.298 | | |
 | 300 | Incremental indexers for Claude and Codex | todo | | | 20.302 | | |
 | 301 | Enrichment loop on the gateway leader | todo | | | 20.298, 20.300, 20.297 | | |
-| 302 | Session readers as line iterables | in_progress | claude | sessions-line-iter | | 2026-11-24 08:00 ICT | Refactor only, tests stay green. |
+| 302 | Session readers as line iterables | done | claude | | | | PR 751 merged. |
 | 303 | Shipper in backup-client | todo | | | 20.299 | | .cluster code. |
 | 304 | Shipper fast lane and hot set | todo | | | 20.303 | | |
 | 305 | Cluster: shipper values, recipient key, ingest secret | todo | | | 20.303 | | .cluster PR. |
