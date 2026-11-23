@@ -1,5 +1,5 @@
 // Starred models: the service between the store, the panels and the host daemons.
-import type { ChatToExt, FavChange } from "../../browser/chat-protocol.ts";
+import type { ChatToExt, FavChange, FavKey } from "../../browser/chat-protocol.ts";
 import type { BrowserHub } from "../browser/hub.ts";
 import type { GatewayMetrics } from "../metrics.ts";
 import type { ChatBus } from "./bus.ts";
@@ -56,15 +56,16 @@ export class FavouritesService {
     return { t: "chat.fav.list", seq: l.seq, ...(l.epoch ? { epoch: l.epoch } : {}), items: l.items.map(({ provider, identity, model }) => ({ provider, identity, model })) };
   }
 
-  /** Applies changes and tells every replica. Returns the list after the call. */
-  async apply(changes: FavChange[], origin: string): Promise<FavouriteList> {
+  /** Applies changes and tells every replica. Returns the list after the call and the keys of the changes the store refused. */
+  async apply(changes: FavChange[], origin: string): Promise<FavouriteList & { refused: FavKey[] }> {
     const r = await this.d.store.apply(changes, origin, (this.d.now ?? Date.now)());
     if (r.changed) {
       this.count("change");
       // The bus delivers to this replica too. When the bus fails the local panels and waiters still hear of it.
       await this.d.bus.publish({ t: "favs", seq: r.seq }).catch(() => this.onNotice());
     }
-    return this.d.store.list();
+    for (let i = 0; i < r.refused.length; i += 1) this.count("refused");
+    return { ...(await this.d.store.list()), refused: r.refused };
   }
 
   /** A panel attached: it gets the list at once. */

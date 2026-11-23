@@ -134,6 +134,29 @@ describe("one round", () => {
     expect((await readState(e.deps))?.synced).toEqual([key("a")]);
   });
 
+  test("a star the gateway refuses (full list) stays in T3, is not recorded as synced and goes up again later", async () => {
+    const e = setup();
+    for (let i = 0; i < 200; i++) await e.gw.star(key(`g${i}`), "add", Date.now() - 100_000 + i);
+    await e.round();
+    expect(e.favs()).toHaveLength(200);
+    const raw = e.home.read();
+    raw.favorites = [...raw.favorites, { provider: "t3-claude-work", model: "fresh" }];
+    writeFileSync(e.home.settings, `${JSON.stringify(raw, null, 2)}\n`);
+    expect(await e.round()).toMatchObject({ status: "ok", pushed: 1 });
+    // Not deleted from T3, not at the gateway, not in the state.
+    expect(e.favs().some((f) => f.model === "fresh")).toBe(true);
+    expect((await e.gw.store.list()).items.some((i) => i.model === "fresh")).toBe(false);
+    expect((await readState(e.deps))?.synced.some((k) => k.model === "fresh")).toBe(false);
+    expect(e.metrics.s.refused).toBe(1);
+    // Room appears: the next round sends it again and it is accepted.
+    await e.gw.star(key("g0"), "remove");
+    await e.round();
+    expect((await e.gw.store.list()).items.some((i) => i.model === "fresh")).toBe(true);
+    expect(e.favs().some((f) => f.model === "fresh")).toBe(true);
+    expect((await readState(e.deps))?.synced.some((k) => k.model === "fresh")).toBe(true);
+    expect(e.favs().some((f) => f.model === "g0")).toBe(false);
+  });
+
   test("a gateway star with no instance on this host is not written and does not come back as a removal", async () => {
     const e = setup();
     await e.gw.star(key("m", "stranger"));
@@ -298,11 +321,13 @@ describe("metrics", () => {
     m.s.pushes = 2;
     m.s.writes = 1;
     m.s.errors = 3;
+    m.s.refused = 2;
     m.persist();
     const text = renderSnapshots(readSnapshots(dir));
     for (const name of ["pulls_total", "pushes_total", "writes_total", "errors_total", "last_success_timestamp_seconds"]) expect(text).toContain(`ais_t3_favourites_sync_${name}{home="${homeKey("/some/t3/home")}"}`);
     expect(text).toContain(`ais_t3_favourites_sync_pulls_total{home="${homeKey("/some/t3/home")}"} 4`);
     expect(text).toContain(`ais_t3_favourites_sync_errors_total{home="${homeKey("/some/t3/home")}"} 3`);
+    expect(text).toContain(`ais_t3_favourites_sync_refused_total{home="${homeKey("/some/t3/home")}"} 2`);
     expect(text).not.toContain("/some/t3/home");
     expect(renderSnapshots([])).toBe("");
     expect(readSnapshots(join(dir, "missing"))).toEqual([]);

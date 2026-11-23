@@ -150,7 +150,7 @@ test("POST applies changes and answers with the list, GET reads it", async () =>
   const h = await http();
   const res = await post(h, { origin: "host-1", changes: [star("m1"), star("m2")] });
   expect(res.status).toBe(200);
-  expect(await res.json()).toEqual({ seq: 2, epoch: (await h.shared.store.list()).epoch, items: [{ provider: "claude", identity: "work", model: "m1" }, { provider: "claude", identity: "work", model: "m2" }] });
+  expect(await res.json()).toEqual({ seq: 2, epoch: (await h.shared.store.list()).epoch, refused: [], items: [{ provider: "claude", identity: "work", model: "m1" }, { provider: "claude", identity: "work", model: "m2" }] });
   const got = (await (await h.call("/favourites")).json()) as any;
   expect(got).toMatchObject({ seq: 2, changed: true, epoch: (await h.shared.store.list()).epoch });
   expect(got.items).toHaveLength(2);
@@ -167,6 +167,16 @@ test("a change with an old time does not undo a newer one made over the socket",
   await h.send(ws, { t: "chat.fav.set", changes: [star("m1", "add", { at: Date.now() - 100 })] });
   await post(h, { origin: "host-1", changes: [star("m1", "remove", { at: Date.now() - 60_000 })] });
   expect(((await (await h.call("/favourites")).json()) as any).items).toHaveLength(1);
+});
+
+test("POST names the changes the store refused, and the metrics count them", async () => {
+  const h = await http();
+  await post(h, { changes: [star("m1", "add", { at: Date.now() - 3000 }), star("m1", "remove", { at: Date.now() - 1000 })] });
+  const res = (await (await post(h, { changes: [star("m1", "add", { at: Date.now() - 9000 }), star("m2")] })).json()) as any;
+  expect(res.refused).toEqual([{ provider: "claude", identity: "work", model: "m1" }]);
+  expect(res.items.map((i: any) => i.model)).toEqual(["m2"]);
+  expect(((await (await post(h, { changes: [] })).json()) as any).refused).toEqual([]);
+  expect(h.metrics.render()).toMatch(/ais_gateway_favourites_total\{event="refused"\} 1/);
 });
 
 test("bad bodies are refused with 400", async () => {

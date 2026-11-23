@@ -4,7 +4,8 @@ import { favId, MAX_FAVOURITES, type FavChange, type FavKey } from "../../browse
 export interface FavouriteItem extends FavKey { at: number }
 /** `epoch` is a random id made once with the store. A store that was reset or rebuilt has another one, so a client can tell "the list is new" from "the list is the same but changed". */
 export interface FavouriteList { epoch: string; seq: number; items: FavouriteItem[] }
-export interface FavouriteApplied { seq: number; changed: boolean }
+/** `refused` names the changes the store did not apply and the caller may want to retry or report: a change that lost to a newer one of the same model (a different state than now), and an add at the cap. */
+export interface FavouriteApplied { seq: number; changed: boolean; refused: FavKey[] }
 
 /** Stars of the owner. A change names its time; the newest change of a model decides whether it is starred. */
 export interface FavouriteStore {
@@ -31,25 +32,33 @@ export class MemoryFavouriteStore implements FavouriteStore {
 
   async apply(changes: FavChange[], origin: string, nowMs: number): Promise<FavouriteApplied> {
     let changed = false;
+    const refused: FavKey[] = [];
     for (const c of changes) {
       const id = favId(c);
       const at = effectiveAt(c.at, nowMs);
       const present = c.op === "add";
       const cur = this.rows.get(id);
+      const k: FavKey = { provider: c.provider, identity: c.identity, model: c.model };
       // A removal of a model with no row has nothing to remove: no row, no new version, no wake-up.
       if (!present && !cur) continue;
-      if (cur && at < cur.at) continue;
+      if (cur && at < cur.at) {
+        if (cur.present !== present) refused.push(k);
+        continue;
+      }
       if (cur && cur.present === present) {
         cur.at = at;
         cur.origin = origin;
         continue;
       }
-      if (present && [...this.rows.values()].filter((r) => r.present).length >= MAX_FAVOURITES) continue;
+      if (present && [...this.rows.values()].filter((r) => r.present).length >= MAX_FAVOURITES) {
+        refused.push(k);
+        continue;
+      }
       this.counter += 1;
       this.rows.set(id, { provider: c.provider, identity: c.identity, model: c.model, present, at, seq: this.counter, origin });
       changed = true;
     }
-    return { seq: this.counter, changed };
+    return { seq: this.counter, changed, refused };
   }
 
   async list(): Promise<FavouriteList> {

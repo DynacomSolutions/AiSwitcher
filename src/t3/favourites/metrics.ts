@@ -13,6 +13,8 @@ export interface FavSyncSnapshot {
   pushes: number;
   /** Writes of settings.json. */
   writes: number;
+  /** Changes that the gateway refused (full list, or a newer change of the same model). */
+  refused: number;
   errors: number;
   /** Unix seconds of the last round that ended without an error, and of the last write. 0 when none yet. */
   lastSuccess: number;
@@ -24,7 +26,7 @@ export interface FavSyncSnapshot {
 export class FavSyncMetrics {
   readonly s: FavSyncSnapshot;
   constructor(private readonly file?: string, now: () => number = Date.now) {
-    this.s = { pulls: 0, pushes: 0, writes: 0, errors: 0, lastSuccess: 0, lastWrite: 0, startedAt: Math.floor(now() / 1000) };
+    this.s = { pulls: 0, pushes: 0, writes: 0, refused: 0, errors: 0, lastSuccess: 0, lastWrite: 0, startedAt: Math.floor(now() / 1000) };
   }
   /** Writes the snapshot to its file (best effort: a metrics file must never stop the sync). */
   persist(): void {
@@ -45,6 +47,7 @@ const HELP: Array<[keyof FavSyncSnapshot, string, string, string]> = [
   ["pulls", "ais_t3_favourites_sync_pulls_total", "counter", "Reads of the gateway favourites list."],
   ["pushes", "ais_t3_favourites_sync_pushes_total", "counter", "Posts of T3 favourite changes to the gateway."],
   ["writes", "ais_t3_favourites_sync_writes_total", "counter", "Writes of favorites in the T3 settings.json."],
+  ["refused", "ais_t3_favourites_sync_refused_total", "counter", "Changes that the gateway refused: the list was full, or a newer change of the same model won."],
   ["errors", "ais_t3_favourites_sync_errors_total", "counter", "Rounds of the favourites sync that failed."],
   ["lastSuccess", "ais_t3_favourites_sync_last_success_timestamp_seconds", "gauge", "Unix time of the last round that ended without an error."],
   ["lastWrite", "ais_t3_favourites_sync_last_write_timestamp_seconds", "gauge", "Unix time of the last write of the T3 settings.json."],
@@ -75,7 +78,7 @@ export function readSnapshots(dir: string): Array<{ home: string; s: FavSyncSnap
     try {
       const v = JSON.parse(readFileSync(join(dir, n), "utf8")) as Partial<FavSyncSnapshot>;
       const num = (x: unknown): number => (typeof x === "number" && Number.isFinite(x) ? x : 0);
-      out.push({ home: n.replace(/\.metrics\.json$/, ""), s: { pulls: num(v.pulls), pushes: num(v.pushes), writes: num(v.writes), errors: num(v.errors), lastSuccess: num(v.lastSuccess), lastWrite: num(v.lastWrite), startedAt: num(v.startedAt) } });
+      out.push({ home: n.replace(/\.metrics\.json$/, ""), s: { pulls: num(v.pulls), pushes: num(v.pushes), writes: num(v.writes), refused: num(v.refused), errors: num(v.errors), lastSuccess: num(v.lastSuccess), lastWrite: num(v.lastWrite), startedAt: num(v.startedAt) } });
     } catch { /* a half-written file */ }
   }
   return out;

@@ -55,8 +55,8 @@ export function fakeGateway(now: () => number = Date.now) {
       if (down) throw new Error("gateway down");
       calls.posts += 1;
       calls.posted.push(changes);
-      await store.apply(changes, origin, now());
-      return list();
+      const r = await store.apply(changes, origin, now());
+      return { ...(await list()), refused: r.refused };
     },
   };
   return { api, store, calls, setDown: (v: boolean) => { down = v; }, star: (k: FavKey, op: "add" | "remove" = "add", at?: number) => store.apply([{ ...k, op, ...(at !== undefined ? { at } : {}) }], "panel", now()) };

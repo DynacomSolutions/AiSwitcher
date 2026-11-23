@@ -10,7 +10,7 @@ export const CHAT_EVENT_LABELS = ["session_created", "session_closed", "session_
 export const CHAT_OUTCOME_LABELS = ["ok", "cancelled", "error"] as const;
 export const CHAT_ERROR_KINDS = ["pod_start", "attach", "agent_exit", "acp", "timeout", "limit", "rate_limit", "close_binding", "resume_failed", "store", "owner_unreachable", "limit", "other"] as const;
 /** Event labels of ais_gateway_favourites_total. `other` is the overflow label. */
-export const FAVOURITE_EVENTS = ["socket_list", "socket_set", "http_get", "http_post", "change", "push", "error"] as const;
+export const FAVOURITE_EVENTS = ["socket_list", "socket_set", "http_get", "http_post", "change", "push", "refused", "error"] as const;
 /** Counters the proxy reports. `PrometheusMetrics` is the production implementation. */
 export interface GatewayMetrics {
   request(e: {

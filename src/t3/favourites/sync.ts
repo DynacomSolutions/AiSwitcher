@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { watch, type FSWatcher } from "node:fs";
 import { dirname, join } from "node:path";
-import { CHAT_PROVIDERS, MAX_FAVOURITES, parseChatToExt, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
+import { CHAT_PROVIDERS, favId, MAX_FAVOURITES, parseChatToExt, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
 import type { FavouritesApi } from "./client.ts";
 import { applyGateway, localChanges, sameFavs } from "./merge.ts";
 import type { MapContext } from "./mapping.ts";
@@ -82,11 +82,19 @@ export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
   const reset = state !== undefined && (gateway.seq < state.seq || (gateway.epoch !== undefined && state.epoch !== undefined && gateway.epoch !== state.epoch));
   const last = state && !reset ? state.synced : undefined;
   const changes = localChanges(settings.favorites, ctx, last, gateway.items);
+  // Stars that this round sent as adds and the gateway refused stay in T3 and are sent again next round.
+  const keep = new Set<string>();
   if (changes.length > 0) {
-    gateway = await d.client.post(d.origin ?? `t3:${homeKey(d.t3Home)}`, changes);
+    const posted = await d.client.post(d.origin ?? `t3:${homeKey(d.t3Home)}`, changes);
     m && (m.s.pushes += 1);
+    const adds = new Set(changes.filter((c) => c.op === "add").map(favId));
+    for (const k of posted.refused ?? []) {
+      m && (m.s.refused += 1);
+      if (adds.has(favId(k))) keep.add(favId(k));
+    }
+    gateway = posted;
   }
-  const applied = applyGateway(settings.favorites, ctx, gateway.items);
+  const applied = applyGateway(settings.favorites, ctx, gateway.items, keep);
   let wrote = false;
   if (!sameFavs(applied.next, settings.favorites)) {
     const r = await writeT3Favourites(settings, applied.next);

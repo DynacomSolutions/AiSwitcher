@@ -1,5 +1,5 @@
 import { SQL } from "bun";
-import { CHAT_PROVIDERS, favId, MAX_FAVOURITES, type ChatProvider, type FavChange } from "../../browser/chat-protocol.ts";
+import { CHAT_PROVIDERS, favId, MAX_FAVOURITES, type ChatProvider, type FavChange, type FavKey } from "../../browser/chat-protocol.ts";
 import { effectiveAt, type FavouriteApplied, type FavouriteList, type FavouriteStore } from "./favourites-store.ts";
 
 type Row = Record<string, unknown>;
@@ -25,21 +25,29 @@ export class PgFavouriteStore implements FavouriteStore {
     return this.sql.begin(async (t) => {
       await t`SELECT pg_advisory_xact_lock(hashtextextended('gateway_favourites', 0))`;
       let changed = false;
+      const refused: FavKey[] = [];
       for (const c of changes) {
+        const k: FavKey = { provider: c.provider, identity: c.identity, model: c.model };
         const id = favId(c);
         const at = effectiveAt(c.at, nowMs);
         const present = c.op === "add";
         const cur = (await t.unsafe("SELECT present, at_ms FROM gateway_favourites WHERE id = $1", [id]))[0] as Row | undefined;
         // A removal of a model with no row has nothing to remove: no row, no new version, no wake-up.
         if (!present && !cur) continue;
-        if (cur && at < Number(cur.at_ms)) continue;
+        if (cur && at < Number(cur.at_ms)) {
+          if (cur.present !== present) refused.push(k);
+          continue;
+        }
         if (cur && cur.present === present) {
           await t.unsafe("UPDATE gateway_favourites SET at_ms = $2::bigint, origin = $3 WHERE id = $1", [id, at, origin]);
           continue;
         }
         if (present) {
           const n = Number((await t.unsafe("SELECT count(*)::int AS n FROM gateway_favourites WHERE present"))[0]?.n ?? 0);
-          if (n >= MAX_FAVOURITES) continue;
+          if (n >= MAX_FAVOURITES) {
+            refused.push(k);
+            continue;
+          }
         }
         await t.unsafe(
           `INSERT INTO gateway_favourites (id, provider, identity, model, present, at_ms, seq, origin)
@@ -50,7 +58,7 @@ export class PgFavouriteStore implements FavouriteStore {
         changed = true;
       }
       const seq = Number((await t.unsafe("SELECT coalesce(max(seq), 0)::bigint AS seq FROM gateway_favourites"))[0]?.seq ?? 0);
-      return { seq, changed };
+      return { seq, changed, refused };
     });
   }
 

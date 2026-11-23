@@ -3,7 +3,14 @@ import { parseChatToExt, type FavChange, type FavKey } from "../../browser/chat-
 import { StoreApi } from "../../gateway/home-store-http.ts";
 
 /** `epoch` names the gateway store. It is absent on a gateway from before the epoch. */
-export interface FavList { seq: number; epoch?: string; items: FavKey[]; changed?: boolean }
+export interface FavList {
+  seq: number;
+  epoch?: string;
+  items: FavKey[];
+  changed?: boolean;
+  /** Set by a POST: the changes the gateway did not apply (the list was full, or a newer change of the same model won). */
+  refused?: FavKey[];
+}
 
 export interface FavouritesApi {
   /** The list. With `since` the gateway waits up to `waitMs` for a list version other than `since`. */
@@ -13,11 +20,22 @@ export interface FavouritesApi {
 
 const REQUEST_MS = 15_000;
 
+/** The keys of `refused`. A bad entry is skipped: it must not hide the others. */
+function parseRefused(v: unknown): FavKey[] {
+  if (!Array.isArray(v)) return [];
+  const out: FavKey[] = [];
+  for (const item of v) {
+    const one = parseChatToExt({ t: "chat.fav.list", seq: 0, items: [item] });
+    if (one?.t === "chat.fav.list" && one.items[0]) out.push(one.items[0]);
+  }
+  return out;
+}
+
 function parse(status: number, json: Record<string, unknown>, what: string): FavList {
   if (status !== 200) throw new Error(`gateway favourites ${what} answered ${status}`);
   const v = parseChatToExt({ t: "chat.fav.list", seq: json.seq, epoch: json.epoch, items: json.items });
   if (!v || v.t !== "chat.fav.list") throw new Error(`gateway favourites ${what} answered with a list that is not valid`);
-  return { seq: v.seq, ...(v.epoch !== undefined ? { epoch: v.epoch } : {}), items: v.items, ...(typeof json.changed === "boolean" ? { changed: json.changed } : {}) };
+  return { seq: v.seq, ...(v.epoch !== undefined ? { epoch: v.epoch } : {}), items: v.items, ...(typeof json.changed === "boolean" ? { changed: json.changed } : {}), ...(json.refused !== undefined ? { refused: parseRefused(json.refused) } : {}) };
 }
 
 export function createFavouritesClient(opts: { url: string; token: string; fetch?: typeof fetch }): FavouritesApi {

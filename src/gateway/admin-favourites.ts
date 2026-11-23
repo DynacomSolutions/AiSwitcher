@@ -11,7 +11,8 @@ import type { GatewayMetrics } from "./metrics.ts";
  * - GET  /favourites?since=N&ms=M   The list: `{seq, epoch, changed, items: [{provider, identity, model}]}`. Without `since` it answers at once.
  *                                   With `since` it answers at once when the list version differs, else when the list changes or after M ms (at most 25 s).
  * - POST /favourites                `{origin, changes: [{provider, identity, model, op: "add" | "remove", at?}]}` applies the changes
- *                                   (the newest change of a model wins) and answers with the list (`{seq, epoch, items}`).
+ *                                   (the newest change of a model wins) and answers with the list and the changes the store refused (`{seq, epoch, items, refused: [{provider, identity, model}]}`:
+ *                                   a change that lost to a newer change of the same model, or an add when the list is full).
  */
 
 /** Longest a long poll waits. It is under the idle limit of the clients and proxies in front of the gateway. */
@@ -75,7 +76,8 @@ export function registerFavouritesAdmin(
     if (typeof changes === "string") return err(400, changes);
     metrics?.favourite?.("http_post");
     try {
-      return c.json(body(await svc.apply(changes, origin)));
+      const r = await svc.apply(changes, origin);
+      return c.json({ ...body(r), refused: r.refused.map(({ provider, identity, model }) => ({ provider, identity, model })) });
     } catch {
       metrics?.favourite?.("error");
       return err(503, "the favourites store is unavailable");
