@@ -331,7 +331,7 @@ Keep new codex releases working against the AIS gateway placeholder login.
 | 292 | Console: gateway row without a login shows missing | done | claude | console-auth-sessions-add | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/741, released v0.5.105. |
 | 293 | Console: add identity into the gateway store | done | claude | console-auth-sessions-add | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/741 and .cluster #3232 (store key), released v0.5.105.<br>Live form checked by screenshot. |
 | 294 | Console: first login of a new identity goes to the gateway store | done | claude | console-auth-sessions-add | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/741, released v0.5.105. |
-| 295 | Sessions in the AIS database (HoardDB) | todo | claude | | | | Owner decision: session index in Postgres, transcripts in HoardDB object storage.<br>Console Sessions page reads from there, not host folders.<br>Design in progress. |
+| 295 | Sessions in the AIS database (HoardDB) | in_progress | claude | | | | Owner decision: session index in Postgres, transcripts in HoardDB object storage.<br>Console Sessions page reads from there, not host folders.<br>Design in progress. |
 
 ## 14. Gateway survives any node loss
 ETA: 2026-11-15 23:00 ICT
@@ -401,8 +401,8 @@ ETA: 2026-11-25 18:00 ICT
 | 272 | Chat: close a binding's chats when its pairing is revoked | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>Chats are visible only to the approval they were made under.<br>Released in v0.5.95. |
 | 273 | Chat: composer with the model picker inside, matching T3 | done | claude | sidepanel-chat-composer | 18.264 | | Input card with the picker inside, on the new-chat screen too (#724).<br>Picker follows the T3 picker.<br>Released in v0.5.99. |
 | 274 | Chat: real provider icons in the picker | done | claude | sidepanel-chat-icons | 18.273 | | Real marks from simple-icons, as in the web UI (#727).<br>Release job installs dependencies (#732).<br>Released in v0.5.101. |
-| 275 | Chat: favourites sync between T3 and the side panel | done | claude |  | 18.273 |  | Merged #735, released v0.5.102.<br>Host proof: both ways in under 4 s. |
-| 276 | Chat: favourites sync options for cluster pods | done | claude |  | 18.275 |  | Merged #737, released v0.5.103.<br>Cluster pods sync both ways in under 1 s. |
+| 275 | Chat: favourites sync between T3 and the side panel | done | claude | | 18.273 | | Merged #735, released v0.5.102.<br>Host proof: both ways in under 4 s. |
+| 276 | Chat: favourites sync options for cluster pods | done | claude | | 18.275 | | Merged #737, released v0.5.103.<br>Cluster pods sync both ways in under 1 s. |
 
 ## 19. CI speed and flaky tests
 
@@ -414,3 +414,31 @@ ETA: 2026-11-25 18:00 ICT
 | 281 | Fit every job timeout to its p99 | done | claude | ci-speed | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/714.<br>Every job has a limit. apt calls can no longer hang. |
 | 282 | Fix the flaky CI tests | done | claude | ci-flaky | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/715.<br>affected.test.ts null diff in shallow checkouts.<br>Two 5 s timeouts on node spawn and backup lock. |
 | 283 | Measure before and after p50 and p90 | done | claude | ci-speed | 19.280, 19.281 | | Before p50/p90: Linux 16.2/19.1, macOS 12.6/14.7, Windows build 8.0/9.5 min.<br>After, 2 warm runs: Linux 8.9/8.9, macOS 5.9/6.1, Windows build 4.5/4.6 min. |
+
+## 20. Sessions in the AIS database
+ETA: 2026-12-12 18:00 ICT
+
+- Every session (agent pools included) is indexed in Postgres and stored in the HoardDB `agent-sessions` bucket.
+- backup-client ships sessions; the console Sessions page reads the database, not host folders.
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 296 | Spike: corpus size, gzip ratio, free space, restic cold read | in_progress | claude | sessions-spike-corpus | | 2026-11-24 04:00 ICT | Evidence file only. |
+| 297 | Spike: age, Bun S3 client against HoardDB | in_progress | claude | sessions-spike-s3 | | 2026-11-24 04:00 ICT | Evidence file only. |
+| 298 | Migration 0014 and SessionStore | in_progress | claude | sessions-store | | 2026-11-24 08:00 ICT | Cursor, ingest rule, idempotency, tree view. |
+| 299 | Ingest routes, scoped token, metrics, flag | todo | | | 20.298 | | |
+| 300 | Incremental indexers for Claude and Codex | todo | | | 20.302 | | |
+| 301 | Enrichment loop on the gateway leader | todo | | | 20.298, 20.300, 20.297 | | |
+| 302 | Session readers as line iterables | in_progress | claude | sessions-line-iter | | 2026-11-24 08:00 ICT | Refactor only, tests stay green. |
+| 303 | Shipper in backup-client | todo | | | 20.299 | | .cluster code. |
+| 304 | Shipper fast lane and hot set | todo | | | 20.303 | | |
+| 305 | Cluster: shipper values, recipient key, ingest secret | todo | | | 20.303 | | .cluster PR. |
+| 306 | Cluster: HoardDB read key, NetworkPolicy, env | todo | | | 20.297 | | .cluster PR. |
+| 307 | Cluster: watchdog rules, metrics, Headlamp row | todo | | | 20.303, 20.299 | | .cluster PR. |
+| 308 | Console reader from the database | todo | | | 20.301, 20.302, 20.306 | | AIS_SESSIONS_SOURCE switch. |
+| 309 | Equivalence test and performance proof | todo | | | 20.308 | | |
+| 310 | Backfill per node with verification | todo | | | 20.305, 20.307 | | |
+| 311 | Reconcile drill and verify-host command | todo | | | 20.310 | | |
+| 312 | Cut over Claude and Codex to the database | todo | | | 20.309, 20.310 | | |
+| 313 | Pi, Grok and Kimi sessions in the database | todo | | | 20.312 | | |
+| 314 | Crush normalised session export | todo | | | 20.313 | | |
