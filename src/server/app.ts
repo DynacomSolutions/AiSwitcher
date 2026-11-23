@@ -170,7 +170,7 @@ export function createWidgetService(deps: ConsoleAppDeps, linkBase?: string): Wi
   return new WidgetService({
     limits: () => loadLimitsPayload(deps, {}, 45, (view) => void (limitsDegraded = view === undefined || view.error !== undefined)),
     limitsDegraded: () => limitsDegraded,
-    auth: async () => authApi.authStatus(Object.values(TOOL_CONFIGS), await freshRefreshStatus(deps.authRefresh)),
+    auth: async () => authApi.authStatus(Object.values(TOOL_CONFIGS), await freshRefreshStatus(deps.authRefresh), deps.gatewayRenewal),
     processes: scanAgents,
     gatewayUsage: (days) => (deps.gatewayUsage ?? loadGatewayUsage)(days),
     claudeSwap: async () => {
@@ -493,7 +493,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   /* ---------------------------------- auth --------------------------------- */
 
   app.get("/api/auth", async (c) =>
-    c.json(await authApi.authStatus(Object.values(TOOL_CONFIGS), await freshRefreshStatus(deps.authRefresh))),
+    c.json(await authApi.authStatus(Object.values(TOOL_CONFIGS), await freshRefreshStatus(deps.authRefresh), deps.gatewayRenewal)),
   );
 
   app.post("/api/auth/zai-key", async (c) => {

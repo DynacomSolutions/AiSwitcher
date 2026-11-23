@@ -16,6 +16,7 @@ import { collectAccounts, accountKey } from "../identities/account-info.ts";
 import { folderHoldsGatewayEntry } from "../identities/gateway-routed.ts";
 import { readLoginRevoked } from "../identities/gateway-revoked.ts";
 import { LOGIN_FLOW_SPECS, type LoginFlowSpec } from "./login-specs.ts";
+import { loadGatewayRenewal, type GatewayRenewalLoginDto, type GatewayRenewalView } from "./gateway-renewal.ts";
 import type { RefreshStatusDto } from "./auth-refresh.ts";
 import type { Identity, ToolConfig } from "../identities/types.ts";
 import {
@@ -326,11 +327,44 @@ async function probeViaGateway(tool: MemberStoreTool, identity: Identity): Promi
   return { ...inner, viaGateway: true, detail: `via gateway member store: ${inner.detail ?? inner.state}` };
 }
 
+/** The gateway's own renewal row for an identity (its name or an alias), or undefined. */
+function renewalRowFor(view: GatewayRenewalView | undefined, tool: string, identity: Identity): GatewayRenewalLoginDto | undefined {
+  if (view?.state !== "ok") return undefined;
+  const names = new Set([identity.name, ...(identity.aliases ?? [])]);
+  return view.logins.find((l) => l.provider === tool && names.has(l.identity));
+}
+
+const shorten = (text: string, max = 120): string => {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}...` : flat;
+};
+
+/**
+ * The gateway renews every login it holds, so its admin row is the truth for those logins: the host's member-store copy and the
+ * identity folder can be weeks stale. Revoked needs a re-login; a recorded renewal error warns; otherwise the login is healthy.
+ */
+function probeFromGatewayRow(row: GatewayRenewalLoginDto): ProbeResult {
+  const base = { kind: "oauth" as const, viaGateway: true, fixable: ["login"], ...(row.expiresAt ? { expiresAt: row.expiresAt } : {}) };
+  if (row.revoked) return { ...base, state: "expired", detail: "refresh token revoked at the gateway: re-login required" };
+  if (row.lastError) {
+    const why = shorten(row.lastError.detail || row.lastError.code);
+    return { ...base, state: "expiring", detail: `via gateway: last renewal failed (${row.lastError.code}): ${why}` };
+  }
+  const renewed = row.lastRefreshAt ? `renewed ${row.lastRefreshAt}` : "not renewed yet";
+  const next = row.nextRefreshAt ? `, next renewal ${row.nextRefreshAt}` : "";
+  return { ...base, state: "ok", detail: `via gateway: ${renewed}${next}` };
+}
+
 export async function authStatus(
   configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
   refreshStatus: RefreshStatusDto[] = [],
+  loadRenewal: () => Promise<GatewayRenewalView> = () => loadGatewayRenewal(),
 ): Promise<AuthDto> {
   const loaded = await loadAll(configs);
+  // One read of the gateway's renewal list per call, only when a claude or codex identity is listed. A failure never throws.
+  const renewal: GatewayRenewalView | undefined = loaded.some(({ cfg }) => cfg.toolName === "claude" || cfg.toolName === "codex")
+    ? await loadRenewal().catch(() => undefined)
+    : undefined;
   const accounts = await collectAccounts(loaded);
   const entries: AuthEntryDto[] = [];
   for (const { cfg, file } of loaded) {
@@ -365,11 +399,19 @@ export async function authStatus(
       try {
         switch (cfg.toolName) {
           case "claude":
-            result = (await probeViaGateway("claude", identity)) ?? (await probeClaude(identity.configDir));
+          case "codex": {
+            const row = renewalRowFor(renewal, cfg.toolName, identity);
+            if (row) {
+              result = probeFromGatewayRow(row);
+            } else if (renewal?.state !== "ok" && renewal?.state !== "unconfigured" && folderHoldsGatewayEntry(cfg.toolName, identity)) {
+              // The gateway holds this login but cannot be asked: a stale host copy must not say "expired".
+              result = { kind: "oauth", state: "unknown", viaGateway: true, detail: "gateway admin unreachable", fixable: ["login"] };
+            } else {
+              const direct = cfg.toolName === "claude" ? probeClaude : probeCodex;
+              result = (await probeViaGateway(cfg.toolName, identity)) ?? (await direct(identity.configDir));
+            }
             break;
-          case "codex":
-            result = (await probeViaGateway("codex", identity)) ?? (await probeCodex(identity.configDir));
-            break;
+          }
           case "grok":
             result = await probeGrok(identity.configDir);
             break;

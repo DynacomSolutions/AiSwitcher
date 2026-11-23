@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { partialLabel, summarisePools } from "../../apps/web/src/lib/pool-usage.ts";
+import { creditsNote } from "../../apps/web/src/lib/credits-note.ts";
 import type { GatewayIdentityUsage, GatewayPeriod, PoolRef, ToolLimitResult, UsageResult } from "../../apps/web/src/types/api.ts";
 
 const id = (name: string) => ({ name, label: name, configDir: "SYNTHETIC_FIXTURE_dir" });
@@ -105,5 +106,33 @@ describe("summarisePools", () => {
     expect(s!.members[2]).toMatchObject({ limitMissing: "limits unavailable" });
     expect(s!.members[2]!.worstPercent).toBeUndefined();
     expect(s!.windows.find((w) => w.label === "week")).toEqual({ label: "week", worstPercent: 100, meanPercent: 70, reporting: 2, total: 3 });
+  });
+});
+
+describe("codex pool members: reset time and credits", () => {
+  const codexPool: PoolRef = { tool: "codex", name: "codex-pool", members: [{ name: "c1", allowed: true }] };
+  const codexLimit: ToolLimitResult = {
+    toolName: "codex",
+    provider: "openai",
+    identity: id("c1"),
+    status: "live",
+    windows: [
+      { label: "session", category: "session", usedPercent: 10, resetsAtMs: 1_000 },
+      { label: "week", category: "week", usedPercent: 40, resetsAtMs: 2_000 },
+    ],
+    extraUsage: { enabled: true, available: true, label: "credits 12" },
+  };
+  const empty = { todayKey: "2026-11-06", weekStartKey: "2026-10-31", gateway: { today: ok([]), week: ok([]) } };
+
+  test("the member row carries the worst window's reset time and the credits", () => {
+    const [s] = summarisePools([codexPool], [], [codexLimit], empty);
+    expect(s!.members[0]).toMatchObject({ worstPercent: 40, worstLabel: "week", worstResetsAtMs: 2_000, extraUsage: { available: true } });
+  });
+
+  test("credits notes never claim they are used", () => {
+    expect(creditsNote({ enabled: true, available: true, label: "credits 12" })).toBe("Credits: available (not used: the gateway stops at 100%)");
+    expect(creditsNote({ enabled: false, available: false, label: "no credits" })).toBe("Credits: none");
+    expect(creditsNote({ enabled: true, available: false, label: "credits 0" })).toBe("Credits: none left");
+    expect(creditsNote(undefined)).toBeUndefined();
   });
 });

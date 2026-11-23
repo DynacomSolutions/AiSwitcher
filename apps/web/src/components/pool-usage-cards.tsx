@@ -6,7 +6,9 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { useLimitsQuery, usePoolsUsageQuery, useUsageQuery } from "@/hooks/queries";
+import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, formatTokens } from "@/lib/format";
+import { formatResetTimes } from "@/lib/reset-time";
 import { partialLabel, summarisePools, type MemberPeriod, type PeriodTotal, type PoolSummary } from "@/lib/pool-usage";
 import type { ToolName } from "@/types/api";
 
@@ -101,6 +103,12 @@ function PoolCard({ pool }: { pool: PoolSummary }) {
               <span className="tabular-nums" title={m.worstLabel ?? m.limitMissing}>
                 {m.worstPercent !== undefined ? `${clampPercent(m.worstPercent).toFixed(0)}%` : `n/a: ${m.limitMissing}`}
               </span>
+              {m.worstResetsAtMs !== undefined || m.extraUsage ? (
+                <div className="col-span-3 space-y-0.5 text-xs text-muted-foreground">
+                  {m.worstResetsAtMs !== undefined ? <div>Resets {formatResetTimes(m.worstResetsAtMs)}</div> : null}
+                  {m.extraUsage ? <div>{creditsNote(m.extraUsage)}</div> : null}
+                </div>
+              ) : null}
               {m.account ? (
                 <div className="col-span-3 space-y-0.5 text-xs">
                   <div className="break-all text-muted-foreground">{m.account.email ?? m.account.label ?? m.account.accountId}</div>

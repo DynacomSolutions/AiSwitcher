@@ -129,6 +129,15 @@ describe("mapGatewayLimitRow: codex, kimi, zai", () => {
     expect(zai.windows.map((w) => w.category)).toEqual(["session", "week"]);
   });
 
+  test("codex credits stay as extra usage and never become an overage", () => {
+    const row = mapGatewayLimitRow({ provider: "codex", identity: "a", status: "live", windows: [{ label: "week", utilization: 0 }], extraUsage: { enabled: true, available: true, label: "credits 12" } })!;
+    expect(row.extraUsage).toEqual({ enabled: true, available: true, label: "credits 12" });
+    expect(row.overage).toBeUndefined();
+    // claude keeps its overage semantics
+    const claude = mapGatewayLimitRow({ provider: "claude", identity: "a", status: "live", windows: [{ label: "five-hour", utilization: 1 }], extraUsage: { enabled: true, available: true, label: "x" } })!;
+    expect(claude.overage).toEqual({ active: true, label: "using extra usage" });
+  });
+
   test("approximate-duration labels keep their duration category", () => {
     const r = mapGatewayLimitRow(row("codex", [{ label: "~30d", utilization: 10 }, { label: "~5h", utilization: 20 }, { label: "usage", utilization: 30 }]))!;
     expect(r.windows.map((w) => w.category)).toEqual(["month", "session", "other"]);

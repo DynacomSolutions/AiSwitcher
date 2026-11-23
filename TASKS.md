@@ -317,7 +317,7 @@ ETA: 2026-11-12 03:00 ICT
 | 181 | Release test: shared browser lock test accepts either renewal winning the lock first | done | claude | fix-ali-lock-test-order | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/496 (130d6c5).<br>v0.5.47 release failed on macOS: "two renewals take turns" asserted a before b; b won the lock, turns were still exclusive.<br>Test now checks no overlap in either order. |
 
 ## 13. Codex clients through the gateway
-ETA: 2026-11-17 15:30 ICT
+ETA: 2026-11-23 21:00 ICT
 Keep new codex releases working against the AIS gateway placeholder login.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -326,6 +326,8 @@ Keep new codex releases working against the AIS gateway placeholder login.
 | 185 | Local gateway serves HTTPS for codex 0.167 (pool identity) | done | claude | codex-local-https | 13.182 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/501 (f0d6377); host updated, local gateway serves HTTPS on 47141.<br>Pool home moved to https://localhost:47141; codex 0.167 `account/read` and `model/list` pass; all four T3 Codex instances load. |
 | 186 | Backup keeps corrupt SQLite files as raw copies, without a warning every run | done | claude | backup-codex-quarantine | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/504 (ec3c38a); host updated.<br>Live codex backup: 66 snapshotted, 0 skipped, 3 kept as raw copies, no corruption warnings. |
 | 256 | Backup skips codex `.tmp/` scratch clones | done | claude | backup-codex-dot-tmp | | | Was 187 (id taken by 5.187).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/507 (2f18716); host updated.<br>First run dropped 145,215 tracked `.tmp` files (one catch-up run with a longer budget).<br>Live codex backup: committed, 0 index errors, 0 warnings. |
+| 290 | Codex limits read from the gateway only, with credits shown | in_progress | claude | codex-pool-console | | 2026-11-23 21:00 ICT | `ais limits` read routed Codex logins from a stale host copy (401).<br>Host reads now go to gateway admin `GET /limits`.<br>Credits shown, never spent: the gateway stops at 100%. |
+| 291 | Console Auth state of gateway logins from the gateway | in_progress | claude | codex-pool-console | | 2026-11-23 21:00 ICT | Auth page probed stale console copies and showed a live login as Expired.<br>State now from gateway `GET /logins/renewal`. |
 
 ## 14. Gateway survives any node loss
 ETA: 2026-11-15 23:00 ICT

@@ -1,4 +1,4 @@
-import type { AccountInfo, GatewayPeriod, LimitWindow, PoolRef, PoolsUsageResponse, ToolLimitResult, UsageResult } from "../types/api";
+import type { AccountInfo, ExtraUsageInfo, GatewayPeriod, LimitWindow, PoolRef, PoolsUsageResponse, ToolLimitResult, UsageResult } from "../types/api";
 
 /** The usage provider each pool tool's native figures are filed under. */
 const USAGE_PROVIDER: Record<string, string> = { claude: "anthropic", codex: "openai", kimi: "kimi" };
@@ -35,6 +35,10 @@ export interface MemberUsage {
   /** Worst window utilisation over the member's limit windows, or why there is none. */
   worstPercent?: number;
   worstLabel?: string;
+  /** Reset time (epoch ms) of the worst window, when the reading carries one. */
+  worstResetsAtMs?: number;
+  /** Codex credits of the member, when its reading carries them. */
+  extraUsage?: ExtraUsageInfo;
   limitMissing?: string;
 }
 
@@ -135,12 +139,12 @@ function total(members: MemberUsage[], period: PeriodName): PeriodTotal {
   return t;
 }
 
-function limitsFor(tool: string, member: string, limits: ToolLimitResult[]): { windows: LimitWindow[] } | { missing: string } {
+function limitsFor(tool: string, member: string, limits: ToolLimitResult[]): { windows: LimitWindow[]; extraUsage?: ExtraUsageInfo } | { missing: string } {
   const r = limits.find((l) => l.toolName === tool && l.identity.name === member);
   if (!r) return { missing: "no limits record" };
   if (r.status === "pending") return { missing: "limits still loading" };
   if (r.windows.length === 0) return { missing: r.status === "unavailable" ? "limits unavailable" : "no limit windows reported" };
-  return { windows: r.windows };
+  return { windows: r.windows, ...(r.extraUsage ? { extraUsage: r.extraUsage } : {}) };
 }
 
 /** Sums each pool's members: native usage (daily figures), gateway ledger usage attributed by identity, and limit windows.
@@ -167,6 +171,8 @@ export function summarisePools(pools: PoolRef[], usage: UsageResult[], limits: T
         }
         out.worstPercent = worst.usedPercent;
         out.worstLabel = worst.label;
+        if (worst.resetsAtMs !== undefined) out.worstResetsAtMs = worst.resetsAtMs;
+        if (pool.tool === "codex" && lim.extraUsage) out.extraUsage = lim.extraUsage;
       }
       return out;
     });

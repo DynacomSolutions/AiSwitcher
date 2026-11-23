@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSwapCommand } from "../../../src/cli/swap/dispatch.ts";
-import { fetchCodexLimits, fetchCodexLimitsViaStore, snapshotFromWham } from "../../../src/cli/limits/codex-limits.ts";
+import { fetchCodexLimits, fetchCodexLimitsViaGateway, fetchCodexLimitsViaStore, snapshotFromWham } from "../../../src/cli/limits/codex-limits.ts";
 import { gatewayEntryText } from "../../../src/identities/claude-gateway-entry.ts";
 import { performSwap as performClaudeSwap } from "../../../src/identities/claude-swap.ts";
 import { fetchMemberUsage } from "../../../src/identities/claude-usage-api.ts";
@@ -215,22 +215,64 @@ describe("codex usage of a routed member", () => {
     expect(snapshotFromWham({}, 0)).toBeUndefined();
   });
 
-  test("reads the store copy's access token with one GET (no refresh, no codex process)", async () => {
+  const gatewayRow = { provider: "codex", identity: "a", status: "live", capturedAt: "2026-11-23T10:00:00.000Z", windows: [{ label: "session", utilization: 3, resetsAt: "2026-11-23T14:00:00.000Z" }, { label: "week", utilization: 0, resetsAt: "2026-11-30T10:00:00.000Z" }], extraUsage: { enabled: true, available: true, label: "credits 12" } };
+  const withAdminSecrets = async () => {
+    await writeFile(join(root, "secrets"), `AIS_GATEWAY_ADMIN_URL=https://gw.test/admin/\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_admin_token\n`);
+  };
+
+  test("a host asks the gateway admin API, never the host copy of the login", async () => {
     await routedCodex();
-    const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+    await withAdminSecrets();
+    const calls: Array<{ url: string; auth: string | undefined }> = [];
     const fetchImpl = (async (url: string, init: RequestInit) => {
-      calls.push({ url, headers: init.headers as Record<string, string> });
-      return new Response(JSON.stringify(whamBody), { status: 200 });
+      calls.push({ url, auth: (init.headers as Record<string, string>).authorization });
+      return new Response(JSON.stringify({ limits: [gatewayRow] }), { status: 200 });
     }) as unknown as typeof fetch;
-    const r = await fetchCodexLimits({ name: "a", label: "a", configDir: dirOf("a") }, { fetchImpl, now: () => T0 * 1000 });
+    const r = await fetchCodexLimits({ name: "a", label: "a", configDir: dirOf("a") }, { gateway: { fetch: fetchImpl }, fetchImpl: (async () => { throw new Error("the host must not call chatgpt.com"); }) as unknown as typeof fetch });
     expect(r.status).toBe("live");
-    expect(r.windows.map((w) => w.usedPercent)).toEqual([42, 7]);
+    expect(r.windows.map((w) => w.usedPercent)).toEqual([3, 0]);
+    expect(r.extraUsage).toMatchObject({ enabled: true, available: true });
+    expect(r.overage).toBeUndefined();
+    expect(r.identity.name).toBe("a");
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toContain("/backend-api/wham/usage");
-    expect(calls[0]!.headers.Authorization).toBe(`Bearer ${jwt("acct-a", T0)}`);
-    expect(calls[0]!.headers["chatgpt-account-id"]).toBe("acct-a");
+    expect(calls[0]!.url).toBe("https://gw.test/admin/limits?provider=codex&identity=a");
+    expect(calls[0]!.auth).toBe("Bearer SYNTHETIC_FIXTURE_admin_token");
     // the store copy is untouched
     expect(await readFile(storeFile("codex", "a", "auth.json"), "utf8")).toBe(codexLogin("acct-a"));
+  });
+
+  test("a host without admin credentials is unavailable, with no host-copy fallback", async () => {
+    await routedCodex();
+    await writeFile(join(root, "secrets"), "");
+    const saved = { url: process.env.AIS_GATEWAY_ADMIN_URL, token: process.env.AIS_GATEWAY_ADMIN_TOKEN };
+    delete process.env.AIS_GATEWAY_ADMIN_URL;
+    delete process.env.AIS_GATEWAY_ADMIN_TOKEN;
+    try {
+      let chatgpt = 0;
+      const fetchImpl = (async () => {
+        chatgpt++;
+        return new Response("{}", { status: 200 });
+      }) as unknown as typeof fetch;
+      const r = await fetchCodexLimits({ name: "a", label: "a", configDir: dirOf("a") }, { fetchImpl });
+      expect(r.status).toBe("unavailable");
+      expect(r.error).toContain("gateway admin is not configured");
+      expect(chatgpt).toBe(0);
+    } finally {
+      if (saved.url !== undefined) process.env.AIS_GATEWAY_ADMIN_URL = saved.url;
+      if (saved.token !== undefined) process.env.AIS_GATEWAY_ADMIN_TOKEN = saved.token;
+    }
+  });
+
+  test("a failed admin read or an unknown identity is unavailable", async () => {
+    await routedCodex();
+    await withAdminSecrets();
+    const identity = { name: "a", label: "a", configDir: dirOf("a") };
+    const down = (async () => new Response("{}", { status: 503 })) as unknown as typeof fetch;
+    const failed = await fetchCodexLimitsViaGateway(identity, { gateway: { fetch: down } });
+    expect(failed).toMatchObject({ status: "unavailable", windows: [] });
+    expect(failed.error).toContain("admin answered 503");
+    const empty = (async () => new Response(JSON.stringify({ limits: [] }), { status: 200 })) as unknown as typeof fetch;
+    expect((await fetchCodexLimitsViaGateway(identity, { gateway: { fetch: empty } })).error).toContain("no usage for this identity");
   });
 
   test("a gateway process reads a member's store copy with one GET too (the pod has no codex binary)", async () => {
@@ -248,10 +290,25 @@ describe("codex usage of a routed member", () => {
       expect(r.status).toBe("live");
       expect(r.windows.map((w) => w.usedPercent)).toEqual([42, 7]);
       expect(calls).toHaveLength(1);
+      // the gateway reads chatgpt.com with its own store copy and never calls its own admin API
+      expect(calls[0]).toContain("/backend-api/wham/usage");
     } finally {
       if (saved === undefined) delete process.env.AIS_GATEWAY_MEMBER_STORE;
       else process.env.AIS_GATEWAY_MEMBER_STORE = saved;
     }
+  });
+
+  test("maps the wham credits block into the snapshot and the extra usage", async () => {
+    const withCredits = { ...whamBody, credits: { has_credits: true, unlimited: false, balance: "12.50", overage_limit_reached: false } };
+    expect(snapshotFromWham(withCredits, T0 * 1000)!.credits).toEqual({ hasCredits: true, unlimited: false, balance: "12.50" });
+    expect(snapshotFromWham({ ...whamBody, credits: { has_credits: false, unlimited: false, balance: 0 } }, 0)!.credits).toEqual({ hasCredits: false, unlimited: false, balance: "0" });
+    expect(snapshotFromWham(whamBody, 0)!.credits).toBeUndefined();
+    await routedCodex();
+    const fetchImpl = ((async () => new Response(JSON.stringify(withCredits), { status: 200 })) as unknown) as typeof fetch;
+    const r = await fetchCodexLimitsViaStore({ name: "a", label: "a", configDir: dirOf("a") }, { fetchImpl, now: () => T0 * 1000 });
+    expect(r.extraUsage).toEqual({ enabled: true, available: true, label: "credits 12.50" });
+    const none = ((async () => new Response(JSON.stringify({ ...whamBody, credits: { has_credits: false, unlimited: false, balance: "0" } }), { status: 200 })) as unknown) as typeof fetch;
+    expect((await fetchCodexLimitsViaStore({ name: "a", label: "a", configDir: dirOf("a") }, { fetchImpl: none })).extraUsage).toEqual({ enabled: false, available: false, label: "no credits" });
   });
 
   test("a rejected token is reported, not repaired", async () => {
