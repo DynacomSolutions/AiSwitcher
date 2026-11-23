@@ -1,6 +1,6 @@
 // T3 Code names a model favourite by provider instance id and model slug. AIS names it by provider, identity (or pool) and model.
 // This file maps one to the other. It is pure: the pool name comes in through the context.
-import { CHAT_PROVIDERS, favId, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
+import { CHAT_PROVIDERS, favId, selectable, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
 
 /** One entry of `favorites` in T3 Code's settings.json. */
 export interface T3Fav { provider: string; model: string }
@@ -61,7 +61,8 @@ export function instanceToAis(id: string, ctx: Pick<MapContext, "poolName" | "ca
 /** The AIS key of a T3 favourite, or undefined when its instance is not mapped or its names are not valid. */
 export function favToKey(f: T3Fav, ctx: Pick<MapContext, "poolName" | "canonical">): FavKey | undefined {
   const a = instanceToAis(f.provider, ctx);
-  if (!a || f.model === "" || !(CHAT_PROVIDERS as readonly string[]).includes(a.provider)) return undefined;
+  // The gateway takes only names that pass `selectable`. A favourite with another name (T3 allows `opus[1m]`) stays in T3 as an unmapped one.
+  if (!a || !(CHAT_PROVIDERS as readonly string[]).includes(a.provider) || !selectable(a.identity) || !selectable(f.model)) return undefined;
   return { provider: a.provider, identity: a.identity, model: f.model };
 }
 

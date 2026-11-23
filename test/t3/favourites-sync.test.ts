@@ -112,6 +112,28 @@ describe("one round", () => {
     expect(e.favs()).toEqual([{ provider: "claudeAgent", model: "x" }, { provider: "t3-claude-kimi-work", model: "k" }]);
   });
 
+  test("a favourite with a name the gateway refuses stays untouched and stops nothing else", async () => {
+    const odd = { provider: "t3-claude-work", model: "opus[1m]" };
+    const e = setup({ favorites: [odd, { provider: "t3-claude-work", model: "ok" }] });
+    await e.gw.star(key("from-panel"));
+    expect(await e.round()).toMatchObject({ status: "ok", pushed: 1, wrote: true });
+    expect(e.gw.calls.posted.flat().map((c) => c.model)).toEqual(["ok"]);
+    expect(e.favs()).toEqual([odd, { provider: "t3-claude-work", model: "ok" }, { provider: "t3-claude-work", model: "from-panel" }]);
+    await e.gw.star(key("ok"), "remove");
+    await e.round();
+    expect(e.favs()).toEqual([odd, { provider: "t3-claude-work", model: "from-panel" }]);
+  });
+
+  test("a bad entry in the state file is skipped, the rest is kept", async () => {
+    const e = setup({ favorites: [{ provider: "t3-claude-work", model: "a" }] });
+    await e.round();
+    const file = join(e.stateDir, `${homeKey(e.home.home)}.json`);
+    const s = JSON.parse(readFileSync(file, "utf8"));
+    s.synced = [{ provider: "claude", identity: "work", model: "opus[1m]" }, ...s.synced, 7, null];
+    writeFileSync(file, JSON.stringify(s));
+    expect((await readState(e.deps))?.synced).toEqual([key("a")]);
+  });
+
   test("a gateway star with no instance on this host is not written and does not come back as a removal", async () => {
     const e = setup();
     await e.gw.star(key("m", "stranger"));

@@ -35,8 +35,15 @@ export const metricsPathOf = (t3Home: string, stateDir = favouritesStateDir()): 
 export async function readState(d: Pick<FavSyncDeps, "t3Home" | "stateDir">): Promise<SyncState | undefined> {
   try {
     const v = JSON.parse(await readFile(statePath(d), "utf8")) as { version?: unknown; seq?: unknown; synced?: unknown };
-    const list = parseChatToExt({ t: "chat.fav.list", seq: v.seq, items: v.synced });
-    return v.version === 1 && list?.t === "chat.fav.list" ? { version: 1, seq: list.seq, synced: list.items } : undefined;
+    const seq = parseChatToExt({ t: "chat.fav.list", seq: v.seq, items: [] });
+    if (v.version !== 1 || seq?.t !== "chat.fav.list" || !Array.isArray(v.synced)) return undefined;
+    // One bad entry is skipped: it must not make the whole list unreadable.
+    const synced: FavKey[] = [];
+    for (const item of v.synced) {
+      const one = parseChatToExt({ t: "chat.fav.list", seq: 0, items: [item] });
+      if (one?.t === "chat.fav.list" && one.items[0]) synced.push(one.items[0]);
+    }
+    return { version: 1, seq: seq.seq, synced };
   } catch {
     return undefined;
   }

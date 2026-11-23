@@ -44,6 +44,13 @@ describe("favourites", () => {
     expect(favToKey({ provider: "t3-claude-work", model: "" }, names())).toBeUndefined();
   });
 
+  test("a favourite whose model or identity the gateway would refuse has no key", () => {
+    for (const model of ["opus[1m]", "a b", "x".repeat(129), "caf\u00e9"]) expect(favToKey({ provider: "t3-claude-work", model }, names())).toBeUndefined();
+    expect(favToKey({ provider: "t3-claude-bad name", model: "m" }, names())).toBeUndefined();
+    expect(favToKey({ provider: "t3-claude-work", model: "claude-opus-4-5:high/x@1+2.3_4" }, names())).toBeDefined();
+    expect(mappedKeys([{ provider: "t3-claude-work", model: "opus[1m]" }, { provider: "t3-claude-work", model: "ok" }], names())).toEqual([key("ok")]);
+  });
+
   test("mappedKeys keeps T3's order, skips unmapped ones and lists a key once", () => {
     const favs = [{ provider: "t3-claude-work", model: "a" }, { provider: "claudeAgent", model: "x" }, { provider: "t3-grok-work", model: "g" }, { provider: "t3-grok-work-acp", model: "g" }, { provider: "t3-codex-work", model: "a" }];
     expect(mappedKeys(favs, names())).toEqual([key("a"), key("g", "work", "grok"), key("a", "work", "codex")]);
