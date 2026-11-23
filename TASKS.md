@@ -403,6 +403,7 @@ ETA: 2026-11-25 18:00 ICT
 | 274 | Chat: real provider icons in the picker | done | claude | sidepanel-chat-icons | 18.273 | | Real marks from simple-icons, as in the web UI (#727).<br>Release job installs dependencies (#732).<br>Released in v0.5.101. |
 | 275 | Chat: favourites sync between T3 and the side panel | done | claude |  | 18.273 |  | Merged #735, released v0.5.102.<br>Host proof: both ways in under 4 s. |
 | 276 | Chat: favourites sync options for cluster pods | done | claude |  | 18.275 |  | Merged #737, released v0.5.103.<br>Cluster pods sync both ways in under 1 s. |
+| 277 | Chat: favourites sync pools with no pool-name config | in_progress | claude | favourites-pools | 18.276 | 2026-11-24 01:00 ICT | Pool favourites of every provider sync, in hosts and pods.<br>No pool names needed. |
 
 ## 19. CI speed and flaky tests
 
