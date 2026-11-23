@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
-import { browserHeaders, isOtherProviderName } from "../../src/browser/headers.ts";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { browserHeaders, isOtherProviderName, readTrimmed } from "../../src/browser/headers.ts";
 
 const TOKEN = "aisg_SYNTHETIC_FIXTURE_tok_abc";
 const id = (name: string, extra: object = {}) => ({ name, label: name, configDir: `/ids/${name}`, ...extra });
@@ -76,5 +79,74 @@ test("a Kimi or Z.ai folder is refused with trailing slash, dot or dot-dot segme
   for (const d of ["/t3/gateway/t3-claude-kimi-pool/.", "/t3/gateway/t3-claude-kimi-pool/", "/t3/gateway/t3-claude-zai-pool//", "/t3/gateway/x/../t3-claude-kimi-pool/."]) {
     const f: any = { version: 1, identities: [id("p", { configDir: d })] };
     expect(await browserHeaders({ ...base, loadFile: async () => f, env: { CLAUDE_CONFIG_DIR: d } })).toEqual({});
+  }
+});
+
+test("agent pod: no registry match, token from AIS_BROWSER_AGENT_TOKEN_FILE, no pool header", async () => {
+  const readTokenPath = async (p: string) => (p === "/run/ais-browser/token" ? TOKEN : undefined);
+  const env = { CLAUDE_CONFIG_DIR: "/home/user/.claude/identities/swap", AIS_BROWSER_AGENT_TOKEN_FILE: "/run/ais-browser/token" };
+  const h = await browserHeaders({ ...base, readTokenPath, env });
+  expect(h.Authorization).toBe(`Bearer ${TOKEN}`);
+  expect(h["X-AIS-Pool"]).toBeUndefined();
+  expect(h["X-AIS-Session-Id"]).toBeUndefined();
+  // A pod has no registry file at all: loading it fails, the token file still applies.
+  const noRegistry = await browserHeaders({ ...base, readTokenPath, loadFile: async () => { throw Object.assign(new Error("no such file"), { code: "ENOENT" }); }, env });
+  expect(noRegistry.Authorization).toBe(`Bearer ${TOKEN}`);
+  // Missing or empty token file: nothing.
+  expect(await browserHeaders({ ...base, readTokenPath: async () => undefined, env })).toEqual({});
+});
+
+test("pod token file never overrides the registry or the Kimi and Z.ai refusal", async () => {
+  const readTokenPath = async () => "aisg_SYNTHETIC_FIXTURE_other";
+  const file = "/run/ais-browser/token";
+  // A registered identity without a token stays without headers.
+  expect(await browserHeaders({ ...base, readToken: async () => undefined, readTokenPath, env: { CLAUDE_CONFIG_DIR: "/ids/alpha", AIS_BROWSER_AGENT_TOKEN_FILE: file } })).toEqual({});
+  // A registered identity with a token uses its own token.
+  const own = await browserHeaders({ ...base, readTokenPath, env: { CLAUDE_CONFIG_DIR: "/ids/alpha", AIS_BROWSER_AGENT_TOKEN_FILE: file } });
+  expect(own.Authorization).toBe(`Bearer ${TOKEN}`);
+  // Other-provider folders get nothing.
+  for (const d of ["/home/user/.claude/identities/kimi-main", "/home/user/.claude/identities/zai-main"]) {
+    expect(await browserHeaders({ ...base, readTokenPath, env: { CLAUDE_CONFIG_DIR: d, AIS_BROWSER_AGENT_TOKEN_FILE: file } })).toEqual({});
+  }
+});
+
+test("a registry error other than a missing file never falls back to the pod token file", async () => {
+  const readTokenPath = async () => TOKEN;
+  const env = { CLAUDE_CONFIG_DIR: "/home/user/.claude/identities/swap", AIS_BROWSER_AGENT_TOKEN_FILE: "/run/ais-browser/token" };
+  const errors = [
+    Object.assign(new Error("denied"), { code: "EACCES" }),
+    Object.assign(new Error("is a directory"), { code: "EISDIR" }),
+    new SyntaxError("Unexpected token in JSON"),
+    new Error("ENOENT in the message only"),
+  ];
+  for (const e of errors) {
+    expect(await browserHeaders({ ...base, readTokenPath, loadFile: async () => { throw e; }, env })).toEqual({});
+  }
+  // A registry that loads but holds no entry for the folder (the normal pod case) still falls back.
+  expect((await browserHeaders({ ...base, readTokenPath, loadFile: async () => ({ version: 1, identities: [] }) as any, env })).Authorization).toBe(`Bearer ${TOKEN}`);
+});
+
+test("token file reader: trims whitespace, refuses empty, missing and directory", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ais-token-file-"));
+  try {
+    const put = (name: string, text: string) => {
+      const path = join(dir, name);
+      writeFileSync(path, text);
+      return path;
+    };
+    expect(await readTrimmed(put("plain", TOKEN))).toBe(TOKEN);
+    expect(await readTrimmed(put("padded", `  \n\t${TOKEN}\r\n\n`))).toBe(TOKEN);
+    expect(await readTrimmed(put("empty", ""))).toBeUndefined();
+    expect(await readTrimmed(put("blank", " \n\t\r\n "))).toBeUndefined();
+    expect(await readTrimmed(join(dir, "missing"))).toBeUndefined();
+    mkdirSync(join(dir, "folder"));
+    expect(await readTrimmed(join(dir, "folder"))).toBeUndefined();
+    // End to end with the default reader: the padded file gives the header, the directory gives none.
+    const env = (f: string) => ({ CLAUDE_CONFIG_DIR: "/home/user/.claude/identities/swap", AIS_BROWSER_AGENT_TOKEN_FILE: f });
+    const noRegistry = { ...base, loadFile: async () => ({ version: 1, identities: [] }) as any };
+    expect((await browserHeaders({ ...noRegistry, env: env(join(dir, "padded")) })).Authorization).toBe(`Bearer ${TOKEN}`);
+    for (const f of ["empty", "blank", "missing", "folder"]) expect(await browserHeaders({ ...noRegistry, env: env(join(dir, f)) })).toEqual({});
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
