@@ -11,6 +11,7 @@ import { HOST_NAME, Updater } from "./updater.ts";
 import { handleMessage } from "./messages.ts";
 import { ChatHub, servePort } from "./chat.ts";
 import { hexForIdentity, OverlayUi } from "./ui.ts";
+import { REQUESTS_CHANGED } from "../shared/request.ts";
 import type { PanelStatus } from "../shared/panel.ts";
 
 const DISCONNECTED_KEY = "disconnected";
@@ -39,6 +40,8 @@ const updater = new Updater({
   isIdle: () => state.inflightCount === 0,
   storage: api.storage,
 });
+// The side panel and the popup page reload their cards when a request starts or ends.
+executor.requests.onChange(() => { void chrome.runtime.sendMessage({ type: REQUESTS_CHANGED }).catch(() => {}); });
 let disconnected = false;
 
 const connection = new Connection({
@@ -141,5 +144,6 @@ chrome.runtime.onMessage.addListener((msg: unknown, sender, reply) => handleMess
   grant: (groupId, sessionId) => tabs.grant(groupId, sessionId),
   revoke: async groupId => { tabs.revoke(groupId); },
   chatCommand: cmd => hub.command(cmd),
+  requests: executor.requests,
   updater,
 }));

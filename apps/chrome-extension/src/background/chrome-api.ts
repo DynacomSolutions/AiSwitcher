@@ -72,6 +72,19 @@ export interface ChromeApi {
     clear(id: string): Promise<void>;
     onButtonClicked(listener: (id: string, buttonIndex: number) => void): void;
     onClosed(listener: (id: string, byUser: boolean) => void): void;
+    /** The user clicked the body of a notification (not a button). */
+    onClicked(listener: (id: string) => void): void;
+  };
+  /** Ways to show an extension page to the owner. */
+  panel: {
+    /** The last focused normal browser window, when there is one. */
+    lastFocusedWindowId(): Promise<number | undefined>;
+    /** Opens the side panel in a window. Throws when Chrome refuses (no user gesture). */
+    openSidePanel(windowId: number): Promise<void>;
+    /** Opens an extension page in a small popup window and returns the id of its tab. `path` is relative to the extension root. */
+    openPopup(path: string, size: { width: number; height: number }): Promise<number | undefined>;
+    /** The text on the toolbar button. An empty text clears it. */
+    setBadge(text: string): Promise<void>;
   };
   debugger: {
     attach(tabId: number): Promise<void>;
@@ -99,7 +112,13 @@ function toTab(t: chrome.tabs.Tab): TabInfo {
   const split = (t as { splitViewId?: unknown }).splitViewId;
   const none = (chrome.tabs as unknown as SplitTabsApi).SPLIT_VIEW_ID_NONE ?? -1;
   const splitViewId = typeof split === "number" && split !== none ? split : -1;
-  return { id: t.id ?? -1, windowId: t.windowId, groupId: t.groupId ?? -1, url: t.url ?? t.pendingUrl ?? "", title: t.title ?? "", active: t.active, splitViewId, index: t.index, pinned: t.pinned };
+  return { id: t.id ?? -1, windowId: t.windowId, groupId: t.groupId ?? -1, url: t.url || t.pendingUrl || "", title: t.title ?? "", active: t.active, splitViewId, index: t.index, pinned: t.pinned };
+}
+
+/** Browser and extension pages. Agent tools never act on these, and the worker never lists them: an extension page can answer approvals. */
+export function isInternalUrl(url: string): boolean {
+  if (/^chrome:\/\/(newtab|new-tab-page)(\/|$|\?|#)/i.test(url)) return false; // the blank page of a tab the agent made
+  return /^(chrome-extension|chrome|devtools|edge|chrome-untrusted|chrome-search):/i.test(url);
 }
 
 export function realChromeApi(): ChromeApi {
@@ -181,6 +200,13 @@ export function realChromeApi(): ChromeApi {
       clear: async id => { await chrome.notifications.clear(id); },
       onButtonClicked: listener => chrome.notifications.onButtonClicked.addListener((id, index) => listener(id, index)),
       onClosed: listener => chrome.notifications.onClosed.addListener((id, byUser) => listener(id, byUser)),
+      onClicked: listener => chrome.notifications.onClicked.addListener(id => listener(id)),
+    },
+    panel: {
+      lastFocusedWindowId: async () => { try { return (await chrome.windows.getLastFocused({ windowTypes: ["normal"] })).id; } catch { return undefined; } },
+      openSidePanel: async windowId => { await chrome.sidePanel.open({ windowId }); },
+      openPopup: async (path, size) => (await chrome.windows.create({ url: chrome.runtime.getURL(path), type: "popup", ...size }))?.tabs?.[0]?.id,
+      setBadge: async text => { await chrome.action.setBadgeText({ text }); },
     },
     debugger: {
       attach: tabId => chrome.debugger.attach({ tabId }, "1.3"),

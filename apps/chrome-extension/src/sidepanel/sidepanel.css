@@ -160,3 +160,13 @@ input.rename-box { font: inherit; font-size: 13px; color: var(--ink); background
 .picker-item[aria-checked="true"]::after { content: "\2713"; margin-left: auto; }
 .picker-model { padding-left: 32px; }
 .picker-badge { font-size: 10px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--line); }
+.requests { padding: 0 16px 8px; display: flex; flex-direction: column; gap: 12px; }
+.requests[hidden] { display: none; }
+.card.request { border-top: 3px solid var(--warn); background: linear-gradient(var(--warn-bg), var(--card) 80px); }
+.card.request h2 { margin: 0 0 8px; font-size: 16px; letter-spacing: -.01em; }
+.card.request .consent { margin: 10px 0 0; font-weight: 550; }
+.card.request .consent.close { color: var(--bad); }
+.card.request .actions { align-items: center; }
+.card.request .actions button { flex: 1; }
+.countdown { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+body.popup .hint { padding: 0 16px; }
