@@ -195,10 +195,6 @@ describe("empty pool", () => {
   test("a provider with no identities is its own rejection", async () => {
     expect(await pickIdentity(pool, { usageFor: async () => undefined, poolMembers: async () => [] })).toEqual({ reject: "no-identities" });
   });
-  test("an allow-list that matches no member is its own rejection", async () => {
-    const limited: GatewayApp = { ...app, target: { kind: "pool", identities: ["ghost"] } };
-    expect(await pickIdentity(limited, { usageFor: async () => undefined, poolMembers: async () => ["a"] })).toEqual({ reject: "no-identities" });
-  });
   test("members that are all over the reserve stay no-headroom", async () => {
     const full = async (): Promise<PoolUsage> => ({ status: "live", maxUtilization: 99, capturedAt: "x" });
     expect(await pickIdentity(pool, { usageFor: full as never, poolMembers: async () => ["a"] })).toEqual({ reject: "no-headroom" });
@@ -217,11 +213,10 @@ describe("pool selection details", () => {
     expect(await pickIdentity(pool, { usageFor: usageFor as never, poolMembers: async () => ["a", "b"] })).toEqual({ identity: "b" });
   });
 
-  test("an alias in the identities list matches the canonical member", async () => {
-    const listed: GatewayApp = { ...app, target: { kind: "pool", identities: ["work-alias"] } };
-    const canonical = async (_p: string, i: string): Promise<string> => (i === "work-alias" ? "work" : i);
-    const r = await pickIdentity(listed, { usageFor: async () => undefined, poolMembers: async () => ["other", "work"], canonical });
-    expect(r).toEqual({ identity: "work" });
+  test("a member list saved by an older build is ignored: a new member with headroom is picked", async () => {
+    const stale = { ...app, target: { kind: "pool", identities: ["full"] } } as unknown as GatewayApp;
+    const usageFor = async (_p: string, i: string): Promise<PoolUsage> => ({ status: "live", maxUtilization: i === "full" ? 100 : 2, capturedAt: "x" });
+    expect(await pickIdentity(stale, { usageFor: usageFor as never, poolMembers: async () => ["full", "joined"] })).toEqual({ identity: "joined" });
   });
 });
 

@@ -37,7 +37,7 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(await s.getApp("a")).toBeUndefined();
     const full: GatewayApp = {
       ...base,
-      target: { kind: "pool", identities: ["x", "y"] },
+      target: { kind: "pool" },
       models: ["m1"],
       dailyTokens: 1000,
       reservePercent: 10,
@@ -50,6 +50,13 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(await s.listApps()).toHaveLength(1);
     await s.revokeApp("a");
     expect((await s.getApp("a"))?.state).toBe("revoked");
+  });
+
+  test("a pool app never keeps a member list, even one written by an older build", async () => {
+    const s = await makeStore();
+    await s.putApp({ ...base, target: { kind: "pool", identities: ["x", "y"] } } as unknown as GatewayApp);
+    expect((await s.getApp("a"))?.target).toEqual({ kind: "pool" });
+    expect((await s.listApps())[0]?.target).toEqual({ kind: "pool" });
   });
 
   test("tokens add and list per app", async () => {

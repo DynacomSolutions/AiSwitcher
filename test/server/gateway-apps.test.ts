@@ -62,7 +62,7 @@ describe("loadGatewayApps", () => {
     expect(view.defaultReservePercent).toBe(100);
     expect(view.apps.map((a) => a.name)).toEqual(["billing", "reports", "gone"]);
     const [billing, reports] = view.apps;
-    expect(billing).toMatchObject({ effectiveReservePercent: 100, dailyTokens: 5000, usage1d: 10, usage7d: 70, target: { kind: "pool", identities: ["m1", "m2"] } });
+    expect(billing).toMatchObject({ effectiveReservePercent: 100, dailyTokens: 5000, usage1d: 10, usage7d: 70, target: { kind: "pool" } });
     expect(billing!.reservePercent).toBeUndefined();
     expect(billing!.tokens.map((t) => t.prefix)).toEqual(["gw_new1", "gw_old0"]);
     expect(reports).toMatchObject({ reservePercent: 40, effectiveReservePercent: 40, models: ["gpt-x"], usage1d: 0, usage7d: 7 });

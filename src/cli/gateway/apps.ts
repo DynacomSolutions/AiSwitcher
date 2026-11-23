@@ -39,14 +39,13 @@ async function localIsPoolName(provider: string, name: string): Promise<boolean>
 async function rejectPoolPin(deps: GatewayCliDeps, provider: string, target: AppTarget | undefined, flagged: boolean): Promise<void> {
   if (!flagged || target?.kind !== "pin" || target.identity === undefined) return;
   if (await (deps.isPoolName ?? localIsPoolName)(provider, target.identity)) {
-    throw new CliUsageError(`"${target.identity}" is a swap pool, not one account: --identity would pin to the pool's active login only. Use --pool --identities=<members> instead`);
+    throw new CliUsageError(`"${target.identity}" is a swap pool, not one account: --identity would pin to the pool's active login only. Use --pool instead: the gateway then uses every current member of the pool`);
   }
 }
 
 interface AppTarget {
   kind: "pin" | "pool";
   identity?: string;
-  identities?: string[];
 }
 
 interface AppBody {
@@ -108,17 +107,13 @@ function intFlag(flags: Flags, name: string): number | undefined {
 function targetFromFlags(flags: Flags, required: boolean): AppTarget | undefined {
   const pool = flags.pool !== undefined;
   const identity = stringFlag(flags, "identity");
+  if (flags.identities !== undefined) throw new CliUsageError("--identities is not supported: a pool app always uses every current member of the provider's pool");
   if (pool && identity !== undefined) throw new CliUsageError("Use either --pool or --identity=<id>, not both");
   if (identity !== undefined) {
-    if (flags.identities !== undefined) throw new CliUsageError("--identities only applies with --pool");
     return { kind: "pin", identity };
   }
-  if (pool) {
-    const identities = listFlag(flags, "identities");
-    return identities && identities.length > 0 ? { kind: "pool", identities } : { kind: "pool" };
-  }
-  if (flags.identities !== undefined) throw new CliUsageError("--identities only applies with --pool");
-  if (required) throw new CliUsageError("Choose a target: --pool [--identities=a,b] or --identity=<id>");
+  if (pool) return { kind: "pool" };
+  if (required) throw new CliUsageError("Choose a target: --pool or --identity=<id>");
   return undefined;
 }
 
@@ -333,7 +328,7 @@ function targetText(t: unknown): string {
   const target = t as AppTarget | undefined;
   if (!target) return "";
   if (target.kind === "pin") return `pin:${target.identity}`;
-  return target.identities ? `pool:${target.identities.join(",")}` : "pool";
+  return "pool";
 }
 
 export function table(head: string[], rows: string[][]): string {

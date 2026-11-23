@@ -778,6 +778,24 @@ describe("failover and refresh", () => {
     expect(who()).toEqual(["Bearer tok-a"]);
   });
 
+  test("a newer live reading after a quota hold lets the recovered member serve immediately", async () => {
+    const { clock, call, who } = await burstSetup("pair");
+    const resetAt = Math.floor(clock.ms / 1000) + 3600;
+    let recovered = false;
+    handler = (_req, request) => recovered && request.headers.get("authorization") === "Bearer tok-b"
+      ? new Response(anthropicJson, { headers: { "content-type": "application/json" } })
+      : new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(resetAt) } });
+    deps.refreshUsage = async (_provider, name) => { usage[name] = { ...live(100), stale: true }; };
+    expect((await call()).status).toBe(429);
+    await settle();
+    seen.length = 0;
+    recovered = true;
+    clock.ms += 1000;
+    usage.b = { ...live(0), capturedAt: new Date(clock.ms).toISOString() };
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]);
+  });
+
   test("a probe that is refused again keeps the hold and waits another interval", async () => {
     const { clock, who } = await burstSetup("pair");
     deps.refreshUsage = async (_p, id) => {
@@ -1166,26 +1184,6 @@ describe("failover and refresh", () => {
     const retry = Number(res.headers.get("retry-after"));
     expect(retry).toBeGreaterThan(0);
     expect(retry).toBeLessThanOrEqual(15);
-    expect(await res.text()).not.toContain("logged out");
-  });
-
-  test("a hold on a member outside the app's pool does not change its quota rejection", async () => {
-    const week = Math.floor(NOW.getTime() / 1000) + 3 * 86400;
-    usage.a = { ...live(100), windows: [{ label: "seven_day", utilization: 100, resetsAt: new Date(week * 1000).toISOString() }] };
-    usage.b = live(10);
-    usage.c = live(10);
-    deps.poolMembers = async () => ["a", "b", "c"];
-    const get = deps.creds.get.bind(deps.creds);
-    deps.creds = { ...deps.creds, get: async (p: GatewayApp["provider"], id: string) => { if (id === "c") throw new GatewayCredentialError("login-dead", p, id); return get(p, id); } } as GatewayDeps["creds"];
-    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-b" ? new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(week) } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
-    const tx = await addApp(baseApp({ name: "x", target: { kind: "pool", identities: ["a", "b"] } }));
-    const ty = await addApp(baseApp({ name: "y", target: { kind: "pool", identities: ["c"] } }));
-    const gw = createGatewayApp(deps);
-    const go = (path: string, token: string) => gw.request(`http://gw.test${path}`, { method: "POST", body: "{}", headers: { authorization: `Bearer ${token}` } });
-    expect((await go("/x/v1/messages", tx)).status).toBe(429);
-    expect((await go("/y/v1/messages", ty)).status).toBe(502);
-    const res = await go("/x/v1/messages", tx);
-    expect(res.status).toBe(429);
     expect(await res.text()).not.toContain("logged out");
   });
 

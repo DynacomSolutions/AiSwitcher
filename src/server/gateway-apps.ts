@@ -130,7 +130,7 @@ export function mapGatewayApp(raw: unknown, usage1d: Map<string, number> | undef
   const t = r.target as Record<string, unknown> | null | undefined;
   const target: GatewayAppDto["target"] | undefined =
     t?.kind === "pin" && typeof t.identity === "string" ? { kind: "pin", identity: t.identity }
-    : t?.kind === "pool" ? (Array.isArray(t.identities) ? { kind: "pool", identities: t.identities.filter((x): x is string => typeof x === "string") } : { kind: "pool" })
+    : t?.kind === "pool" ? { kind: "pool" }
     : undefined;
   if (!target) return undefined;
   const tokens: GatewayAppTokenDto[] = (Array.isArray(r.tokens) ? r.tokens : []).flatMap((x: unknown) => {

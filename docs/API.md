@@ -548,7 +548,7 @@ days, tokens }], error? }`; `configured: false` means no admin URL and token.
 
 `GET /api/gateway/apps` answers `{ configured, defaultReservePercent, apps[],
 error?, usageError? }`. Each app: `name, owner, namespace, provider, style,
-target ({ kind: "pin", identity } or { kind: "pool", identities? }), models?,
+target ({ kind: "pin", identity } or { kind: "pool" }; a pool app has no member list), models?,
 dailyTokens?, reservePercent?, effectiveReservePercent, state, createdAt?,
 lastUsedAt?, tokens[] ({ prefix, createdAt, expiresAt? }, newest first),
 usage1d, usage7d` (usage is null when the usage read failed). Full tokens are

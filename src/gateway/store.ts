@@ -2,6 +2,11 @@ import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browse
 import type { GatewayApp, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, SessionIdentityUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 
+/** A pool app target as stored by an older build may carry a member list: drop it (pool apps follow the live pool). */
+export function appTarget(t: GatewayApp["target"]): GatewayApp["target"] {
+  return t.kind === "pool" ? { kind: "pool" } : t;
+}
+
 /** The message for any attempt to reuse or extend a revoked app. */
 export function revokedMessage(name: string): string {
   return `app "${name}" is revoked; a revoked app stays revoked and its tokens never work again. Register a new name.`;
@@ -135,7 +140,7 @@ export class MemoryGatewayStore implements GatewayStore {
 
   async putApp(app: GatewayApp): Promise<void> {
     if (this.apps.get(app.name)?.state === "revoked") throw new AppRevokedError(app.name);
-    this.apps.set(app.name, { ...app });
+    this.apps.set(app.name, { ...app, target: appTarget(app.target) });
     this.changed(app.name);
   }
 

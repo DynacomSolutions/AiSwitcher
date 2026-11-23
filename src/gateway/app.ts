@@ -823,15 +823,31 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
    * has passed. Claims the probe at once (no await between the check and the claim), so one request per member and
    * interval probes on this replica.
    */
-  const claimProbe = (held: ReadonlySet<string>): string | undefined => {
-    const now = deps.now().getTime();
-    for (const name of held) {
+  let probed = false;
+  const claimProbe = async (tried: ReadonlySet<string>): Promise<{ identity: string } | undefined> => {
+    if (probed || app.target.kind !== "pool") return;
+    const held = await exhaustedNames();
+    const excluded = new Set(tried);
+    while (true) {
+      const candidate = await pickIdentity(app, deps, excluded, model);
+      if (!("identity" in candidate)) return;
+      const name = candidate.identity;
+      excluded.add(name);
+      if (!held.has(name)) return candidate;
+      const reading = await deps.usageFor(app.provider, name).catch(() => undefined);
+      const now = deps.now().getTime();
+      const captured = reading?.status === "live" && !reading.stale && !reading.noPlan && (utilisationOf(usageForModel(reading, model)) ?? 100) < (app.reservePercent ?? DEFAULT_RESERVE_PERCENT) ? Date.parse(reading.capturedAt) : NaN;
       const keys = holdKeysFor(name);
-      if (keys.length === 0 || keys.some((k) => holds.has(k) || (probes.get(k) ?? 0) > now)) continue;
-      for (const k of keys) probes.set(k, now + QUOTA_PROBE_INTERVAL_MS);
-      return name;
+      if (keys.length === 0) return candidate;
+      if (keys.some((key) => {
+        const due = probes.get(key);
+        return holds.has(key) || due === undefined || (due > now && !(captured > due - QUOTA_PROBE_INTERVAL_MS && captured <= now));
+      })) continue;
+      for (const key of keys) probes.set(key, now + QUOTA_PROBE_INTERVAL_MS);
+      probed = true;
+      log(JSON.stringify({ event: "quota_probe", app: app.name, provider: app.provider, identity: name, ...(model !== undefined ? { model } : {}) }));
+      return candidate;
     }
-    return undefined;
   };
   /** A member answered the request without a quota error: its account-wide hold and its hold for this model are over. */
   const releaseHolds = (name: string): void => {
@@ -917,15 +933,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     // usage endpoint itself answers 429 for full accounts, so a reset spent out of band (or an early provider reset) would
     // otherwise wait out the whole week. At most once per interval and member, this request goes to the held member:
     // the provider's own answer is the ground truth (a 200 ends the hold; a refusal renews it and passes through).
-    const held = await exhaustedNames();
-    const probe = claimProbe(held);
-    if (probe !== undefined) {
-      const p = await pickIdentity(app, deps, new Set([...held].filter((n) => n !== probe)), model);
-      if ("identity" in p) {
-        log(JSON.stringify({ event: "quota_probe", app: app.name, provider: app.provider, identity: p.identity, ...(model !== undefined ? { model } : {}) }));
-        picked = p;
-      }
-    }
+    picked = (await claimProbe(new Set())) ?? picked;
   }
   const pick = picked;
   if ("reject" in pick) {
@@ -1082,7 +1090,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       let name = pick.identity;
       while (quota || !cur) {
         tried.add(name);
-        const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried]), model);
+        let next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried]), model);
+        if ("reject" in next && next.reject === "no-headroom") next = (await claimProbe(tried)) ?? next;
         if (!("identity" in next)) {
           // Everyone left is only briefly held: wait for the first to free, then try the pool again from the top.
           if (quota && cur && (await waitForShortHold())) {

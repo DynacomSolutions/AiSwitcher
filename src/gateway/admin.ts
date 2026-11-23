@@ -111,8 +111,9 @@ function parseAppBody(raw: unknown): Pick<GatewayApp, "owner" | "namespace" | "p
     if (typeof target.identity !== "string" || !target.identity) return "target.identity is required for a pin";
     t = { kind: "pin", identity: target.identity };
   } else if (target.kind === "pool") {
-    if (target.identities !== undefined && !isStrings(target.identities)) return "target.identities must be a list of names";
-    t = target.identities === undefined ? { kind: "pool" } : { kind: "pool", identities: target.identities };
+    // A pool app follows the live pool: it never stores a member list (a saved list goes stale when a member joins).
+    if (target.identities !== undefined) return "target.identities is not supported: a pool app always uses every current member of the provider's pool";
+    t = { kind: "pool" };
   } else {
     return "target.kind must be pin or pool";
   }
@@ -322,10 +323,10 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const existing = await read.getApp(name);
     if (existing?.state === "revoked") return err(409, revokedMessage(name));
     try {
-    for (const identity of parsed.target.kind === "pin" ? [parsed.target.identity] : (parsed.target.identities ?? [])) {
+    for (const identity of parsed.target.kind === "pin" ? [parsed.target.identity] : []) {
       const state = (await deps.identityState?.(parsed.provider, identity)) ?? "ok";
       if (state === "pool") {
-        return err(400, `"${identity}" is a swap pool, not one account: a pin would only ever use the pool's active login. Use target kind "pool" with identities set to the member accounts (CLI: --pool --identities=<members>)`);
+        return err(400, `"${identity}" is a swap pool, not one account: a pin would only ever use the pool's active login. Use target kind "pool" (CLI: --pool): the gateway then uses every current member of the pool`);
       }
       if (state !== "ok") return err(400, `identity "${identity}" is ${state === "retired" ? "retired" : "not a known"} ${parsed.provider} identity`);
     }

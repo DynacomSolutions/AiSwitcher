@@ -157,7 +157,7 @@ describe("admin api", () => {
     expect((await put("c4", { reservePercent: 100 })).status).toBe(201);
   });
 
-  test("a pinned or listed identity must exist and not be retired", async () => {
+  test("a pinned identity must exist and not be retired", async () => {
     const checked = createAdminApp({
       store,
       adminToken: ADMIN,
@@ -168,7 +168,9 @@ describe("admin api", () => {
       checked.request("http://admin.test/apps/ident", { method: "PUT", headers: { authorization: `Bearer ${ADMIN}` }, body: JSON.stringify({ ...body, ...b }) });
     expect((await req({ target: { kind: "pin", identity: "gone" } })).status).toBe(400);
     expect((await req({ target: { kind: "pin", identity: "old" } })).status).toBe(400);
-    expect((await req({ target: { kind: "pool", identities: ["id1", "gone"] } })).status).toBe(400);
+    const listed = await req({ target: { kind: "pool", identities: ["id1"] } });
+    expect(listed.status).toBe(400);
+    expect(((await listed.json()) as { error: string }).error).toContain("every current member");
     expect((await req({ target: { kind: "pin", identity: "id1" } })).status).toBe(201);
     expect((await req({ target: { kind: "pool" } })).status).toBe(200);
   });
@@ -184,7 +186,7 @@ describe("admin api", () => {
       checked.request("http://admin.test/apps/poolpin", { method: "PUT", headers: { authorization: `Bearer ${ADMIN}` }, body: JSON.stringify({ ...body, ...b }) });
     const bad = await req({ target: { kind: "pin", identity: "shared-pool" } });
     expect(bad.status).toBe(400);
-    expect(((await bad.json()) as { error: string }).error).toContain("identities");
+    expect(((await bad.json()) as { error: string }).error).toContain('target kind "pool"');
     expect((await req({ target: { kind: "pin", identity: "real-account" } })).status).toBe(201);
     expect((await req({ target: { kind: "pin", identity: "alias-of-real" } })).status).toBe(200);
   });

@@ -58,13 +58,8 @@ export function reserveUtilisationOf(usage: PoolUsage | undefined): number | und
 /** The members an app may use: the pin, or the pool members narrowed by the app's identity list. */
 export async function allowedMembers(app: GatewayApp, deps: Pick<GatewayDeps, "poolMembers" | "canonical">): Promise<string[]> {
   if (app.target.kind === "pin") return [app.target.identity];
-  let names = await deps.poolMembers(app.provider);
-  if (app.target.identities && app.target.identities.length > 0) {
-    const canon = deps.canonical;
-    const allowed = new Set(await Promise.all(app.target.identities.map((n) => (canon ? canon(app.provider, n).catch(() => n) : n))));
-    names = names.filter((n) => allowed.has(n));
-  }
-  return names;
+  // The live pool, always: a pool app never narrows it with a saved list.
+  return deps.poolMembers(app.provider);
 }
 
 /** The usage readings of the members an app may use, for the native limit answer (reset times), as they apply to `model`; `unfiltered` keeps every per-model window. */

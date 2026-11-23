@@ -61,7 +61,12 @@ describe("pool name as pinned identity", () => {
   const PIN = "gateway app add billing --namespace=shop --provider=claude";
 
   test("add rejects a pool name before any write", async () => {
-    await expect(run(`${PIN} --identity=shared-pool`, { isPoolName })).rejects.toThrow(/--pool --identities=<members>/);
+    await expect(run(`${PIN} --identity=shared-pool`, { isPoolName })).rejects.toThrow(/Use --pool instead/);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  test("add refuses --identities before any write: a pool app uses every current member", async () => {
+    await expect(run(`${ADD} --identities=a,b`, { isPoolName })).rejects.toThrow(/every current member/);
     expect(calls.some((c) => c.method === "PUT")).toBe(false);
   });
 

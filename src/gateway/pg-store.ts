@@ -2,7 +2,7 @@ import { SQL, type TransactionSQL } from "bun";
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import { bumpSideCountOn, type SqlTag } from "./side-count.ts";
 import { errorTag } from "./ledger-buffer.ts";
-import { AppRevokedError, type GatewayStore, type SessionUsageFilter } from "./store.ts";
+import { AppRevokedError, appTarget, type GatewayStore, type SessionUsageFilter } from "./store.ts";
 import type { GatewayApp, GatewayProvider, IdentityUsageRow, ModelDailyUsageRow, ModelUsageRow, SessionIdentityUsageRow, TokenRecord, UsageHistoryFilter, UsageHistoryRow, UsageHistoryStored, UsageRow } from "./types.ts";
 import { priceNullCostGroup } from "./usage.ts";
 import { planRollupRange, rollupAggregateSql, rollupSource } from "./usage-rollup.ts";
@@ -21,6 +21,7 @@ import chat0012 from "./migrations/0012_chat.sql" with { type: "text" };
 import favourites0013 from "./migrations/0013_favourites.sql" with { type: "text" };
 import type { PgListener } from "./pg-listen.ts";
 import { pgPoolOptions } from "./pg-pool.ts";
+
 
 const USAGE_ROLLUP_VERSION = "0009_usage_rollup";
 
@@ -152,7 +153,7 @@ function toApp(r: Row): GatewayApp {
     namespace: r.namespace,
     provider: r.provider,
     style: r.style,
-    target: json(r.target) as GatewayApp["target"],
+    target: appTarget(json(r.target) as GatewayApp["target"]),
     state: r.state,
     createdAt: iso(r.created_at),
   };

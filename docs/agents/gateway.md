@@ -76,9 +76,14 @@ tokens cannot be shown: the gateway keeps only prefixes and hashes.
 
 - `--identity=<id>` pins the app to one AIS identity. Use it when the app needs one
   specific account.
-- `--pool` lets the gateway pick among the provider's identities by headroom;
-  `--identities=a,b` limits the pool to those. Prefer the pool unless there is a
-  reason to pin.
+- `--pool` lets the gateway pick among the provider's identities by headroom.
+  A pool app always uses every current member of the provider's pool. It never
+  stores a member list: a saved list goes stale when a member joins, and the new
+  member is then never used (23 Nov 2026: the Claude apps kept an eight-member
+  list without the new member, so every request answered 429 while that member
+  was at 2%). The admin API refuses `target.identities`, the CLI refuses
+  `--identities`, and the stores drop a list that an older build saved. Prefer
+  the pool unless there is a reason to pin.
 - The two are mutually exclusive, and one of them is required.
 - `--style=anthropic|openai` is required for `kimi` and `zai`, which offer both API
   styles. Other providers have one style and it is filled in for you.
