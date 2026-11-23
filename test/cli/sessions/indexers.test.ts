@@ -22,7 +22,7 @@ import { truncateLabel } from "../../../src/cli/resume/label.ts";
  */
 
 const enc = new TextEncoder();
-const WT = "/srv/repos/.worktrees/org-a/task-1/repo-x";
+const WT = "/srv/repositories/.worktrees/org-a/task-1/repo-x";
 const SID = "11111111-2222-4333-8444-555555555555";
 const AGENT_ID = "a1b2c3d4e5f60718";
 
@@ -327,11 +327,11 @@ describe("state and offsets", () => {
 
 describe("paths and projects", () => {
   test("projectFromCwd", () => {
-    expect(projectFromCwd("/srv/repos/.worktrees/org-a/task-1/repo-x/src/deep")).toBe("org-a/repo-x");
-    expect(projectFromCwd("/srv/repos/.worktrees/org-a/.base/repo-x")).toBe("org-a/repo-x");
-    expect(projectFromCwd("/srv/repos/org-a/repo-x")).toBe("org-a/repo-x");
-    expect(projectFromCwd("/srv/repos/.data/org-a/repo-x")).toBeNull();
-    expect(projectFromCwd("/srv/repos/.worktrees/org-a/task-1")).toBeNull();
+    expect(projectFromCwd("/srv/repositories/.worktrees/org-a/task-1/repo-x/src/deep")).toBe("org-a/repo-x");
+    expect(projectFromCwd("/srv/repositories/.worktrees/org-a/.base/repo-x")).toBe("org-a/repo-x");
+    expect(projectFromCwd("/srv/repositories/org-a/repo-x")).toBe("org-a/repo-x");
+    expect(projectFromCwd("/srv/repositories/.data/org-a/repo-x")).toBeNull();
+    expect(projectFromCwd("/srv/repositories/.worktrees/org-a/task-1")).toBeNull();
     expect(projectFromCwd("/tmp/scratch")).toBeNull();
     expect(projectFromCwd(undefined)).toBeNull();
   });
