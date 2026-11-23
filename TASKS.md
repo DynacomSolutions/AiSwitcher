@@ -414,6 +414,7 @@ ETA: 2026-11-25 18:00 ICT
 | 281 | Fit every job timeout to its p99 | done | claude | ci-speed | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/714.<br>Every job has a limit. apt calls can no longer hang. |
 | 282 | Fix the flaky CI tests | done | claude | ci-flaky | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/715.<br>affected.test.ts null diff in shallow checkouts.<br>Two 5 s timeouts on node spawn and backup lock. |
 | 283 | Measure before and after p50 and p90 | done | claude | ci-speed | 19.280, 19.281 | | Before p50/p90: Linux 16.2/19.1, macOS 12.6/14.7, Windows build 8.0/9.5 min.<br>After, 2 warm runs: Linux 8.9/8.9, macOS 5.9/6.1, Windows build 4.5/4.6 min. |
+| 315 | Full test suite only per release | done | claude | ci-full-suite-release | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/749.<br>Pushes run only the tests their changes select.<br>test-shard moved to release.yml, with Postgres. |
 
 ## 20. Sessions in the AIS database
 ETA: 2026-12-12 18:00 ICT
