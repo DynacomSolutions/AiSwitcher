@@ -487,6 +487,33 @@ describe("favourites", () => {
     expect(e.hub.state(1).favourites).toEqual([fav("m2")]);
   });
 
+  test("a star refused for the cap is not kept and the state names why; a stale refusal needs no message", async () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    const full = Array.from({ length: 200 }, (_, i) => fav(`g${i}`));
+    e.hub.handleFrame(list(full));
+    await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("extra") });
+    expect(e.hub.state(1).favourites).toHaveLength(200);
+    expect(e.hub.state(1).favourites?.some(f => f.model === "extra")).toBe(true);
+    // The gateway answers with its list (200 stars) and refuses the add for the cap.
+    e.hub.handleFrame({ ...list(full, 2), refused: [{ ...fav("extra"), reason: "cap" as const }] });
+    const s = e.hub.state(1);
+    expect(s.favourites?.some(f => f.model === "extra")).toBe(false);
+    expect(s.favourites).toHaveLength(200);
+    expect(s.favouritesNotice).toBe("You have 200 favourites. Remove one to add another.");
+    // The notice stays through a push that changes nothing, and the lost star is not sent again by a later list.
+    e.hub.handleFrame(list(full, 3));
+    expect(e.hub.state(1).favouritesNotice).toBeDefined();
+    expect(e.sets()).toHaveLength(1);
+    // The next click clears it. A stale refusal sets no notice, and the star is not shown.
+    await e.hub.command({ type: "ais-chat-favourite", op: "remove", ...fav("g0") });
+    expect(e.hub.state(1).favouritesNotice).toBeUndefined();
+    await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("late") });
+    e.hub.handleFrame({ ...list(full.slice(1), 4), refused: [{ ...fav("late"), reason: "stale" as const }] });
+    expect(e.hub.state(1).favouritesNotice).toBeUndefined();
+    expect(e.hub.state(1).favourites?.some(f => f.model === "late")).toBe(false);
+  });
+
   test("a star in the panel shows at once, is cached and is sent with its time", async () => {
     const e = withLocal();
     e.hub.onWelcome();

@@ -14,6 +14,8 @@ export interface PickerModel {
   locked?: boolean;
   /** The starred models. They live in local storage, so they are not part of the catalogue. */
   favourites?: Fav[];
+  /** An error line for the favourites: the gateway refused a star because the list is full. */
+  favouritesNotice?: string;
 }
 export interface LiveConfig { models: Array<{ id: string; name: string }>; efforts: string[]; current: { model?: string; effort?: string } }
 export const NO_MODEL = "Choose a model";

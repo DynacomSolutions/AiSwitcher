@@ -1,14 +1,17 @@
 // Types shared by the service worker and the side panel for chats.
 import type { ChatBody, ChatCatalogProvider, ChatProvider, ChatSelection, ChatSummary, FavKey } from "../../../../src/browser/chat-protocol.ts";
-import { CHAT_PROVIDERS, MAX_CHATS_PER_WINDOW } from "../../../../src/browser/chat-protocol.ts";
+import { CHAT_PROVIDERS, MAX_CHATS_PER_WINDOW, MAX_FAVOURITES } from "../../../../src/browser/chat-protocol.ts";
 
 /** Shown by the hub and by the panel when a window has the most chats. */
 export const CAP_MESSAGE = `You can have ${MAX_CHATS_PER_WINDOW} chats in one window. Close a chat to start another.`;
 
+/** Shown in the picker popover when the gateway refused a star because the list is full. The star is not kept. */
+export const FAVOURITES_FULL = `You have ${MAX_FAVOURITES} favourites. Remove one to add another.`;
+
 export interface ChatItem { seq: number; ts: number; body: ChatBody }
 export interface ChatView { summary: ChatSummary; items: ChatItem[]; pending?: { permission?: string } }
 /** `favourites` are the starred models: the gateway list, with the changes the user made that the gateway has not confirmed yet. */
-export interface ChatPanelState { windowId: number; connected: boolean; chats: ChatView[]; catalog?: ChatCatalogProvider[]; favourites?: FavKey[]; cap: number; error?: string }
+export interface ChatPanelState { windowId: number; connected: boolean; chats: ChatView[]; catalog?: ChatCatalogProvider[]; favourites?: FavKey[]; favouritesNotice?: string; cap: number; error?: string }
 
 export type ChatPanelCommand =
   | { type: "ais-chat-create"; windowId: number; selection: ChatSelection; text?: string; tabIds: number[] }

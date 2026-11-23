@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { MAX_CHAT_NAME, MAX_CHAT_TABS, MAX_CHAT_TEXT } from "../../../src/browser/chat-protocol.ts";
 import type { TabInfo } from "../src/background/chrome-api.ts";
-import { CAP_MESSAGE } from "../src/shared/chat.ts";
+import { CAP_MESSAGE, FAVOURITES_FULL } from "../src/shared/chat.ts";
 import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../src/shared/chat.ts";
 import { AGENT_TAB, LINK_PROMPT, ChatTab, checkSelection, parseSelection, NEW_PLACEHOLDER, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
 import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
@@ -659,6 +659,16 @@ describe("composer with the picker inside", () => {
       { type: "ais-chat-favourite", op: "add", provider: "claude", identity: "work", model: "m2" },
       { type: "ais-chat-favourite", op: "remove", ...one },
     ]);
+  });
+  test("the favourites notice shows as an error line in the popover and goes when the state drops it", async () => {
+    const s = make();
+    s.push(stateOf([], { catalog: cat, favourites: [one], favouritesNotice: FAVOURITES_FULL }));
+    const picker = byClass(s.root, "picker")[0]!;
+    walk(picker).find(n => n.className === "picker-button")!.click();
+    const lines = () => walk(picker).filter(n => n.className === "hint bad").map(n => n.textContent);
+    expect(lines()).toEqual(["You have 200 favourites. Remove one to add another."]);
+    s.push(stateOf([], { catalog: cat, favourites: [one] }));
+    expect(lines()).toEqual([]);
   });
   test("a change of the gateway list shows as a star at once, with no click", async () => {
     const s = make();

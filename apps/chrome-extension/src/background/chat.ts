@@ -1,9 +1,9 @@
 // Background chat hub: keeps every chat's feed, talks to the gateway and serves the side panel.
 // All gateway frames reach the hub already checked by the protocol parsers.
-import type { ChatCatalogProvider, ChatFromExt, ChatProvider, ChatSummary, ChatToExt, FavChange, FavKey } from "../../../../src/browser/chat-protocol.ts";
+import type { ChatCatalogProvider, ChatFromExt, ChatProvider, ChatSummary, ChatToExt, FavChange, FavKey, FavRefusal } from "../../../../src/browser/chat-protocol.ts";
 import { favId, MAX_CHAT_TABS, MAX_CHATS_PER_WINDOW, MAX_FAVOURITES, parseChatFromExt, sessionIdForChat } from "../../../../src/browser/chat-protocol.ts";
 import { nextChatColour } from "../shared/chat-palette.ts";
-import { CAP_MESSAGE } from "../shared/chat.ts";
+import { CAP_MESSAGE, FAVOURITES_FULL } from "../shared/chat.ts";
 import type { ChatCommandResult, ChatItem, ChatPanelCommand, ChatPanelState, ChatView } from "../shared/chat.ts";
 import { parsePanelCommand, parsePortSubscribe } from "../shared/chat.ts";
 import type { ChromeApi } from "./chrome-api.ts";
@@ -61,6 +61,8 @@ export class ChatHub {
   private favsClicks = new Map<string, Click>();
   /** True from a welcome until the first list of the gateway has been merged with the local one. */
   private favsMerge = false;
+  /** A line for the picker popover while the last add was refused because the list is full. */
+  private favsNotice: string | undefined;
   private connected = false;
   /** Panel error text per window. A reject that names no chat goes in `globalError` and shows in every window. */
   private readonly errors = new Map<number, string>();
@@ -109,7 +111,7 @@ export class ChatHub {
 
   state(windowId: number): ChatPanelState {
     const chats = [...this.chats.values()].filter(e => e.view.summary.windowId === windowId).map(e => e.view);
-    return { windowId, connected: this.connected, chats, ...(this.catalog ? { catalog: this.catalog } : {}), favourites: this.favs, cap: MAX_CHATS_PER_WINDOW, ...(this.errors.get(windowId) ?? this.globalError ? { error: (this.errors.get(windowId) ?? this.globalError) as string } : {}) };
+    return { windowId, connected: this.connected, chats, ...(this.catalog ? { catalog: this.catalog } : {}), favourites: this.favs, ...(this.favsNotice !== undefined ? { favouritesNotice: this.favsNotice } : {}), cap: MAX_CHATS_PER_WINDOW, ...(this.errors.get(windowId) ?? this.globalError ? { error: (this.errors.get(windowId) ?? this.globalError) as string } : {}) };
   }
 
   subscribe(l: (windowId: number) => void): () => void {
@@ -205,7 +207,7 @@ export class ChatHub {
         this.changed(ALL_WINDOWS, false);
         return;
       }
-      case "chat.fav.list": return this.onFavourites(f.items, f.epoch);
+      case "chat.fav.list": return this.onFavourites(f.items, f.epoch, f.refused);
       case "chat.reject": return this.onReject(f);
     }
   }
@@ -217,7 +219,7 @@ export class ChatHub {
    * A list with another epoch than the last one comes from a store that lost its data. It is merged like a first run with no known list:
    * every local star goes up, and nothing is dropped or removed because the new list lacks it.
    */
-  private onFavourites(items: FavKey[], epoch?: string): void {
+  private onFavourites(items: FavKey[], epoch?: string, refused: FavRefusal[] = []): void {
     const gateway = new Set(items.map(favId));
     let shown = items;
     const reset = epoch !== undefined && this.favsEpoch !== undefined && epoch !== this.favsEpoch;
@@ -237,6 +239,11 @@ export class ChatHub {
     this.favsSynced = [...items];
     // A click that the gateway list now agrees with is confirmed: drop its time.
     for (const [id, c] of this.favsClicks) if (gateway.has(id) === (c.op === "add")) this.favsClicks.delete(id);
+    // A refused add is over: the gateway list is the truth, so the star is not shown and its click is not kept.
+    // `stale` needs no message (a newer change won). `cap` tells the user why the star went: the list is full.
+    for (const r of refused) this.favsClicks.delete(favId(r));
+    if (refused.some(r => r.reason === "cap")) this.favsNotice = FAVOURITES_FULL;
+    else if (items.length < MAX_FAVOURITES) this.favsNotice = undefined;
     if (epoch !== undefined) this.favsEpoch = epoch;
     this.favs = shown;
     this.saveFavourites();
@@ -248,6 +255,7 @@ export class ChatHub {
     const change: FavChange = { ...f, op: c.op, at: this.d.now() };
     if (!parseChatFromExt({ t: "chat.fav.set", changes: [change] })) return this.fail("The favourite is not valid.");
     const id = favId(f);
+    this.favsNotice = undefined;
     this.favsClicks.set(id, { op: c.op, at: change.at as number });
     this.favs = c.op === "add" ? [...this.favs.filter(x => favId(x) !== id), f].slice(-MAX_FAVOURITES) : this.favs.filter(x => favId(x) !== id);
     this.saveFavourites();

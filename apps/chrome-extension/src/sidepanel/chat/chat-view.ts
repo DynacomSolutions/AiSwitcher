@@ -235,6 +235,9 @@ export class ChatTab {
 
   private selectedChat(): ChatView | undefined { return this.selected ? this.state?.chats.find(x => x.summary.chatId === this.selected) : undefined; }
 
+  /** The error line of the favourites, for the pickers. */
+  private get notice(): { favouritesNotice?: string } { const n = this.state?.favouritesNotice; return n === undefined ? {} : { favouritesNotice: n }; }
+
   /** The starred models. The worker owns the list, keeps it in step with the gateway, and sends it in the state. */
   private get favourites(): Fav[] { return this.state?.favourites ?? []; }
 
@@ -400,7 +403,7 @@ export class ChatTab {
     if (!s.catalog) this.askCatalog();
     const selection = this.newSelection();
     this.newComposer.update({ send: selection !== undefined && !cap.full && !this.creating, stop: false, ...(cap.message !== undefined ? { hint: cap.message } : {}) });
-    this.listPicker.update({ ...buildPicker(s.catalog, this.newSelection()), favourites: this.favourites });
+    this.listPicker.update({ ...buildPicker(s.catalog, this.newSelection()), favourites: this.favourites, ...this.notice });
     const chats = openChats(s.chats, this.d.windowId);
     this.empty.hidden = chats.length > 0;
     const byId = new Map(chats.map(c => [c.summary.chatId, c]));
@@ -519,7 +522,7 @@ export class ChatTab {
     composer.update(composerMode(c, this.paused));
     const sel = c.summary.selection;
     const cfg = [...c.items].reverse().find(i => i.body.k === "config")?.body;
-    this.detailPicker.update({ ...buildPicker(this.state?.catalog, sel, cfg && cfg.k === "config" ? cfg : undefined), locked: true, favourites: this.favourites });
+    this.detailPicker.update({ ...buildPicker(this.state?.catalog, sel, cfg && cfg.k === "config" ? cfg : undefined), locked: true, favourites: this.favourites, ...this.notice });
   }
 
   // ---- chips --------------------------------------------------------------
