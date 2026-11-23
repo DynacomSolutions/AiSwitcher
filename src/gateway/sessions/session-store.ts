@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { SQL } from "bun";
 
 /**
@@ -12,6 +13,12 @@ import { SQL } from "bun";
  * (`sessionRef`), not by the host path. The same session in two folders or on two nodes is stored once. The table
  * `ais_session_path` records every path that held it. A path that holds a different file under the same session id
  * (a head that differs) is refused as `other_copy` and starts no new generation, so two diverged copies never take turns.
+ *
+ * Who may write. A path that holds the CURRENT generation (its path row points at the newest file row) appends, and it alone
+ * may start a new generation (a rewrite). A path that held only an older generation is a stranger now: it gets `other_copy`.
+ * A stranger that wants to join the session must prove that its file holds the stored bytes: it sends an `anchor`, the hash of
+ * its own bytes for the last stored part (range and hash come from the cursor answer). Without the proof nothing is stored
+ * and the path is not recorded. A holder may send the anchor too: a mismatch is then a rewrite.
  */
 
 /** Length of the file head that `headSha256` covers. */
@@ -20,6 +27,23 @@ export const HEAD_BYTES = 4096;
 export const MAX_PART_BYTES = 64 * 1024 * 1024;
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
+/** Largest value of a Postgres `integer` column (generation, lines). */
+export const INT4_MAX = 2_147_483_647;
+/** Host modification times outside 1970 to 2099 are a bug of the writer, not a time. */
+export const MTIME_MIN_MS = 0;
+export const MTIME_MAX_MS = 4_102_444_800_000;
+/** Control characters (NUL included) and lone surrogates: Postgres refuses some, and none is a valid path or name. */
+const BAD_TEXT = /[\u0000-\u001f\u007f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+export const hasBadText = (s: string): boolean => BAD_TEXT.test(s);
+
+/**
+ * Every part object of a session lives under this prefix: tool, the first 16 hex characters of SHA-256 of the session id,
+ * and the generation. The key holds no title, prompt or path. The shipper builds the same prefix.
+ */
+export function partObjectPrefix(kind: string, sessionRef: string, generation: number): string {
+  return `objects/v1/${kind}/${createHash("sha256").update(sessionRef).digest("hex").slice(0, 16)}/g${generation}/`;
+}
+const KEY_REST = /^[A-Za-z0-9._-]{1,128}$/;
 
 /** A host path that holds a session file. */
 export interface SessionPath {
@@ -46,6 +70,18 @@ export interface SessionPartInput {
   objectKey: string;
 }
 
+/**
+ * Proof that a path holds the stored bytes: the SHA-256 of the path's own file bytes in `[startOffset, endOffset)`, which is
+ * a part that the session has stored (the last part, as the cursor answer names it). The store compares it with the stored
+ * part that starts at `startOffset`. The hash covers bytes the writer reads from its own file, so a copy that differs inside
+ * that range (or whose line cuts differ) does not pass.
+ */
+export interface SessionAnchor {
+  startOffset: number;
+  endOffset: number;
+  plainSha256: string;
+}
+
 export interface SessionIngest extends SessionFileKey {
   /** Starts at 0. A larger value than the stored one starts a new generation: the file was rewritten. */
   generation: number;
@@ -54,6 +90,11 @@ export interface SessionIngest extends SessionFileKey {
   parentRef?: string | null;
   /** SHA-256 (hex) of the first min(4096, end of the last part) bytes of the file after this ingest. */
   headSha256: string;
+  /**
+   * Required from a path that does not hold the current generation yet (it joins the session as another copy). Optional
+   * from a holder. Absent from the first writer of a new session.
+   */
+  anchor?: SessionAnchor | null;
   /** Host modification time (ms). Moves `updated_at` forward until the indexer reads the real record time. */
   mtimeMs?: number;
   /** In order, contiguous. */
@@ -74,7 +115,10 @@ export interface SessionCursor {
 
 /** The answer to a cursor request: the cursor of the session, and whether the asked path is recorded as a holder of it. */
 export interface SessionCursorInfo extends SessionCursor {
+  /** True when the asked path holds the CURRENT generation. */
   held: boolean;
+  /** The last stored part: the range and hash that a new holder proves with. null: nothing stored. */
+  anchor: SessionAnchor | null;
 }
 
 export type IngestConflictReason =
@@ -92,7 +136,12 @@ export type IngestConflictReason =
    * The session is stored already from another path, and this path holds a different file under the same id (a head that
    * differs, or a rewrite). Nothing is stored. The writer skips this copy.
    */
-  | "other_copy";
+  | "other_copy"
+  /**
+   * The path does not hold the current generation and sent no anchor. Nothing is stored and the path is not recorded.
+   * Read the cursor again and send its `anchor` hash of your own bytes.
+   */
+  | "proof_required";
 
 export type IngestResult =
   | { status: "committed"; cursor: SessionCursor; created: boolean; partsAdded: number }
@@ -244,10 +293,20 @@ const bad = (m: string): never => {
 function validateBase(req: SessionHold): void {
   for (const f of ["node", "root", "relPath", "kind", "origin", "sessionRef"] as const) {
     if (typeof req[f] !== "string" || req[f].length === 0) bad(`${f} must be a non-empty string`);
+    if (hasBadText(req[f])) bad(`${f} must not hold control characters`);
   }
-  if (!Number.isSafeInteger(req.generation) || req.generation < 0) bad("generation must be a whole number, 0 or more");
+  for (const f of ["pool", "parentRef"] as const) {
+    const v = req[f];
+    if (v !== undefined && v !== null && (typeof v !== "string" || v.length === 0 || hasBadText(v))) bad(`${f} must be a text with no control characters, or null`);
+  }
+  if (!Number.isSafeInteger(req.generation) || req.generation < 0 || req.generation > INT4_MAX) bad(`generation must be a whole number from 0 to ${INT4_MAX}`);
   if (!SHA256_HEX.test(req.headSha256)) bad("headSha256 must be 64 lower-case hex characters");
-  if (req.mtimeMs !== undefined && !Number.isFinite(req.mtimeMs)) bad("mtimeMs must be a finite number");
+  if (req.mtimeMs !== undefined && (!Number.isFinite(req.mtimeMs) || req.mtimeMs < MTIME_MIN_MS || req.mtimeMs > MTIME_MAX_MS)) bad(`mtimeMs must be a time from ${MTIME_MIN_MS} to ${MTIME_MAX_MS} (ms since 1970)`);
+  const a = req.anchor;
+  if (a !== undefined && a !== null) {
+    if (!Number.isSafeInteger(a.startOffset) || !Number.isSafeInteger(a.endOffset) || a.startOffset < 0 || a.endOffset <= a.startOffset) bad("anchor needs 0 <= startOffset < endOffset");
+    if (!SHA256_HEX.test(a.plainSha256)) bad("anchor.plainSha256 must be 64 lower-case hex characters");
+  }
 }
 
 /** Refuses a hold request (no parts) that no correct writer sends. */
@@ -265,10 +324,13 @@ export function validateIngest(req: SessionIngest): void {
     if (p.startOffset !== at) bad("parts must be contiguous and in order");
     if (p.plainBytes !== p.endOffset - p.startOffset) bad("plainBytes must equal endOffset - startOffset");
     if (p.plainBytes > MAX_PART_BYTES) bad(`a part is at most ${MAX_PART_BYTES} bytes`);
-    if (!Number.isSafeInteger(p.lines) || p.lines < 0) bad("lines must be a whole number, 0 or more");
+    if (!Number.isSafeInteger(p.lines) || p.lines < 0 || p.lines > INT4_MAX) bad(`lines must be a whole number from 0 to ${INT4_MAX}`);
     if (!Number.isSafeInteger(p.objectBytes) || p.objectBytes < 0) bad("objectBytes must be a whole number, 0 or more");
     if (!SHA256_HEX.test(p.plainSha256)) bad("plainSha256 must be 64 lower-case hex characters");
-    if (typeof p.objectKey !== "string" || p.objectKey.length === 0) bad("objectKey must be a non-empty string");
+    const prefix = partObjectPrefix(req.kind, req.sessionRef, req.generation);
+    if (typeof p.objectKey !== "string" || !p.objectKey.startsWith(prefix) || !KEY_REST.test(p.objectKey.slice(prefix.length)) || p.objectKey.slice(prefix.length).includes("..")) {
+      bad(`objectKey must be ${prefix}<name> for this session and generation`);
+    }
     at = p.endOffset;
   }
 }
@@ -296,15 +358,15 @@ export class SessionStore {
   /**
    * The cursor of the newest generation of each session, in the order of `keys`. null: the session is not known yet.
    * The session is found by tool and session id, so a path that holds a copy of a stored session gets the same cursor.
-   * `held` tells whether the asked path is recorded as a holder.
+   * `held` tells whether the asked path holds the current generation. `anchor` is the last stored part (what a path proves with).
    */
   async cursors(keys: SessionFileKey[]): Promise<(SessionCursorInfo | null)[]> {
     if (keys.length === 0) return [];
     const rows = await this.sql.unsafe(
       `SELECT k.ord, f.id, f.generation, f.committed_bytes, f.committed_lines, f.head_sha256,
+              a.start_offset AS anchor_start, a.end_offset AS anchor_end, a.plain_sha256 AS anchor_sha256,
               f.id IS NOT NULL AND EXISTS (
-                SELECT 1 FROM ais_session_path p JOIN ais_session_file g ON g.id = p.file_id
-                 WHERE g.kind = k.kind AND g.session_ref = k.session_ref AND p.node = k.node AND p.root = k.root AND p.rel_path = k.rel_path
+                SELECT 1 FROM ais_session_path p WHERE p.file_id = f.id AND p.node = k.node AND p.root = k.root AND p.rel_path = k.rel_path
               ) AS held
          FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) WITH ORDINALITY AS k(kind, session_ref, node, root, rel_path, ord)
          LEFT JOIN LATERAL (
@@ -313,10 +375,21 @@ export class SessionStore {
             WHERE kind = k.kind AND session_ref = k.session_ref
             ORDER BY generation DESC LIMIT 1
          ) f ON true
+         LEFT JOIN LATERAL (
+           SELECT start_offset, end_offset, plain_sha256 FROM ais_session_part WHERE file_id = f.id ORDER BY start_offset DESC LIMIT 1
+         ) a ON true
         ORDER BY k.ord`,
       [keys.map((k) => k.kind), keys.map((k) => k.sessionRef), keys.map((k) => k.node), keys.map((k) => k.root), keys.map((k) => k.relPath)],
     );
-    return rows.map((r: Row) => (r.id === null || r.id === undefined ? null : { ...cursorOf(r), held: r.held === true }));
+    return rows.map((r: Row) =>
+      r.id === null || r.id === undefined
+        ? null
+        : {
+            ...cursorOf(r),
+            held: r.held === true,
+            anchor: r.anchor_sha256 === null || r.anchor_sha256 === undefined ? null : { startOffset: num(r.anchor_start), endOffset: num(r.anchor_end), plainSha256: String(r.anchor_sha256) },
+          },
+    );
   }
 
   /**
@@ -352,13 +425,10 @@ export class SessionStore {
         const refuse = (reason: IngestConflictReason): never => {
           throw new Refused({ status: "conflict", reason, cursor: curCursor });
         };
+        // Only a holder of the CURRENT generation appends or rewrites. A path that held an older generation is a stranger now.
         const held = cur
           ? (
-              await t.unsafe(
-                `SELECT 1 FROM ais_session_path p JOIN ais_session_file f ON f.id = p.file_id
-                  WHERE f.kind = $1 AND f.session_ref = $2 AND p.node = $3 AND p.root = $4 AND p.rel_path = $5 LIMIT 1`,
-                [req.kind, req.sessionRef, req.node, req.root, req.relPath],
-              )
+              await t.unsafe(`SELECT 1 FROM ais_session_path WHERE file_id = $1 AND node = $2 AND root = $3 AND rel_path = $4 LIMIT 1`, [num(cur.id), req.node, req.root, req.relPath])
             ).length > 0
           : false;
         const first = req.parts[0];
@@ -368,7 +438,7 @@ export class SessionStore {
         let created = false;
         if (!cur || req.generation > num(cur.generation)) {
           // A new session, or a new generation after a rewrite: it starts at byte 0.
-          // Only a path that holds the session rewrites it. A stranger with other content is another copy: skip it.
+          // Only a holder of the current generation rewrites it. Any other path with other content is another copy: skip it.
           if (cur && !held) refuse("other_copy");
           if (!first || first.startOffset !== 0) refuse(cur ? "generation_start" : "gap");
           const row = (
@@ -384,9 +454,19 @@ export class SessionStore {
           created = true;
         } else {
           if (req.generation < num(cur.generation)) refuse("stale_generation");
+          // A holder whose file changed rewrote it. A path that is not a holder has another file under the same id.
+          const differs: IngestConflictReason = held ? "rewritten" : "other_copy";
           // A full 4 KiB head is fixed for the life of the file. A shorter head grows with the file, so it cannot tell a rewrite.
-          // A holder with another head rewrote its file. A path that is not a holder has another file under the same id.
-          if (num(cur.committed_bytes) >= HEAD_BYTES && String(cur.head_sha256) !== req.headSha256) refuse(held ? "rewritten" : "other_copy");
+          if (num(cur.committed_bytes) >= HEAD_BYTES && String(cur.head_sha256) !== req.headSha256) refuse(differs);
+          // The head covers 4 KiB only. The anchor covers the last stored part, so a copy that differs later cannot join.
+          if (req.anchor) {
+            const stored = (
+              await t.unsafe(`SELECT end_offset, plain_sha256 FROM ais_session_part WHERE file_id = $1 AND start_offset = $2`, [num(cur.id), req.anchor.startOffset])
+            )[0] as Row | undefined;
+            if (!stored || num(stored.end_offset) !== req.anchor.endOffset || String(stored.plain_sha256) !== req.anchor.plainSha256) refuse(differs);
+          } else if (!held) {
+            refuse("proof_required");
+          }
           fileId = num(cur.id);
           committed = num(cur.committed_bytes);
         }

@@ -1,7 +1,7 @@
 import type { Hono } from "hono";
 import type { GatewayMetrics } from "./metrics.ts";
-import type { IngestConflictReason, IngestResult, SessionCursorInfo, SessionFileKey, SessionHold, SessionIngest, SessionPartInput } from "./sessions/session-store.ts";
-import { SessionIngestInvalid } from "./sessions/session-store.ts";
+import type { IngestConflictReason, IngestResult, SessionAnchor, SessionCursorInfo, SessionFileKey, SessionHold, SessionIngest, SessionPartInput } from "./sessions/session-store.ts";
+import { hasBadText, SessionIngestInvalid, validateHold, validateIngest } from "./sessions/session-store.ts";
 
 /**
  * Admin routes of the session store: the shipper of backup-client sends the index rows of the transcripts it stored
@@ -13,10 +13,12 @@ import { SessionIngestInvalid } from "./sessions/session-store.ts";
  *
  * - GET  /sessions/v1/ping      `{ok, flushGapSeconds, limits}`. Reads the database, so it proves the real client path.
  * - POST /sessions/v1/cursors   `{files: [{kind, sessionRef, node, root, relPath}]}` (at most 500) answers
- *                               `{flushGapSeconds, cursors: [null | {generation, committedBytes, committedLines, headSha256, held}]}`
- *                               in the order asked. null: the session is unknown, start at byte 0 of generation 0.
+ *                               `{flushGapSeconds, cursors: [null | {generation, committedBytes, committedLines, headSha256, held, anchor}]}`
+ *                               in the order asked. null: the session is unknown, start at byte 0 of generation 0. `held`: the asked path holds
+ *                               the current generation. `anchor` is `{startOffset, endOffset, plainSha256}` of the last stored part: a path that
+ *                               does not hold the session hashes its own bytes in that range and sends the same shape in its record.
  * - POST /sessions/v1/ingest    `{files: [record]}` (at most 100). A record is the cursor key plus `{origin, pool?, parentRef?, generation,
- *                               headSha256, mtimeMs?, parts}`. `parts` may be empty: the path holds a session that is stored already.
+ *                               headSha256, anchor?, mtimeMs?, parts}`. `anchor` is required from a path that does not hold the current generation. `parts` may be empty: the path holds a session that is stored already.
  *                               Answers `{flushGapSeconds, results: [...]}`, one result per record in order. HTTP 200 whatever the
  *                               results are: `committed` (new parts stored), `duplicate` (all parts were stored), `conflict` (with a
  *                               `reason` and the `cursor` where the session stands) or `invalid` (with an `error`). Nothing of a refused
@@ -61,7 +63,8 @@ type Fail = (status: 400 | 404 | 503, message: string, extra?: object) => Respon
 type Rec = Record<string, unknown>;
 
 const isRec = (v: unknown): v is Rec => typeof v === "object" && v !== null && !Array.isArray(v);
-const str = (v: unknown, max: number): string | undefined => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
+/** A non-empty text of at most `max` characters with no control character (Postgres refuses NUL, and no name holds one). */
+const str = (v: unknown, max: number): string | undefined => (typeof v === "string" && v.length > 0 && v.length <= max && !hasBadText(v) ? v : undefined);
 const KIND = /^[a-z][a-z0-9_-]{0,31}$/;
 
 /** The path and session fields every record carries, or a message that names the problem. */
@@ -70,13 +73,13 @@ export function parseSessionKey(raw: unknown): SessionFileKey | string {
   const kind = typeof raw.kind === "string" && KIND.test(raw.kind) ? raw.kind : undefined;
   if (!kind) return "kind must be a short lower-case name";
   const sessionRef = str(raw.sessionRef, 512);
-  if (!sessionRef) return "sessionRef must be a text of 1 to 512 characters";
+  if (!sessionRef) return "sessionRef must be a text of 1 to 512 characters with no control characters";
   const node = str(raw.node, 128);
-  if (!node) return "node must be a text of 1 to 128 characters";
+  if (!node) return "node must be a text of 1 to 128 characters with no control characters";
   const root = str(raw.root, 4096);
-  if (!root) return "root must be a text of 1 to 4096 characters";
+  if (!root) return "root must be a text of 1 to 4096 characters with no control characters";
   const relPath = str(raw.relPath, 4096);
-  if (!relPath) return "relPath must be a text of 1 to 4096 characters";
+  if (!relPath) return "relPath must be a text of 1 to 4096 characters with no control characters";
   return { kind, sessionRef, node, root, relPath };
 }
 
@@ -86,7 +89,7 @@ function parsePart(raw: unknown): SessionPartInput | string {
   for (const k of nums) if (typeof raw[k] !== "number" || !Number.isSafeInteger(raw[k])) return `part.${k} must be a whole number`;
   const plainSha256 = typeof raw.plainSha256 === "string" ? raw.plainSha256 : "";
   const objectKey = str(raw.objectKey, 512);
-  if (!objectKey || !objectKey.startsWith(SESSIONS_OBJECT_PREFIX) || objectKey.includes("..") || /[\0\r\n]/.test(objectKey)) return `part.objectKey must be a key under ${SESSIONS_OBJECT_PREFIX}`;
+  if (!objectKey || !objectKey.startsWith(SESSIONS_OBJECT_PREFIX) || objectKey.includes("..")) return `part.objectKey must be a key under ${SESSIONS_OBJECT_PREFIX}`;
   return {
     startOffset: raw.startOffset as number,
     endOffset: raw.endOffset as number,
@@ -104,11 +107,17 @@ export function parseIngestRecord(raw: unknown): SessionIngest | string {
   if (typeof key === "string") return key;
   const r = raw as Rec;
   const origin = str(r.origin, 64);
-  if (!origin) return "origin must be a text of 1 to 64 characters";
-  if (r.pool !== undefined && r.pool !== null && !str(r.pool, 128)) return "pool must be a text of 1 to 128 characters or null";
-  if (r.parentRef !== undefined && r.parentRef !== null && !str(r.parentRef, 512)) return "parentRef must be a text of 1 to 512 characters or null";
+  if (!origin) return "origin must be a text of 1 to 64 characters with no control characters";
+  if (r.pool !== undefined && r.pool !== null && !str(r.pool, 128)) return "pool must be a text of 1 to 128 characters with no control characters, or null";
+  if (r.parentRef !== undefined && r.parentRef !== null && !str(r.parentRef, 512)) return "parentRef must be a text of 1 to 512 characters with no control characters, or null";
   if (typeof r.generation !== "number" || !Number.isSafeInteger(r.generation)) return "generation must be a whole number";
   if (typeof r.headSha256 !== "string") return "headSha256 must be a text";
+  let anchor: SessionAnchor | undefined;
+  if (r.anchor !== undefined && r.anchor !== null) {
+    const a = r.anchor;
+    if (!isRec(a) || typeof a.startOffset !== "number" || typeof a.endOffset !== "number" || typeof a.plainSha256 !== "string") return "anchor must be {startOffset, endOffset, plainSha256}";
+    anchor = { startOffset: a.startOffset, endOffset: a.endOffset, plainSha256: a.plainSha256 };
+  }
   if (r.mtimeMs !== undefined && (typeof r.mtimeMs !== "number" || !Number.isFinite(r.mtimeMs))) return "mtimeMs must be a number";
   if (!Array.isArray(r.parts)) return "parts must be a list";
   if (r.parts.length > SESSIONS_MAX_PARTS_PER_FILE) return `parts must hold at most ${SESSIONS_MAX_PARTS_PER_FILE} entries`;
@@ -118,25 +127,36 @@ export function parseIngestRecord(raw: unknown): SessionIngest | string {
     if (typeof part === "string") return part;
     parts.push(part);
   }
-  return {
+  const rec: SessionIngest = {
     ...key,
     origin,
     ...(typeof r.pool === "string" ? { pool: r.pool } : {}),
     ...(typeof r.parentRef === "string" ? { parentRef: r.parentRef } : {}),
     generation: r.generation,
     headSha256: r.headSha256,
+    ...(anchor ? { anchor } : {}),
     ...(typeof r.mtimeMs === "number" ? { mtimeMs: r.mtimeMs } : {}),
     parts,
   };
+  // The store limits (int4 ranges, time range, hashes, object keys of this session) apply here too, so a value that
+  // Postgres would refuse ends as an `invalid` result of this record and not as a failed request that the shipper repeats.
+  try {
+    if (parts.length === 0) validateHold(rec);
+    else validateIngest(rec);
+  } catch (e) {
+    if (e instanceof SessionIngestInvalid) return e.message;
+    throw e;
+  }
+  return rec;
 }
 
-type CursorView = { generation: number; committedBytes: number; committedLines: number; headSha256: string; held?: boolean };
-const cursorView = (c: { generation: number; committedBytes: number; committedLines: number; headSha256: string }, held?: boolean): CursorView => ({
+type CursorView = { generation: number; committedBytes: number; committedLines: number; headSha256: string; held?: boolean; anchor?: SessionAnchor | null };
+const cursorView = (c: { generation: number; committedBytes: number; committedLines: number; headSha256: string }, extra?: { held: boolean; anchor: SessionAnchor | null }): CursorView => ({
   generation: c.generation,
   committedBytes: c.committedBytes,
   committedLines: c.committedLines,
   headSha256: c.headSha256,
-  ...(held !== undefined ? { held } : {}),
+  ...(extra ? { held: extra.held, anchor: extra.anchor } : {}),
 });
 
 type RecordResult =
@@ -233,7 +253,7 @@ export function registerSessionsAdmin(hono: Hono, deps: SessionsAdminDeps | unde
         keys.push(k);
       }
       const cursors = await store.cursors(keys);
-      return { outcome: "ok", res: c.json({ flushGapSeconds, cursors: cursors.map((x) => (x ? cursorView(x, x.held) : null)) }) };
+      return { outcome: "ok", res: c.json({ flushGapSeconds, cursors: cursors.map((x) => (x ? cursorView(x, { held: x.held, anchor: x.anchor }) : null)) }) };
     }),
   );
 
