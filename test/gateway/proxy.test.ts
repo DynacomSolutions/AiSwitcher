@@ -741,6 +741,27 @@ describe("failover and refresh", () => {
     expect(who()).toEqual(["Bearer tok-a"]);
   });
 
+  // Incident 24 Nov 2026: the busiest members answered burst 429s often, each one read their usage fresh (per replica,
+  // past the shared reading), their usage endpoint answered 429, and their readings went stale.
+  test("a burst 429 does not read the member's usage again", async () => {
+    await burstSetup("pair");
+    const refreshed: string[] = [];
+    deps.refreshUsage = async (_p, id) => {
+      refreshed.push(id);
+    };
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "poolr", target: { kind: "pool" } }));
+    handler = (_req, s) =>
+      s.headers.get("authorization") === "Bearer tok-a"
+        ? new Response("{}", { status: 429, headers: { "retry-after": "5" } })
+        : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    const r = await gw.request("http://gw.test/poolr/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } });
+    await r.arrayBuffer();
+    expect(r.status).toBe(200);
+    await settle();
+    expect(refreshed).toEqual([]);
+  });
+
   // Incident 16 Nov 2026: the owner spent a limit reset on an exhausted member out of band. The usage endpoint kept
   // answering 429 (stale reading), so the one read after the 429 never ended the hold and the pool answered
   // "no-headroom:exhausted" for days on every replica that had seen the 429.

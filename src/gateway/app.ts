@@ -779,18 +779,18 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       else {
         exhausted.set(exKey(name), burstHoldUntil(res.headers, nowMs));
         holds.set(exKey(name), { kind: "burst", long: false });
-        void refreshFromSource(name);
       }
     } else if (res.status === 402 || res.status === 403 || (res.status === 429 && provesSubscriptionExhaustion(res.headers))) {
       if (res.status === 429) noteLimitReset(res.headers);
       holds.delete(exKey(name));
       bridgeUntilReading(name, exKey(name), exhaustedUntil(res.headers, nowMs));
     } else if (res.status === 429) {
-      // A burst 429 (no window rejected) is not about usage: its hold is the provider's retry-after. The source is still
-      // read again so the next pick sees current figures.
+      // A burst 429 (no window rejected) is not about usage: its hold is the provider's retry-after. The usage source is
+      // not read again for it: the busiest member answers burst 429s most often, and a fresh read for each one (per
+      // replica, past the shared reading) got its usage endpoint answering 429, so its reading went stale. The regular
+      // shared poll keeps the figure current.
       exhausted.set(exKey(name), burstHoldUntil(res.headers, nowMs));
       holds.set(exKey(name), { kind: "burst", long: false });
-      void refreshFromSource(name);
     }
   };
   /** Reads the member's usage from the source now (single-flight per member), so the next pick decides on real data. */
@@ -855,7 +855,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (shortHeld.length === 0) return false;
     // Only worth waiting when some member would be picked once the short holds are gone.
     const quotaOut = new Set([...held].filter((n) => !shortHeld.includes(n)));
-    if (!("identity" in (await pickIdentity(app, deps, quotaOut, model, true)))) return false;
+    if (!("identity" in (await pickIdentity(app, deps, quotaOut, model)))) return false;
     const soonest = Math.min(...shortHeld.map((n) => exhausted.get(exKey(n)) ?? now));
     waits++;
     await (deps.sleep ?? defaultSleep)(Math.min(Math.max(soonest - now, SHORT_HOLD_MIN_SLEEP_MS), left), req.signal);
@@ -871,12 +871,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (rejectKind === "no-headroom" && app.target.kind === "pool") {
       // Only the short holds are ignored: members out for proven quota exhaustion stay excluded.
       const quotaOut = new Set([...(await exhaustedNames())].filter((n) => !holds.has(exKey(n))));
-      let free = await pickIdentity(app, deps, quotaOut, model, true);
+      let free = await pickIdentity(app, deps, quotaOut, model);
       let h = "identity" in free ? holds.get(exKey(free.identity)) : undefined;
       if (h?.kind === "cred") {
         // A burst-held member frees sooner than a credential-held one, so it decides the answer.
         const noCred = new Set([...quotaOut, ...[...holds].filter(([k, v]) => v.kind === "cred" && k.startsWith(exKey(""))).map(([k]) => k.slice(exKey("").length))]);
-        const alt = await pickIdentity(app, deps, noCred, model, true);
+        const alt = await pickIdentity(app, deps, noCred, model);
         if ("identity" in alt && holds.get(exKey(alt.identity))?.kind === "burst") {
           free = alt;
           h = holds.get(exKey(alt.identity));

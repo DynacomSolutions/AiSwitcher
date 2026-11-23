@@ -916,11 +916,9 @@ describe("side routes do not disturb logins or the pool", () => {
     reply = (s) => (s.url.includes("/search") ? new Response('{"error":{"type":"insufficient_quota"}}', { status: 403 }) : new Response("{}"));
     expect((await call("k", "/search", { method: "POST", body: "{}" })).status).toBe(403);
     expect(seen).toHaveLength(1);
-    // Members with no usage figure take turns, so member a's next turn is the second chat call: it is still served.
-    await call("k", "/chat/completions", { method: "POST", body: "{}" });
     await call("k", "/chat/completions", { method: "POST", body: "{}" });
     expect(new URL(seen[1]!.url).pathname).toBe("/coding/v1/chat/completions");
-    expect(seen.slice(1).map((r) => r.headers.get("authorization"))).toContain("Bearer tok-a");
+    expect(seen[1]!.headers.get("authorization")).toBe("Bearer tok-a");
   });
   test("chat 401 still refreshes", async () => {
     await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });

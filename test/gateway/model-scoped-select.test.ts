@@ -93,31 +93,3 @@ describe("usage body scoped windows", () => {
     expect(parseUsageBody({ five_hour: { utilization: 5 }, seven_day_fable: { utilization: 99 } }).scoped).toEqual([{ model: "fable", utilization: 99 }]);
   });
 });
-
-describe("members with no fresh figure take turns", () => {
-  const stale = (pct: number): PoolUsage => ({ status: "live", stale: true, maxUtilization: pct, capturedAt: "2026-11-12T00:00:00.000Z" });
-  const live = (pct: number): PoolUsage => ({ status: "live", maxUtilization: pct, capturedAt: "2026-11-12T00:00:00.000Z" });
-  const noPlan: PoolUsage = { status: "unavailable", noPlan: true, capturedAt: "2026-11-12T00:00:00.000Z" };
-  const rows: Record<string, PoolUsage> = { full1: live(100), none: noPlan, s1: stale(81), s2: stale(15), full2: live(100) };
-  const mk = () => ({ usageFor: async (_p: string, id: string) => rows[id], poolMembers: async () => ["full1", "none", "s1", "s2", "full2"] });
-
-  test("every full live member is skipped and the stale members alternate (not all traffic on the first)", async () => {
-    const d = mk();
-    const picks: string[] = [];
-    for (let i = 0; i < 4; i++) picks.push(((await pickIdentity(pool, d, undefined, OPUS)) as { identity: string }).identity);
-    expect(picks).toEqual(["s1", "s2", "s1", "s2"]);
-  });
-
-  test("a peek does not take a turn", async () => {
-    const d = mk();
-    expect(await pickIdentity(pool, d, undefined, OPUS, true)).toEqual({ identity: "s1" });
-    expect(await pickIdentity(pool, d, undefined, OPUS)).toEqual({ identity: "s1" });
-    expect(await pickIdentity(pool, d, undefined, OPUS)).toEqual({ identity: "s2" });
-  });
-
-  test("a member with no plan is tried only when nothing else is left", async () => {
-    const d = mk();
-    expect(await pickIdentity(pool, d, new Set(["s1", "s2"]), OPUS)).toEqual({ identity: "none" });
-    expect(await pickIdentity(pool, d, new Set(["s2"]), OPUS)).toEqual({ identity: "s1" });
-  });
-});
