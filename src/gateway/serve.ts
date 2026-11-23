@@ -22,6 +22,8 @@ import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { isOperationalPath, publicHostsFromEnv, viaPublicHost } from "./public-host.ts";
 import { aliSessionOnce, aliSetupSelfTest, listAliAccounts, type AliSetupDeps } from "./ali-session.ts";
 import { withStoreWaitTimeout } from "./admin-store.ts";
+import { SessionStore } from "./sessions/session-store.ts";
+import type { SessionsIngestStore } from "./admin-sessions.ts";
 import { createAdminApp, limitsIdentities, LIMITS_PROVIDERS, type IdentityState } from "./admin.ts";
 import { createWarmGate, positiveIntEnv } from "../shared/warm-gate.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
@@ -86,6 +88,11 @@ export interface GatewayOptions {
   credentialStore?: { key: Buffer; fileStore?: boolean; importOnStart?: boolean };
   /** This replica's admin base URL for other replicas (browser relay forwarding). Multi-replica relay is on when set. */
   replicaUrl?: string;
+  /**
+   * The session ingest routes (`/sessions/v1/*`, admin-sessions.ts). Off when absent: the routes answer 404.
+   * `token`: the ingest token, AIS_GATEWAY_SESSIONS_TOKEN. `flushGapSeconds`: AIS_GATEWAY_SESSIONS_FLUSH_GAP_SECONDS (default 120).
+   */
+  sessions?: { token: string; flushGapSeconds?: number };
 }
 
 /** Everything a test (or another host) may replace. Production uses the defaults. */
@@ -171,6 +178,10 @@ export interface GatewayHooks {
   chatStore?: ChatStore;
   /** Tests: the starred-model store (in-memory store mode only). */
   favouriteStore?: FavouriteStore;
+  /** Tests: the session store behind the ingest routes (default: the gateway database). */
+  sessionStore?: SessionsIngestStore;
+  /** Tests and the object store check: whether a part object exists. Absent: the gateway does not check. */
+  sessionObjectExists?(key: string): Promise<boolean>;
 }
 
 /** What `AIS_GATEWAY_CHAT_*` configures. */
@@ -547,6 +558,10 @@ export async function keepAliveOnce(deps: {
 
 export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {}): Promise<RunningGateway> {
   if (opts.adminToken.length < MIN_ADMIN_TOKEN_LENGTH) throw new Error(`gateway: the admin token (AIS_GATEWAY_ADMIN_TOKEN) must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters`);
+  if (opts.sessions) {
+    if (opts.sessions.token.length < MIN_ADMIN_TOKEN_LENGTH) throw new Error(`gateway: the session ingest token (AIS_GATEWAY_SESSIONS_TOKEN) must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters`);
+    if (opts.sessions.token === opts.adminToken) throw new Error("gateway: the session ingest token (AIS_GATEWAY_SESSIONS_TOKEN) must differ from the admin token");
+  }
   startModelPriceRefresh();
   enableMemberStore(); // read each account's login from the gateway member store, not the local identity folders
   markGatewayOwnerProcess(); // this process alone refreshes gateway-managed logins
@@ -821,6 +836,18 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     browserIdentityExists,
     browserHub: browser,
     favourites: () => favourites,
+    ...(opts.sessions
+      ? {
+          sessions: {
+            token: opts.sessions.token,
+            store: hooks.sessionStore ?? new SessionStore(opts.databaseUrl, { sql: sharedSql }),
+            ...(opts.sessions.flushGapSeconds !== undefined ? { flushGapSeconds: opts.sessions.flushGapSeconds } : {}),
+            now,
+            metrics,
+            ...(hooks.sessionObjectExists ? { objectExists: hooks.sessionObjectExists } : {}),
+          },
+        }
+      : {}),
     metrics,
     onBindingRevoked: async (binding, before) => {
       await chatBroker?.closeBinding(binding, before === undefined ? {} : { before }).catch(() => metrics.chatError("close_binding"));

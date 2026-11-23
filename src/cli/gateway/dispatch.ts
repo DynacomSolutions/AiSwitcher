@@ -8,6 +8,7 @@ import { CONNECT_RELAY_DEFAULT_PORT, parseUpstreams, startConnectRelay, type Con
 import { installDrainHandlers, LOCAL_GATEWAY_DEFAULT_PORT, startLocalGateway } from "../../gateway/local.ts";
 import { parseStoreKey, STORE_KEY_ENV } from "../../gateway/home-store.ts";
 import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_CONNECT_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
+import { SESSIONS_DEFAULT_FLUSH_GAP_SECONDS } from "../../gateway/admin-sessions.ts";
 
 function portOf(flag: string | undefined, env: string | undefined, fallback: number, name: string): number {
   const raw = flag ?? env;
@@ -88,7 +89,9 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   const credentialStore = credentialStoreFromEnv(process.env);
   const replicaUrl = replicaUrlFromEnv(process.env, adminPort);
   if (credentialStore) console.info(`gateway: logins from the PostgreSQL credential store${credentialStore.fileStore ? " (this replica's HOME is the host file store: write-back on)" : ""}`);
-  const gateway = await startGateway({ port, adminPort, databaseUrl, adminToken, handleSignals: true, ...(connect ? { connect } : {}), ...(credentialStore ? { credentialStore } : {}), ...(replicaUrl ? { replicaUrl } : {}) });
+  const sessions = sessionsFromEnv(process.env);
+  if (sessions) console.info(`gateway: session ingest routes on (flush gap ${sessions.flushGapSeconds ?? SESSIONS_DEFAULT_FLUSH_GAP_SECONDS} s)`);
+  const gateway = await startGateway({ port, adminPort, databaseUrl, adminToken, handleSignals: true, ...(connect ? { connect } : {}), ...(credentialStore ? { credentialStore } : {}), ...(replicaUrl ? { replicaUrl } : {}), ...(sessions ? { sessions } : {}) });
   console.info(`gateway: proxy on :${gateway.port}, admin on :${gateway.adminPort}; warming up`);
   // Runs until SIGTERM or SIGINT, whose handler drains and exits the process.
   await new Promise<void>(() => {});
@@ -163,6 +166,26 @@ export function credentialStoreFromEnv(env: Record<string, string | undefined>):
   if (mode === "files") return undefined;
   if (mode !== "pg") throw new CliUsageError(`${CREDENTIAL_STORE_ENV} must be "pg" or "files", got "${mode}"`);
   return { key: parseStoreKey(env[STORE_KEY_ENV]), fileStore: truthy(env[FILE_STORE_ENV]), importOnStart: truthy(env[STORE_IMPORT_ENV]) };
+}
+
+/** Env names of the session ingest routes (docs/API.md, "Session ingest"). */
+export const SESSIONS_INGEST_ENV = "AIS_GATEWAY_SESSIONS_INGEST";
+export const SESSIONS_TOKEN_ENV = "AIS_GATEWAY_SESSIONS_TOKEN";
+export const SESSIONS_FLUSH_GAP_ENV = "AIS_GATEWAY_SESSIONS_FLUSH_GAP_SECONDS";
+
+/**
+ * The session ingest settings. The routes are off (undefined) unless `AIS_GATEWAY_SESSIONS_INGEST` is 1 or true.
+ * When on, `AIS_GATEWAY_SESSIONS_TOKEN` is required: the scoped token of the shipper.
+ */
+export function sessionsFromEnv(env: Record<string, string | undefined>): { token: string; flushGapSeconds?: number } | undefined {
+  if (!truthy(env[SESSIONS_INGEST_ENV]?.trim())) return undefined;
+  const token = env[SESSIONS_TOKEN_ENV]?.trim();
+  if (!token) throw new CliUsageError(`${SESSIONS_TOKEN_ENV} is required when ${SESSIONS_INGEST_ENV} is on`);
+  const gapRaw = env[SESSIONS_FLUSH_GAP_ENV]?.trim();
+  if (gapRaw === undefined || gapRaw === "") return { token };
+  const gap = Number(gapRaw);
+  if (!Number.isInteger(gap) || gap < 1 || gap > 3600) throw new CliUsageError(`${SESSIONS_FLUSH_GAP_ENV} must be a whole number of seconds from 1 to 3600`);
+  return { token, flushGapSeconds: gap };
 }
 
 /** This replica's admin address for the others: AIS_GATEWAY_REPLICA_URL, else http://$POD_IP:<admin port>; none on a single host. */

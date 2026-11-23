@@ -4,6 +4,7 @@ import { AppRevokedError, revokedMessage, type GatewayStore } from "./store.ts";
 import { registerBrowserAdmin } from "./browser/admin.ts";
 import { registerStoreAdmin, type StoreAdminDeps } from "./admin-store.ts";
 import { registerFavouritesAdmin } from "./admin-favourites.ts";
+import { registerSessionsAdmin, type SessionsAdminDeps } from "./admin-sessions.ts";
 import { favouritesToken } from "./favourites-token.ts";
 import type { FavouritesService } from "./chat/favourites.ts";
 import type { GatewayMetrics } from "./metrics.ts";
@@ -53,7 +54,12 @@ export interface AdminDeps {
   storeAdmin?: StoreAdminDeps;
   /** The starred models behind GET and POST /favourites (admin-favourites.ts). Read at each call: it is undefined until the chat stack is up. */
   favourites?(): FavouritesService | undefined;
-  metrics?: Pick<GatewayMetrics, "favourite">;
+  metrics?: Pick<GatewayMetrics, "favourite" | "sessionsError">;
+  /**
+   * The session ingest routes (admin-sessions.ts, `/sessions/v1/*`). Absent: the feature is off and the routes answer 404.
+   * `token` is the ingest token (AIS_GATEWAY_SESSIONS_TOKEN). It opens these routes and no other.
+   */
+  sessions?: SessionsAdminDeps & { token: string };
   /** One identity's cached subscription usage (GET /limits); absent when the gateway has no usage source. */
   usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   /** The member accounts of every swap pool of one provider (GET /limits). */
@@ -249,10 +255,14 @@ export function createAdminApp(deps: AdminDeps): Hono {
 
   // The favourites token (derived from the admin token) opens GET and POST /favourites and nothing else.
   const favouritesBearer = deps.adminToken ? favouritesToken(deps.adminToken) : undefined;
+  // The ingest token opens `/sessions/v1/*` and nothing else, and only while the feature is on.
+  const sessionsBearer = deps.sessions?.token || undefined;
   hono.use("*", async (c, next) => {
     const given = bearer(c.req.raw);
     if (deps.adminToken && sameSecret(given, deps.adminToken)) return next();
     if (favouritesBearer && c.req.path === "/favourites" && (c.req.method === "GET" || c.req.method === "POST") && sameSecret(given, favouritesBearer)) return next();
+    if (sessionsBearer && c.req.path.startsWith("/sessions/v1/") && sameSecret(given, sessionsBearer)) return next();
+    if (c.req.path.startsWith("/sessions/v1/")) deps.metrics?.sessionsError?.("auth");
     return err(401, "admin token required");
   });
   hono.onError(() => err(503, "store unavailable"));
@@ -260,6 +270,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
 
   registerStoreAdmin(hono, deps.storeAdmin, (status, message, extra) => Response.json({ error: message, ...extra }, { status }));
   registerFavouritesAdmin(hono, deps.favourites, err, deps.metrics);
+  registerSessionsAdmin(hono, deps.sessions, (status, message, extra) => Response.json({ error: message, ...extra }, { status }));
 
   // Renewal state of every login the gateway keeps alive: journal (last refresh, last error) plus the stored login (expiry).
   hono.get("/logins/renewal", async (c) => {

@@ -873,6 +873,70 @@ Contract notes:
 - Per-tool support matches the tree (claude, codex, pi, grok, kimi, zai,
   ali); opencode answers `400` with an honest "no reader" message.
 
+### Session ingest (gateway admin API)
+
+The shipper of `backup-client` sends the index rows of the session transcripts it stored as part objects. These routes
+belong to the gateway admin API (admin port, `AIS_GATEWAY_ADMIN_URL`), not to the console. They are off unless
+`AIS_GATEWAY_SESSIONS_INGEST=1` (or `true`). While they are off, every `/sessions/v1/*` path answers `404`.
+
+Settings of the gateway:
+
+- `AIS_GATEWAY_SESSIONS_INGEST`: `1` or `true` turns the routes on. Default off.
+- `AIS_GATEWAY_SESSIONS_TOKEN`: the ingest token. Required when the routes are on. At least 32 characters. It must differ from the admin token.
+- `AIS_GATEWAY_SESSIONS_FLUSH_GAP_SECONDS`: the least time between two flushes of one live file, 1 to 3600. Default 120. Every answer carries it as `flushGapSeconds`, so the shipper follows it.
+
+Auth: `Authorization: Bearer <token>`. The ingest token opens `/sessions/v1/*` and no other admin route (every other route
+answers `401` to it). The admin token opens these routes too. Wrong or missing token: `401`.
+
+One session is stored once. A session is named by its tool (`kind`, for example `claude` or `codex`) and its session id
+(`sessionRef`), not by the host path. The same session in two folders or on two nodes has one set of parts. The index
+(`ais_session_path`) records every path that held it. Every request still names the path (`node`, `root`, `relPath`).
+
+`GET /sessions/v1/ping` -> `{ ok, flushGapSeconds, limits: { cursors, files, parts, bodyBytes } }`. It reads the
+database, so it proves the real client path. `503` with `Retry-After: 5` when the database is down.
+
+`POST /sessions/v1/cursors` body `{ files: [{ kind, sessionRef, node, root, relPath }] }` (1 to 500 entries) ->
+`{ flushGapSeconds, cursors: [null | { generation, committedBytes, committedLines, headSha256, held }] }` in the order asked.
+`null`: the session is unknown. Start at byte 0 of generation 0. Otherwise continue at `committedBytes` of the newest
+`generation`, even when another path stored the bytes. `held` says whether the asked path is recorded as a holder.
+
+`POST /sessions/v1/ingest` body `{ files: [record] }` (1 to 100 records). A record is
+`{ kind, sessionRef, node, root, relPath, origin, pool?, parentRef?, generation, headSha256, mtimeMs?, parts }`:
+
+- `origin`: where the folder comes from (for example `t3-pool`, `agent-pod`, `host`). `pool`: the swap pool folder, when there is one.
+- `headSha256`: SHA-256 of the first `min(4096, end of the last part)` bytes of the host file after this record.
+- `mtimeMs`: host modification time. It moves `updatedAt` forward and gives the lag metric.
+- `parts`: at most 64, in order and contiguous. A part is `{ startOffset, endOffset, lines, plainBytes, objectBytes, plainSha256, objectKey }`.
+  Offsets are bytes of the plain file, cut at line ends. `plainBytes` equals `endOffset - startOffset` and is at most 64 MiB.
+  `objectKey` starts with `objects/v1/`. The writer uploads the object first and sends the record second.
+- `parts: []` records that this path holds a session that is stored already (a copy), with no new bytes.
+
+The answer is `{ flushGapSeconds, results: [...] }`, one result per record, in order, with HTTP `200` whatever the results
+are. A record is atomic and records do not depend on each other. A result is one of:
+
+- `{ status: "committed", created, partsAdded, cursor }`: the new parts are stored and the cursor moved.
+- `{ status: "duplicate", cursor }`: every part was stored already. Nothing changed. This is the answer to a retry after a lost answer.
+- `{ status: "conflict", reason, cursor }`: refused. Nothing changed. `cursor` is where the session stands (`null`: unknown). Reasons:
+  - `gap`: the first part starts after the cursor. Read again from `cursor.committedBytes`. For an unknown session the cursor is `null`: start at byte 0.
+  - `overlap`: a part starts before the cursor and is not a repeat of the stored part (same end, same `plainSha256`).
+  - `rewritten`: a path that holds the session has another head than the stored one (the file was rewritten). Send `generation + 1` from byte 0.
+  - `generation_start`: a new generation must start at byte 0 and carry parts.
+  - `stale_generation`: the generation is older than the stored one.
+  - `other_copy`: the session is stored from another path, and this path holds a different file under the same id (its head differs). Nothing is stored and the path is not recorded. Skip this copy. A path that does not hold the session cannot start a new generation, so two diverged copies never take turns.
+  - `object_missing`: the gateway checked the part object in the object store and did not find it (only when the check is set up). Upload again.
+- `{ status: "invalid", error }`: the record is malformed (a bug of the writer, not a race). Do not retry it unchanged.
+
+A head shorter than 4 KiB grows with the file, so it cannot tell a rewrite or another copy. The head check applies once 4 KiB are stored.
+
+Errors of the whole request: `400` (body is not JSON, `files` is missing, empty or too long, a cursor entry is malformed),
+`401`, `404` (feature off), `413` (body over 4 MiB), `503` with `Retry-After: 5` (database or object store check failed: back off and retry).
+
+Metrics (gateway `/metrics`): `ais_sessions_ingest_requests_total{route,outcome}`, `ais_sessions_ingest_seconds`,
+`ais_sessions_ingest_total{outcome}` (`committed`, `duplicate`, `conflict`, `invalid`, `object_missing`),
+`ais_sessions_ingest_parts_total`, `ais_sessions_ingest_bytes_total{kind="plain|object"}`,
+`ais_sessions_ingest_errors_total{kind}` (`store`, `auth`, `body`, `object_check`) and `ais_sessions_ingest_lag_seconds`
+(host modification time to commit). No label holds a path, a session id or a token.
+
 ### Auth
 
 `GET /api/auth`

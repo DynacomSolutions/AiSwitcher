@@ -11,6 +11,11 @@ export const CHAT_OUTCOME_LABELS = ["ok", "cancelled", "error"] as const;
 export const CHAT_ERROR_KINDS = ["pod_start", "attach", "agent_exit", "acp", "timeout", "limit", "rate_limit", "close_binding", "resume_failed", "store", "owner_unreachable", "limit", "other"] as const;
 /** Event labels of ais_gateway_favourites_total. `other` is the overflow label. */
 export const FAVOURITE_EVENTS = ["socket_list", "socket_set", "http_get", "http_post", "change", "push", "refused", "rate_limited", "error", "pool_migrated"] as const;
+/** Fixed label sets of the session ingest metrics (admin-sessions.ts). `other` is the overflow label. */
+export const SESSIONS_ROUTES = ["ping", "cursors", "ingest"] as const;
+export const SESSIONS_REQUEST_OUTCOMES = ["ok", "bad_request", "too_large", "unavailable", "error"] as const;
+export const SESSIONS_RECORD_OUTCOMES = ["committed", "duplicate", "conflict", "invalid", "object_missing"] as const;
+export const SESSIONS_ERROR_KINDS = ["store", "auth", "body", "object_check"] as const;
 /** Counters the proxy reports. `PrometheusMetrics` is the production implementation. */
 export interface GatewayMetrics {
   request(e: {
@@ -46,6 +51,16 @@ export interface GatewayMetrics {
   /** A starred-model event: a socket or HTTP call, a change that flipped a star, a frame pushed to a panel, or an error. Unknown values are counted as "other". */
   /** `reason` is set for `refused`: `stale` or `cap`. */
   favourite?(event: string, reason?: string): void;
+  /** One request to a session ingest route. `route` and `outcome` come from fixed sets (SESSIONS_ROUTES, SESSIONS_REQUEST_OUTCOMES). */
+  sessionsRequest?(route: string, outcome: string, seconds: number): void;
+  /** The result of one file record of an ingest request (SESSIONS_RECORD_OUTCOMES). */
+  sessionsRecord?(outcome: string): void;
+  /** Parts stored by one ingest request, with their plain and object bytes. */
+  sessionsParts?(parts: number, plainBytes: number, objectBytes: number): void;
+  /** Seconds from the host modification time of a file to the commit of its new parts. */
+  sessionsLag?(seconds: number): void;
+  /** An ingest error that is not a refusal of the writer (SESSIONS_ERROR_KINDS). */
+  sessionsError?(kind: string): void;
   /** Media parts replaced by a text note because the provider refused the file they name (media-recovery.ts). */
   mediaRemoved?(app: string, parts: number): void;
   /** An error event inside a response that began with HTTP 200 (stream or body). Labels are bounded by the implementation. */
@@ -105,6 +120,35 @@ class Gauge {
   }
 }
 
+class Histogram {
+  private readonly counts: number[];
+  private count = 0;
+  private sum = 0;
+  constructor(readonly name: string, readonly help: string, private readonly buckets: readonly number[]) {
+    this.counts = buckets.map(() => 0);
+  }
+  observe(v: number): void {
+    this.count += 1;
+    this.sum += v;
+    this.buckets.forEach((b, i) => {
+      if (v <= b) this.counts[i] = (this.counts[i] ?? 0) + 1;
+    });
+  }
+  render(): string[] {
+    return [
+      `# HELP ${this.name} ${this.help}`,
+      `# TYPE ${this.name} histogram`,
+      ...this.buckets.map((b, i) => `${this.name}_bucket{le="${b}"} ${this.counts[i]}`),
+      `${this.name}_bucket{le="+Inf"} ${this.count}`,
+      `${this.name}_sum ${this.sum}`,
+      `${this.name}_count ${this.count}`,
+    ];
+  }
+}
+
+/** Seconds buckets for the ingest lag: from a quick flush to a long backfill. */
+const LAG_BUCKETS = [1, 5, 15, 30, 60, 120, 300, 900, 3600, 21600, 86400];
+
 /**
  * Prometheus text exposition. Labels are limited to app, provider, identity,
  * status, reason, kind and outcome, all drawn from configuration or fixed
@@ -143,6 +187,13 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly chatTurns = new Counter("ais_gateway_chat_turns_total", "Chat turns by outcome.");
   private readonly chatErrors = new Counter("ais_gateway_chat_errors_total", "Chat errors by kind.");
   private readonly favourites = new Counter("ais_gateway_favourites_total", "Starred-model events by event.");
+  private readonly sessionsRequests = new Counter("ais_sessions_ingest_requests_total", "Session ingest requests by route and outcome.");
+  private readonly sessionsRecords = new Counter("ais_sessions_ingest_total", "Session file records by outcome (committed, duplicate, conflict, invalid, object_missing).");
+  private readonly sessionsPartsTotal = new Counter("ais_sessions_ingest_parts_total", "Session parts stored.");
+  private readonly sessionsBytes = new Counter("ais_sessions_ingest_bytes_total", "Bytes of stored session parts, by kind (plain or object).");
+  private readonly sessionsErrors = new Counter("ais_sessions_ingest_errors_total", "Session ingest errors by kind (store, auth, body, object_check).");
+  private readonly sessionsSeconds = new Histogram("ais_sessions_ingest_seconds", "Time to answer a session ingest request.", BUCKETS);
+  private readonly sessionsLagSeconds = new Histogram("ais_sessions_ingest_lag_seconds", "Seconds from the host modification time of a session file to the commit of its new parts.", LAG_BUCKETS);
   private readonly podBucketCounts = BUCKETS.map(() => 0);
   private podCount = 0;
   private podSum = 0;
@@ -248,6 +299,32 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.favourites.inc(e === "refused" ? { event: e, reason: reason === "stale" || reason === "cap" ? reason : "other" } : { event: e });
   }
 
+  sessionsRequest(route: string, outcome: string, seconds: number): void {
+    this.sessionsRequests.inc({
+      route: (SESSIONS_ROUTES as readonly string[]).includes(route) ? route : "other",
+      outcome: (SESSIONS_REQUEST_OUTCOMES as readonly string[]).includes(outcome) ? outcome : "other",
+    });
+    this.sessionsSeconds.observe(seconds);
+  }
+
+  sessionsRecord(outcome: string): void {
+    this.sessionsRecords.inc({ outcome: (SESSIONS_RECORD_OUTCOMES as readonly string[]).includes(outcome) ? outcome : "other" });
+  }
+
+  sessionsParts(parts: number, plainBytes: number, objectBytes: number): void {
+    this.sessionsPartsTotal.inc({}, parts);
+    this.sessionsBytes.inc({ kind: "plain" }, plainBytes);
+    this.sessionsBytes.inc({ kind: "object" }, objectBytes);
+  }
+
+  sessionsLag(seconds: number): void {
+    this.sessionsLagSeconds.observe(Math.max(0, seconds));
+  }
+
+  sessionsError(kind: string): void {
+    this.sessionsErrors.inc({ kind: (SESSIONS_ERROR_KINDS as readonly string[]).includes(kind) ? kind : "other" });
+  }
+
   chatPodStart(seconds: number): void {
     this.podCount += 1;
     this.podSum += seconds;
@@ -338,7 +415,8 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors, this.favourites]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors, this.favourites, this.sessionsRequests, this.sessionsRecords, this.sessionsPartsTotal, this.sessionsBytes, this.sessionsErrors]) out.push(...c.render());
+    out.push(...this.sessionsSeconds.render(), ...this.sessionsLagSeconds.render());
     for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
