@@ -5,7 +5,7 @@ import type { ChatProvider } from "../../../../../src/browser/chat-protocol.ts";
 import { EMPTY_TEXT, FAVOURITES, LOCKED_HINT, favKey, menuKey, pickerRows, providerTabs, startTab, tabOrder } from "./picker.ts";
 import type { Fav, PickerEntry, PickerModel } from "./picker.ts";
 import { icon } from "./icons.ts";
-import { providerMark } from "./provider-icons.ts";
+import { providerIconSvg } from "./provider-icons.ts";
 
 export interface PickerHandlers {
   /** Called each time the popover opens, so the owner can ask for the catalogue. */
@@ -21,13 +21,10 @@ export const SEARCH_PLACEHOLDER = "Search models...";
 export const NO_PROVIDERS = "No providers are ready.";
 export const LOADING_HINT = "Loading providers";
 
-function mark(doc: Document, provider: ChatProvider | undefined): HTMLElement {
-  const m = providerMark(provider);
+function mark(doc: Document, provider: ChatProvider | undefined, size: number): HTMLElement {
   const s = doc.createElement("span");
   s.className = "provider-mark";
-  s.textContent = m.text;
-  s.style.background = m.colour;
-  s.setAttribute("aria-hidden", "true");
+  s.append(providerIconSvg(doc, provider, size));
   return s;
 }
 
@@ -47,8 +44,9 @@ export function createPicker(doc: Document, h: PickerHandlers, label: string): P
   button.setAttribute("aria-haspopup", "dialog");
   button.setAttribute("aria-expanded", "false");
   button.setAttribute("aria-label", label);
-  const buttonMark = el(doc, "span", "provider-mark");
-  buttonMark.setAttribute("aria-hidden", "true");
+  const buttonMark = mark(doc, undefined, 16);
+  // The mark of an unknown provider is on the button until a selection arrives.
+  let markProvider: ChatProvider | undefined;
   const buttonText = el(doc, "span", "picker-label");
   button.append(buttonMark, buttonText, icon(doc, "chevron-down", 16));
 
@@ -93,7 +91,7 @@ export function createPicker(doc: Document, h: PickerHandlers, label: string): P
   pop.append(side, main);
   root.append(button, effortWrap, pop);
 
-  let model: PickerModel = { button: { providerIcon: "?", label: "" }, groups: [], efforts: [], loading: true };
+  let model: PickerModel = { button: { label: "" }, groups: [], efforts: [], loading: true };
   let sig = "";
   let open = false;
   let effortOpen = false;
@@ -151,7 +149,7 @@ export function createPicker(doc: Document, h: PickerHandlers, label: string): P
       tabs.push(b);
     };
     tab(FAVOURITES, "Favourites", icon(doc, "star", 18));
-    for (const t of providerTabs(model)) tab(t.provider, t.name, mark(doc, t.provider));
+    for (const t of providerTabs(model)) tab(t.provider, t.name, mark(doc, t.provider, 20));
     side.replaceChildren(...tabs);
   };
 
@@ -182,7 +180,10 @@ export function createPicker(doc: Document, h: PickerHandlers, label: string): P
       group.setAttribute("role", "group");
       if (s.heading !== null) {
         group.setAttribute("aria-label", s.heading);
-        group.append(el(doc, "div", "picker-heading", s.heading));
+        const head = el(doc, "div", "picker-heading");
+        if (s.provider !== undefined) head.append(mark(doc, s.provider, 14));
+        head.append(el(doc, "span", "picker-heading-text", s.heading));
+        group.append(head);
       }
       for (const e of s.entries) {
         index += 1;
@@ -368,8 +369,10 @@ export function createPicker(doc: Document, h: PickerHandlers, label: string): P
     root, button, effortButton,
     update(m) {
       model = m;
-      buttonMark.textContent = m.button.providerIcon;
-      buttonMark.style.background = providerMark(m.groups.find(g => g.identities.some(i => i.selected))?.provider).colour;
+      if (m.button.provider !== markProvider) {
+        markProvider = m.button.provider;
+        buttonMark.replaceChildren(providerIconSvg(doc, markProvider, 16));
+      }
       if (buttonText.textContent !== m.button.label) buttonText.textContent = m.button.label;
       effortWrap.hidden = m.efforts.length === 0;
       const effortLabel = m.effort ?? "Effort";

@@ -9,6 +9,7 @@ import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } fr
 import { defaultChatTabs, splitPartners } from "../../shared/split-view.ts";
 import { addableTabs, chipsFor } from "./chips.ts";
 import { composerMode, createComposer } from "./composer.ts";
+import { providerIconSvg } from "./provider-icons.ts";
 import type { Composer } from "./composer.ts";
 import { buildFeed } from "./feed.ts";
 import { renderFeed } from "./feed-view.ts";
@@ -117,7 +118,7 @@ export function checkSelection(x: ChatSelection | undefined, catalog: ChatCatalo
 }
 
 interface Row {
-  node: HTMLElement; bar: HTMLElement; open: HTMLButtonElement; title: HTMLElement; sub: HTMLElement; dot: HTMLElement;
+  node: HTMLElement; bar: HTMLElement; open: HTMLButtonElement; title: HTMLElement; sub: HTMLElement; mark: HTMLElement; markProvider?: ChatSelection["provider"]; dot: HTMLElement;
   rename: HTMLButtonElement; close: HTMLButtonElement; renameForm: HTMLElement; renameBox: HTMLInputElement; confirm: HTMLElement; cancelClose: HTMLButtonElement;
 }
 interface Chip { node: HTMLElement; label: HTMLElement; remove: HTMLButtonElement; tabId: number }
@@ -417,7 +418,10 @@ export class ChatTab {
     const main = el(doc, "div", "row-main");
     const open = button(doc, "", "row-open", () => this.select(chatId));
     const title = el(doc, "span", "title"), sub = el(doc, "span", "sub"), dot = el(doc, "span", "dot", "New");
-    open.append(title, sub, dot);
+    const mark = el(doc, "span", "provider-mark");
+    const subLine = el(doc, "span", "sub-line");
+    subLine.append(mark, sub);
+    open.append(title, subLine, dot);
     const renameBox = el(doc, "input", "rename-box");
     renameBox.type = "text";
     renameBox.maxLength = MAX_CHAT_NAME;
@@ -461,7 +465,7 @@ export class ChatTab {
     const actions = el(doc, "div", "row-actions");
     actions.append(rename, close);
     node.append(bar, main, actions);
-    const row: Row = { node, bar, open, title, sub, dot, rename, close, renameForm, renameBox, confirm, cancelClose: cancelBtn };
+    const row: Row = { node, bar, open, title, sub, mark, dot, rename, close, renameForm, renameBox, confirm, cancelClose: cancelBtn };
     return row;
   }
 
@@ -480,6 +484,10 @@ export class ChatTab {
     row.bar.style.background = r.colour;
     this.setText(row.title, r.name);
     this.setText(row.sub, `${r.provider} / ${STATE_LABEL[r.state]}`);
+    if (row.markProvider !== r.provider) {
+      row.markProvider = r.provider;
+      row.mark.replaceChildren(providerIconSvg(this.d.doc, r.provider, 14));
+    }
     row.dot.hidden = !r.unread;
     row.rename.setAttribute("aria-label", `Rename ${r.name}`);
     row.close.setAttribute("aria-label", `Close ${r.name}`);

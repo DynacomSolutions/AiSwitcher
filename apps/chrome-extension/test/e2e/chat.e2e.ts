@@ -603,7 +603,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       expect(lcard.b).toBeGreaterThan(600); // the card sits at the bottom of the 760 px panel
       expect(await Q.eval<boolean>(`document.querySelector("${list} .composer-send").disabled`)).toBe(true); // empty box
       await sleep(300);
-      await shot("composer-g-new-chat-r3", Q);
+      await shot("composer-g-new-chat-r4", Q);
 
       // The picker opens above the card, inside the panel. Choose Claude Sonnet 5.5 of alpha.
       await clickUntil(Q, "list picker button", ".chat-list .picker-button");
@@ -614,7 +614,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       expect(lpop.y).toBeGreaterThanOrEqual(0);
       expect(lpop.x).toBeGreaterThanOrEqual(0);
       expect(lpop.r).toBeLessThanOrEqual(400);
-      await shot("composer-h-new-chat-picker-r3", Q);
+      await shot("composer-h-new-chat-picker-r4", Q);
       await Q.eval(`[...document.querySelectorAll(".chat-list .picker-option")].find(b => b.textContent.startsWith("Claude Sonnet 5.5")).click()`);
       await until("Sonnet chosen", () => Q.eval<boolean>(`document.querySelector(".chat-list .picker-button").textContent.includes("Claude Sonnet 5.5")`));
 
@@ -629,7 +629,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       expect(await chips(Q)).toEqual(["Page A"]);
       await until("reply to the first prompt", async () => (await replyOf(name)) === "Hello from the new chat screen", 240_000);
       await turnDone(name);
-      await shot("composer-i-new-chat-sent-r3", Q);
+      await shot("composer-i-new-chat-sent-r4", Q);
 
       const detail = ".chat-detail:not([hidden])";
       const rect = (sel: string) => Q.eval<{ x: number; y: number; w: number; h: number; r: number; b: number }>(`(() => { const e = document.querySelector(${JSON.stringify(`${detail} ${sel}`)}); const { left, top, width, height, right, bottom } = e.getBoundingClientRect(); return { x: left, y: top, w: width, h: height, r: right, b: bottom }; })()`);
@@ -645,7 +645,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       for (const r of [box, pick, send]) expect(r.x >= card.x && r.r <= card.r && r.y >= card.y && r.b <= card.b).toBe(true);
       expect(await Q.eval<string>(`getComputedStyle(document.querySelector("${detail} .composer-card")).borderRadius`)).toBe("16px");
       expect(await Q.eval<string>(`document.querySelector("${detail} .composer .picker-button").textContent`)).toContain("Claude Sonnet 5.5");
-      await shot("composer-a-empty-r1", Q);
+      await shot("composer-a-empty-r4", Q);
 
       // (b) the picker open on a provider tab: the popover is above the box and inside the panel.
       await clickIn(Q, `${detail} .composer .picker-button`);
@@ -659,7 +659,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       expect(await Q.eval<boolean>(`document.activeElement.classList.contains("picker-search-input")`)).toBe(true);
       expect(await Q.eval<string[]>(`[...document.querySelectorAll("${detail} .picker-tab")].map(t => t.getAttribute("aria-label") + ":" + t.getAttribute("aria-selected"))`)).toEqual(["Favourites:false", "Claude:true", "Codex:false", "Kimi:false"]);
       expect(await Q.eval<string>(`document.querySelector("${detail} .picker-row[data-highlighted='true']").textContent`)).toContain("Claude Sonnet 5.5");
-      await shot("composer-b-picker-open-r1", Q);
+      await shot("composer-b-picker-open-r4", Q);
 
       // (c) a search: results from two providers under headers. Typed with the keyboard, the box has focus.
       await Q.send("Input.insertText", { text: "5" });
@@ -668,7 +668,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       expect(heads.some(h => h.startsWith("Claude"))).toBe(true);
       expect(heads.some(h => h.startsWith("Codex"))).toBe(true);
       await sleep(300);
-      await shot("composer-c-search-r1", Q);
+      await shot("composer-c-search-r4", Q);
 
       // (d) one favourite, shown on the Favourites tab and kept in local storage.
       await Q.eval(`document.querySelector("${detail} [aria-label='Add Claude Opus 5.5 to favourites']").click()`);
@@ -676,7 +676,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       await clickIn(Q, `${detail} .picker-tab`, "Favourites");
       await until("favourite listed", () => Q.eval<boolean>(`[...document.querySelectorAll("${detail} .picker-option")].map(o => o.textContent).join() === "Claude Opus 5.5claude-opus-5-5"`));
       await sleep(300);
-      await shot("composer-d-favourites-r1", Q);
+      await shot("composer-d-favourites-r5", Q);
       // The star went to the gateway, and a change made there (a host daemon does it for T3 Code) shows in the open picker.
       const adminFavs = async (init?: RequestInit) => (await (await fetch(`http://127.0.0.1:${gatewayPorts.adminPort}/favourites`, { ...init, headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" } })).json()) as { seq: number; items: Array<{ provider: string; identity: string; model: string }> };
       expect((await adminFavs()).items).toEqual([{ provider: "claude", identity: "alpha", model: "claude-opus-5-5" }]);
@@ -693,7 +693,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       await say(Q, name, "slow");
       await until("Stop shown", () => Q.eval<boolean>(`document.querySelector("${detail} .composer .composer-stop")?.hidden === false && document.querySelector("${detail} .composer .composer-send").hidden === true`), 90_000);
       await sleep(300);
-      await shot("composer-f-running-stop-r1", Q);
+      await shot("composer-f-running-stop-r4", Q);
       await clickIn(Q, `${detail} .composer .composer-stop`, "Stop");
       await until("idle after Stop", async () => (await stateOf(name)) === "idle", 60_000);
 
@@ -704,7 +704,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       await until("effort menu", () => Q.eval<boolean>(`!document.querySelector("${detail} .picker-effort-menu").hidden`));
       expect(await Q.eval<string[]>(`[...document.querySelectorAll("${detail} .picker-effort-menu [role=menuitemradio]")].map(i => i.textContent)`)).toEqual(["low", "high"]);
       await sleep(300);
-      await shot("composer-e-effort-menu-r1", Q);
+      await shot("composer-e-effort-menu-r4", Q);
       await key(Q, "Escape");
       await until("effort menu closed", () => Q.eval<boolean>(`document.querySelector("${detail} .picker-effort-menu").hidden`));
 
