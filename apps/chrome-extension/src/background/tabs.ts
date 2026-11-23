@@ -31,6 +31,8 @@ const SHRINK_COMMIT_MS = 10_000;
 const HANDOVER_MAX_AGE_MS = 5 * 60_000;
 /** No call for this long: the session is treated as ended, its grants are revoked and it is dropped when it holds no tabs. */
 export const SESSION_END_MS = 30 * 60_000;
+/** A removal and a replacement of the same tab id that arrive within this time belong together. */
+const REPLACE_WINDOW_MS = 2000;
 const COLORS: GroupColor[] = ["blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
 
 /** Stable colour per identity: FNV-1a hash into the palette. */
@@ -112,7 +114,12 @@ export class TabManager {
   private readonly requests = new Set<number>();
 
   constructor(private readonly api: ChromeApi, private readonly now: () => number = Date.now) {
-    api.tabs.onRemoved(tabId => { this.forget(tabId); this.scheduleSavedRefresh(); });
+    api.tabs.onRemoved(tabId => {
+      // Chrome may send onRemoved for the id that onReplaced just retired: the tab lives on under its new id.
+      if (!this.recentlyReplaced(tabId)) this.forget(tabId, true);
+      this.scheduleSavedRefresh();
+    });
+    api.tabs.onReplaced((addedTabId, removedTabId) => this.replaced(addedTabId, removedTabId));
     api.tabGroups.onUpdated(() => this.scheduleSavedRefresh());
   }
 
@@ -727,13 +734,13 @@ export class TabManager {
    * The user approved: checks every rule again, then the group becomes the own group of the session. Every tab is adopted and approved.
    * No tab is moved, closed, reloaded or activated. The agent record is written at once.
    */
-  takeGroup(ref: SessionRef, groupId: number, counted: number[]): Promise<RequestCheck> {
-    const run = this.reclaiming.then(() => this.serial(ref.id, () => this.takeNow(ref, groupId, counted)), () => this.serial(ref.id, () => this.takeNow(ref, groupId, counted)));
+  takeGroup(ref: SessionRef, groupId: number, counted: number[], allowClose = false): Promise<RequestCheck> {
+    const run = this.reclaiming.then(() => this.serial(ref.id, () => this.takeNow(ref, groupId, counted, allowClose)), () => this.serial(ref.id, () => this.takeNow(ref, groupId, counted, allowClose)));
     this.reclaiming = run.then(() => {}, () => {});
     return run;
   }
 
-  private async takeNow(ref: SessionRef, groupId: number, counted: number[]): Promise<RequestCheck> {
+  private async takeNow(ref: SessionRef, groupId: number, counted: number[], allowClose: boolean): Promise<RequestCheck> {
     this.session(ref);
     const c = await this.checkRequest(ref, groupId);
     if (!c.ok || c.already) return c;
@@ -742,6 +749,11 @@ export class TabManager {
     // Only the tabs the user saw in the prompt may be taken. Removed tabs are fine. A new tab means the user approved something else.
     if (members.some(t => !counted.includes(t.id))) return { ok: false, code: "forbidden_tab", message: "The group changed while the prompt was open. Ask again." };
     const created = new Set<number>(); // tabs the old own-group session made itself: they stay owned, not adopted
+    const protectedTabs = new Set<number>(); // tabs an earlier approval protected: allowClose never removes that
+    for (const [id, o] of this.sessions) {
+      if (id !== ref.id) for (const t of members) if (o.approved?.has(t.id)) protectedTabs.add(t.id);
+    }
+    for (const r of this.agents.values()) for (const t of r.tabs) if (t.approved === true && members.some(m => m.id === t.id)) protectedTabs.add(t.id);
     for (const [id, o] of [...this.sessions]) {
       if (id === ref.id) continue;
       if (o.groupId === groupId && o.identity === ref.identity) for (const t of members) if (o.tabIds.has(t.id) && !o.adopted.has(t.id)) created.add(t.id);
@@ -751,8 +763,12 @@ export class TabManager {
     }
     const s = this.session(ref);
     s.groupId = groupId;
-    s.approved ??= new Set();
-    for (const t of members) { s.tabIds.add(t.id); if (!created.has(t.id)) s.adopted.add(t.id); s.approved.add(t.id); }
+    for (const t of members) {
+      s.tabIds.add(t.id);
+      const keep = !allowClose || protectedTabs.has(t.id) || s.approved?.has(t.id) === true;
+      // allowClose: the tab is owned like a created tab (close_tab works, the session end closes it), unless an earlier approval protected it.
+      if (keep) { s.approved ??= new Set(); s.approved.add(t.id); if (!created.has(t.id)) s.adopted.add(t.id); }
+    }
     this.persist();
     await this.refreshAgents();
     return c;
@@ -920,8 +936,83 @@ export class TabManager {
     return undefined;
   }
 
-  /** Drop a tab from every session (tab closed, by the user or by us). */
-  forget(tabId: number): void {
+  /** Old tab ids that Chrome replaced, with the time of the replacement. */
+  private readonly replacedAt = new Map<number, number>();
+  /** Memory of tabs that a removal event dropped, kept briefly in case onReplaced arrives after onRemoved. */
+  private readonly tombstones = new Map<number, { at: number; sessions: Array<{ id: string; adopted: boolean; approved: boolean; owned: boolean; whole?: SessionTabs }>; links: string[] }>();
+
+  private recentlyReplaced(tabId: number): boolean {
+    const at = this.replacedAt.get(tabId);
+    if (at === undefined) return false;
+    if (this.now() - at <= REPLACE_WINDOW_MS) return true;
+    this.replacedAt.delete(tabId);
+    return false;
+  }
+
+  /**
+   * Chrome gave a tab a new id (prerender activation, restore of a discarded tab). The tab keeps its place in every session, grant, saved group,
+   * agent record and chat link. An unknown old id changes nothing, unless a removal of that id arrived a moment ago: then the tab is restored.
+   */
+  replaced(addedTabId: number, removedTabId: number): void {
+    if (addedTabId === removedTabId) return;
+    const now = this.now();
+    for (const [id, at] of this.replacedAt) if (now - at > REPLACE_WINDOW_MS) this.replacedAt.delete(id);
+    for (const [id, t] of this.tombstones) if (now - t.at > REPLACE_WINDOW_MS) this.tombstones.delete(id);
+    let touched = false;
+    const swapSet = (set: Set<number> | undefined): boolean => {
+      if (!set || !set.has(removedTabId)) return false;
+      set.delete(removedTabId); set.add(addedTabId);
+      return true;
+    };
+    for (const s of this.sessions.values()) {
+      if (swapSet(s.tabIds)) touched = true;
+      swapSet(s.adopted);
+      swapSet(s.approved);
+    }
+    const tomb = this.tombstones.get(removedTabId);
+    if (!touched && tomb) {
+      // onRemoved came first and dropped the tab: put it back.
+      for (const t of tomb.sessions) {
+        let s = this.sessions.get(t.id);
+        if (!s && t.whole) { s = t.whole; this.sessions.set(t.id, s); }
+        if (!s) continue;
+        s.tabIds.add(addedTabId);
+        if (t.adopted) s.adopted.add(addedTabId);
+        if (t.approved) (s.approved ??= new Set()).add(addedTabId);
+        touched = true;
+      }
+      for (const id of tomb.links) { const set = this.links.get(id) ?? new Set<number>(); set.add(addedTabId); this.links.set(id, set); touched = true; }
+    }
+    this.tombstones.delete(removedTabId);
+    const changed: string[] = [];
+    for (const [id, set] of this.links) if (swapSet(set)) { changed.push(id); touched = true; }
+    let savedChanged = false;
+    for (const g of this.saved.values()) {
+      const i = g.tabIds.indexOf(removedTabId);
+      if (i !== -1) { g.tabIds[i] = addedTabId; savedChanged = true; touched = true; }
+    }
+    let agentsChanged = false;
+    for (const r of this.agents.values()) for (const t of r.tabs) if (t.id === removedTabId) { t.id = addedTabId; agentsChanged = true; touched = true; }
+    if (!touched) return;
+    this.replacedAt.set(removedTabId, now);
+    this.persist();
+    if (savedChanged) void this.persistSaved();
+    if (agentsChanged) void this.persistAgents();
+    for (const id of changed) this.linksChanged(id);
+    this.scheduleSavedRefresh();
+  }
+
+  /** Drop a tab from every session (tab closed, by the user or by us). `remember`: keep a short memory of it, for an onReplaced that follows. */
+  forget(tabId: number, remember = false): void {
+    const tomb: { at: number; sessions: Array<{ id: string; adopted: boolean; approved: boolean; owned: boolean; whole?: SessionTabs }>; links: string[] } = { at: this.now(), sessions: [], links: [] };
+    for (const [id, set] of this.links) if (set.has(tabId)) tomb.links.push(id);
+    for (const [id, s] of this.sessions) {
+      if (!s.tabIds.has(tabId)) continue;
+      const entry: { id: string; adopted: boolean; approved: boolean; owned: boolean; whole?: SessionTabs } = { id, adopted: s.adopted.has(tabId), approved: s.approved?.has(tabId) === true, owned: true };
+      if (s.tabIds.size === 1 && !this.queues.has(id) && this.grantedGroups(id).length === 0) entry.whole = { ...s, tabIds: new Set(), adopted: new Set(), ...(s.approved ? { approved: new Set<number>() } : {}) };
+      tomb.sessions.push(entry);
+    }
+    if (remember && (tomb.sessions.length > 0 || tomb.links.length > 0)) this.tombstones.set(tabId, tomb);
     for (const [id, s] of this.sessions) {
       s.tabIds.delete(tabId);
       s.adopted.delete(tabId);

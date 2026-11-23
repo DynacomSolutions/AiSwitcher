@@ -23,6 +23,7 @@ export class PopupGuard {
 
   constructor(private readonly api: ChromeApi, private readonly tabs: TabManager, private readonly now: () => number = Date.now, private readonly wait = sleep) {
     api.tabs.onActivated((tabId, windowId) => this.activated(tabId, windowId));
+    api.tabs.onReplaced((added, removed) => this.replaced(added, removed));
     api.tabs.onCreated(tab => { void this.created(tab).catch(() => {}); });
     api.debugger.onEvent((tabId, method, _params, sessionId) => { if (method === "Page.windowOpen" && sessionId === undefined) this.windowOpen(tabId); });
   }
@@ -37,6 +38,13 @@ export class PopupGuard {
     if (current === tabId) return;
     if (current !== undefined) this.previous.set(windowId, current);
     this.active.set(windowId, tabId);
+  }
+
+  /** Chrome gave a tab a new id: the guard follows it. */
+  replaced(added: number, removed: number): void {
+    for (const [w, id] of this.active) if (id === removed) this.active.set(w, added);
+    for (const [w, id] of this.previous) if (id === removed) this.previous.set(w, added);
+    for (const p of this.pending) if (p.source === removed) p.source = added;
   }
 
   windowOpen(tabId: number): void {
