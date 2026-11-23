@@ -265,15 +265,18 @@ async function gatewayManaged(toolName: "claude" | "codex", identityName: string
 /**
  * First sign-in of a gateway-managed identity: the gateway has no login for it yet. The login goes into the credential store
  * first (compare-and-swap, new rows), and a failed push is an "error": the folder is left as signed in and nothing else
- * changes. Then route-all (afterLogin) puts the gateway entry into the folder like for an existing member, from a short-lived
- * member-store copy that is removed again afterwards, so the console pod keeps no second login of the account.
+ * changes. Then route-all (afterLogin) puts the gateway entry into the folder like for an existing member, from a member-store
+ * copy equal to the pushed rows. That copy stays in place (see the comment in the body: it is the host sync mirror of the rows).
  */
 async function adoptFirstLogin(toolName: "claude" | "codex", identityName: string, configDir: string, folder: string, root: string, opts: RouteAllOptions, gatewayKey: string | undefined, store: AdoptStoreOptions): Promise<AdoptResult | undefined> {
   const { managed, key } = await gatewayManaged(toolName, identityName, opts, gatewayKey);
   if (!managed) return undefined;
   const push = await pushFirstLogin(toolName, identityName, configDir, { root, ...(opts.home ? { home: opts.home } : {}), ...(opts.secretsPath ? { secretsPath: opts.secretsPath } : {}), ...store });
   if (!push.ok) return adoptError(`the login could not be saved to the gateway store (${push.note})`);
-  // The seed holds exactly the files just pushed; route-all needs a member copy to find the account (hasMemberCopy).
+  // The member copy holds exactly the files just pushed; route-all needs it to find the account (hasMemberCopy). It stays after
+  // the push: it equals the store rows, and on a host the member root is the sync mirror of those rows (the console pod mounts
+  // the real ~/.ais), so deleting it removed the host's own copy and the mirror, which only writes on a row change, never
+  // restored the account record (.claude.json, the email). Only a copy that could not be written in full is removed again.
   const dir = memberDir(toolName, identityName, root);
   const files = toolName === "claude" ? [".claude.json", memberLoginFile(toolName)] : [memberLoginFile(toolName)];
   try {
@@ -284,13 +287,16 @@ async function adoptFirstLogin(toolName: "claude" | "codex", identityName: strin
       await writeFile(`${dir}/${file}`, content, { mode: 0o600 });
       await chmod(`${dir}/${file}`, 0o600);
     }
+  } catch (err) {
+    for (const file of files) await rm(`${dir}/${file}`, { force: true }).catch(() => undefined);
+    await rmdir(dir).catch(() => undefined);
+    return adoptError(`the gateway entry could not be written (${err instanceof Error ? err.name : "error"}); the gateway store already holds the login`);
+  }
+  try {
     const result = await routeAdopted(toolName, identityName, folder, root, { ...opts, storePush: opts.storePush ?? (async () => "the login was already saved to the PostgreSQL store") }, key, true);
     return result?.outcome === "error" ? { ...result, message: `${result.message} (the gateway store already holds the login; the folder still holds it too)` } : result;
   } catch (err) {
     return adoptError(`the gateway entry could not be written (${err instanceof Error ? err.name : "error"}); the gateway store already holds the login`);
-  } finally {
-    for (const file of files) await rm(`${dir}/${file}`, { force: true }).catch(() => undefined);
-    await rmdir(dir).catch(() => undefined);
   }
 }
 
