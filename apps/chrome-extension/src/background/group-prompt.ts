@@ -23,13 +23,19 @@ export class GroupPrompt<M = unknown> {
   /** Popup windows that the worker opened for a request: tab id to request id. Only these tabs may answer. */
   private readonly popupTabs = new Map<number, string>();
   private readonly listeners: Array<() => void> = [];
+  /** The last focused normal window. Cached so the click handler needs no await before sidePanel.open. */
+  private windowId: number | undefined;
 
   constructor(private readonly api: ChromeApi, private readonly newId: () => string = () => crypto.randomUUID(), private readonly now: () => number = () => Date.now()) {
     // Registered when the worker starts, so the listeners exist when Chrome wakes it for a click.
     api.notifications.onButtonClicked((id, index) => this.settle(id, index === 0 ? "approve" : "deny"));
     // A close that the user did not cause (the system moved it away) leaves the request pending in the side panel.
     api.notifications.onClosed((id, byUser) => { if (byUser) this.settle(id, "closed"); });
-    api.notifications.onClicked(id => { void this.open(id); });
+    api.notifications.onClicked(id => { this.open(id); });
+    // The side panel can open only inside the click handler, so the window id is known before the click.
+    api.panel.onWindowFocused(windowId => { this.windowId = windowId; });
+    api.panel.onWindowRemoved(windowId => { if (this.windowId === windowId) this.windowId = undefined; });
+    void api.panel.lastFocusedWindowId().then(windowId => { if (this.windowId === undefined) this.windowId = windowId; }, () => {});
     api.tabs.onRemoved(tabId => { this.popupTabs.delete(tabId); });
   }
 
@@ -46,17 +52,23 @@ export class GroupPrompt<M = unknown> {
   /** The request that a popup tab was opened for. */
   popupRequestId(tabId: number): string | undefined { return this.popupTabs.get(tabId); }
 
-  /** Shows the request in the side panel of the last focused window, else in a popup window. Only a human click on the notification calls this. */
-  async open(id: string): Promise<void> {
+  /** Shows the request in the side panel of the last focused window, else in a popup window. Only a human click on the notification calls this.
+   *  It must stay synchronous up to sidePanel.open: any await before it loses the user gesture. */
+  open(id: string): void {
     if (!this.pending.has(id)) return;
-    try {
-      const windowId = await this.api.panel.lastFocusedWindowId();
-      if (windowId === undefined) throw new Error("no window");
-      await this.api.panel.openSidePanel(windowId);
-    } catch {
-      const tabId = await this.api.panel.openPopup(`${POPUP_PATH}?id=${encodeURIComponent(id)}`, POPUP_SIZE).catch(() => undefined);
-      if (tabId !== undefined) this.popupTabs.set(tabId, id);
-    }
+    const windowId = this.windowId;
+    if (windowId === undefined) { void this.openPopup(id, windowId); return; }
+    let opened: Promise<void>;
+    try { opened = this.api.panel.openSidePanel(windowId); } catch { opened = Promise.reject(new Error("refused")); }
+    opened.catch(() => this.openPopup(id, windowId));
+  }
+
+  private async openPopup(id: string, windowId: number | undefined): Promise<void> {
+    if (!this.pending.has(id)) return;
+    const bounds = windowId === undefined ? undefined : await this.api.panel.windowBounds(windowId).catch(() => undefined);
+    const place = bounds ? { left: Math.round(bounds.left + (bounds.width - POPUP_SIZE.width) / 2), top: Math.round(bounds.top + (bounds.height - POPUP_SIZE.height) / 2) } : {};
+    const tabId = await this.api.panel.openPopup(`${POPUP_PATH}?id=${encodeURIComponent(id)}`, { ...POPUP_SIZE, ...place }).catch(() => undefined);
+    if (tabId !== undefined) this.popupTabs.set(tabId, id);
   }
 
   /** The pending request of this session for this group. */

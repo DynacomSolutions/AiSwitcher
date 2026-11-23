@@ -227,7 +227,7 @@ ETA: 2026-11-20 14:00 ICT
 | 246 | Kimi and Grok threads snooze at a usage limit and resume at the reset | blocked | agent | acp-limit-snooze | 5.229 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/657 (8141866).<br>Host runs v0.5.85.<br>Waits on the first real Kimi or Grok usage limit to prove snooze and resume. |
 | 255 | Usage collector: Grok log re-read (~0.9 GB per cycle) | todo | | | 5.133 | | Split from 5.133.<br>Each cycle re-reads the whole Grok log. |
 ## 6. Browser control extension
-ETA: 2026-11-23 16:00 ICT
+ETA: 2026-11-23 16:30 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -260,7 +260,8 @@ ETA: 2026-11-23 16:00 ICT
 | 269 | AIS Browser: a dead restored session never counts as live | done | claude | browser-stale-holder | 6.268 | | After an extension reload, dead sessions counted as live, so request_group refused.<br>A new session of the same chat now takes the group from a dead session.<br>Merged and live-verified 2026-11-23: ContractFinder group saved, 100 tabs, 50 splits. |
 | 284 | AIS Browser: keep a tab when Chrome replaces it (new tab id) | done | claude | browser-tab-replaced | 6.269 | | Live: one ContractFinder tab got a new id and left sessionTabs.<br>The extension had no tabs.onReplaced listener.<br>request_group allowClose: an agent closes a group after the user approves it.<br>Merged in PR 717, released in v0.5.96. |
 | 285 | AIS Browser: harden tab replace and allowClose | done | claude | browser-replace-hardening | 6.284 | | Review notes from PR 717.<br>Ignore a replace into a known tab, refuse allowClose while an approval record is unlinked.<br>Merged in PR 719. |
-| 286 | AIS Browser: approve group requests in the side panel and from a notification click | in_review | claude | browser-approve-ui | 6.284 | 2026-11-23 16:00 ICT | macOS hid the notification buttons, so the owner could not approve.<br>Body click opens the request, side panel lists pending requests. |
+| 286 | AIS Browser: approve group requests in the side panel and from a notification click | done | claude | browser-approve-ui | 6.284 | | Merged in PR 720, released in v0.5.97. |
+| 287 | AIS Browser: side panel from notification click, close_tab on frozen tabs | in_review | claude | browser-panel-gesture | 6.286 | 2026-11-23 16:30 ICT | macOS opened a full-screen popup.<br>sidePanel.open lost the user gesture after an await.<br>close_tab no longer attaches to discarded or unresponsive tabs. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-15 23:00 ICT

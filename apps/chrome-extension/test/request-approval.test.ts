@@ -57,10 +57,10 @@ describe("pending group requests", () => {
 
   test("a notification body click opens the side panel of the last focused window", async () => {
     const t = setup(5000);
-    t.api.focusedWindowId = 4;
     const { gid } = await userGroup(t.api);
     const pending = t.call("request_group", { groupId: gid });
     await until(() => t.api.shown.size === 1);
+    t.api.focusWindow(4);
     t.api.clickNotificationBody();
     await until(() => t.api.sidePanelOpened.length === 1);
     expect(t.api.sidePanelOpened).toEqual([4]);
@@ -79,6 +79,54 @@ describe("pending group requests", () => {
     await until(() => t.api.popupsOpened.length === 1);
     const id = t.executor.requests.list()[0]!.id;
     expect(t.api.popupsOpened[0]).toMatchObject({ path: `request.html?id=${id}`, width: 420, height: 360 });
+    t.api.clickNotification(1);
+    await pending;
+  });
+
+  test("sidePanel.open runs synchronously inside the click dispatch", async () => {
+    const t = setup(5000);
+    const { gid } = await userGroup(t.api);
+    const pending = t.call("request_group", { groupId: gid });
+    await until(() => t.api.shown.size === 1);
+    await Bun.sleep(5);
+    t.api.clickNotificationBody();
+    expect(t.api.sidePanelOpenedSync).toEqual([true]);
+    expect(t.api.sidePanelOpened).toEqual([1]);
+    t.api.clickNotification(1);
+    await pending;
+  });
+
+  test("the cached window follows focus changes and clears when the window closes", async () => {
+    const t = setup(5000);
+    const { gid } = await userGroup(t.api);
+    const pending = t.call("request_group", { groupId: gid });
+    await until(() => t.api.shown.size === 1);
+    await Bun.sleep(5);
+    t.api.focusWindow(7);
+    t.api.clickNotificationBody();
+    expect(t.api.sidePanelOpened).toEqual([7]);
+    t.api.closeWindow(3); // another window: no change
+    t.api.clickNotificationBody();
+    expect(t.api.sidePanelOpened).toEqual([7, 7]);
+    t.api.closeWindow(7);
+    t.api.clickNotificationBody();
+    await until(() => t.api.popupsOpened.length === 1);
+    expect(t.api.sidePanelOpened).toEqual([7, 7]);
+    t.api.clickNotification(1);
+    await pending;
+  });
+
+  test("the popup fallback is not full screen and is centred on the cached window", async () => {
+    const t = setup(5000);
+    t.api.sidePanelFails = true;
+    t.api.windowBoundsById.set(1, { left: 100, top: 50, width: 1000, height: 800 });
+    const { gid } = await userGroup(t.api);
+    const pending = t.call("request_group", { groupId: gid });
+    await until(() => t.api.shown.size === 1);
+    await Bun.sleep(5);
+    t.api.clickNotificationBody();
+    await until(() => t.api.popupsOpened.length === 1);
+    expect(t.api.popupsOpened[0]).toMatchObject({ width: 420, height: 360, left: 100 + (1000 - 420) / 2, top: 50 + (800 - 360) / 2 });
     t.api.clickNotification(1);
     await pending;
   });
