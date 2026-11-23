@@ -84,7 +84,7 @@ Deploy: the gateway image must contain this code. No new config is needed. The d
 
 ## Tools
 
-`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `split_tabs`, `unsplit_tabs`, `save_group`, `open_group`, `forget_group`, `request_group`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
+`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `split_tabs`, `unsplit_tabs`, `save_group`, `open_group`, `forget_group`, `close_group`, `request_group`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `upload_file`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`, `handle_dialog`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
 
 Split view (two tabs side by side) needs Chrome 155 or later. Older Chrome versions fail these calls with `bad_args` and the message "Split view needs Chrome 155 or later. This Chrome is <version>."
 
@@ -125,6 +125,21 @@ A group that a session created stays with the chat that made it. The chat is the
 - The call limit of `request_group` is 130 seconds (gateway and extension), under the agent tool timeouts of 135 seconds (Claude MCP and Codex `tool_timeout_sec`).
 - Only the tabs counted in the prompt are taken. A tab added while the prompt is open gives `forbidden_tab` ("Ask again"). A group of another session of the same identity shows "Another agent session made this group." in the prompt. A group of a session of another identity is refused.
 - The extension needs the `notifications` permission. It gives no install warning.
+
+### Closing a whole group (`close_group`)
+
+`close_group {groupId}` closes every tab of the own group of the session in one call. It replaces many `close_tab` calls, for example to remove a duplicate group. Get the id from `groups` in `tabs_context` (scope `own`).
+
+- One rule: every live tab of the group must pass the check that `close_tab` makes (the session owns the tab, and no approval protects it). The two tools share one function.
+- Refused with `forbidden_tab`, and no tab is closed: a granted group, a saved group (run `forget_group` first, then close), a group of another session, a group with a user tab, an approved tab, a tab of another session, a browser or extension page, and a chat-panel session.
+- The tab set is read once, and again right before the close. A tab added to the group later is not closed.
+- A Stop or gateway abort before the close leaves every tab open.
+- One `tabs.remove` call closes all tabs. No debugger attach is needed. The call then waits up to 5 seconds, as `close_tab` does.
+- A tab that stays open (for example a "Leave site?" dialog) stays owned. Its id is in `stillOpen`. No debugger is attached, so the agent never sees the dialog, and a later attach would hang on it. The user must answer the dialog in Chrome, so the agent asks the user. The agent does not retry with `close_tab` or `handle_dialog`.
+- A `tabs.remove` error after Chrome closed some tabs is caught. The call still waits and reports `stillOpen` from what is left.
+- Both tab reads refuse a browser or extension page, as `close_tab` does.
+- After the close, the closed tabs leave the session. When no tab of the group is left, the agent record of the group is dropped.
+- Result: `{ groupId, closed, stillOpen, note }`.
 
 ### Saved tab groups
 

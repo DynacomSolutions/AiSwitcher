@@ -11,7 +11,7 @@ import { splitUnsupported, UnsupportedApiError } from "./chrome-api.ts";
 import type { ChromeApi, TabInfo } from "./chrome-api.ts";
 import { parseKeys } from "./keys.ts";
 import type { State } from "./state.ts";
-import type { TabManager } from "./tabs.ts";
+import type { SessionRef, TabManager } from "./tabs.ts";
 import { noopUi } from "./ui.ts";
 import type { ActionKind, Ui, UiSession } from "./ui.ts";
 
@@ -402,6 +402,55 @@ export class Executor {
         if (!r.ok) throw new ToolError(r.code, r.message);
         return text(JSON.stringify({ name: key, forgotten: true, open: r.wasOpen, note: "No tab was closed." }));
       }
+      case "close_group": {
+        this.throwIfAborted(sig);
+        const { groupId } = a("close_group");
+        if (session.chat === true) throw new ToolError("forbidden_tab", "A chat cannot close a tab group.");
+        const rule = this.tabs.checkClose(session, groupId);
+        if (!rule.ok) throw new ToolError(rule.code, rule.message);
+        // The tab set is read once. A tab added to the group later is never closed.
+        const members = (await this.api.tabs.query()).filter(t => t.groupId === groupId);
+        if (members.length === 0) throw new ToolError("bad_args", `Group ${groupId} no longer exists or has no tab.`);
+        // One tab that this session may not close refuses the whole call, and nothing is closed.
+        for (const t of members) {
+          if (isInternalUrl(t.url)) throw new ToolError("forbidden_tab", `Tab ${t.id} shows a browser or extension page. Group ${groupId} is not closed.`);
+          const refusal = this.closeRefusal(session, t.id);
+          if (refusal) throw new ToolError("forbidden_tab", `${refusal} Group ${groupId} is not closed and no tab was closed.`);
+        }
+        // Read again right before the remove: no await between this check, the abort check and the remove call.
+        const latest = (await this.api.tabs.query()).filter(t => t.groupId === groupId);
+        const ids = members.map(t => t.id).filter(id => latest.some(t => t.id === id));
+        for (const t of latest) {
+          if (!ids.includes(t.id)) continue;
+          if (isInternalUrl(t.url)) throw new ToolError("forbidden_tab", `Tab ${t.id} shows a browser or extension page. Group ${groupId} is not closed.`);
+          const refusal = this.closeRefusal(session, t.id);
+          if (refusal) throw new ToolError("forbidden_tab", `${refusal} Group ${groupId} is not closed and no tab was closed.`);
+        }
+        if (this.tabs.checkClose(session, groupId).ok !== true) throw new ToolError("forbidden_tab", `Group ${groupId} changed. It is not closed and no tab was closed.`);
+        // A Stop or gateway abort here leaves every tab open.
+        this.throwIfAborted(sig);
+        // No debugger attach: like a discarded tab, the tabs close in one call. A page that asks "Leave site?" stays open and is reported below.
+        // Chrome can throw after it closed some tabs (for example "No tab with id"). The wait and the report below show what is left.
+        if (ids.length > 0) { try { await this.api.tabs.remove(ids); } catch { /* the stillOpen report below is the truth */ } }
+        for (let waited = 0; waited < CLOSE_WAIT_MS; waited += CLOSE_POLL_MS) {
+          if (!(await this.anyOpen(ids))) break;
+          await this.sleepFn(CLOSE_POLL_MS, sig);
+        }
+        const stillOpen: number[] = [];
+        for (const id of ids) {
+          if (await this.api.tabs.get(id)) { stillOpen.push(id); continue; } // it stays owned
+          this.tabs.forget(id);
+          await this.detach(id);
+          await this.unmark(id);
+        }
+        if (!(await this.api.tabs.query()).some(t => t.groupId === groupId)) this.tabs.closedGroup(groupId);
+        const closed = ids.length - stillOpen.length;
+        const left = stillOpen.length;
+        const note = left > 0
+          ? `${left} tab${left === 1 ? "" : "s"} stayed open and stay${left === 1 ? "s" : ""} yours. The page may ask "Leave site?" in Chrome, and this tool cannot see that dialog. The user must answer it in Chrome. Ask the user.`
+          : "Every tab of the group is closed.";
+        return text(JSON.stringify({ groupId, closed, stillOpen, note }));
+      }
       case "request_group": {
         this.throwIfAborted(sig);
         const { groupId, allowClose } = a("request_group");
@@ -490,6 +539,11 @@ export class Executor {
       }, sig);
     };
     return session.chat === true ? this.withTabLock(tabId, work, sig) : work();
+  }
+
+  private async anyOpen(ids: number[]): Promise<boolean> {
+    const open = new Set((await this.api.tabs.query()).map(t => t.id));
+    return ids.some(id => open.has(id));
   }
 
   /** Runs `work` after every earlier chat call on the same tab has ended. */
@@ -625,9 +679,8 @@ export class Executor {
         return text(`Emulated a ${w}x${h} viewport on tab ${tabId} (responsive mode). The browser window was not changed.`);
       }
       case "close_tab": {
-        // Only tabs this session opened or adopted: tabs that merely sit in a granted group are the user's.
-        if (!this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} was not opened by this session, so it cannot be closed.`);
-        if (this.tabs.isApproved(session.id, tabId)) throw new ToolError("forbidden_tab", `Tab ${tabId} is in a group the user approved for this session. The session never closes these tabs.`);
+        const refusal = this.closeRefusal(session, tabId);
+        if (refusal) throw new ToolError("forbidden_tab", refusal);
         // A discarded or frozen page runs no script, so it cannot raise "Leave site?" and does not answer a debugger attach: close it directly.
         const before = await this.api.tabs.get(tabId);
         let unresponsive = false;
@@ -652,6 +705,14 @@ export class Executor {
       default:
         throw new ToolError("bad_args", `Unsupported tool ${tool}`);
     }
+  }
+
+  /** Why this session may not close the tab, or undefined when it may. The one rule of close_tab and close_group. */
+  private closeRefusal(session: SessionRef, tabId: number): string | undefined {
+    // Only tabs this session opened or adopted: tabs that merely sit in a granted group are the user's.
+    if (!this.tabs.owns(session.id, tabId, session.identity)) return `Tab ${tabId} was not opened by this session, so it cannot be closed.`;
+    if (this.tabs.isApproved(session.id, tabId)) return `Tab ${tabId} is in a group the user approved for this session. The session never closes these tabs.`;
+    return undefined;
   }
 
   /** Fails before anything changes when this Chrome has no split view. */

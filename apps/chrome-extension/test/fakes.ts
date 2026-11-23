@@ -39,6 +39,10 @@ export class FakeChrome implements ChromeApi {
   groupNewFailure: string | undefined;
   groupUpdatedListeners: Array<(groupId: number) => void> = [];
   moveCalls: Array<{ tabId: number; index: number }> = [];
+  /** Every tabs.remove call, as given (a number or a list of ids). */
+  removeCalls: Array<number | number[]> = [];
+  /** Tab ids that stay open when removed (a page that asks "Leave site?"). */
+  keepOpen = new Set<number>();
 
   addTab(id: number, url = "https://example.test/", title = "T", where: number | { splitViewId?: number; windowId?: number } = 1): TabInfo {
     const extra = typeof where === "number" ? { windowId: where } : where;
@@ -178,7 +182,7 @@ export class FakeChrome implements ChromeApi {
       if (members.length === 0) throw new Error("No split view with this id.");
       for (const t of members) t.splitViewId = -1;
     },
-    remove: async (id: number) => { this.closeTab(id); },
+    remove: async (id: number | number[]) => { this.removeCalls.push(id); for (const x of Array.isArray(id) ? id : [id]) if (!this.keepOpen.has(x)) this.closeTab(x); },
     group: async (ids: number[], groupId?: number, windowId?: number) => {
       this.groupWindowIds.push(windowId);
       if (this.groupNewFailure && groupId === undefined) throw new Error(this.groupNewFailure);

@@ -2,7 +2,7 @@
 import type { ChatFromExt, ChatToExt } from "./chat-protocol.ts";
 import type { BrowserTarget } from "./types.ts";
 
-export const BROWSER_TOOLS = ["list_browsers", "tabs_context", "tabs_create", "adopt_tab", "split_tabs", "unsplit_tabs", "save_group", "open_group", "forget_group", "request_group", "navigate", "screenshot", "read_page", "find", "click", "type", "key", "scroll", "hover", "form_input", "upload_file", "javascript", "get_console", "get_network", "wait", "resize", "close_tab", "handle_dialog"] as const;
+export const BROWSER_TOOLS = ["list_browsers", "tabs_context", "tabs_create", "adopt_tab", "split_tabs", "unsplit_tabs", "save_group", "open_group", "forget_group", "close_group", "request_group", "navigate", "screenshot", "read_page", "find", "click", "type", "key", "scroll", "hover", "form_input", "upload_file", "javascript", "get_console", "get_network", "wait", "resize", "close_tab", "handle_dialog"] as const;
 export type BrowserTool = (typeof BROWSER_TOOLS)[number];
 /** Internal notice that an agent session ended. Not an MCP tool: the shim sends it, the gateway relays it, the extension closes what the session created. */
 export const SESSION_END_TOOL = "session_end";
