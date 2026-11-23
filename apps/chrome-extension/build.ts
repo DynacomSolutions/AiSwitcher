@@ -12,6 +12,7 @@ await mkdir(dist, { recursive: true });
 const entries = [
   ["src/background/index.ts", "background", "esm"],
   ["src/sidepanel/sidepanel.ts", "sidepanel", "esm"],
+  ["src/sidepanel/request.ts", "request", "esm"],
   ["src/content/index.ts", "content", "iife"],
 ] as const;
 for (const [entry, name, format] of entries) {
@@ -25,6 +26,7 @@ const aisVersion = (await Bun.file(join(root, "../../package.json")).json() as {
 const manifest = stampManifest(await Bun.file(join(root, "manifest.json")).json() as Record<string, unknown>, aisVersion);
 await Bun.write(join(dist, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 await cp(join(root, "src/sidepanel/sidepanel.html"), join(dist, "sidepanel.html"));
+await cp(join(root, "src/sidepanel/request.html"), join(dist, "request.html"));
 await cp(join(root, "src/sidepanel/sidepanel.css"), join(dist, "sidepanel.css"));
 await cp(join(root, "icons"), join(dist, "icons"), { recursive: true });
 console.log(`Built ${process.argv[2] ?? "apps/chrome-extension/dist"}`);

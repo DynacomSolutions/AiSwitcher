@@ -228,6 +228,22 @@ export class FakeChrome implements ChromeApi {
   clearedNotifications: string[] = [];
   notificationButtonListeners: Array<(id: string, index: number) => void> = [];
   notificationClosedListeners: Array<(id: string, byUser: boolean) => void> = [];
+  notificationClickListeners: Array<(id: string) => void> = [];
+  /** The user clicks the body of the notification on screen (the latest one when no id is given). */
+  clickNotificationBody(id = [...this.shown.keys()].at(-1)): void {
+    if (id === undefined) throw new Error("No notification on screen.");
+    for (const l of this.notificationClickListeners) l(id);
+  }
+  /** Windows the fake offers to the panel API, and what was opened. */
+  focusedWindowId: number | undefined = 1;
+  sidePanelFails = false;
+  sidePanelOpened: number[] = [];
+  popupsOpened: Array<{ path: string; width: number; height: number }> = [];
+  panel = {
+    lastFocusedWindowId: async () => this.focusedWindowId,
+    openSidePanel: async (windowId: number) => { if (this.sidePanelFails) throw new Error("sidePanel.open() may only be called in response to a user gesture."); this.sidePanelOpened.push(windowId); },
+    openPopup: async (path: string, size: { width: number; height: number }) => { this.popupsOpened.push({ path, ...size }); },
+  };
   /** The user presses a button of the notification on screen (the latest one when no id is given). */
   clickNotification(index: number, id = [...this.shown.keys()].at(-1)): void {
     if (id === undefined) throw new Error("No notification on screen.");
@@ -244,6 +260,7 @@ export class FakeChrome implements ChromeApi {
     clear: async (id: string) => { this.clearedNotifications.push(id); this.shown.delete(id); },
     onButtonClicked: (l: (id: string, index: number) => void) => { this.notificationButtonListeners.push(l); },
     onClosed: (l: (id: string, byUser: boolean) => void) => { this.notificationClosedListeners.push(l); },
+    onClicked: (l: (id: string) => void) => { this.notificationClickListeners.push(l); },
   };
   debugger = {
     attach: async (id: number) => { this.attachedTabs.add(id); },

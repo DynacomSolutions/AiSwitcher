@@ -11,7 +11,7 @@ import { CLAUDE_CONFIG, CODEX_CONFIG } from "../identities/tool-configs.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { chatNameResolver, type ChatTool } from "./chat-name.ts";
 import { sessionName } from "./session-label.ts";
-import { BROWSER_TOOLS, SESSION_END_TOOL, type CallResult } from "./protocol.ts";
+import { BROWSER_TOOLS, REQUEST_GROUP_CALL_TIMEOUT_MS, SESSION_END_TOOL, type CallResult } from "./protocol.ts";
 import { mcpTools } from "./tool-schemas.ts";
 import { BROWSER_INSTRUCTIONS, LATEST_VERSION, STOPPED_BY_USER_NOTE, SUPPORTED_VERSIONS, errorResult, mapCallResult, type McpContent } from "./mcp-core.ts";
 import { readUploadFiles } from "./upload.ts";
@@ -20,6 +20,8 @@ export { BROWSER_INSTRUCTIONS, STOPPED_BY_USER_NOTE, mapCallResult };
 
 export const BROWSER_TOKEN_FILE = "ais-browser-token";
 const FETCH_TIMEOUT_MS = 130_000;
+/** request_group waits for the owner: the shim waits a little longer than the gateway call limit. */
+export const REQUEST_GROUP_FETCH_TIMEOUT_MS = REQUEST_GROUP_CALL_TIMEOUT_MS + 10_000;
 /** The end notice must never hold the agent's exit up for long. */
 export const SESSION_END_TIMEOUT_MS = 2_000;
 
@@ -51,7 +53,7 @@ export interface ShimContext {
 
 interface RpcMessage { jsonrpc?: string; id?: string | number | null; method?: string; params?: Record<string, unknown> }
 
-async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal?: AbortSignal, timeoutMs = FETCH_TIMEOUT_MS, internal = false): Promise<{ isError?: true; content: McpContent[] }> {
+async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal?: AbortSignal, timeoutMs = name === "request_group" ? REQUEST_GROUP_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS, internal = false): Promise<{ isError?: true; content: McpContent[] }> {
   if (!internal && !(BROWSER_TOOLS as readonly string[]).includes(name)) return errorResult(`bad_args: unknown tool ${name}`);
   if (!internal) usedContexts.add(ctx);
   const { browser, ...args } = (typeof rawArgs === "object" && rawArgs !== null ? rawArgs : {}) as Record<string, unknown>;

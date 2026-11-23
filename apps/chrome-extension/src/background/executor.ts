@@ -1,4 +1,6 @@
 import { GroupPrompt } from "./group-prompt.ts";
+import { PROMPT_WAIT_MS } from "../shared/request.ts";
+import type { PendingRequest } from "../shared/request.ts";
 import { DEFAULT_CALL_TIMEOUT_MS, REQUEST_GROUP_CALL_TIMEOUT_MS, SESSION_END_TOOL, WAIT_CALL_TIMEOUT_MS } from "../../../../src/browser/protocol.ts";
 import type { BrowserErrorCode, CallRequest, CallResult } from "../../../../src/browser/protocol.ts";
 import { TOOL_SCHEMAS, validateToolArgs } from "../../../../src/browser/tool-args.ts";
@@ -126,6 +128,11 @@ export class Executor {
   private readonly onLinks: (sessionId: string, tabIds: number[]) => void | Promise<void>;
   private readonly groupPrompt: GroupPrompt;
   private readonly groupPromptMs: number;
+  /** Pending request_group approvals, and the one way to answer them. */
+  get requests(): { list(): PendingRequest[]; answer(id: string, approve: boolean): boolean; onChange(l: () => void): void } {
+    const p = this.groupPrompt;
+    return { list: () => p.list(), answer: (id, approve) => (approve ? p.approve(id) : p.deny(id)), onChange: l => p.onChange(l) };
+  }
   /** Per tab: the tail of the calls of chat sessions, so chats that share a tab never run on it at the same time. */
   private readonly tabLocks = new Map<number, Promise<void>>();
   private readonly attached = new Set<number>();
@@ -159,7 +166,7 @@ export class Executor {
     this.ui = deps.ui ?? noopUi;
     this.onLinks = deps.onLinks ?? (() => {});
     this.groupPrompt = new GroupPrompt(deps.api);
-    this.groupPromptMs = deps.groupPromptMs ?? 120_000;
+    this.groupPromptMs = deps.groupPromptMs ?? PROMPT_WAIT_MS;
     if (deps.onLinks) this.tabs.onLinksChanged = deps.onLinks;
     this.sleepFn = deps.sleep ?? ((ms, signal) => new Promise<void>((resolve, reject) => {
       const t = setTimeout(resolve, ms);
@@ -392,8 +399,7 @@ export class Executor {
         let answer;
         try {
           answer = await this.groupPrompt.ask({
-            title: "AIS Browser: allow an agent to use a tab group?",
-            message: `Agent "${session.label}" (identity ${session.identity}) asks to use the group "${first.title}" with ${first.tabCount} tabs.${first.shared ? " Another agent session made this group." : ""} ${closable ? "The agent can read, use and CLOSE these tabs." : "The agent can read and use these tabs. It never closes them."}`,
+            agentLabel: session.label, identity: session.identity, groupId, groupTitle: first.title, tabCount: first.tabCount, allowClose: closable, shared: first.shared,
           }, sig, this.groupPromptMs);
         } finally {
           this.tabs.endRequest(groupId);

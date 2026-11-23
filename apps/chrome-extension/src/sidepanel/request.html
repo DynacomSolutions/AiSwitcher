@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIS Browser</title>
+  <link rel="icon" href="icons/icon-32.png">
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body class="popup">
+  <header>
+    <div class="brand"><img class="mark" src="icons/icon-48.png" alt="" aria-hidden="true"><span class="name">AIS Browser</span></div>
+  </header>
+  <div id="requests" class="requests" aria-live="polite"></div>
+  <p id="ended" class="hint" hidden>This request has ended.</p>
+  <script type="module" src="request.js"></script>
+</body>
+</html>

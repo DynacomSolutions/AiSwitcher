@@ -1,6 +1,7 @@
 // Side panel shell: a Chat tab and a Status tab. The status code lives in status.ts.
 import type { PanelStatus } from "../shared/panel.ts";
 import { initChatTab } from "./chat/chat-view.ts";
+import { initRequests } from "./requests.ts";
 import { initStatus } from "./status.ts";
 import { defaultTab, loadTab, nextTab, PANEL_TABS, saveTab } from "./tabs.ts";
 import type { PanelTab } from "./tabs.ts";
@@ -55,5 +56,7 @@ async function initTabs(): Promise<void> {
 
 if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   initStatus();
+  const requests = document.getElementById("requests");
+  if (requests) initRequests(requests);
   void initTabs();
 }

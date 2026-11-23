@@ -28,7 +28,7 @@ export type GatewayToExt = { t: "welcome"; binding: string; target: BrowserTarge
 
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 export const WAIT_CALL_TIMEOUT_MS = 120_000;
-/** request_group waits up to 120 seconds for the user: its call limit is longer. */
-export const REQUEST_GROUP_CALL_TIMEOUT_MS = 150_000;
+/** request_group waits up to 300 seconds for the user: its call limit is longer. */
+export const REQUEST_GROUP_CALL_TIMEOUT_MS = 330_000;
 /** An upload carries the file content, so the gateway allows it longer to reach the extension. */
 export const UPLOAD_CALL_TIMEOUT_MS = 120_000;
