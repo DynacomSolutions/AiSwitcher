@@ -32,6 +32,7 @@ import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
 import { qk, useLimitsQuery, usePoolsUsageQuery } from "@/hooks/queries";
 import { api } from "@/lib/api";
+import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
 import { formatResetTimes } from "@/lib/reset-time";
 import { AccountWarnings } from "@/components/account-line";
@@ -314,6 +315,12 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
           <p className="text-sm text-muted-foreground">This tool reported no quota windows.</p>
         ) : null}
         {result.overage ? <OverageBlock overage={result.overage} /> : null}
+        {result.toolName === "codex" && !unavailable && result.extraUsage ? (
+          <div className="flex items-start gap-2 text-xs text-muted-foreground">
+            <CreditCard aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+            <span>{creditsNote(result.extraUsage)}</span>
+          </div>
+        ) : null}
         {result.manualReset ? <ManualResetBlock reset={result.manualReset} result={result} /> : null}
       </CardContent>
     </Card>

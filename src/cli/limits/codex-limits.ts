@@ -4,6 +4,7 @@ import { hasMemberCopy, memberDir, memberStoreEnabled, memberStoreRoot } from ".
 import { classifyLogin } from "../../identities/gateway-routed.ts";
 import { codexAccountOf, codexAuthPath, parseCodexAuth, readCodexAuthText } from "../../identities/codex-auth.ts";
 import { readFileSync } from "node:fs";
+import { loadGatewayLimits, type LoadGatewayLimitsDeps } from "../../identities/gateway-limits-reader.ts";
 import { reconcileOnceForFetch, oauthRefreshHealth } from "../../identities/oauth-refresh.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByMinutes } from "./bucket.ts";
@@ -449,7 +450,10 @@ export function isCodexAuthRejectionError(error: string | undefined): boolean {
 
 export async function fetchCodexLimits(identity: Identity, deps: CodexStoreUsageDeps = {}): Promise<FetchedLimitResult> {
   // Routed through the AIS gateway: the folder holds the gateway entry and the login lives in the gateway member store.
-  if (readsViaMemberStore(identity, deps.memberRoot)) return fetchCodexLimitsViaStore(identity, deps);
+  const via = memberStoreRead(identity, deps.memberRoot);
+  if (via === "store") return fetchCodexLimitsViaStore(identity, deps);
+  // A host never reads its own copy of that login (it goes stale): the gateway reads the account and the host asks the gateway.
+  if (via === "gateway") return fetchCodexLimitsViaGateway(identity, deps);
   // A usage probe must never start another probe (see shared/limits-probe.ts).
   if (isLimitsProbe()) {
     return { toolName: "codex", identity, windows: [], status: "unavailable", error: "usage probes are disabled inside a usage probe" };
@@ -506,6 +510,8 @@ export interface CodexStoreUsageDeps {
   fetchImpl?: typeof fetch;
   memberRoot?: string;
   now?: () => number;
+  /** Test hooks for the host path: the gateway admin read (fetch, secrets file, timeout). */
+  gateway?: Pick<LoadGatewayLimitsDeps, "fetch" | "secretsPath" | "timeoutMs">;
 }
 
 /** ChatGPT's usage endpoint (what codex reads for `account/rateLimits/read`). */
@@ -513,21 +519,29 @@ export const CODEX_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 const STORE_USAGE_TIMEOUT_MS = 15_000;
 
 /**
- * True when this identity's usage must be read from the gateway member store with one GET: the store holds the login,
- * and either this is a gateway process whose registry already points the member at its store folder (the cluster pod
- * has no codex binary, and an app-server there would spend the store's single-use refresh token), or the identity's
- * own folder holds no login.
+ * Where a gateway-routed identity's usage is read, or undefined when the identity is not routed.
+ * - "store": a gateway process (memberStoreEnabled, set by `ais gateway serve` and `ais gateway local`) whose registry
+ *   points the member at its own store folder. That copy is current, and the cluster pod has no codex binary (an
+ *   app-server there would spend the store's single-use refresh token). It must not call its own admin API.
+ * - "gateway": any other process (the host CLI and console) with a member copy but no login in the identity's own
+ *   folder. The host copy of that login goes stale, so the host asks the gateway admin API instead.
  */
-function readsViaMemberStore(identity: Identity, root?: string): boolean {
-  if (!hasMemberCopy("codex", identity.name, root)) return false;
-  if (memberStoreEnabled()) return identity.configDir === memberDir("codex", identity.name, root ?? memberStoreRoot());
+function memberStoreRead(identity: Identity, root?: string): "store" | "gateway" | undefined {
+  if (!hasMemberCopy("codex", identity.name, root)) return undefined;
+  if (memberStoreEnabled()) return identity.configDir === memberDir("codex", identity.name, root ?? memberStoreRoot()) ? "store" : undefined;
   let text: string | undefined;
   try {
     text = readFileSync(codexAuthPath(identity.configDir), "utf8");
   } catch {
     text = undefined;
   }
-  return classifyLogin("codex", text) !== "login";
+  return classifyLogin("codex", text) !== "login" ? "gateway" : undefined;
+}
+
+interface WhamCredits {
+  has_credits?: unknown;
+  unlimited?: unknown;
+  balance?: unknown;
 }
 
 interface WhamWindow {
@@ -553,7 +567,13 @@ export function snapshotFromWham(body: unknown, nowMs: number): RateLimitSnapsho
   const secondary = win(rl?.secondary_window);
   if (!primary && !secondary) return undefined;
   const plan = (body as { plan_type?: unknown }).plan_type;
-  return { primary: primary ?? null, secondary: secondary ?? null, ...(typeof plan === "string" ? { planType: plan } : {}) };
+  const rawCredits = (body as { credits?: WhamCredits | null }).credits;
+  const balance = typeof rawCredits?.balance === "string" ? rawCredits.balance : finite(rawCredits?.balance) !== undefined ? String(rawCredits!.balance) : null;
+  const credits =
+    rawCredits && typeof rawCredits === "object"
+      ? { hasCredits: rawCredits.has_credits === true, unlimited: rawCredits.unlimited === true, balance }
+      : undefined;
+  return { primary: primary ?? null, secondary: secondary ?? null, ...(typeof plan === "string" ? { planType: plan } : {}), ...(credits ? { credits } : {}) };
 }
 
 /**
@@ -577,8 +597,26 @@ export async function fetchCodexLimitsViaStore(identity: Identity, deps: CodexSt
     const nowMs = deps.now?.() ?? Date.now();
     const snapshot = snapshotFromWham(await res.json(), nowMs);
     if (!snapshot) return { ...base, windows: [], status: "unavailable", error: "usage endpoint returned no rate-limit windows" };
-    return { ...base, windows: buildWindows(snapshot), status: "live", capturedAt: new Date(nowMs).toISOString() };
+    const extraUsage = extraUsageFromCredits(snapshot);
+    return { ...base, windows: buildWindows(snapshot), status: "live", capturedAt: new Date(nowMs).toISOString(), ...(extraUsage ? { extraUsage } : {}) };
   } catch (err) {
     return { ...base, windows: [], status: "unavailable", error: errorMessage(err) };
   }
+}
+
+/**
+ * Usage of a gateway-routed identity on a host: one read of the gateway admin API (`GET /limits?provider=codex&identity=`).
+ * The gateway reads the account with its own current login. There is no fallback to the host copy: a missing admin
+ * URL or token, or a failed read, comes back as an honest "unavailable".
+ */
+export async function fetchCodexLimitsViaGateway(identity: Identity, deps: CodexStoreUsageDeps = {}): Promise<FetchedLimitResult> {
+  const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "codex", identity };
+  const unavailable = (error: string): FetchedLimitResult => ({ ...base, windows: [], status: "unavailable", error });
+  const view = await loadGatewayLimits({ provider: "codex", identity: identity.name, ...deps.gateway });
+  if (!view.configured) return unavailable("the gateway admin is not configured on this host (AIS_GATEWAY_ADMIN_URL and AIS_GATEWAY_ADMIN_TOKEN)");
+  if (view.error) return unavailable(`the gateway admin could not be read: ${view.error}`);
+  const row = view.rows.find((r) => r.toolName === "codex" && r.identity.name === identity.name);
+  if (!row) return unavailable("the gateway reports no usage for this identity");
+  const { provider: _provider, ...result } = row;
+  return { ...result, identity };
 }

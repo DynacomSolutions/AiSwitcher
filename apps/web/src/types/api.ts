@@ -216,6 +216,16 @@ export interface LimitWindow {
   model?: string;
 }
 
+/** Paid capacity past the standard windows: Claude extra usage, Codex credits. */
+export interface ExtraUsageInfo {
+  enabled: boolean;
+  available: boolean;
+  usedPercent?: number;
+  label: string;
+  stale?: boolean;
+  capturedAt?: string;
+}
+
 export interface OverageInfo {
   active: boolean;
   label: string;
@@ -288,6 +298,8 @@ export interface ToolLimitResult {
   error?: string;
   capturedAt?: string;
   overage?: OverageInfo;
+  /** Codex credits (shown as a note: the gateway never spends them) and Claude extra usage. */
+  extraUsage?: ExtraUsageInfo;
   manualReset?: ManualResetInfo;
   account?: AccountInfo;
 }
