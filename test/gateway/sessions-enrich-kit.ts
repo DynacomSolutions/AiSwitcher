@@ -59,7 +59,7 @@ export class FakeObjects implements PartSource {
 }
 
 /** Cuts `lines` into parts of `perPart` lines, stores them encrypted in `objects`, returns the rows. */
-export async function storeParts(objects: FakeObjects, recipient: string, fileTag: string, lines: string[], perPart: number, startAt = 0, startOffset = 0): Promise<SessionPartRow[]> {
+export async function storeParts(objects: FakeObjects, recipient: string, fileTag: string, lines: string[], perPart: number, startAt = 0, startOffset = 0, keyPrefix?: string): Promise<SessionPartRow[]> {
   const rows: SessionPartRow[] = [];
   let offset = startOffset;
   for (let i = startAt; i < lines.length; i += perPart) {
@@ -67,7 +67,7 @@ export async function storeParts(objects: FakeObjects, recipient: string, fileTa
     const e = new Encrypter();
     e.addRecipient(recipient);
     const stored = await e.encrypt(Bun.gzipSync(plain));
-    const key = `objects/v1/node-a/r/${fileTag}/g0/${offset}-${offset + plain.length}.gz.age`;
+    const key = `${keyPrefix ?? `objects/v1/node-a/r/${fileTag}/g0/`}${offset}-${offset + plain.length}.gz.age`;
     objects.objects.set(key, stored);
     rows.push({ startOffset: offset, endOffset: offset + plain.length, lines: Math.min(perPart, lines.length - i), plainBytes: plain.length, objectBytes: stored.length, plainSha256: sha(plain), objectKey: key });
     offset += plain.length;

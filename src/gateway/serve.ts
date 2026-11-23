@@ -10,7 +10,7 @@ import { HomeMirror } from "./home-mirror.ts";
 import { importHome, STORE_META_PATH } from "./home-import.ts";
 import { PgHomeStore } from "./home-store.ts";
 import { PgLeader } from "./pg-leader.ts";
-import { createSessionsEnrichment } from "./sessions/enrich-setup.ts";
+import { sessionsEnrichEnabled } from "./sessions/enrich-config.ts";
 import { getGatewayListener, releaseGatewayListener } from "./pg-listen.ts";
 import { getGatewaySql, releaseGatewaySql } from "./pg-pool.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
@@ -590,7 +590,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const mirror = homeStore ? new HomeMirror(homeStore, { ...(hooks.home ? { home: hooks.home } : {}), fileStore: pgCreds?.fileStore === true }) : undefined;
   const leader = pgCreds ? new PgLeader(opts.databaseUrl, hooks.leaderTryMs ?? 10_000) : undefined;
   // Session enrichment (off unless AIS_SESSIONS_ENRICH is set): runs on the leader only; without a leader election it runs here alone.
-  const sessionsEnrich = hooks.openStore ? undefined : createSessionsEnrichment({ env: process.env, sql: sharedSql, isLeader: () => !leader || leader.isLeader() });
+  // The modules load only when the flag is on: every `ais` process reads its imports at start.
+  const sessionsEnrich = hooks.openStore || !sessionsEnrichEnabled(process.env) ? undefined : (await import("./sessions/enrich-setup.ts")).createSessionsEnrichment({ env: process.env, sql: sharedSql, isLeader: () => !leader || leader.isLeader() });
   if (sessionsEnrich) metrics.sections.push(sessionsEnrich.render);
   if (mirror) setLocalWriteHook(async (abs, kind, account) => mirror.push([abs], account, kind));
   const grantPaths = (tool: RefreshableTool, identity: Identity): Promise<string[]> => effectiveGrantPaths(tool, identity).catch(() => [] as string[]);

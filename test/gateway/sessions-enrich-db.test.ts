@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { SQL } from "bun";
 import { migrate } from "../../src/gateway/pg-store.ts";
 import { SessionEnricher } from "../../src/gateway/sessions/enrich.ts";
-import { SessionStore, type SessionIngest } from "../../src/gateway/sessions/session-store.ts";
+import { SessionStore, partObjectPrefix, type SessionIngest } from "../../src/gateway/sessions/session-store.ts";
 import { FakeObjects, claudeLines, makeKeys, sha, storeParts, wholePass, type Keys } from "./sessions-enrich-kit.ts";
 
 /** The enrichment against the real SessionStore on Postgres, with a fake object store. */
@@ -47,15 +47,17 @@ if (!url && process.env.CI && !optOut) {
 
   /** Ingests the parts of `lines` in groups, as the shipper does, and returns the file id. */
   async function ingestLines(store: SessionStore, objects: FakeObjects, rel: string, tag: string, lines: string[], perPart: number, startAt = 0, startOffset = 0, over: Partial<SessionIngest> = {}) {
-    const parts = await storeParts(objects, keys.recipient, tag, lines, perPart, startAt, startOffset);
+    const kind = over.kind ?? "claude";
+    const sessionRef = over.sessionRef ?? "11111111-2222-4333-8444-555555555555";
+    const parts = await storeParts(objects, keys.recipient, tag, lines, perPart, startAt, startOffset, partObjectPrefix(kind, sessionRef, 0));
     const res = await store.ingest({
       node: "node-a",
       root: "/data/pool",
       relPath: rel,
       generation: 0,
-      kind: "claude",
+      kind,
       origin: "pool-folder",
-      sessionRef: "11111111-2222-4333-8444-555555555555",
+      sessionRef,
       headSha256: sha("head"),
       mtimeMs: 1_700_000_000_000,
       parts,
