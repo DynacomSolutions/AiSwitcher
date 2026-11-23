@@ -30,6 +30,7 @@ export function favouriteStoreContract(make: () => Promise<FavouriteStore>): voi
 
   test("the newest change of a model wins, whatever the arrival order", async () => {
     const s = await make();
+    await s.apply([add("m1", NOW - 3000)], "t3", NOW);
     await s.apply([remove("m1", NOW - 1000)], "t3", NOW);
     // An older add that arrives late does not bring the star back.
     expect((await s.apply([add("m1", NOW - 5000)], "chrome", NOW)).changed).toBe(false);
@@ -40,6 +41,21 @@ export function favouriteStoreContract(make: () => Promise<FavouriteStore>): voi
     // An older remove after a newer add does not remove it.
     expect((await s.apply([remove("m1", NOW - 500)], "t3", NOW)).changed).toBe(false);
     expect(await models(s)).toEqual(["work/m1"]);
+  });
+
+  test("a removal of a model that is not starred changes nothing and does not move the version", async () => {
+    const s = await make();
+    const a = await s.apply([add("m1", NOW - 100)], "chrome", NOW);
+    const gone = await s.apply([remove("never", NOW)], "t3", NOW);
+    expect(gone).toMatchObject({ changed: false, seq: a.seq });
+    expect((await s.list()).seq).toBe(a.seq);
+    // A removal of a star that is already removed does not move it either.
+    await s.apply([remove("m1", NOW - 50)], "t3", NOW);
+    const seq = (await s.list()).seq;
+    expect((await s.apply([remove("m1", NOW - 10)], "t3", NOW)).seq).toBe(seq);
+    // The skipped removal left no row: a star made earlier than it is still accepted.
+    expect((await s.apply([add("never", NOW - 1000)], "chrome", NOW)).changed).toBe(true);
+    expect(await models(s)).toEqual(["work/never"]);
   });
 
   test("an equal time lets the later call win", async () => {

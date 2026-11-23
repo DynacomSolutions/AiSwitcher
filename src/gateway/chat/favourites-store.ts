@@ -34,6 +34,8 @@ export class MemoryFavouriteStore implements FavouriteStore {
       const at = effectiveAt(c.at, nowMs);
       const present = c.op === "add";
       const cur = this.rows.get(id);
+      // A removal of a model with no row has nothing to remove: no row, no new version, no wake-up.
+      if (!present && !cur) continue;
       if (cur && at < cur.at) continue;
       if (cur && cur.present === present) {
         cur.at = at;

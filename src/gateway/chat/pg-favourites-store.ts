@@ -30,6 +30,8 @@ export class PgFavouriteStore implements FavouriteStore {
         const at = effectiveAt(c.at, nowMs);
         const present = c.op === "add";
         const cur = (await t.unsafe("SELECT present, at_ms FROM gateway_favourites WHERE id = $1", [id]))[0] as Row | undefined;
+        // A removal of a model with no row has nothing to remove: no row, no new version, no wake-up.
+        if (!present && !cur) continue;
         if (cur && at < Number(cur.at_ms)) continue;
         if (cur && cur.present === present) {
           await t.unsafe("UPDATE gateway_favourites SET at_ms = $2::bigint, origin = $3 WHERE id = $1", [id, at, origin]);
