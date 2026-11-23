@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { readT3Settings, writeT3Favourites } from "../../src/t3/favourites/settings.ts";
-import { CLAUDE_POOL, makeHome } from "./favourites-fixtures.ts";
+import { CLAUDE_POOL, makeHome, scratch } from "./favourites-fixtures.ts";
 
 describe("settings.json", () => {
   test("reads the favourites and the instance ids", async () => {
@@ -68,6 +68,44 @@ describe("settings.json", () => {
     expect(h.read().defaultAutoPull).toBe(false);
     expect(h.read().favorites).toEqual([]);
     expect(existsSync(h.settings)).toBe(true);
+    expect(readdirSync(dirname(h.settings))).toEqual(["settings.json"]);
+  });
+
+  // The re-read of the text catches most races. The check of mtime, size and inode just before the rename catches a write that
+  // leaves the same text (or a rewrite by another tool that keeps the content): the round must run again.
+  test("a rewrite of the same text by another writer (new mtime) makes the write say changed", async () => {
+    const h = makeHome();
+    const s = (await readT3Settings(h.home))!;
+    const later = new Date(Date.now() + 5000);
+    utimesSync(h.settings, later, later);
+    expect(await writeT3Favourites(s, [{ provider: CLAUDE_POOL, model: "m" }])).toBe("changed");
+    expect(h.read().favorites).toEqual([]);
+    expect(readdirSync(dirname(h.settings))).toEqual(["settings.json"]);
+  });
+  test("a replacement of the file with the same text and time (new inode) makes the write say changed", async () => {
+    const h = makeHome();
+    const s = (await readT3Settings(h.home))!;
+    const copy = `${h.settings}.copy`;
+    copyFileSync(h.settings, copy);
+    const st = statSync(h.settings);
+    utimesSync(copy, st.atime, st.mtime);
+    renameSync(copy, h.settings);
+    expect(await writeT3Favourites(s, [{ provider: CLAUDE_POOL, model: "m" }])).toBe("changed");
+    expect(h.read().favorites).toEqual([]);
+  });
+  test("a settings.json that is a symlink is written through: the link stays and its target changes", async () => {
+    const h = makeHome({ favorites: [{ provider: CLAUDE_POOL, model: "m1" }] });
+    const elsewhere = scratch();
+    mkdirSync(join(elsewhere, "real"), { recursive: true });
+    const real = join(elsewhere, "real", "settings.real.json");
+    renameSync(h.settings, real);
+    symlinkSync(real, h.settings);
+    const s = (await readT3Settings(h.home))!;
+    expect(s.favorites).toEqual([{ provider: CLAUDE_POOL, model: "m1" }]);
+    expect(await writeT3Favourites(s, [{ provider: CLAUDE_POOL, model: "m2" }])).toBe("written");
+    expect(lstatSync(h.settings).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(readFileSync(real, "utf8")).favorites).toEqual([{ provider: CLAUDE_POOL, model: "m2" }]);
+    expect(readdirSync(dirname(real))).toEqual(["settings.real.json"]);
     expect(readdirSync(dirname(h.settings))).toEqual(["settings.json"]);
   });
 });
