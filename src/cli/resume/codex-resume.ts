@@ -4,6 +4,7 @@ import { normalizePath } from "../../identities/match.ts";
 import type { Identity } from "../../identities/types.ts";
 import { truncateLabel } from "./label.ts";
 import type { ResumableSession, ToolResumeResult } from "./types.ts";
+import { forEachLine, type LineSource } from "../sessions/lines.ts";
 import { mapPool } from "../sessions/shared.ts";
 import { readSessionCwdOverrides, type SessionCwdOverrides } from "./cwd-overrides.ts";
 
@@ -103,20 +104,21 @@ function parseSessionMeta(firstLine: string): SessionMeta | undefined {
   };
 }
 
-interface RestOfFile {
+export interface RestOfFile {
   label?: string;
   lastTimestamp?: string;
 }
 
-function parseRestOfFile(text: string): RestOfFile {
+/** Folds one rollout (a path or any line source) into its label and last timestamp. */
+export async function parseRestOfFile(source: LineSource): Promise<RestOfFile> {
   const result: RestOfFile = {};
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
+  await forEachLine(source, (line) => {
+    if (!line.trim()) return;
     let entry: Record<string, unknown>;
     try {
       entry = JSON.parse(line);
     } catch {
-      continue;
+      return;
     }
     if (typeof entry.timestamp === "string") result.lastTimestamp = entry.timestamp;
 
@@ -126,7 +128,7 @@ function parseRestOfFile(text: string): RestOfFile {
         result.label = truncateLabel(payload.message);
       }
     }
-  }
+  });
   return result;
 }
 
@@ -188,13 +190,12 @@ export async function readCodexSessions(
     if (!match) continue;
     const { filePath, sessionId, effectiveCwd } = match;
 
-    let text: string;
+    let rest: RestOfFile;
     try {
-      text = await Bun.file(filePath).text();
+      rest = await parseRestOfFile(filePath);
     } catch {
       continue;
     }
-    const rest = parseRestOfFile(text);
 
     let lastActiveAt = rest.lastTimestamp;
     if (!lastActiveAt) {

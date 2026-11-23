@@ -18,6 +18,7 @@ import {
   safeJsonParse,
   textFromBlocks,
   windowCutoffMs,
+  type LineSource,
   type TranscriptOpts,
   type WindowOpts,
 } from "./shared.ts";
@@ -97,8 +98,8 @@ function userTextFromLine(line: string): string | undefined {
 /** Bounded scan for the first real user prompt (the title source); both
  * shapes codex writes appear within the first few lines, so this reads a
  * few KB at most. */
-async function firstUserMessage(filePath: string): Promise<string | undefined> {
-  const line = await findFirstLine(filePath, (candidate) => userTextFromLine(candidate) !== undefined);
+export async function firstUserMessage(source: LineSource): Promise<string | undefined> {
+  const line = await findFirstLine(source, (candidate) => userTextFromLine(candidate) !== undefined);
   return line === undefined ? undefined : userTextFromLine(line);
 }
 
@@ -239,12 +240,38 @@ export async function readCodexTranscript(
 ): Promise<TranscriptDto | undefined> {
   const filePath = await locateCodexTranscript(identity.configDir, id);
   if (!filePath) return undefined;
+  return codexTranscriptFromLines(identity, id, filePath, async () => {
+    try {
+      return (await stat(filePath)).mtimeMs;
+    } catch {
+      return undefined; // vanished mid-read
+    }
+  }, opts);
+}
 
-  let meta = parseMetaLine(await readFirstLine(filePath));
+/**
+ * The transcript of one Codex session from any line source (a path, or lines
+ * from decrypted object parts). The first line is the session_meta peek.
+ * `mtime` runs after the lines are read and gives the source's last write
+ * time, or undefined when unknown.
+ */
+export async function codexTranscriptFromLines(
+  identity: Identity,
+  id: string,
+  source: LineSource,
+  mtime: () => Promise<number | undefined>,
+  opts: TranscriptOpts & WindowOpts = {},
+): Promise<TranscriptDto> {
+  let meta = undefined as CodexMeta | undefined;
+  let firstLine = true;
   const collector = new TurnCollector(opts.tail);
   let title: string | undefined;
   let lastTs: number | undefined;
-  await forEachLine(filePath, (line) => {
+  await forEachLine(source, (line) => {
+    if (firstLine) {
+      firstLine = false;
+      meta = parseMetaLine(line);
+    }
     const entry = safeJsonParse(line);
     if (!entry) return;
     if (meta === undefined && entry.type === "session_meta") meta = parseMetaLine(line);
@@ -263,12 +290,7 @@ export async function readCodexTranscript(
     }
   });
 
-  let mtimeMs: number | undefined;
-  try {
-    mtimeMs = (await stat(filePath)).mtimeMs;
-  } catch {
-    // vanished mid-read
-  }
+  const mtimeMs = await mtime();
 
   const resolvedTitle = title ?? (meta?.threadSource && meta.threadSource !== "user" ? meta.threadSource : undefined);
   return {
