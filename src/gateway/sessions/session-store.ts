@@ -7,6 +7,11 @@ import { SQL } from "bun";
  * is the end of the last part. A writer asks for the cursor, reads from there and sends the next parts. `ingest` is
  * the only code that moves the cursor, and it takes parts in order only: a gap or an overlap is refused. The same
  * part sent twice is a no-op, so a writer can retry after a lost answer.
+ *
+ * One copy per session (migration 0015_sessions_one_copy). A session is named by its tool (`kind`) and its session id
+ * (`sessionRef`), not by the host path. The same session in two folders or on two nodes is stored once. The table
+ * `ais_session_path` records every path that held it. A path that holds a different file under the same session id
+ * (a head that differs) is refused as `other_copy` and starts no new generation, so two diverged copies never take turns.
  */
 
 /** Length of the file head that `headSha256` covers. */
@@ -16,11 +21,17 @@ export const MAX_PART_BYTES = 64 * 1024 * 1024;
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
-/** Names a file. The same file in a new generation (after a rewrite) has the same key. */
-export interface SessionFileKey {
+/** A host path that holds a session file. */
+export interface SessionPath {
   node: string;
   root: string;
   relPath: string;
+}
+
+/** Names a stored session. The same session in a new generation (after a rewrite) has the same key. */
+export interface SessionFileKey extends SessionPath {
+  kind: string;
+  sessionRef: string;
 }
 
 export interface SessionPartInput {
@@ -38,10 +49,8 @@ export interface SessionPartInput {
 export interface SessionIngest extends SessionFileKey {
   /** Starts at 0. A larger value than the stored one starts a new generation: the file was rewritten. */
   generation: number;
-  kind: string;
   origin: string;
   pool?: string | null;
-  sessionRef: string;
   parentRef?: string | null;
   /** SHA-256 (hex) of the first min(4096, end of the last part) bytes of the file after this ingest. */
   headSha256: string;
@@ -51,6 +60,9 @@ export interface SessionIngest extends SessionFileKey {
   parts: SessionPartInput[];
 }
 
+/** A path that holds a session, with no new bytes: the writer reports that its copy is stored already. */
+export type SessionHold = Omit<SessionIngest, "parts">;
+
 /** Where a writer continues. A file that is not known yet has no cursor: start at byte 0 of generation 0. */
 export interface SessionCursor {
   fileId: number;
@@ -58,6 +70,11 @@ export interface SessionCursor {
   committedBytes: number;
   committedLines: number;
   headSha256: string;
+}
+
+/** The answer to a cursor request: the cursor of the session, and whether the asked path is recorded as a holder of it. */
+export interface SessionCursorInfo extends SessionCursor {
+  held: boolean;
 }
 
 export type IngestConflictReason =
@@ -69,8 +86,13 @@ export type IngestConflictReason =
   | "rewritten"
   /** The generation is older than the stored one. */
   | "stale_generation"
-  /** A new generation must start at byte 0. */
-  | "generation_start";
+  /** A new generation must start at byte 0 and carry parts. */
+  | "generation_start"
+  /**
+   * The session is stored already from another path, and this path holds a different file under the same id (a head that
+   * differs, or a rewrite). Nothing is stored. The writer skips this copy.
+   */
+  | "other_copy";
 
 export type IngestResult =
   | { status: "committed"; cursor: SessionCursor; created: boolean; partsAdded: number }
@@ -120,6 +142,15 @@ export interface SessionTreeQuery {
   project?: string;
   /** Most nodes to return, newest first (default 5000, at most 50000). */
   limit?: number;
+}
+
+/** One host path that held a session. */
+export interface SessionHolderRow extends SessionPath {
+  origin: string;
+  pool: string | null;
+  generation: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
 }
 
 export interface SessionPartRow {
@@ -205,17 +236,28 @@ function partRowOf(r: Row): SessionPartRow {
   };
 }
 
-/** Refuses a request that no correct writer sends. A race never reaches here: it ends as a conflict. */
-export function validateIngest(req: SessionIngest): void {
-  const bad = (m: string): never => {
-    throw new SessionIngestInvalid(m);
-  };
+const bad = (m: string): never => {
+  throw new SessionIngestInvalid(m);
+};
+
+/** The fields every request carries. Throws SessionIngestInvalid. */
+function validateBase(req: SessionHold): void {
   for (const f of ["node", "root", "relPath", "kind", "origin", "sessionRef"] as const) {
     if (typeof req[f] !== "string" || req[f].length === 0) bad(`${f} must be a non-empty string`);
   }
   if (!Number.isSafeInteger(req.generation) || req.generation < 0) bad("generation must be a whole number, 0 or more");
   if (!SHA256_HEX.test(req.headSha256)) bad("headSha256 must be 64 lower-case hex characters");
   if (req.mtimeMs !== undefined && !Number.isFinite(req.mtimeMs)) bad("mtimeMs must be a finite number");
+}
+
+/** Refuses a hold request (no parts) that no correct writer sends. */
+export function validateHold(req: SessionHold): void {
+  validateBase(req);
+}
+
+/** Refuses a request that no correct writer sends. A race never reaches here: it ends as a conflict. */
+export function validateIngest(req: SessionIngest): void {
+  validateBase(req);
   if (req.parts.length === 0) bad("parts must not be empty");
   let at = req.parts[0]!.startOffset;
   for (const p of req.parts) {
@@ -246,51 +288,89 @@ export class SessionStore {
     if (this.ownsSql) await this.sql.close();
   }
 
-  /** The cursor of the newest generation of each file, in the order of `keys`. null: the file is not known yet. */
-  async cursors(keys: SessionFileKey[]): Promise<(SessionCursor | null)[]> {
-    if (keys.length === 0) return [];
-    const rows = await this.sql.unsafe(
-      `SELECT k.ord, f.id, f.generation, f.committed_bytes, f.committed_lines, f.head_sha256
-         FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS k(node, root, rel_path, ord)
-         LEFT JOIN LATERAL (
-           SELECT id, generation, committed_bytes, committed_lines, head_sha256
-             FROM ais_session_file
-            WHERE node = k.node AND root = k.root AND rel_path = k.rel_path
-            ORDER BY generation DESC LIMIT 1
-         ) f ON true
-        ORDER BY k.ord`,
-      [keys.map((k) => k.node), keys.map((k) => k.root), keys.map((k) => k.relPath)],
-    );
-    return rows.map((r: Row) => (r.id === null || r.id === undefined ? null : cursorOf(r)));
+  /** Reads the database. Throws when it is unreachable. */
+  async ping(): Promise<void> {
+    await this.sql`SELECT 1`;
   }
 
   /**
-   * Stores parts of one file. All or nothing: a refusal leaves the file as it was.
-   * One transaction per file, serialised by a lock on the file key, so two writers of one file never interleave.
+   * The cursor of the newest generation of each session, in the order of `keys`. null: the session is not known yet.
+   * The session is found by tool and session id, so a path that holds a copy of a stored session gets the same cursor.
+   * `held` tells whether the asked path is recorded as a holder.
+   */
+  async cursors(keys: SessionFileKey[]): Promise<(SessionCursorInfo | null)[]> {
+    if (keys.length === 0) return [];
+    const rows = await this.sql.unsafe(
+      `SELECT k.ord, f.id, f.generation, f.committed_bytes, f.committed_lines, f.head_sha256,
+              f.id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM ais_session_path p JOIN ais_session_file g ON g.id = p.file_id
+                 WHERE g.kind = k.kind AND g.session_ref = k.session_ref AND p.node = k.node AND p.root = k.root AND p.rel_path = k.rel_path
+              ) AS held
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) WITH ORDINALITY AS k(kind, session_ref, node, root, rel_path, ord)
+         LEFT JOIN LATERAL (
+           SELECT id, generation, committed_bytes, committed_lines, head_sha256
+             FROM ais_session_file
+            WHERE kind = k.kind AND session_ref = k.session_ref
+            ORDER BY generation DESC LIMIT 1
+         ) f ON true
+        ORDER BY k.ord`,
+      [keys.map((k) => k.kind), keys.map((k) => k.sessionRef), keys.map((k) => k.node), keys.map((k) => k.root), keys.map((k) => k.relPath)],
+    );
+    return rows.map((r: Row) => (r.id === null || r.id === undefined ? null : { ...cursorOf(r), held: r.held === true }));
+  }
+
+  /**
+   * Stores parts of one session. All or nothing: a refusal leaves the session as it was.
+   * One transaction per session, serialised by a lock on the tool and the session id, so two writers (also two paths
+   * that hold the same session) never interleave. The path is recorded as a holder of the session.
    */
   async ingest(req: SessionIngest): Promise<IngestResult> {
     validateIngest(req);
+    return this.writeSession(req);
+  }
+
+  /**
+   * Records that a path holds a session that is stored already (a copy in another folder or on another node), with no
+   * new bytes. An unknown session or a generation that is not the stored one is a conflict, as in `ingest`.
+   */
+  async hold(req: SessionHold): Promise<IngestResult> {
+    validateHold(req);
+    return this.writeSession({ ...req, parts: [] });
+  }
+
+  private async writeSession(req: SessionIngest): Promise<IngestResult> {
     try {
       return await this.sql.begin(async (t) => {
-        await t`SELECT pg_advisory_xact_lock(hashtextextended(${JSON.stringify(["ais_session_file", req.node, req.root, req.relPath])}, 0))`;
+        await t`SELECT pg_advisory_xact_lock(hashtextextended(${JSON.stringify(["ais_session", req.kind, req.sessionRef])}, 0))`;
         const cur = (
           await t.unsafe(
-            `SELECT * FROM ais_session_file WHERE node = $1 AND root = $2 AND rel_path = $3 ORDER BY generation DESC LIMIT 1 FOR UPDATE`,
-            [req.node, req.root, req.relPath],
+            `SELECT * FROM ais_session_file WHERE kind = $1 AND session_ref = $2 ORDER BY generation DESC LIMIT 1 FOR UPDATE`,
+            [req.kind, req.sessionRef],
           )
         )[0] as Row | undefined;
         const curCursor = cur ? cursorOf(cur) : null;
         const refuse = (reason: IngestConflictReason): never => {
           throw new Refused({ status: "conflict", reason, cursor: curCursor });
         };
-        const first = req.parts[0]!;
+        const held = cur
+          ? (
+              await t.unsafe(
+                `SELECT 1 FROM ais_session_path p JOIN ais_session_file f ON f.id = p.file_id
+                  WHERE f.kind = $1 AND f.session_ref = $2 AND p.node = $3 AND p.root = $4 AND p.rel_path = $5 LIMIT 1`,
+                [req.kind, req.sessionRef, req.node, req.root, req.relPath],
+              )
+            ).length > 0
+          : false;
+        const first = req.parts[0];
 
         let fileId: number;
         let committed: number;
         let created = false;
         if (!cur || req.generation > num(cur.generation)) {
-          // A new file, or a new generation after a rewrite: it starts at byte 0.
-          if (first.startOffset !== 0) refuse(cur ? "generation_start" : "gap");
+          // A new session, or a new generation after a rewrite: it starts at byte 0.
+          // Only a path that holds the session rewrites it. A stranger with other content is another copy: skip it.
+          if (cur && !held) refuse("other_copy");
+          if (!first || first.startOffset !== 0) refuse(cur ? "generation_start" : "gap");
           const row = (
             await t.unsafe(
               `INSERT INTO ais_session_file (node, root, rel_path, generation, kind, origin, pool, session_ref, parent_ref, head_sha256, updated_at)
@@ -305,7 +385,8 @@ export class SessionStore {
         } else {
           if (req.generation < num(cur.generation)) refuse("stale_generation");
           // A full 4 KiB head is fixed for the life of the file. A shorter head grows with the file, so it cannot tell a rewrite.
-          if (num(cur.committed_bytes) >= HEAD_BYTES && String(cur.head_sha256) !== req.headSha256) refuse("rewritten");
+          // A holder with another head rewrote its file. A path that is not a holder has another file under the same id.
+          if (num(cur.committed_bytes) >= HEAD_BYTES && String(cur.head_sha256) !== req.headSha256) refuse(held ? "rewritten" : "other_copy");
           fileId = num(cur.id);
           committed = num(cur.committed_bytes);
         }
@@ -332,6 +413,16 @@ export class SessionStore {
           addedLines += p.lines;
           await this.hooks.afterPartInsert?.(i);
         }
+
+        // Record the path as a holder. A repeat touches the row at most once a minute.
+        await t.unsafe(
+          `INSERT INTO ais_session_path (file_id, node, root, rel_path, origin, pool)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (file_id, node, root, rel_path) DO UPDATE
+             SET last_seen_at = now(), origin = EXCLUDED.origin, pool = EXCLUDED.pool
+             WHERE ais_session_path.last_seen_at < now() - interval '1 minute'`,
+          [fileId, req.node, req.root, req.relPath, req.origin, req.pool ?? null],
+        );
 
         if (added === 0) return { status: "duplicate", cursor: curCursor! } satisfies IngestResult;
         const row = (
@@ -369,13 +460,34 @@ export class SessionStore {
     return rows.map(treeRowOf);
   }
 
-  /** Every stored file row of a session, all generations and folders, newest generation first. */
+  /** Every stored file row of a session (one per generation), newest generation first. */
   async filesOfSession(kind: string, sessionRef: string): Promise<SessionTreeRow[]> {
     const rows = await this.sql.unsafe(
       `SELECT * FROM ais_session_file WHERE kind = $1 AND session_ref = $2 ORDER BY generation DESC, committed_bytes DESC, id DESC`,
       [kind, sessionRef],
     );
     return rows.map(treeRowOf);
+  }
+
+  /** Every path that held a session (all generations), first seen first. */
+  async paths(kind: string, sessionRef: string): Promise<SessionHolderRow[]> {
+    const rows = await this.sql.unsafe(
+      `SELECT p.node, p.root, p.rel_path, p.origin, p.pool, p.first_seen_at, p.last_seen_at, f.generation
+         FROM ais_session_path p JOIN ais_session_file f ON f.id = p.file_id
+        WHERE f.kind = $1 AND f.session_ref = $2
+        ORDER BY p.first_seen_at, p.node, p.root, p.rel_path`,
+      [kind, sessionRef],
+    );
+    return rows.map((r: Row) => ({
+      node: String(r.node),
+      root: String(r.root),
+      relPath: String(r.rel_path),
+      origin: String(r.origin),
+      pool: strOrNull(r.pool),
+      generation: num(r.generation),
+      firstSeenAt: msOrNull(r.first_seen_at) ?? 0,
+      lastSeenAt: msOrNull(r.last_seen_at) ?? 0,
+    }));
   }
 
   /** The children of a node (subagents), newest first. */
