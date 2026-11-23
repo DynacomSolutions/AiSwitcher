@@ -401,8 +401,8 @@ ETA: 2026-11-25 18:00 ICT
 | 272 | Chat: close a binding's chats when its pairing is revoked | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>Chats are visible only to the approval they were made under.<br>Released in v0.5.95. |
 | 273 | Chat: composer with the model picker inside, matching T3 | done | claude | sidepanel-chat-composer | 18.264 | | Input card with the picker inside, on the new-chat screen too (#724).<br>Picker follows the T3 picker.<br>Released in v0.5.99. |
 | 274 | Chat: real provider icons in the picker | done | claude | sidepanel-chat-icons | 18.273 | | Real marks from simple-icons, as in the web UI (#727).<br>Release job installs dependencies (#732).<br>Released in v0.5.101. |
-| 275 | Chat: favourites sync between T3 and the side panel | in_progress | claude | favourites-sync | 18.273 | 2026-11-23 20:00 ICT | Owner approved: both directions, all AIS-managed T3 instances.<br>T3 reloads settings.json live, so no T3 patch. |
-| 276 | Chat: favourites sync options for cluster pods | in_progress | claude | favourites-cluster | 18.275 | 2026-11-23 20:00 ICT | Pool names, usage instances, origin label, favourites-only token. |
+| 275 | Chat: favourites sync between T3 and the side panel | done | claude |  | 18.273 |  | Merged #735, released v0.5.102.<br>Host proof: both ways in under 4 s. |
+| 276 | Chat: favourites sync options for cluster pods | done | claude |  | 18.275 |  | Merged #737, released v0.5.103.<br>Cluster pods sync both ways in under 1 s. |
 
 ## 19. CI speed and flaky tests
 
