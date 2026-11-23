@@ -1,0 +1,240 @@
+// The favourites sync of one T3 home: T3 Code's settings.json on one side, the gateway list on the other.
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { watch, type FSWatcher } from "node:fs";
+import { dirname, join } from "node:path";
+import { CHAT_PROVIDERS, MAX_FAVOURITES, parseChatToExt, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
+import type { FavouritesApi } from "./client.ts";
+import { applyGateway, localChanges, sameFavs } from "./merge.ts";
+import type { MapContext } from "./mapping.ts";
+import { favouritesStateDir, type FavSyncMetrics } from "./metrics.ts";
+import { readT3Settings, settingsPathOf, writeT3Favourites } from "./settings.ts";
+
+/** The name context of the host: the pool name of a provider and the canonical name of an identity. The instances come from settings.json. */
+export type HostNames = Pick<MapContext, "poolName" | "canonical">;
+
+export interface FavSyncDeps {
+  t3Home: string;
+  client: FavouritesApi;
+  /** A short label the gateway keeps with each change. */
+  origin?: string;
+  names: () => Promise<HostNames>;
+  /** Where the state of the last sync is kept. Default: the AIS state folder. */
+  stateDir?: string;
+  metrics?: FavSyncMetrics;
+  log?: (message: string) => void;
+}
+
+export interface SyncState { version: 1; seq: number; synced: FavKey[] }
+
+/** A short, stable name of a T3 home. It is used in file names, in the origin label and in metric labels, so no path leaks. */
+export const homeKey = (t3Home: string): string => createHash("sha256").update(t3Home).digest("hex").slice(0, 8);
+const statePath = (d: Pick<FavSyncDeps, "t3Home" | "stateDir">): string => join(d.stateDir ?? favouritesStateDir(), `${homeKey(d.t3Home)}.json`);
+export const metricsPathOf = (t3Home: string, stateDir = favouritesStateDir()): string => join(stateDir, `${homeKey(t3Home)}.metrics.json`);
+
+export async function readState(d: Pick<FavSyncDeps, "t3Home" | "stateDir">): Promise<SyncState | undefined> {
+  try {
+    const v = JSON.parse(await readFile(statePath(d), "utf8")) as { version?: unknown; seq?: unknown; synced?: unknown };
+    const list = parseChatToExt({ t: "chat.fav.list", seq: v.seq, items: v.synced });
+    return v.version === 1 && list?.t === "chat.fav.list" ? { version: 1, seq: list.seq, synced: list.items } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeState(d: Pick<FavSyncDeps, "t3Home" | "stateDir">, s: SyncState): Promise<void> {
+  const path = statePath(d);
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const temp = `${path}.tmp-${process.pid}`;
+  await writeFile(temp, JSON.stringify(s), { mode: 0o600 });
+  await rename(temp, path);
+}
+
+export type RoundResult =
+  | { status: "no-settings" }
+  /** T3 Code wrote its settings while this round worked. Nothing was written, run again. */
+  | { status: "retry" }
+  | { status: "ok"; seq: number; pushed: number; wrote: boolean };
+
+/**
+ * One round. It reads the gateway list, sends the stars made in T3 since the last round, makes T3's mapped favourites equal to the
+ * gateway list, and remembers the result. A round that finds nothing to change writes nothing, so the file event that follows a
+ * write of this code ends the loop.
+ */
+export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
+  const m = d.metrics;
+  const settings = await readT3Settings(d.t3Home);
+  if (!settings) return { status: "no-settings" };
+  const ctx: MapContext = { ...(await d.names()), instances: settings.instances };
+  const state = await readState(d);
+  let gateway = await d.client.get();
+  m && (m.s.pulls += 1);
+  // A list version below the remembered one means the gateway lost its data. Every star of T3 goes up again, and nothing is removed.
+  const last = state && gateway.seq >= state.seq ? state.synced : undefined;
+  const changes = localChanges(settings.favorites, ctx, last, gateway.items);
+  if (changes.length > 0) {
+    gateway = await d.client.post(d.origin ?? `t3:${homeKey(d.t3Home)}`, changes);
+    m && (m.s.pushes += 1);
+  }
+  const applied = applyGateway(settings.favorites, ctx, gateway.items);
+  let wrote = false;
+  if (!sameFavs(applied.next, settings.favorites)) {
+    const r = await writeT3Favourites(settings, applied.next);
+    if (r === "changed") return { status: "retry" };
+    wrote = r === "written";
+    if (wrote && m) {
+      m.s.writes += 1;
+      m.s.lastWrite = Math.floor(Date.now() / 1000);
+    }
+  }
+  await writeState(d, { version: 1, seq: gateway.seq, synced: applied.synced.slice(0, MAX_FAVOURITES) });
+  if (m) m.s.lastSuccess = Math.floor(Date.now() / 1000);
+  return { status: "ok", seq: gateway.seq, pushed: changes.length, wrote };
+}
+
+export interface RunOptions {
+  signal?: AbortSignal;
+  /** The slow poll that backs up the file watch and the gateway wait. Default 60 s. */
+  fallbackMs?: number;
+  /** How long the gateway holds a wait for a change. Default 25 s. */
+  waitMs?: number;
+  /** Pause after a failed round, growing to `maxBackoffMs`. Default 2 s. */
+  backoffMs?: number;
+  maxBackoffMs?: number;
+  /** Time to let the file settle after an event (T3 writes settings.json after 100 ms). Default 150 ms. */
+  settleMs?: number;
+}
+
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(t);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
+
+/**
+ * The long-running mode. A round runs at the start, when the settings file changes (a watch on its folder), when the gateway reports
+ * a new list version (a held request), and at least every `fallbackMs`. A failed round is logged once per message and tried again with a growing pause.
+ */
+export async function runFavouritesSync(d: FavSyncDeps, o: RunOptions = {}): Promise<void> {
+  const log = d.log ?? ((m: string) => console.error(`ais: ${m}`));
+  const signal = o.signal;
+  const fallbackMs = o.fallbackMs ?? 60_000;
+  const waitMs = o.waitMs ?? 25_000;
+  const minBackoff = o.backoffMs ?? 2_000;
+  const maxBackoff = o.maxBackoffMs ?? 60_000;
+  const settleMs = o.settleMs ?? 150;
+  let wake: (() => void) | undefined;
+  let kicked = false;
+  const kick = (): void => {
+    kicked = true;
+    wake?.();
+  };
+
+  // The settings file is replaced by a rename, so the watch is on the folder and filters by name.
+  let watcher: FSWatcher | undefined;
+  const watchFolder = (): void => {
+    if (watcher) return;
+    try {
+      watcher = watch(dirname(settingsPathOf(d.t3Home)), (_event, name) => {
+        if (name === null || name === "settings.json") kick();
+      });
+      watcher.on("error", () => {
+        watcher?.close();
+        watcher = undefined;
+      });
+    } catch { /* the folder is not there yet: the fallback poll runs the round, and the next one tries again */ }
+  };
+
+  // The held request to the gateway: it ends when the list version differs from the one this loop last saw.
+  let seen: number | undefined;
+  const follow = (async () => {
+    let pause = minBackoff;
+    while (!signal?.aborted) {
+      try {
+        const r = await d.client.get(seen, waitMs, signal);
+        pause = minBackoff;
+        if (seen === undefined || r.changed === true || r.seq !== seen) {
+          const first = seen === undefined;
+          seen = r.seq;
+          if (!first) kick();
+        }
+        // A gateway without the wait answers at once: never spin.
+        await sleep(r.changed === true ? 250 : 1_000, signal);
+      } catch {
+        await sleep(pause, signal);
+        pause = Math.min(pause * 2, maxBackoff);
+      }
+    }
+  })();
+
+  let failures = 0;
+  let lastMessage: string | undefined;
+  try {
+    while (!signal?.aborted) {
+      watchFolder();
+      kicked = false;
+      let retry = false;
+      try {
+        const r = await syncOnce(d);
+        retry = r.status === "retry";
+        if (r.status === "ok") seen = r.seq;
+        failures = 0;
+        if (lastMessage !== undefined) log(`t3 favourites sync: working again`);
+        lastMessage = undefined;
+      } catch (err) {
+        failures += 1;
+        if (d.metrics) d.metrics.s.errors += 1;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg !== lastMessage) log(`t3 favourites sync: ${msg}`);
+        lastMessage = msg;
+      }
+      d.metrics?.persist();
+      if (retry) {
+        await sleep(settleMs, signal);
+        continue;
+      }
+      const wait = failures > 0 ? Math.min(minBackoff * 2 ** (failures - 1), maxBackoff) : fallbackMs;
+      if (!kicked) {
+        await Promise.race([new Promise<void>((resolve) => { wake = resolve; }), sleep(wait, signal)]);
+        wake = undefined;
+      }
+      // Let a burst of file events end before the next round.
+      if (!signal?.aborted) await sleep(settleMs, signal);
+    }
+  } finally {
+    watcher?.close();
+    await Promise.race([follow, sleep(200)]);
+  }
+}
+
+/** The pool name of each provider and the canonical identity names, read from the AIS identity registries of this host. */
+export async function hostNames(): Promise<HostNames> {
+  const { TOOL_CONFIGS } = await import("../../cli/identities/resolve-tool.ts");
+  const { loadIdentitiesFile } = await import("../../identities/store.ts");
+  const { poolsOf } = await import("../../identities/pool/swap-pool.ts");
+  const pools = new Map<ChatProvider, string>();
+  const canon = new Map<ChatProvider, Array<{ name: string; aliases: string[] }>>();
+  for (const p of CHAT_PROVIDERS) {
+    const cfg = (TOOL_CONFIGS as Record<string, { identitiesJsonPath: string } | undefined>)[p];
+    if (!cfg) continue;
+    try {
+      const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
+      const found = poolsOf(file);
+      if (found.length === 1) pools.set(p, found[0]!.name);
+      canon.set(p, file.identities.map((i) => ({ name: i.name, aliases: i.aliases ?? [] })));
+    } catch { /* a tool with no registry: its names are used as they are */ }
+  }
+  return {
+    poolName: (p) => pools.get(p) ?? "pool",
+    canonical: (p, name) => {
+      const hit = canon.get(p)?.find((i) => i.name === name || i.aliases.includes(name));
+      return hit?.name ?? name;
+    },
+  };
+}

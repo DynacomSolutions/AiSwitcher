@@ -575,6 +575,34 @@ Metrics: `ais_gateway_chat_sessions_total`, `ais_gateway_chat_turns_total`, `ais
 
 Rollout. On SIGTERM, readiness drops first. The chat drain then starts: new prompts get `unavailable`, open asks end as cancelled, and turns in flight finish with no timer. Pods end and leases free after the turns. The ledger flushes after the drain. Chats resume with `session/load` on the next prompt.
 
+## Starred models: T3 Code and the side panel (`src/t3/favourites/`)
+
+The model stars of the Chrome side panel picker and of T3 Code follow each other, in both directions, for every T3 home that AIS manages. T3 Code is not patched: it keeps its stars in `<T3 home>/userdata/settings.json` (`favorites: [{provider: <instance id>, model}]`), watches that file and reloads it by itself, so a write of the `favorites` key shows at once.
+
+Gateway. One list for the gateway owner, in `gateway_favourites` (migration `0013_favourites`; an in-memory store for tests, same contract test). A change is `{provider, identity, model, op: add|remove, at}`. The newest `at` of a model wins, so a star in Chrome and a star in T3 at the same time both stay. A removed model keeps a row, so a late older add cannot bring it back. An `at` more than a minute ahead of the gateway clock, or older than a week, counts as now. At most 200 stars. A change notice `{t: "favs"}` goes over the chat bus, so every replica pushes the new list to its panels and wakes its long polls.
+
+- Panel socket (needs a gateway with chat on): the panel sends `chat.fav.list` (read) and `chat.fav.set {changes}`. The gateway answers and pushes `chat.fav.list {seq, items}` after an attach and after every change. An older extension drops the unknown frame (`parseChatToExt` returns undefined for a type it does not know, and the connection ignores it). An older gateway drops `chat.fav.*` from a newer extension (`parseChatFromExt` returns undefined), so the panel keeps its local cache.
+- Daemon API (admin bearer token, admin port): `GET /favourites` answers `{seq, items}`. With `?since=N&ms=M` it answers at once when the list version differs from N, else when the list changes or after M ms (at most 25 s): this is the long poll that gives updates in about 5 s or less. `POST /favourites {origin, changes}` applies changes and answers with the list. Both answer 404 until the chat stack is up.
+- Metric `ais_gateway_favourites_total{event}`: `socket_list`, `socket_set`, `http_get`, `http_post`, `change`, `push`, `error`.
+
+Extension. The service worker owns the stars (`ChatHub`): the panel sends `ais-chat-favourite`, the worker sends the change to the gateway, saves the list in `chrome.storage.local` (`chatFavourites`, with `chatFavouritesSynced` for the last gateway list) and follows `chat.fav.list` live. After each connect the first list is merged once with the local one: a local star the gateway never reported goes up, and a star taken away offline is removed at the gateway. Offline the star stays local and goes up on the next connect.
+
+Host: `ais t3 favourites sync [--once] [--t3-home=<dir>]`. It reads the gateway list, sends the stars made in T3 since the last run, and makes T3's mapped favourites equal to the gateway list. It changes only the `favorites` key, writes next to the file and renames (mode and owner kept, the indent and the final newline kept), and does nothing when the file is already right, so the file event of its own write ends the loop. When T3 writes the file during a round, the round starts again. A favourite whose instance AIS does not map stays where it is and is never sent. A removal in T3 is found by comparing with the last sync, kept in `~/.ais/state/t3-favourites/<home hash>.json`. The long-running mode watches the settings folder, holds a long poll at the gateway and polls every 60 s as a backup. The profile-sync daemon runs it for the T3 home of this host (`T3CODE_HOME`, else `~/.t3`) when `AIS_GATEWAY_ADMIN_URL` and `AIS_GATEWAY_ADMIN_TOKEN` are set (environment or `~/.secrets`). Cluster T3 pods run `ais t3 favourites sync` as a second process with `T3CODE_HOME`, the admin address and the admin token (`--metrics-listen=0.0.0.0:<port>` serves `/metrics`).
+
+Instance mapping (a name context gives the pool name of each provider and the canonical identity name):
+
+| T3 instance id | AIS provider | AIS identity |
+| --- | --- | --- |
+| `<claude or codex>-pool` | claude, codex | the pool |
+| `t3-claude-<identity>`, `t3-codex-<identity>` | claude, codex | `<identity>` |
+| `t3-kimi-<identity>-acp`, `t3-zai-<identity>-acp` | kimi, zai | `<identity>` |
+| `t3-grok-<identity>`, `t3-grok-<identity>-acp` | grok | `<identity>` |
+| `t3-opencode-<identity>` | opencode | `<identity>` |
+| `t3-kimi-pool-acp`, `t3-grok-pool`, `t3-opencode-pool` | kimi, grok, opencode | the pool |
+| `claudeAgent`, `codex`, `t3-claude-kimi-*`, `t3-claude-zai-*`, `t3-zcode-*` | none | not synced |
+
+Metrics of the host sync: `ais_t3_favourites_sync_{pulls,pushes,writes,errors}_total` and `..._last_success_timestamp_seconds`, `..._last_write_timestamp_seconds`, `..._started_timestamp_seconds`, labelled `home` (a short hash, never a path). The console `/metrics` serves the snapshot files that every sync process writes to `~/.ais/state/t3-favourites/`, and `--metrics-listen` serves them from the process.
+
 ## Refresh guard
 
 The gateway alone refreshes account logins, and a provider rotates the refresh

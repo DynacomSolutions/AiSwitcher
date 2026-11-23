@@ -132,6 +132,17 @@ export const HELP: Record<string, HelpNode> = {
       ),
     },
   },
+  t3: {
+    usage: "ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>]",
+    desc: "T3 Code: keep model favourites in step with the AIS gateway",
+    examples: ["ais t3 favourites sync --once", "AIS_GATEWAY_ADMIN_URL=<admin url> AIS_GATEWAY_ADMIN_TOKEN=<token> T3CODE_HOME=<dir> ais t3 favourites sync"],
+    subs: {
+      favourites: sub(
+        "ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>]",
+        "Sync the model favourites of one T3 Code home with the AIS gateway list, in both directions, so a star in T3 shows in the Chrome side panel and the other way round. Changes only the favorites key of <T3 home>/userdata/settings.json (written next to the file and renamed, mode and owner kept); a favourite whose instance AIS does not manage is left alone. T3 reloads the file by itself. A removal in T3 is found by comparing with the last sync (kept in the AIS state folder). Env or ~/.secrets: AIS_GATEWAY_ADMIN_URL, AIS_GATEWAY_ADMIN_TOKEN; T3CODE_HOME or --t3-home picks the home (default ~/.t3). --once runs one round and exits; without it the command follows the file (watch plus a slow poll, --interval seconds, default 60) and the gateway (a held request, updates in about 5 s), and the profile-sync daemon runs it for this host. --metrics-listen serves GET /metrics (pulls, pushes, writes, errors) for a scraper; the same counters go to the AIS state folder for the console /metrics",
+      ),
+    },
+  },
   browser: {
     usage: "ais browser approve|list|revoke|agent-token|extension|headers|codex-config|mcp|upload ...",
     desc: "AIS Browser: bind Chrome extensions to an identity or swap pool; agent tokens",
