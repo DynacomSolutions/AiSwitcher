@@ -33,7 +33,7 @@ export function makeHome(opts: { favorites?: Array<{ provider: string; model: st
 /** The gateway as a function: the real store rules, no network. Calls are counted. */
 export function fakeGateway(now: () => number = Date.now) {
   const store = new MemoryFavouriteStore();
-  const calls = { gets: 0, posts: 0, posted: [] as FavChange[][] };
+  const calls = { gets: 0, posts: 0, posted: [] as FavChange[][], origins: [] as string[] };
   let down = false;
   const list = async (): Promise<FavList> => {
     const l = await store.list();
@@ -55,6 +55,7 @@ export function fakeGateway(now: () => number = Date.now) {
       if (down) throw new Error("gateway down");
       calls.posts += 1;
       calls.posted.push(changes);
+      calls.origins.push(origin);
       const r = await store.apply(changes, origin, now());
       return { ...(await list()), refused: r.refused };
     },

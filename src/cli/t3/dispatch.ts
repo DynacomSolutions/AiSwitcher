@@ -2,9 +2,9 @@ import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { t3Paths } from "../../identities/t3-anthropic-proxy.ts";
 import { createFavouritesClient, type FavouritesApi } from "../../t3/favourites/client.ts";
-import { ADMIN_TOKEN_KEY, ADMIN_URL_KEY, gatewayAdmin } from "../../t3/favourites/config.ts";
+import { ADMIN_TOKEN_KEY, ADMIN_URL_KEY, FAVOURITES_TOKEN_KEY, gatewayAdmin } from "../../t3/favourites/config.ts";
 import { FavSyncMetrics } from "../../t3/favourites/metrics.ts";
-import { homeKey, hostNames, metricsPathOf, runFavouritesSync, syncOnce, type HostNames } from "../../t3/favourites/sync.ts";
+import { homeKey, hostNames, metricsPathOf, ORIGIN_LABEL, parsePoolNames, POOL_NAMES_ENV, runFavouritesSync, syncOnce, type HostNames, type PoolNames } from "../../t3/favourites/sync.ts";
 
 export interface T3CliDeps {
   out(line: string): void;
@@ -17,7 +17,8 @@ export interface T3CliDeps {
   signal?: AbortSignal;
 }
 
-const USAGE = "Usage: ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>]";
+const ORIGIN_ENV = "AIS_T3_FAVOURITES_ORIGIN";
+const USAGE = "Usage: ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>] [--pool-names=<tool>=<name>,...] [--origin=<label>]";
 
 /** `ais t3 favourites sync`: keeps the model favourites of one T3 Code home in step with the AIS gateway list, in both directions. */
 export async function runT3Command(positionals: string[], flags: ParsedArgs["flags"], deps: Partial<T3CliDeps> = {}): Promise<void> {
@@ -32,14 +33,24 @@ export async function runT3Command(positionals: string[], flags: ParsedArgs["fla
   const listen = stringFlag(flags, "metrics-listen");
   if (listen !== undefined && !/^[^:\s]+:\d{1,5}$/.test(listen)) throw new CliUsageError("--metrics-listen must be host:port");
 
+  // The flags win over the environment. A bad value stops the command here, before any round.
+  let poolNames: PoolNames;
+  try {
+    poolNames = { ...parsePoolNames(env[POOL_NAMES_ENV]), ...parsePoolNames(stringFlag(flags, "pool-names")) };
+  } catch (err) {
+    throw new CliUsageError(err instanceof Error ? err.message : String(err));
+  }
+  const label = stringFlag(flags, "origin") ?? (env[ORIGIN_ENV]?.trim() || undefined);
+  if (label !== undefined && !ORIGIN_LABEL.test(label)) throw new CliUsageError("--origin (or AIS_T3_FAVOURITES_ORIGIN) must be a short label: letters, digits, _ and -, at most 40 characters, starting with a letter or digit");
+
   let client = d.client;
   if (!client) {
     const admin = await gatewayAdmin(env);
-    if (!admin) throw new CliUsageError(`${ADMIN_URL_KEY} and ${ADMIN_TOKEN_KEY} must be set in the environment or in ~/.secrets`);
+    if (!admin) throw new CliUsageError(`${ADMIN_URL_KEY} and ${FAVOURITES_TOKEN_KEY} (or ${ADMIN_TOKEN_KEY}) must be set in the environment or in ~/.secrets`);
     client = createFavouritesClient(admin);
   }
-  const metrics = new FavSyncMetrics(metricsPathOf(t3Home, d.stateDir));
-  const sync = { t3Home, client, names: d.names ?? hostNames, metrics, ...(d.stateDir ? { stateDir: d.stateDir } : {}), log: (m: string) => console.error(`ais: ${m}`) };
+  const metrics = new FavSyncMetrics(metricsPathOf(t3Home, d.stateDir, "cli", process.pid, label));
+  const sync = { t3Home, client, names: d.names ?? (() => hostNames({ poolNames, env })), metrics, ...(label ? { label } : {}), ...(d.stateDir ? { stateDir: d.stateDir } : {}), log: (m: string) => console.error(`ais: ${m}`) };
 
   if (boolFlag(flags, "once")) {
     try {
@@ -47,7 +58,7 @@ export async function runT3Command(positionals: string[], flags: ParsedArgs["fla
       for (let i = 0; ; i++) {
         const r = await syncOnce(sync);
         if (r.status === "retry" && i < 2) continue;
-        if (r.status === "no-settings") d.out(`t3 favourites sync: no settings.json in this T3 home (${homeKey(t3Home)})`);
+        if (r.status === "no-settings") d.out(`t3 favourites sync: no settings.json in this T3 home (${homeKey(t3Home, label)})`);
         else if (r.status === "retry") throw new Error("T3 Code kept writing its settings; run it again");
         else d.out(`t3 favourites sync: ${r.pushed} sent to the gateway, T3 settings ${r.wrote ? "updated" : "unchanged"} (list version ${r.seq})`);
         return;
@@ -70,11 +81,11 @@ export async function runT3Command(positionals: string[], flags: ParsedArgs["fla
     ? Bun.serve({
         hostname: listen.slice(0, listen.lastIndexOf(":")),
         port: Number(listen.slice(listen.lastIndexOf(":") + 1)),
-        fetch: (req) => (new URL(req.url).pathname === "/metrics" ? new Response(metrics.render(homeKey(t3Home)), { headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } }) : new Response("not found", { status: 404 })),
+        fetch: (req) => (new URL(req.url).pathname === "/metrics" ? new Response(metrics.render(homeKey(t3Home, label)), { headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } }) : new Response("not found", { status: 404 })),
       })
     : undefined;
   try {
-    d.out(`t3 favourites sync: following ${homeKey(t3Home)}`);
+    d.out(`t3 favourites sync: following ${homeKey(t3Home, label)}`);
     await runFavouritesSync(sync, { signal: ctl.signal, ...(fallbackMs !== undefined ? { fallbackMs } : {}) });
   } finally {
     metrics.remove();
