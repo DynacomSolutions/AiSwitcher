@@ -1,5 +1,5 @@
 // Provider, identity and model picker: the pure model and the key rules. The DOM is in picker-view.ts.
-import { selectable } from "../../../../../src/browser/chat-protocol.ts";
+import { CHAT_PROVIDERS, selectable } from "../../../../../src/browser/chat-protocol.ts";
 import type { ChatCatalogProvider, ChatProvider, ChatSelection } from "../../../../../src/browser/chat-protocol.ts";
 import { providerMark } from "./provider-icons.ts";
 
@@ -12,6 +12,8 @@ export interface PickerModel {
   notice?: string;
   /** An open chat cannot change provider or identity. Other identities show as disabled. */
   locked?: boolean;
+  /** The starred models. They live in local storage, so they are not part of the catalogue. */
+  favourites?: Fav[];
 }
 export interface LiveConfig { models: Array<{ id: string; name: string }>; efforts: string[]; current: { model?: string; effort?: string } }
 export const NO_MODEL = "Choose a model";
@@ -78,3 +80,123 @@ export function menuKey(state: { open: boolean; index: number; count: number }, 
     default: return { open, index };
   }
 }
+
+
+// ---- the model list of the popover ----------------------------------------------------------------------------
+
+/** A starred model: the pick that a click makes. */
+export interface Fav { provider: ChatProvider; identity: string; model: string }
+/** The id of the Favourites tab. A provider id never equals it. */
+export const FAVOURITES = "favourites";
+export const EMPTY_TEXT = {
+  favourites: "No favourites yet",
+  search: "No models found",
+  provider: "No models are available for this provider.",
+};
+export const DEFAULT_ROW_NAME = "Default model";
+export const DEFAULT_ROW_SUB = "Chosen by the agent";
+const MAX_FAVOURITES = 200;
+
+export const favKey = (f: Fav): string => [f.provider, f.identity, f.model].join("\u0000");
+
+/** Accepts stored favourites only when each has a known provider and selectable names. A bad entry is dropped. */
+export function parseFavourites(v: unknown): Fav[] {
+  if (!Array.isArray(v)) return [];
+  const out: Fav[] = [];
+  const seen = new Set<string>();
+  for (const raw of v) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const r = raw as Record<string, unknown>;
+    if (!(CHAT_PROVIDERS as readonly unknown[]).includes(r.provider) || typeof r.identity !== "string" || typeof r.model !== "string" || !selectable(r.identity) || !selectable(r.model)) continue;
+    const f: Fav = { provider: r.provider as ChatProvider, identity: r.identity, model: r.model };
+    if (seen.has(favKey(f))) continue;
+    seen.add(favKey(f));
+    out.push(f);
+    if (out.length >= MAX_FAVOURITES) break;
+  }
+  return out;
+}
+
+/** Adds the favourite when it is new, else removes it. */
+export function toggleFavourite(list: Fav[], f: Fav): Fav[] {
+  const key = favKey(f);
+  return list.some(x => favKey(x) === key) ? list.filter(x => favKey(x) !== key) : [...list, f].slice(-MAX_FAVOURITES);
+}
+
+/** One row of the model list. An identity with no model list gets one default row, so it stays pickable. */
+export interface PickerEntry {
+  key: string;
+  provider: ChatProvider;
+  providerName: string;
+  identity: string;
+  kind: "identity" | "pool";
+  /** Absent on the default row. */
+  model?: string;
+  name: string;
+  sub: string;
+  selected: boolean;
+  /** A locked chat cannot move to another identity. */
+  disabled: boolean;
+}
+export interface PickerSection { heading: string | null; entries: PickerEntry[] }
+
+export function pickerEntries(m: PickerModel): PickerEntry[] {
+  const out: PickerEntry[] = [];
+  for (const g of m.groups) {
+    const providerName = providerMark(g.provider).name;
+    for (const i of g.identities) {
+      const disabled = m.locked === true && !i.selected;
+      const base = { provider: g.provider, providerName, identity: i.name, kind: i.kind, disabled };
+      if (i.models.length === 0) out.push({ ...base, key: `${g.provider}\u0000${i.name}`, name: DEFAULT_ROW_NAME, sub: DEFAULT_ROW_SUB, selected: i.selected });
+      else for (const mo of i.models) out.push({ ...base, key: favKey({ provider: g.provider, identity: i.name, model: mo.id }), model: mo.id, name: mo.name, sub: mo.id, selected: mo.selected });
+    }
+  }
+  return out;
+}
+
+/** The tabs of the sidebar after Favourites: the providers that have an identity. */
+export function providerTabs(m: PickerModel): Array<{ provider: ChatProvider; name: string }> {
+  return m.groups.map(g => ({ provider: g.provider, name: providerMark(g.provider).name }));
+}
+
+/** Every word of the query must appear in the name, the id, the identity or the provider name. */
+export function matchesQuery(e: PickerEntry, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  const hay = `${e.name} ${e.model ?? ""} ${e.identity} ${e.providerName}`.toLowerCase();
+  return q.split(/\s+/).every(t => hay.includes(t));
+}
+
+const where = (e: PickerEntry): string => `${e.providerName} \u00b7 ${e.identity}`;
+const identityHeading = (e: PickerEntry): string => (e.kind === "pool" ? `${e.identity} (pool)` : e.identity);
+
+/** Sections of the list: search results from every provider, the favourites, or one provider by identity. */
+export function pickerRows(m: PickerModel, active: string, query: string): PickerSection[] {
+  const all = pickerEntries(m);
+  const sections: PickerSection[] = [];
+  const add = (heading: string | null, entry: PickerEntry): void => {
+    const last = sections[sections.length - 1];
+    if (last && last.heading === heading) last.entries.push(entry); else sections.push({ heading, entries: [entry] });
+  };
+  if (query.trim() !== "") {
+    for (const e of all.filter(x => matchesQuery(x, query))) add(where(e), e);
+  } else if (active === FAVOURITES) {
+    const stars = new Set((m.favourites ?? []).map(favKey));
+    for (const e of all.filter(x => x.model !== undefined && stars.has(x.key))) add(where(e), e);
+  } else {
+    for (const e of all.filter(x => x.provider === active)) add(identityHeading(e), e);
+  }
+  return sections;
+}
+
+/** The tab to open on: the provider of the selected model, else Favourites when it has a row, else the first provider. */
+export function startTab(m: PickerModel): string {
+  const selected = m.groups.find(g => g.identities.some(i => i.selected));
+  if (selected) return selected.provider;
+  const stars = new Set((m.favourites ?? []).map(favKey));
+  if (pickerEntries(m).some(e => e.model !== undefined && stars.has(e.key))) return FAVOURITES;
+  return m.groups[0]?.provider ?? FAVOURITES;
+}
+
+/** The sidebar order: Favourites, then the providers. */
+export function tabOrder(m: PickerModel): string[] { return [FAVOURITES, ...providerTabs(m).map(t => t.provider)]; }

@@ -478,7 +478,9 @@ describe("picker wiring", () => {
     const s = make(undefined);
     await s.flush();
     s.push(stateOf([], { catalog: [{ ...cat[0]!, efforts: ["low", "bad effort"] }] }));
-    const items = walk(byClass(s.root, "picker")[0]!).filter(n => n.attrs.role === "menuitemradio");
+    const picker = byClass(s.root, "picker")[0]!;
+    walk(picker).find(n => n.className === "picker-button picker-effort")!.click();
+    const items = walk(picker).filter(n => n.attrs.role === "menuitemradio");
     items.find(n => n.textContent === "low")!.click();
     expect(s.saved.length).toBe(1);
     expect(s.saved[0]).toMatchObject({ effort: "low" });
@@ -499,11 +501,12 @@ describe("picker wiring", () => {
     await s.flush();
     const pickers = byClass(s.root, "picker");
     const detail = pickers[1]!;
-    const items = walk(detail).filter(n => n.attrs.role === "menuitemradio");
-    const pool = items.find(n => n.textContent.includes("pool-a"))!;
+    walk(detail).find(n => n.className === "picker-button")!.click();
+    const items = walk(detail).filter(n => n.attrs.role === "option");
+    const pool = items.find(n => n.textContent.includes("Pool One"))!;
     expect(pool.attrs["aria-disabled"]).toBe("true");
     pool.click();
-    items.find(n => n.textContent === "Two")!.click();
+    items.find(n => n.textContent.startsWith("Two"))!.click();
     await s.flush();
     expect(s.sent.filter(c => c.type === "ais-chat-config")).toEqual([{ type: "ais-chat-config", chatId: "a", model: "m2" }]);
   });
@@ -518,6 +521,72 @@ describe("picker wiring", () => {
     btn.click();
     await s.flush();
     expect(s.sent.filter(c => c.type === "ais-chat-catalog").length).toBe(2);
+  });
+});
+
+describe("composer with the picker inside", () => {
+  const cat = [{ provider: "claude" as const, efforts: ["low"], identities: [{ name: "work", kind: "identity" as const, models: [{ id: "m1", name: "One" }, { id: "m2", name: "Two" }] }] }];
+  const make = (stored?: unknown) => {
+    const doc = fakeDoc();
+    const root = doc.createElement("section");
+    let push: (m: unknown) => void = () => {};
+    const saved: unknown[] = [];
+    const t = new ChatTab({
+      doc: asDoc(doc), windowId: 1,
+      connect: () => ({ postMessage: () => {}, onMessage: l => { push = l; }, onDisconnect: () => {} }),
+      queryTabs: async () => [tab(5, { active: true })],
+      send: async () => ({ ok: true }),
+      loadSeen: async () => ({}), saveSeen: () => {},
+      loadFavourites: async () => stored, saveFavourites: f => { saved.push(f); },
+    }, asEl(root));
+    t.start();
+    return { t, root, saved, push: (s: ChatPanelState) => push(s), flush: () => new Promise(r => setTimeout(r, 0)) };
+  };
+  test("the model picker sits in the bottom row of the composer card, below the message box", async () => {
+    const s = make();
+    s.push(stateOf([view("a", { selection: { provider: "claude", identity: "work" } })], { catalog: cat }));
+    s.t.select("a");
+    await s.flush();
+    const card = byClass(s.root, "composer-card")[0]!;
+    const bar = byClass(card, "composer-bar")[0]!;
+    const tools = byClass(bar, "composer-tools")[0]!;
+    expect(card.children[0]!.className).toBe("composer-box");
+    expect(tools.children[0]!.className).toBe("picker");
+    expect(byClass(bar, "composer-send")).toHaveLength(1);
+    // The old place, a picker between the feed and the composer, is gone.
+    expect(byClass(s.root, "chat-detail")[0]!.children.map(c => c.className)).not.toContain("picker");
+  });
+  test("the picker moves with the open chat", async () => {
+    const s = make();
+    const chats = [view("a", { selection: { provider: "claude", identity: "work" } }), view("b", { selection: { provider: "claude", identity: "work" } })];
+    s.push(stateOf(chats, { catalog: cat }));
+    s.t.select("a");
+    await s.flush();
+    const composerOf = (n: number) => byClass(s.root, "composer-tools")[n]!;
+    const picker = walk(composerOf(0)).find(n => n.className === "picker")!;
+    s.t.select(undefined);
+    s.t.select("b");
+    expect(byClass(s.root, "composer-tools").some(t => t.children.includes(picker))).toBe(true);
+    expect(byClass(s.root, "composer-tools").filter(t => t.children.length > 0)).toHaveLength(1);
+  });
+  test("a star is saved and stays after a reload of the list", async () => {
+    const s = make([{ provider: "claude", identity: "work", model: "m1" }]);
+    await s.flush();
+    s.push(stateOf([], { catalog: cat }));
+    const picker = byClass(s.root, "picker")[0]!;
+    walk(picker).find(n => n.className === "picker-button")!.click();
+    expect(walk(picker).find(n => n.attrs["aria-label"] === "Remove One from favourites")).toBeDefined();
+    walk(picker).find(n => n.attrs["aria-label"] === "Add Two to favourites")!.click();
+    expect(s.saved).toEqual([[{ provider: "claude", identity: "work", model: "m1" }, { provider: "claude", identity: "work", model: "m2" }]]);
+    expect(walk(picker).find(n => n.attrs["aria-label"] === "Remove Two from favourites")).toBeDefined();
+  });
+  test("bad stored favourites are dropped", async () => {
+    const s = make([{ provider: "claude", identity: "work", model: "bad id" }, "x"]);
+    await s.flush();
+    s.push(stateOf([], { catalog: cat }));
+    const picker = byClass(s.root, "picker")[0]!;
+    walk(picker).find(n => n.className === "picker-button")!.click();
+    expect(walk(picker).filter(n => n.attrs["aria-pressed"] === "true")).toHaveLength(0);
   });
 });
 
