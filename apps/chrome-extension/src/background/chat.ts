@@ -21,6 +21,8 @@ export const FAVOURITES_KEY = "chatFavourites";
 export const FAVOURITES_SYNCED_KEY = "chatFavouritesSynced";
 /** The epoch of the gateway store that `chatFavouritesSynced` came from. */
 export const FAVOURITES_EPOCH_KEY = "chatFavouritesEpoch";
+/** The list version of the last gateway list. A list with the same epoch and a lower version is a restore of old data. */
+export const FAVOURITES_SEQ_KEY = "chatFavouritesSeq";
 /** The time of each click that the gateway has not confirmed yet, by star id. A change that waits offline keeps it, so the gateway orders it by the click and not by the reconnect. */
 export const FAVOURITES_AT_KEY = "chatFavouritesAt";
 
@@ -57,6 +59,8 @@ export class ChatHub {
   private favsSynced: FavKey[] = [];
   /** The store epoch of `favsSynced`. A list with another epoch means the gateway lost its data. Undefined until a gateway has named one. */
   private favsEpoch: string | undefined;
+  /** The list version of the last gateway list. A restore from a backup keeps the epoch, so the version going backwards is the sign of it. */
+  private favsSeq: number | undefined;
   /** Clicks that wait for the gateway to confirm them. */
   private favsClicks = new Map<string, Click>();
   /** True from a welcome until the first list of the gateway has been merged with the local one. */
@@ -88,17 +92,19 @@ export class ChatHub {
   private async loadFavourites(): Promise<void> {
     if (!this.d.local) return;
     try {
-      const r = await this.d.local.get([FAVOURITES_KEY, FAVOURITES_SYNCED_KEY, FAVOURITES_EPOCH_KEY, FAVOURITES_AT_KEY]);
+      const r = await this.d.local.get([FAVOURITES_KEY, FAVOURITES_SYNCED_KEY, FAVOURITES_EPOCH_KEY, FAVOURITES_SEQ_KEY, FAVOURITES_AT_KEY]);
       this.favs = cleanFavs(r[FAVOURITES_KEY]);
       this.favsSynced = cleanFavs(r[FAVOURITES_SYNCED_KEY]);
       const epoch = r[FAVOURITES_EPOCH_KEY];
       this.favsEpoch = typeof epoch === "string" && epoch !== "" ? epoch : undefined;
+      const seq = r[FAVOURITES_SEQ_KEY];
+      this.favsSeq = typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0 ? seq : undefined;
       this.favsClicks = cleanClicks(r[FAVOURITES_AT_KEY]);
     } catch { /* no cache: the gateway list fills it */ }
   }
 
   private saveFavourites(): void {
-    void this.d.local?.set({ [FAVOURITES_KEY]: this.favs, [FAVOURITES_SYNCED_KEY]: this.favsSynced, [FAVOURITES_EPOCH_KEY]: this.favsEpoch ?? "", [FAVOURITES_AT_KEY]: Object.fromEntries(this.favsClicks) }).catch(() => { /* a full store keeps the list in memory */ });
+    void this.d.local?.set({ [FAVOURITES_KEY]: this.favs, [FAVOURITES_SYNCED_KEY]: this.favsSynced, [FAVOURITES_EPOCH_KEY]: this.favsEpoch ?? "", [FAVOURITES_SEQ_KEY]: this.favsSeq ?? -1, [FAVOURITES_AT_KEY]: Object.fromEntries(this.favsClicks) }).catch(() => { /* a full store keeps the list in memory */ });
   }
 
   /** Writes now, without waiting for the timer. Used on chat close and when the panel disconnects. */
@@ -207,7 +213,7 @@ export class ChatHub {
         this.changed(ALL_WINDOWS, false);
         return;
       }
-      case "chat.fav.list": return this.onFavourites(f.items, f.epoch, f.refused);
+      case "chat.fav.list": return this.onFavourites(f.items, f.epoch, f.refused, f.seq);
       case "chat.reject": return this.onReject(f);
     }
   }
@@ -218,11 +224,12 @@ export class ChatHub {
    * is the truth, and the panel follows it live.
    * A list with another epoch than the last one comes from a store that lost its data. It is merged like a first run with no known list:
    * every local star goes up, and nothing is dropped or removed because the new list lacks it.
+   * A restore from a backup keeps the epoch, so a list version below the last one seen is a reset too, like on the host.
    */
-  private onFavourites(items: FavKey[], epoch?: string, refused: FavRefusal[] = []): void {
+  private onFavourites(items: FavKey[], epoch?: string, refused: FavRefusal[] = [], seq?: number): void {
     const gateway = new Set(items.map(favId));
     let shown = items;
-    const reset = epoch !== undefined && this.favsEpoch !== undefined && epoch !== this.favsEpoch;
+    const reset = (epoch !== undefined && this.favsEpoch !== undefined && epoch !== this.favsEpoch) || (seq !== undefined && this.favsSeq !== undefined && seq < this.favsSeq);
     if (this.favsMerge || reset) {
       this.favsMerge = false;
       const mine = new Set(this.favs.map(favId));
@@ -245,6 +252,7 @@ export class ChatHub {
     if (refused.some(r => r.reason === "cap")) this.favsNotice = FAVOURITES_FULL;
     else if (items.length < MAX_FAVOURITES) this.favsNotice = undefined;
     if (epoch !== undefined) this.favsEpoch = epoch;
+    if (seq !== undefined) this.favsSeq = seq;
     this.favs = shown;
     this.saveFavourites();
     this.changed(ALL_WINDOWS, false);

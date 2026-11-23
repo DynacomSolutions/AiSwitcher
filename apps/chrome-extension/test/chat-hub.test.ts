@@ -602,6 +602,27 @@ describe("favourites", () => {
     expect(e.hub.state(1).favourites).toEqual([fav("a")]);
   });
 
+  test("a restore keeps the epoch: a list version below the last one is a reset, also after a worker restart", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("a"), fav("b")], [SYNCED_KEY]: [fav("a"), fav("b")], [EPOCH_KEY]: "e1", ["chatFavouritesSeq"]: 9 });
+    await e.hub.load();
+    e.hub.onWelcome();
+    // The store was restored from a backup that had only "a" at version 4: same epoch, lower version.
+    e.hub.handleFrame(list([fav("a")], 4, "e1"));
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("b"), op: "add", at: 5000 }] }]);
+    expect(e.hub.state(1).favourites).toEqual([fav("a"), fav("b")]);
+    await Bun.sleep(0);
+    expect(e.store["chatFavouritesSeq"]).toBe(4);
+  });
+
+  test("a list version that only grows with the same epoch is no reset", () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([fav("a")], 5, "e1"));
+    e.hub.handleFrame(list([], 6, "e1"));
+    expect(e.hub.state(1).favourites).toEqual([]);
+    expect(e.sets()).toEqual([]);
+  });
+
   test("a gateway without an epoch, or a store from before the epoch, keeps the old rules", async () => {
     const e = withLocal({ [FAV_KEY]: [fav("m1")], [SYNCED_KEY]: [fav("m1")] });
     await e.hub.load();

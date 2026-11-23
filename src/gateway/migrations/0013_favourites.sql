@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS gateway_favourites (
   origin   text NOT NULL
 );
 CREATE INDEX IF NOT EXISTS gateway_favourites_present ON gateway_favourites (present, at_ms);
--- One row that names this store. A restore, a rebuild or a fresh database makes a new epoch, so clients tell a reset list from a changed one.
+-- One row that names this store. A rebuild or a fresh database makes a new epoch. A restore from a backup or a TRUNCATE keeps the epoch, so clients tell it by the list version (`seq`) going backwards.
 CREATE TABLE IF NOT EXISTS gateway_favourites_meta (
   id    boolean PRIMARY KEY DEFAULT true CHECK (id),
   epoch text NOT NULL
