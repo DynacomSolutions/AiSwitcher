@@ -262,8 +262,8 @@ ETA: 2026-11-23 16:30 ICT
 | 285 | AIS Browser: harden tab replace and allowClose | done | claude | browser-replace-hardening | 6.284 | | Review notes from PR 717.<br>Ignore a replace into a known tab, refuse allowClose while an approval record is unlinked.<br>Merged in PR 719. |
 | 286 | AIS Browser: approve group requests in the side panel and from a notification click | done | claude | browser-approve-ui | 6.284 | | Merged in PR 720, released in v0.5.97. |
 | 287 | AIS Browser: side panel from notification click, close_tab on frozen tabs | in_review | claude | browser-panel-gesture | 6.286 | 2026-11-23 16:30 ICT | macOS opened a full-screen popup.<br>sidePanel.open lost the user gesture after an await.<br>close_tab no longer attaches to discarded or unresponsive tabs. |
-| 288 | AIS Browser: close a whole tab group in one call (close_group) | in_progress | claude | browser-close-group | 6.287 | 2026-11-23 17:30 ICT | Owner ask: one call instead of 100 close_tab calls.<br>Same rules as close_tab; refuses the whole group if any tab is not closable. |
-| 289 | AIS Browser: a later session of the same chat regains its saved group | in_progress | claude | browser-saved-reclaim | 6.288 | 2026-11-23 18:00 ICT | Live: after a compaction the saved ContractFinder group was read-only.<br>Same identity and chat regain it as own, no tab moved.<br>Review fix: owned and approved flags are stored per tab on the saved entry. |
+| 288 | AIS Browser: close a whole tab group in one call (close_group) | done | claude | browser-close-group | 6.287 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/728, released v0.5.100.<br>Refuses saved, granted and protected tabs; all or nothing. |
+| 289 | AIS Browser: a later session of the same chat regains its saved group | done | claude | browser-saved-reclaim | 6.288 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/731, released v0.5.101.<br>Saved entries now store label and owned/approved flags.<br>Live: ContractFinder re-saved, 34 expired tabs closed, 66 tabs in 33 splits. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-15 23:00 ICT
@@ -394,7 +394,7 @@ ETA: 2026-11-25 18:00 ICT
 | 271 | Chat: keep Codex start warnings out of the reply | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>The warning shows as a notice.<br>Released in v0.5.95. |
 | 272 | Chat: close a binding's chats when its pairing is revoked | done | claude | sidepanel-chat-followups | 18.265 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/711.<br>Chats are visible only to the approval they were made under.<br>Released in v0.5.95. |
 | 273 | Chat: composer with the model picker inside, matching T3 | done | claude | sidepanel-chat-composer | 18.264 | | Input card with the picker inside, on the new-chat screen too (#724).<br>Picker follows the T3 picker.<br>Released in v0.5.99. |
-| 274 | Chat: real provider icons in the picker | done | claude | sidepanel-chat-icons | 18.273 |  | Real marks from simple-icons, as in the web UI (#727).<br>Release job installs dependencies (#732).<br>Released in v0.5.101. |
+| 274 | Chat: real provider icons in the picker | done | claude | sidepanel-chat-icons | 18.273 | | Real marks from simple-icons, as in the web UI (#727).<br>Release job installs dependencies (#732).<br>Released in v0.5.101. |
 
 ## 19. CI speed and flaky tests
 
