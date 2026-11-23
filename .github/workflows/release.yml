@@ -155,6 +155,10 @@ jobs:
         with:
           bun-version-file: .bun-version
 
+      # The extension imports simple-icons for the provider marks.
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
       - name: Test and build the extension
         working-directory: apps/chrome-extension
         run: |
