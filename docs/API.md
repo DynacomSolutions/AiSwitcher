@@ -896,19 +896,20 @@ One session is stored once. A session is named by its tool (`kind`, for example 
 database, so it proves the real client path. `503` with `Retry-After: 5` when the database is down.
 
 `POST /sessions/v1/cursors` body `{ files: [{ kind, sessionRef, node, root, relPath }] }` (1 to 500 entries) ->
-`{ flushGapSeconds, cursors: [null | { generation, committedBytes, committedLines, headSha256, held }] }` in the order asked.
+`{ flushGapSeconds, cursors: [null | { generation, committedBytes, committedLines, headSha256, held, anchor }] }` in the order asked.
 `null`: the session is unknown. Start at byte 0 of generation 0. Otherwise continue at `committedBytes` of the newest
-`generation`, even when another path stored the bytes. `held` says whether the asked path is recorded as a holder.
+`generation`, even when another path stored the bytes. `held` says whether the asked path holds the CURRENT generation (a path that held only an older one is not a holder). `anchor` is `{ startOffset, endOffset, plainSha256 }` of the last stored part, or `null`.
 
 `POST /sessions/v1/ingest` body `{ files: [record] }` (1 to 100 records). A record is
-`{ kind, sessionRef, node, root, relPath, origin, pool?, parentRef?, generation, headSha256, mtimeMs?, parts }`:
+`{ kind, sessionRef, node, root, relPath, origin, pool?, parentRef?, generation, headSha256, anchor?, mtimeMs?, parts }`:
 
 - `origin`: where the folder comes from (for example `t3-pool`, `agent-pod`, `host`). `pool`: the swap pool folder, when there is one.
 - `headSha256`: SHA-256 of the first `min(4096, end of the last part)` bytes of the host file after this record.
-- `mtimeMs`: host modification time. It moves `updatedAt` forward and gives the lag metric.
+- `anchor`: `{ startOffset, endOffset, plainSha256 }`, the SHA-256 of this path's own file bytes in the range of the last stored part (the range comes from the cursor answer). Required from a path that does not hold the current generation (`held: false`): the store compares it with the stored part that starts at `startOffset` and refuses the record when they differ. A holder may send it: a mismatch is then `rewritten`. The first writer of a new session sends none.
+- `mtimeMs`: host modification time (ms since 1970, from 1970 to 2099). It moves `updatedAt` forward and gives the lag metric.
 - `parts`: at most 64, in order and contiguous. A part is `{ startOffset, endOffset, lines, plainBytes, objectBytes, plainSha256, objectKey }`.
   Offsets are bytes of the plain file, cut at line ends. `plainBytes` equals `endOffset - startOffset` and is at most 64 MiB.
-  `objectKey` starts with `objects/v1/`. The writer uploads the object first and sends the record second.
+  `objectKey` is `objects/v1/<kind>/<16 hex of SHA-256 of sessionRef>/g<generation>/<name>` for the record's own session and generation (`<name>` is 1 to 128 of `A-Za-z0-9._-`, for example `0-4194304.gz.age`). The writer uploads the object first and sends the record second.
 - `parts: []` records that this path holds a session that is stored already (a copy), with no new bytes.
 
 The answer is `{ flushGapSeconds, results: [...] }`, one result per record, in order, with HTTP `200` whatever the results
@@ -919,14 +920,15 @@ are. A record is atomic and records do not depend on each other. A result is one
 - `{ status: "conflict", reason, cursor }`: refused. Nothing changed. `cursor` is where the session stands (`null`: unknown). Reasons:
   - `gap`: the first part starts after the cursor. Read again from `cursor.committedBytes`. For an unknown session the cursor is `null`: start at byte 0.
   - `overlap`: a part starts before the cursor and is not a repeat of the stored part (same end, same `plainSha256`).
-  - `rewritten`: a path that holds the session has another head than the stored one (the file was rewritten). Send `generation + 1` from byte 0.
+  - `rewritten`: a path that holds the CURRENT generation has another head than the stored one, or an anchor that does not match (the file was rewritten). Send `generation + 1` from byte 0.
   - `generation_start`: a new generation must start at byte 0 and carry parts.
   - `stale_generation`: the generation is older than the stored one.
-  - `other_copy`: the session is stored from another path, and this path holds a different file under the same id (its head differs). Nothing is stored and the path is not recorded. Skip this copy. A path that does not hold the session cannot start a new generation, so two diverged copies never take turns.
+  - `other_copy`: the session is stored from another path, and this path does not hold the current generation and holds a different file under the same id (its head or anchor differs), or it asks for a new generation. Nothing is stored and the path is not recorded. Skip this copy. Only a holder of the current generation may start a new one, so two diverged copies never take turns.
+  - `proof_required`: the path does not hold the current generation and sent no `anchor`. Nothing is stored and the path is not recorded. Read the cursor again and send the anchor.
   - `object_missing`: the gateway checked the part object in the object store and did not find it (only when the check is set up). Upload again.
-- `{ status: "invalid", error }`: the record is malformed (a bug of the writer, not a race). Do not retry it unchanged.
+- `{ status: "invalid", error }`: the record is malformed (a bug of the writer, not a race). Do not retry it unchanged. This covers a generation or `lines` above 2147483647, a `mtimeMs` outside 1970 to 2099, control characters (NUL included) in a text field, and an `objectKey` that is not under the session's prefix. The other records of the request go on.
 
-A head shorter than 4 KiB grows with the file, so it cannot tell a rewrite or another copy. The head check applies once 4 KiB are stored.
+A head shorter than 4 KiB grows with the file, so it cannot tell a rewrite or another copy. The head check applies once 4 KiB are stored. The anchor covers the bytes of the last stored part, whatever the size.
 
 Errors of the whole request: `400` (body is not JSON, `files` is missing, empty or too long, a cursor entry is malformed),
 `401`, `404` (feature off), `413` (body over 4 MiB), `503` with `Retry-After: 5` (database or object store check failed: back off and retry).

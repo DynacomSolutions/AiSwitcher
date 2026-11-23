@@ -90,7 +90,12 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   const replicaUrl = replicaUrlFromEnv(process.env, adminPort);
   if (credentialStore) console.info(`gateway: logins from the PostgreSQL credential store${credentialStore.fileStore ? " (this replica's HOME is the host file store: write-back on)" : ""}`);
   const sessions = sessionsFromEnv(process.env);
-  if (sessions) console.info(`gateway: session ingest routes on (flush gap ${sessions.flushGapSeconds ?? SESSIONS_DEFAULT_FLUSH_GAP_SECONDS} s)`);
+  if (sessions) {
+    console.info(`gateway: session ingest routes on (flush gap ${sessions.flushGapSeconds ?? SESSIONS_DEFAULT_FLUSH_GAP_SECONDS} s)`);
+    // No object store client with a read key exists in the gateway config yet (board row 20.306), so the hook that checks a
+    // part object before its row is committed (spec 4.2) is not wired. The shipper's upload-first order is the only guard.
+    console.warn("gateway: session ingest does not check part objects in the object store (no read-capable client is configured; board row 20.306)");
+  }
   const gateway = await startGateway({ port, adminPort, databaseUrl, adminToken, handleSignals: true, ...(connect ? { connect } : {}), ...(credentialStore ? { credentialStore } : {}), ...(replicaUrl ? { replicaUrl } : {}), ...(sessions ? { sessions } : {}) });
   console.info(`gateway: proxy on :${gateway.port}, admin on :${gateway.adminPort}; warming up`);
   // Runs until SIGTERM or SIGINT, whose handler drains and exits the process.
