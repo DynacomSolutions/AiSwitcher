@@ -2,6 +2,7 @@ import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { normalizePath } from "../../identities/match.ts";
 import type { Identity } from "../../identities/types.ts";
+import { forEachLine, type LineSource } from "../sessions/lines.ts";
 import { truncateLabel } from "./label.ts";
 import type { ResumableSession, ToolResumeResult } from "./types.ts";
 
@@ -34,7 +35,7 @@ function extractUserMessageText(message: unknown): string | undefined {
   return undefined;
 }
 
-interface ParsedSession {
+export interface ParsedSession {
   cwd?: string;
   firstUserMessage?: string;
   /** Claude's own auto-generated session title ("ai-title" lines): when
@@ -45,15 +46,16 @@ interface ParsedSession {
   lastTimestamp?: string;
 }
 
-function parseSessionFile(text: string): ParsedSession {
+/** Folds one session transcript (a path or any line source) into its resume facts. */
+export async function parseSessionFile(source: LineSource): Promise<ParsedSession> {
   const result: ParsedSession = {};
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
+  await forEachLine(source, (line) => {
+    if (!line.trim()) return;
     let entry: Record<string, unknown>;
     try {
       entry = JSON.parse(line);
     } catch {
-      continue;
+      return;
     }
 
     if (entry.type === "ai-title" && typeof entry.aiTitle === "string") {
@@ -69,7 +71,7 @@ function parseSessionFile(text: string): ParsedSession {
     if (typeof entry.timestamp === "string") {
       result.lastTimestamp = entry.timestamp;
     }
-  }
+  });
   return result;
 }
 
@@ -103,14 +105,12 @@ export async function readClaudeSessions(identity: Identity, targetCwd: string):
     const sessionId = entry.slice(0, -".jsonl".length);
     const filePath = join(projectDir, entry);
 
-    let text: string;
+    let parsed: ParsedSession;
     try {
-      text = await Bun.file(filePath).text();
+      parsed = await parseSessionFile(filePath);
     } catch {
       continue;
     }
-
-    const parsed = parseSessionFile(text);
     if (parsed.cwd === undefined) continue;
     // normalizePath on both sides (targetCwd arrives already normalized from
     // dispatch.ts) matches every other cwd comparison in this codebase (see

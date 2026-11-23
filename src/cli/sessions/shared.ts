@@ -1,6 +1,6 @@
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { fileTextChunks } from "../../shared/local-spend.ts";
+import { linesOf, type LineSource } from "./lines.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../../shared/reproducible-paths.ts";
 
 /**
@@ -73,61 +73,22 @@ export function argsPreviewFrom(args: unknown): string {
   return clampText(serialised, TURN_ARGS_MAX_CHARS);
 }
 
-/**
- * Streams a text file LINE BY LINE without ever holding the whole file in
- * memory: fileTextChunks (shared with the usage pipeline) yields bounded
- * decoded pieces with a real macrotask yield between them, and this folds
- * those into complete "\n"-separated lines. `visit` runs once per line in
- * file order. A final partial line (no trailing newline, torn write) is
- * still visited.
- */
-export async function forEachLine(path: string, visit: (line: string) => void): Promise<void> {
-  let rest = "";
-  for await (const chunk of fileTextChunks(path)) {
-    rest += chunk;
-    let newlineAt = rest.indexOf("\n");
-    while (newlineAt !== -1) {
-      visit(rest.slice(0, newlineAt));
-      rest = rest.slice(newlineAt + 1);
-      newlineAt = rest.indexOf("\n");
-    }
-    // Real macrotask boundary (see fileTextChunks/collectRecordsFromChunks:
-    // awaiting the stream alone runs whole-file stretches inside microtasks).
-    await Bun.sleep(0);
-  }
-  if (rest) visit(rest);
-}
-
-/**
- * Bounded prefix read: streams lines until `predicate` matches and returns
- * THAT line (or undefined when nothing matches / the file is unreadable).
- * This is the cheap title/header peek every tool's tree scan uses — the
- * match is nearly always within the first few lines, so the rest of a
- * multi-megabyte transcript is never touched.
- */
-export async function findFirstLine(
-  path: string,
-  predicate: (line: string) => boolean,
-): Promise<string | undefined> {
-  let rest = "";
-  for await (const chunk of fileTextChunks(path)) {
-    rest += chunk;
-    let newlineAt = rest.indexOf("\n");
-    while (newlineAt !== -1) {
-      const line = rest.slice(0, newlineAt);
-      if (predicate(line)) return line;
-      rest = rest.slice(newlineAt + 1);
-      newlineAt = rest.indexOf("\n");
-    }
-    await Bun.sleep(0);
-  }
-  return rest.trim() && predicate(rest) ? rest : undefined;
-}
+export { findFirstLine, forEachLine, type LineSource } from "./lines.ts";
 
 /** First line only, releasing the stream afterwards (session_meta peek).
- * Returns undefined on any read failure, matching codex-resume.ts. */
-export async function readFirstLine(path: string): Promise<string | undefined> {
-  const reader = Bun.file(path).stream().getReader();
+ * Returns undefined on any read failure, matching codex-resume.ts. A path
+ * reads bytes up to the first newline. Any other line source gives its first
+ * line, or undefined when it holds none. */
+export async function readFirstLine(source: LineSource): Promise<string | undefined> {
+  if (typeof source !== "string") {
+    try {
+      for await (const line of linesOf(source)) return line;
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+  const reader = Bun.file(source).stream().getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   try {

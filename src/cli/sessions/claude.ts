@@ -16,9 +16,11 @@ import {
   safeJsonParse,
   textFromBlocks,
   windowCutoffMs,
+  type LineSource,
   type TranscriptOpts,
   type WindowOpts,
 } from "./shared.ts";
+import { linesOf } from "./lines.ts";
 import { TurnCollector } from "./turn-collector.ts";
 
 /**
@@ -46,7 +48,7 @@ import { TurnCollector } from "./turn-collector.ts";
  * type (mode/queue-operation/ai-title/...) are skipped.
  */
 
-interface ClaudeScan {
+export interface ClaudeScan {
   cwd?: string;
   firstTs?: number;
   lastTs?: number;
@@ -57,11 +59,12 @@ interface ClaudeScan {
   messageCount: number;
 }
 
-/** One streaming pass over a session JSONL collecting everything the tree
- * node (and the transcript's session meta) needs. */
-async function scanSessionFile(filePath: string): Promise<ClaudeScan> {
+/** One streaming pass over a session JSONL (a path or any line source)
+ * collecting everything the tree node (and the transcript's session meta)
+ * needs. */
+export async function scanSessionFile(source: LineSource): Promise<ClaudeScan> {
   const scan: ClaudeScan = { messageCount: 0 };
-  await forEachLine(filePath, (line) => {
+  await forEachLine(source, (line) => {
     const entry = safeJsonParse(line);
     if (!entry) return;
     const type = entry.type;
@@ -83,21 +86,21 @@ async function scanSessionFile(filePath: string): Promise<ClaudeScan> {
   return scan;
 }
 
-/** Bounded pass over a subagent transcript: the header line (always line 1)
- * carries agentId/cwd/firstTs, and its first real user line is the task
- * prompt the tree uses as the node title. Both reads stop at their match,
- * so only the first few lines of the file are ever touched. */
-async function scanAgentFile(filePath: string): Promise<{ agentId?: string; cwd?: string; firstTs?: number; firstUser?: string }> {
-  const header = safeJsonParse((await findFirstLine(filePath, (line) => line.trim() !== "")) ?? "");
-  const userLine = safeJsonParse(
-    (await findFirstLine(filePath, (line) => {
-      const entry = safeJsonParse(line);
-      if (!entry || entry.type !== "user" || entry.isMeta === true) return false;
-      const message = entry.message as Record<string, unknown> | undefined;
-      const text = typeof message?.content === "string" ? message.content : textFromBlocks(message?.content);
-      return text !== undefined && text.trim() !== "" && !isClaudeInjectedUserText(text);
-    })) ?? "",
-  );
+/** Bounded pass over a subagent transcript (a path or any line source): the
+ * header line (first non-blank line) carries agentId/cwd/firstTs, and its
+ * first real user line is the task prompt the tree uses as the node title.
+ * One pass that stops once both are found, so only the first few lines of
+ * the source are ever touched. */
+export async function scanAgentFile(source: LineSource): Promise<{ agentId?: string; cwd?: string; firstTs?: number; firstUser?: string }> {
+  let headerLine: string | undefined;
+  let userLine: string | undefined;
+  for await (const line of linesOf(source)) {
+    if (headerLine === undefined && line.trim() !== "") headerLine = line;
+    if (userLine === undefined && isClaudeUserPromptLine(line)) userLine = line;
+    if (headerLine !== undefined && userLine !== undefined) break;
+  }
+  const header = safeJsonParse(headerLine ?? "");
+  const userEntry = safeJsonParse(userLine ?? "");
   const result: { agentId?: string; cwd?: string; firstTs?: number; firstUser?: string } = {};
   if (header) {
     if (typeof header.agentId === "string") result.agentId = header.agentId;
@@ -105,12 +108,21 @@ async function scanAgentFile(filePath: string): Promise<{ agentId?: string; cwd?
     const ts = parseTimestampMs(header.timestamp);
     if (ts !== undefined) result.firstTs = ts;
   }
-  if (userLine) {
-    const message = userLine.message as Record<string, unknown> | undefined;
+  if (userEntry) {
+    const message = userEntry.message as Record<string, unknown> | undefined;
     const text = typeof message?.content === "string" ? message.content : textFromBlocks(message?.content);
     if (text?.trim()) result.firstUser = text;
   }
   return result;
+}
+
+/** True for a real (non-meta, non-injected) user prompt line. */
+function isClaudeUserPromptLine(line: string): boolean {
+  const entry = safeJsonParse(line);
+  if (!entry || entry.type !== "user" || entry.isMeta === true) return false;
+  const message = entry.message as Record<string, unknown> | undefined;
+  const text = typeof message?.content === "string" ? message.content : textFromBlocks(message?.content);
+  return text !== undefined && text.trim() !== "" && !isClaudeInjectedUserText(text);
 }
 
 function titleFor(aiTitle: string | undefined, firstUser: string | undefined): string {
@@ -357,10 +369,30 @@ export async function readClaudeTranscript(
 ): Promise<TranscriptDto | undefined> {
   const filePath = await locateClaudeTranscript(identity.configDir, id);
   if (!filePath) return undefined;
+  return claudeTranscriptFromLines(identity, id, filePath, async () => {
+    try {
+      return (await stat(filePath)).mtimeMs;
+    } catch {
+      return undefined; // vanished mid-read: the turns we streamed are still valid
+    }
+  }, opts);
+}
 
+/**
+ * The transcript of one Claude session from any line source (a path, or lines
+ * from decrypted object parts). `mtime` runs after the lines are read and
+ * gives the source's last write time, or undefined when unknown.
+ */
+export async function claudeTranscriptFromLines(
+  identity: Identity,
+  id: string,
+  source: LineSource,
+  mtime: () => Promise<number | undefined>,
+  opts: TranscriptOpts & WindowOpts = {},
+): Promise<TranscriptDto> {
   const meta: ClaudeScan = { messageCount: 0 };
   const collector = new TurnCollector(opts.tail);
-  await forEachLine(filePath, (line) => {
+  await forEachLine(source, (line) => {
     const entry = safeJsonParse(line);
     if (!entry) return;
     // Same accumulation the tree scan does, folded into the transcript pass
@@ -383,12 +415,7 @@ export async function readClaudeTranscript(
     pushClaudeEntry(collector, entry);
   });
 
-  let mtimeMs: number | undefined;
-  try {
-    mtimeMs = (await stat(filePath)).mtimeMs;
-  } catch {
-    // vanished mid-read: the turns we streamed are still valid
-  }
+  const mtimeMs = await mtime();
 
   return {
     session: {
