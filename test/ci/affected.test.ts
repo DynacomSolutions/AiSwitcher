@@ -212,23 +212,45 @@ describe("shard split", () => {
 });
 
 describe("github output mode", () => {
-  test("push events run everything", () => {
+  const githubOutputs = (env: Record<string, string>): Record<string, string> => {
     const dir = mkdtempSync(join(tmpdir(), "ci-affected-out-"));
     try {
       const output = join(dir, "output");
       const run = Bun.spawnSync(["bun", "scripts/ci/affected.ts", "--github"], {
         cwd: ROOT,
-        env: { ...process.env, GITHUB_EVENT_NAME: "push", GITHUB_OUTPUT: output },
+        env: { ...process.env, GITHUB_OUTPUT: output, ...env },
       });
       expect(run.exitCode).toBe(0);
-      const text = readFileSync(output, "utf8");
-      expect(text).toContain("macos=true");
-      expect(text).toContain("extension=true");
-      expect(text).toContain("web=true");
-      expect(text).toContain("tests=all");
+      return Object.fromEntries(readFileSync(output, "utf8").split("\n").filter(Boolean).map((line) => {
+        const index = line.indexOf("=");
+        return [line.slice(0, index), line.slice(index + 1)];
+      }));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  };
+  const expectEverything = (outputs: Record<string, string>) => {
+    expect(outputs.macos).toBe("true");
+    expect(outputs.extension).toBe("true");
+    expect(outputs.web).toBe("true");
+    expect(outputs.tests).toBe("all");
+  };
+  test("push events with a readable diff select like a pull request", () => {
+    const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: ROOT }).stdout.toString().trim();
+    const parent = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", "HEAD~1^{commit}"], { cwd: ROOT });
+    // A shallow checkout (CI depth 1) has no parent commit, so there is no diff to compare.
+    if (parent.exitCode !== 0) return;
+    const base = parent.stdout.toString().trim();
+    const push = githubOutputs({ GITHUB_EVENT_NAME: "push", BASE_SHA: base, HEAD_SHA: head });
+    const pull = githubOutputs({ GITHUB_EVENT_NAME: "pull_request", BASE_SHA: base, HEAD_SHA: head });
+    expect(push).toEqual(pull);
+  });
+  test("push events with a zero, missing or unreadable base fail open to everything", () => {
+    const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: ROOT }).stdout.toString().trim();
+    expectEverything(githubOutputs({ GITHUB_EVENT_NAME: "push", BASE_SHA: "0".repeat(40), HEAD_SHA: head }));
+    expectEverything(githubOutputs({ GITHUB_EVENT_NAME: "push", BASE_SHA: "", HEAD_SHA: head }));
+    expectEverything(githubOutputs({ GITHUB_EVENT_NAME: "push", BASE_SHA: "1".repeat(40), HEAD_SHA: head }));
+    expectEverything(githubOutputs({ GITHUB_EVENT_NAME: "push" }));
   });
   test("pull request outputs agree with the engine on the same diff", () => {
     const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: ROOT }).stdout.toString().trim();

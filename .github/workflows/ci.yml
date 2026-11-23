@@ -11,8 +11,10 @@ concurrency:
 
 jobs:
   # Selects the jobs and tests that the change set can affect, from the source
-  # dependency graph (scripts/ci/affected.ts). Pushes to main run everything.
-  # Shared inputs run everything. Any doubt fails open.
+  # dependency graph (scripts/ci/affected.ts). Pull requests and pushes select
+  # the same way, from the event base to the head. Shared inputs run everything.
+  # Any doubt fails open (new branch, force-push, unreadable diff). The full
+  # suite runs only per release (release.yml).
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -33,8 +35,8 @@ jobs:
       - name: Select jobs and tests from the dependency graph
         id: select
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: bun run scripts/ci/affected.ts --github
 
   test:
@@ -121,15 +123,15 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      # The live-image script tests drive expect and node. PRs run only the
-      # selected tests; pushes to main run the full suite in test-shard.
+      # The live-image script tests drive expect and node. Pull requests and
+      # pushes run only the selected tests; the release workflow runs the full suite.
       - name: Install test tools
-        if: github.event_name == 'pull_request' && needs.changes.outputs.tests != 'none'
+        if: needs.changes.outputs.tests != 'none'
         run: |
           bash scripts/ci/apt-install.sh --no-install-recommends expect nodejs
 
       - name: Test
-        if: github.event_name == 'pull_request' && needs.changes.outputs.tests != 'none'
+        if: needs.changes.outputs.tests != 'none'
         env:
           AIS_REQUIRE_LIVE_TEST_TOOLS: "1"
           AIS_GATEWAY_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/gateway_test
@@ -141,51 +143,6 @@ jobs:
           else
             bun test $TESTS
           fi
-
-  # The full suite on pushes to main, split round-robin into four shards.
-  # PRs run their selected tests in the test job instead.
-  test-shard:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
-    services:
-      postgres:
-        image: timescale/timescaledb:2.17.2-pg17
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_DB: gateway_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: .bun-version
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Install test tools
-        run: |
-          bash scripts/ci/apt-install.sh --no-install-recommends expect nodejs
-
-      - name: Test shard ${{ matrix.shard }} of 4
-        env:
-          AIS_REQUIRE_LIVE_TEST_TOOLS: "1"
-          AIS_GATEWAY_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/gateway_test
-        run: |
-          files=$(bun run scripts/ci/affected.ts --shard "${{ matrix.shard }}" --shards 4)
-          bun test $files
 
   # GitHub-hosted runner only: this repository is public, never self-hosted.
   test-macos:
@@ -264,7 +221,7 @@ jobs:
   # Always runs, so a required check keeps reporting when path-gated jobs are skipped.
   ci-gate:
     if: always()
-    needs: [test, changes, test-macos, extension, web, test-shard]
+    needs: [test, changes, test-macos, extension, web]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

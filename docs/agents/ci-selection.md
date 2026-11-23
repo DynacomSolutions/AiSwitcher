@@ -1,7 +1,9 @@
 # CI change selection
 
-Pull request CI runs only the jobs and tests that the change set can affect.
-Pushes to `main` run everything. The selector is `scripts/ci/affected.ts`;
+Pull request CI and push CI run only the jobs and tests that the change set
+can affect. A push reads the diff from the event base to the head, as a pull
+request does. The full suite runs only per release, before publish
+(`release.yml`). The selector is `scripts/ci/affected.ts`;
 the host app uses the same engine through `scripts/host/affected.ts`, and the
 live image uses `image/build/affected.ts` with the `bun run build` metafile.
 
@@ -65,13 +67,18 @@ The aggregate gates always run: `ci-gate` in `ci.yml`, `gate` in
 was cancelled, and pass when the selection deliberately skipped it. Required
 checks therefore keep reporting on every PR.
 
-## Full suite on main
+## Pushes and the full suite
 
-Pushes to `main` run the full suite in four `test-shard` jobs
-(`scripts/ci/affected.ts --shard N --shards 4`, round-robin over the sorted
-test list). The `test` job still runs the privacy, identifier and secret
-scans, the mod validation and the typecheck on every event. On pull requests
-the `test` job runs the selected tests instead.
+Pushes to `main` select like pull requests. The `changes` job passes the
+push `before` and `after` commits as the base and head. A zero base (new
+branch), an unreadable base (force-push) or a deleted file fails open to
+everything. The `test` job runs the privacy, identifier and secret scans, the
+mod validation and the typecheck on every event, then the selected tests.
+
+The full suite runs once per release. The `test` job in `release.yml` runs it
+in four round-robin shards (`scripts/ci/affected.ts --shard N --shards 4`) with
+a TimescaleDB service. The `build` job needs it, so a failing test blocks the
+publish.
 
 ## Local checks
 

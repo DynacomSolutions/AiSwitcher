@@ -8,8 +8,9 @@
 // - Shared inputs (root config, lockfile, toolchain, workflows, shared test
 //   helpers) run everything. A version-only bump of the root package.json is
 //   not a shared input: the version string changes no behaviour.
-// - Pushes to the default branch run everything.
-// - Any doubt (unknown path, unreadable diff, deleted file) fails open.
+// - Pushes select like pull requests: the diff runs from the event base to the
+//   head. The full suite runs only per release (release.yml).
+// - Any doubt (unknown path, unreadable or all-zero base, deleted file) fails open.
 import { appendFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 
@@ -208,6 +209,8 @@ export type DiffChanges = { paths: string[]; hasDeletions: boolean };
 /** Changed paths between two commits, with rename sources included. Null when the diff cannot be read. */
 export function diffChanges(base: string, head: string, root: string = ROOT): DiffChanges | null {
   if (!/^[a-f0-9]{40}$/.test(base) || !/^[a-f0-9]{40}$/.test(head)) return null;
+  // A new branch push reports an all-zero base: there is no diff to read.
+  if (/^0{40}$/.test(base)) return null;
   const diff = Bun.spawnSync(["git", "diff", "--name-status", "-z", `${base}...${head}`], { cwd: root, timeout: 30_000 });
   if (diff.exitCode !== 0) return null;
   const fields = diff.stdout.toString().split("\0").filter(Boolean);
@@ -264,9 +267,9 @@ if (import.meta.main) {
     const headText = showFile(head, "package.json");
     console.log(String(baseText !== null && headText !== null && versionOnlyBump(baseText, headText)));
   } else if (args.includes("--github")) {
-    // Pushes and anything but a pull request run everything.
-    const forceAll = process.env.GITHUB_EVENT_NAME !== "pull_request";
-    const { changed, hasDeletions } = forceAll ? { changed: [], hasDeletions: true } : githubDiff();
+    // Pushes and pull requests read the diff from BASE_SHA to HEAD_SHA. A missing,
+    // all-zero (new branch) or unreadable base fails open inside githubDiff.
+    const { changed, hasDeletions } = githubDiff();
     const selection = selectChanges(changed, { hasDeletions });
     writeOutput("macos", String(selection.macos));
     writeOutput("extension", String(selection.extension));
