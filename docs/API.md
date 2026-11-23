@@ -566,6 +566,30 @@ minted token with `deliveryError`.
 
 `POST /api/gateway/apps/:name/revoke` revokes the app at once (final).
 
+### Gateway identities
+
+`POST /api/gateway/identities/:tool` adds a login slot (an identity) for tool
+`claude` or `codex` through the gateway credential store. Body `{ name, label,
+description?, pool? }`. `name` is a slug (lowercase letters, digits, single
+hyphens) that no identity name or alias uses. `description` (for example an
+email) stays in the store. `pool` names an existing swap pool of the tool: the
+new identity copies the shape of that pool's members (config folder pattern,
+Codex sign-in method) and joins its member list. Without `pool` it copies the
+first other identity of the tool.
+
+The route reads the tool's registry row from the store over the gateway admin
+API (`/store/files`), adds the entry, and writes the row back with the version
+check. It writes no host identity file and no host login file. The gateway and
+console pick the entry up from the store on their own. Sign it in afterwards
+with Login on the Auth page. It needs `AIS_GATEWAY_ADMIN_URL`,
+`AIS_GATEWAY_ADMIN_TOKEN` and `AIS_GATEWAY_STORE_KEY` (environment or
+`~/.secrets`).
+
+Answers 201 `{ tool, identity, pool?, registryVersion }`. Errors: 400 bad body
+or name, 404 no such pool or no registry in the store, 409 name taken or the
+row changed during the write (retry), 502 gateway store failed, 503 gateway
+admin or store key missing.
+
 ### Usage
 
 `GET /api/usage?tool=&identity=`

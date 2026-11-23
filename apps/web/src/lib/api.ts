@@ -4,6 +4,8 @@ import type {
   AuthResponse,
   BreakdownResponse,
   UsageProjectsResponse,
+  AddGatewayIdentityBody,
+  AddGatewayIdentityResponse,
   CreateIdentityBody,
   FileContentResponse,
   FileRoot,
@@ -119,6 +121,8 @@ export const api = {
   getIdentities: () => request<RegistriesResponse>("/api/identities"),
   createIdentity: (tool: ToolName, body: CreateIdentityBody) =>
     request<unknown>(`/api/identities/${tool}`, { method: "POST", body }),
+  addGatewayIdentity: (tool: ToolName, body: AddGatewayIdentityBody) =>
+    request<AddGatewayIdentityResponse>(`/api/gateway/identities/${encodeURIComponent(tool)}`, { method: "POST", body }),
   patchIdentity: (tool: ToolName, name: string, body: PatchIdentityBody) =>
     request<unknown>(`/api/identities/${encodeURIComponent(tool)}/${encodeURIComponent(name)}`, {
       method: "PATCH",

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { chmod, mkdir, rmdir, rm, writeFile } from "node:fs/promises";
 import { credentialPathsForTool } from "./auth.ts";
 import { requireTool } from "./registries.ts";
 import { CODEX_BROWSER_SPEC, LOGIN_FLOW_SPECS, type LoginFlowSpec } from "./login-specs.ts";
@@ -9,6 +10,10 @@ import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/sto
 import type { ToolConfig } from "../identities/types.ts";
 import { routeAllViaGateway, type RouteAllOptions } from "../cli/identities/route-all.ts";
 import { isGatewayAccessToken } from "../identities/claude-gateway-entry.ts";
+import { expandPath } from "../identities/match.ts";
+import { appTokenKey } from "../cli/gateway/secrets-file.ts";
+import { LOCAL_GATEWAY_ROUTES } from "../gateway/local-routes.ts";
+import { pushFirstLogin, type OwnerPushOptions } from "../gateway/owner-store-push.ts";
 import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreRoot } from "../identities/gateway-members.ts";
 import { classifyLogin, isPureGatewayEntry, refreshOf } from "../identities/gateway-routed.ts";
 import { HttpError, type LoginFlowDto, type LoginFlowStatus } from "./types.ts";
@@ -187,37 +192,106 @@ export function accountChangeText(identity: string, { from, to }: { from?: strin
   return `${identity} now uses ${to ?? "the new account"}${from ? ` (was ${from})` : ""}`;
 }
 
+/** How the first-login hand-over reaches the store (tests inject an open store or a config; production uses the process env). */
+export type AdoptStoreOptions = Pick<OwnerPushOptions, "store" | "config" | "env" | "secretsPath">;
+
+const adoptError = (why: string): AdoptResult => ({ outcome: "error", message: `signed in, but the gateway could not take the new login: ${why}` });
+
 /**
  * After an owner-started sign-in on a gateway-routed identity: the gateway reads the account's login from its member store,
  * not from the folder the tool just wrote the new login into (over the gateway entry). The sign-in is the owner's choice of
  * account, so it always replaces the store copy (the old one is backed up) and the gateway entry goes back into the folder
  * (route-all `afterLogin`). Running sessions are reported, never a reason to refuse. Undefined when there is nothing to hand
  * over (not a gateway identity, or the folder holds no new login). An "error" outcome means a step could not run.
+ *
+ * A first sign-in (no member copy yet, for example a new swap-pool member added in the console) takes adoptFirstLogin: the
+ * login goes into the credential store first, then the same route-all step puts the gateway entry back into the folder.
  */
-export async function adoptLoginIntoGateway(toolName: string, identityName: string, configDir: string, opts: RouteAllOptions = {}, gatewayKey?: string): Promise<AdoptResult | undefined> {
+export async function adoptLoginIntoGateway(toolName: string, identityName: string, configDir: string, opts: RouteAllOptions = {}, gatewayKey?: string, store: AdoptStoreOptions = {}): Promise<AdoptResult | undefined> {
   if (!isMemberStoreTool(toolName)) return undefined;
   const root = opts.memberRoot ?? memberStoreRoot();
-  if (!hasMemberCopy(toolName, identityName, root)) return undefined;
   const folder = await Bun.file(`${configDir}/${memberLoginFile(toolName)}`).text().catch(() => undefined);
   if (classifyLogin(toolName, folder) !== "login") return undefined;
-  const error = (why: string): AdoptResult => ({ outcome: "error", message: `signed in, but the gateway could not take the new login: ${why}` });
+  if (!hasMemberCopy(toolName, identityName, root)) return adoptFirstLogin(toolName, identityName, configDir, folder!, root, opts, gatewayKey, store);
+  return routeAdopted(toolName, identityName, folder!, root, opts, gatewayKey);
+}
+
+/** The route-all step shared by both paths: store copy in place, gateway entry back into the folder, store row pushed. */
+async function routeAdopted(toolName: "claude" | "codex", identityName: string, folder: string, root: string, opts: RouteAllOptions, gatewayKey: string | undefined, first = false): Promise<AdoptResult | undefined> {
   let line;
   try {
     const report = await routeAllViaGateway({ ...opts, memberRoot: root, only: { tool: toolName, identity: identityName }, afterLogin: true, ...(gatewayKey ? { fallbackToken: gatewayKey } : {}) });
     line = report.lines[0];
-    if (!line) return error(report.unroutedTools[0]?.reason ?? "the identity could not be routed");
+    if (!line) return adoptError(report.unroutedTools[0]?.reason ?? "the identity could not be routed");
   } catch (err) {
-    return error(`routing failed (${err instanceof Error ? err.name : "error"})`);
+    return adoptError(`routing failed (${err instanceof Error ? err.name : "error"})`);
   }
-  if (line.status === "refused") return error(line.detail ?? line.status);
-  if (line.status !== "routed") return undefined;
-  const store = await Bun.file(`${memberDir(toolName, identityName, root)}/${memberLoginFile(toolName)}`).text().catch(() => undefined);
-  if (refreshOf(toolName, store) !== refreshOf(toolName, folder)) return error("the member store does not hold the new login after the write");
+  if (line.status === "refused") return adoptError(line.detail ?? line.status);
+  if (line.status !== "routed") return first ? adoptError(`the gateway entry was not written (${line.status})`) : undefined;
+  if (!first) {
+    const store = await Bun.file(`${memberDir(toolName, identityName, root)}/${memberLoginFile(toolName)}`).text().catch(() => undefined);
+    if (refreshOf(toolName, store) !== refreshOf(toolName, folder)) return adoptError("the member store does not hold the new login after the write");
+  }
   const change = line.accountChange;
   const head = change ? accountChangeText(identityName, change) : undefined;
   if (line.attention) return { outcome: "attention", message: [head, line.detail].filter(Boolean).join(". "), ...(change ? { accountChange: change } : {}) };
   if (change) return { outcome: "adopted", message: [head, line.storeNote].filter(Boolean).join(". "), accountChange: change };
+  if (first) return { outcome: "adopted", message: `${identityName} signed in; the gateway store holds the login and the folder holds the gateway entry` };
   return undefined;
+}
+
+/** True when the gateway should hold this identity's login: it is a member of a swap pool, or its folder held a gateway entry before the sign-in. */
+async function gatewayManaged(toolName: "claude" | "codex", identityName: string, opts: RouteAllOptions, gatewayKey: string | undefined): Promise<{ managed: boolean; key?: string }> {
+  const registry = opts.registries?.[toolName] ?? requireTool(toolName).identitiesJsonPath;
+  const identities = (await loadIdentitiesFile(registry).catch(() => undefined))?.identities ?? [];
+  const self = identities.find((i) => i.name === identityName);
+  const names = new Set([identityName, ...(self?.aliases ?? [])]);
+  const poolMember = identities.some((i) => !isRetired(i) && (i.swapPool?.accounts ?? []).some((n) => names.has(n)));
+  if (!poolMember && !gatewayKey) return { managed: false };
+  // The app key a new folder needs for its gateway entry: the folder's old entry, else the process env, else a sibling folder's entry
+  // (the console pod has no secrets file). It is only handed to route-all in memory; never logged.
+  const env = process.env[appTokenKey(LOCAL_GATEWAY_ROUTES[toolName]!.app)]?.trim();
+  let key = gatewayKey ?? (env && isGatewayAccessToken(env) ? env : undefined);
+  if (!key) {
+    for (const other of identities) {
+      if (other.name === identityName || other.swapPool || isRetired(other)) continue;
+      key = await readFolderGatewayKey(toolName, expandPath(other.configDir));
+      if (key) break;
+    }
+  }
+  return { managed: true, ...(key ? { key } : {}) };
+}
+
+/**
+ * First sign-in of a gateway-managed identity: the gateway has no login for it yet. The login goes into the credential store
+ * first (compare-and-swap, new rows), and a failed push is an "error": the folder is left as signed in and nothing else
+ * changes. Then route-all (afterLogin) puts the gateway entry into the folder like for an existing member, from a short-lived
+ * member-store copy that is removed again afterwards, so the console pod keeps no second login of the account.
+ */
+async function adoptFirstLogin(toolName: "claude" | "codex", identityName: string, configDir: string, folder: string, root: string, opts: RouteAllOptions, gatewayKey: string | undefined, store: AdoptStoreOptions): Promise<AdoptResult | undefined> {
+  const { managed, key } = await gatewayManaged(toolName, identityName, opts, gatewayKey);
+  if (!managed) return undefined;
+  const push = await pushFirstLogin(toolName, identityName, configDir, { root, ...(opts.home ? { home: opts.home } : {}), ...(opts.secretsPath ? { secretsPath: opts.secretsPath } : {}), ...store });
+  if (!push.ok) return adoptError(`the login could not be saved to the gateway store (${push.note})`);
+  // The seed holds exactly the files just pushed; route-all needs a member copy to find the account (hasMemberCopy).
+  const dir = memberDir(toolName, identityName, root);
+  const files = toolName === "claude" ? [".claude.json", memberLoginFile(toolName)] : [memberLoginFile(toolName)];
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    for (const file of files) {
+      const content = await Bun.file(`${configDir}/${file}`).text().catch(() => undefined);
+      if (content === undefined) continue;
+      await writeFile(`${dir}/${file}`, content, { mode: 0o600 });
+      await chmod(`${dir}/${file}`, 0o600);
+    }
+    const result = await routeAdopted(toolName, identityName, folder, root, { ...opts, storePush: opts.storePush ?? (async () => "the login was already saved to the PostgreSQL store") }, key, true);
+    return result?.outcome === "error" ? { ...result, message: `${result.message} (the gateway store already holds the login; the folder still holds it too)` } : result;
+  } catch (err) {
+    return adoptError(`the gateway entry could not be written (${err instanceof Error ? err.name : "error"}); the gateway store already holds the login`);
+  } finally {
+    for (const file of files) await rm(`${dir}/${file}`, { force: true }).catch(() => undefined);
+    await rmdir(dir).catch(() => undefined);
+  }
 }
 
 export interface LoginFlowManagerDeps {

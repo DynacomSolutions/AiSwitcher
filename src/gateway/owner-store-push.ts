@@ -27,6 +27,74 @@ export interface OwnerPushOptions {
 
 const ATTEMPTS = 3;
 
+/** An open store, from the options or the process config. `reason` is set when this process has no usable store. */
+async function openStore(opts: OwnerPushOptions): Promise<{ store?: HomeStoreClient; own: boolean; reason?: string }> {
+  if (opts.store) return { store: opts.store, own: false };
+  const cfg = "config" in opts ? opts.config : await hostStoreConfig(opts.env ?? process.env, opts.secretsPath);
+  if (!cfg) return { own: false, reason: "no store config in this process (the gateway store key and admin address are not set)" };
+  if (cfg.databaseUrl) {
+    // The direct database path, only with AIS_GATEWAY_STORE_DIRECT=1 (host-sync.ts).
+    const { PgHomeStore } = await import("./home-store.ts");
+    return { store: new PgHomeStore(cfg.databaseUrl, cfg.key, `owner-adopt:${hostname()}:${process.pid}`), own: true };
+  }
+  return { store: new HttpHomeStore({ url: cfg.admin!.url, token: cfg.admin!.token, key: cfg.key }), own: true };
+}
+
+/** Replaces one row by compare-and-swap on the version just read (null when the row is new). False when it kept changing. */
+async function putRow(store: HomeStoreClient, relPath: string, content: Buffer, account: string, kind: "login" | "marker"): Promise<boolean> {
+  for (let i = 0; i < ATTEMPTS; i++) {
+    const [row] = await store.get([relPath]);
+    if (row && row.sha256 === sha256Hex(content)) return true;
+    const r = await store.put(relPath, content, { account, kind, expectedVersion: row ? row.version : null });
+    if (r.ok) return true;
+  }
+  return false;
+}
+
+export interface FirstLoginPush {
+  ok: boolean;
+  /** A short reason or count; never holds a token. */
+  note: string;
+}
+
+/**
+ * Puts a first sign-in into the credential store through the gateway admin API: the login rows of a member that has no
+ * store copy yet (the console signed a new pool member in). The content comes from the given folder files, not from a
+ * member-store folder, so no second copy of the login is written. Same rows, account key and compare-and-swap as
+ * pushOwnerLogin (a new row is created with expectedVersion null), but the outcome is structured: ok is false when no row
+ * was written, so the caller must report an error and leave the folder alone.
+ */
+export async function pushFirstLogin(tool: MemberStoreTool, name: string, folder: string, opts: OwnerPushOptions): Promise<FirstLoginPush> {
+  const home = opts.home ?? homedir();
+  let opened: { store?: HomeStoreClient; own: boolean } = { own: false };
+  try {
+    const open = await openStore(opts);
+    if (!open.store) return { ok: false, note: open.reason ?? "no store" };
+    opened = open;
+    const store = open.store;
+    const dir = memberDir(tool, name, opts.root);
+    // The record file goes first, the login file last: a row for the login means the account is complete.
+    const files = [...(tool === "claude" ? [".claude.json"] : []), memberLoginFile(tool)];
+    let pushed = 0;
+    for (const file of files) {
+      const content = await readFile(join(folder, file)).catch(() => undefined);
+      if (!content || content.length === 0) {
+        if (file === memberLoginFile(tool)) return { ok: false, note: `the folder holds no ${file} to hand over` };
+        continue;
+      }
+      const rel = relative(home, join(dir, file));
+      if (rel === "" || rel.startsWith("..") || rel.startsWith(sep)) return { ok: false, note: "the member store path is outside HOME, so the store row path cannot be formed" };
+      if (!(await putRow(store, rel.split(sep).join("/"), content, `${tool}/${name}`, "login"))) return { ok: false, note: `the store row for ${file} kept changing` };
+      pushed++;
+    }
+    return { ok: true, note: `pushed ${pushed} file${pushed === 1 ? "" : "s"} to the PostgreSQL store` };
+  } catch (err) {
+    return { ok: false, note: `could not reach the store (${err instanceof Error ? err.name : "error"})` };
+  } finally {
+    if (opened.own) await opened.store?.close().catch(() => undefined);
+  }
+}
+
 export async function pushOwnerLogin(tool: MemberStoreTool, name: string, opts: OwnerPushOptions): Promise<string> {
   const home = opts.home ?? homedir();
   let store = opts.store;
