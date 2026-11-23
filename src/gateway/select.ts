@@ -83,13 +83,15 @@ export async function memberUsages(
 /**
  * Pinned: the identity, unless its worst window is at or over the reserve.
  * Pool: the member with the lowest utilisation below the reserve; members with
- * no usage figure are allowed after those with one. A per-model window counts only for a request for that model.
+ * no fresh usage figure are allowed after those with one, in turn. A per-model window counts only for a request for that model.
  */
 export async function pickIdentity(
   app: GatewayApp,
   deps: Pick<GatewayDeps, "usageFor" | "poolMembers">,
   exclude?: string | ReadonlySet<string>,
   model?: string,
+  /** Only asks whether a member would be picked: the rotation does not advance. */
+  peek = false,
 ): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" | "no-identities" }> {
   const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
   if (app.target.kind === "pin") {
@@ -106,12 +108,31 @@ export async function pickIdentity(
     names.map(async (name) => {
       const usage = usageForModel(await usageOf(deps, app, name), model);
       const util = reserveUtilisationOf(usage);
-      return { name, usage: util === undefined ? undefined : ({ status: "live", maxUtilization: util, capturedAt: "", ...(usage?.extraUsage ? { extraUsage: usage.extraUsage } : {}) } as PoolUsage) };
+      return { name, noPlan: usage?.noPlan === true, usage: util === undefined ? undefined : ({ status: "live", maxUtilization: util, capturedAt: "", ...(usage?.extraUsage ? { extraUsage: usage.extraUsage } : {}) } as PoolUsage) };
     }),
   );
   // A window at 100% is full whatever the reserve says (reserve 100 must not let a full account through).
   const known = chooseBest(rows, { belowPercent: Math.min(reserve, 99.999), requireKnown: true });
   if (known) return { identity: known };
-  const unknown = rows.find((r) => r.usage === undefined);
-  return unknown ? { identity: unknown.name } : { reject: "no-headroom" };
+  // Members with no fresh figure (stale readings: Anthropic's usage API stops answering a busy account) take turns:
+  // always taking the first one sent the whole pool's traffic to one account, which then answered burst 429s while
+  // the others had capacity.
+  // A member with no plan cannot serve: it is tried only when nothing else is left, as before.
+  const unknownAll = rows.filter((r) => r.usage === undefined);
+  if (unknownAll.length === 0) return { reject: "no-headroom" };
+  const unknown = unknownAll.some((r) => !r.noPlan) ? unknownAll.filter((r) => !r.noPlan) : unknownAll.slice(0, 1);
+  const turns = unknownTurns(deps, app.provider);
+  const next = unknown.reduce((a, b) => ((turns.last.get(b.name) ?? 0) < (turns.last.get(a.name) ?? 0) ? b : a));
+  if (!peek) turns.last.set(next.name, ++turns.seq);
+  return { identity: next.name };
+}
+
+/** Per gateway (deps object) and provider: when each unknown-figure member was last picked, for the rotation above. */
+const turnsByDeps = new WeakMap<object, Map<string, { seq: number; last: Map<string, number> }>>();
+function unknownTurns(deps: object, provider: string): { seq: number; last: Map<string, number> } {
+  let byProvider = turnsByDeps.get(deps);
+  if (!byProvider) turnsByDeps.set(deps, (byProvider = new Map()));
+  let t = byProvider.get(provider);
+  if (!t) byProvider.set(provider, (t = { seq: 0, last: new Map() }));
+  return t;
 }

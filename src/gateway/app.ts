@@ -855,7 +855,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (shortHeld.length === 0) return false;
     // Only worth waiting when some member would be picked once the short holds are gone.
     const quotaOut = new Set([...held].filter((n) => !shortHeld.includes(n)));
-    if (!("identity" in (await pickIdentity(app, deps, quotaOut, model)))) return false;
+    if (!("identity" in (await pickIdentity(app, deps, quotaOut, model, true)))) return false;
     const soonest = Math.min(...shortHeld.map((n) => exhausted.get(exKey(n)) ?? now));
     waits++;
     await (deps.sleep ?? defaultSleep)(Math.min(Math.max(soonest - now, SHORT_HOLD_MIN_SLEEP_MS), left), req.signal);
@@ -871,12 +871,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (rejectKind === "no-headroom" && app.target.kind === "pool") {
       // Only the short holds are ignored: members out for proven quota exhaustion stay excluded.
       const quotaOut = new Set([...(await exhaustedNames())].filter((n) => !holds.has(exKey(n))));
-      let free = await pickIdentity(app, deps, quotaOut, model);
+      let free = await pickIdentity(app, deps, quotaOut, model, true);
       let h = "identity" in free ? holds.get(exKey(free.identity)) : undefined;
       if (h?.kind === "cred") {
         // A burst-held member frees sooner than a credential-held one, so it decides the answer.
         const noCred = new Set([...quotaOut, ...[...holds].filter(([k, v]) => v.kind === "cred" && k.startsWith(exKey(""))).map(([k]) => k.slice(exKey("").length))]);
-        const alt = await pickIdentity(app, deps, noCred, model);
+        const alt = await pickIdentity(app, deps, noCred, model, true);
         if ("identity" in alt && holds.get(exKey(alt.identity))?.kind === "burst") {
           free = alt;
           h = holds.get(exKey(alt.identity));
