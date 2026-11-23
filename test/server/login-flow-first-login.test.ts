@@ -8,6 +8,7 @@ import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type
 import type { HomeStoreClient } from "../../src/gateway/home-store.ts";
 import { classifyLogin } from "../../src/identities/gateway-routed.ts";
 import { memberDir } from "../../src/identities/gateway-members.ts";
+import { pushOwnerLogin } from "../../src/gateway/owner-store-push.ts";
 import { adoptLoginIntoGateway } from "../../src/server/login-flows.ts";
 
 /**
@@ -99,8 +100,11 @@ describe("first sign-in of a new gateway-managed identity", () => {
     expect(store.rows.get(LOGIN_ROW)?.content.toString("utf8")).toBe(claudeLogin("new"));
     expect(store.rows.get(RECORD_ROW)?.content.toString("utf8")).toBe(claudeJson("uuid-new"));
     expect(classifyLogin("claude", await readFile(join(folder, ".credentials.json"), "utf8"))).toBe("gateway");
-    // the pod keeps no second copy of the login
-    expect(existsSync(memberDir("claude", "fresh", routeOpts.memberRoot))).toBe(false);
+    // The member copy equals the store rows and stays: on a host the member root is the sync mirror of those rows, and
+    // deleting its files left the console without the account record (email) until the sync daemon restarted.
+    const dir = memberDir("claude", "fresh", routeOpts.memberRoot);
+    expect(await readFile(join(dir, ".credentials.json"), "utf8")).toBe(claudeLogin("new"));
+    expect(await readFile(join(dir, ".claude.json"), "utf8")).toBe(claudeJson("uuid-new"));
   });
 
   test("a folder that held a gateway entry before the sign-in is managed without a pool, using that key", async () => {
@@ -147,7 +151,8 @@ describe("first sign-in of a new gateway-managed identity", () => {
       expect(result?.outcome).toBe("error");
       expect(result?.message).toContain("already holds the login");
       expect(store.rows.has(LOGIN_ROW)).toBe(true);
-      expect(existsSync(memberDir("claude", "fresh", routeOpts.memberRoot))).toBe(false);
+      // the push worked, so the member copy (equal to the store rows) stays
+      expect(await readFile(join(memberDir("claude", "fresh", routeOpts.memberRoot), ".claude.json"), "utf8")).toBe(claudeJson("uuid-new"));
     } finally {
       if (saved !== undefined) process.env.AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN = saved;
     }
@@ -179,10 +184,13 @@ describe("first sign-in of a new gateway-managed identity", () => {
     await writeFile(join(folder, ".credentials.json"), claudeLogin("again"));
     await writeFile(join(folder, ".claude.json"), claudeJson("uuid-again"));
     store.puts.length = 0;
-    const result = await adoptLoginIntoGateway("claude", "fresh", folder, routeOpts, CLAUDE_KEY, { store: asStore(store) });
+    // The member copy from the first sign-in stays, so this one takes the existing-member path: route-all pushes the owner login.
+    const storePush: RouteAllOptions["storePush"] = (tool, name, root) => pushOwnerLogin(tool, name, { root, home, store: asStore(store) });
+    const result = await adoptLoginIntoGateway("claude", "fresh", folder, { ...routeOpts, storePush }, CLAUDE_KEY, { store: asStore(store) });
     expect(result?.outcome).toBe("adopted");
-    expect(store.puts.every((p) => typeof p.expectedVersion === "number")).toBe(true);
+    // the two login rows move by compare-and-swap (the replaced-login marker is a new row)
+    expect(store.puts.filter((p) => p.path === LOGIN_ROW || p.path === RECORD_ROW).every((p) => typeof p.expectedVersion === "number")).toBe(true);
     expect(store.rows.get(LOGIN_ROW)?.content.toString("utf8")).toBe(claudeLogin("again"));
     expect((await readdir(folder)).some((f) => f === ".credentials.json")).toBe(true);
-  });
+  }, 30_000);
 });

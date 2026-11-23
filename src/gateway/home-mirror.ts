@@ -444,8 +444,11 @@ export class HomeMirror {
   async pushDirty(): Promise<void> {
     for (const [rel, base] of [...this.bases]) {
       const local = await readLocal(this.abs(rel));
-      if (!local || sha256Hex(local) === base.sha) continue;
       const k = this.kinds.get(rel);
+      // A login or meta file this replica wrote that is gone now (deleted by another process) is written again from its row.
+      // Only a file store does it: a scratch HOME may lose its files on purpose. keepHostLogin and hostOwnsLogin still apply.
+      const missing = !local && this.fileStore && (k?.kind === "login" || k?.kind === "meta");
+      if (!missing && (!local || sha256Hex(local) === base.sha)) continue;
       if (!k || (!this.fileStore && (k.kind === "registry" || k.kind === "hostfile"))) continue;
       const run = async (): Promise<void> => {
         const [row] = await this.store.get([rel]);
