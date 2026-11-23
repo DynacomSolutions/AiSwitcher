@@ -131,13 +131,15 @@ A group that a session created stays with the chat that made it. The chat is the
 `close_group {groupId}` closes every tab of the own group of the session in one call. It replaces many `close_tab` calls, for example to remove a duplicate group. Get the id from `groups` in `tabs_context` (scope `own`).
 
 - One rule: every live tab of the group must pass the check that `close_tab` makes (the session owns the tab, and no approval protects it). The two tools share one function.
-- Refused with `forbidden_tab`, and no tab is closed: a granted group, a saved group, a group of another session, a group with a user tab, an approved tab, a tab of another session, a browser or extension page, and a chat-panel session.
+- Refused with `forbidden_tab`, and no tab is closed: a granted group, a saved group (run `forget_group` first, then close), a group of another session, a group with a user tab, an approved tab, a tab of another session, a browser or extension page, and a chat-panel session.
 - The tab set is read once, and again right before the close. A tab added to the group later is not closed.
 - A Stop or gateway abort before the close leaves every tab open.
 - One `tabs.remove` call closes all tabs. No debugger attach is needed. The call then waits up to 5 seconds, as `close_tab` does.
-- A tab that stays open (for example a "Leave site?" dialog) stays owned. Its id is in `stillOpen`. The agent can use `close_tab` and `handle_dialog` on it.
+- A tab that stays open (for example a "Leave site?" dialog) stays owned. Its id is in `stillOpen`. No debugger is attached, so the agent never sees the dialog, and a later attach would hang on it. The user must answer the dialog in Chrome, so the agent asks the user. The agent does not retry with `close_tab` or `handle_dialog`.
+- A `tabs.remove` error after Chrome closed some tabs is caught. The call still waits and reports `stillOpen` from what is left.
+- Both tab reads refuse a browser or extension page, as `close_tab` does.
 - After the close, the closed tabs leave the session. When no tab of the group is left, the agent record of the group is dropped.
-- Result: `{ groupId, closed, stillOpen, note }`. A saved group stays saved: closing tabs does not forget it, and the extension has no API to delete the saved entry in Chrome.
+- Result: `{ groupId, closed, stillOpen, note }`.
 
 ### Saved tab groups
 

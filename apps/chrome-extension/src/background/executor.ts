@@ -420,15 +420,18 @@ export class Executor {
         // Read again right before the remove: no await between this check, the abort check and the remove call.
         const latest = (await this.api.tabs.query()).filter(t => t.groupId === groupId);
         const ids = members.map(t => t.id).filter(id => latest.some(t => t.id === id));
-        for (const id of ids) {
-          const refusal = this.closeRefusal(session, id);
+        for (const t of latest) {
+          if (!ids.includes(t.id)) continue;
+          if (isInternalUrl(t.url)) throw new ToolError("forbidden_tab", `Tab ${t.id} shows a browser or extension page. Group ${groupId} is not closed.`);
+          const refusal = this.closeRefusal(session, t.id);
           if (refusal) throw new ToolError("forbidden_tab", `${refusal} Group ${groupId} is not closed and no tab was closed.`);
         }
         if (this.tabs.checkClose(session, groupId).ok !== true) throw new ToolError("forbidden_tab", `Group ${groupId} changed. It is not closed and no tab was closed.`);
         // A Stop or gateway abort here leaves every tab open.
         this.throwIfAborted(sig);
         // No debugger attach: like a discarded tab, the tabs close in one call. A page that asks "Leave site?" stays open and is reported below.
-        if (ids.length > 0) await this.api.tabs.remove(ids);
+        // Chrome can throw after it closed some tabs (for example "No tab with id"). The wait and the report below show what is left.
+        if (ids.length > 0) { try { await this.api.tabs.remove(ids); } catch { /* the stillOpen report below is the truth */ } }
         for (let waited = 0; waited < CLOSE_WAIT_MS; waited += CLOSE_POLL_MS) {
           if (!(await this.anyOpen(ids))) break;
           await this.sleepFn(CLOSE_POLL_MS, sig);
@@ -442,7 +445,11 @@ export class Executor {
         }
         if (!(await this.api.tabs.query()).some(t => t.groupId === groupId)) this.tabs.closedGroup(groupId);
         const closed = ids.length - stillOpen.length;
-        return text(JSON.stringify({ groupId, closed, stillOpen, note: `${stillOpen.length > 0 ? `${stillOpen.length} tab${stillOpen.length === 1 ? "" : "s"} stayed open (for example a "Leave site?" dialog) and stay yours: use close_tab and handle_dialog on ${stillOpen.length === 1 ? "it" : "them"}. ` : ""}A saved group stays saved: closing tabs does not forget it, and this tool cannot delete the saved entry in Chrome.` }));
+        const left = stillOpen.length;
+        const note = left > 0
+          ? `${left} tab${left === 1 ? "" : "s"} stayed open and stay${left === 1 ? "s" : ""} yours. The page may ask "Leave site?" in Chrome, and this tool cannot see that dialog. The user must answer it in Chrome. Ask the user.`
+          : "Every tab of the group is closed.";
+        return text(JSON.stringify({ groupId, closed, stillOpen, note }));
       }
       case "request_group": {
         this.throwIfAborted(sig);

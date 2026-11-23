@@ -44,7 +44,7 @@ describe("close_group", () => {
     const cdp = t.api.cdpLog.length;
     const r = await t.call("close_group", { groupId: gid });
     expect(t.json(r)).toMatchObject({ groupId: gid, closed: 3, stillOpen: [] });
-    expect(t.json(r).note).toContain("saved group stays saved");
+    expect(t.json(r).note).not.toContain("saved");
     expect(t.api.removeCalls).toEqual([ids]);
     expect(t.api.cdpLog.length).toBe(cdp);
     expect(t.api.attachedTabs.size).toBe(0);
@@ -172,9 +172,53 @@ describe("close_group", () => {
     const r = await t.call("close_group", { groupId: gid });
     expect(t.json(r)).toMatchObject({ groupId: gid, closed: 2, stillOpen: [ids[1]!] });
     expect(t.json(r).note).toContain("stayed open");
+    expect(t.json(r).note).toContain("Ask the user");
+    expect(t.json(r).note).not.toContain("handle_dialog");
+    expect(t.json(r).note).not.toContain("close_tab");
     expect(t.api.tabList.has(ids[1]!)).toBe(true);
     expect(t.tabs.owns("agent-1", ids[1]!, "alice")).toBe(true);
     expect(t.tabs.sessions.get("agent-1")!.tabIds.size).toBe(1);
+  });
+
+  test("a remove error after Chrome closed some tabs still ends in the normal report", async () => {
+    const t = setup();
+    const { ids, gid } = await t.own();
+    t.api.tabs.remove = async (id: number | number[]) => {
+      const list = Array.isArray(id) ? id : [id];
+      t.api.removeCalls.push(id);
+      t.api.closeTab(list[0]!);
+      throw new Error(`No tab with id: ${list[1]}.`);
+    };
+    const r = await t.call("close_group", { groupId: gid });
+    expect(t.json(r)).toMatchObject({ groupId: gid, closed: 1, stillOpen: [ids[1]!, ids[2]!] });
+    expect(t.tabs.owns("agent-1", ids[1]!, "alice")).toBe(true);
+    expect(t.tabs.owns("agent-1", ids[0]!, "alice")).toBe(false);
+  });
+
+  test("a remove error with every tab gone drops the group record", async () => {
+    const t = setup();
+    const { ids, gid } = await t.own();
+    t.api.tabs.remove = async (id: number | number[]) => {
+      for (const x of Array.isArray(id) ? id : [id]) t.api.closeTab(x);
+      throw new Error("No tab with id: 1.");
+    };
+    const r = await t.call("close_group", { groupId: gid });
+    expect(t.json(r)).toMatchObject({ closed: ids.length, stillOpen: [] });
+    expect(t.tabs.sessions.has("agent-1")).toBe(false);
+  });
+
+  test("a tab that turns into a browser page between the two reads refuses the whole call", async () => {
+    const t = setup();
+    const { ids, gid } = await t.own();
+    const query = t.api.tabs.query.bind(t.api.tabs);
+    let queries = 0;
+    t.api.tabs.query = async (...args: Parameters<typeof query>) => {
+      if (++queries === 2) t.api.tabList.get(ids[1]!)!.url = "chrome://settings/";
+      return query(...args);
+    };
+    expect(await t.call("close_group", { groupId: gid })).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.api.removeCalls).toEqual([]);
+    expect(t.api.tabList.size).toBe(3);
   });
 
   test("a group taken with request_group allowClose can be closed", async () => {
