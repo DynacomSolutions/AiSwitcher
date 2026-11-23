@@ -10,6 +10,18 @@ export const MAX_CHAT_TEXT = 65536;
 export const MAX_CHAT_TABS = 32;
 export const MAX_CHATS_PER_WINDOW = 6;
 export const MAX_CHAT_NAME = 80;
+/** Most starred models the gateway keeps, and most changes one frame may carry. */
+export const MAX_FAVOURITES = 200;
+
+/** A starred model: the same three names a pick uses. */
+export interface FavKey { provider: ChatProvider; identity: string; model: string }
+/** One star change. `at` is the time (epoch ms) the user made it, when the sender knows it: the gateway keeps the newest change of a model. */
+export interface FavChange extends FavKey { op: "add" | "remove"; at?: number }
+/** Why a store refused a change. `stale`: a newer change of the same model won, so the change is dead. `cap`: the list holds the most stars, so the add may be tried again after a removal. */
+export type FavRefusalReason = "stale" | "cap";
+export interface FavRefusal extends FavKey { reason: FavRefusalReason }
+/** One string per starred model. The names may hold `/` and `:`, so the id is a JSON array. */
+export const favId = (f: FavKey): string => JSON.stringify([f.provider, f.identity, f.model]);
 
 export interface ChatSelection { provider: ChatProvider; identity: string; model?: string; effort?: string }
 export interface ChatSummary { chatId: string; name: string; color: string; windowId: number; state: ChatState; selection: ChatSelection; tabIds: number[]; lastSeq: number; updatedAt: number }
@@ -29,18 +41,23 @@ export type ChatFromExt =
   | { t: "chat.link"; chatId: string; tabIds: number[] } | { t: "chat.config"; chatId: string; model?: string; effort?: string }
   | { t: "chat.rename"; chatId: string; name: string } | { t: "chat.close"; chatId: string }
   | { t: "chat.resume"; chatId: string; afterSeq: number } | { t: "chat.list"; windowId?: number }
-  | { t: "chat.catalog"; reqId: string; provider?: ChatProvider };
+  | { t: "chat.catalog"; reqId: string; provider?: ChatProvider }
+  /** Asks for the starred models. The gateway answers with `chat.fav.list`. */
+  | { t: "chat.fav.list" } | { t: "chat.fav.set"; changes: FavChange[] };
 export interface ChatCatalogProvider { provider: ChatProvider; identities: Array<{ name: string; kind: "identity" | "pool"; models: Array<{ id: string; name: string }>; modelsError?: string }>; efforts: string[] }
 export type ChatToExt =
   | { t: "chat.event"; chatId: string; seq: number; ts: number; body: ChatBody } | { t: "chat.state"; chatId: string; state: ChatState; summary: ChatSummary }
   | { t: "chat.list"; chats: ChatSummary[] } | { t: "chat.reject"; chatId?: string; reqId?: string; code: ChatErrorCode; message: string }
-  | { t: "chat.catalog"; reqId: string; providers: ChatCatalogProvider[] };
+  | { t: "chat.catalog"; reqId: string; providers: ChatCatalogProvider[] }
+  /** The starred models, oldest first. `seq` grows with each change. `epoch` names the store: it changes when the gateway data was reset, so a client that sees a new epoch treats its last list as unknown. The gateway sends it after an attach, after a `chat.fav.list` and after every change. */
+  | { t: "chat.fav.list"; seq: number; items: FavKey[]; epoch?: string; refused?: FavRefusal[] };
 
 export const sessionIdForChat = (chatId: string): string => `chat:${chatId}`;
 
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const COLOR_RE = /^#[0-9a-f]{6}$/;
 const SEL_RE = /^[A-Za-z0-9._:/@+-]{1,128}$/;
+const EPOCH_RE = /^[A-Za-z0-9._:-]{1,64}$/;
 const MAX_SHORT = 256;
 const MAX_MODELS = 4096;
 const MAX_SMALL_LIST = 64;
@@ -89,6 +106,26 @@ const models = (v: unknown): Array<{ id: string; name: string }> | undefined =>
     const mid = str(m.id), mname = str(m.name);
     return mid === undefined || mname === undefined ? undefined : { id: mid, name: mname };
   });
+
+function favKey(v: unknown): FavKey | undefined {
+  if (!isRec(v)) return undefined;
+  const provider = oneOf(CHAT_PROVIDERS, v.provider), identity = sel(v.identity), model = sel(v.model);
+  return provider && identity && model ? { provider, identity, model } : undefined;
+}
+
+export function favRefusal(v: unknown): FavRefusal | undefined {
+  const k = favKey(v);
+  if (!k || !isRec(v)) return undefined;
+  const reason = oneOf(["stale", "cap"] as const, v.reason);
+  return reason ? { ...k, reason } : undefined;
+}
+
+function favChange(v: unknown): FavChange | undefined {
+  const k = favKey(v);
+  if (!k || !isRec(v)) return undefined;
+  const op = oneOf(["add", "remove"] as const, v.op), at = opt(v.at, int);
+  return op && at.ok ? withOpt({ ...k, op } as FavChange, { at: at.v }) : undefined;
+}
 
 function selection(v: unknown): ChatSelection | undefined {
   if (!isRec(v)) return undefined;
@@ -214,6 +251,11 @@ export function parseChatFromExt(v: unknown): ChatFromExt | undefined {
       if (!reqId || !p.ok) return undefined;
       return withOpt({ t: "chat.catalog", reqId } as ChatFromExt, { provider: p.v });
     }
+    case "chat.fav.list": return { t: "chat.fav.list" };
+    case "chat.fav.set": {
+      const changes = list(v.changes, MAX_FAVOURITES, favChange);
+      return changes ? { t: "chat.fav.set", changes } : undefined;
+    }
     default: return undefined;
   }
 }
@@ -241,6 +283,14 @@ export function parseChatToExt(v: unknown): ChatToExt | undefined {
     case "chat.catalog": {
       const reqId = id(v.reqId), providers = list(v.providers, MAX_LIST, catalogProvider);
       return reqId && providers ? { t: "chat.catalog", reqId, providers } : undefined;
+    }
+    case "chat.fav.list": {
+      const seq = int(v.seq), items = list(v.items, MAX_FAVOURITES, favKey);
+      // A bad epoch is dropped, not fatal: the list is still good.
+      const epoch = typeof v.epoch === "string" && EPOCH_RE.test(v.epoch) ? v.epoch : undefined;
+      // A bad refusal entry is skipped: it must not hide the list.
+      const refused = Array.isArray(v.refused) ? v.refused.slice(0, MAX_FAVOURITES).map(favRefusal).filter((r): r is FavRefusal => r !== undefined) : undefined;
+      return seq !== undefined && items ? { t: "chat.fav.list", seq, items, ...(epoch !== undefined ? { epoch } : {}), ...(refused !== undefined && refused.length > 0 ? { refused } : {}) } : undefined;
     }
     default: return undefined;
   }

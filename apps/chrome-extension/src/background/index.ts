@@ -26,6 +26,7 @@ const hub = new ChatHub({
   send: frame => connection.sendChat(frame),
   tabs,
   storage: api.sessionStorage,
+  local: api.storage,
   now: () => Date.now(),
   newId: () => crypto.randomUUID(),
   resumeSession: sessionId => state.resumeSession(sessionId),

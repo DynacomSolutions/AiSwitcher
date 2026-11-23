@@ -11,7 +11,9 @@ export type ChatBusMsg =
   | { t: "event"; chatId: string; seq: number }
   | { t: "state"; chatId: string }
   | { t: "cmd"; to: string; chatId: string; cmd: ChatCmd; seq?: number; args?: Record<string, unknown>; from?: string; ref?: string }
-  | { t: "ack"; to: string; chatId: string; ref: string };
+  | { t: "ack"; to: string; chatId: string; ref: string }
+  /** The starred models changed. The body is read from the store. */
+  | { t: "favs"; seq: number };
 
 export interface ChatBus {
   publish(m: ChatBusMsg): Promise<void>;
@@ -38,6 +40,7 @@ export function parseBusMsg(payload: string): ChatBusMsg | undefined {
   }
   if (typeof v !== "object" || v === null) return undefined;
   const o = v as Record<string, unknown>;
+  if (o.t === "favs") return typeof o.seq === "number" && Number.isSafeInteger(o.seq) ? { t: "favs", seq: o.seq } : undefined;
   if (typeof o.chatId !== "string") return undefined;
   switch (o.t) {
     case "event":

@@ -12,6 +12,7 @@ import { listLiveSessions, sessionRegistryDir, type IsRunning, type RegisteredSe
 import type { SyncRunOptions } from "./types.ts";
 import { createStoreSyncSupervisor, type StoreSyncSupervisor } from "./store-sync-supervisor.ts";
 import { createT3ClaudeTicker, type T3ClaudeTicker } from "./t3-claude-ticker.ts";
+import { createT3FavouritesTicker, type T3FavouritesTicker } from "./t3-favourites-ticker.ts";
 import { createT3ModelsTicker, type T3ModelsTicker } from "./t3-models-ticker.ts";
 import { createT3UsageTicker, type T3UsageTicker } from "./t3-usage-ticker.ts";
 import { POLL_MS, scanTree, snapshotsDiffer, type Snapshot } from "./watch.ts";
@@ -283,6 +284,8 @@ export interface RunDaemonOptions {
   t3Usage?: T3UsageTicker | false;
   /** T3 Claude home drift check against the source identities (t3-claude-ticker.ts). Default: one is created when no `deps` are given. */
   t3Claude?: T3ClaudeTicker | false;
+  /** T3 favourites sync with the gateway list (t3-favourites-ticker.ts). Default: one is created when no `deps` are given. */
+  t3Favourites?: T3FavouritesTicker | false;
 }
 
 /**
@@ -303,6 +306,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
   const t3Models = options.t3Models === false ? undefined : (options.t3Models ?? (options.deps ? undefined : createT3ModelsTicker()));
   const t3Usage = options.t3Usage === false ? undefined : (options.t3Usage ?? (options.deps ? undefined : createT3UsageTicker()));
   const t3Claude = options.t3Claude === false ? undefined : (options.t3Claude ?? (options.deps ? undefined : createT3ClaudeTicker()));
+  const t3Favourites = options.t3Favourites === false ? undefined : (options.t3Favourites ?? (options.deps ? undefined : createT3FavouritesTicker()));
   let stopped = false;
   let wake: (() => void) | undefined;
   const onSignal = () => {
@@ -333,6 +337,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
       try { await t3Models?.tick(); } catch { /* retried next interval */ }
       try { await t3Usage?.tick(); } catch { /* retried next interval */ }
       try { await t3Claude?.tick(); } catch { /* retried next interval */ }
+      try { await t3Favourites?.tick(); } catch { /* retried next interval */ }
       if (stopped) break;
       await new Promise<void>((resolve) => {
         wake = resolve;
@@ -343,6 +348,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
     return 0;
   } finally {
     storeSync?.stop();
+    t3Favourites?.stop();
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);
     options.signal?.removeEventListener("abort", onSignal);

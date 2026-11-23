@@ -139,7 +139,7 @@ describe("chat hub", () => {
     e.sent.length = 0;
     e.hub.onWelcome();
     expect(e.sent).toEqual([
-      { t: "chat.list" },
+      { t: "chat.list" }, { t: "chat.fav.list" },
       { t: "chat.resume", chatId: "a", afterSeq: 2 }, { t: "chat.resume", chatId: "b", afterSeq: 0 },
       { t: "chat.link", chatId: "a", tabIds: [7] }, { t: "chat.link", chatId: "b", tabIds: [] },
     ]);
@@ -452,5 +452,226 @@ describe("chat port", () => {
     p.say({ type: "ais-chat-create", windowId: "x" });
     p.say("junk");
     expect(e.sent.filter(f => f.t === "chat.create")).toHaveLength(1);
+  });
+});
+
+describe("favourites", () => {
+  const fav = (model: string, identity = "alpha") => ({ provider: "claude" as const, identity, model });
+  const FAV_KEY = "chatFavourites";
+  const SYNCED_KEY = "chatFavouritesSynced";
+  function withLocal(local: Record<string, unknown> = {}, online = true) {
+    const api = new FakeChrome();
+    const sent: ChatFromExt[] = [];
+    let up = online;
+    const store: Record<string, unknown> = { ...local };
+    let clock = 5000;
+    const hub = new ChatHub({
+      send: f => { if (!up) return false; sent.push(f); return true; },
+      tabs: new TabManager(api), storage: api.sessionStorage, now: () => clock, newId: () => "x",
+      local: { get: async keys => Object.fromEntries(keys.filter(k => k in store).map(k => [k, store[k]])), set: async v => { Object.assign(store, v); }, remove: async () => {} },
+    });
+    return { hub, sent, store, setUp: (v: boolean) => { up = v; }, setNow: (v: number) => { clock = v; }, sets: () => sent.filter(f => f.t === "chat.fav.set") };
+  }
+  const list = (items: ReturnType<typeof fav>[], seq = 1, epoch?: string) => ({ t: "chat.fav.list" as const, seq, items, ...(epoch !== undefined ? { epoch } : {}) });
+  const EPOCH_KEY = "chatFavouritesEpoch";
+
+  test("a welcome asks for the list, and the state shows what the gateway lists", () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    expect(e.sent.filter(f => f.t === "chat.fav.list")).toHaveLength(1);
+    e.hub.handleFrame(list([fav("m1")]));
+    expect(e.hub.state(1).favourites).toEqual([fav("m1")]);
+    e.hub.handleFrame(list([fav("m1"), fav("m2")], 2));
+    expect(e.hub.state(1).favourites).toEqual([fav("m1"), fav("m2")]);
+    e.hub.handleFrame(list([fav("m2")], 3));
+    expect(e.hub.state(1).favourites).toEqual([fav("m2")]);
+  });
+
+  test("a star refused for the cap is not kept and the state names why; a stale refusal needs no message", async () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    const full = Array.from({ length: 200 }, (_, i) => fav(`g${i}`));
+    e.hub.handleFrame(list(full));
+    await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("extra") });
+    expect(e.hub.state(1).favourites).toHaveLength(200);
+    expect(e.hub.state(1).favourites?.some(f => f.model === "extra")).toBe(true);
+    // The gateway answers with its list (200 stars) and refuses the add for the cap.
+    e.hub.handleFrame({ ...list(full, 2), refused: [{ ...fav("extra"), reason: "cap" as const }] });
+    const s = e.hub.state(1);
+    expect(s.favourites?.some(f => f.model === "extra")).toBe(false);
+    expect(s.favourites).toHaveLength(200);
+    expect(s.favouritesNotice).toBe("You have 200 favourites. Remove one to add another.");
+    // The notice stays through a push that changes nothing, and the lost star is not sent again by a later list.
+    e.hub.handleFrame(list(full, 3));
+    expect(e.hub.state(1).favouritesNotice).toBeDefined();
+    expect(e.sets()).toHaveLength(1);
+    // The next click clears it. A stale refusal sets no notice, and the star is not shown.
+    await e.hub.command({ type: "ais-chat-favourite", op: "remove", ...fav("g0") });
+    expect(e.hub.state(1).favouritesNotice).toBeUndefined();
+    await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("late") });
+    e.hub.handleFrame({ ...list(full.slice(1), 4), refused: [{ ...fav("late"), reason: "stale" as const }] });
+    expect(e.hub.state(1).favouritesNotice).toBeUndefined();
+    expect(e.hub.state(1).favourites?.some(f => f.model === "late")).toBe(false);
+  });
+
+  test("a star in the panel shows at once, is cached and is sent with its time", async () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([]));
+    await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("m1") });
+    expect(e.hub.state(1).favourites).toEqual([fav("m1")]);
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("m1"), op: "add", at: 5000 }] }]);
+    await Bun.sleep(0);
+    expect(e.store[FAV_KEY]).toEqual([fav("m1")]);
+    await e.hub.command({ type: "ais-chat-favourite", op: "remove", ...fav("m1") });
+    expect(e.hub.state(1).favourites).toEqual([]);
+    expect(e.sets()[1]).toEqual({ t: "chat.fav.set", changes: [{ ...fav("m1"), op: "remove", at: 5000 }] });
+  });
+
+  test("the first list after a connect sends up a star the gateway never saw, once", async () => {
+    // The old build kept stars in this same key and no synced list: all of them are local only.
+    const e = withLocal({ [FAV_KEY]: [fav("local1"), fav("both")] });
+    await e.hub.load();
+    expect(e.hub.state(1).favourites).toEqual([fav("local1"), fav("both")]);
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([fav("both"), fav("remote")]));
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("local1"), op: "add", at: 5000 }] }]);
+    expect(e.hub.state(1).favourites?.map(f => f.model).sort()).toEqual(["both", "local1", "remote"]);
+    // The reply and a later push do not send it again.
+    e.hub.handleFrame(list([fav("both"), fav("remote"), fav("local1")], 2));
+    e.hub.handleFrame(list([fav("both"), fav("local1")], 3));
+    expect(e.sets()).toHaveLength(1);
+    expect(e.hub.state(1).favourites?.map(f => f.model)).toEqual(["both", "local1"]);
+  });
+
+  test("a star taken away while offline is removed at the gateway on the next connect", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("keep")], [SYNCED_KEY]: [fav("keep"), fav("gone")] });
+    await e.hub.load();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([fav("keep"), fav("gone")]));
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("gone"), op: "remove", at: 5000 }] }]);
+    expect(e.hub.state(1).favourites).toEqual([fav("keep")]);
+  });
+
+  test("a star the gateway dropped while this browser was offline is not sent up again", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("m1")], [SYNCED_KEY]: [fav("m1")] });
+    await e.hub.load();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([]));
+    expect(e.sets()).toEqual([]);
+    expect(e.hub.state(1).favourites).toEqual([]);
+    await Bun.sleep(0);
+    expect(e.store[FAV_KEY]).toEqual([]);
+    expect(e.store[SYNCED_KEY]).toEqual([]);
+  });
+
+  test("a star made offline stays, survives a worker restart and goes up on the next connect", async () => {
+    const e = withLocal({}, false);
+    await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("m1") });
+    expect(e.sent).toEqual([]);
+    expect(e.hub.state(1).favourites).toEqual([fav("m1")]);
+    await Bun.sleep(0);
+    const again = withLocal(e.store);
+    await again.hub.load();
+    again.hub.onWelcome();
+    again.hub.handleFrame(list([]));
+    expect(again.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("m1"), op: "add", at: 5000 }] }]);
+  });
+
+  test("a gateway with a new epoch is a reset: every known star goes up again and none is dropped", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("a"), fav("b")], [SYNCED_KEY]: [fav("a"), fav("b")], [EPOCH_KEY]: "e1" });
+    await e.hub.load();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([], 1, "e2"));
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("a"), op: "add", at: 5000 }, { ...fav("b"), op: "add", at: 5000 }] }]);
+    expect(e.hub.state(1).favourites).toEqual([fav("a"), fav("b")]);
+    await Bun.sleep(0);
+    expect(e.store[EPOCH_KEY]).toBe("e2");
+  });
+
+  test("a new epoch in the middle of a session is handled the same way, and the same epoch is not a reset", async () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([fav("a")], 1, "e1"));
+    e.hub.handleFrame(list([], 2, "e1"));
+    expect(e.hub.state(1).favourites).toEqual([]);
+    expect(e.sets()).toEqual([]);
+    e.hub.handleFrame(list([fav("a")], 3, "e1"));
+    e.hub.handleFrame(list([], 1, "e2"));
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("a"), op: "add", at: 5000 }] }]);
+    expect(e.hub.state(1).favourites).toEqual([fav("a")]);
+  });
+
+  test("a restore keeps the epoch: a list version below the last one is a reset, also after a worker restart", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("a"), fav("b")], [SYNCED_KEY]: [fav("a"), fav("b")], [EPOCH_KEY]: "e1", ["chatFavouritesSeq"]: 9 });
+    await e.hub.load();
+    e.hub.onWelcome();
+    // The store was restored from a backup that had only "a" at version 4: same epoch, lower version.
+    e.hub.handleFrame(list([fav("a")], 4, "e1"));
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("b"), op: "add", at: 5000 }] }]);
+    expect(e.hub.state(1).favourites).toEqual([fav("a"), fav("b")]);
+    await Bun.sleep(0);
+    expect(e.store["chatFavouritesSeq"]).toBe(4);
+  });
+
+  test("a list version that only grows with the same epoch is no reset", () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([fav("a")], 5, "e1"));
+    e.hub.handleFrame(list([], 6, "e1"));
+    expect(e.hub.state(1).favourites).toEqual([]);
+    expect(e.sets()).toEqual([]);
+  });
+
+  test("a gateway without an epoch, or a store from before the epoch, keeps the old rules", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("m1")], [SYNCED_KEY]: [fav("m1")] });
+    await e.hub.load();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([], 1, "e1"));
+    expect(e.sets()).toEqual([]);
+    expect(e.hub.state(1).favourites).toEqual([]);
+  });
+
+  test("a star made offline goes up with the time of the click, also after a worker restart", async () => {
+    const e = withLocal({}, false);
+    await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("m1") });
+    await Bun.sleep(0);
+    e.setNow(9000);
+    const again = withLocal(e.store);
+    again.setNow(9000);
+    await again.hub.load();
+    again.hub.onWelcome();
+    again.hub.handleFrame(list([]));
+    expect(again.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("m1"), op: "add", at: 5000 }] }]);
+  });
+
+  test("a star taken away offline goes up with the time of the click", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("gone")], [SYNCED_KEY]: [fav("gone")] }, false);
+    await e.hub.load();
+    await e.hub.command({ type: "ais-chat-favourite", op: "remove", ...fav("gone") });
+    e.setNow(9000);
+    e.setUp(true);
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([fav("gone")]));
+    expect(e.sets()).toEqual([{ t: "chat.fav.set", changes: [{ ...fav("gone"), op: "remove", at: 5000 }] }]);
+  });
+
+  test("a click time is dropped once the gateway list agrees with it", async () => {
+    const e = withLocal();
+    e.hub.onWelcome();
+    e.hub.handleFrame(list([]));
+    await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("m1") });
+    e.hub.handleFrame(list([fav("m1")], 2));
+    await Bun.sleep(0);
+    expect(e.store["chatFavouritesAt"]).toEqual({});
+  });
+
+  test("a bad stored list is dropped, and an invalid command is refused", async () => {
+    const e = withLocal({ [FAV_KEY]: [fav("ok"), { provider: "claude", identity: "a", model: "bad id" }, "x", fav("ok")] });
+    await e.hub.load();
+    expect(e.hub.state(1).favourites).toEqual([fav("ok")]);
+    expect(parsePanelCommand({ type: "ais-chat-favourite", op: "toggle", ...fav("m") })).toBeUndefined();
+    expect(parsePanelCommand({ type: "ais-chat-favourite", op: "add", provider: "bash", identity: "a", model: "m" })).toBeUndefined();
+    expect(await e.hub.command({ type: "ais-chat-favourite", op: "add", ...fav("bad id") })).toMatchObject({ ok: false });
   });
 });

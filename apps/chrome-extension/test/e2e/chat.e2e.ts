@@ -676,7 +676,14 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       await clickIn(Q, `${detail} .picker-tab`, "Favourites");
       await until("favourite listed", () => Q.eval<boolean>(`[...document.querySelectorAll("${detail} .picker-option")].map(o => o.textContent).join() === "Claude Opus 5.5claude-opus-5-5"`));
       await sleep(300);
-      await shot("composer-d-favourites-r4", Q);
+      await shot("composer-d-favourites-r5", Q);
+      // The star went to the gateway, and a change made there (a host daemon does it for T3 Code) shows in the open picker.
+      const adminFavs = async (init?: RequestInit) => (await (await fetch(`http://127.0.0.1:${gatewayPorts.adminPort}/favourites`, { ...init, headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" } })).json()) as { seq: number; items: Array<{ provider: string; identity: string; model: string }> };
+      expect((await adminFavs()).items).toEqual([{ provider: "claude", identity: "alpha", model: "claude-opus-5-5" }]);
+      await adminFavs({ method: "POST", body: JSON.stringify({ origin: "host-test", changes: [{ provider: "claude", identity: "alpha", model: "claude-sonnet-5-5", op: "add" }] }) });
+      await until("star from the gateway shown", () => Q.eval<boolean>(`[...document.querySelectorAll("${detail} .picker-option")].map(o => o.textContent).join() === "Claude Opus 5.5claude-opus-5-5,Claude Sonnet 5.5claude-sonnet-5-5"`));
+      await adminFavs({ method: "POST", body: JSON.stringify({ origin: "host-test", changes: [{ provider: "claude", identity: "alpha", model: "claude-sonnet-5-5", op: "remove" }] }) });
+      await until("star removed at the gateway disappears", () => Q.eval<boolean>(`[...document.querySelectorAll("${detail} .picker-option")].map(o => o.textContent).join() === "Claude Opus 5.5claude-opus-5-5"`));
       // Keyboard: ArrowRight switches the tab, Escape closes the popover and returns the focus to the button.
       await key(Q, "Escape");
       await until("picker closed", () => Q.eval<boolean>(`document.querySelector("${detail} .picker-pop").hidden`));
@@ -705,6 +712,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       await clickIn(Q, `${detail} .composer .picker-button`);
       await Q.eval(`document.querySelector("${detail} [aria-label='Remove Claude Opus 5.5 from favourites']")?.click() ?? document.querySelector("${detail} [aria-label='Add Claude Opus 5.5 to favourites']") === null`);
       await until("favourite removed", async () => ((await sw.eval<{ chatFavourites?: unknown[] }>(`chrome.storage.local.get("chatFavourites")`)).chatFavourites ?? []).length === 0);
+      await until("favourite removed at the gateway", async () => (await adminFavs()).items.length === 0);
       const id = (await hubChat(name))!.summary.chatId;
       await Q.eval(`chrome.runtime.sendMessage({ type: "ais-chat-close", chatId: ${JSON.stringify(id)} })`);
     } finally {

@@ -162,6 +162,7 @@ export function createPicker(doc: Document, h: PickerHandlers, label: string): P
     else if (model.groups.length === 0) hint(NO_PROVIDERS);
     if (model.locked) hint(LOCKED_HINT);
     if (model.notice !== undefined) hint(model.notice);
+    if (model.favouritesNotice !== undefined) out.push(el(doc, "p", "hint bad", model.favouritesNotice));
     hints.replaceChildren(...out);
     hints.hidden = out.length === 0;
   };

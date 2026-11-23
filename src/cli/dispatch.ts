@@ -160,6 +160,11 @@ export async function runCli(argv: string[]): Promise<void> {
       case "gateway":
         await runGatewayCommand(rest, flags);
         break;
+      case "t3": {
+        const { runT3Command } = await import("./t3/dispatch.ts");
+        await runT3Command(rest, flags);
+        break;
+      }
       case "browser":
         if (rest[0] === "upload") {
           // Raw argv: its valued flags take the space form, and file names may start with "-".

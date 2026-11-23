@@ -18,6 +18,7 @@ import usageRollup0009 from "./migrations/0009_usage_rollup.sql" with { type: "t
 import usageReadings0010 from "./migrations/0010_usage_readings.sql" with { type: "text" };
 import usageSession0011 from "./migrations/0011_usage_session.sql" with { type: "text" };
 import chat0012 from "./migrations/0012_chat.sql" with { type: "text" };
+import favourites0013 from "./migrations/0013_favourites.sql" with { type: "text" };
 import type { PgListener } from "./pg-listen.ts";
 import { pgPoolOptions } from "./pg-pool.ts";
 
@@ -36,6 +37,7 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0010_usage_readings", sql: usageReadings0010 },
   { version: "0011_usage_session", sql: usageSession0011 },
   { version: "0012_chat", sql: chat0012 },
+  { version: "0013_favourites", sql: favourites0013 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */

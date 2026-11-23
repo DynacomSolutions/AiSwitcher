@@ -3,6 +3,9 @@ import { Hono } from "hono";
 import { AppRevokedError, revokedMessage, type GatewayStore } from "./store.ts";
 import { registerBrowserAdmin } from "./browser/admin.ts";
 import { registerStoreAdmin, type StoreAdminDeps } from "./admin-store.ts";
+import { registerFavouritesAdmin } from "./admin-favourites.ts";
+import type { FavouritesService } from "./chat/favourites.ts";
+import type { GatewayMetrics } from "./metrics.ts";
 import type { LoginRenewal } from "./renewal.ts";
 import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
@@ -47,6 +50,9 @@ export interface AdminDeps {
   renewal?(): Promise<LoginRenewal[]>;
   /** The credential store behind the host sync routes (/store/*, admin-store.ts); absent when the gateway has no credential store. */
   storeAdmin?: StoreAdminDeps;
+  /** The starred models behind GET and POST /favourites (admin-favourites.ts). Read at each call: it is undefined until the chat stack is up. */
+  favourites?(): FavouritesService | undefined;
+  metrics?: Pick<GatewayMetrics, "favourite">;
   /** One identity's cached subscription usage (GET /limits); absent when the gateway has no usage source. */
   usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   /** The member accounts of every swap pool of one provider (GET /limits). */
@@ -233,7 +239,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
   const read = deps.readStore ?? store;
   const hono = new Hono();
-  const err = (status: 400 | 401 | 404 | 409 | 500 | 503, message: string): Response => Response.json({ error: message }, { status });
+  const err = (status: 400 | 401 | 404 | 409 | 429 | 500 | 503, message: string): Response => Response.json({ error: message }, { status, ...(status === 429 ? { headers: { "retry-after": "5" } } : {}) });
 
   hono.use("*", async (c, next) => {
     if (!deps.adminToken || !sameSecret(bearer(c.req.raw), deps.adminToken)) return err(401, "admin token required");
@@ -243,6 +249,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
   registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserHub ? { hub: deps.browserHub } : {}), ...(deps.onBindingRevoked ? { onBindingRevoked: deps.onBindingRevoked } : {}), ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
 
   registerStoreAdmin(hono, deps.storeAdmin, (status, message, extra) => Response.json({ error: message, ...extra }, { status }));
+  registerFavouritesAdmin(hono, deps.favourites, err, deps.metrics);
 
   // Renewal state of every login the gateway keeps alive: journal (last refresh, last error) plus the stored login (expiry).
   hono.get("/logins/renewal", async (c) => {

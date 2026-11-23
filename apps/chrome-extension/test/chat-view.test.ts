@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { MAX_CHAT_NAME, MAX_CHAT_TABS, MAX_CHAT_TEXT } from "../../../src/browser/chat-protocol.ts";
 import type { TabInfo } from "../src/background/chrome-api.ts";
-import { CAP_MESSAGE } from "../src/shared/chat.ts";
+import { CAP_MESSAGE, FAVOURITES_FULL } from "../src/shared/chat.ts";
 import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../src/shared/chat.ts";
 import { AGENT_TAB, LINK_PROMPT, ChatTab, checkSelection, parseSelection, NEW_PLACEHOLDER, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
 import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
@@ -601,21 +601,20 @@ describe("picker wiring", () => {
 
 describe("composer with the picker inside", () => {
   const cat = [{ provider: "claude" as const, efforts: ["low"], identities: [{ name: "work", kind: "identity" as const, models: [{ id: "m1", name: "One" }, { id: "m2", name: "Two" }] }] }];
-  const make = (stored?: unknown) => {
+  const make = () => {
     const doc = fakeDoc();
     const root = doc.createElement("section");
     let push: (m: unknown) => void = () => {};
-    const saved: unknown[] = [];
+    const sent: unknown[] = [];
     const t = new ChatTab({
       doc: asDoc(doc), windowId: 1,
       connect: () => ({ postMessage: () => {}, onMessage: l => { push = l; }, onDisconnect: () => {} }),
       queryTabs: async () => [tab(5, { active: true })],
-      send: async () => ({ ok: true }),
+      send: async c => { sent.push(c); return { ok: true }; },
       loadSeen: async () => ({}), saveSeen: () => {},
-      loadFavourites: async () => stored, saveFavourites: f => { saved.push(f); },
     }, asEl(root));
     t.start();
-    return { t, root, saved, push: (s: ChatPanelState) => push(s), flush: () => new Promise(r => setTimeout(r, 0)) };
+    return { t, root, sent, push: (s: ChatPanelState) => push(s), flush: () => new Promise(r => setTimeout(r, 0)) };
   };
   test("the model picker sits in the bottom row of the composer card, below the message box", async () => {
     const s = make();
@@ -645,23 +644,41 @@ describe("composer with the picker inside", () => {
     expect(detailTools.some(t => t.children.includes(picker))).toBe(true);
     expect(detailTools.filter(t => t.children.length > 0)).toHaveLength(1);
   });
-  test("a star is saved and stays after a reload of the list", async () => {
-    const s = make([{ provider: "claude", identity: "work", model: "m1" }]);
+  const one = { provider: "claude" as const, identity: "work", model: "m1" };
+  test("the stars of the state show in the picker, and a click sends the change to the worker", async () => {
+    const s = make();
     await s.flush();
-    s.push(stateOf([], { catalog: cat }));
+    s.push(stateOf([], { catalog: cat, favourites: [one] }));
     const picker = byClass(s.root, "picker")[0]!;
     walk(picker).find(n => n.className === "picker-button")!.click();
     expect(walk(picker).find(n => n.attrs["aria-label"] === "Remove One from favourites")).toBeDefined();
     walk(picker).find(n => n.attrs["aria-label"] === "Add Two to favourites")!.click();
-    expect(s.saved).toEqual([[{ provider: "claude", identity: "work", model: "m1" }, { provider: "claude", identity: "work", model: "m2" }]]);
-    expect(walk(picker).find(n => n.attrs["aria-label"] === "Remove Two from favourites")).toBeDefined();
-  });
-  test("bad stored favourites are dropped", async () => {
-    const s = make([{ provider: "claude", identity: "work", model: "bad id" }, "x"]);
+    walk(picker).find(n => n.attrs["aria-label"] === "Remove One from favourites")!.click();
     await s.flush();
+    expect(s.sent.filter(c => (c as { type: string }).type === "ais-chat-favourite")).toEqual([
+      { type: "ais-chat-favourite", op: "add", provider: "claude", identity: "work", model: "m2" },
+      { type: "ais-chat-favourite", op: "remove", ...one },
+    ]);
+  });
+  test("the favourites notice shows as an error line in the popover and goes when the state drops it", async () => {
+    const s = make();
+    s.push(stateOf([], { catalog: cat, favourites: [one], favouritesNotice: FAVOURITES_FULL }));
+    const picker = byClass(s.root, "picker")[0]!;
+    walk(picker).find(n => n.className === "picker-button")!.click();
+    const lines = () => walk(picker).filter(n => n.className === "hint bad").map(n => n.textContent);
+    expect(lines()).toEqual(["You have 200 favourites. Remove one to add another."]);
+    s.push(stateOf([], { catalog: cat, favourites: [one] }));
+    expect(lines()).toEqual([]);
+  });
+  test("a change of the gateway list shows as a star at once, with no click", async () => {
+    const s = make();
     s.push(stateOf([], { catalog: cat }));
     const picker = byClass(s.root, "picker")[0]!;
     walk(picker).find(n => n.className === "picker-button")!.click();
+    expect(walk(picker).filter(n => n.attrs["aria-pressed"] === "true")).toHaveLength(0);
+    s.push(stateOf([], { catalog: cat, favourites: [{ provider: "claude", identity: "work", model: "m2" }] }));
+    expect(walk(picker).find(n => n.attrs["aria-label"] === "Remove Two from favourites")).toBeDefined();
+    s.push(stateOf([], { catalog: cat, favourites: [] }));
     expect(walk(picker).filter(n => n.attrs["aria-pressed"] === "true")).toHaveLength(0);
   });
 });

@@ -44,12 +44,13 @@ function b64(raw: unknown): Buffer | undefined {
 }
 
 /**
- * Wraps the admin server's fetch so a long poll is never cut by Bun's idle timeout (10 s by default, shorter than the
+ * Wraps the admin server's fetch so a long poll (`/store/wait`, `/favourites`) is never cut by Bun's idle timeout (10 s by default, shorter than the
  * 25 s poll). The wait itself is capped at STORE_WAIT_MAX_MS by the route. Other requests keep the default.
  */
 export function withStoreWaitTimeout<S extends { timeout(req: Request, seconds: number): void }>(handler: (req: Request) => Response | Promise<Response>): (req: Request, server: S) => Response | Promise<Response> {
   return (req, server) => {
-    if (req.method === "GET" && new URL(req.url).pathname === "/store/wait") server.timeout(req, 0);
+    const path = new URL(req.url).pathname;
+    if (req.method === "GET" && (path === "/store/wait" || path === "/favourites")) server.timeout(req, 0);
     return handler(req);
   };
 }

@@ -13,7 +13,7 @@ import { providerIconSvg } from "./provider-icons.ts";
 import type { Composer } from "./composer.ts";
 import { buildFeed } from "./feed.ts";
 import { renderFeed } from "./feed-view.ts";
-import { buildPicker, choose, parseFavourites, toggleFavourite } from "./picker.ts";
+import { buildPicker, choose, favKey } from "./picker.ts";
 import type { Fav } from "./picker.ts";
 import { createPicker } from "./picker-view.ts";
 import type { Picker } from "./picker-view.ts";
@@ -96,9 +96,6 @@ export interface ChatViewDeps {
   /** The last selection used for a new chat. Kept in local storage. */
   loadSelection?(): Promise<unknown>;
   saveSelection?(s: ChatSelection): void;
-  /** The starred models of the picker. Kept in local storage. */
-  loadFavourites?(): Promise<unknown>;
-  saveFavourites?(f: Fav[]): void;
 }
 
 /** Accepts a stored selection only when it has the right shape and every field is selectable. */
@@ -144,7 +141,6 @@ export class ChatTab {
   private shown: string | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private lastUsed: ChatSelection | undefined;
-  private favourites: Fav[] = [];
   private selectionLoaded: boolean;
   private catalogAsked = false;
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -233,7 +229,6 @@ export class ChatTab {
   start(): void {
     this.root.replaceChildren(this.loading, this.connBanner, this.errBanner, this.listEl, this.detailEl);
     void this.d.loadSeen().then(s => { this.seen = { ...s }; this.seenLoaded = true; this.noteSeen(); this.paint(); }, () => { this.seenLoaded = true; });
-    void this.d.loadFavourites?.().then(v => { this.favourites = parseFavourites(v); this.paint(); }, () => { /* no favourites */ });
     void this.d.loadSelection?.().then(v => { this.lastUsed = parseSelection(v); this.selectionLoaded = true; this.paint(); }, () => { this.selectionLoaded = true; this.paint(); });
     this.open();
     void this.refreshTabs();
@@ -241,11 +236,16 @@ export class ChatTab {
 
   private selectedChat(): ChatView | undefined { return this.selected ? this.state?.chats.find(x => x.summary.chatId === this.selected) : undefined; }
 
-  /** Stars the model, or removes the star. The list is saved, then both pickers show it. */
+  /** The error line of the favourites, for the pickers. */
+  private get notice(): { favouritesNotice?: string } { const n = this.state?.favouritesNotice; return n === undefined ? {} : { favouritesNotice: n }; }
+
+  /** The starred models. The worker owns the list, keeps it in step with the gateway, and sends it in the state. */
+  private get favourites(): Fav[] { return this.state?.favourites ?? []; }
+
+  /** Stars the model, or removes the star. The worker saves it and tells the gateway, then both pickers show the new state. */
   private starModel(f: Fav): void {
-    this.favourites = toggleFavourite(this.favourites, f);
-    this.d.saveFavourites?.(this.favourites);
-    this.paint();
+    const on = this.favourites.some(x => favKey(x) === favKey(f));
+    void this.d.send({ type: "ais-chat-favourite", op: on ? "remove" : "add", provider: f.provider, identity: f.identity, model: f.model }).then(r => { if (r?.ok !== true) this.paint(); }, () => { /* the worker is gone: the next state repaints */ });
   }
 
   /** Asks for the catalogue once per panel session, when a menu first opens. */
@@ -404,7 +404,7 @@ export class ChatTab {
     if (!s.catalog) this.askCatalog();
     const selection = this.newSelection();
     this.newComposer.update({ send: selection !== undefined && !cap.full && !this.creating, stop: false, ...(cap.message !== undefined ? { hint: cap.message } : {}) });
-    this.listPicker.update({ ...buildPicker(s.catalog, this.newSelection()), favourites: this.favourites });
+    this.listPicker.update({ ...buildPicker(s.catalog, this.newSelection()), favourites: this.favourites, ...this.notice });
     const chats = openChats(s.chats, this.d.windowId);
     this.empty.hidden = chats.length > 0;
     const byId = new Map(chats.map(c => [c.summary.chatId, c]));
@@ -530,7 +530,7 @@ export class ChatTab {
     composer.update(composerMode(c, this.paused));
     const sel = c.summary.selection;
     const cfg = [...c.items].reverse().find(i => i.body.k === "config")?.body;
-    this.detailPicker.update({ ...buildPicker(this.state?.catalog, sel, cfg && cfg.k === "config" ? cfg : undefined), locked: true, favourites: this.favourites });
+    this.detailPicker.update({ ...buildPicker(this.state?.catalog, sel, cfg && cfg.k === "config" ? cfg : undefined), locked: true, favourites: this.favourites, ...this.notice });
   }
 
   // ---- chips --------------------------------------------------------------
@@ -633,14 +633,12 @@ export function initChatTab(root: HTMLElement, windowId: number, paused: () => P
     saveSeen: seen => { void chrome.storage.session.set({ [seenKey]: seen }); },
     loadSelection: async () => (await chrome.storage.local.get("chatSelection")).chatSelection,
     saveSelection: sel => { void chrome.storage.local.set({ chatSelection: sel }); },
-    loadFavourites: async () => (await chrome.storage.local.get("chatFavourites")).chatFavourites,
-    saveFavourites: f => { void chrome.storage.local.set({ chatFavourites: f }); },
   }, root);
   const refreshPaused = (): void => { void paused().then(p => tab.setPaused(p)); };
   const refreshTabs = (): void => { void tab.refreshTabs(); };
   tab.start();
   refreshPaused();
-  chrome.storage.onChanged.addListener(changes => { if (!onlyOwnKeys(changes, [seenKey, "chatSelection", "chatFavourites"])) refreshPaused(); });
+  chrome.storage.onChanged.addListener(changes => { if (!onlyOwnKeys(changes, [seenKey, "chatSelection", "chatFavourites", "chatFavouritesSynced", "chatFavouritesEpoch", "chatFavouritesSeq", "chatFavouritesAt"])) refreshPaused(); });
   chrome.tabs.onActivated.addListener(refreshTabs);
   chrome.tabs.onUpdated.addListener((_id, info) => { if (info.status !== undefined || info.url !== undefined || info.title !== undefined) refreshTabs(); });
   chrome.tabs.onRemoved.addListener(refreshTabs);

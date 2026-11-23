@@ -9,6 +9,8 @@ export const CHAT_EVENT_LABELS = ["session_created", "session_closed", "session_
 /** Outcome labels. `other` is the overflow label for unknown values. */
 export const CHAT_OUTCOME_LABELS = ["ok", "cancelled", "error"] as const;
 export const CHAT_ERROR_KINDS = ["pod_start", "attach", "agent_exit", "acp", "timeout", "limit", "rate_limit", "close_binding", "resume_failed", "store", "owner_unreachable", "limit", "other"] as const;
+/** Event labels of ais_gateway_favourites_total. `other` is the overflow label. */
+export const FAVOURITE_EVENTS = ["socket_list", "socket_set", "http_get", "http_post", "change", "push", "refused", "rate_limited", "error"] as const;
 /** Counters the proxy reports. `PrometheusMetrics` is the production implementation. */
 export interface GatewayMetrics {
   request(e: {
@@ -41,6 +43,9 @@ export interface GatewayMetrics {
   chatError(kind: string): void;
   /** Seconds a chat pod took to start. */
   chatPodStart(seconds: number): void;
+  /** A starred-model event: a socket or HTTP call, a change that flipped a star, a frame pushed to a panel, or an error. Unknown values are counted as "other". */
+  /** `reason` is set for `refused`: `stale` or `cap`. */
+  favourite?(event: string, reason?: string): void;
   /** Media parts replaced by a text note because the provider refused the file they name (media-recovery.ts). */
   mediaRemoved?(app: string, parts: number): void;
   /** An error event inside a response that began with HTTP 200 (stream or body). Labels are bounded by the implementation. */
@@ -137,6 +142,7 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly chatSessions = new Counter("ais_gateway_chat_sessions_total", "Chat session events by event.");
   private readonly chatTurns = new Counter("ais_gateway_chat_turns_total", "Chat turns by outcome.");
   private readonly chatErrors = new Counter("ais_gateway_chat_errors_total", "Chat errors by kind.");
+  private readonly favourites = new Counter("ais_gateway_favourites_total", "Starred-model events by event.");
   private readonly podBucketCounts = BUCKETS.map(() => 0);
   private podCount = 0;
   private podSum = 0;
@@ -237,6 +243,11 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.chatErrors.inc({ kind: (CHAT_ERROR_KINDS as readonly string[]).includes(kind) ? kind : "other" });
   }
 
+  favourite(event: string, reason?: string): void {
+    const e = (FAVOURITE_EVENTS as readonly string[]).includes(event) ? event : "other";
+    this.favourites.inc(e === "refused" ? { event: e, reason: reason === "stale" || reason === "cap" ? reason : "other" } : { event: e });
+  }
+
   chatPodStart(seconds: number): void {
     this.podCount += 1;
     this.podSum += seconds;
@@ -327,7 +338,7 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors, this.favourites]) out.push(...c.render());
     for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
