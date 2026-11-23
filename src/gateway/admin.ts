@@ -4,6 +4,7 @@ import { AppRevokedError, revokedMessage, type GatewayStore } from "./store.ts";
 import { registerBrowserAdmin } from "./browser/admin.ts";
 import { registerStoreAdmin, type StoreAdminDeps } from "./admin-store.ts";
 import { registerFavouritesAdmin } from "./admin-favourites.ts";
+import { favouritesToken } from "./favourites-token.ts";
 import type { FavouritesService } from "./chat/favourites.ts";
 import type { GatewayMetrics } from "./metrics.ts";
 import type { LoginRenewal } from "./renewal.ts";
@@ -241,9 +242,13 @@ export function createAdminApp(deps: AdminDeps): Hono {
   const hono = new Hono();
   const err = (status: 400 | 401 | 404 | 409 | 429 | 500 | 503, message: string): Response => Response.json({ error: message }, { status, ...(status === 429 ? { headers: { "retry-after": "5" } } : {}) });
 
+  // The favourites token (derived from the admin token) opens GET and POST /favourites and nothing else.
+  const favouritesBearer = deps.adminToken ? favouritesToken(deps.adminToken) : undefined;
   hono.use("*", async (c, next) => {
-    if (!deps.adminToken || !sameSecret(bearer(c.req.raw), deps.adminToken)) return err(401, "admin token required");
-    return next();
+    const given = bearer(c.req.raw);
+    if (deps.adminToken && sameSecret(given, deps.adminToken)) return next();
+    if (favouritesBearer && c.req.path === "/favourites" && (c.req.method === "GET" || c.req.method === "POST") && sameSecret(given, favouritesBearer)) return next();
+    return err(401, "admin token required");
   });
   hono.onError(() => err(503, "store unavailable"));
   registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserHub ? { hub: deps.browserHub } : {}), ...(deps.onBindingRevoked ? { onBindingRevoked: deps.onBindingRevoked } : {}), ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });

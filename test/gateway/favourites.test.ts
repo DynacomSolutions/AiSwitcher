@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createAdminApp } from "../../src/gateway/admin.ts";
+import { favouritesToken } from "../../src/gateway/favourites-token.ts";
 import type { BrowserBinding } from "../../src/browser/types.ts";
 import { BrowserHub, type HubSocket } from "../../src/gateway/browser/hub.ts";
 import { MemoryChatBus, parseBusMsg } from "../../src/gateway/chat/bus.ts";
@@ -163,6 +164,33 @@ test("GET and POST /favourites need the admin token", async () => {
   expect((await h.call("/favourites", { token: null })).status).toBe(401);
   expect((await h.call("/favourites", { token: "wrong" })).status).toBe(401);
   expect((await h.call("/favourites", { method: "POST", token: null, body: "{}" })).status).toBe(401);
+});
+
+test("the favourites token opens GET and POST /favourites and nothing else", async () => {
+  const h = await http();
+  const token = favouritesToken(ADMIN);
+  expect(token).toMatch(/^[0-9a-f]{64}$/);
+  expect(token).not.toBe(ADMIN);
+  expect((await h.call("/favourites", { token })).status).toBe(200);
+  const res = await h.call("/favourites", { method: "POST", token, body: JSON.stringify({ origin: "pod-1", changes: [star("m1")] }) });
+  expect(res.status).toBe(200);
+  expect(((await res.json()) as any).items).toHaveLength(1);
+  // Every other route, including token minting and the credential store, refuses it.
+  const others: Array<[string, string]> = [
+    ["GET", "/apps"], ["PUT", "/apps/demo"], ["POST", "/apps/demo/tokens"], ["POST", "/apps/demo/revoke"], ["GET", "/usage"],
+    ["GET", "/store/files"], ["POST", "/store/files"], ["POST", "/store/files/read"], ["GET", "/store/journal"], ["GET", "/store/wait"],
+    ["GET", "/browser/bindings"], ["POST", "/browser/agents/x/tokens"], ["GET", "/limits"], ["GET", "/logins/renewal"],
+    ["GET", "/favourites/"], ["PUT", "/favourites"], ["DELETE", "/favourites"],
+  ];
+  for (const [method, path] of others) {
+    const r = await h.call(path, { method, token, ...(method === "GET" || method === "DELETE" ? {} : { body: "{}" }) });
+    expect([method, path, r.status]).toEqual([method, path, 401]);
+  }
+  // A token derived from another admin token, and the right token with a change, are refused or kept apart.
+  expect((await h.call("/favourites", { token: favouritesToken("other-admin-token-value") })).status).toBe(401);
+  expect((await h.call("/favourites", { token: token.slice(0, -1) + (token.endsWith("0") ? "1" : "0") })).status).toBe(401);
+  // The admin token still works everywhere it did.
+  expect((await h.call("/favourites")).status).toBe(200);
 });
 
 test("POST applies changes and answers with the list, GET reads it", async () => {

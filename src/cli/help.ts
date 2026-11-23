@@ -80,7 +80,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|codex-home|favourites-token ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -125,6 +125,10 @@ export const HELP: Record<string, HelpNode> = {
       "t3-instance": sub(
         "ais gateway t3-instance <instance-id> --driver=claude|grok|opencode|pi --app=<gateway app> [--name=<name>|--display-name=<name>] [--provider=<slug>] [--models=a,b,...] [--source=<identity>|none] [--like=<claude instance id, binary path only>] [--binary=<path>] [--check] [--remove]",
         "Create or update one T3 Code provider instance whose folder (<T3 home>/gateway/<id>) holds only the gateway app token: writes the instance into T3's settings.json (backup kept, other instances untouched), and for claude the folder settings.json (a full copy of the source identity config with the gateway base URL, models and no generic proxy; the source is found by the instance id, or --source=<identity>, or --source=none for a kimi or zai home) and .credentials.json (a cached oauthAccount in the folder .claude.json that is not the gateway account is removed), for grok a launcher in ~/.ais/t3/grok/<id> that reads the token at start, plus the usage auth.json, for opencode the folder opencode.json (gateway provider) with environment OPENCODE_CONFIG_DIR and XDG_DATA_HOME set to the folder and the usage auth.json (opencode-go entry), for pi (Pi coding agent, --models required) the folder models.json (anthropic-messages provider at the gateway base URL, key read from the token file with !cat, so no token inside) and settings.json (default provider and model), and the PI_CODING_AGENT_DIR instance environment; --provider sets the pi provider slug (default: the app's provider from the gateway admin API, else the app name); says created, updated or current; --check writes nothing and fails on a difference; --remove drops the instance entry and leaves the folder",
+      ),
+      "favourites-token": sub(
+        "ais gateway favourites-token",
+        "Print the favourites-only token that is derived from the gateway admin token (env or ~/.secrets AIS_GATEWAY_ADMIN_TOKEN): HMAC-SHA256 of the admin token with the text ais-favourites-v1, as hex. The gateway accepts it on GET and POST /favourites only, so a T3 pod sidecar can run `ais t3 favourites sync` without the admin token (set it there as AIS_GATEWAY_FAVOURITES_TOKEN). It changes when the admin token changes. Seal the output into a Secret; the command prints nothing else",
       ),
       "codex-home": sub(
         "ais gateway codex-home <codex home dir>... [--check]",
