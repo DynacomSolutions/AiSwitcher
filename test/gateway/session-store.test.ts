@@ -6,7 +6,10 @@ import {
   HEAD_BYTES,
   SessionIngestInvalid,
   SessionStore,
+  partObjectPrefix,
+  validateHold,
   validateIngest,
+  type SessionAnchor,
   type SessionIngest,
   type SessionPartInput,
 } from "../../src/gateway/sessions/session-store.ts";
@@ -25,11 +28,20 @@ function part(start: number, len: number, tag = "a"): SessionPartInput {
     plainBytes: len,
     objectBytes: Math.round(len / 6),
     plainSha256: sha(`${start}:${len}:${tag}`),
-    objectKey: `objects/v1/node-a/r/f/g0/${start}-${start + len}.gz.age`,
+    objectKey: AUTO_KEY,
   };
 }
 
+/** The anchor that a path sends for the part `part(start, len, tag)`: its own bytes in that range hash the same. */
+const anchorOf = (start: number, len: number, tag = "a"): SessionAnchor => ({ startOffset: start, endOffset: start + len, plainSha256: part(start, len, tag).plainSha256 });
+
+/** `part()` leaves the object key to `req()`, which builds the key of the record's own session and generation. */
+const AUTO_KEY = "auto";
+
 function req(parts: SessionPartInput[], over: Partial<SessionIngest> = {}): SessionIngest {
+  const kind = over.kind ?? "claude";
+  const sessionRef = over.sessionRef ?? "s1";
+  const generation = over.generation ?? 0;
   return {
     node: "node-a",
     root: "/data/pool",
@@ -40,7 +52,7 @@ function req(parts: SessionPartInput[], over: Partial<SessionIngest> = {}): Sess
     pool: "main",
     sessionRef: "s1",
     headSha256: sha("head"),
-    parts,
+    parts: parts.map((p) => (p.objectKey === AUTO_KEY ? { ...p, objectKey: `${partObjectPrefix(kind, sessionRef, generation)}${p.startOffset}-${p.endOffset}.gz.age` } : p)),
     ...over,
   };
 }
@@ -61,6 +73,51 @@ describe("validateIngest", () => {
     bad(req([part(0, 100)], { generation: -1 }));
     bad(req([part(0, 100)], { sessionRef: "" }));
     expect(() => validateIngest(req([part(0, 100), part(100, 50)]))).not.toThrow();
+  });
+
+  test("refuses values that Postgres would refuse, so a bad record cannot fail a whole batch", () => {
+    const bad = (r: SessionIngest) => expect(() => validateIngest(r)).toThrow(SessionIngestInvalid);
+    const ok = (r: SessionIngest) => expect(() => validateIngest(r)).not.toThrow();
+    ok(req([part(0, 100)], { generation: 2_147_483_647 }));
+    bad(req([part(0, 100)], { generation: 2_147_483_648 }));
+    ok(req([{ ...part(0, 100), lines: 2_147_483_647 }]));
+    bad(req([{ ...part(0, 100), lines: 2_147_483_648 }]));
+    ok(req([part(0, 100)], { mtimeMs: Date.parse("2026-11-01T00:00:00Z") }));
+    bad(req([part(0, 100)], { mtimeMs: -1 }));
+    bad(req([part(0, 100)], { mtimeMs: 1e18 }));
+    bad(req([part(0, 100)], { mtimeMs: Number.NaN }));
+    for (const f of ["sessionRef", "origin", "node", "root", "relPath"] as const) {
+      bad(req([part(0, 100)], { [f]: "a\u0000b" }));
+      bad(req([part(0, 100)], { [f]: "a\nb" }));
+    }
+    bad(req([part(0, 100)], { pool: "a\u0000b" }));
+    bad(req([part(0, 100)], { parentRef: "a\u0007b" }));
+    bad(req([part(0, 100)], { sessionRef: "a\ud800b" }));
+    ok(req([part(0, 100)], { sessionRef: "parent1/a1", pool: null, parentRef: null }));
+    bad(req([part(0, 100)], { anchor: { startOffset: 5, endOffset: 5, plainSha256: sha("x") } }));
+    bad(req([part(0, 100)], { anchor: { startOffset: 0, endOffset: 5, plainSha256: "xyz" } }));
+    expect(() => validateHold(req([], { generation: 2_147_483_648 }))).toThrow(SessionIngestInvalid);
+    expect(() => validateHold(req([], { sessionRef: "a\u0000" }))).toThrow(SessionIngestInvalid);
+  });
+
+  test("an object key must sit under the prefix of the record's own session and generation", () => {
+    const bad = (r: SessionIngest) => expect(() => validateIngest(r)).toThrow(SessionIngestInvalid);
+    const own = partObjectPrefix("claude", "s1", 0);
+    expect(own).toMatch(/^objects\/v1\/claude\/[0-9a-f]{16}\/g0\/$/);
+    expect(partObjectPrefix("claude", "s2", 0)).not.toBe(own);
+    expect(partObjectPrefix("claude", "s1", 1)).not.toBe(own);
+    expect(() => validateIngest(req([{ ...part(0, 100), objectKey: `${own}0-100.gz.age` }]))).not.toThrow();
+    bad(req([{ ...part(0, 100), objectKey: `${partObjectPrefix("claude", "s2", 0)}0-100.gz.age` }]));
+    bad(req([{ ...part(0, 100), objectKey: `${partObjectPrefix("codex", "s1", 0)}0-100.gz.age` }]));
+    bad(req([{ ...part(0, 100), objectKey: `${partObjectPrefix("claude", "s1", 1)}0-100.gz.age` }]));
+    bad(req([{ ...part(0, 100), objectKey: "objects/v1/node-a/r/f/g0/0-100.gz.age" }]));
+    bad(req([{ ...part(0, 100), objectKey: `${own}` }]));
+    bad(req([{ ...part(0, 100), objectKey: `${own}a/b.gz.age` }]));
+    bad(req([{ ...part(0, 100), objectKey: `${own}..` }]));
+    bad(req([{ ...part(0, 100), objectKey: `${own}a\u0000b` }]));
+    // The key follows the generation of the record.
+    expect(() => validateIngest(req([part(0, 100)], { generation: 3 }))).not.toThrow();
+    bad(req([{ ...part(0, 100), objectKey: `${own}0-100.gz.age` }], { generation: 3 }));
   });
 });
 
@@ -123,7 +180,7 @@ if (!url && process.env.CI && !optOut) {
       await s.ingest(a);
       await s.ingest(b);
       const [ca, unknown, cb] = await s.cursors([keyOf(a), { ...keyOf(a), sessionRef: "nobody", node: "node-b", root: "/x", relPath: "y" }, keyOf(b)]);
-      expect(ca).toMatchObject({ generation: 0, committedBytes: 1500, headSha256: a.headSha256, held: true });
+      expect(ca).toMatchObject({ generation: 0, committedBytes: 1500, headSha256: a.headSha256, held: true, anchor: anchorOf(1000, 500) });
       expect(unknown).toBeNull();
       expect(cb).toMatchObject({ committedBytes: 300 });
       expect(ca!.committedLines).toBe(part(0, 1000).lines + part(1000, 500).lines);
@@ -366,8 +423,8 @@ if (!url && process.env.CI && !optOut) {
       const s = make();
       await s.ingest(req([part(0, 5000)], { mtimeMs: Date.parse("2026-11-01T10:00:00Z") }));
       const [c] = await s.cursors([keyOf(copy([]))]);
-      expect(c).toMatchObject({ committedBytes: 5000, held: false });
-      const r = await s.ingest(copy([part(5000, 4000)], { mtimeMs: Date.parse("2026-11-01T11:00:00Z") }));
+      expect(c).toMatchObject({ committedBytes: 5000, held: false, anchor: anchorOf(0, 5000) });
+      const r = await s.ingest(copy([part(5000, 4000)], { anchor: c!.anchor, mtimeMs: Date.parse("2026-11-01T11:00:00Z") }));
       expect(r).toMatchObject({ status: "committed", created: false, partsAdded: 1, cursor: { committedBytes: 9000 } });
       expect(await fileCount()).toBe(1);
       expect(await partCount()).toBe(2);
@@ -380,7 +437,7 @@ if (!url && process.env.CI && !optOut) {
     test("the index records every path that held the session", async () => {
       const s = make();
       await s.ingest(req([part(0, 5000)]));
-      await s.ingest(copy([part(5000, 100)]));
+      await s.ingest(copy([part(5000, 100)], { anchor: anchorOf(0, 5000) }));
       const paths = await s.paths("claude", "s1");
       expect(paths.map((p) => [p.node, p.root, p.relPath, p.origin, p.pool])).toEqual([
         ["node-a", "/data/pool", "projects/p/s1.jsonl", "pool-folder", "main"],
@@ -395,7 +452,7 @@ if (!url && process.env.CI && !optOut) {
       const s = make();
       await s.ingest(req([part(0, 5000)]));
       const before = await admin`SELECT last_ingest_at, committed_bytes FROM ais_session_file`;
-      expect(await s.hold(copy([]))).toMatchObject({ status: "duplicate", cursor: { committedBytes: 5000 } });
+      expect(await s.hold(copy([], { anchor: anchorOf(0, 5000) }))).toMatchObject({ status: "duplicate", cursor: { committedBytes: 5000 } });
       expect(await s.hold(copy([]))).toMatchObject({ status: "duplicate" });
       expect(await admin`SELECT last_ingest_at, committed_bytes FROM ais_session_file`).toEqual(before);
       expect((await s.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a", "node-b"]);
@@ -405,7 +462,7 @@ if (!url && process.env.CI && !optOut) {
     test("the same bytes sent from a second path are a repeat, not a second copy", async () => {
       const s = make();
       await s.ingest(req([part(0, 5000)]));
-      expect(await s.ingest(copy([part(0, 5000)]))).toMatchObject({ status: "duplicate" });
+      expect(await s.ingest(copy([part(0, 5000)], { anchor: anchorOf(0, 5000) }))).toMatchObject({ status: "duplicate" });
       expect(await partCount()).toBe(1);
       expect((await s.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a", "node-b"]);
     });
@@ -437,6 +494,75 @@ if (!url && process.env.CI && !optOut) {
       expect(await fileCount()).toBe(2);
     });
 
+    test("two holders of generation 0: one rewrites, the other is a stranger and the generation count stays bounded", async () => {
+      const s = make();
+      const size = HEAD_BYTES + 100;
+      await s.ingest(req([part(0, size)]));
+      expect(await s.hold(copy([], { anchor: anchorOf(0, size) }))).toMatchObject({ status: "duplicate" });
+      expect((await s.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a", "node-b"]);
+      for (let round = 1; round <= 3; round += 1) {
+        // A rewrites its file: generation `round`, a new head, content of its own.
+        const newHead = sha(`head of A ${round}`);
+        expect(await s.ingest(req([part(size, 100)], { generation: round - 1, headSha256: newHead }))).toMatchObject({ status: "conflict", reason: "rewritten" });
+        expect(await s.ingest(req([part(0, size, `v${round}`)], { generation: round, headSha256: newHead }))).toMatchObject({ status: "committed", created: true, cursor: { generation: round } });
+        // B still has the old file. It holds no longer the current generation, so it can neither append nor start a generation.
+        expect((await s.cursors([keyOf(copy([]))]))[0]).toMatchObject({ generation: round, held: false });
+        expect(await s.ingest(copy([part(size, 100)], { generation: round, headSha256: sha("old head of B"), anchor: anchorOf(0, size) }))).toMatchObject({ status: "conflict", reason: "other_copy", cursor: { generation: round } });
+        expect(await s.ingest(copy([part(0, size)], { generation: round + 1, headSha256: sha("old head of B") }))).toMatchObject({ status: "conflict", reason: "other_copy", cursor: { generation: round } });
+        expect(await s.ingest(copy([part(size, 100)], { generation: round - 1, headSha256: sha("old head of B") }))).toMatchObject({ status: "conflict", reason: "stale_generation" });
+        // A is the holder of the new generation and appends.
+        expect(await s.ingest(req([part(size, 100, `v${round}`)], { generation: round, headSha256: newHead }))).toMatchObject({ status: "committed", created: false });
+      }
+      // Generations 0..3 and no more. B never made a row.
+      expect(await fileCount()).toBe(4);
+      expect((await s.paths("claude", "s1")).filter((p) => p.node === "node-b").map((p) => p.generation)).toEqual([0]);
+    });
+
+    test("a holder of an older generation that joins the new one with the proof becomes a holder again", async () => {
+      const s = make();
+      const size = HEAD_BYTES + 100;
+      await s.ingest(req([part(0, size)]));
+      await s.hold(copy([], { anchor: anchorOf(0, size) }));
+      await s.ingest(req([part(0, size, "v2")], { generation: 1, headSha256: sha("new head") }));
+      // B rewrote its file as well and now holds the same bytes as generation 1.
+      expect((await s.hold(copy([], { generation: 1, headSha256: sha("new head") }))).status).toBe("conflict");
+      expect(await s.hold(copy([], { generation: 1, headSha256: sha("new head"), anchor: anchorOf(0, size, "v2") }))).toMatchObject({ status: "duplicate" });
+      expect((await s.cursors([keyOf(copy([]))]))[0]).toMatchObject({ generation: 1, held: true });
+    });
+
+    test("a copy that differs after the first 4 KiB cannot append to the stored bytes", async () => {
+      const s = make();
+      await s.ingest(req([part(0, 3000), part(3000, 3000)]));
+      const other = (over: Partial<SessionIngest> = {}) => copy([part(6000, 100, "other")], over);
+      // Same head, but its last 3000 bytes differ from the stored ones.
+      expect(await s.ingest(other({ anchor: anchorOf(3000, 3000, "other") }))).toMatchObject({ status: "conflict", reason: "other_copy", cursor: { committedBytes: 6000 } });
+      expect(await s.hold(copy([], { anchor: anchorOf(3000, 3000, "other") }))).toMatchObject({ status: "conflict", reason: "other_copy" });
+      // A range that is no stored part is no proof either.
+      expect(await s.ingest(other({ anchor: anchorOf(3000, 2000) }))).toMatchObject({ status: "conflict", reason: "other_copy" });
+      expect(await s.ingest(other({ anchor: anchorOf(3500, 2500) }))).toMatchObject({ status: "conflict", reason: "other_copy" });
+      expect(await partCount()).toBe(2);
+      expect((await s.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a"]);
+      // The right proof joins it.
+      expect(await s.ingest(other({ anchor: anchorOf(3000, 3000) }))).toMatchObject({ status: "committed", cursor: { committedBytes: 6100 } });
+      expect((await s.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a", "node-b"]);
+    });
+
+    test("while the stored head is shorter than 4 KiB, a different file cannot join without the proof", async () => {
+      const s = make();
+      await s.ingest(req([part(0, 1000)]));
+      // The head check is skipped under 4 KiB, so only the anchor protects the stored bytes.
+      expect(await s.ingest(copy([part(1000, 100)]))).toMatchObject({ status: "conflict", reason: "proof_required", cursor: { committedBytes: 1000 } });
+      expect(await s.hold(copy([]))).toMatchObject({ status: "conflict", reason: "proof_required" });
+      expect(await s.ingest(copy([part(1000, 100)], { anchor: anchorOf(0, 1000, "other") }))).toMatchObject({ status: "conflict", reason: "other_copy" });
+      expect(await s.hold(copy([], { anchor: anchorOf(0, 1000, "other") }))).toMatchObject({ status: "conflict", reason: "other_copy" });
+      expect((await s.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a"]);
+      expect(await partCount()).toBe(1);
+      // A holder does not need the proof, and a holder whose bytes changed is a rewrite.
+      expect(await s.ingest(req([part(1000, 100)]))).toMatchObject({ status: "committed" });
+      expect(await s.ingest(req([part(1100, 100)], { anchor: anchorOf(1000, 100, "other") }))).toMatchObject({ status: "conflict", reason: "rewritten" });
+      expect(await s.ingest(req([part(1100, 100)], { anchor: anchorOf(1000, 100) }))).toMatchObject({ status: "committed", cursor: { committedBytes: 1200 } });
+    });
+
     test("a hold for an unknown session or a new generation is refused", async () => {
       const s = make();
       expect(await s.hold(copy([]))).toEqual({ status: "conflict", reason: "gap", cursor: null });
@@ -449,8 +575,13 @@ if (!url && process.env.CI && !optOut) {
     test("writers on two nodes race on one session: one copy of the bytes, contiguous parts", async () => {
       const writers = Array.from({ length: 6 }, () => make());
       const parts = Array.from({ length: 6 }, (_, i) => part(i * 500, 500));
+      // Node b joins first with the proof, and is a holder from then on: a holder needs no anchor.
+      const s = make();
+      expect((await s.ingest(req([parts[0]!]))).status).toBe("committed");
+      expect((await s.hold(copy([], { anchor: anchorOf(0, 500) }))).status).toBe("duplicate");
       await Promise.all(
-        writers.map(async (w, i) => {
+        writers.slice(1).map(async (w, j) => {
+          const i = j + 1;
           const send = i % 2 === 0 ? req : copy;
           for (let attempt = 0; attempt < 80; attempt += 1) {
             const r = await w.ingest(send([parts[i]!]));

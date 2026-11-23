@@ -16,7 +16,7 @@ import { migrate } from "../../src/gateway/pg-store.ts";
 import { startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
-import { SessionStore, type IngestResult, type SessionFileKey } from "../../src/gateway/sessions/session-store.ts";
+import { partObjectPrefix, SessionStore, type IngestResult, type SessionFileKey } from "../../src/gateway/sessions/session-store.ts";
 
 const ADMIN = "adm-test-value-0001-0123456789abcdef";
 const INGEST = "ing-test-value-0002-0123456789abcdef";
@@ -32,11 +32,18 @@ function part(start: number, len: number, tag = "a") {
     plainBytes: len,
     objectBytes: Math.round(len / 6),
     plainSha256: sha(`${start}:${len}:${tag}`),
-    objectKey: `objects/v1/claude/abc/g0/${start}-${start + len}.gz.age`,
+    objectKey: AUTO_KEY,
   };
 }
 
+/** `part()` leaves the object key to `record()`, which builds the key of the record's own session and generation. */
+const AUTO_KEY = "auto";
+const anchorOf = (start: number, len: number, tag = "a") => ({ startOffset: start, endOffset: start + len, plainSha256: part(start, len, tag).plainSha256 });
+
 function record(parts: ReturnType<typeof part>[], over: Record<string, unknown> = {}) {
+  const kind = typeof over.kind === "string" ? over.kind : "claude";
+  const sessionRef = typeof over.sessionRef === "string" ? over.sessionRef : "s1";
+  const generation = typeof over.generation === "number" && Number.isSafeInteger(over.generation) && over.generation >= 0 ? over.generation : 0;
   return {
     kind: "claude",
     sessionRef: "s1",
@@ -48,7 +55,7 @@ function record(parts: ReturnType<typeof part>[], over: Record<string, unknown> 
     generation: 0,
     headSha256: sha("head"),
     mtimeMs: NOW.getTime() - 30_000,
-    parts,
+    parts: parts.map((p) => (p.objectKey === AUTO_KEY ? { ...p, objectKey: `${partObjectPrefix(kind, sessionRef, generation)}${p.startOffset}-${p.endOffset}.gz.age` } : p)),
     ...over,
   };
 }
@@ -223,6 +230,8 @@ describe("session ingest routes: ping and cursors", () => {
     expect(await bad({ files: [{ ...ok, kind: "Claude" }] })).toBe(400);
     expect(await bad({ files: [{ ...ok, sessionRef: "" }] })).toBe(400);
     expect(await bad({ files: [{ ...ok, relPath: 5 }] })).toBe(400);
+    expect(await bad({ files: [{ ...ok, sessionRef: "a\u0000b" }] })).toBe(400);
+    expect(await bad({ files: [{ ...ok, root: "/r\nx" }] })).toBe(400);
     const msg = (await (await h.post("/sessions/v1/cursors", { files: [ok, { ...ok, node: "" }] })).json()) as { error: string };
     expect(msg.error).toContain("files[1]");
     expect(await bad({ files: Array.from({ length: SESSIONS_MAX_CURSOR_FILES }, () => ok) })).toBe(200);
@@ -299,6 +308,62 @@ describe("session ingest routes: ingest records", () => {
     expect(body.results.map((r) => r.status)).toEqual(["invalid", "invalid", "invalid", "invalid", "invalid", "invalid", "committed"]);
     expect(body.results[1]!.error).toContain("objects/v1/");
     expect((h.store as FakeStore).calls).toHaveLength(1);
+  });
+
+  test("values that Postgres refuses are invalid results of their own record, and the rest of the batch goes on", async () => {
+    const h = build();
+    const res = await h.post("/sessions/v1/ingest", {
+      files: [
+        record([part(0, 100)], { generation: 2_147_483_648 }),
+        record([{ ...part(0, 100), lines: 2_147_483_648 }]),
+        record([part(0, 100)], { mtimeMs: -5 }),
+        record([part(0, 100)], { mtimeMs: 1e18 }),
+        record([part(0, 100)], { sessionRef: "a\u0000b" }),
+        record([part(0, 100)], { origin: "t3\u0000pool" }),
+        record([part(0, 100)], { pool: "p\nq" }),
+        record([part(0, 100)], { parentRef: "p\u0001" }),
+        record([part(0, 100)], { relPath: "a\u0000" }),
+        record([], { sessionRef: "a\u0000b" }),
+        record([part(0, 100)], { anchor: { startOffset: 0, endOffset: 0, plainSha256: sha("x") } }),
+        record([part(0, 100)], { anchor: "nope" }),
+        record([part(0, 100)], { sessionRef: "ok", generation: 2_147_483_647 }),
+        record([part(0, 100)], { sessionRef: "ok2", mtimeMs: 0 }),
+      ],
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { results: Array<{ status: string; error?: string }> };
+    expect(body.results.map((r) => r.status)).toEqual([...Array.from({ length: 12 }, () => "invalid"), "committed", "committed"]);
+    expect(body.results[0]!.error).toContain("generation");
+    expect(body.results[1]!.error).toContain("lines");
+    expect(body.results[2]!.error).toContain("mtimeMs");
+    expect(body.results[4]!.error).toContain("control");
+    expect((h.store as FakeStore).calls).toHaveLength(2);
+  });
+
+  test("an object key must belong to the record's own session and generation", async () => {
+    const h = build();
+    const own = (ref: string, gen: number) => partObjectPrefix("claude", ref, gen);
+    const res = await h.post("/sessions/v1/ingest", {
+      files: [
+        record([{ ...part(0, 100), objectKey: `${own("other", 0)}0-100.gz.age` }]),
+        record([{ ...part(0, 100), objectKey: `${own("s1", 1)}0-100.gz.age` }]),
+        record([{ ...part(0, 100), objectKey: "objects/v1/claude/abc/g0/0-100.gz.age" }]),
+        record([{ ...part(0, 100), objectKey: `${own("s1", 0)}x/0-100.gz.age` }]),
+        record([part(0, 100)], { generation: 4 }),
+        record([{ ...part(0, 100), objectKey: `${own("s1", 4)}0-100.gz.age` }], { generation: 4 }),
+      ],
+    });
+    const body = (await res.json()) as { results: Array<{ status: string; error?: string }> };
+    expect(body.results.map((r) => r.status)).toEqual(["invalid", "invalid", "invalid", "invalid", "committed", "committed"]);
+    expect(body.results[0]!.error).toContain("objectKey");
+    expect((h.store as FakeStore).calls).toHaveLength(2);
+  });
+
+  test("the anchor goes to the store as sent", async () => {
+    const h = build();
+    await h.post("/sessions/v1/ingest", { files: [record([part(1000, 100)], { anchor: anchorOf(0, 1000) }), record([], { anchor: anchorOf(0, 1000), sessionRef: "s2" })] });
+    const calls = (h.store as FakeStore).calls;
+    expect(calls.map((c) => (c.arg as { anchor?: unknown }).anchor)).toEqual([anchorOf(0, 1000), anchorOf(0, 1000)]);
   });
 
   test("a request the store refuses as invalid (bad hash) is an invalid result, not a failed request", async () => {
@@ -447,7 +512,7 @@ if (!url && process.env.CI && !optOut) {
   const admin = new SQL(url);
   let sessionStore: SessionStore;
   let h: ReturnType<typeof build>;
-  type Result = { status: string; reason?: string; partsAdded?: number; created?: boolean; cursor?: { committedBytes: number; committedLines?: number; headSha256?: string; generation: number; held?: boolean } | null };
+  type Result = { status: string; reason?: string; partsAdded?: number; created?: boolean; cursor?: { committedBytes: number; committedLines?: number; headSha256?: string; generation: number; held?: boolean; anchor?: { startOffset: number; endOffset: number; plainSha256: string } | null } | null };
   const ingest = async (files: unknown[]): Promise<Result[]> => {
     const res = await h.post("/sessions/v1/ingest", { files });
     expect(res.status).toBe(200);
@@ -475,7 +540,7 @@ if (!url && process.env.CI && !optOut) {
       expect(await cursors([key()])).toEqual([null]);
       const [first] = await ingest([record([part(0, 1000), part(1000, 500)])]);
       expect(first).toMatchObject({ status: "committed", created: true, partsAdded: 2, cursor: { generation: 0, committedBytes: 1500 } });
-      expect(await cursors([key()])).toEqual([{ generation: 0, committedBytes: 1500, committedLines: part(0, 1000).lines + part(1000, 500).lines, headSha256: sha("head"), held: true }]);
+      expect(await cursors([key()])).toEqual([{ generation: 0, committedBytes: 1500, committedLines: part(0, 1000).lines + part(1000, 500).lines, headSha256: sha("head"), held: true, anchor: anchorOf(1000, 500) }]);
       const [next] = await ingest([record([part(1500, 200)])]);
       expect(next).toMatchObject({ status: "committed", created: false, cursor: { committedBytes: 1700 } });
     });
@@ -518,7 +583,10 @@ if (!url && process.env.CI && !optOut) {
       const second = { node: "node-b", root: "/other", relPath: "pool2/s1.jsonl", origin: "agent-pod", pool: null };
       const [c] = await cursors([key(second)]);
       expect(c).toMatchObject({ committedBytes: 5000, held: false });
-      const [r] = await ingest([record([part(5000, 700)], second)]);
+      expect(c).toMatchObject({ anchor: anchorOf(0, 5000) });
+      const [noProof] = await ingest([record([part(5000, 700)], second)]);
+      expect(noProof).toMatchObject({ status: "conflict", reason: "proof_required", cursor: { committedBytes: 5000 } });
+      const [r] = await ingest([record([part(5000, 700)], { ...second, anchor: c!.anchor })]);
       expect(r).toMatchObject({ status: "committed", created: false, cursor: { committedBytes: 5700 } });
       // The same session again from both paths: nothing new, both are holders.
       const [d] = await ingest([record([], second)]);
@@ -536,6 +604,19 @@ if (!url && process.env.CI && !optOut) {
       const [r] = await ingest([record([part(5000, 100)], stranger)]);
       expect(r).toMatchObject({ status: "conflict", reason: "other_copy", cursor: { committedBytes: 5000 } });
       expect((await sessionStore.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a"]);
+    });
+
+    test("one copy: a copy that differs after the first 4 KiB is refused by its anchor, and a bad record does not fail the batch", async () => {
+      await ingest([record([part(0, 3000), part(3000, 3000)])]);
+      const stranger = { node: "node-b", root: "/other", relPath: "x.jsonl" };
+      const results = await ingest([
+        record([part(6000, 100)], { ...stranger, anchor: anchorOf(3000, 3000, "other") }),
+        record([part(6000, 100)], { ...stranger, sessionRef: "bad\u0000ref", anchor: anchorOf(3000, 3000) }),
+        record([part(6000, 100)], { ...stranger, anchor: anchorOf(3000, 3000) }),
+      ]);
+      expect(results.map((r) => r.status)).toEqual(["conflict", "invalid", "committed"]);
+      expect(results[0]).toMatchObject({ reason: "other_copy", cursor: { committedBytes: 6000 } });
+      expect(results[2]).toMatchObject({ cursor: { committedBytes: 6100 } });
     });
 
     test("the same session of two tools stays two sessions", async () => {
