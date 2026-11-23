@@ -40,9 +40,9 @@ describe("what comes down", () => {
     expect(r.next[0]).toBe(odd);
   });
   test("a new star goes to the instance of the identity, a star with no instance on this host is left out", () => {
-    const r = applyGateway([], ctx, [key("a", "pool"), key("b", "stranger"), key("c", "work", "grok")]);
+    const r = applyGateway([], ctx, [key("a", "@pool"), key("b", "stranger"), key("c", "work", "grok")]);
     expect(r.next).toEqual(t3([CLAUDE_POOL, "a"], ["t3-grok-work", "c"]));
-    expect(r.synced).toEqual([key("a", "pool"), key("c", "work", "grok")]);
+    expect(r.synced).toEqual([key("a", "@pool"), key("c", "work", "grok")]);
   });
   test("both instances of one identity keep their favourite", () => {
     const favs = t3(["t3-grok-work", "g"], ["t3-grok-work-acp", "g"]);

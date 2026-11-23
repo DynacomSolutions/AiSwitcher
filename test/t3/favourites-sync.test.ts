@@ -32,10 +32,10 @@ describe("one round", () => {
 
   test("T3 stars go up on the first run and the gateway stars come down", async () => {
     const e = setup({ favorites: [{ provider: "t3-claude-work", model: "from-t3" }, { provider: "claudeAgent", model: "builtin" }] });
-    await e.gw.star(key("from-chrome", "pool"));
+    await e.gw.star(key("from-chrome", "@pool"));
     const r = await e.round();
     expect(r).toMatchObject({ status: "ok", pushed: 1, wrote: true });
-    expect((await e.gw.store.list()).items.map((i) => `${i.identity}/${i.model}`).sort()).toEqual(["pool/from-chrome", "work/from-t3"]);
+    expect((await e.gw.store.list()).items.map((i) => `${i.identity}/${i.model}`).sort()).toEqual(["@pool/from-chrome", "work/from-t3"]);
     expect(e.favs()).toEqual([{ provider: "t3-claude-work", model: "from-t3" }, { provider: "claudeAgent", model: "builtin" }, { provider: CLAUDE_POOL, model: "from-chrome" }]);
     expect(e.metrics.s).toMatchObject({ pulls: 1, pushes: 1, writes: 1 });
   });

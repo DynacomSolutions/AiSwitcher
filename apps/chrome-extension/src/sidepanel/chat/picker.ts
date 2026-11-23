@@ -1,5 +1,5 @@
 // Provider, identity and model picker: the pure model and the key rules. The DOM is in picker-view.ts.
-import { CHAT_PROVIDERS, selectable } from "../../../../../src/browser/chat-protocol.ts";
+import { CHAT_PROVIDERS, POOL_IDENTITY, selectable } from "../../../../../src/browser/chat-protocol.ts";
 import type { ChatCatalogProvider, ChatProvider, ChatSelection } from "../../../../../src/browser/chat-protocol.ts";
 import { providerMark } from "./provider-icons.ts";
 
@@ -99,6 +99,9 @@ export const DEFAULT_ROW_NAME = "Default model";
 export const DEFAULT_ROW_SUB = "Chosen by the agent";
 const MAX_FAVOURITES = 200;
 
+/** The identity of a favourite for a catalogue entry: a pool is always POOL_IDENTITY, whatever its name, so every device and T3 instance agrees on the key. */
+export const favIdentity = (e: { kind: "identity" | "pool"; name: string }): string => (e.kind === "pool" ? POOL_IDENTITY : e.name);
+
 export const favKey = (f: Fav): string => [f.provider, f.identity, f.model].join("\u0000");
 
 /** Accepts stored favourites only when each has a known provider and selectable names. A bad entry is dropped. */
@@ -131,6 +134,8 @@ export interface PickerEntry {
   provider: ChatProvider;
   providerName: string;
   identity: string;
+  /** The identity a star on this row is kept under: POOL_IDENTITY for a pool, else `identity`. */
+  favIdentity: string;
   kind: "identity" | "pool";
   /** Absent on the default row. */
   model?: string;
@@ -149,9 +154,9 @@ export function pickerEntries(m: PickerModel): PickerEntry[] {
     const providerName = providerMark(g.provider).name;
     for (const i of g.identities) {
       const disabled = m.locked === true && !i.selected;
-      const base = { provider: g.provider, providerName, identity: i.name, kind: i.kind, disabled };
+      const base = { provider: g.provider, providerName, identity: i.name, favIdentity: favIdentity(i), kind: i.kind, disabled };
       if (i.models.length === 0) out.push({ ...base, key: `${g.provider}\u0000${i.name}`, name: DEFAULT_ROW_NAME, sub: DEFAULT_ROW_SUB, selected: i.selected });
-      else for (const mo of i.models) out.push({ ...base, key: favKey({ provider: g.provider, identity: i.name, model: mo.id }), model: mo.id, name: mo.name, sub: mo.id, selected: mo.selected });
+      else for (const mo of i.models) out.push({ ...base, key: favKey({ provider: g.provider, identity: favIdentity(i), model: mo.id }), model: mo.id, name: mo.name, sub: mo.id, selected: mo.selected });
     }
   }
   return out;

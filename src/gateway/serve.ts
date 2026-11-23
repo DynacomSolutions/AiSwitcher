@@ -1247,7 +1247,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         const t = Date.parse(b.createdAt);
         return Number.isNaN(t) ? 0 : t;
       };
-      const favs = new FavouritesService({ store: testing ? (hooks.favouriteStore ?? new MemoryFavouriteStore()) : new PgFavouriteStore(opts.databaseUrl, { sql: sharedSql }), bus, hub, metrics });
+      const favs = new FavouritesService({ store: testing ? (hooks.favouriteStore ?? new MemoryFavouriteStore()) : new PgFavouriteStore(opts.databaseUrl, { sql: sharedSql }), bus, hub, metrics, pools: () => (catalogRef ? catalogRef.pools() : Promise.reject(new Error("the catalogue is not ready"))) });
       let frames: ChatFrames | undefined;
       let catalogRef: ChatCatalog | undefined;
       const broker = new ChatBroker({

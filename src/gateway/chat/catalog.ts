@@ -67,6 +67,17 @@ export class ChatCatalog {
     return f;
   }
 
+  /** The pools of every provider, by their real names: the identities of the ConfigMap that the gateway knows as a pool. Throws when the ConfigMap cannot be read. */
+  async pools(): Promise<Array<{ provider: ChatProvider; name: string }>> {
+    const cfg = await this.config();
+    const out: Array<{ provider: ChatProvider; name: string }> = [];
+    for (const p of CHAT_PROVIDERS) {
+      const names = (cfg.providers?.[p]?.identities ?? []).filter((n): n is string => typeof n === "string" && n !== "").slice(0, MAX_IDENTITIES);
+      for (const name of names) if (await this.d.isPool(name).catch(() => false)) out.push({ provider: p, name });
+    }
+    return out;
+  }
+
   /** Is this provider and identity listed, and is the model in the identity's list (when that list is not empty)? Throws when the ConfigMap cannot be read. */
   async check(provider: ChatProvider, identity: string, model?: string): Promise<SelectionCheck> {
     const pc = (await this.config()).providers?.[provider];

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ChatCatalogProvider } from "../../../src/browser/chat-protocol.ts";
-import { selectable } from "../../../src/browser/chat-protocol.ts";
+import { POOL_IDENTITY, selectable } from "../../../src/browser/chat-protocol.ts";
 import { buildPicker, choose, FAVOURITES, favKey, matchesQuery, menuKey, parseFavourites, pickerEntries, pickerRows, startTab, toggleFavourite } from "../src/sidepanel/chat/picker.ts";
 import { createPicker } from "../src/sidepanel/chat/picker-view.ts";
 import { providerIconSvg, providerMark } from "../src/sidepanel/chat/provider-icons.ts";
@@ -270,6 +270,34 @@ describe("picker view", () => {
     expect(remove.attrs["aria-pressed"]).toBe("true");
     remove.click();
     expect(s.picks).toEqual([{ star: { provider: "kimi", identity: "work", model: "k1" } }]);
+  });
+  test("a pool row stars under the pool key, whatever the pool is called", () => {
+    const s = setup();
+    s.btn.click();
+    s.star("Add Model Three to favourites").click();
+    expect(s.picks).toEqual([{ star: { provider: "claude", identity: POOL_IDENTITY, model: "m3" } }]);
+  });
+  test("a pool row shows its star set from a favourite under the pool key, and not from one under its name", () => {
+    const keyed = setup({ provider: "claude", identity: "work", model: "m1" }, { favourites: [{ provider: "claude", identity: POOL_IDENTITY, model: "m3" }] });
+    keyed.btn.click();
+    expect(keyed.star("Remove Model Three from favourites").attrs["aria-pressed"]).toBe("true");
+    // The Favourites tab lists the pool row, and a pick on it still names the pool.
+    keyed.tabs().find(t => t.attrs["aria-label"] === "Favourites")!.click();
+    expect(keyed.optionText().join("|")).toContain("Model Three");
+    const old = setup({ provider: "claude", identity: "work", model: "m1" }, { favourites: [{ provider: "claude", identity: "pool-a", model: "m3" }] });
+    old.btn.click();
+    expect(old.star("Add Model Three to favourites").attrs["aria-pressed"]).toBe("false");
+  });
+  test("picking a pool row names the pool itself, not the pool key", () => {
+    const s = setup();
+    s.btn.click();
+    s.options().find(n => n.textContent.includes("Model Three"))!.click();
+    expect(s.picks).toEqual([{ provider: "claude", identity: "pool-a", model: "m3" }]);
+  });
+  test("the entry of a pool row carries the pool key, an identity row its own name", () => {
+    const entries = pickerEntries(buildPicker(catalog, undefined));
+    expect(entries.filter(e => e.kind === "pool").map(e => e.favIdentity)).toEqual([POOL_IDENTITY]);
+    expect(entries.filter(e => e.kind === "identity").map(e => e.favIdentity)).toEqual(["work", "work", "work"]);
   });
   test("adds a favourite from a provider list, and the star keeps the popover open", () => {
     const s = setup();

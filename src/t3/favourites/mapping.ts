@@ -1,13 +1,11 @@
 // T3 Code names a model favourite by provider instance id and model slug. AIS names it by provider, identity (or pool) and model.
-// This file maps one to the other. It is pure: the pool name comes in through the context.
-import { CHAT_PROVIDERS, favId, selectable, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
+// This file maps one to the other. It is pure and needs no configuration: a pool instance maps to the reserved identity POOL_IDENTITY.
+import { CHAT_PROVIDERS, favId, POOL_IDENTITY, selectable, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
 
 /** One entry of `favorites` in T3 Code's settings.json. */
 export interface T3Fav { provider: string; model: string }
 
 export interface MapContext {
-  /** The name AIS gives the pool of a provider (the swap pool identity). Undefined when no source gives it: the pool favourites of that provider are then not mapped. */
-  poolName(provider: ChatProvider): string | undefined;
   /** Resolves an alias to the canonical identity name. Absent: the name is used as it is. */
   canonical?(provider: ChatProvider, name: string): string;
   /** The provider instance ids that exist in settings.json. A reverse map picks one of these. */
@@ -19,7 +17,7 @@ export interface MapContext {
  *
  * | instance id                                  | AIS provider | identity     |
  * | -------------------------------------------- | ------------ | ------------ |
- * | <claude\|codex>-pool                          | claude, codex | the pool     |
+ * | <claude\|codex>-pool                          | claude, codex | the pool (POOL_IDENTITY) |
  * | t3-claude-<identity>                         | claude       | <identity>   |
  * | t3-codex-<identity>                          | codex        | <identity>   |
  * | t3-kimi-<identity>-acp, t3-kimi-pool-acp     | kimi         | <identity>, the pool |
@@ -27,6 +25,8 @@ export interface MapContext {
  * | t3-grok-pool                                 | grok         | the pool     |
  * | t3-zai-<identity>-acp                        | zai          | <identity>   |
  * | t3-opencode-<identity>, t3-opencode-pool     | opencode     | <identity>, the pool |
+ *
+ * A pool instance maps to the same AIS identity on every host and pod, `POOL_IDENTITY`, whatever the pool is called. No pool name is read.
  *
  * Everything else has no AIS identity and is never mapped: T3's own `claudeAgent` and `codex` instances, the Claude homes that
  * route to Kimi or Z.ai models (`t3-claude-kimi-*`, `t3-claude-zai-*`), `t3-zcode-*`, and every usage-only instance (an id that ends in `-usage`).
@@ -53,25 +53,15 @@ function parseInstance(id: string): Parsed | undefined {
 }
 
 /** The AIS provider and identity of a T3 instance id, or undefined when the instance is not one AIS manages. */
-export function instanceToAis(id: string, ctx: Pick<MapContext, "poolName" | "canonical">): { provider: ChatProvider; identity: string } | undefined {
+export function instanceToAis(id: string, ctx: Pick<MapContext, "canonical"> = {}): { provider: ChatProvider; identity: string } | undefined {
   const p = parseInstance(id);
-  if (!p) return undefined;
-  const identity = p.pool ? ctx.poolName(p.provider) : (ctx.canonical?.(p.provider, p.name) ?? p.name);
-  return identity === undefined ? undefined : { provider: p.provider, identity };
-}
-
-/** The providers that have a pool instance among these instance ids. */
-export function poolProviders(instances: Iterable<string>): ChatProvider[] {
-  const found = new Set<ChatProvider>();
-  for (const id of instances) {
-    const p = parseInstance(id);
-    if (p?.pool) found.add(p.provider);
-  }
-  return [...found];
+  // An instance id has no `@` (`ais gateway t3-instance` refuses it), so an identity never equals the pool identity. A hand-made id that does is not mapped.
+  if (!p || (!p.pool && p.name === POOL_IDENTITY)) return undefined;
+  return { provider: p.provider, identity: p.pool ? POOL_IDENTITY : (ctx.canonical?.(p.provider, p.name) ?? p.name) };
 }
 
 /** The AIS key of a T3 favourite, or undefined when its instance is not mapped or its names are not valid. */
-export function favToKey(f: T3Fav, ctx: Pick<MapContext, "poolName" | "canonical">): FavKey | undefined {
+export function favToKey(f: T3Fav, ctx: Pick<MapContext, "canonical"> = {}): FavKey | undefined {
   const a = instanceToAis(f.provider, ctx);
   // The gateway takes only names that pass `selectable`. A favourite with another name (T3 allows `opus[1m]`) stays in T3 as an unmapped one.
   if (!a || !(CHAT_PROVIDERS as readonly string[]).includes(a.provider) || !selectable(a.identity) || !selectable(f.model)) return undefined;
@@ -79,8 +69,8 @@ export function favToKey(f: T3Fav, ctx: Pick<MapContext, "poolName" | "canonical
 }
 
 /** The instance ids that can hold a favourite of this provider and identity, best first. */
-export function instanceCandidates(provider: ChatProvider, identity: string, ctx: Pick<MapContext, "poolName">): string[] {
-  const pool = identity === ctx.poolName(provider);  // undefined never equals an identity: a provider with no pool name has no pool candidate
+export function instanceCandidates(provider: ChatProvider, identity: string): string[] {
+  const pool = identity === POOL_IDENTITY;
   switch (provider) {
     case "claude": return pool ? [poolId("claude")] : [`t3-claude-${identity}`];
     case "codex": return pool ? [poolId("codex")] : [`t3-codex-${identity}`];
@@ -93,12 +83,12 @@ export function instanceCandidates(provider: ChatProvider, identity: string, ctx
 
 /** The T3 favourite for an AIS key: the first candidate instance that exists. Undefined when this T3 home has no such instance. */
 export function keyToFav(k: FavKey, ctx: MapContext): T3Fav | undefined {
-  const id = instanceCandidates(k.provider, k.identity, ctx).find((c) => ctx.instances.has(c) && parseInstance(c) !== undefined);
+  const id = instanceCandidates(k.provider, k.identity).find((c) => ctx.instances.has(c) && parseInstance(c) !== undefined);
   return id === undefined ? undefined : { provider: id, model: k.model };
 }
 
 /** The AIS keys of the mapped favourites, in T3's order, each once. */
-export function mappedKeys(favs: readonly T3Fav[], ctx: Pick<MapContext, "poolName" | "canonical">): FavKey[] {
+export function mappedKeys(favs: readonly T3Fav[], ctx: Pick<MapContext, "canonical"> = {}): FavKey[] {
   const seen = new Set<string>();
   const out: FavKey[] = [];
   for (const f of favs) {
