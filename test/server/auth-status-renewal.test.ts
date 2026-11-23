@@ -103,6 +103,24 @@ describe("auth status from the gateway renewal row", () => {
     expect(e.detail!.length).toBeLessThan(220);
   });
 
+  test("a row with no expiry and no refresh is missing, not ok", async () => {
+    await seed(staleClaude);
+    const e = await status(view(row({ expiresAt: null, lastRefreshAt: null, lastRefreshReplica: null, nextRefreshAt: null })));
+    expect(e.state).toBe("missing");
+    expect(e.detail).toBe("via gateway: no login yet: log in");
+    expect(e.fixable).toEqual(["login"]);
+  });
+
+  test("a row with a refresh time but no expiry stays ok", async () => {
+    await seed(staleClaude);
+    expect((await status(view(row({ expiresAt: null })))).state).toBe("ok");
+  });
+
+  test("a revoked row with no login still reports expired", async () => {
+    await seed(staleClaude);
+    expect((await status(view(row({ expiresAt: null, lastRefreshAt: null, revoked: true })))).state).toBe("expired");
+  });
+
   test("an identity with no row keeps the host probe", async () => {
     await seed(staleClaude);
     const e = await status(view(row({ identity: "someone-else" })));

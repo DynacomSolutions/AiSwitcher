@@ -350,6 +350,7 @@ function probeFromGatewayRow(row: GatewayRenewalLoginDto): ProbeResult {
     const why = shorten(row.lastError.detail || row.lastError.code);
     return { ...base, state: "expiring", detail: `via gateway: last renewal failed (${row.lastError.code}): ${why}` };
   }
+  if (!row.expiresAt && !row.lastRefreshAt) return { ...base, state: "missing", detail: "via gateway: no login yet: log in" };
   const renewed = row.lastRefreshAt ? `renewed ${row.lastRefreshAt}` : "not renewed yet";
   const next = row.nextRefreshAt ? `, next renewal ${row.nextRefreshAt}` : "";
   return { ...base, state: "ok", detail: `via gateway: ${renewed}${next}` };
