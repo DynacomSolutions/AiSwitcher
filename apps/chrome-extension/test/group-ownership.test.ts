@@ -132,12 +132,15 @@ describe("a chat keeps its group", () => {
     expect(fresh.tabs.ownerOf(901)).toBeUndefined();
   });
 
-  test("a group that a saved group or a grant claims is not reclaimed", async () => {
+  test("a group that a saved group claims is not reclaimed as a record, only regained by its own chat", async () => {
     const { t, ids } = await ownerCase();
     await t.call("save_group", { name: "Job board" }); // the record gives way to the saved group
     clock += SESSION_END_MS + 1000;
     t.tabs.expireIdle();
-    expect(await t.tabs.reclaim(B)).toBe(false);
+    expect(await t.tabs.reclaim(OTHER_LABEL)).toBe(false);
+    expect(await t.tabs.reclaim(OTHER_IDENTITY)).toBe(false);
+    expect(await t.tabs.reclaim(B)).toBe(true); // same identity and chat: regained as the saved group's holder
+    expect(t.tabs.sessions.get(B.id)!.groupId).toBe(-1);
     expect(t.api.store.agentGroups).toEqual([]);
     expect(ids.length).toBe(4);
   });
