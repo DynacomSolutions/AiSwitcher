@@ -95,8 +95,11 @@ describe("request_group", () => {
     await until(() => slow.api.shown.size === 1);
     slow.state.abort("abort-me");
     expect((await aborted).ok).toBe(false);
+    // An abort of the call does not end the request: it stays pending for the owner.
+    expect(slow.api.shown.size).toBe(1);
+    expect(slow.executor.requests.list().length).toBe(1);
+    slow.executor.requests.answer(slow.executor.requests.list()[0]!.id, false);
     expect(slow.api.shown.size).toBe(0);
-    expect(slow.api.clearedNotifications.length).toBe(1);
     expect(t.api.shown.size).toBe(0);
     expect(t.api.clearedNotifications.length).toBe(3);
     expect(t.tabs.sessions.get("agent-1")?.groupId ?? -1).toBe(-1);

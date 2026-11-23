@@ -21,7 +21,7 @@ export interface MessageDeps {
   /** Runs a side panel chat command. Present when chat is wired. */
   chatCommand?(cmd: NonNullable<ReturnType<typeof parsePanelCommand>>): Promise<ChatCommandResult>;
   /** Pending request_group approvals. Present when the executor is wired. */
-  requests?: { list(): PendingRequest[]; answer(id: string, approve: boolean): boolean };
+  requests?: { list(): PendingRequest[]; answer(id: string, approve: boolean): boolean; popupRequestId(tabId: number): string | undefined };
   updater?: { check(): Promise<unknown>; update(): Promise<void>; setAuto(enabled: boolean): Promise<void> };
 }
 
@@ -50,11 +50,15 @@ export function handleMessage(msg: unknown, sender: MessageSender, reply: (r: un
   const fromExtensionPage = sender.origin === `chrome-extension://${deps.runtimeId}`;
   const type = (msg as { type?: unknown }).type;
   if (type === "ais-requests" || type === "ais-request-answer") {
-    // Approvals come from the side panel and the popup page only. A content script has the extension id but a web page origin and url.
+    // Approvals come from the side panel (it has no tab) and from the popup page the worker opened for one request. A content script has a web page origin.
+    // Any other tab that shows an extension page is refused: an agent could have opened or driven it.
     if (!isOwnPage(sender, deps.runtimeId) || !deps.requests) return false;
-    if (type === "ais-requests") { reply(deps.requests.list()); return false; }
+    const popupFor = sender.tab?.id === undefined ? undefined : deps.requests.popupRequestId(sender.tab.id);
+    if (sender.tab !== undefined && popupFor === undefined) return false;
+    if (type === "ais-requests") { reply(deps.requests.list().filter(r => popupFor === undefined || r.id === popupFor)); return false; }
     const { id, approve } = msg as { id?: unknown; approve?: unknown };
     if (typeof id !== "string" || typeof approve !== "boolean") { reply({ ok: false, error: "bad_args" }); return false; }
+    if (popupFor !== undefined && id !== popupFor) return false;
     reply({ ok: deps.requests.answer(id, approve) });
     return false;
   }

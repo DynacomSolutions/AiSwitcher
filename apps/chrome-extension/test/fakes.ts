@@ -238,11 +238,14 @@ export class FakeChrome implements ChromeApi {
   focusedWindowId: number | undefined = 1;
   sidePanelFails = false;
   sidePanelOpened: number[] = [];
-  popupsOpened: Array<{ path: string; width: number; height: number }> = [];
+  popupsOpened: Array<{ path: string; width: number; height: number; tabId: number }> = [];
+  badge = "";
+  nextPopupTab = 900;
   panel = {
     lastFocusedWindowId: async () => this.focusedWindowId,
     openSidePanel: async (windowId: number) => { if (this.sidePanelFails) throw new Error("sidePanel.open() may only be called in response to a user gesture."); this.sidePanelOpened.push(windowId); },
-    openPopup: async (path: string, size: { width: number; height: number }) => { this.popupsOpened.push({ path, ...size }); },
+    openPopup: async (path: string, size: { width: number; height: number }) => { const tabId = this.nextPopupTab++; this.popupsOpened.push({ path, ...size, tabId }); return tabId; },
+    setBadge: async (text: string) => { this.badge = text; },
   };
   /** The user presses a button of the notification on screen (the latest one when no id is given). */
   clickNotification(index: number, id = [...this.shown.keys()].at(-1)): void {

@@ -1,4 +1,6 @@
+import { isInternalUrl } from "./chrome-api.ts";
 import { GroupPrompt } from "./group-prompt.ts";
+import type { PromptAnswer } from "./group-prompt.ts";
 import { PROMPT_WAIT_MS } from "../shared/request.ts";
 import type { PendingRequest } from "../shared/request.ts";
 import { DEFAULT_CALL_TIMEOUT_MS, REQUEST_GROUP_CALL_TIMEOUT_MS, SESSION_END_TOOL, WAIT_CALL_TIMEOUT_MS } from "../../../../src/browser/protocol.ts";
@@ -30,6 +32,11 @@ const MAX_FRAME_DEPTH = 5;
 const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe" }] };
 
 type Content = Extract<CallResult, { ok: true }>["content"];
+
+/** What a request_group request carries to its answer: the tabs the owner saw, and whether closing was asked. */
+interface GroupMeta { tabIds: number[]; closable: boolean }
+/** One request_group call waits this long. Agent tool timeouts are near 135 seconds, so the call returns before them. */
+const GROUP_WAIT_MS = 100_000;
 
 export class ToolError extends Error {
   constructor(readonly code: BrowserErrorCode, message: string) { super(message); }
@@ -118,6 +125,8 @@ export interface ExecutorDeps {
   onLinks?: (sessionId: string, tabIds: number[]) => void | Promise<void>;
   /** How long request_group waits for the user (tests shorten it). */
   groupPromptMs?: number;
+  /** How long one request_group call waits before it reports "pending" (tests shorten it). */
+  groupWaitMs?: number;
 }
 
 export class Executor {
@@ -126,12 +135,13 @@ export class Executor {
   private readonly state: State;
   private readonly ui: Ui;
   private readonly onLinks: (sessionId: string, tabIds: number[]) => void | Promise<void>;
-  private readonly groupPrompt: GroupPrompt;
+  private readonly groupPrompt: GroupPrompt<GroupMeta>;
+  private readonly groupWaitMs: number;
   private readonly groupPromptMs: number;
   /** Pending request_group approvals, and the one way to answer them. */
-  get requests(): { list(): PendingRequest[]; answer(id: string, approve: boolean): boolean; onChange(l: () => void): void } {
+  get requests(): { list(): PendingRequest[]; answer(id: string, approve: boolean): boolean; onChange(l: () => void): void; popupRequestId(tabId: number): string | undefined } {
     const p = this.groupPrompt;
-    return { list: () => p.list(), answer: (id, approve) => (approve ? p.approve(id) : p.deny(id)), onChange: l => p.onChange(l) };
+    return { list: () => p.list(), answer: (id, approve) => (approve ? p.approve(id) : p.deny(id)), onChange: l => p.onChange(l), popupRequestId: tabId => p.popupRequestId(tabId) };
   }
   /** Per tab: the tail of the calls of chat sessions, so chats that share a tab never run on it at the same time. */
   private readonly tabLocks = new Map<number, Promise<void>>();
@@ -165,7 +175,8 @@ export class Executor {
     this.state = deps.state;
     this.ui = deps.ui ?? noopUi;
     this.onLinks = deps.onLinks ?? (() => {});
-    this.groupPrompt = new GroupPrompt(deps.api);
+    this.groupPrompt = new GroupPrompt<GroupMeta>(deps.api);
+    this.groupWaitMs = deps.groupWaitMs ?? GROUP_WAIT_MS;
     this.groupPromptMs = deps.groupPromptMs ?? PROMPT_WAIT_MS;
     if (deps.onLinks) this.tabs.onLinksChanged = deps.onLinks;
     this.sleepFn = deps.sleep ?? ((ms, signal) => new Promise<void>((resolve, reject) => {
@@ -247,6 +258,7 @@ export class Executor {
 
   /** The agent session ended: closes the tabs it created, releases the rest. Works while paused, so a pause never leaves a dead session's tabs behind. */
   private async endSession(req: CallRequest): Promise<CallResult> {
+    this.groupPrompt.cancelSession(req.session.id);
     const s = this.tabs.sessions.get(req.session.id);
     if (!s || s.identity === req.session.identity) this.state.resumeSession(req.session.id, req.session.identity);
     if (s && s.identity !== req.session.identity) return { id: req.id, ok: true, content: [{ type: "text", text: "no such session" }] };
@@ -274,7 +286,10 @@ export class Executor {
     switch (tool) {
       case "tabs_context": {
         if (session.chat === true) return this.chatContext(session.id);
-        const { own, granted, other } = await this.tabs.list(session.id);
+        const listed = await this.tabs.list(session.id);
+        // Browser and extension pages are left out: no agent tool may use them.
+        const usable = (t: TabInfo) => !isInternalUrl(t.url);
+        const own = listed.own.filter(usable), granted = listed.granted.filter(usable), other = listed.other.filter(usable);
         const view = (t: TabInfo) => ({ tabId: t.id, url: t.url, title: t.title, active: t.active, groupId: t.groupId, ...(t.splitViewId !== undefined && t.splitViewId !== -1 ? { splitViewId: t.splitViewId } : {}) });
         const dialog = (t: TabInfo) => {
           const d = this.dialogs.get(t.id);
@@ -390,23 +405,33 @@ export class Executor {
       case "request_group": {
         this.throwIfAborted(sig);
         const { groupId, allowClose } = a("request_group");
-        const closable = allowClose === true;
         if (session.chat === true) throw new ToolError("forbidden_tab", "A chat cannot ask for a tab group.");
-        const first = await this.tabs.checkRequest(session, groupId, closable);
-        if (!first.ok) throw new ToolError(first.code, first.message);
-        if (first.already) return text(JSON.stringify({ groupId, already: true, note: "This group is already yours." }));
-        if (!this.tabs.beginRequest(groupId)) throw new ToolError("forbidden_tab", `Another request for group ${groupId} is waiting for the user.`);
-        let answer;
-        try {
-          answer = await this.groupPrompt.ask({
-            agentLabel: session.label, identity: session.identity, groupId, groupTitle: first.title, tabCount: first.tabCount, allowClose: closable, shared: first.shared,
-          }, sig, this.groupPromptMs);
-        } finally {
-          this.tabs.endRequest(groupId);
+        // The request outlives this call. A repeat call from the same session reads the answer that came after the last call returned, or joins the open request.
+        let ticket = this.groupPrompt.pendingFor(session.id, groupId);
+        let answer: PromptAnswer | "waiting" | undefined;
+        let meta: GroupMeta | undefined = ticket?.meta;
+        const earlier = ticket ? undefined : this.groupPrompt.answerFor(session.id, groupId);
+        if (earlier) { answer = earlier.answer; meta = earlier.meta; }
+        if (!ticket && !earlier) {
+          const closable = allowClose === true;
+          const first = await this.tabs.checkRequest(session, groupId, closable);
+          if (!first.ok) throw new ToolError(first.code, first.message);
+          if (first.already) return text(JSON.stringify({ groupId, already: true, note: "This group is already yours." }));
+          if (!this.tabs.beginRequest(groupId)) throw new ToolError("forbidden_tab", `Another request for group ${groupId} is waiting for the user.`);
+          meta = { tabIds: first.tabIds, closable };
+          const started = this.groupPrompt.start(session.id, { agentLabel: session.label, identity: session.identity, groupId, groupTitle: first.title, tabCount: first.tabCount, allowClose: closable, shared: first.shared }, this.groupPromptMs, meta);
+          void this.groupPrompt.wait(started.id, this.groupPromptMs + 1000, new AbortController().signal).then(() => this.tabs.endRequest(groupId));
+          ticket = { ...started, meta };
         }
+        if (answer === undefined) answer = await this.groupPrompt.wait(ticket!.id, this.groupWaitMs, sig);
         this.throwIfAborted(sig);
+        if (answer === "waiting") {
+          return text(JSON.stringify({ pending: true, requestId: ticket!.id, deadline: ticket!.deadline, message: "Waiting for the owner. Call request_group again with the same groupId to get the answer." }));
+        }
+        this.groupPrompt.forgetAnswer(session.id, groupId); // delivered now: a repeat call asks again
         if (answer !== "approve") throw new ToolError("forbidden_tab", answer === "timeout" ? "The user did not answer in time. Do not ask again unless the user asks." : answer === "deny" ? "The user denied access to this group. Do not ask again." : "The user closed the question without an answer. Do not ask again unless the user asks.");
-        const done = await this.tabs.takeGroup(session, groupId, first.tabIds, closable);
+        const closable = meta!.closable;
+        const done = await this.tabs.takeGroup(session, groupId, meta!.tabIds, closable);
         if (!done.ok) throw new ToolError(done.code, done.message);
         return text(JSON.stringify({ groupId, approved: true, tabCount: done.tabCount, note: closable ? "The group is now your own group. You can close its tabs with close_tab, and the session end closes them. A tab that an earlier approval protected stays protected." : "The group is now your own group and every tab is adopted. The session end closes and ungroups none of them." }));
       }
@@ -415,6 +440,7 @@ export class Executor {
         if (session.chat === true && !this.tabs.chatLinked(session.id, tabId) && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", "Only tabs you linked to this chat can be used. Link it in the side panel.");
         const tab = await this.api.tabs.get(tabId);
         if (!tab) throw new ToolError("tab_closed", `Tab ${tabId} no longer exists.`);
+        this.assertDrivable(tab);
         if (session.chat === true) {
           return text(`Tab ${tabId} is linked to this chat and is already usable.`);
         }
@@ -490,7 +516,7 @@ export class Executor {
     const dead = links.filter(id => !live.has(id));
     if (dead.length > 0) this.tabs.setChatLinks(sessionId, links.filter(id => live.has(id)));
     const created = this.tabs.sessions.get(sessionId)?.tabIds ?? new Set<number>();
-    const mine = all.filter(t => created.has(t.id) || this.tabs.chatLinked(sessionId, t.id));
+    const mine = all.filter(t => !isInternalUrl(t.url) && (created.has(t.id) || this.tabs.chatLinked(sessionId, t.id)));
     const row = (t: TabInfo) => {
       const d = this.dialogs.get(t.id);
       return {
@@ -649,6 +675,7 @@ export class Executor {
         this.dropTab(tabId);
         throw new ToolError("tab_closed", `Tab ${tabId} was closed.`);
       }
+      this.assertDrivable(linked);
       return linked;
     }
     const forbidden = (): ToolError => new ToolError("forbidden_tab", `Tab ${tabId} is not in this session. Use tabs_create, or adopt_tab to take one of the user's tabs.`);
@@ -660,7 +687,13 @@ export class Executor {
       this.dropTab(tabId);
       throw new ToolError("tab_closed", `Tab ${tabId} was closed.`);
     }
+    this.assertDrivable(tab);
     return tab;
+  }
+
+  /** Browser and extension pages are never driven by an agent. An extension page could answer an approval request. */
+  private assertDrivable(tab: TabInfo): void {
+    if (isInternalUrl(tab.url)) throw new ToolError("forbidden_tab", `Tab ${tab.id} shows a browser or extension page. Agents cannot use these pages.`);
   }
 
   // ---- JavaScript dialogs ------------------------------------------------
@@ -795,6 +828,8 @@ export class Executor {
   private async ensureAttached(sig: AbortSignal, tabId: number): Promise<void> {
     this.throwIfAborted(sig);
     if (this.attached.has(tabId)) return this.awaitEnabled(tabId);
+    const current = await this.api.tabs.get(tabId);
+    if (current) this.assertDrivable(current); // last guard: no path may attach the debugger to a browser or extension page
     try {
       await this.api.debugger.attach(tabId);
     } catch (e) {

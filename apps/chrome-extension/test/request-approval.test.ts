@@ -14,14 +14,16 @@ const ID = "abcdefghijklmnopabcdefghijklmnop";
 const AG = { id: "agent-1", identity: "alice", label: "ContractFinder" };
 let n = 0;
 
-function setup(promptMs?: number) {
+function setup(promptMs?: number, waitMs?: number) {
   const api = new FakeChrome();
   const tabs = new TabManager(api, () => 9_000_000);
-  const executor = new Executor({ api, tabs, state: new State(api.storage), groupPromptMs: promptMs });
-  const call = (tool: BrowserTool, args: Record<string, unknown> = {}) => executor.run({ id: `q${++n}`, session: AG, tool, args } as CallRequest);
+  const state = new State(api.storage);
+  const executor = new Executor({ api, tabs, state, groupPromptMs: promptMs, groupWaitMs: waitMs });
+  const call = (tool: BrowserTool, args: Record<string, unknown> = {}, id = `q${++n}`) => executor.run({ id, session: AG, tool, args } as CallRequest);
   const deps = { runtimeId: ID, requests: executor.requests } as unknown as MessageDeps;
+  const text = (r: Awaited<ReturnType<typeof call>>) => JSON.parse(r.ok && r.content[0]?.type === "text" ? r.content[0].text : "{}");
   const send = (msg: unknown, sender: MessageSender) => { const replies: unknown[] = []; const r = handleMessage(msg, sender, v => replies.push(v), deps); return { r, replies }; };
-  return { api, tabs, executor, call, send };
+  return { api, tabs, state, executor, call, send, text };
 }
 async function userGroup(api: FakeChrome, count = 3) {
   const ids: number[] = [];
@@ -76,7 +78,7 @@ describe("pending group requests", () => {
     t.api.clickNotificationBody();
     await until(() => t.api.popupsOpened.length === 1);
     const id = t.executor.requests.list()[0]!.id;
-    expect(t.api.popupsOpened[0]).toEqual({ path: `request.html?id=${id}`, width: 420, height: 360 });
+    expect(t.api.popupsOpened[0]).toMatchObject({ path: `request.html?id=${id}`, width: 420, height: 360 });
     t.api.clickNotification(1);
     await pending;
   });
@@ -141,7 +143,7 @@ describe("pending group requests", () => {
     await until(() => changes === 1);
     t.executor.requests.answer(t.executor.requests.list()[0]!.id, false);
     await pending;
-    expect(changes).toBeGreaterThanOrEqual(3);
+    expect(changes).toBe(2);
   });
 
   test("a content script is refused, with a web page origin, with a spoofed url, and from another extension", async () => {
@@ -168,6 +170,165 @@ describe("pending group requests", () => {
     const t = setup(5000);
     const { replies } = t.send({ type: "ais-request-answer", id: 5, approve: "yes" }, page);
     expect(replies).toEqual([{ ok: false, error: "bad_args" }]);
+  });
+});
+
+describe("agent cannot approve its own request", () => {
+  const extUrl = `chrome-extension://${ID}/request.html?id=x`;
+
+  test("a failed notification opens no window and keeps the request in the side panel with a badge", async () => {
+    const t = setup(5000);
+    t.api.notifications.create = async () => { throw new Error("no notifications"); };
+    const { gid } = await userGroup(t.api);
+    const pending = t.call("request_group", { groupId: gid });
+    await until(() => t.executor.requests.list().length === 1);
+    await Bun.sleep(20);
+    expect(t.api.popupsOpened).toEqual([]);
+    expect(t.api.sidePanelOpened).toEqual([]);
+    expect(t.api.badge).toBe("!");
+    t.send({ type: "ais-request-answer", id: t.executor.requests.list()[0]!.id, approve: false }, page);
+    await pending;
+    expect(t.api.badge).toBe("");
+  });
+
+  test("a tab that shows an extension page cannot read or answer requests", async () => {
+    const t = setup(5000);
+    const { gid } = await userGroup(t.api);
+    const pending = t.call("request_group", { groupId: gid });
+    await until(() => t.executor.requests.list().length === 1);
+    const id = t.executor.requests.list()[0]!.id;
+    const inTab: MessageSender = { ...page, tab: { id: 55 }, url: extUrl, frameId: 0 };
+    for (const msg of [{ type: "ais-requests" }, { type: "ais-request-answer", id, approve: true }]) {
+      const { r, replies } = t.send(msg, inTab);
+      expect(r).toBe(false);
+      expect(replies).toEqual([]);
+    }
+    expect(t.executor.requests.list().length).toBe(1);
+    t.executor.requests.answer(id, false);
+    await pending;
+  });
+
+  test("the popup tab opened for a request sees and answers only that request", async () => {
+    const t = setup(5000);
+    const g1 = await userGroup(t.api, 2);
+    const p1 = t.call("request_group", { groupId: g1.gid });
+    await until(() => t.api.shown.size === 1);
+    const first = t.executor.requests.list()[0]!.id;
+    const g2 = await userGroup(t.api, 2);
+    const p2 = t.executor.requests; // second request from another session
+    const other = t.executor.run({ id: "q-other", session: { id: "agent-2", identity: "alice", label: "Other" }, tool: "request_group", args: { groupId: g2.gid } } as CallRequest);
+    await until(() => t.executor.requests.list().length === 2);
+    t.api.sidePanelFails = true;
+    t.api.clickNotificationBody(first);
+    await until(() => t.api.popupsOpened.length === 1);
+    const popupTab = t.api.popupsOpened[0]!.tabId;
+    const sender: MessageSender = { ...page, tab: { id: popupTab }, url: `chrome-extension://${ID}/request.html?id=${first}` };
+    const listed = t.send({ type: "ais-requests" }, sender).replies[0] as Array<{ id: string }>;
+    expect(listed.map(r => r.id)).toEqual([first]);
+    const secondId = p2.list().find(r => r.id !== first)!.id;
+    expect(t.send({ type: "ais-request-answer", id: secondId, approve: true }, sender).replies).toEqual([]);
+    expect(t.send({ type: "ais-request-answer", id: first, approve: false }, sender).replies).toEqual([{ ok: true }]);
+    await p1;
+    // The tab closes: it can no longer answer.
+    for (const l of t.api.removedListeners) l(popupTab);
+    expect(t.send({ type: "ais-request-answer", id: secondId, approve: false }, sender).r).toBe(false);
+    p2.answer(secondId, false);
+    await other;
+  });
+
+  test("adopt_tab, tabs_context and every tab tool refuse a browser or extension page", async () => {
+    const t = setup(5000);
+    const ext = t.api.addTab(70, extUrl);
+    const settings = t.api.addTab(71, "chrome://settings/");
+    const dev = t.api.addTab(72, "devtools://devtools/bundled/inspector.html");
+    const web = t.api.addTab(73, "https://example.com/");
+    for (const tab of [ext, settings, dev]) {
+      expect(await t.call("adopt_tab", { tabId: tab.id })).toMatchObject({ ok: false, error: "forbidden_tab" });
+    }
+    expect((await t.call("adopt_tab", { tabId: web.id })).ok).toBe(true);
+    const ctx = t.text(await t.call("tabs_context"));
+    expect([...ctx.sessionTabs, ...ctx.otherTabs].map((x: { tabId: number }) => x.tabId)).toEqual([web.id]);
+    // A session tab that later shows an extension page: no tool acts on it.
+    t.api.tabList.get(web.id)!.url = extUrl;
+    for (const [tool, args] of [["javascript", { code: "1" }], ["click", { coordinate: [1, 1] }], ["type", { text: "a" }], ["key", { key: "Enter" }], ["form_input", { ref: "r", value: "v" }], ["read_page", {}], ["screenshot", {}], ["navigate", { url: "https://example.com" }], ["close_tab", {}]] as const) {
+      expect(await t.call(tool as BrowserTool, { tabId: web.id, ...args })).toMatchObject({ ok: false, error: "forbidden_tab" });
+    }
+    for (const tab of [ext, settings, dev]) expect(t.api.attachedTabs.has(tab.id)).toBe(false);
+  });
+});
+
+describe("request_group returns before the agent tool timeout", () => {
+  test("no answer in time gives pending, and the answer arrives on the second call", async () => {
+    const t = setup(5000, 30);
+    const { gid } = await userGroup(t.api);
+    const first = await t.call("request_group", { groupId: gid });
+    const body = t.text(first);
+    expect(body).toMatchObject({ pending: true, message: "Waiting for the owner. Call request_group again with the same groupId to get the answer." });
+    expect(body.requestId).toBe(t.executor.requests.list()[0]!.id);
+    expect(typeof body.deadline).toBe("number");
+    expect(t.api.shown.size).toBe(1);
+    const second = t.call("request_group", { groupId: gid });
+    await Bun.sleep(5);
+    t.api.clickNotification(0);
+    const r = await second;
+    expect(t.text(r)).toMatchObject({ approved: true, tabCount: 3 });
+    expect(t.api.everShown.length).toBe(1);
+  });
+
+  test("an answer between two calls is returned at once", async () => {
+    const t = setup(5000, 20);
+    const { gid } = await userGroup(t.api);
+    await t.call("request_group", { groupId: gid });
+    t.api.clickNotification(0);
+    const r = await t.call("request_group", { groupId: gid });
+    expect(t.text(r)).toMatchObject({ approved: true });
+    expect(t.api.everShown.length).toBe(1);
+  });
+
+  test("a denial between two calls is returned at once, once", async () => {
+    const t = setup(5000, 20);
+    const { gid } = await userGroup(t.api);
+    await t.call("request_group", { groupId: gid });
+    t.api.clickNotification(1);
+    expect(await t.call("request_group", { groupId: gid })).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.api.everShown.length).toBe(1);
+    // Delivered: a later call asks again.
+    await t.call("request_group", { groupId: gid });
+    expect(t.api.everShown.length).toBe(2);
+    t.api.clickNotification(1);
+  });
+
+  test("an abort of the call keeps the request pending, and a repeat call joins it", async () => {
+    const t = setup(5000, 5000);
+    const { gid } = await userGroup(t.api);
+    const aborted = t.call("request_group", { groupId: gid }, "abort-1");
+    await until(() => t.api.shown.size === 1);
+    t.state.abort("abort-1");
+    expect((await aborted).ok).toBe(false);
+    expect(t.executor.requests.list().length).toBe(1);
+    expect(t.api.shown.size).toBe(1);
+    const again = t.call("request_group", { groupId: gid });
+    await Bun.sleep(10);
+    t.api.clickNotification(0);
+    expect(t.text(await again)).toMatchObject({ approved: true });
+    expect(t.api.everShown.length).toBe(1);
+  });
+
+  test("another session is refused while the request is pending", async () => {
+    const t = setup(5000, 20);
+    const { gid } = await userGroup(t.api);
+    await t.call("request_group", { groupId: gid });
+    const other = await t.executor.run({ id: "q-o", session: { id: "agent-2", identity: "alice", label: "Other" }, tool: "request_group", args: { groupId: gid } } as CallRequest);
+    expect(other).toMatchObject({ ok: false, error: "forbidden_tab" });
+    t.api.clickNotification(1);
+  });
+
+  test("a timeout of the request itself gives the same error", async () => {
+    const t = setup(40, 5000);
+    const { gid } = await userGroup(t.api);
+    const r = await t.call("request_group", { groupId: gid });
+    expect(r).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(r.ok ? "" : r.message).toContain("did not answer");
   });
 });
 
