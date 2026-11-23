@@ -123,3 +123,27 @@ describe("chat protocol", () => {
     expect(parseChatToExt({ t: "chat.reject", code: 5, message: "m" })).toBeUndefined();
   });
 });
+
+describe("favourites frames", () => {
+  const key = { provider: "claude", identity: "work", model: "claude-opus-5-5" };
+  test("an extension frame to read or change the stars parses", () => {
+    expect(parseChatFromExt({ t: "chat.fav.list" })).toEqual({ t: "chat.fav.list" });
+    expect(parseChatFromExt({ t: "chat.fav.set", changes: [{ ...key, op: "add", at: 5 }, { ...key, op: "remove" }] })).toEqual({ t: "chat.fav.set", changes: [{ ...key, op: "add", at: 5 }, { ...key, op: "remove" }] } as never);
+  });
+  test("a bad change fails the whole frame", () => {
+    expect(parseChatFromExt({ t: "chat.fav.set", changes: [{ ...key, op: "toggle" }] })).toBeUndefined();
+    expect(parseChatFromExt({ t: "chat.fav.set", changes: [{ ...key, provider: "bash", op: "add" }] })).toBeUndefined();
+    expect(parseChatFromExt({ t: "chat.fav.set", changes: [{ ...key, model: "a b", op: "add" }] })).toBeUndefined();
+    expect(parseChatFromExt({ t: "chat.fav.set", changes: [{ ...key, op: "add", at: -1 }] })).toBeUndefined();
+    expect(parseChatFromExt({ t: "chat.fav.set", changes: Array.from({ length: 201 }, () => ({ ...key, op: "add" })) })).toBeUndefined();
+    expect(parseChatFromExt({ t: "chat.fav.set" })).toBeUndefined();
+  });
+  test("the list frame of the gateway parses and drops unknown fields", () => {
+    expect(parseChatToExt({ t: "chat.fav.list", seq: 3, items: [{ ...key, at: 9 }] })).toEqual({ t: "chat.fav.list", seq: 3, items: [key] } as never);
+    expect(parseChatToExt({ t: "chat.fav.list", seq: -1, items: [] })).toBeUndefined();
+    expect(parseChatToExt({ t: "chat.fav.list", seq: 1, items: [{ provider: "bash", identity: "a", model: "m" }] })).toBeUndefined();
+  });
+  test("an older build ignores the new frame: the parser it has returns undefined for a type it does not know", () => {
+    expect(parseChatToExt({ t: "chat.future.thing", seq: 1 })).toBeUndefined();
+  });
+});

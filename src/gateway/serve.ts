@@ -33,10 +33,13 @@ import { MAX_CHATS_PER_WINDOW } from "../browser/chat-protocol.ts";
 import { ChatBroker, chatIdleMsFromEnv } from "./chat/broker.ts";
 import { MemoryChatBus, PgChatBus, type ChatBus } from "./chat/bus.ts";
 import { ChatCatalog } from "./chat/catalog.ts";
+import { FavouritesService } from "./chat/favourites.ts";
+import { MemoryFavouriteStore, type FavouriteStore } from "./chat/favourites-store.ts";
 import { ChatFrames } from "./chat/frames.ts";
 import { HttpKubeApi, inClusterKube } from "./chat/kube-http.ts";
 import type { KubeApi, KubeConfigEnv, PodTransport } from "./chat/kube.ts";
 import { PgChatStore } from "./chat/pg-chat-store.ts";
+import { PgFavouriteStore } from "./chat/pg-favourites-store.ts";
 import { KubePodTransport } from "./chat/pod-transport.ts";
 import { MemoryChatStore } from "./chat/store.ts";
 import { chatTokenKey } from "./chat/token.ts";
@@ -166,6 +169,8 @@ export interface GatewayHooks {
   chatBus?: ChatBus;
   /** Tests: the chat store (in-memory store mode only). A second gateway given the same store sees the chats of the first. */
   chatStore?: ChatStore;
+  /** Tests: the starred-model store (in-memory store mode only). */
+  favouriteStore?: FavouriteStore;
 }
 
 /** What `AIS_GATEWAY_CHAT_*` configures. */
@@ -733,6 +738,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const chatTesting = hooks.chatTransport !== undefined || hooks.chatKubeApi !== undefined;
   const chatOn = hooks.chatTransport !== undefined || chatEnv !== undefined;
   let chatBroker: ChatBroker | undefined;
+  // Starred models. Built with the chat stack, so the admin routes read it late.
+  let favourites: FavouritesService | undefined;
   // The hub reads `onChat` and `onAttach` from this same object when a frame arrives. The chat stack sets them after it is built (below),
   // so a gateway with chat off or failed answers every chat frame with `chat.reject` unavailable.
   const hubOpts: HubOptions = { authToken: async (t) => {
@@ -813,6 +820,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     browserPoolMembers,
     browserIdentityExists,
     browserHub: browser,
+    favourites: () => favourites,
+    metrics,
     onBindingRevoked: async (binding, before) => {
       await chatBroker?.closeBinding(binding, before === undefined ? {} : { before }).catch(() => metrics.chatError("close_binding"));
     },
@@ -1238,6 +1247,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         const t = Date.parse(b.createdAt);
         return Number.isNaN(t) ? 0 : t;
       };
+      const favs = new FavouritesService({ store: testing ? (hooks.favouriteStore ?? new MemoryFavouriteStore()) : new PgFavouriteStore(opts.databaseUrl, { sql: sharedSql }), bus, hub, metrics });
       let frames: ChatFrames | undefined;
       let catalogRef: ChatCatalog | undefined;
       const broker = new ChatBroker({
@@ -1270,7 +1280,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         isPool: async (name) => (await browserPoolMembers(name)) !== undefined,
       });
       catalogRef = catalog;
-      frames = new ChatFrames({ broker, store: chatStore, bus, catalog, hub, bindingSince, maxPerWindow: MAX_CHATS_PER_WINDOW, maxLive: chatEnv?.maxLive ?? CHAT_MAX_DEFAULT, metrics });
+      frames = new ChatFrames({ broker, store: chatStore, bus, catalog, hub, bindingSince, maxPerWindow: MAX_CHATS_PER_WINDOW, maxLive: chatEnv?.maxLive ?? CHAT_MAX_DEFAULT, metrics, favourites: favs });
       const live = frames;
       chatBroker = broker;
       chat = { broker, frames: live, store: chatStore };
@@ -1280,7 +1290,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       let framesStarted = false;
       let tries = 0;
       /** A start that ends after stop() must leave nothing running: it undoes its own listeners. */
+      let favsStarted = false;
       const abandon = async (): Promise<void> => {
+        await favs.stop().catch(() => undefined);
         await live.stop().catch(() => undefined);
         await broker.dispose().catch(() => undefined);
       };
@@ -1295,6 +1307,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
           if (!framesStarted) {
             await live.start();
             framesStarted = true;
+            if (draining) return abandon();
+          }
+          if (!favsStarted) {
+            await favs.start();
+            favsStarted = true;
+            favourites = favs;
             if (draining) return abandon();
           }
           hubOpts.onChat = (b, m, r) => live.handle(b, m, r);

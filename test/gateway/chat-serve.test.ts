@@ -576,3 +576,21 @@ test("old chats that were never closed do not count against the window cap of a 
   await c2.until(() => c2.of("chat.state").some((s) => s.chatId === chatId));
   expect(c2.of("chat.reject")).toEqual([]);
 });
+
+test("a star set in the panel reaches a host daemon over the admin API, and a star set over the API reaches the panel", async () => {
+  const token = await pair();
+  const g = await boot({ chatTransport: stub() });
+  const c = await Client.open(g.port, token);
+  // The attach sends the list first: empty.
+  await c.until(() => c.of("chat.fav.list").length === 1);
+  expect(c.of("chat.fav.list")[0]).toMatchObject({ seq: 0, items: [] });
+  const admin = { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" };
+  c.send({ t: "chat.fav.set", changes: [{ provider: "claude", identity: "alpha", model: "m1", op: "add" }] });
+  await c.until(() => c.of("chat.fav.list").some((f) => f.items.length === 1));
+  const got = (await (await fetch(`http://127.0.0.1:${g.adminPort}/favourites?since=0&ms=2000`, { headers: admin })).json()) as { seq: number; items: unknown[] };
+  expect(got.items).toEqual([{ provider: "claude", identity: "alpha", model: "m1" }]);
+  const res = await fetch(`http://127.0.0.1:${g.adminPort}/favourites`, { method: "POST", headers: admin, body: JSON.stringify({ origin: "host-1", changes: [{ provider: "claude", identity: "alpha", model: "m2", op: "add" }] }) });
+  expect(res.status).toBe(200);
+  await c.until(() => c.of("chat.fav.list").some((f) => f.items.length === 2));
+  expect(c.of("chat.fav.list").at(-1)?.items.map((i: { model: string }) => i.model)).toEqual(["m1", "m2"]);
+});

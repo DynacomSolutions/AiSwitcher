@@ -7,6 +7,7 @@ import type { GatewayMetrics } from "../metrics.ts";
 import { GATEWAY_CAP_MESSAGE as CAP_COPY, type BrokerReject, type ChatBroker } from "./broker.ts";
 import type { ChatBus } from "./bus.ts";
 import type { ChatCatalog } from "./catalog.ts";
+import type { FavouritesService } from "./favourites.ts";
 import type { ChatRecord, ChatStore } from "./types.ts";
 
 /** Events read from the store in one step. */
@@ -35,7 +36,9 @@ export interface ChatFramesDeps {
   maxLive?: number;
   /** Longest a create waits for the create before it. Only the wait for the lock is bound, never a create in flight. Default 30 s. */
   createLockWaitMs?: number;
-  metrics?: Pick<GatewayMetrics, "chatError">;
+  metrics?: Pick<GatewayMetrics, "chatError" | "favourite">;
+  /** The starred models. Without it `chat.fav.*` frames get `unavailable`. */
+  favourites?: Pick<FavouritesService, "list" | "apply" | "frame" | "sendTo">;
   /** When the active binding of this name was approved (epoch ms); undefined when none is active. Without it the binding record of the frame decides. */
   bindingSince?(binding: string): Promise<number | undefined>;
 }
@@ -136,6 +139,7 @@ export class ChatFrames {
     for (const [id, w] of this.watches) if (w.binding === binding.name) this.watches.delete(id);
     const recs = await this.mine(binding);
     this.d.hub.sendTo(binding.name, { t: "chat.list", chats: recs.slice(0, MAX_LIST).map(summaryOf) });
+    await this.d.favourites?.sendTo(binding.name).catch(() => this.d.metrics?.favourite?.("error"));
   }
 
   async handle(binding: BrowserBinding, frame: ChatFromExt, reply: (f: ChatToExt) => void): Promise<void> {
@@ -146,6 +150,7 @@ export class ChatFrames {
       const r: Extract<ChatToExt, { t: "chat.reject" }> = { t: "chat.reject", code: "unavailable", message: SERVICE_BUSY };
       if ("chatId" in frame) r.chatId = frame.chatId;
       if (frame.t === "chat.catalog") r.reqId = frame.reqId;
+      if (frame.t.startsWith("chat.fav.")) this.d.metrics?.favourite?.("error");
       reply(r);
     }
   }
@@ -158,6 +163,14 @@ export class ChatFrames {
       case "chat.list": {
         const recs = await this.mine(binding, f.windowId === undefined ? {} : { windowId: f.windowId });
         reply({ t: "chat.list", chats: recs.slice(0, MAX_LIST).map(summaryOf) });
+        return;
+      }
+      case "chat.fav.list":
+      case "chat.fav.set": {
+        if (!this.d.favourites) return reject("unavailable", "Favourites are not available on this gateway.");
+        this.d.metrics?.favourite?.(f.t === "chat.fav.list" ? "socket_list" : "socket_set");
+        const l = f.t === "chat.fav.set" ? await this.d.favourites.apply(f.changes, binding.name) : await this.d.favourites.list();
+        reply(this.d.favourites.frame(l));
         return;
       }
       case "chat.catalog": {
