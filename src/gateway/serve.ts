@@ -10,6 +10,7 @@ import { HomeMirror } from "./home-mirror.ts";
 import { importHome, STORE_META_PATH } from "./home-import.ts";
 import { PgHomeStore } from "./home-store.ts";
 import { PgLeader } from "./pg-leader.ts";
+import { sessionsEnrichEnabled } from "./sessions/enrich-config.ts";
 import { getGatewayListener, releaseGatewayListener } from "./pg-listen.ts";
 import { getGatewaySql, releaseGatewaySql } from "./pg-pool.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
@@ -588,6 +589,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const homeStore = pgCreds ? new PgHomeStore(opts.databaseUrl, pgCreds.key, undefined, undefined, { sql: sharedSql, listener: sharedListener }) : undefined;
   const mirror = homeStore ? new HomeMirror(homeStore, { ...(hooks.home ? { home: hooks.home } : {}), fileStore: pgCreds?.fileStore === true }) : undefined;
   const leader = pgCreds ? new PgLeader(opts.databaseUrl, hooks.leaderTryMs ?? 10_000) : undefined;
+  // Session enrichment (off unless AIS_SESSIONS_ENRICH is set): runs on the leader only; without a leader election it runs here alone.
+  // The modules load only when the flag is on: every `ais` process reads its imports at start.
+  const sessionsEnrich = hooks.openStore || !sessionsEnrichEnabled(process.env) ? undefined : (await import("./sessions/enrich-setup.ts")).createSessionsEnrichment({ env: process.env, sql: sharedSql, isLeader: () => !leader || leader.isLeader() });
+  if (sessionsEnrich) metrics.sections.push(sessionsEnrich.render);
   if (mirror) setLocalWriteHook(async (abs, kind, account) => mirror.push([abs], account, kind));
   const grantPaths = (tool: RefreshableTool, identity: Identity): Promise<string[]> => effectiveGrantPaths(tool, identity).catch(() => [] as string[]);
   const inflightRefreshes = new Set<Promise<unknown>>();
@@ -982,6 +987,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       let stage = "migrate";
       try {
         await (hooks.migrate ?? migrate)(opts.databaseUrl);
+        // The tables exist now. start() does nothing when the loop runs already (this block can run again after a failed warm-up).
+        if (!draining) sessionsEnrich?.enricher.start();
         if (mirror && homeStore && !storeSynced) {
           if (pgCreds?.importOnStart && pgCreds.fileStore) {
             stage = "credential store import";
@@ -1418,6 +1425,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       // The ledger flush, the relay and the leader lock do not wait for chat turns: a long turn must not hold them until the kill ceiling.
       await ledger.close();
       await relay?.stop().catch(() => undefined);
+      await sessionsEnrich?.enricher.stop().catch(() => undefined);
       await leader?.stop().catch(() => undefined);
       // The chat drain needs only the shared SQL pool, the listener and the chat store, which stay open until the end.
       await chatDrain;

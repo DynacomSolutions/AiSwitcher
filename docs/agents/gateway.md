@@ -1075,3 +1075,35 @@ block ledger writes; reads are bound by time and by `session_key IS NOT NULL`). 
   inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, firstTs, lastTs }], turns, firstTs, lastTs }] }`.
   Only served requests (`status = ok`) with a key and a real identity count. `activeIdentity` is the account of the latest
   request. `identities` is newest first. A pool that swaps member in the middle of a session shows both accounts.
+
+## Session store enrichment (`src/gateway/sessions/enrich*.ts`)
+
+The shipper stores transcript parts (gzip, then age) in object storage and the ingest routes record them in
+`ais_session_file` and `ais_session_part`. The enrichment loop turns the stored bytes into the index fields (title,
+cwd, project, model, times, message count, parent). It is off by default.
+
+- Flag and settings: `AIS_SESSIONS_ENRICH=1` (or `true`) turns it on. Then `AIS_SESSIONS_S3_ENDPOINT`,
+  `AIS_SESSIONS_S3_BUCKET`, `AIS_SESSIONS_S3_ACCESS_KEY_ID`, `AIS_SESSIONS_S3_SECRET_ACCESS_KEY` and
+  `AIS_SESSIONS_AGE_IDENTITY` must be set. `AIS_SESSIONS_S3_PREFIX` (default none) limits which part keys the loop fetches,
+  `AIS_SESSIONS_S3_REGION` defaults to `auto`. `AIS_SESSIONS_ENRICH_INTERVAL_MS` (5000) and `AIS_SESSIONS_ENRICH_BATCH` (50)
+  are optional. A missing setting logs its name (never a value) and leaves the loop off.
+- Leader only: each pass first asks the gateway leader lock (`PgLeader`). A replica that is not the leader does nothing.
+- One pass: list files with `indexed_bytes < committed_bytes` (kinds `claude` and `codex`, oldest ingest first, at most
+  `AIS_SESSIONS_ENRICH_BATCH`), read each file's next parts (at most 16 MiB plain per file, 128 MiB per pass), fetch,
+  age decrypt, gunzip, check length and SHA-256 against the part row, split into lines and call `advanceSessionIndex`.
+  The fields and the new `scan_state` go to the row in one `UPDATE ... WHERE indexed_bytes = <value read>`. Another
+  runner that got there first makes that update a no-op, so a leader change never double-writes.
+- Resume: the stored `scan_state` is continued only when it has the known version and kind, belongs to the same path and
+  ends at `indexed_bytes`. Anything else is read again from byte 0. A crash loses nothing: the state moves only with the
+  write.
+- Errors and back-off: a file with a gap in its parts, a missing object, a decrypt or integrity failure or a storage error
+  is left unchanged and skipped by later passes (30 s, doubling, at most 30 minutes). A pass in which nothing moved
+  and storage or the database failed also slows the whole loop (5 s, doubling, at most 5 minutes).
+- The loop never writes `session_ref`: the shipper finds a session by it (tool and session id from the path), so only the
+  ingest sets it. It also lists only the newest generation of a session.
+- Not done here: identity and pool resolution, and the Codex thread name from `session_index.jsonl` (that file is marked
+  as indexed without being read).
+- Metrics (job `ais-gateway`): `ais_sessions_files_enriched_total`, `ais_sessions_enrich_parts_total`,
+  `ais_sessions_enrich_bytes_total{kind="plain|object"}`, `ais_sessions_indexer_errors_total{kind}`,
+  `ais_sessions_indexer_last_success_timestamp_seconds`, `ais_sessions_enrich_leader`, and, on the leader only,
+  `ais_sessions_unindexed_files`, `ais_sessions_unindexed_bytes`, `ais_sessions_enrich_lag_seconds`.
