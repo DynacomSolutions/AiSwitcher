@@ -14,6 +14,7 @@ import { loadGatewayGuard } from "../sync/gateway-guard.ts";
 import { storeMayHoldLogin } from "./host-login-gate.ts";
 import { isFresher, isReplacedLogin, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
 import { sha256Hex, type HomeFileKind, type HomeStoreClient } from "./home-store.ts";
+import { mergeRegistries, readRegistryBase } from "./registry-sync.ts";
 import type { RefreshGuardBackend } from "./refresh-guard.ts";
 
 /**
@@ -21,7 +22,10 @@ import type { RefreshGuardBackend } from "./refresh-guard.ts";
  * host that holds the files (`ais gateway store import`), or at gateway startup with AIS_GATEWAY_STORE_IMPORT=1 on a
  * replica whose HOME is the host's files. Re-running only uploads what changed:
  * - a path the store lacks is added;
- * - registries, host files and markers take the host copy;
+ * - host files and markers take the host copy;
+ * - a registry follows the host mirror's rule (registry-sync.ts): a host copy that did not move since it was last in step with
+ *   the store is never pushed over a newer row (a console add), a host copy that moved alone is pushed, and when both moved
+ *   (or nothing was recorded) the two are merged per identity name and the merge is pushed;
  * - a login is replaced only by a strictly fresher grant (later expiry), under the account's refresh lock, and never by
  *   a refresh token the journal shows already rotated out;
  * - the heartbeat is only seeded.
@@ -171,8 +175,26 @@ export async function importHome(
           return;
         }
       }
+      let body = content;
+      if (e.kind === "registry") {
+        const last = await readRegistryBase(home, rel);
+        if (last && last.sha === sha256Hex(content)) {
+          report.skipped.push({ path: rel, why: "the store's registry is newer and the host copy did not change" });
+          return;
+        }
+        if (!last || last.sha !== row.sha256) {
+          const merged = mergeRegistries(content.toString("utf8"), row.content.toString("utf8"));
+          if (merged) {
+            if (sha256Hex(merged) === row.sha256) {
+              report.skipped.push({ path: rel, why: "the store's registry already holds every host identity" });
+              return;
+            }
+            body = merged;
+          }
+        }
+      }
       if (!opts.dryRun) {
-        const r = await store.put(rel, content, { account: e.account, kind: e.kind, expectedVersion: row.version });
+        const r = await store.put(rel, body, { account: e.account, kind: e.kind, expectedVersion: row.version });
         if (!r.ok) return once();
       }
       report.updated.push(rel);

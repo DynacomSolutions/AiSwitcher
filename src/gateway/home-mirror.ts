@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
+import { mergeRegistries, readRegistryBase, writeRegistryBase } from "./registry-sync.ts";
 import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type HomeStoreClient } from "./home-store.ts";
 
 /**
@@ -13,8 +14,11 @@ import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type
  * - local file changed (a refresh here, a host login under a file store), row unchanged: the file is pushed
  *   (compare-and-swap on the base version, so a concurrent write elsewhere is never overwritten);
  * - both changed, or no base yet: logins go to the fresher grant (later expiry; a tie goes to the row, PostgreSQL being the
- *   source of truth); registries and host files keep the host's copy under a file store and take the row otherwise;
- *   heartbeat, markers and metadata take the row.
+ *   source of truth); host files keep the host's copy under a file store and registries are merged per identity name there
+ *   (registry-sync.ts); both take the row otherwise; heartbeat, markers and metadata take the row.
+ *
+ * Under a file store the base of a registry also lives in the ais state directory, so a restart does not lose it: a registry
+ * row that moved in the store (a console add) reaches the host file, and a host file that did not move is never pushed over it.
  *
  * With a file store (`fileStore`, this replica's HOME is the host's real files) pulls are the write-back to the files, and
  * changed host files are imported. Without one HOME is scratch and only gateway writes (refreshes, markers, heartbeat) are
@@ -262,23 +266,24 @@ export class HomeMirror {
     const write = async (): Promise<"wrote" | "kept"> => {
       if (this.fileStore && row.kind === "login" && this.keepHostLogin && (await this.keepHostLogin(row.path).catch(() => true))) return "kept";
       await writeAtomic(abs, row.content);
-      this.bases.set(row.path, { version: row.version, sha: row.sha256 });
+      await this.setBase(row.path, row.version, row.sha256);
       return "wrote";
     };
     if (this.fileStore && row.kind === "derived") return "kept";
     if (local === undefined) return write();
     const localSha = sha256Hex(local);
     if (localSha === row.sha256) {
-      this.bases.set(row.path, { version: row.version, sha: row.sha256 });
+      await this.setBase(row.path, row.version, row.sha256);
       return "same";
     }
+    if (this.fileStore && row.kind === "registry") return this.reconcileRegistry(row, abs, local, localSha, write);
     if (base && localSha === base.sha) return write();
     // The owner replaced this login with another account's: a copy still holding the replaced token never wins.
     if (row.kind === "login" && (await isReplacedLogin(this.store, row.path, local.toString("utf8")))) return write();
     const push = async (expected: number): Promise<"pushed" | "conflict"> => {
       const r = await this.store.put(row.path, local, { account: row.account, kind: row.kind, expectedVersion: expected });
       if (!r.ok) return "conflict";
-      this.bases.set(row.path, { version: r.version, sha: localSha });
+      await this.setBase(row.path, r.version, localSha);
       return "pushed";
     };
     const hostTruth = this.fileStore && (row.kind === "registry" || row.kind === "hostfile");
@@ -300,6 +305,36 @@ export class HomeMirror {
   }
 
   /**
+   * A registry under a file store (the host's real files). The base is the in-memory one, else the one recorded in the state
+   * directory (it survives a restart): host file unchanged since the base means the store moved (a console add) and the row
+   * is written to the host; row unchanged means the host moved and the host file is pushed; anything else (both moved, no
+   * base) merges per identity name (registry-sync.ts) and pushes the merge, so neither side loses an identity.
+   */
+  private async reconcileRegistry(row: HomeFileRow, abs: string, local: Buffer, localSha: string, write: () => Promise<"wrote" | "kept">): Promise<ReconcileOutcome> {
+    const last = this.bases.get(row.path) ?? (await readRegistryBase(this.home, row.path));
+    const put = async (content: Buffer): Promise<"pushed" | "conflict"> => {
+      const r = await this.store.put(row.path, content, { account: row.account, kind: row.kind, expectedVersion: row.version });
+      if (!r.ok) return "conflict";
+      await this.setBase(row.path, r.version, sha256Hex(content));
+      return "pushed";
+    };
+    if (last && last.sha === localSha) return write();
+    if (last && last.sha === row.sha256) return put(local);
+    const merged = mergeRegistries(local.toString("utf8"), row.content.toString("utf8"));
+    if (!merged) return put(local);
+    if (sha256Hex(merged) === row.sha256) return write();
+    await writeAtomic(abs, merged);
+    return put(merged);
+  }
+
+  /** Remembers the version and hash a path was last in step at; a registry under a file store also goes to the state directory. */
+  private async setBase(path: string, version: number, sha: string): Promise<void> {
+    this.bases.set(path, { version, sha });
+    if (!this.fileStore || this.kinds.get(path)?.kind !== "registry") return;
+    await writeRegistryBase(this.home, path, { version, sha }).catch((err: unknown) => this.warn(`could not record the sync state of ${path} (${(err as Error).name})`));
+  }
+
+  /**
    * A shared file (pi's auth.json, one entry per provider) changed on both sides: merge per key, write the merge locally and
    * push it against the row's version, again on a further conflict. Throws when it stays unresolved.
    */
@@ -312,13 +347,13 @@ export class HomeMirror {
       const sha = sha256Hex(merged);
       if (sha === cur.sha256) {
         await writeAtomic(this.abs(cur.path), cur.content);
-        this.bases.set(cur.path, { version: cur.version, sha: cur.sha256 });
+        await this.setBase(cur.path, cur.version, cur.sha256);
         return "wrote";
       }
       await writeAtomic(this.abs(cur.path), merged);
       const r = await this.store.put(cur.path, merged, { account: cur.account, kind: cur.kind, expectedVersion: cur.version });
       if (r.ok) {
-        this.bases.set(cur.path, { version: r.version, sha });
+        await this.setBase(cur.path, r.version, sha);
         return "pushed";
       }
       mine = merged;
@@ -383,8 +418,8 @@ export class HomeMirror {
       const known = this.kinds.get(rel);
       const r = await this.store.put(rel, local, { account: known?.account ?? account, kind: known?.kind ?? kind, expectedVersion: base ? base.version : null });
       if (r.ok) {
-        this.bases.set(rel, { version: r.version, sha });
         this.kinds.set(rel, { kind: known?.kind ?? kind, account: known?.account ?? account });
+        await this.setBase(rel, r.version, sha);
         continue;
       }
       // Someone else wrote it: reconcile against their row (fresher grant wins).
