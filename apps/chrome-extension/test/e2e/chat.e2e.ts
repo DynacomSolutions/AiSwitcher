@@ -684,6 +684,22 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       await until("star from the gateway shown", () => Q.eval<boolean>(`[...document.querySelectorAll("${detail} .picker-option")].map(o => o.textContent).join() === "Claude Opus 5.5claude-opus-5-5,Claude Sonnet 5.5claude-sonnet-5-5"`));
       await adminFavs({ method: "POST", body: JSON.stringify({ origin: "host-test", changes: [{ provider: "claude", identity: "alpha", model: "claude-sonnet-5-5", op: "remove" }] }) });
       await until("star removed at the gateway disappears", () => Q.eval<boolean>(`[...document.querySelectorAll("${detail} .picker-option")].map(o => o.textContent).join() === "Claude Opus 5.5claude-opus-5-5"`));
+      // A star on a pool row is kept under the fixed pool key, so every host and pod agrees on it whatever the pool is called.
+      const poolRow = (verb: string, model: string) => `${detail} .picker-group[aria-label='delta (pool)'] [aria-label='${verb} ${model} ${verb === "Add" ? "to" : "from"} favourites']`;
+      await clickIn(Q, `${detail} .picker-tab`, "Codex");
+      await until("pool row", () => Q.eval<boolean>(`document.querySelector(${JSON.stringify(poolRow("Add", "GPT 5.2"))}) !== null`));
+      await Q.eval(`document.querySelector(${JSON.stringify(poolRow("Add", "GPT 5.2"))}).click()`);
+      await until("pool star at the gateway", async () => (await adminFavs()).items.some(i => i.provider === "codex" && i.identity === "@pool" && i.model === "gpt-5-2"));
+      expect((await adminFavs()).items.some(i => i.identity === "delta")).toBe(false);
+      // The identity row with the same model is not starred by it.
+      expect(await Q.eval<boolean>(`document.querySelector("${detail} .picker-group[aria-label='gamma'] [aria-label='Add GPT 5.2 to favourites']") !== null`)).toBe(true);
+      // A star set at the gateway on the pool key shows on the pool row.
+      await adminFavs({ method: "POST", body: JSON.stringify({ origin: "host-test", changes: [{ provider: "codex", identity: "@pool", model: "gpt-5-mini", op: "add" }] }) });
+      await until("pool star from the gateway shown", () => Q.eval<boolean>(`document.querySelector(${JSON.stringify(poolRow("Remove", "GPT 5 Mini"))})?.getAttribute("aria-pressed") === "true"`));
+      await Q.eval(`document.querySelector(${JSON.stringify(poolRow("Remove", "GPT 5.2"))}).click()`);
+      await Q.eval(`document.querySelector(${JSON.stringify(poolRow("Remove", "GPT 5 Mini"))}).click()`);
+      await until("pool stars removed at the gateway", async () => (await adminFavs()).items.length === 1);
+      await clickIn(Q, `${detail} .picker-tab`, "Favourites");
       // Keyboard: ArrowRight switches the tab, Escape closes the popover and returns the focus to the button.
       await key(Q, "Escape");
       await until("picker closed", () => Q.eval<boolean>(`document.querySelector("${detail} .picker-pop").hidden`));
