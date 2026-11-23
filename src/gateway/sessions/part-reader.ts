@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { S3Client } from "bun";
-import { Decrypter } from "age-encryption";
 import type { SessionPartRow } from "./session-store.ts";
 import type { SessionsEnrichConfig } from "./enrich-config.ts";
 
@@ -58,6 +57,8 @@ export class S3PartSource implements PartSource {
 export async function decodePart(stored: Uint8Array, part: SessionPartRow, identity: string): Promise<string> {
   let gz: Uint8Array;
   try {
+    // Loaded on first use: every `ais` process reads its imports at start, and only a gateway with the enrichment on needs age.
+    const { Decrypter } = await import("age-encryption");
     const d = new Decrypter();
     d.addIdentity(identity);
     gz = await d.decrypt(stored);
