@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isGatewayAccessToken } from "./claude-gateway-entry.ts";
+import { GATEWAY_LIMITS_UNAVAILABLE, claudeReadsViaGateway, fetchMemberUsageViaGateway, type ClaudeGatewayUsageDeps } from "./claude-gateway-usage.ts";
 import { hasMemberCopy, memberDir, memberStoreEnabled } from "./gateway-members.ts";
 import { readProviderGrantCopy } from "./oauth-reconcile.ts";
 import { poolStoreDirsFor, refreshIdentityOAuthGrant, type FetchImpl } from "./oauth-refresh.ts";
@@ -150,7 +151,7 @@ export function parseUsageBody(body: unknown, capturedAt: string = new Date().to
   };
 }
 
-export interface FetchUsageDeps {
+export interface FetchUsageDeps extends ClaudeGatewayUsageDeps {
   fetchImpl?: FetchImpl;
   now?: () => number;
   /** Test hook: claude registry listing swap pools. */
@@ -288,6 +289,8 @@ export async function fetchUsageBodyWithResets(
   member: Identity,
   deps: FetchUsageDeps = {},
 ): Promise<{ body?: unknown; error?: string; status?: number }> {
+  // A login the gateway holds is read through the gateway only (claude-gateway-usage.ts): never a second poll of Anthropic.
+  if (claudeReadsViaGateway(member, deps.memberRoot)) return { error: `${GATEWAY_LIMITS_UNAVAILABLE}: the gateway holds this login; its raw usage body is not read from this host` };
   try {
     const cacheDir = deps.cacheDir ?? aisCacheDir();
     const nowMs = deps.now?.() ?? Date.now();
@@ -309,6 +312,8 @@ const EXTRA_USAGE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 /** Live reads refresh the shared last-good file; rate-limited/failed reads inherit its fresh-enough extra usage, marked stale. */
 export async function fetchMemberUsage(member: Identity, deps: FetchUsageDeps = {}): Promise<MemberUsage> {
+  // A login the gateway holds: the gateway read is the only source (it polls Anthropic itself; a second poll draws a 429).
+  if (claudeReadsViaGateway(member, deps.memberRoot)) return fetchMemberUsageViaGateway(member, deps);
   const cacheDir = deps.cacheDir ?? aisCacheDir();
   const usage = await readMemberUsage(member, deps, cacheDir);
   if (usage.status === "live") return usage;

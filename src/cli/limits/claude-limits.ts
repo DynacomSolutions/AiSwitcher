@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 import type { Identity } from "../../identities/types.ts";
 import { FRESH_READ_TTL_MS, freshLastGood, fetchUsageBodyWithResets, manualResetFromCedarEmber, carriedManualReset, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
+import { claudeReadsViaGateway, fetchClaudeLimitsViaGateway, type ClaudeGatewayUsageDeps } from "../../identities/claude-gateway-usage.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { AIS_LIMITS_PROBE_ENV, isLimitsProbe } from "../../shared/limits-probe.ts";
@@ -200,7 +201,7 @@ export function overageFromUsageText(stdout: string): OverageInfo | undefined {
  * observed live (every identity on this machine turned out to be logged in
  * once the env-stripping bug was fixed), so we don't try to infer it from
  * text parsing. */
-export interface ClaudeLimitsDeps {
+export interface ClaudeLimitsDeps extends ClaudeGatewayUsageDeps {
   /** Test hooks. */
   fetchBody?: typeof fetchUsageBodyWithResets;
   cacheDir?: string;
@@ -278,6 +279,10 @@ function grantsCurrent(read: FetchedLimitResult, nowMs: number): boolean {
 export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDeps = {}): Promise<FetchedLimitResult> {
   const cacheDir = deps.cacheDir ?? aisCacheDir();
   const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "claude", identity };
+
+  // A login the gateway holds is read from the gateway admin API only. The gateway polls Anthropic for it; a second poll from
+  // this host draws a 429 and stale figures. No reconcile, no binary and no direct call: a failed gateway read is "unavailable".
+  if (claudeReadsViaGateway(identity, deps.memberRoot)) return fetchClaudeLimitsViaGateway(identity, deps);
 
   // ONE reconcile per fetch, before the binary runs: pi may hold a fresher
   // copy of this account's grant (claude's own copy goes stale whenever pi

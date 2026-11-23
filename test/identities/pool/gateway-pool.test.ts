@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,10 @@ import { runSwapCommand } from "../../../src/cli/swap/dispatch.ts";
 import { fetchCodexLimits, fetchCodexLimitsViaGateway, fetchCodexLimitsViaStore, snapshotFromWham } from "../../../src/cli/limits/codex-limits.ts";
 import { gatewayEntryText } from "../../../src/identities/claude-gateway-entry.ts";
 import { performSwap as performClaudeSwap } from "../../../src/identities/claude-swap.ts";
-import { fetchMemberUsage } from "../../../src/identities/claude-usage-api.ts";
+import { fetchClaudeLimits } from "../../../src/cli/limits/claude-limits.ts";
+import { claudeReadsViaGateway } from "../../../src/identities/claude-gateway-usage.ts";
+import { poolStatus } from "../../../src/identities/claude-swap-ops.ts";
+import { fetchMemberUsage, fetchUsageBodyWithResets } from "../../../src/identities/claude-usage-api.ts";
 import { classifyLogin } from "../../../src/identities/gateway-routed.ts";
 import { codexAdapter, codexMemberProblem, codexTuning } from "../../../src/identities/pool/codex-adapter.ts";
 import { codexPoolEntryText, isCodexGatewayPoolDir, isGatewayRoutedPool } from "../../../src/identities/pool/gateway-pool.ts";
@@ -352,26 +355,168 @@ describe("claude: gateway-routed pools and members", () => {
     expect(await read("pool", ".credentials.json")).toBe(claudeLogin("pool-old", 1));
   });
 
-  test("usage of a routed member is read with the member store token and never refreshed", async () => {
-    await claudeSetup(true);
-    const seen: string[] = [];
-    const fetchImpl = (async (_url: string, init: RequestInit) => {
-      seen.push((init.headers as Record<string, string>).Authorization ?? "");
-      return new Response(JSON.stringify({ five_hour: { utilization: 12, resets_at: null }, seven_day: { utilization: 34, resets_at: null } }), { status: 200 });
+  const claudeRow = (name: string, extra: Record<string, unknown> = {}) => ({
+    provider: "claude",
+    identity: name,
+    status: "live",
+    capturedAt: "2026-11-24T03:00:00.000Z",
+    windows: [
+      { label: "five-hour", utilization: 12, resetsAt: "2026-11-24T08:00:00.000Z" },
+      { label: "seven-day", utilization: 34, resetsAt: "2026-11-30T08:00:00.000Z" },
+      { label: "seven-day (Fable)", utilization: 5, model: "Fable", resetsAt: "2026-11-30T08:00:00.000Z" },
+    ],
+    manualReset: { availableCount: 1, grants: [{ id: "full-reset-2611", kind: "full", resetsLeft: 1, usableNow: true, paused: false }] },
+    ...extra,
+  });
+  const withAdmin = () => writeFile(join(root, "secrets"), `AIS_GATEWAY_ADMIN_URL=https://gw.test/admin/\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_admin_token\n`);
+  const noAnthropic = (async (url: string) => {
+    throw new Error(`the host must not call Anthropic (${url})`);
+  }) as unknown as typeof fetch;
+  const gatewayFetch = (body: unknown, calls: string[] = [], status = 200) =>
+    (async (url: string) => {
+      calls.push(url);
+      return new Response(JSON.stringify(body), { status });
     }) as unknown as typeof fetch;
+
+  test("usage of a routed member comes from the gateway /limits row; Anthropic is never called", async () => {
+    await claudeSetup(true);
+    await withAdmin();
+    const calls: string[] = [];
     const member = { name: "a", label: "a", configDir: dirOf("a") };
-    const usage = await fetchMemberUsage(member, { fetchImpl, claudeRegistryPath: registry, cacheDir: join(root, "cache") });
+    const usage = await fetchMemberUsage(member, { fetchImpl: noAnthropic, claudeRegistryPath: registry, cacheDir: join(root, "cache"), gateway: { fetch: gatewayFetch({ limits: [claudeRow("a")] }, calls) } });
     expect(usage.status).toBe("live");
     expect(usage.maxUtilization).toBe(34);
-    expect(seen.every((h) => h === "Bearer sk-ant-SYNTHETIC_FIXTURE-a")).toBe(true);
+    expect(usage.fiveHour?.utilization).toBe(12);
+    expect(usage.scoped).toEqual([{ model: "Fable", utilization: 5, resetsAt: "2026-11-30T08:00:00.000Z" }]);
+    expect(usage.capturedAt).toBe("2026-11-24T03:00:00.000Z");
+    expect(usage.manualReset?.grants?.[0]).toMatchObject({ id: "full-reset-2611", usableNow: true });
+    expect(calls).toEqual(["https://gw.test/admin/limits?provider=claude&identity=a"]);
+    // the store copy is untouched and no host usage cache is written
+    expect(await readFile(storeFile("claude", "a", ".credentials.json"), "utf8")).toContain("sk-ant-SYNTHETIC_FIXTURE-a");
+    expect(existsSync(join(root, "cache"))).toBe(false);
+  });
 
-    // an expired store copy: reported, no refresh request
-    await putStore("claude", "b", ".credentials.json", claudeLogin("b", 1));
-    seen.length = 0;
-    const expired = await fetchMemberUsage({ name: "b", label: "b", configDir: dirOf("b") }, { fetchImpl, claudeRegistryPath: registry, cacheDir: join(root, "cache") });
-    expect(expired.status).toBe("unavailable");
-    expect(expired.error).toContain("the AIS gateway renews it");
-    expect(seen).toHaveLength(0);
+  test("a pool status on a routed host reads every member from the gateway", async () => {
+    await claudeSetup(true);
+    await withAdmin();
+    const calls: string[] = [];
+    const rows = [claudeRow("a"), claudeRow("b", { windows: [{ label: "five-hour", utilization: 80 }, { label: "seven-day", utilization: 90 }] })];
+    const gateway = { fetch: (async (url: string) => {
+      calls.push(url);
+      const identity = new URL(url).searchParams.get("identity");
+      return new Response(JSON.stringify({ limits: rows.filter((r) => r.identity === identity) }), { status: 200 });
+    }) as unknown as typeof fetch };
+    const status = await poolStatus({ registryPath: registry, ledgerPath: ledger, fetchImpl: noAnthropic, cacheDir: join(root, "cache"), gateway }, "pool");
+    expect(status.rows.map((r) => [r.name, r.usage?.status, r.usage?.maxUtilization])).toEqual([["a", "live", 34], ["b", "live", 90]]);
+    expect(calls).toHaveLength(2);
+  });
+
+  test("limits of a routed identity come from the gateway; no binary, no Anthropic call", async () => {
+    await claudeSetup(true);
+    await withAdmin();
+    const identity = { name: "a", label: "a", configDir: dirOf("a") };
+    const r = await fetchClaudeLimits(identity, {
+      cacheDir: join(root, "cache"),
+      gateway: { fetch: gatewayFetch({ limits: [claudeRow("a")] }) },
+      fetchBody: async () => {
+        throw new Error("the host must not read the usage body");
+      },
+      reconcile: async () => {
+        throw new Error("the host must not reconcile a gateway-held login");
+      },
+      run: async () => {
+        throw new Error("the host must not start claude");
+      },
+    });
+    expect(r.status).toBe("live");
+    expect(r.windows.map((w) => [w.label, w.usedPercent])).toEqual([["session (5h)", 12], ["week (all)", 34], ["week (Fable)", 5]]);
+    expect(r.manualReset?.grants?.[0]?.id).toBe("full-reset-2611");
+    expect(r.identity).toBe(identity);
+  });
+
+  test("a stale gateway row is not a live reading", async () => {
+    await claudeSetup(true);
+    await withAdmin();
+    const member = { name: "a", label: "a", configDir: dirOf("a") };
+    const usage = await fetchMemberUsage(member, { fetchImpl: noAnthropic, cacheDir: join(root, "cache"), gateway: { fetch: gatewayFetch({ limits: [claudeRow("a", { status: "rate-limited", stale: true })] }) } });
+    expect(usage.status).toBe("rate-limited");
+    expect(usage.maxUtilization).toBe(34);
+  });
+
+  test("gateway down: a clear 'gateway limits unavailable' state, never a direct Anthropic call", async () => {
+    await claudeSetup(true);
+    const member = { name: "a", label: "a", configDir: dirOf("a") };
+    const cacheDir = join(root, "cache");
+    const down = (async () => {
+      throw new Error("connect refused");
+    }) as unknown as typeof fetch;
+    const saved = { url: process.env.AIS_GATEWAY_ADMIN_URL, token: process.env.AIS_GATEWAY_ADMIN_TOKEN };
+    delete process.env.AIS_GATEWAY_ADMIN_URL;
+    delete process.env.AIS_GATEWAY_ADMIN_TOKEN;
+    try {
+      // not configured
+      await writeFile(join(root, "secrets"), "");
+      const unconfigured = await fetchMemberUsage(member, { fetchImpl: noAnthropic, cacheDir });
+      expect(unconfigured.status).toBe("unavailable");
+      expect(unconfigured.error).toContain("gateway limits unavailable");
+      expect(unconfigured.error).toContain("not configured");
+
+      await withAdmin();
+      // unreachable, an error status and an unknown identity
+      for (const [fetchGateway, reason] of [[down, "admin unreachable"], [gatewayFetch({}, [], 503), "admin answered 503"], [gatewayFetch({ limits: [] }), "no usage for this identity"]] as const) {
+        const usage = await fetchMemberUsage(member, { fetchImpl: noAnthropic, cacheDir, gateway: { fetch: fetchGateway } });
+        expect(usage).toMatchObject({ status: "unavailable" });
+        expect(usage.error).toContain("gateway limits unavailable");
+        expect(usage.error).toContain(reason);
+        const limits = await fetchClaudeLimits(member, { cacheDir, gateway: { fetch: fetchGateway }, fetchBody: async () => { throw new Error("no direct read"); } });
+        expect(limits).toMatchObject({ status: "unavailable", windows: [] });
+        expect(limits.error).toContain("gateway limits unavailable");
+      }
+      // the raw body read refuses too, with no request
+      const body = await fetchUsageBodyWithResets(member, { fetchImpl: noAnthropic, cacheDir });
+      expect(body.body).toBeUndefined();
+      expect(body.error).toContain("gateway limits unavailable");
+      expect(existsSync(join(cacheDir, "claude-usage-backoff"))).toBe(false);
+    } finally {
+      if (saved.url !== undefined) process.env.AIS_GATEWAY_ADMIN_URL = saved.url;
+      if (saved.token !== undefined) process.env.AIS_GATEWAY_ADMIN_TOKEN = saved.token;
+    }
+  });
+
+  test("an identity the gateway does not hold keeps the direct read and never asks the gateway", async () => {
+    await claudeSetup(true);
+    await withAdmin();
+    // c: a real login in its own folder, no member store copy
+    await put("c", ".credentials.json", claudeLogin("c", Date.now() + 3_600_000));
+    const member = { name: "c", label: "c", configDir: dirOf("c") };
+    const seen: Array<{ url: string; auth: string }> = [];
+    const fetchImpl = (async (url: string, init: RequestInit) => {
+      seen.push({ url, auth: (init.headers as Record<string, string>).Authorization ?? "" });
+      return new Response(JSON.stringify({ five_hour: { utilization: 12, resets_at: null }, seven_day: { utilization: 34, resets_at: null } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const gatewayCalls: string[] = [];
+    const usage = await fetchMemberUsage(member, { fetchImpl, claudeRegistryPath: registry, cacheDir: join(root, "cache"), gateway: { fetch: gatewayFetch({ limits: [] }, gatewayCalls) } });
+    expect(usage.status).toBe("live");
+    expect(usage.maxUtilization).toBe(34);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.url).toContain("api.anthropic.com/api/oauth/usage");
+    expect(seen[0]!.auth).toBe("Bearer sk-ant-SYNTHETIC_FIXTURE-c");
+    expect(gatewayCalls).toHaveLength(0);
+
+    // a member with a member store copy but its own real login in the folder is a separate login: direct too
+    await put("d", ".credentials.json", claudeLogin("d", Date.now() + 3_600_000));
+    await putStore("claude", "d", ".credentials.json", claudeLogin("d-store", Date.now() + 3_600_000));
+    expect(claudeReadsViaGateway({ name: "d", label: "d", configDir: dirOf("d") })).toBe(false);
+    expect(claudeReadsViaGateway({ name: "a", label: "a", configDir: dirOf("a") })).toBe(true);
+    // a gateway process reads its own store copy, never its own admin API
+    const savedStore = process.env.AIS_GATEWAY_MEMBER_STORE;
+    process.env.AIS_GATEWAY_MEMBER_STORE = "1";
+    try {
+      expect(claudeReadsViaGateway({ name: "a", label: "a", configDir: dirOf("a") })).toBe(false);
+    } finally {
+      if (savedStore === undefined) delete process.env.AIS_GATEWAY_MEMBER_STORE;
+      else process.env.AIS_GATEWAY_MEMBER_STORE = savedStore;
+    }
   });
 });
 
