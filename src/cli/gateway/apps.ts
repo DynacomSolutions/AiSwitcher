@@ -39,14 +39,22 @@ async function localIsPoolName(provider: string, name: string): Promise<boolean>
 async function rejectPoolPin(deps: GatewayCliDeps, provider: string, target: AppTarget | undefined, flagged: boolean): Promise<void> {
   if (!flagged || target?.kind !== "pin" || target.identity === undefined) return;
   if (await (deps.isPoolName ?? localIsPoolName)(provider, target.identity)) {
-    throw new CliUsageError(`"${target.identity}" is a swap pool, not one account: --identity would pin to the pool's active login only. Use --pool --identities=<members> instead`);
+    throw new CliUsageError(`"${target.identity}" is a swap pool, not one account: --identity would pin to the pool's active login only. Use --pool instead`);
   }
+}
+
+/** Said when `--identities` is used. A pool app uses every live pool member. */
+const POOL_LIST_REFUSED = "pool apps follow the live pool; member lists are not accepted";
+
+/** The target of a stored app for an update. An old member list on a pool is dropped. */
+function currentTarget(t: unknown): AppTarget {
+  const target = t as AppTarget & { identities?: unknown };
+  return target?.kind === "pool" ? { kind: "pool" } : target;
 }
 
 interface AppTarget {
   kind: "pin" | "pool";
   identity?: string;
-  identities?: string[];
 }
 
 interface AppBody {
@@ -109,16 +117,10 @@ function targetFromFlags(flags: Flags, required: boolean): AppTarget | undefined
   const pool = flags.pool !== undefined;
   const identity = stringFlag(flags, "identity");
   if (pool && identity !== undefined) throw new CliUsageError("Use either --pool or --identity=<id>, not both");
-  if (identity !== undefined) {
-    if (flags.identities !== undefined) throw new CliUsageError("--identities only applies with --pool");
-    return { kind: "pin", identity };
-  }
-  if (pool) {
-    const identities = listFlag(flags, "identities");
-    return identities && identities.length > 0 ? { kind: "pool", identities } : { kind: "pool" };
-  }
-  if (flags.identities !== undefined) throw new CliUsageError("--identities only applies with --pool");
-  if (required) throw new CliUsageError("Choose a target: --pool [--identities=a,b] or --identity=<id>");
+  if (flags.identities !== undefined) throw new CliUsageError(POOL_LIST_REFUSED);
+  if (identity !== undefined) return { kind: "pin", identity };
+  if (pool) return { kind: "pool" };
+  if (required) throw new CliUsageError("Choose a target: --pool or --identity=<id>");
   return undefined;
 }
 
@@ -282,13 +284,14 @@ export async function runAppCommand(action: string | undefined, positionals: str
     }
     case "update": {
       const name = appName(positionals);
+      if (flags.identities !== undefined) throw new CliUsageError(POOL_LIST_REFUSED);
       const { json: cur } = await admin.call("GET", `/apps/${name}`);
       const body: AppBody = {
         owner: stringFlag(flags, "owner") ?? str(cur.owner),
         namespace: stringFlag(flags, "namespace") ?? str(cur.namespace),
         provider: stringFlag(flags, "provider") ?? str(cur.provider),
         style: stringFlag(flags, "style") ?? str(cur.style),
-        target: targetFromFlags(flags, false) ?? (cur.target as AppTarget),
+        target: targetFromFlags(flags, false) ?? currentTarget(cur.target),
       };
       await rejectPoolPin(deps, body.provider, body.target, stringFlag(flags, "identity") !== undefined);
       for (const k of ["models", "dailyTokens", "reservePercent"] as const) if (cur[k] !== undefined) (body as unknown as Record<string, unknown>)[k] = cur[k];
@@ -333,7 +336,7 @@ function targetText(t: unknown): string {
   const target = t as AppTarget | undefined;
   if (!target) return "";
   if (target.kind === "pin") return `pin:${target.identity}`;
-  return target.identities ? `pool:${target.identities.join(",")}` : "pool";
+  return "pool";
 }
 
 export function table(head: string[], rows: string[][]): string {

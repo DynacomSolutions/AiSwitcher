@@ -228,8 +228,8 @@ describe("pool model lists are the union of every member's list", () => {
     expect(requests.at(-1)).toMatchObject({ status: "upstream_error", httpStatus: 429 });
   });
 
-  test("only the members the app may use are asked", async () => {
-    await addApp("mc", "codex", "openai", { target: { kind: "pool", identities: ["a"] } });
+  test("a pin asks only its own member", async () => {
+    await addApp("mc", "codex", "openai", { target: { kind: "pin", identity: "a" } });
     reply = (s) => jsonRes(memberOf(s) === "a" ? codexSmall : codexLarge);
     const res = await call("mc", "/models", { method: "GET" });
     expect(seen.map(memberOf)).toEqual(["a"]);
@@ -792,22 +792,6 @@ describe("claude account paths", () => {
     const res = await call("cl", "/api/oauth/profile", { method: "GET" });
     for (const h of ["set-cookie", "www-authenticate", "x-api-key", "authorization", "keep-alive"]) expect(res.headers.get(h)).toBeNull();
     expect(res.headers.get("content-type")).toBe("application/json");
-  });
-  test("an account route respects the pool's identity narrowing: owner probe and least-used pick stay inside the set", async () => {
-    await addApp("cl", "claude", "anthropic", { target: { kind: "pool", identities: ["b"] } });
-    usage.a = { status: "live", maxUtilization: 1, capturedAt: "" };
-    usage.b = { status: "live", maxUtilization: 90, capturedAt: "" };
-    reply = (s) => {
-      const path = new URL(s.url).pathname;
-      if (path === "/api/oauth/usage") return Response.json({ cedar_ember: { grants: [{ id: "grant-of-a" }] } }); // everyone "owns" it; only b may be asked
-      if (path === "/api/oauth/profile") return Response.json({ organization: { uuid: "org-of-b" } });
-      return Response.json({ result: "reset" });
-    };
-    await call("cl", "/api/organizations/org-x/reset_rate_limits", { method: "POST", body: '{"grant_id":"grant-of-a"}' });
-    expect(seen.length).toBeGreaterThan(0);
-    expect(seen.every((x) => x.headers.get("authorization") === "Bearer tok-b")).toBe(true);
-    await call("cl", "/api/oauth/profile", { method: "GET" });
-    expect(seen.every((x) => x.headers.get("authorization") === "Bearer tok-b")).toBe(true);
   });
   test("an org that cannot be read is fail-closed: 502 and the client's org is never sent", async () => {
     await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });

@@ -1169,25 +1169,6 @@ describe("failover and refresh", () => {
     expect(await res.text()).not.toContain("logged out");
   });
 
-  test("a hold on a member outside the app's pool does not change its quota rejection", async () => {
-    const week = Math.floor(NOW.getTime() / 1000) + 3 * 86400;
-    usage.a = { ...live(100), windows: [{ label: "seven_day", utilization: 100, resetsAt: new Date(week * 1000).toISOString() }] };
-    usage.b = live(10);
-    usage.c = live(10);
-    deps.poolMembers = async () => ["a", "b", "c"];
-    const get = deps.creds.get.bind(deps.creds);
-    deps.creds = { ...deps.creds, get: async (p: GatewayApp["provider"], id: string) => { if (id === "c") throw new GatewayCredentialError("login-dead", p, id); return get(p, id); } } as GatewayDeps["creds"];
-    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-b" ? new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(week) } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
-    const tx = await addApp(baseApp({ name: "x", target: { kind: "pool", identities: ["a", "b"] } }));
-    const ty = await addApp(baseApp({ name: "y", target: { kind: "pool", identities: ["c"] } }));
-    const gw = createGatewayApp(deps);
-    const go = (path: string, token: string) => gw.request(`http://gw.test${path}`, { method: "POST", body: "{}", headers: { authorization: `Bearer ${token}` } });
-    expect((await go("/x/v1/messages", tx)).status).toBe(429);
-    expect((await go("/y/v1/messages", ty)).status).toBe(502);
-    const res = await go("/x/v1/messages", tx);
-    expect(res.status).toBe(429);
-    expect(await res.text()).not.toContain("logged out");
-  });
 
   test("all members exhausted gives one 429 with a reason in the log", async () => {
     const gw = createGatewayApp(deps);

@@ -319,7 +319,7 @@ describe("a session poisoned by a failed upload", () => {
   });
 
   test("a pool app is repaired with the member that answered", async () => {
-    token = await addApp(app({ name: "kp", target: { kind: "pool", identities: ["id1"] } }));
+    token = await addApp(app({ name: "kp", target: { kind: "pool" } }));
     kimi.files.set("file_bad", "error");
     const res = await call("/kp/v1/chat/completions", { method: "POST", body: conversation(["file_bad"]) });
     expect(res.status).toBe(200);
@@ -327,7 +327,7 @@ describe("a session poisoned by a failed upload", () => {
   });
 
   test("a pool app keeps a file its member does not have: another member may hold it", async () => {
-    token = await addApp(app({ name: "kp", target: { kind: "pool", identities: ["id1"] } }));
+    token = await addApp(app({ name: "kp", target: { kind: "pool" } }));
     const res = await call("/kp/v1/chat/completions", { method: "POST", body: conversation(["file_elsewhere"]) });
     expect(res.status).toBe(404);
     expect(kimi.seen.length).toBe(1);

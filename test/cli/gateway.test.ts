@@ -61,7 +61,7 @@ describe("pool name as pinned identity", () => {
   const PIN = "gateway app add billing --namespace=shop --provider=claude";
 
   test("add rejects a pool name before any write", async () => {
-    await expect(run(`${PIN} --identity=shared-pool`, { isPoolName })).rejects.toThrow(/--pool --identities=<members>/);
+    await expect(run(`${PIN} --identity=shared-pool`, { isPoolName })).rejects.toThrow(/swap pool.*Use --pool instead/);
     expect(calls.some((c) => c.method === "PUT")).toBe(false);
   });
 
@@ -187,6 +187,22 @@ describe("other commands", () => {
     await expect(run("gateway app rotate billing")).rejects.toThrow(/revoked.*Register a new name/);
     expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
     expect(kube).toHaveLength(0);
+  });
+
+  test("add and update refuse --identities", async () => {
+    await expect(run("gateway app add billing --namespace=shop --provider=claude --pool --identities=a,b")).rejects.toThrow(/pool apps follow the live pool; member lists are not accepted/);
+    await expect(run("gateway app update billing --pool --identities=a")).rejects.toThrow(/member lists are not accepted/);
+    await expect(run("gateway app add billing --namespace=shop --provider=claude --identity=work --identities=a")).rejects.toThrow(/member lists are not accepted/);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  test("update drops a stored legacy member list", async () => {
+    respond = (_u, m) =>
+      m === "GET"
+        ? Response.json({ name: "billing", owner: "o", namespace: "shop", provider: "claude", style: "anthropic", target: { kind: "pool", identities: ["old"] }, state: "active", createdAt: "x", tokens: [] })
+        : Response.json({ name: "billing" });
+    await run("gateway app update billing --daily-tokens=5000");
+    expect(calls[1]!.body).toEqual({ owner: "o", namespace: "shop", provider: "claude", style: "anthropic", target: { kind: "pool" }, dailyTokens: 5000 });
   });
 
   test("update merges flags over the current app", async () => {

@@ -898,7 +898,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     };
     for (const app of await store.listApps()) {
       if (app.state !== "active") continue;
-      const listed = app.target.kind === "pin" ? [app.target.identity] : (app.target.identities ?? []);
+      const listed = app.target.kind === "pin" ? [app.target.identity] : [];
       for (const identity of listed) {
         try {
           await creds.get(app.provider, identity);
@@ -908,8 +908,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         }
         await prefill(app.provider, identity);
       }
-      // A pool with no list may use any current member.
-      if (app.target.kind === "pool" && listed.length === 0) {
+      // A pool app may use any current member.
+      if (app.target.kind === "pool") {
         for (const member of await poolMembers(app.provider).catch(() => [] as string[])) await prefill(app.provider, member);
       }
     }

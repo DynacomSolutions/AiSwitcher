@@ -82,8 +82,13 @@ function bearer(req: Request): string {
 /** Token metadata for listings: prefix and dates only, never the hash. */
 const tokenView = (t: TokenRecord) => ({ prefix: t.prefix, createdAt: t.createdAt, ...(t.expiresAt !== undefined ? { expiresAt: t.expiresAt } : {}) });
 
+/** Said when a request names pool members. A pool app uses every live pool member of its provider. */
+export const POOL_LIST_REFUSED = "pool apps follow the live pool; member lists are not accepted";
+
 async function appView(store: GatewayStore, app: GatewayApp) {
-  return { ...app, tokens: (await store.tokensFor(app.name)).map(tokenView) };
+  // An old stored row may still hold a member list: it is ignored, so it is not shown either.
+  const target = app.target.kind === "pool" ? { kind: "pool" as const } : app.target;
+  return { ...app, target, tokens: (await store.tokensFor(app.name)).map(tokenView) };
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -111,8 +116,8 @@ function parseAppBody(raw: unknown): Pick<GatewayApp, "owner" | "namespace" | "p
     if (typeof target.identity !== "string" || !target.identity) return "target.identity is required for a pin";
     t = { kind: "pin", identity: target.identity };
   } else if (target.kind === "pool") {
-    if (target.identities !== undefined && !isStrings(target.identities)) return "target.identities must be a list of names";
-    t = target.identities === undefined ? { kind: "pool" } : { kind: "pool", identities: target.identities };
+    if (target.identities !== undefined) return POOL_LIST_REFUSED;
+    t = { kind: "pool" };
   } else {
     return "target.kind must be pin or pool";
   }
@@ -322,10 +327,10 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const existing = await read.getApp(name);
     if (existing?.state === "revoked") return err(409, revokedMessage(name));
     try {
-    for (const identity of parsed.target.kind === "pin" ? [parsed.target.identity] : (parsed.target.identities ?? [])) {
+    for (const identity of parsed.target.kind === "pin" ? [parsed.target.identity] : []) {
       const state = (await deps.identityState?.(parsed.provider, identity)) ?? "ok";
       if (state === "pool") {
-        return err(400, `"${identity}" is a swap pool, not one account: a pin would only ever use the pool's active login. Use target kind "pool" with identities set to the member accounts (CLI: --pool --identities=<members>)`);
+        return err(400, `"${identity}" is a swap pool, not one account: a pin would only ever use the pool's active login. Use target kind "pool": it uses every pool member (CLI: --pool)`);
       }
       if (state !== "ok") return err(400, `identity "${identity}" is ${state === "retired" ? "retired" : "not a known"} ${parsed.provider} identity`);
     }

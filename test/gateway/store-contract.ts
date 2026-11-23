@@ -37,7 +37,7 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(await s.getApp("a")).toBeUndefined();
     const full: GatewayApp = {
       ...base,
-      target: { kind: "pool", identities: ["x", "y"] },
+      target: { kind: "pool" },
       models: ["m1"],
       dailyTokens: 1000,
       reservePercent: 10,

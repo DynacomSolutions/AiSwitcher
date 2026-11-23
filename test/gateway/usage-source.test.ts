@@ -195,9 +195,9 @@ describe("empty pool", () => {
   test("a provider with no identities is its own rejection", async () => {
     expect(await pickIdentity(pool, { usageFor: async () => undefined, poolMembers: async () => [] })).toEqual({ reject: "no-identities" });
   });
-  test("an allow-list that matches no member is its own rejection", async () => {
-    const limited: GatewayApp = { ...app, target: { kind: "pool", identities: ["ghost"] } };
-    expect(await pickIdentity(limited, { usageFor: async () => undefined, poolMembers: async () => ["a"] })).toEqual({ reject: "no-identities" });
+  test("a stored member list is ignored: the live pool decides", async () => {
+    const legacy = { ...app, target: { kind: "pool", identities: ["ghost"] } } as unknown as GatewayApp;
+    expect(await pickIdentity(legacy, { usageFor: async () => undefined, poolMembers: async () => ["a"] })).toEqual({ identity: "a" });
   });
   test("members that are all over the reserve stay no-headroom", async () => {
     const full = async (): Promise<PoolUsage> => ({ status: "live", maxUtilization: 99, capturedAt: "x" });
@@ -217,11 +217,19 @@ describe("pool selection details", () => {
     expect(await pickIdentity(pool, { usageFor: usageFor as never, poolMembers: async () => ["a", "b"] })).toEqual({ identity: "b" });
   });
 
-  test("an alias in the identities list matches the canonical member", async () => {
-    const listed: GatewayApp = { ...app, target: { kind: "pool", identities: ["work-alias"] } };
-    const canonical = async (_p: string, i: string): Promise<string> => (i === "work-alias" ? "work" : i);
-    const r = await pickIdentity(listed, { usageFor: async () => undefined, poolMembers: async () => ["other", "work"], canonical });
-    expect(r).toEqual({ identity: "work" });
+  test("a member that joins the pool is picked by an existing pool app", async () => {
+    let members = ["old"];
+    const full = async (_p: string, i: string): Promise<PoolUsage> => ({ status: "live", maxUtilization: i === "old" ? 100 : 10, capturedAt: "x" });
+    const deps = { usageFor: full as never, poolMembers: async () => members };
+    expect(await pickIdentity(pool, deps)).toEqual({ reject: "no-headroom" });
+    members = ["old", "new"];
+    expect(await pickIdentity(pool, deps)).toEqual({ identity: "new" });
+  });
+
+  test("a stored member list does not hide a new member", async () => {
+    const legacy = { ...app, target: { kind: "pool", identities: ["old"] } } as unknown as GatewayApp;
+    const usageFor = async (_p: string, i: string): Promise<PoolUsage> => ({ status: "live", maxUtilization: i === "old" ? 100 : 10, capturedAt: "x" }) as PoolUsage;
+    expect(await pickIdentity(legacy, { usageFor: usageFor as never, poolMembers: async () => ["old", "new"] })).toEqual({ identity: "new" });
   });
 });
 
