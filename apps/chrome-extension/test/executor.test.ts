@@ -867,6 +867,72 @@ describe("JavaScript dialogs", () => {
     expect((await executor.run(call("javascript", { tabId: tab.id, code: "1" }))).ok).toBe(true);
   });
 
+  describe("close_tab on tabs that do not answer the debugger", () => {
+    test("a discarded or frozen tab closes with no attach call", async () => {
+      for (const flag of ["discarded", "frozen"] as const) {
+        const { api, tabs, executor } = setup();
+        const tab = await tabs.create(session);
+        api.tabList.get(tab.id)![flag] = true;
+        let attaches = 0;
+        const attach = api.debugger.attach;
+        api.debugger.attach = async id => { attaches++; await attach(id); };
+        expect((await executor.run(call("close_tab", { tabId: tab.id }))).ok).toBe(true);
+        expect(attaches).toBe(0);
+        expect(api.tabList.has(tab.id)).toBe(false);
+        expect(tabs.owns("s1", tab.id, "dyn")).toBe(false);
+      }
+    });
+
+    test("a tab whose attach times out still closes", async () => {
+      const { api, tabs, executor } = setup(undefined, { defaultTimeoutMs: 5000, attachAnswerMs: 50 });
+      api.cdpResults["Page.enable"] = never;
+      const tab = await tabs.create(session);
+      expect(textOf(await executor.run(call("close_tab", { tabId: tab.id })))).toContain(`Closed tab ${tab.id}.`);
+      expect(api.tabList.has(tab.id)).toBe(false);
+      expect(tabs.owns("s1", tab.id, "dyn")).toBe(false);
+    });
+
+    test("a Stop while the attach waits on a slow page leaves the tab open when the attach ends unresponsive", async () => {
+      const { api, state, tabs, executor } = setup(undefined, { defaultTimeoutMs: 5000, attachAnswerMs: 60 });
+      api.cdpResults["Page.enable"] = never;
+      const tab = await tabs.create(session);
+      const pending = executor.run(call("close_tab", { tabId: tab.id }));
+      await new Promise(r => setTimeout(r, 10)); // the attach is waiting for the page
+      await state.stop();
+      expect(await pending).toMatchObject({ ok: false, error: "stopped_by_user" });
+      await new Promise(r => setTimeout(r, 120)); // the attach gives up and the dispatch unwinds
+      expect(api.tabList.has(tab.id)).toBe(true);
+      expect(tabs.owns("s1", tab.id, "dyn")).toBe(true);
+    });
+
+    test("an abort on a discarded tab leaves it open and does not return ok", async () => {
+      const { api, state, tabs, executor } = setup();
+      const tab = await tabs.create(session);
+      api.tabList.get(tab.id)!.discarded = true;
+      const realGet = api.tabs.get;
+      const req = call("close_tab", { tabId: tab.id });
+      // The abort lands while the discarded flag is read, before the tab is removed.
+      api.tabs.get = async id => { const t = await realGet(id); if (t?.discarded) state.abort(req.id); return t; };
+      const r = await executor.run(req);
+      await new Promise(res => setTimeout(res, 20));
+      expect(r.ok).toBe(false);
+      expect(api.tabList.has(tab.id)).toBe(true);
+      expect(tabs.owns("s1", tab.id, "dyn")).toBe(true);
+    });
+
+    test("a tab that stays open after remove gives the timeout error and stays owned", async () => {
+      const { api, tabs, executor } = setup(undefined, { defaultTimeoutMs: 20000, attachAnswerMs: 50, sleep: async () => {} });
+      api.cdpResults["Page.enable"] = never;
+      const tab = await tabs.create(session);
+      api.tabs.remove = async () => {}; // a "Leave site?" dialog keeps the tab
+      const r = await executor.run(call("close_tab", { tabId: tab.id }));
+      expect(r).toMatchObject({ ok: false, error: "timeout" });
+      expect(errorOf(r)).toContain(`Tab ${tab.id} does not respond.`);
+      expect(api.tabList.has(tab.id)).toBe(true);
+      expect(tabs.owns("s1", tab.id, "dyn")).toBe(true);
+    });
+  });
+
   test("a page that does not answer the attach (a dialog opened before it) fails fast; adopt_tab still adopts and says so", async () => {
     const { api, tabs, executor } = setup(undefined, { defaultTimeoutMs: 5000, attachAnswerMs: 50 });
     api.cdpResults["Page.enable"] = never;
@@ -875,7 +941,7 @@ describe("JavaScript dialogs", () => {
     expect(textOf(adopted)).toContain("Adopted tab 7");
     expect(textOf(adopted)).toContain("opened before AIS attached to it; AIS cannot see or answer that one. Ask the user to answer it in Chrome");
     expect(tabs.owns("s1", 7, "dyn")).toBe(true);
-    for (const [tool, args] of [["screenshot", {}], ["close_tab", {}], ["handle_dialog", { accept: false }]] as const) {
+    for (const [tool, args] of [["screenshot", {}], ["handle_dialog", { accept: false }]] as const) {
       const t0 = Date.now();
       const r = await executor.run(call(tool, { tabId: 7, ...args }));
       expect(Date.now() - t0).toBeLessThan(1000);
