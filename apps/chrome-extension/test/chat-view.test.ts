@@ -517,6 +517,23 @@ describe("picker wiring", () => {
     await s.flush();
     expect(creates(s.sent)[0]).toMatchObject({ text: "hi", selection: { provider: "claude", identity: "pool-a", model: "p1" } });
   });
+  test("with no stored selection a new chat starts on the first identity's first model", async () => {
+    const s = make(undefined);
+    s.push(stateOf([], { catalog: cat }));
+    await s.flush();
+    expect(s.root.textContent).not.toContain("Choose a model");
+    typeNew(s.root, "hi");
+    await s.flush();
+    expect(creates(s.sent)[0]).toMatchObject({ selection: { provider: "claude", identity: "work", model: "m1" } });
+  });
+  test("a stored selection without a model gets the identity's first model", async () => {
+    const s = make({ provider: "claude", identity: "pool-a" });
+    await s.flush();
+    s.push(stateOf([], { catalog: cat }));
+    typeNew(s.root, "hi");
+    await s.flush();
+    expect(creates(s.sent)[0]).toMatchObject({ selection: { provider: "claude", identity: "pool-a", model: "p1" } });
+  });
   test("Send before the stored selection loads sends nothing and keeps the stored selection", async () => {
     let release: (v: unknown) => void = () => {};
     const stored = new Promise<unknown>(r => { release = r; });
@@ -543,13 +560,13 @@ describe("picker wiring", () => {
     expect(s.saved.length).toBe(1);
     expect(s.saved[0]).toMatchObject({ effort: "low" });
   });
-  test("a stored model the catalogue lacks is dropped", async () => {
+  test("a stored model the catalogue lacks is replaced by the identity's first model", async () => {
     const s = make({ provider: "claude", identity: "work", model: "gone" });
     await s.flush();
     s.push(stateOf([], { catalog: cat }));
     typeNew(s.root, "hi");
     await s.flush();
-    expect(creates(s.sent)[0]!.selection).toEqual({ provider: "claude", identity: "work" });
+    expect(creates(s.sent)[0]!.selection).toEqual({ provider: "claude", identity: "work", model: "m1" });
   });
   test("a model pick in an open chat sends ais-chat-config, other identities send nothing", async () => {
     const s = make(undefined);

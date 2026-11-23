@@ -261,7 +261,11 @@ export class ChatTab {
     if (!s || !catalog || !this.selectionLoaded) return undefined;
     const mine = openChats(s.chats, this.d.windowId).at(-1)?.summary.selection;
     const first = catalog.find(p => p.identities.some(i => selectable(i.name)));
-    return checkSelection(this.lastUsed, catalog) ?? checkSelection(mine, catalog) ?? (first ? { provider: first.provider, identity: first.identities.find(i => selectable(i.name))!.name } : undefined);
+    const base = checkSelection(this.lastUsed, catalog) ?? checkSelection(mine, catalog) ?? (first ? { provider: first.provider, identity: first.identities.find(i => selectable(i.name))!.name } : undefined);
+    if (!base || base.model !== undefined) return base;
+    // Like other AI tools, a new chat always starts on a model: the identity's first one.
+    const withModel = choose(undefined, base, catalog);
+    return base.effort !== undefined ? { ...withModel, effort: base.effort } : withModel;
   }
 
   private setNew(sel: ChatSelection): void {

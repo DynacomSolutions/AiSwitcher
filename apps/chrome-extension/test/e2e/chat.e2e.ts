@@ -603,7 +603,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       expect(lcard.b).toBeGreaterThan(600); // the card sits at the bottom of the 760 px panel
       expect(await Q.eval<boolean>(`document.querySelector("${list} .composer-send").disabled`)).toBe(true); // empty box
       await sleep(300);
-      await shot("composer-g-new-chat-r2", Q);
+      await shot("composer-g-new-chat-r3", Q);
 
       // The picker opens above the card, inside the panel. Choose Claude Sonnet 5.5 of alpha.
       await clickUntil(Q, "list picker button", ".chat-list .picker-button");
@@ -614,7 +614,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       expect(lpop.y).toBeGreaterThanOrEqual(0);
       expect(lpop.x).toBeGreaterThanOrEqual(0);
       expect(lpop.r).toBeLessThanOrEqual(400);
-      await shot("composer-h-new-chat-picker-r2", Q);
+      await shot("composer-h-new-chat-picker-r3", Q);
       await Q.eval(`[...document.querySelectorAll(".chat-list .picker-option")].find(b => b.textContent.startsWith("Claude Sonnet 5.5")).click()`);
       await until("Sonnet chosen", () => Q.eval<boolean>(`document.querySelector(".chat-list .picker-button").textContent.includes("Claude Sonnet 5.5")`));
 
@@ -629,7 +629,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       expect(await chips(Q)).toEqual(["Page A"]);
       await until("reply to the first prompt", async () => (await replyOf(name)) === "Hello from the new chat screen", 240_000);
       await turnDone(name);
-      await shot("composer-i-new-chat-sent-r2", Q);
+      await shot("composer-i-new-chat-sent-r3", Q);
 
       const detail = ".chat-detail:not([hidden])";
       const rect = (sel: string) => Q.eval<{ x: number; y: number; w: number; h: number; r: number; b: number }>(`(() => { const e = document.querySelector(${JSON.stringify(`${detail} ${sel}`)}); const { left, top, width, height, right, bottom } = e.getBoundingClientRect(); return { x: left, y: top, w: width, h: height, r: right, b: bottom }; })()`);
