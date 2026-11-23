@@ -433,7 +433,7 @@ ETA: 2026-12-12 18:00 ICT
 | 303 | Shipper in backup-client | todo | | | 20.299 | | .cluster code. |
 | 304 | Shipper fast lane and hot set | todo | | | 20.303 | | |
 | 305 | Cluster: shipper values, recipient key, ingest secret | todo | | | 20.303 | | .cluster PR. |
-| 306 | Cluster: HoardDB read key, NetworkPolicy, env | todo | | | 20.297 | | .cluster PR. |
+| 306 | Cluster: HoardDB read key, NetworkPolicy, env | blocked_on_owner | Thomas | | 20.297 | | HoardDB key create needs MFA or an admin API token.<br>Run from a tailnet or MFA admin session: `hoarddb svc objectstore key create --tenant platform-backups --bucket agent-sessions --scope read --env-file <file>`<br>Save as AIS_SESSIONS_S3_READ_ACCESS_KEY_ID and AIS_SESSIONS_S3_READ_SECRET_ACCESS_KEY in ~/.secrets.<br>Or put a HoardDB admin API token in ~/.secrets. |
 | 307 | Cluster: watchdog rules, metrics, Headlamp row | todo | | | 20.303, 20.299 | | .cluster PR. |
 | 308 | Console reader from the database | todo | | | 20.301, 20.302, 20.306 | | AIS_SESSIONS_SOURCE switch. |
 | 309 | Equivalence test and performance proof | todo | | | 20.308 | | |
