@@ -35,13 +35,16 @@ export interface HeadersInput {
  */
 export const BROWSER_TOKEN_FILE_ENV = "AIS_BROWSER_AGENT_TOKEN_FILE";
 
-const readTrimmed = async (path: string): Promise<string | undefined> => {
+/** The token in the file, trimmed. `undefined` for a missing, unreadable or empty file, and for a directory. */
+export const readTrimmed = async (path: string): Promise<string | undefined> => {
   try {
     return (await readFile(path, "utf8")).trim() || undefined;
   } catch {
     return undefined;
   }
 };
+
+const isMissingFile = (e: unknown): boolean => (e as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 
 /** A folder or identity that talks to another model provider (Kimi, Z.ai). Page content must never go there. */
 const OTHER_PROVIDER = /(^|[-_.])(kimi|zai|z-ai)([-_.]|$)/i;
@@ -59,7 +62,12 @@ export async function browserHeaders(i: HeadersInput): Promise<Record<string, st
     const configDir = i.configDir ?? (tool === "codex" ? i.env.CODEX_HOME : i.env.CLAUDE_CONFIG_DIR);
     if (!tool || !configDir) return {};
     if (isOtherProviderName(basename(resolve(expandPath(configDir))))) return {};
-    const fromRegistry = await registryAuth(i, tool, configDir).catch(() => undefined);
+    // Only a registry file that does not exist (a pod has none) lets the token file apply. Any other registry error
+    // (unreadable, not JSON, wrong shape) must not turn into a token from the pod file: it ends in `{}`.
+    const fromRegistry = await registryAuth(i, tool, configDir).catch((e: unknown) => {
+      if (isMissingFile(e)) return undefined;
+      throw e;
+    });
     let token = fromRegistry?.token;
     const pool = fromRegistry?.pool;
     if (!fromRegistry && i.env[BROWSER_TOKEN_FILE_ENV]) token = await (i.readTokenPath ?? readTrimmed)(i.env[BROWSER_TOKEN_FILE_ENV]!);
