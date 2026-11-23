@@ -1047,6 +1047,12 @@ exists), `LoginFlowManager` then runs route-all for that one identity (`adoptLog
 than the store copy, no running session, no other holder. The new login moves to the store, the folder gets the gateway entry
 back, the marker is cleared. Whatever route-all refuses is returned as the flow's `note`.
 
+## Session store ingest
+
+Migrations `0014_sessions` and `0015_sessions_one_copy` hold the session index (`ais_session_file`, `ais_session_part`, `ais_session_path`, view `ais_session_tree`). `SessionStore` (`src/gateway/sessions/session-store.ts`) is the only writer. One session is stored once, keyed by tool (`kind`) and session id (`session_ref`); the host path is not part of the key. `ais_session_path` records every `(node, root, rel_path)` that held the session. The `node`, `root` and `rel_path` columns of the file row are the path that stored it first.
+
+The shipper reaches the store through `/sessions/v1/*` on the admin port (`src/gateway/admin-sessions.ts`, wire contract in `docs/API.md`, "Session ingest"). The routes are off unless `AIS_GATEWAY_SESSIONS_INGEST=1`. `AIS_GATEWAY_SESSIONS_TOKEN` is a scoped bearer token that opens these routes and no other admin route (the favourites token works the same way). `AIS_GATEWAY_SESSIONS_FLUSH_GAP_SECONDS` (default 120) is the least time between two flushes of a live file; the shipper reads it from every answer. Deployment: add the token to the gateway Secret and the shipper Secret, set the flag, roll the gateways. The migration is additive to 0014 and safe to run first.
+
 ## Session ledger: which account served which session
 
 Each ledger row of a model request carries the client's own session id (`session_key`) and the tool family from its user

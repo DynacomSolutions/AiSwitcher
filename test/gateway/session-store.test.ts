@@ -45,7 +45,7 @@ function req(parts: SessionPartInput[], over: Partial<SessionIngest> = {}): Sess
   };
 }
 
-const keyOf = (r: SessionIngest) => ({ node: r.node, root: r.root, relPath: r.relPath });
+const keyOf = (r: SessionIngest) => ({ kind: r.kind, sessionRef: r.sessionRef, node: r.node, root: r.root, relPath: r.relPath });
 
 describe("validateIngest", () => {
   test("refuses requests that no correct writer sends", () => {
@@ -103,10 +103,10 @@ if (!url && process.env.CI && !optOut) {
     test("creates the tables and the view, and runs twice without error", async () => {
       await migrate(url);
       await migrate(url);
-      const t = await admin`SELECT to_regclass('ais_session_file') AS f, to_regclass('ais_session_part') AS p, to_regclass('ais_session_tree') AS v`;
-      expect(t[0]).toMatchObject({ f: "ais_session_file", p: "ais_session_part", v: "ais_session_tree" });
-      const v = await admin`SELECT version FROM schema_migrations WHERE version = '0014_sessions'`;
-      expect(v.length).toBe(1);
+      const t = await admin`SELECT to_regclass('ais_session_file') AS f, to_regclass('ais_session_part') AS p, to_regclass('ais_session_tree') AS v, to_regclass('ais_session_path') AS h`;
+      expect(t[0]).toMatchObject({ f: "ais_session_file", p: "ais_session_part", v: "ais_session_tree", h: "ais_session_path" });
+      const v = await admin`SELECT version FROM schema_migrations WHERE version IN ('0014_sessions', '0015_sessions_one_copy')`;
+      expect(v.length).toBe(2);
     });
   });
 
@@ -122,19 +122,24 @@ if (!url && process.env.CI && !optOut) {
       const b = req([part(0, 300)], { relPath: "projects/p/s2.jsonl", sessionRef: "s2" });
       await s.ingest(a);
       await s.ingest(b);
-      const [ca, unknown, cb] = await s.cursors([keyOf(a), { node: "node-b", root: "/x", relPath: "y" }, keyOf(b)]);
-      expect(ca).toMatchObject({ generation: 0, committedBytes: 1500, headSha256: a.headSha256 });
+      const [ca, unknown, cb] = await s.cursors([keyOf(a), { ...keyOf(a), sessionRef: "nobody", node: "node-b", root: "/x", relPath: "y" }, keyOf(b)]);
+      expect(ca).toMatchObject({ generation: 0, committedBytes: 1500, headSha256: a.headSha256, held: true });
       expect(unknown).toBeNull();
       expect(cb).toMatchObject({ committedBytes: 300 });
       expect(ca!.committedLines).toBe(part(0, 1000).lines + part(1000, 500).lines);
     });
 
-    test("the key includes the node and the root", async () => {
+    test("the key is the tool and the session id: another path gets the same cursor, but is not a holder", async () => {
       const s = make();
       await s.ingest(req([part(0, 100)]));
-      const other = req([part(0, 100)], { node: "node-b" });
-      const other2 = req([part(0, 100)], { root: "/other" });
-      expect(await s.cursors([keyOf(other), keyOf(other2)])).toEqual([null, null]);
+      const [otherNode, otherRoot, otherTool] = await s.cursors([
+        keyOf(req([], { node: "node-b" })),
+        keyOf(req([], { root: "/other" })),
+        keyOf(req([], { kind: "codex" })),
+      ]);
+      expect(otherNode).toMatchObject({ committedBytes: 100, held: false });
+      expect(otherRoot).toMatchObject({ committedBytes: 100, held: false });
+      expect(otherTool).toBeNull();
     });
   });
 
@@ -351,18 +356,150 @@ if (!url && process.env.CI && !optOut) {
     });
   });
 
-  describe("tree view and queries", () => {
-    const at = (iso: string) => Date.parse(iso);
+  describe("one copy per session", () => {
+    /** The same session as seen from a second path (another folder, another node). */
+    const copy = (parts: SessionPartInput[], over: Partial<SessionIngest> = {}): SessionIngest =>
+      req(parts, { node: "node-b", root: "/other/root", relPath: "pool2/s1.jsonl", origin: "t3-pool", pool: "second", ...over });
+    const fileCount = async (): Promise<number> => Number((await admin`SELECT count(*)::int AS n FROM ais_session_file`)[0]!.n);
 
-    test("the same session in two folders is one node: the newest generation, then the most bytes", async () => {
+    test("a second path continues the stored session from the cursor and no byte is stored twice", async () => {
       const s = make();
-      await s.ingest(req([part(0, 5000)], { relPath: "a/s1.jsonl", mtimeMs: at("2026-11-01T10:00:00Z"), sessionRef: "dup" }));
-      await s.ingest(req([part(0, 9000)], { relPath: "b/s1.jsonl", mtimeMs: at("2026-11-01T11:00:00Z"), sessionRef: "dup", root: "/other/root" }));
+      await s.ingest(req([part(0, 5000)], { mtimeMs: Date.parse("2026-11-01T10:00:00Z") }));
+      const [c] = await s.cursors([keyOf(copy([]))]);
+      expect(c).toMatchObject({ committedBytes: 5000, held: false });
+      const r = await s.ingest(copy([part(5000, 4000)], { mtimeMs: Date.parse("2026-11-01T11:00:00Z") }));
+      expect(r).toMatchObject({ status: "committed", created: false, partsAdded: 1, cursor: { committedBytes: 9000 } });
+      expect(await fileCount()).toBe(1);
+      expect(await partCount()).toBe(2);
+      expect((await s.parts((r as { cursor: { fileId: number } }).cursor.fileId)).map((p) => [p.startOffset, p.endOffset])).toEqual([[0, 5000], [5000, 9000]]);
       const tree = await s.tree();
       expect(tree).toHaveLength(1);
-      expect(tree[0]).toMatchObject({ sessionRef: "dup", committedBytes: 9000, root: "/other/root" });
-      expect(await s.filesOfSession("claude", "dup")).toHaveLength(2);
+      expect(tree[0]).toMatchObject({ sessionRef: "s1", committedBytes: 9000 });
     });
+
+    test("the index records every path that held the session", async () => {
+      const s = make();
+      await s.ingest(req([part(0, 5000)]));
+      await s.ingest(copy([part(5000, 100)]));
+      const paths = await s.paths("claude", "s1");
+      expect(paths.map((p) => [p.node, p.root, p.relPath, p.origin, p.pool])).toEqual([
+        ["node-a", "/data/pool", "projects/p/s1.jsonl", "pool-folder", "main"],
+        ["node-b", "/other/root", "pool2/s1.jsonl", "t3-pool", "second"],
+      ]);
+      expect(await s.filesOfSession("claude", "s1")).toHaveLength(1);
+      const [c] = await s.cursors([keyOf(copy([]))]);
+      expect(c?.held).toBe(true);
+    });
+
+    test("a copy that is stored already is recorded with no new bytes, and the repeat changes nothing", async () => {
+      const s = make();
+      await s.ingest(req([part(0, 5000)]));
+      const before = await admin`SELECT last_ingest_at, committed_bytes FROM ais_session_file`;
+      expect(await s.hold(copy([]))).toMatchObject({ status: "duplicate", cursor: { committedBytes: 5000 } });
+      expect(await s.hold(copy([]))).toMatchObject({ status: "duplicate" });
+      expect(await admin`SELECT last_ingest_at, committed_bytes FROM ais_session_file`).toEqual(before);
+      expect((await s.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a", "node-b"]);
+      expect(await partCount()).toBe(1);
+    });
+
+    test("the same bytes sent from a second path are a repeat, not a second copy", async () => {
+      const s = make();
+      await s.ingest(req([part(0, 5000)]));
+      expect(await s.ingest(copy([part(0, 5000)]))).toMatchObject({ status: "duplicate" });
+      expect(await partCount()).toBe(1);
+      expect((await s.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a", "node-b"]);
+    });
+
+    test("a path with another head holds another file under the same id: refused and not recorded", async () => {
+      const s = make();
+      await s.ingest(req([part(0, HEAD_BYTES + 100)]));
+      const diverged = copy([part(HEAD_BYTES + 100, 100)], { headSha256: sha("other head") });
+      expect(await s.ingest(diverged)).toMatchObject({ status: "conflict", reason: "other_copy", cursor: { committedBytes: HEAD_BYTES + 100 } });
+      expect(await s.hold(copy([], { headSha256: sha("other head") }))).toMatchObject({ status: "conflict", reason: "other_copy" });
+      expect(await partCount()).toBe(1);
+      expect((await s.paths("claude", "s1")).map((p) => p.node)).toEqual(["node-a"]);
+    });
+
+    test("only a holder may start a new generation: a stranger is refused, so two diverged copies never take turns", async () => {
+      const s = make();
+      await s.ingest(req([part(0, HEAD_BYTES + 100)]));
+      const stranger = copy([part(0, 800, "v2")], { generation: 1, headSha256: sha("stranger head") });
+      expect(await s.ingest(stranger)).toMatchObject({ status: "conflict", reason: "other_copy", cursor: { generation: 0 } });
+      expect(await fileCount()).toBe(1);
+      // The holder rewrites its file: a head that differs is a rewrite, and generation 1 starts at byte 0.
+      const rewrite = req([part(HEAD_BYTES + 100, 100)], { headSha256: sha("new head") });
+      expect(await s.ingest(rewrite)).toMatchObject({ status: "conflict", reason: "rewritten" });
+      const v2 = HEAD_BYTES + 200;
+      expect(await s.ingest(req([part(0, v2, "v2")], { generation: 1, headSha256: sha("new head") }))).toMatchObject({ status: "committed", created: true, cursor: { generation: 1 } });
+      // The stranger still holds the old file: its head differs from generation 1, and it is still a stranger.
+      expect(await s.ingest(copy([part(v2, 100)], { generation: 1 }))).toMatchObject({ status: "conflict", reason: "other_copy" });
+      expect(await s.ingest(copy([part(0, 900, "v3")], { generation: 2, headSha256: sha("stranger head") }))).toMatchObject({ status: "conflict", reason: "other_copy" });
+      expect(await fileCount()).toBe(2);
+    });
+
+    test("a hold for an unknown session or a new generation is refused", async () => {
+      const s = make();
+      expect(await s.hold(copy([]))).toEqual({ status: "conflict", reason: "gap", cursor: null });
+      await s.ingest(req([part(0, 1000)]));
+      expect(await s.hold(req([], { generation: 1 }))).toMatchObject({ status: "conflict", reason: "generation_start" });
+      expect(await s.hold(req([], { generation: 0, headSha256: sha("head") }))).toMatchObject({ status: "duplicate" });
+      expect(await fileCount()).toBe(1);
+    });
+
+    test("writers on two nodes race on one session: one copy of the bytes, contiguous parts", async () => {
+      const writers = Array.from({ length: 6 }, () => make());
+      const parts = Array.from({ length: 6 }, (_, i) => part(i * 500, 500));
+      await Promise.all(
+        writers.map(async (w, i) => {
+          const send = i % 2 === 0 ? req : copy;
+          for (let attempt = 0; attempt < 80; attempt += 1) {
+            const r = await w.ingest(send([parts[i]!]));
+            if (r.status !== "conflict") return;
+            if (r.reason !== "gap") throw new Error(`unexpected ${r.reason}`);
+            await new Promise((res) => setTimeout(res, 5));
+          }
+          throw new Error("writer never got in");
+        }),
+      );
+      expect(await fileCount()).toBe(1);
+      const cur = await state(req([]));
+      expect(cur?.committedBytes).toBe(3000);
+      expect(await partCount()).toBe(6);
+      expect((await make().paths("claude", "s1")).map((p) => p.node).sort()).toEqual(["node-a", "node-b"]);
+    });
+
+    test("the same session id of two tools is two sessions even on one path", async () => {
+      const s = make();
+      await s.ingest(req([part(0, 100)]));
+      await s.ingest(req([part(0, 100)], { kind: "codex" }));
+      expect(await fileCount()).toBe(2);
+    });
+
+    test("migration 0015 merges rows of one session that exist before it and keeps every path", async () => {
+      const s = make();
+      await s.ingest(req([part(0, 5000)]));
+      await s.ingest(req([part(0, 9000, "big")], { sessionRef: "s2" }));
+      // Rebuild the state before 0015: keyed by host path, two rows for one session, no path table content.
+      await admin`DELETE FROM schema_migrations WHERE version = '0015_sessions_one_copy'`;
+      await admin`DROP VIEW ais_session_tree`;
+      await admin`DROP INDEX ais_session_file_session_generation`;
+      await admin`TRUNCATE ais_session_path`;
+      await admin`UPDATE ais_session_file SET node = 'node-b', root = '/other', rel_path = 'x.jsonl' WHERE committed_bytes = 9000`;
+      await admin`ALTER TABLE ais_session_file ADD CONSTRAINT ais_session_file_node_root_rel_path_generation_key UNIQUE (node, root, rel_path, generation)`;
+      await admin`UPDATE ais_session_file SET session_ref = 's1'`;
+      await migrate(url);
+      const rows = await admin`SELECT id, node, committed_bytes FROM ais_session_file`;
+      expect(rows).toHaveLength(1);
+      expect(Number(rows[0]!.committed_bytes)).toBe(9000);
+      const paths = await admin`SELECT node FROM ais_session_path ORDER BY node`;
+      expect(paths.map((p: { node: string }) => p.node)).toEqual(["node-a", "node-b"]);
+      expect(await partCount()).toBe(1);
+      expect(await s.tree()).toHaveLength(1);
+    });
+  });
+
+  describe("tree view and queries", () => {
+    const at = (iso: string) => Date.parse(iso);
 
     test("a rewritten file shows its newest generation only", async () => {
       const s = make();
