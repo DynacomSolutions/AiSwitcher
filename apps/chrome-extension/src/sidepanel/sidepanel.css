@@ -118,6 +118,7 @@ label.check { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
 
 /* Chat list, chips and composer */
 .list-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.chat-list .list-head { margin-bottom: 0; }
 .list-head h2 { margin: 0; flex: 1; }
 .chat-name { text-transform: none; letter-spacing: 0; font-size: 14px; color: var(--ink); overflow-wrap: anywhere; }
 .dot-bar { width: 4px; height: 18px; border-radius: 3px; }
@@ -132,7 +133,9 @@ button.row-open { display: flex; flex-direction: column; align-items: flex-start
 .chip-tab.missing { color: var(--muted); font-style: italic; }
 button.chip-x { border: 0; background: none; padding: 0 6px; font-size: 12px; color: var(--muted); }
 select.chip-add { flex: 0 1 auto; font-size: 12px; padding: 3px 8px; }
-.chat-detail { min-height: calc(100vh - 168px); }
+.chat-detail, .chat-list { min-height: calc(100vh - 168px); }
+.chat-list { display: flex; flex-direction: column; gap: 10px; }
+.chat-rows-slot { flex: 1; min-height: 0; overflow-y: auto; }
 .feed-slot { flex: 1; }
 .composer { display: flex; flex-direction: column; gap: 4px; position: sticky; bottom: 0; background: var(--bg); padding: 6px 0 4px; }
 .composer-card { position: relative; display: flex; flex-direction: column; gap: 2px; padding: 8px 8px 6px; background: var(--card); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); }
@@ -156,10 +159,8 @@ input.rename-box { font: inherit; font-size: 13px; color: var(--ink); background
 
 /* Provider and model picker: buttons in the composer row, a popover above the box */
 .picker { display: flex; align-items: center; gap: 2px; min-width: 0; }
-.chat-list .picker { position: relative; margin-bottom: 6px; }
 .picker-button { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-width: 0; font: inherit; font-size: 12.5px; font-weight: 500; color: var(--muted); background: none; border: 0; border-radius: 8px; padding: 4px 8px; cursor: pointer; }
 .picker-button:hover { color: var(--ink); background: var(--idle-bg); }
-.chat-list .picker-button { border: 1px solid var(--line); background: var(--card); color: var(--ink); }
 .picker-button:focus-visible, .picker-option:focus-visible, .picker-item:focus-visible, .picker-tab:focus-visible, .picker-star:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .picker-button[aria-expanded="true"] { color: var(--ink); background: var(--idle-bg); }
 .picker-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 170px; }
@@ -197,7 +198,6 @@ button.picker-star:hover { background: var(--idle-bg); border-color: transparent
 button.picker-star.on { color: var(--warn); }
 .picker-effort-wrap { position: relative; }
 .picker-effort-menu { position: absolute; z-index: 30; left: 0; bottom: 100%; margin-bottom: 6px; min-width: 120px; padding: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 28px rgba(0, 0, 0, .22); }
-.chat-list .picker-effort-menu { bottom: auto; top: 100%; margin: 6px 0 0; }
 .picker-effort-menu[hidden] { display: none; }
 button.picker-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; text-align: left; font-size: 13px; font-weight: 400; color: var(--ink); background: none; border: 0; border-radius: 6px; padding: 6px 8px; text-transform: capitalize; }
 button.picker-item:hover { background: color-mix(in srgb, var(--ink) 8%, transparent); border-color: transparent; }

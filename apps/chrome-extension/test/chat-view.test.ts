@@ -3,7 +3,7 @@ import { MAX_CHAT_NAME, MAX_CHAT_TABS, MAX_CHAT_TEXT } from "../../../src/browse
 import type { TabInfo } from "../src/background/chrome-api.ts";
 import { CAP_MESSAGE } from "../src/shared/chat.ts";
 import type { ChatCommandResult, ChatPanelCommand, ChatPanelState, ChatView } from "../src/shared/chat.ts";
-import { AGENT_TAB, LINK_PROMPT, ChatTab, checkSelection, parseSelection, LOADING_PROVIDERS, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
+import { AGENT_TAB, LINK_PROMPT, ChatTab, checkSelection, parseSelection, NEW_PLACEHOLDER, onlyOwnKeys, RESTARTED } from "../src/sidepanel/chat/chat-view.ts";
 import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
 import type { FakeNode } from "./fake-dom.ts";
 
@@ -24,7 +24,8 @@ function setup(chats: ChatView[], opts: { tabs?: TabInfo[]; result?: () => ChatC
     doc: asDoc(doc), windowId: 1,
     connect: () => ({ postMessage: () => {}, onMessage: l => { push = l; }, onDisconnect: () => {} }),
     queryTabs: async () => opts.tabs ?? [tab(5)],
-    send: async c => { sent.push(c); return opts.result ? opts.result() : { ok: true }; },
+    // The list screen asks for the catalogue on its own. Those frames are not part of what the tests count.
+    send: async c => { if (c.type !== "ais-chat-catalog") sent.push(c); return opts.result ? opts.result() : { ok: true }; },
     loadSeen: async () => opts.seen ?? {},
     saveSeen: s => { saved.push(s); },
   }, asEl(root));
@@ -34,6 +35,18 @@ function setup(chats: ChatView[], opts: { tabs?: TabInfo[]; result?: () => ChatC
 const all = (root: FakeNode): FakeNode[] => walk(root);
 const byClass = (root: FakeNode, cls: string): FakeNode[] => all(root).filter(n => n.className.split(" ").includes(cls));
 const byText = (root: FakeNode, tag: string, text: string): FakeNode | undefined => all(root).find(n => n.tag === tag && n.textContent === text);
+/** Types a message in the box of the list screen and presses Enter. */
+const typeNew = (root: FakeNode, text: string, send = true): FakeNode => {
+  const box = byClass(root, "composer-box")[0]!;
+  box.value = text;
+  box.dispatch("input");
+  if (send) box.dispatch("keydown", { key: "Enter", shiftKey: false });
+  return box;
+};
+/** The message box of the open chat, not the one of the list screen. */
+const chatBox = (root: FakeNode): FakeNode => byClass(byClass(root, "chat-detail")[0]!, "composer-box")[0]!;
+const sendButton = (root: FakeNode): FakeNode => byClass(root, "composer-send")[0]!;
+const creates = (sent: ChatPanelCommand[]) => sent.filter((c): c is Extract<ChatPanelCommand, { type: "ais-chat-create" }> => c.type === "ais-chat-create");
 const byLabel = (root: FakeNode, label: string): FakeNode | undefined => all(root).find(n => n.attrs["aria-label"] === label);
 
 describe("chat tab", () => {
@@ -76,7 +89,7 @@ describe("chat tab", () => {
     s.push(stateOf([view("a")]));
     s.t.select("a");
     await s.flush();
-    const box = byClass(s.root, "composer-box")[0]!;
+    const box = chatBox(s.root);
     expect(box.maxLength).toBe(MAX_CHAT_TEXT);
     box.value = "hello";
     box.dispatch("keydown", { key: "Enter", shiftKey: false });
@@ -114,11 +127,11 @@ describe("chat tab", () => {
     s.push(stateOf([view("a")]));
     s.t.select("a");
     await s.flush();
-    const box = byClass(s.root, "composer-box")[0]!;
+    const box = chatBox(s.root);
     box.value = "draft";
     s.t.select(undefined);
     s.t.select("a");
-    expect(byClass(s.root, "composer-box")[0]).toBe(box);
+    expect(chatBox(s.root)).toBe(box);
     expect(box.value).toBe("draft");
   });
 
@@ -195,7 +208,19 @@ describe("chat tab", () => {
     expect(byClass(s.root, "banner").find(b => b.textContent === AGENT_TAB)).toBeDefined();
   });
 
-  test("New chat is disabled while a create is in flight and the loading line clears with the catalogue", async () => {
+  test("the list screen is a composer: no New chat button, the picker sits in the card", () => {
+    const s = setup([]);
+    s.push(stateOf([]));
+    expect(byText(s.root, "button", "New chat")).toBeUndefined();
+    const list = byClass(s.root, "chat-list")[0]!;
+    const card = byClass(list, "composer-card")[0]!;
+    expect(byClass(card, "picker")).toHaveLength(1);
+    expect(byClass(card, "composer-tools")[0]!.children[0]!.className).toBe("picker");
+    expect(byClass(card, "composer-box")[0]!.placeholder).toBe(NEW_PLACEHOLDER);
+    expect(byClass(list, "empty")[0]!.hidden).toBe(false);
+  });
+
+  test("Send is disabled until there is text and a model, then a create carries the text and stays single while in flight", async () => {
     let release: (r: ChatCommandResult) => void = () => {};
     const doc = fakeDoc();
     const root = doc.createElement("section");
@@ -210,21 +235,57 @@ describe("chat tab", () => {
     }, asEl(root));
     t.start();
     push(stateOf([]));
-    const btn = byText(root, "button", "New chat")!;
-    btn.click();
     await new Promise(r => setTimeout(r, 0));
-    expect(byClass(root, "banner").find(b => b.textContent === LOADING_PROVIDERS)).toBeDefined();
-    expect(byClass(root, "banner").find(b => b.textContent === LOADING_PROVIDERS)!.attrs.role).toBe("alert");
+    // No catalogue yet: the panel asks for it, Send stays disabled and Enter creates nothing.
+    expect(sent.some(c => c.type === "ais-chat-catalog")).toBe(true);
+    typeNew(root, "hello");
+    expect(sendButton(root).disabled).toBe(true);
+    expect(creates(sent)).toHaveLength(0);
     push(stateOf([], { catalog: [{ provider: "claude", identities: [{ name: "a", kind: "identity", models: [] }], efforts: [] }] }));
-    expect(byClass(root, "banner").find(b => b.textContent === LOADING_PROVIDERS)?.hidden ?? true).toBe(true);
-    btn.click();
+    expect(sendButton(root).disabled).toBe(false);
+    typeNew(root, "", false);
+    expect(sendButton(root).disabled).toBe(true);
+    const box = typeNew(root, "  hello  ");
     await new Promise(r => setTimeout(r, 0));
-    expect(btn.disabled).toBe(true);
-    btn.click();
-    expect(sent.filter(c => c.type === "ais-chat-create").length).toBe(1);
+    expect(creates(sent)).toHaveLength(1);
+    expect(creates(sent)[0]).toMatchObject({ windowId: 1, text: "hello", selection: { provider: "claude", identity: "a" }, tabIds: [5] });
+    expect(sendButton(root).disabled).toBe(true);
+    box.dispatch("keydown", { key: "Enter", shiftKey: false });
+    expect(creates(sent)).toHaveLength(1);
     release({ ok: true });
     await new Promise(r => setTimeout(r, 0));
-    expect(btn.disabled).toBe(false);
+    expect(box.value).toBe("");
+  });
+
+  test("a refused create keeps the draft and shows the error", async () => {
+    const cat = [{ provider: "claude" as const, identities: [{ name: "a", kind: "identity" as const, models: [] }], efforts: [] }];
+    const s = setup([], { result: () => ({ ok: false, error: "Offline" }) });
+    s.push(stateOf([], { catalog: cat }));
+    const box = typeNew(s.root, "hello");
+    await s.flush();
+    expect(box.value).toBe("hello");
+    expect(byClass(s.root, "banner").find(b => b.textContent === "Offline")).toBeDefined();
+    expect(sendButton(s.root).disabled).toBe(false);
+  });
+
+  test("a full window disables Send and shows the cap hint under the composer", async () => {
+    const chats = ["a", "b", "c", "d", "e", "f"].map(i => view(i));
+    const s = setup(chats);
+    s.push(stateOf(chats, { catalog: [{ provider: "claude", identities: [{ name: "a", kind: "identity", models: [] }], efforts: [] }] }));
+    typeNew(s.root, "hello");
+    expect(sendButton(s.root).disabled).toBe(true);
+    expect(creates(s.sent)).toHaveLength(0);
+    expect(byClass(s.root, "composer-hint").some(n => !n.hidden && n.textContent === CAP_MESSAGE)).toBe(true);
+  });
+
+  test("the new chat opens when the hub reports it", async () => {
+    const cat = [{ provider: "claude" as const, identities: [{ name: "a", kind: "identity" as const, models: [] }], efforts: [] }];
+    const s = setup([]);
+    s.push(stateOf([], { catalog: cat }));
+    typeNew(s.root, "hello");
+    await s.flush();
+    s.push(stateOf([view("n", {}, [{ seq: 1, ts: 0, body: { k: "user", text: "hello" } }])], { catalog: cat }));
+    expect(s.t.selectedId).toBe("n");
   });
 
   test("a reload keeps the seen marks from session storage", async () => {
@@ -254,9 +315,9 @@ describe("chat tab", () => {
     byLabel(s.root, "Close Chat a")!.click();
     byText(confirm, "button", "Close")!.click();
     expect(s.doc.activeElement).toBe(byClass(s.root, "row-open")[1]);
-    // The last row has no next row: focus goes to New chat.
+    // The last row has no next row: focus goes to the message box of the list screen.
     byLabel(s.root, "Close Chat c")!.click();
-    expect(s.doc.activeElement).toBe(byText(s.root, "button", "New chat"));
+    expect(s.doc.activeElement).toBe(byClass(s.root, "composer-box")[0]);
   });
 
   test("N2: a tab title change keeps the same option nodes and adds only the new one", async () => {
@@ -404,7 +465,7 @@ describe("chat tab", () => {
     s.push(stateOf([view("a"), view("b")]));
     await s.flush();
     byClass(s.root, "row-open")[1]!.click();
-    expect(s.doc.activeElement).toBe(byClass(s.root, "composer-box")[0]);
+    expect(s.doc.activeElement).toBe(chatBox(s.root));
     byText(s.root, "button", "Back")!.click();
     expect(s.doc.activeElement).toBe(byClass(s.root, "row-open")[1]);
   });
@@ -444,35 +505,32 @@ describe("picker wiring", () => {
     expect(checkSelection({ provider: "claude", identity: "work", model: "zz", effort: "max" }, cat)).toEqual({ provider: "claude", identity: "work" });
     expect(checkSelection({ provider: "claude", identity: "gone" }, cat)).toBeUndefined();
   });
-  test("New chat waits for the catalogue and then uses the stored selection", async () => {
+  test("Send waits for the catalogue and then uses the stored selection", async () => {
     const s = make({ provider: "claude", identity: "pool-a", model: "p1" });
     s.push(stateOf([]));
     await s.flush();
-    byText(s.root, "button", "New chat")!.click();
+    typeNew(s.root, "hi");
     await s.flush();
-    expect(s.sent.some(c => c.type === "ais-chat-create")).toBe(false);
-    expect(byClass(s.root, "banner").find(b => b.textContent === LOADING_PROVIDERS)).toBeDefined();
+    expect(creates(s.sent)).toHaveLength(0);
     s.push(stateOf([], { catalog: cat }));
-    byText(s.root, "button", "New chat")!.click();
+    typeNew(s.root, "hi");
     await s.flush();
-    const create = s.sent.find(c => c.type === "ais-chat-create");
-    expect(create && create.type === "ais-chat-create" ? create.selection : undefined).toEqual({ provider: "claude", identity: "pool-a", model: "p1" });
+    expect(creates(s.sent)[0]).toMatchObject({ text: "hi", selection: { provider: "claude", identity: "pool-a", model: "p1" } });
   });
-  test("New chat before the stored selection loads sends nothing and keeps the stored selection", async () => {
+  test("Send before the stored selection loads sends nothing and keeps the stored selection", async () => {
     let release: (v: unknown) => void = () => {};
     const stored = new Promise<unknown>(r => { release = r; });
     const s = make(stored);
     s.push(stateOf([], { catalog: cat }));
-    byText(s.root, "button", "New chat")!.click();
+    typeNew(s.root, "hi");
     await s.flush();
-    expect(s.sent.some(c => c.type === "ais-chat-create")).toBe(false);
+    expect(creates(s.sent)).toHaveLength(0);
     expect(s.saved).toEqual([]);
     release({ provider: "claude", identity: "pool-a", model: "p1" });
     await s.flush();
-    byText(s.root, "button", "New chat")!.click();
+    typeNew(s.root, "hi");
     await s.flush();
-    const create = s.sent.find(c => c.type === "ais-chat-create");
-    expect(create && create.type === "ais-chat-create" ? create.selection : undefined).toEqual({ provider: "claude", identity: "pool-a", model: "p1" });
+    expect(creates(s.sent)[0]).toMatchObject({ selection: { provider: "claude", identity: "pool-a", model: "p1" } });
   });
   test("an effort that is not selectable is not saved for a new chat", async () => {
     const s = make(undefined);
@@ -489,10 +547,9 @@ describe("picker wiring", () => {
     const s = make({ provider: "claude", identity: "work", model: "gone" });
     await s.flush();
     s.push(stateOf([], { catalog: cat }));
-    byText(s.root, "button", "New chat")!.click();
+    typeNew(s.root, "hi");
     await s.flush();
-    const create = s.sent.find(c => c.type === "ais-chat-create");
-    expect(create && create.type === "ais-chat-create" ? create.selection : undefined).toEqual({ provider: "claude", identity: "work" });
+    expect(creates(s.sent)[0]!.selection).toEqual({ provider: "claude", identity: "work" });
   });
   test("a model pick in an open chat sends ais-chat-config, other identities send nothing", async () => {
     const s = make(undefined);
@@ -520,7 +577,8 @@ describe("picker wiring", () => {
     btn.click();
     btn.click();
     await s.flush();
-    expect(s.sent.filter(c => c.type === "ais-chat-catalog").length).toBe(2);
+    // One ask comes from the list screen itself, the others from the opened menu.
+    expect(s.sent.filter(c => c.type === "ais-chat-catalog").length).toBe(3);
   });
 });
 
@@ -562,12 +620,13 @@ describe("composer with the picker inside", () => {
     s.push(stateOf(chats, { catalog: cat }));
     s.t.select("a");
     await s.flush();
-    const composerOf = (n: number) => byClass(s.root, "composer-tools")[n]!;
+    const composerOf = (n: number) => byClass(byClass(s.root, "chat-detail")[0]!, "composer-tools")[n]!;
     const picker = walk(composerOf(0)).find(n => n.className === "picker")!;
     s.t.select(undefined);
     s.t.select("b");
-    expect(byClass(s.root, "composer-tools").some(t => t.children.includes(picker))).toBe(true);
-    expect(byClass(s.root, "composer-tools").filter(t => t.children.length > 0)).toHaveLength(1);
+    const detailTools = byClass(byClass(s.root, "chat-detail")[0]!, "composer-tools");
+    expect(detailTools.some(t => t.children.includes(picker))).toBe(true);
+    expect(detailTools.filter(t => t.children.length > 0)).toHaveLength(1);
   });
   test("a star is saved and stays after a reload of the list", async () => {
     const s = make([{ provider: "claude", identity: "work", model: "m1" }]);
@@ -596,10 +655,9 @@ describe("a chat with no linkable tab", () => {
     const s = setup([], { tabs });
     s.push(stateOf([], { catalog: [{ provider: "claude", efforts: [], identities: [{ name: "work", kind: "identity", models: [] }] }] }));
     await s.flush();
-    byText(s.root, "button", "New chat")!.click();
+    typeNew(s.root, "hi");
     await s.flush();
-    const create = s.sent.find(c => c.type === "ais-chat-create");
-    expect(create && create.type === "ais-chat-create" ? create.tabIds : undefined).toEqual([]);
+    expect(creates(s.sent)[0]!.tabIds).toEqual([]);
     s.push(stateOf([view("a", { tabIds: [] })]));
     s.t.select("a");
     await s.flush();

@@ -10,6 +10,7 @@ export class FakeNode {
   value = "";
   disabled = false;
   maxLength = -1;
+  placeholder = "";
   className = "";
   hidden = false;
   tabIndex = 0;

@@ -147,17 +147,18 @@ const openChat = (p: Session, name: string) => until(`open ${name}`, () => p.eva
   if (!row) return false; row["click"](); return true; })()`), 30_000);
 const backToList = (p: Session) => p.eval(`(() => { const d = document.querySelector(".chat-detail"); if (!d.hidden) [...d.querySelectorAll("button")].find(b => b.textContent === "Back").click(); })()`);
 
-/** Types a message in the open chat and presses Enter. */
+/** Types a message in the open chat and presses Enter. Send is disabled while the box is empty, so the text goes in first. */
 async function say(p: Session, name: string, text: string): Promise<void> {
   await openChat(p, name);
+  const type = `(() => { const box = document.querySelector(".chat-detail:not([hidden]) .composer-box"); box.value = ${JSON.stringify(text)}; box.dispatchEvent(new Event("input", { bubbles: true })); })()`;
   try {
-    await until("send enabled", () => p.eval<boolean>(`(() => { const b = document.querySelector(".chat-detail:not([hidden]) .composer .composer-send"); return b !== null && !b.hidden && !b.disabled; })()`), 240_000); // the first prompt waits for the pod: a loaded host needs minutes
+    await until("send enabled", () => p.eval<boolean>(`(() => { ${type}; const b = document.querySelector(".chat-detail:not([hidden]) .composer .composer-send"); return b !== null && !b.hidden && !b.disabled; })()`), 240_000); // a loaded host needs minutes for a pod
   } catch (e) {
     console.error(`composer of ${name}:`, await p.eval<string>(`(document.querySelector(".chat-detail .composer")?.outerHTML ?? "none").slice(0, 600)`), JSON.stringify((await hubChat(name))?.summary), JSON.stringify((await hubChat(name))?.items.slice(-4)));
     throw e;
   }
   sent.set(name, (sent.get(name) ?? 0) + 1);
-  await p.eval(`(() => { const box = document.querySelector(".chat-detail:not([hidden]) .composer-box"); box.value = ${JSON.stringify(text)}; box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); })()`);
+  await p.eval(`(() => { const box = document.querySelector(".chat-detail:not([hidden]) .composer-box"); box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); })()`);
 }
 const run = (steps: Array<{ tool: string; args?: Record<string, unknown> }>, extra: { repeat?: boolean; gapMs?: number } = {}): string => `run:${JSON.stringify({ steps, ...extra })}`;
 /** How many messages each chat was given, so turnDone waits for the turn of the last one and not for an older one. */
@@ -167,12 +168,21 @@ const turnDone = (name: string, ms = 120_000) => until(`${name} idle`, async () 
   return c !== undefined && c.items.filter(i => i.body.k === "user").length === sent.get(name) && c.summary.state === "idle" && c.items.at(-1)?.body.k === "turn_end";
 }, ms);
 
-/** Starts a chat from the list with the tab that is active now. Returns its name. */
-async function newChat(p: Session): Promise<string> {
+/** Types a message in the box of the list screen and waits until Send is enabled for it. */
+const typeInList = (p: Session, text: string) => until("list Send enabled", () => p.eval<boolean>(`(() => {
+  const l = document.querySelector(".chat-list"); if (l.hidden) return false;
+  const box = l.querySelector(".composer-box"); box.value = ${JSON.stringify(text)}; box.dispatchEvent(new Event("input", { bubbles: true }));
+  return !l.querySelector(".composer-send").disabled; })()`), 60_000);
+const pressEnterInList = (p: Session) => p.eval(`document.querySelector(".chat-list .composer-box").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }))`);
+
+/** Starts a chat from the list: types the first message with the tab that is active now and sends it. Returns the chat name. */
+async function newChat(p: Session, first = "say:ready"): Promise<string> {
   await backToList(p);
-  await clickUntil(p, "New chat button", ".chat-list .list-head button", "New chat");
+  await typeInList(p, first);
+  await pressEnterInList(p);
   await until("new chat open", () => p.eval<boolean>(`(() => { const d = document.querySelector(".chat-detail"); return !d.hidden && d.querySelector(".chat-name").textContent !== ""; })()`), 60_000);
   const name = await p.eval<string>(`document.querySelector(".chat-detail .chat-name").textContent`);
+  sent.set(name, 1);
   return name;
 }
 const chips = (p: Session) => p.eval<string[]>(`[...document.querySelectorAll(".chat-detail:not([hidden]) .chip-tab .chip-label")].map(e => e.textContent)`);
@@ -255,8 +265,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
     await clickUntil(P, "picker button", ".chat-list .picker-button");
     await until("catalogue in the popover", () => P.eval<boolean>(`[...document.querySelectorAll(".chat-list .picker-heading")].some(b => b.textContent.includes("alpha"))`), 60_000);
     await clickUntil(P, "pick alpha", ".chat-list .picker-option");
-    expect(await newChat(P)).toBe("Chat 1");
-    await say(P, "Chat 1", "say:**Bold words** and <b>raw html</b> end");
+    expect(await newChat(P, "say:**Bold words** and <b>raw html</b> end")).toBe("Chat 1");
     await until("assistant message", () => P.eval<boolean>(`document.querySelector(".chat-detail:not([hidden]) .msg.assistant strong") !== null`), 90_000);
     const view = await P.eval<{ strong: string; rawB: boolean; text: string }>(`(() => { const m = document.querySelector(".chat-detail:not([hidden]) .msg.assistant"); return { strong: m.querySelector("strong").textContent, rawB: m.querySelector("b") !== null, text: m.textContent }; })()`);
     expect(view.strong).toBe("Bold words");
@@ -421,8 +430,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
 
   it("closing the panel mid-stream and reopening it restores the feed with no duplicate items", async () => {
     await activate(tabA);
-    expect(await newChat(P)).toBe("Chat 3");
-    await say(P, "Chat 3", "wait:3000");
+    expect(await newChat(P, "wait:3000")).toBe("Chat 3");
     await until("Chat 3 running", async () => (await stateOf("Chat 3")) === "thinking", 60_000);
     await cdp.send("Target.closeTarget", { targetId: P.targetId });
     await until("turn ends while the panel is closed", async () => (await replyOf("Chat 3")) === "waited" && (await stateOf("Chat 3")) === "idle", 90_000);
@@ -439,7 +447,9 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
     await activate(tabA);
     for (const n of [4, 5, 6]) expect(await newChat(P)).toBe(`Chat ${n}`);
     await backToList(P);
-    await until("New chat disabled", () => P.eval<boolean>(`document.querySelector(".chat-list .list-head button").disabled === true`), 30_000);
+    // With six chats open Send stays disabled even for a typed message, and the cap message shows under the card.
+    const typeOnly = () => P.eval<boolean>(`(() => { const box = document.querySelector(".chat-list .composer-box"); box.value = "one more"; box.dispatchEvent(new Event("input", { bubbles: true })); return document.querySelector(".chat-list .composer-send").disabled; })()`);
+    await until("Send disabled at the cap", typeOnly, 30_000);
     expect(await P.eval<string>(`[...document.querySelectorAll(".chat-list .hint")].map(h => h.textContent).join("|")`)).toContain(CAP_MESSAGE);
     // The worker refuses a seventh create too, whatever the panel does.
     const refused = await P.eval<{ ok: boolean; error?: string }>(`chrome.windows.getCurrent().then(w => chrome.runtime.sendMessage({ type: "ais-chat-create", windowId: w.id, selection: { provider: "claude", identity: "alpha" }, tabIds: [] }))`);
@@ -450,7 +460,8 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       const id = (await hubChat(`Chat ${n}`))!.summary.chatId;
       expect(await P.eval<{ ok: boolean }>(`chrome.runtime.sendMessage({ type: "ais-chat-close", chatId: ${JSON.stringify(id)} })`)).toEqual({ ok: true });
     }
-    await until("New chat enabled", () => P.eval<boolean>(`document.querySelector(".chat-list .list-head button").disabled === false`), 30_000);
+    await until("Send enabled again", async () => !(await typeOnly()), 30_000);
+    await P.eval(`(() => { const box = document.querySelector(".chat-list .composer-box"); box.value = ""; box.dispatchEvent(new Event("input", { bubbles: true })); })()`);
   });
 
   it("the picker is keyboard operable (ArrowDown, Enter, Escape) and returns focus to its button", async () => {
@@ -513,8 +524,7 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
   it("a gateway stop() mid-turn: the feed shows the turn end and the next prompt resumes with a notice", async () => {
     await activate(tabA);
     await backToList(P);
-    const name = await newChat(P);
-    await say(P, name, "say:before the restart");
+    const name = await newChat(P, "say:before the restart");
     await turnDone(name);
     await say(P, name, "wait:2500");
     await until("turn running", async () => (await stateOf(name)) === "thinking", 60_000);
@@ -568,19 +578,59 @@ describe.skipIf(!chromium)("Side-panel chat in real Chromium", () => {
       await Q.send("Page.addScriptToEvaluateOnNewDocument", { source: patch });
       await Q.send("Page.navigate", { url: `chrome-extension://${extId}/sidepanel.html` });
       await until("chat list", () => Q.eval<boolean>(`document.querySelector("#chat .chat-list") !== null && !document.querySelector("#chat .chat-list").hidden`), 120_000);
+      // Start from an empty list: close the chats of the earlier cases.
+      const open = (await sw.eval<{ chatHub?: { chats: Array<{ view: HubChat }> } }>(`chrome.storage.session.get("chatHub")`)).chatHub?.chats.map(c => c.view.summary).filter(x => x.state !== "closed") ?? [];
+      for (const c of open) expect(await Q.eval<{ ok: boolean }>(`chrome.runtime.sendMessage({ type: "ais-chat-close", chatId: ${JSON.stringify(c.chatId)} })`)).toEqual({ ok: true });
+      await until("no chat rows", () => Q.eval<boolean>(`document.querySelectorAll(".chat-list .chat-row").length === 0 && !document.querySelector(".chat-list .empty").hidden`), 30_000);
       await activate(tabA);
       await Q.send("Page.bringToFront");
 
-      // The new-chat picker (same component): choose Claude Sonnet 5.5 of alpha.
+      // The new-chat screen is a composer: no New chat button, the picker and Send inside one card at the bottom of the panel.
+      await typeInList(Q, "x"); // Send enables once the catalogue and a selection are in
+      await Q.eval(`(() => { const box = document.querySelector(".chat-list .composer-box"); box.value = ""; box.dispatchEvent(new Event("input", { bubbles: true })); })()`);
+      const list = ".chat-list";
+      const lrect = (sel: string) => Q.eval<{ x: number; y: number; w: number; h: number; r: number; b: number }>(`(() => { const e = document.querySelector(${JSON.stringify(`${list} ${sel}`)}); const { left, top, width, height, right, bottom } = e.getBoundingClientRect(); return { x: left, y: top, w: width, h: height, r: right, b: bottom }; })()`);
+      expect(await Q.eval<boolean>(`[...document.querySelectorAll("${list} button")].some(b => b.textContent === "New chat" || b.textContent === "Choose a model" && !b.classList.contains("picker-button"))`)).toBe(false);
+      expect(await Q.eval<string>(`document.querySelector("${list} .composer-box").placeholder`)).toBe("Ask about the open pages");
+      const lcard = await lrect(".composer-card");
+      const lbox = await lrect(".composer-box");
+      const lpick = await lrect(".composer .picker-button");
+      const lsend = await lrect(".composer .composer-send");
+      expect(lpick.y).toBeGreaterThan(lbox.b - 1);
+      expect(lsend.y).toBeGreaterThan(lbox.b - 1);
+      expect(lpick.x).toBeLessThan(lsend.x);
+      for (const r of [lbox, lpick, lsend]) expect(r.x >= lcard.x && r.r <= lcard.r && r.y >= lcard.y && r.b <= lcard.b).toBe(true);
+      expect(lcard.b).toBeGreaterThan(600); // the card sits at the bottom of the 760 px panel
+      expect(await Q.eval<boolean>(`document.querySelector("${list} .composer-send").disabled`)).toBe(true); // empty box
+      await sleep(300);
+      await shot("composer-g-new-chat-r2", Q);
+
+      // The picker opens above the card, inside the panel. Choose Claude Sonnet 5.5 of alpha.
       await clickUntil(Q, "list picker button", ".chat-list .picker-button");
       await until("stub catalogue in the list picker", () => Q.eval<boolean>(`[...document.querySelectorAll(".chat-list .picker-tab")].map(t => t.getAttribute("aria-label")).join() === "Favourites,Claude,Codex,Kimi"`), 60_000);
       await sleep(300);
-      await shot("composer-g-list-picker-r1", Q);
-      expect(await Q.eval<boolean>(`document.querySelector(".chat-list .picker-pop").getBoundingClientRect().bottom <= window.innerHeight`)).toBe(true);
+      const lpop = await lrect(".picker-pop");
+      expect(lpop.b).toBeLessThanOrEqual(lcard.y + 1);
+      expect(lpop.y).toBeGreaterThanOrEqual(0);
+      expect(lpop.x).toBeGreaterThanOrEqual(0);
+      expect(lpop.r).toBeLessThanOrEqual(400);
+      await shot("composer-h-new-chat-picker-r2", Q);
       await Q.eval(`[...document.querySelectorAll(".chat-list .picker-option")].find(b => b.textContent.startsWith("Claude Sonnet 5.5")).click()`);
       await until("Sonnet chosen", () => Q.eval<boolean>(`document.querySelector(".chat-list .picker-button").textContent.includes("Claude Sonnet 5.5")`));
 
-      const name = await newChat(Q);
+      // The page the user looks at is linked by default: make tab A the active one, as it is in real use.
+      await activate(tabA);
+      await sleep(500);
+      // Type and send: the chat opens and its feed shows the message as the first prompt.
+      const name = await newChat(Q, "say:Hello from the new chat screen");
+      await until("user message in the feed", () => Q.eval<boolean>(`[...document.querySelectorAll(".chat-detail:not([hidden]) .feed .msg.user")].some(m => m.textContent === "say:Hello from the new chat screen")`), 120_000);
+      expect(await Q.eval<number>(`document.querySelectorAll(".chat-detail:not([hidden]) .feed .msg.user").length`)).toBe(1);
+      expect(await Q.eval<string>(`document.querySelector(".chat-detail:not([hidden]) .composer .picker-button").textContent`)).toContain("Claude Sonnet 5.5");
+      expect(await chips(Q)).toEqual(["Page A"]);
+      await until("reply to the first prompt", async () => (await replyOf(name)) === "Hello from the new chat screen", 240_000);
+      await turnDone(name);
+      await shot("composer-i-new-chat-sent-r2", Q);
+
       const detail = ".chat-detail:not([hidden])";
       const rect = (sel: string) => Q.eval<{ x: number; y: number; w: number; h: number; r: number; b: number }>(`(() => { const e = document.querySelector(${JSON.stringify(`${detail} ${sel}`)}); const { left, top, width, height, right, bottom } = e.getBoundingClientRect(); return { x: left, y: top, w: width, h: height, r: right, b: bottom }; })()`);
 

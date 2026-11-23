@@ -21,6 +21,8 @@ export interface ComposerHandlers {
   /** Resolves true when the message was accepted. The draft stays until then. */
   onSend(text: string): Promise<boolean>;
   onStop(): void;
+  /** The hint inside the empty box. */
+  placeholder?: string;
 }
 export interface Composer {
   root: HTMLElement;
@@ -49,7 +51,7 @@ export function createComposer(doc: Document, h: ComposerHandlers): Composer {
   box.className = "composer-box";
   box.rows = 2;
   box.maxLength = MAX_CHAT_TEXT;
-  box.placeholder = "Message the agent";
+  box.placeholder = h.placeholder ?? "Message the agent";
   box.setAttribute("aria-label", "Message");
   const tools = doc.createElement("div");
   tools.className = "composer-tools";
@@ -73,8 +75,12 @@ export function createComposer(doc: Document, h: ComposerHandlers): Composer {
   root.append(hint, card);
   let mode = { send: false, stop: false } as { send: boolean; stop: boolean };
   let sending = false;
-  /** Send looks dim while the box is empty. It stays clickable: an empty send does nothing. */
-  const paintSend = (): void => { send.className = box.value.trim() === "" ? "composer-send idle" : "composer-send"; };
+  /** Send is disabled and dim while the box is empty, and while the mode forbids it. */
+  const paintSend = (): void => {
+    const empty = box.value.trim() === "";
+    send.className = empty ? "composer-send idle" : "composer-send";
+    send.disabled = empty || !mode.send;
+  };
   paintSend();
   const submit = (): void => {
     const text = box.value.trim();
@@ -98,7 +104,7 @@ export function createComposer(doc: Document, h: ComposerHandlers): Composer {
       mode = m;
       send.hidden = m.stop;
       stop.hidden = !m.stop;
-      send.disabled = !m.send;
+      paintSend();
       hint.textContent = m.hint ?? "";
       hint.hidden = m.hint === undefined;
     },

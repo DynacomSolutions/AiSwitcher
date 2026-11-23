@@ -33,6 +33,7 @@ describe("composer", () => {
   });
   test("a running turn shows Stop in place of Send", () => {
     const s = setup();
+    s.box.value = "hi";
     s.c.update({ send: true, stop: false });
     expect([s.send.hidden, s.stop.hidden, s.send.disabled]).toEqual([false, true, false]);
     s.c.update({ send: false, stop: true });
@@ -40,15 +41,23 @@ describe("composer", () => {
     s.stop.click();
     expect(s.stops()).toBe(1);
   });
-  test("Send is disabled when the mode does not allow it, and dim while the box is empty", () => {
+  test("Send is disabled when the mode does not allow it, and while the box is empty", () => {
     const s = setup();
     s.c.update({ send: false, stop: false });
     expect(s.send.disabled).toBe(true);
     s.c.update({ send: true, stop: false });
     expect(s.send.className).toBe("composer-send idle");
+    expect(s.send.disabled).toBe(true);
     s.box.value = "hi";
     s.box.dispatch("input");
     expect(s.send.className).toBe("composer-send");
+    expect(s.send.disabled).toBe(false);
+    s.c.update({ send: false, stop: false });
+    expect(s.send.disabled).toBe(true);
+  });
+  test("the placeholder comes from the handlers", () => {
+    const c = createComposer(asDoc(fakeDoc()), { onSend: async () => true, onStop: () => {}, placeholder: "Ask about the open pages" });
+    expect(c.box.placeholder).toBe("Ask about the open pages");
   });
   test("Enter and the Send button send the trimmed draft, Shift+Enter and an empty box do not", async () => {
     const s = setup();

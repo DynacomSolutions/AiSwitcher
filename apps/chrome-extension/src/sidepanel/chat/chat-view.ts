@@ -20,9 +20,9 @@ import { capState, openChats, rowFor, STATE_LABEL, turnRunning } from "./list.ts
 
 const RECONNECT_MS = 500;
 const SAVE_MS = 250;
-export const LOADING_PROVIDERS = "Providers are loading. Try again in a moment.";
 export const RESTARTED = "The extension restarted. Try again.";
 export const LINK_PROMPT = "Link a tab so the agent can see a page.";
+export const NEW_PLACEHOLDER = "Ask about the open pages";
 export const AGENT_TAB = "The agent opened this page. Close the tab to remove it.";
 
 function el<K extends keyof HTMLElementTagNameMap>(doc: Document, tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
@@ -158,8 +158,7 @@ export class ChatTab {
   private readonly connBanner: HTMLElement;
   private readonly errBanner: HTMLElement;
   private readonly listEl: HTMLElement;
-  private readonly newBtn: HTMLButtonElement;
-  private readonly capHint: HTMLElement;
+  private readonly newComposer: Composer;
   private readonly empty: HTMLElement;
   private readonly ul: HTMLElement;
   private readonly detailEl: HTMLElement;
@@ -185,11 +184,9 @@ export class ChatTab {
     for (const b of [this.connBanner, this.errBanner]) { b.setAttribute("role", "alert"); b.hidden = true; }
 
     this.listEl = el(doc, "div", "chat-list");
-    this.newBtn = button(doc, "New chat", "primary-small", () => void this.newChat());
     const head = el(doc, "div", "list-head");
-    head.append(el(doc, "h2", undefined, "Chats"), this.newBtn);
-    this.capHint = el(doc, "p", "hint");
-    this.empty = el(doc, "p", "empty", "No chats yet. Start one to ask an agent about your open pages.");
+    head.append(el(doc, "h2", undefined, "Chats"));
+    this.empty = el(doc, "p", "empty", "No chats yet. Write a message below to start one.");
     this.ul = el(doc, "ul", "sessions chat-rows");
     this.listPicker = createPicker(doc, {
       onOpen: () => this.askCatalog(),
@@ -197,7 +194,11 @@ export class ChatTab {
       onPick: p => this.pickNew(p),
       onEffort: effort => { const cur = this.newSelection(); if (cur && selectable(effort)) this.setNew({ ...cur, effort }); },
     }, "Provider and model for new chats");
-    this.listEl.append(head, this.listPicker.root, this.capHint, this.empty, this.ul);
+    this.newComposer = createComposer(doc, { placeholder: NEW_PLACEHOLDER, onSend: text => this.newChat(text), onStop: () => { /* a new chat has nothing to stop */ } });
+    this.newComposer.tools.replaceChildren(this.listPicker.root);
+    const rows = el(doc, "div", "chat-rows-slot");
+    rows.append(this.empty, this.ul);
+    this.listEl.append(head, rows, this.newComposer.root);
 
     this.detailEl = el(doc, "div", "chat-detail");
     const dhead = el(doc, "div", "list-head");
@@ -314,7 +315,6 @@ export class ChatTab {
     }
     this.known = new Set(s.chats.map(c => c.summary.chatId));
     this.state = s;
-    if (this.localError === LOADING_PROVIDERS && s.catalog?.some(p => p.identities.length > 0)) this.localError = undefined;
     if (this.selected && !s.chats.some(c => c.summary.chatId === this.selected)) this.selected = undefined;
     this.prune(s);
     this.noteSeen();
@@ -396,9 +396,9 @@ export class ChatTab {
 
   private paintList(s: ChatPanelState): void {
     const cap = capState(s.chats, this.d.windowId);
-    this.newBtn.disabled = cap.full || this.creating;
-    this.capHint.hidden = cap.message === undefined;
-    this.setText(this.capHint, cap.message ?? "");
+    if (!s.catalog) this.askCatalog();
+    const selection = this.newSelection();
+    this.newComposer.update({ send: selection !== undefined && !cap.full && !this.creating, stop: false, ...(cap.message !== undefined ? { hint: cap.message } : {}) });
     this.listPicker.update({ ...buildPicker(s.catalog, this.newSelection()), favourites: this.favourites });
     const chats = openChats(s.chats, this.d.windowId);
     this.empty.hidden = chats.length > 0;
@@ -465,7 +465,7 @@ export class ChatTab {
   private closeChat(chatId: string): void {
     const ids = [...this.rows.keys()];
     const next = this.rows.get(ids[ids.indexOf(chatId) + 1] ?? "");
-    (next ? next.open : this.newBtn).focus();
+    (next ? next.open : this.newComposer.box).focus();
     void this.run({ type: "ais-chat-close", chatId });
   }
 
@@ -583,23 +583,19 @@ export class ChatTab {
 
   // ---- new chat -----------------------------------------------------------
 
-  private async newChat(): Promise<void> {
+  /** Creates a chat with the chosen selection and sends the text as its first prompt. Resolves true when the hub accepted it. */
+  private async newChat(text: string): Promise<boolean> {
     const s = this.state;
-    if (!s || this.creating) return;
+    if (!s || this.creating) return false;
     const selection = this.newSelection();
-    if (!selection) {
-      this.localError = LOADING_PROVIDERS;
-      void this.d.send({ type: "ais-chat-catalog" });
-      this.paint();
-      return;
-    }
+    if (!selection) return false; // Send stays disabled until the catalogue and the stored selection are in
     const active = this.tabs.find(t => t.active && t.windowId === this.d.windowId);
     const tabIds = active ? defaultChatTabs(this.tabs.filter(t => t.windowId === this.d.windowId), active.id) : [];
     this.d.saveSelection?.(selection);
     this.openNew = true;
     this.creating = true;
     this.paint();
-    try { await this.run({ type: "ais-chat-create", windowId: this.d.windowId, selection, tabIds }); } finally { this.creating = false; this.paint(); }
+    try { return await this.run({ type: "ais-chat-create", windowId: this.d.windowId, selection, text, tabIds }); } finally { this.creating = false; this.paint(); }
   }
 }
 
