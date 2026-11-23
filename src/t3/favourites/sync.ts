@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { CHAT_PROVIDERS, favId, MAX_FAVOURITES, parseChatToExt, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
 import type { FavouritesApi } from "./client.ts";
 import { applyGateway, localChanges, sameFavs } from "./merge.ts";
-import type { MapContext } from "./mapping.ts";
+import { mappedKeys, type MapContext, type T3Fav } from "./mapping.ts";
 import { favouritesStateDir, type FavSyncMetrics, type FavSyncRole } from "./metrics.ts";
 import { readT3Settings, settingsPathOf, writeT3Favourites } from "./settings.ts";
 
@@ -25,8 +25,13 @@ export interface FavSyncDeps {
   log?: (message: string) => void;
 }
 
-/** `epoch` is the gateway store the list came from. Absent in a file from before the epoch existed. */
-export interface SyncState { version: 1; seq: number; epoch?: string; synced: FavKey[] }
+/** A change found in T3 that the gateway has not confirmed yet. `at` is the settings.json time of the read that first found it. */
+export interface PendingChange { op: "add" | "remove"; at: number }
+/**
+ * `epoch` is the gateway store the list came from. Absent in a file from before the epoch existed.
+ * `pending` holds the T3 changes that wait for the gateway, by star id. Absent in a file from before it existed.
+ */
+export interface SyncState { version: 1; seq: number; epoch?: string; synced: FavKey[]; pending?: Record<string, PendingChange> }
 
 /** A short, stable name of a T3 home. It is used in file names, in the origin label and in metric labels, so no path leaks. */
 export const homeKey = (t3Home: string): string => createHash("sha256").update(t3Home).digest("hex").slice(0, 8);
@@ -34,9 +39,20 @@ const statePath = (d: Pick<FavSyncDeps, "t3Home" | "stateDir">): string => join(
 /** The counters file of one process: the role and the pid are in the name, so two processes of one home never share a file. */
 export const metricsPathOf = (t3Home: string, stateDir = favouritesStateDir(), role: FavSyncRole = "cli", pid: number = process.pid): string => join(stateDir, `${homeKey(t3Home)}.${role}-${pid}.metrics.json`);
 
+/** A bad entry is skipped: it only costs the original time of one change. */
+function cleanPending(raw: unknown): Record<string, PendingChange> {
+  const out: Record<string, PendingChange> = {};
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return out;
+  for (const [id, e] of Object.entries(raw as Record<string, unknown>)) {
+    const o = e as { op?: unknown; at?: unknown } | null;
+    if (o && (o.op === "add" || o.op === "remove") && typeof o.at === "number" && Number.isFinite(o.at)) out[id] = { op: o.op, at: o.at };
+  }
+  return out;
+}
+
 export async function readState(d: Pick<FavSyncDeps, "t3Home" | "stateDir">): Promise<SyncState | undefined> {
   try {
-    const v = JSON.parse(await readFile(statePath(d), "utf8")) as { version?: unknown; seq?: unknown; epoch?: unknown; synced?: unknown };
+    const v = JSON.parse(await readFile(statePath(d), "utf8")) as { version?: unknown; seq?: unknown; epoch?: unknown; synced?: unknown; pending?: unknown };
     const seq = parseChatToExt({ t: "chat.fav.list", seq: v.seq, epoch: v.epoch, items: [] });
     if (v.version !== 1 || seq?.t !== "chat.fav.list" || !Array.isArray(v.synced)) return undefined;
     // One bad entry is skipped: it must not make the whole list unreadable.
@@ -45,7 +61,8 @@ export async function readState(d: Pick<FavSyncDeps, "t3Home" | "stateDir">): Pr
       const one = parseChatToExt({ t: "chat.fav.list", seq: 0, items: [item] });
       if (one?.t === "chat.fav.list" && one.items[0]) synced.push(one.items[0]);
     }
-    return { version: 1, seq: seq.seq, ...(seq.epoch !== undefined ? { epoch: seq.epoch } : {}), synced };
+    const pending = cleanPending(v.pending);
+    return { version: 1, seq: seq.seq, ...(seq.epoch !== undefined ? { epoch: seq.epoch } : {}), synced, ...(Object.keys(pending).length > 0 ? { pending } : {}) };
   } catch {
     return undefined;
   }
@@ -57,6 +74,26 @@ async function writeState(d: Pick<FavSyncDeps, "t3Home" | "stateDir">, s: SyncSt
   const temp = `${path}.tmp-${process.pid}`;
   await writeFile(temp, JSON.stringify(s), { mode: 0o600 });
   await rename(temp, path);
+}
+
+const samePending = (a: Record<string, PendingChange>, b: Record<string, PendingChange>): boolean => {
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every((id) => b[id]?.op === a[id]!.op && b[id]?.at === a[id]!.at);
+};
+
+/** The differences between T3 and the last sync, each with the time of the read that first found it. A difference that is gone (T3 undid it, or the sync caught up) is dropped. */
+function pendingOf(t3: readonly T3Fav[], ctx: MapContext, state: SyncState | undefined, readAt: number): Record<string, PendingChange> {
+  const local = new Set(mappedKeys(t3, ctx).map(favId));
+  const synced = state?.synced ?? [];
+  const syncedIds = new Set(synced.map(favId));
+  const out: Record<string, PendingChange> = {};
+  const note = (id: string, op: PendingChange["op"]): void => {
+    const prev = state?.pending?.[id];
+    out[id] = prev?.op === op ? prev : { op, at: readAt };
+  };
+  for (const id of local) if (!syncedIds.has(id)) note(id, "add");
+  for (const k of synced) if (!local.has(favId(k))) note(favId(k), "remove");
+  return out;
 }
 
 export type RoundResult =
@@ -76,23 +113,37 @@ export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
   if (!settings) return { status: "no-settings" };
   const ctx: MapContext = { ...(await d.names()), instances: settings.instances };
   const state = await readState(d);
+  // T3 does not date its stars, so the first read that shows a change dates it. A later read must not move that time: an unrelated save of
+  // settings.json while the change waits (gateway down, failed rounds) would make an old removal look newer than a panel add.
+  // It is stored before the gateway is asked, so a round that fails on the gateway keeps it.
+  const pending = pendingOf(settings.favorites, ctx, state, settings.mtimeMs);
+  if (!samePending(pending, state?.pending ?? {})) await writeState(d, { version: 1, seq: state?.seq ?? 0, ...(state?.epoch !== undefined ? { epoch: state.epoch } : {}), synced: state?.synced ?? [], ...(Object.keys(pending).length > 0 ? { pending } : {}) });
   let gateway = await d.client.get();
   m && (m.s.pulls += 1);
   // A new epoch, or a list version below the remembered one, means the gateway lost its data. Every star of T3 goes up again, and nothing is removed.
   // The version alone is not enough: a rebuilt store may already be past the old version when the host reads it.
   const reset = state !== undefined && (gateway.seq < state.seq || (gateway.epoch !== undefined && state.epoch !== undefined && gateway.epoch !== state.epoch));
   const last = state && !reset ? state.synced : undefined;
-  const changes = localChanges(settings.favorites, ctx, last, gateway.items, settings.mtimeMs);
+  const changes = localChanges(settings.favorites, ctx, last, gateway.items, settings.mtimeMs).map((c) => {
+    const p = pending[favId(c)];
+    return p && p.op === c.op ? { ...c, at: p.at } : c;
+  });
   // An add that the gateway refused because the list is full (`cap`) stays in T3 and is sent again next round.
   // An add that lost to a newer change (`stale`) is dead: the newer change wins everywhere, so T3 follows the gateway list and the add is not kept or sent again.
   const keep = new Set<string>();
+  // The gateway confirms a change when it lists it with that op, and a `stale` refusal ends it. Only a `cap` add stays pending, with its first time.
+  const waiting: Record<string, PendingChange> = {};
   if (changes.length > 0) {
     const posted = await d.client.post(d.origin ?? `t3:${homeKey(d.t3Home)}`, changes);
     m && (m.s.pushes += 1);
     const adds = new Set(changes.filter((c) => c.op === "add").map(favId));
     for (const k of posted.refused ?? []) {
       m && (m.s.refused += 1);
-      if (k.reason === "cap" && adds.has(favId(k))) keep.add(favId(k));
+      if (k.reason === "cap" && adds.has(favId(k))) {
+        keep.add(favId(k));
+        const c = changes.find((x) => x.op === "add" && favId(x) === favId(k));
+        if (c?.at !== undefined) waiting[favId(k)] = { op: "add", at: c.at };
+      }
     }
     gateway = posted;
   }
@@ -107,7 +158,7 @@ export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
       m.s.lastWrite = Math.floor(Date.now() / 1000);
     }
   }
-  await writeState(d, { version: 1, seq: gateway.seq, ...(gateway.epoch !== undefined ? { epoch: gateway.epoch } : {}), synced: applied.synced.slice(0, MAX_FAVOURITES) });
+  await writeState(d, { version: 1, seq: gateway.seq, ...(gateway.epoch !== undefined ? { epoch: gateway.epoch } : {}), synced: applied.synced.slice(0, MAX_FAVOURITES), ...(Object.keys(waiting).length > 0 ? { pending: waiting } : {}) });
   if (m) m.s.lastSuccess = Math.floor(Date.now() / 1000);
   return { status: "ok", seq: gateway.seq, pushed: changes.length, wrote };
 }

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { favId } from "../../src/browser/chat-protocol.ts";
 import { FavSyncMetrics, readSnapshots, renderSnapshots } from "../../src/t3/favourites/metrics.ts";
 import { homeKey, metricsPathOf, readState, runFavouritesSync, syncOnce, type FavSyncDeps } from "../../src/t3/favourites/sync.ts";
 import { CLAUDE_POOL, fakeGateway, key, makeHome, names, scratch } from "./favourites-fixtures.ts";
@@ -249,6 +250,84 @@ describe("one round", () => {
     await e.round();
     expect(e.favs()).toHaveLength(1);
     expect((await readState(e.deps))?.epoch).toBe((await e.gw.store.list()).epoch);
+  });
+
+  test("an unrelated T3 save does not re-date a change that waits: the old removal stays older than a newer panel add", async () => {
+    const X = { provider: "t3-claude-work", model: "x" };
+    const e = setup({ favorites: [X, { provider: "t3-claude-work", model: "y" }] });
+    const ago = (h: number) => { const t = new Date(Date.now() - h * 3600_000); return t; };
+    const stamp = (h: number) => utimesSync(e.home.settings, ago(h), ago(h));
+    const rewrite = (fn: (raw: Record<string, any>) => void, h: number) => { const raw = e.home.read(); fn(raw); writeFileSync(e.home.settings, `${JSON.stringify(raw, null, 2)}\n`); stamp(h); };
+    stamp(6);
+    await e.round();
+    expect((await e.gw.store.list()).items.map((i) => i.model).sort()).toEqual(["x", "y"]);
+    // t1: T3 removes X while the gateway is down. The rounds fail.
+    e.gw.setDown(true);
+    rewrite((raw) => { raw.favorites = raw.favorites.filter((f: { model: string }) => f.model !== "x"); }, 4);
+    await expect(e.round()).rejects.toThrow(/down/);
+    // t2: the panel adds X (the store is reached by another route). t3: T3 saves an unrelated key.
+    await e.gw.star(key("x"), "add", Date.now() - 3 * 3600_000);
+    rewrite((raw) => { raw.defaultAutoPull = false; }, 2);
+    await expect(e.round()).rejects.toThrow(/down/);
+    e.gw.setDown(false);
+    await e.round();
+    // The removal is dated t1 < t2, so it lost: X stays starred at the gateway and in T3.
+    expect((await e.gw.store.list()).items.map((i) => i.model).sort()).toEqual(["x", "y"]);
+    expect(e.favs().map((f) => f.model).sort()).toEqual(["x", "y"]);
+    expect((await readState(e.deps))?.synced.map((k) => k.model).sort()).toEqual(["x", "y"]);
+    expect((await readState(e.deps))?.pending).toBeUndefined();
+    expect(e.metrics.s.refused).toBe(1);
+  });
+
+  test("a pending change keeps its first time across rounds, a different op for the same star gets a new time, a state file with no pending map is read", async () => {
+    const A = { provider: "t3-claude-work", model: "a" };
+    const e = setup({ favorites: [A] });
+    utimesSync(e.home.settings, new Date(Date.now() - 5 * 3600_000), new Date(Date.now() - 5 * 3600_000));
+    await e.round();
+    const stateFile = join(e.stateDir, `${homeKey(e.home.home)}.json`);
+    const old = JSON.parse(readFileSync(stateFile, "utf8"));
+    expect(old.pending).toBeUndefined();
+    expect((await readState(e.deps))?.pending).toBeUndefined();
+    const edit = (favorites: unknown[], h: number) => { const raw = e.home.read(); raw.favorites = favorites; writeFileSync(e.home.settings, `${JSON.stringify(raw, null, 2)}\n`); const t = new Date(Date.now() - h * 3600_000); utimesSync(e.home.settings, t, t); return Math.floor(statSync(e.home.settings).mtimeMs); };
+    e.gw.setDown(true);
+    const t1 = edit([], 4);
+    await expect(e.round()).rejects.toThrow(/down/);
+    expect((await readState(e.deps))?.pending).toEqual({ [favId(key("a"))]: { op: "remove", at: t1 } });
+    edit([], 1);
+    await expect(e.round()).rejects.toThrow(/down/);
+    expect(Object.values((await readState(e.deps))?.pending ?? {})).toEqual([{ op: "remove", at: t1 }]);
+    // T3 stars it again: the difference is gone, then a new removal is a new change with a new time.
+    edit([A], 3);
+    await expect(e.round()).rejects.toThrow(/down/);
+    expect((await readState(e.deps))?.pending).toBeUndefined();
+    const t4 = edit([], 0.5);
+    await expect(e.round()).rejects.toThrow(/down/);
+    expect(Object.values((await readState(e.deps))?.pending ?? {})).toEqual([{ op: "remove", at: t4 }]);
+  });
+
+  test("a cap-refused add keeps its entry and its first time", async () => {
+    const e = setup();
+    for (let i = 0; i < 200; i++) await e.gw.star(key(`g${i}`), "add", Date.now() - 100_000 + i);
+    await e.round();
+    const raw = e.home.read();
+    raw.favorites = [...raw.favorites, { provider: "t3-claude-work", model: "fresh" }];
+    writeFileSync(e.home.settings, `${JSON.stringify(raw, null, 2)}\n`);
+    const t = new Date(Date.now() - 2 * 3600_000);
+    utimesSync(e.home.settings, t, t);
+    const t1 = Math.floor(statSync(e.home.settings).mtimeMs);
+    await e.round();
+    expect(Object.values((await readState(e.deps))?.pending ?? {})).toEqual([{ op: "add", at: t1 }]);
+    // An unrelated save moves the mtime: the add is still sent with t1.
+    const raw2 = e.home.read();
+    raw2.defaultAutoPull = false;
+    writeFileSync(e.home.settings, `${JSON.stringify(raw2, null, 2)}\n`);
+    await e.round();
+    expect(e.gw.calls.posted.at(-1)).toEqual([expect.objectContaining({ model: "fresh", op: "add", at: t1 })]);
+    // Room appears: it is accepted and the entry goes.
+    await e.gw.star(key("g0"), "remove");
+    await e.round();
+    expect((await e.gw.store.list()).items.some((i) => i.model === "fresh")).toBe(true);
+    expect((await readState(e.deps))?.pending).toBeUndefined();
   });
 
   test("a gateway that is down fails the round and changes nothing", async () => {
