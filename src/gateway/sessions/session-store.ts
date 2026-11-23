@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { SQL } from "bun";
+import type { SessionIndexFields } from "../../cli/sessions/indexer-shared.ts";
 
 /**
  * Index of stored session transcripts in Postgres (tables from migration 0014_sessions).
@@ -211,6 +212,40 @@ export interface SessionPartRow {
   plainSha256: string;
   objectKey: string;
 }
+
+/** A file whose parts are newer than its index state. */
+export interface EnrichCandidate {
+  fileId: number;
+  generation: number;
+  kind: string;
+  relPath: string;
+  committedBytes: number;
+  indexedBytes: number;
+  /** The stored `scan_state` (`{}` for a file that was never indexed). */
+  scanState: unknown;
+  /** Time (ms) of the last ingest. The queue is oldest first. */
+  lastIngestAt: number;
+}
+
+/** What the enrichment still has to read. */
+export interface EnrichBacklog {
+  files: number;
+  bytes: number;
+  /** Oldest `last_ingest_at` (ms) of a file with unread bytes, null when there is none. */
+  oldestIngestAt: number | null;
+}
+
+export interface EnrichWrite {
+  fileId: number;
+  /** The `indexed_bytes` the caller read. The write happens only while it still holds (another writer moved it: no write). */
+  expectedIndexedBytes: number;
+  fields: SessionIndexFields;
+  /** The indexer state after the fields. Its `bytes` equals `fields.indexedBytes`. */
+  state: unknown;
+}
+
+/** Kinds that have an incremental indexer. Other files stay out of the enrichment queue. */
+export const ENRICH_KINDS = ["claude", "codex"] as const;
 
 export interface SessionStoreHooks {
   /** Test seam. Runs inside the ingest transaction after part `index` was inserted. */
@@ -577,6 +612,89 @@ export class SessionStore {
       [kind, parentRef],
     );
     return rows.map(treeRowOf);
+  }
+
+  /**
+   * Files with unread bytes (`indexed_bytes < committed_bytes`), oldest ingest first. `skipIds` leaves out files the
+   * caller backs off from. Only kinds with an indexer are listed.
+   */
+  async enrichQueue(limit: number, skipIds: number[] = []): Promise<EnrichCandidate[]> {
+    const rows = await this.sql.unsafe(
+      `SELECT id, generation, kind, rel_path, committed_bytes, indexed_bytes, scan_state, last_ingest_at
+         FROM ais_session_file
+        WHERE indexed_bytes < committed_bytes AND kind = ANY($1::text[]) AND id <> ALL($2::bigint[])
+        ORDER BY last_ingest_at, id
+        LIMIT $3`,
+      [[...ENRICH_KINDS], skipIds, Math.min(Math.max(Math.trunc(limit), 1), 500)],
+    );
+    return rows.map((r: Row) => ({
+      fileId: num(r.id),
+      generation: num(r.generation),
+      kind: String(r.kind),
+      relPath: String(r.rel_path),
+      committedBytes: num(r.committed_bytes),
+      indexedBytes: num(r.indexed_bytes),
+      scanState: typeof r.scan_state === "string" ? JSON.parse(r.scan_state) : r.scan_state,
+      lastIngestAt: msOrNull(r.last_ingest_at) ?? 0,
+    }));
+  }
+
+  /** The unread backlog of the enrichment queue. */
+  async enrichBacklog(): Promise<EnrichBacklog> {
+    const r = (
+      await this.sql.unsafe(
+        `SELECT count(*) AS files, COALESCE(sum(committed_bytes - indexed_bytes), 0) AS bytes, min(last_ingest_at) AS oldest
+           FROM ais_session_file WHERE indexed_bytes < committed_bytes AND kind = ANY($1::text[])`,
+        [[...ENRICH_KINDS]],
+      )
+    )[0] as Row;
+    return { files: num(r.files), bytes: num(r.bytes), oldestIngestAt: msOrNull(r.oldest) };
+  }
+
+  /**
+   * The parts of a file from byte `fromOffset` on, in byte order, as many as cover `maxBytes` (always at least one when
+   * a part exists). The caller checks that the first part starts at `fromOffset` and that the parts are contiguous.
+   */
+  async partsFrom(fileId: number, fromOffset: number, maxBytes: number): Promise<SessionPartRow[]> {
+    const rows = await this.sql.unsafe(
+      `SELECT * FROM (
+         SELECT p.*, COALESCE(SUM(plain_bytes) OVER (ORDER BY start_offset ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS before_bytes
+           FROM ais_session_part p WHERE file_id = $1 AND start_offset >= $2
+       ) x
+       WHERE before_bytes < $3
+       ORDER BY start_offset`,
+      [fileId, Math.max(fromOffset, 0), Math.max(maxBytes, 1)],
+    );
+    return rows.map(partRowOf);
+  }
+
+  /**
+   * Writes the index fields and the indexer state of a file in one statement. Returns false when `indexed_bytes` is not
+   * `expectedIndexedBytes` any more (another writer got there first) or the state covers more than the committed bytes.
+   * `updated_at` takes the record time when the indexer found one, and keeps the ingest time otherwise.
+   */
+  async applyEnrichment(w: EnrichWrite): Promise<boolean> {
+    const f = w.fields;
+    const rows = await this.sql.unsafe(
+      `UPDATE ais_session_file
+          SET session_ref = $3, parent_ref = COALESCE($4, parent_ref), agent_name = $5, title = $6, cwd = $7, project = $8, model = $9,
+              started_at = COALESCE(to_timestamp($10::double precision / 1000), started_at),
+              updated_at = COALESCE(to_timestamp($11::double precision / 1000), updated_at),
+              message_count = $12, indexed_bytes = $13, scan_state = $14::jsonb
+        WHERE id = $1 AND indexed_bytes = $2 AND $13::bigint <= committed_bytes
+        RETURNING id`,
+      [w.fileId, w.expectedIndexedBytes, f.sessionRef, f.parentRef, f.agentName, f.title, f.cwd, f.project, f.model, f.startedAt, f.updatedAt, f.messageCount, f.indexedBytes, JSON.stringify(w.state)],
+    );
+    return rows.length === 1;
+  }
+
+  /** Moves `indexed_bytes` of a file that needs no indexing (for example a Codex thread name file) to its committed bytes. */
+  async markIndexed(fileId: number, expectedIndexedBytes: number): Promise<boolean> {
+    const rows = await this.sql.unsafe(
+      `UPDATE ais_session_file SET indexed_bytes = committed_bytes WHERE id = $1 AND indexed_bytes = $2 RETURNING id`,
+      [fileId, expectedIndexedBytes],
+    );
+    return rows.length === 1;
   }
 
   /** All parts of a file in byte order. */

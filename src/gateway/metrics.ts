@@ -209,6 +209,8 @@ export class PrometheusMetrics implements GatewayMetrics {
   /** Readiness and usage warm-up state, set in serve.ts. */
   readiness: () => { ready: boolean; state: string } = () => ({ ready: false, state: "cold" });
   usageWarmup: () => { seconds: number; timeouts: number; cold: number } = () => ({ seconds: 0, timeouts: 0, cold: 0 });
+  /** Extra text sections of other components (the session enrichment). Each returns finished exposition lines. */
+  readonly sections: Array<() => string[]> = [];
   private publicHostCount = 0;
   private budgetWaiting = 0;
   private readonly budgetBucketCounts = BUCKETS.map(() => 0);
@@ -446,6 +448,7 @@ export class PrometheusMetrics implements GatewayMetrics {
     out.push("# HELP ais_gateway_usage_warmup_cold_identities Identities still cold when the warm-up timeout fired (0 otherwise).", "# TYPE ais_gateway_usage_warmup_cold_identities gauge", `ais_gateway_usage_warmup_cold_identities ${uw.cold}`);
     out.push("# HELP ais_gateway_ledger_buffer_depth Usage rows waiting to be written.", "# TYPE ais_gateway_ledger_buffer_depth gauge", `ais_gateway_ledger_buffer_depth ${this.gauges.ledgerDepth()}`);
     out.push("# HELP ais_gateway_ledger_dropped_total Usage rows lost.", "# TYPE ais_gateway_ledger_dropped_total counter", `ais_gateway_ledger_dropped_total ${this.gauges.ledgerDropped()}`);
+    for (const section of this.sections) out.push(...section());
     return `${out.join("\n")}\n`;
   }
 }
