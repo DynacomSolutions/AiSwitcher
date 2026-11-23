@@ -15,6 +15,7 @@ export class FakeChrome implements ChromeApi {
   attachedTabs = new Set<number>();
   detachCalls: number[] = [];
   removedListeners: Array<(id: number) => void> = [];
+  replacedListeners: Array<(addedTabId: number, removedTabId: number) => void> = [];
   eventListeners: Array<(tabId: number, method: string, params: Record<string, unknown>, sessionId?: string) => void> = [];
   createdListeners: Array<(tab: TabInfo) => void> = [];
   activatedListeners: Array<(tabId: number, windowId: number) => void> = [];
@@ -53,7 +54,7 @@ export class FakeChrome implements ChromeApi {
    */
   restart(): Map<number, number> {
     this.session = {};
-    this.removedListeners = []; this.eventListeners = []; this.createdListeners = []; this.activatedListeners = []; this.groupUpdatedListeners = []; this.detachListeners = []; this.notificationButtonListeners = []; this.notificationClosedListeners = [];
+    this.removedListeners = []; this.replacedListeners = []; this.eventListeners = []; this.createdListeners = []; this.activatedListeners = []; this.groupUpdatedListeners = []; this.detachListeners = []; this.notificationButtonListeners = []; this.notificationClosedListeners = [];
     this.attachedTabs.clear();
     const tabMap = new Map<number, number>();
     const groupMap = new Map<number, number>();
@@ -97,6 +98,20 @@ export class FakeChrome implements ChromeApi {
       if (gone.splitViewId !== -1) for (const t of this.splitMembers(gone.splitViewId)) t.splitViewId = -1;
     }
     for (const l of this.removedListeners) l(id);
+  }
+  /**
+   * Chrome gives the tab a new id with the same url, group, window, index and split view (prerender activation, restore of a discarded tab),
+   * and fires onReplaced only: no onRemoved, no onCreated. Returns the new id.
+   */
+  replaceTab(oldId: number): number {
+    const old = this.tabList.get(oldId);
+    if (!old) throw new Error("No tab with id");
+    const id = this.nextTab++;
+    this.tabList.delete(oldId);
+    this.tabList.set(id, { ...old, id });
+    this.attachedTabs.delete(oldId); // Chrome detaches the debugger from the retired tab
+    for (const l of this.replacedListeners) l(id, oldId);
+    return id;
   }
   /** `sessionId`: the event comes from a child session (a cross-origin iframe). */
   emit(tabId: number, method: string, params: Record<string, unknown>, sessionId?: string): void {
@@ -174,6 +189,7 @@ export class FakeChrome implements ChromeApi {
     },
     ungroup: async (ids: number[]) => { for (const id of ids) { const t = this.tabList.get(id); if (t) t.groupId = -1; } },
     onRemoved: (l: (id: number) => void) => { this.removedListeners.push(l); },
+    onReplaced: (l: (addedTabId: number, removedTabId: number) => void) => { this.replacedListeners.push(l); },
     activate: async (id: number) => { this.activations.push(id); this.setActive(id); },
     onCreated: (l: (tab: TabInfo) => void) => { this.createdListeners.push(l); },
     onActivated: (l: (tabId: number, windowId: number) => void) => { this.activatedListeners.push(l); },

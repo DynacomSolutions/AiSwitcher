@@ -50,6 +50,8 @@ export interface ChromeApi {
     group(tabIds: number[], groupId?: number, windowId?: number): Promise<number>;
     ungroup(tabIds: number[]): Promise<void>;
     onRemoved(listener: (tabId: number) => void): void;
+    /** Chrome gave a tab a new id (prerender activation, restore of a discarded tab). Everything keyed by the old id must move to the new one. */
+    onReplaced(listener: (addedTabId: number, removedTabId: number) => void): void;
     /** Makes the tab the active one in its window. Only used to give the owner back the tab they were on. */
     activate(tabId: number): Promise<void>;
     onCreated(listener: (tab: TabInfo) => void): void;
@@ -161,6 +163,7 @@ export function realChromeApi(): ChromeApi {
       },
       ungroup: async tabIds => { await chrome.tabs.ungroup(tabIds as [number, ...number[]]); },
       onRemoved: listener => chrome.tabs.onRemoved.addListener(listener),
+      onReplaced: listener => chrome.tabs.onReplaced.addListener(listener),
       activate: async tabId => { await chrome.tabs.update(tabId, { active: true }); },
       onCreated: listener => chrome.tabs.onCreated.addListener(t => listener(toTab(t))),
       onActivated: listener => chrome.tabs.onActivated.addListener(info => listener(info.tabId, info.windowId)),

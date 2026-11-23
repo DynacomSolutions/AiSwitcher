@@ -12,6 +12,8 @@ export interface Ui {
   markControlled(tabId: number, session: UiSession): Promise<void> | void;
   /** Clears cursor and indicator from one tab (tab released, closed or session ended). */
   unmark(tabId: number): Promise<void> | void;
+  /** Chrome gave the tab a new id: move the marks. Optional for test doubles. */
+  replaceTab?(addedTabId: number, removedTabId: number): Promise<void> | void;
   /** Clears one session from one tab. The other sessions on the tab stay marked. */
   unmarkSession(tabId: number, sessionId: string): Promise<void> | void;
   /** Clears every marked tab (Stop, Pause). */
@@ -158,6 +160,18 @@ export class OverlayUi implements Ui {
       this.lastActive.delete(tabId);
     }
     await this.run(tabId, "unmark", { sessionId }, false);
+  }
+
+  /** Chrome gave the tab a new id: the marks follow it and the overlay is drawn again in the restored page. */
+  async replaceTab(addedTabId: number, removedTabId: number): Promise<void> {
+    const m = this.marked.get(removedTabId);
+    if (!m) return;
+    this.marked.delete(removedTabId);
+    this.marked.set(addedTabId, m);
+    const last = this.lastActive.get(removedTabId);
+    this.lastActive.delete(removedTabId);
+    if (last !== undefined) this.lastActive.set(addedTabId, last);
+    await this.refresh(addedTabId);
   }
 
   async unmarkAll(): Promise<void> {

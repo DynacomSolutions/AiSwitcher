@@ -177,6 +177,12 @@ export class Executor {
       if (reason === "canceled_by_user") void this.state.stop();
     });
     this.api.tabs.onRemoved(tabId => { this.dropTab(tabId); this.cancelHold(tabId); void this.unmark(tabId); });
+    this.api.tabs.onReplaced((added, removed) => {
+      // The debugger was attached to the retired id: mark it detached, so the next call attaches to the new tab.
+      this.dropTab(removed);
+      this.cancelHold(removed);
+      if (this.ui.replaceTab) void Promise.resolve(this.ui.replaceTab(added, removed)).catch(() => {});
+    });
     this.state.onStop(async () => { await Promise.all([this.detachAll(), this.ui.unmarkAll(), this.releaseAllHolds()]); });
     this.state.onChange(paused => { if (paused) void this.ui.unmarkAll(); });
   }
@@ -376,7 +382,8 @@ export class Executor {
       }
       case "request_group": {
         this.throwIfAborted(sig);
-        const { groupId } = a("request_group");
+        const { groupId, allowClose } = a("request_group");
+        const closable = allowClose === true;
         if (session.chat === true) throw new ToolError("forbidden_tab", "A chat cannot ask for a tab group.");
         const first = await this.tabs.checkRequest(session, groupId);
         if (!first.ok) throw new ToolError(first.code, first.message);
@@ -386,16 +393,16 @@ export class Executor {
         try {
           answer = await this.groupPrompt.ask({
             title: "AIS Browser: allow an agent to use a tab group?",
-            message: `Agent "${session.label}" (identity ${session.identity}) asks to use the group "${first.title}" with ${first.tabCount} tabs.${first.shared ? " Another agent session made this group." : ""} The agent can read and use these tabs. It never closes them.`,
+            message: `Agent "${session.label}" (identity ${session.identity}) asks to use the group "${first.title}" with ${first.tabCount} tabs.${first.shared ? " Another agent session made this group." : ""} ${closable ? "The agent can read, use and CLOSE these tabs." : "The agent can read and use these tabs. It never closes them."}`,
           }, sig, this.groupPromptMs);
         } finally {
           this.tabs.endRequest(groupId);
         }
         this.throwIfAborted(sig);
         if (answer !== "approve") throw new ToolError("forbidden_tab", answer === "timeout" ? "The user did not answer in time. Do not ask again unless the user asks." : answer === "deny" ? "The user denied access to this group. Do not ask again." : "The user closed the question without an answer. Do not ask again unless the user asks.");
-        const done = await this.tabs.takeGroup(session, groupId, first.tabIds);
+        const done = await this.tabs.takeGroup(session, groupId, first.tabIds, closable);
         if (!done.ok) throw new ToolError(done.code, done.message);
-        return text(JSON.stringify({ groupId, approved: true, tabCount: done.tabCount, note: "The group is now your own group and every tab is adopted. The session end closes and ungroups none of them." }));
+        return text(JSON.stringify({ groupId, approved: true, tabCount: done.tabCount, note: closable ? "The group is now your own group. You can close its tabs with close_tab, and the session end closes them. A tab that an earlier approval protected stays protected." : "The group is now your own group and every tab is adopted. The session end closes and ungroups none of them." }));
       }
       case "adopt_tab": {
         const { tabId } = a("adopt_tab");

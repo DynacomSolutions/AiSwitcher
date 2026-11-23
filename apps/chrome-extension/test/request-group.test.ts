@@ -305,3 +305,67 @@ describe("request_group", () => {
     await pending;
   });
 });
+
+describe("request_group allowClose", () => {
+  test("the prompt says the agent can close the tabs, the title stays the same", async () => {
+    const t = setup();
+    const { gid } = await userGroup(t.api);
+    const pending = t.call("request_group", { groupId: gid, allowClose: true });
+    await until(() => t.api.shown.size === 1);
+    const note = t.api.everShown[0]!;
+    expect(note.title).toBe("AIS Browser: allow an agent to use a tab group?");
+    expect(note.message).toContain("The agent can read, use and CLOSE these tabs.");
+    expect(note.message).not.toContain("never closes");
+    t.api.clickNotification(1);
+    await pending;
+  });
+
+  test("approve: the tabs are owned and not approved, close_tab works and session_end closes the rest", async () => {
+    const t = setup();
+    const { ids, gid } = await userGroup(t.api);
+    const pending = t.call("request_group", { groupId: gid, allowClose: true });
+    await until(() => t.api.shown.size === 1);
+    t.api.clickNotification(0);
+    const r = await pending;
+    expect(t.json(r)).toMatchObject({ approved: true, tabCount: 4 });
+    const s = t.tabs.sessions.get("agent-1")!;
+    expect(s.groupId).toBe(gid);
+    expect([...s.tabIds]).toEqual(ids);
+    expect(s.adopted.size).toBe(0);
+    expect(s.approved?.size ?? 0).toBe(0);
+    expect((await t.call("close_tab", { tabId: ids[0]! })).ok).toBe(true);
+    expect(t.api.tabList.has(ids[0]!)).toBe(false);
+    await t.call("session_end");
+    expect(t.api.tabList.size).toBe(0);
+  });
+
+  test("deny does nothing", async () => {
+    const t = setup();
+    const { ids, gid } = await userGroup(t.api);
+    const pending = t.call("request_group", { groupId: gid, allowClose: true });
+    await until(() => t.api.shown.size === 1);
+    t.api.clickNotification(1);
+    expect(await pending).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.tabs.sessions.get("agent-1")?.groupId ?? -1).toBe(-1);
+    for (const id of ids) expect(t.api.tabList.get(id)!.groupId).toBe(gid);
+    expect(t.api.tabList.size).toBe(4);
+  });
+
+  test("tabs that an earlier approval protected stay unclosable", async () => {
+    const t = setup();
+    const { ids, gid } = await userGroup(t.api);
+    const first = t.call("request_group", { groupId: gid });
+    await until(() => t.api.shown.size === 1);
+    t.api.clickNotification(0);
+    await first;
+    expect(await t.call("close_tab", { tabId: ids[0]! })).toMatchObject({ ok: false, error: "forbidden_tab" });
+    // A later chat session of the same identity asks again, now with allowClose.
+    clock += HOLDER_LIVE_MS + 1000;
+    const second = t.call("request_group", { groupId: gid, allowClose: true }, OTHER);
+    await until(() => t.api.shown.size === 1);
+    t.api.clickNotification(0);
+    await second;
+    expect(await t.call("close_tab", { tabId: ids[0]! }, OTHER)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.api.tabList.has(ids[0]!)).toBe(true);
+  });
+});
