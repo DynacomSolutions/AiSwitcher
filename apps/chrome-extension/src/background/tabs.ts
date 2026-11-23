@@ -720,6 +720,25 @@ export class TabManager {
 
   endRequest(groupId: number): void { this.requests.delete(groupId); }
 
+  /**
+   * Group-level rule of close_group. Only the own group of the session can be closed: never a granted group, a saved group or the group of another session.
+   * The per-tab rule (owns, not approved) is checked by the caller with the same predicate as close_tab.
+   */
+  checkClose(ref: SessionRef, groupId: number): { ok: true } | { ok: false; code: "forbidden_tab"; message: string } {
+    const refuse = (message: string) => ({ ok: false as const, code: "forbidden_tab" as const, message });
+    if (groupId < 0) return refuse(`Group ${groupId} is not a tab group.`);
+    if (this.grants.has(groupId)) return refuse(`Group ${groupId} is granted to a session. A granted group belongs to the user and is never closed.`);
+    if (this.savedClaims(groupId)) return refuse(`Group ${groupId} is a saved group. It belongs to the user and is never closed.`);
+    const s = this.sessions.get(ref.id);
+    if (!s || s.identity !== ref.identity || s.groupId !== groupId) return refuse(`Group ${groupId} is not the own group of this session, so it cannot be closed.`);
+    return { ok: true };
+  }
+
+  /** The agent record of a group that a session closed on purpose is dropped: a later restore of its tabs must not give the group back. */
+  closedGroup(groupId: number): void {
+    this.dropAgentGroup(groupId);
+  }
+
   /** True when the tab sits in a group the user approved for this session: the session never closes or ungroups it. */
   isApproved(sessionId: string, tabId: number): boolean { return this.sessions.get(sessionId)?.approved?.has(tabId) ?? false; }
 

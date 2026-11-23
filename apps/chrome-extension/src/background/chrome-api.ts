@@ -45,7 +45,8 @@ export interface ChromeApi {
     createSplit(tabIds: [number, number]): Promise<number>;
     /** Throws UnsupportedApiError before Chrome 155. */
     unsplit(splitViewId: number): Promise<void>;
-    remove(tabId: number): Promise<void>;
+    /** One call closes all the given tabs. */
+    remove(tabId: number | number[]): Promise<void>;
     /** A new group is made in `windowId` when given (the window that holds the tabs). Ignored when `groupId` is given. */
     group(tabIds: number[], groupId?: number, windowId?: number): Promise<number>;
     ungroup(tabIds: number[]): Promise<void>;
@@ -180,7 +181,7 @@ export function realChromeApi(): ChromeApi {
         if (typeof api.unsplit !== "function") throw splitUnsupported();
         await api.unsplit(splitViewId);
       },
-      remove: async tabId => { await chrome.tabs.remove(tabId); },
+      remove: async tabId => { if (Array.isArray(tabId)) await chrome.tabs.remove(tabId as [number, ...number[]]); else await chrome.tabs.remove(tabId); },
       group: (tabIds, groupId, windowId) => {
         const ids = tabIds as [number, ...number[]];
         if (groupId !== undefined) return chrome.tabs.group({ tabIds: ids, groupId });
