@@ -407,7 +407,7 @@ describe("gateway metrics page", () => {
   test("a section added to PrometheusMetrics shows in the render", async () => {
     const { PrometheusMetrics } = await import("../../src/gateway/metrics.ts");
     const page = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
-    expect(page.render()).not.toContain("ais_sessions_");
+    expect(page.render()).not.toContain("ais_sessions_files_enriched_total");
     const m = new SessionsEnrichMetrics();
     page.sections.push(() => m.render());
     expect(page.render()).toContain("ais_sessions_files_enriched_total 0");

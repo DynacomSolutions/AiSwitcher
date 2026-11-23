@@ -1099,6 +1099,8 @@ cwd, project, model, times, message count, parent). It is off by default.
 - Errors and back-off: a file with a gap in its parts, a missing object, a decrypt or integrity failure or a storage error
   is left unchanged and skipped by later passes (30 s, doubling, at most 30 minutes). A pass in which nothing moved
   and storage or the database failed also slows the whole loop (5 s, doubling, at most 5 minutes).
+- The loop never writes `session_ref`: the shipper finds a session by it (tool and session id from the path), so only the
+  ingest sets it. It also lists only the newest generation of a session.
 - Not done here: identity and pool resolution, and the Codex thread name from `session_index.jsonl` (that file is marked
   as indexed without being read).
 - Metrics (job `ais-gateway`): `ais_sessions_files_enriched_total`, `ais_sessions_enrich_parts_total`,

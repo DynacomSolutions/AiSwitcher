@@ -615,7 +615,7 @@ export class SessionStore {
   }
 
   /**
-   * Files with unread bytes (`indexed_bytes < committed_bytes`), oldest ingest first. `skipIds` leaves out files the
+   * Files with unread bytes (`indexed_bytes < committed_bytes`), oldest ingest first. Only the newest generation of a session counts: readers take that one. `skipIds` leaves out files the
    * caller backs off from. Only kinds with an indexer are listed.
    */
   async enrichQueue(limit: number, skipIds: number[] = []): Promise<EnrichCandidate[]> {
@@ -623,6 +623,7 @@ export class SessionStore {
       `SELECT id, generation, kind, rel_path, committed_bytes, indexed_bytes, scan_state, last_ingest_at
          FROM ais_session_file
         WHERE indexed_bytes < committed_bytes AND kind = ANY($1::text[]) AND id <> ALL($2::bigint[])
+          AND NOT EXISTS (SELECT 1 FROM ais_session_file n WHERE n.kind = ais_session_file.kind AND n.session_ref = ais_session_file.session_ref AND n.generation > ais_session_file.generation)
         ORDER BY last_ingest_at, id
         LIMIT $3`,
       [[...ENRICH_KINDS], skipIds, Math.min(Math.max(Math.trunc(limit), 1), 500)],
@@ -644,7 +645,9 @@ export class SessionStore {
     const r = (
       await this.sql.unsafe(
         `SELECT count(*) AS files, COALESCE(sum(committed_bytes - indexed_bytes), 0) AS bytes, min(last_ingest_at) AS oldest
-           FROM ais_session_file WHERE indexed_bytes < committed_bytes AND kind = ANY($1::text[])`,
+           FROM ais_session_file
+          WHERE indexed_bytes < committed_bytes AND kind = ANY($1::text[])
+            AND NOT EXISTS (SELECT 1 FROM ais_session_file n WHERE n.kind = ais_session_file.kind AND n.session_ref = ais_session_file.session_ref AND n.generation > ais_session_file.generation)`,
         [[...ENRICH_KINDS]],
       )
     )[0] as Row;
@@ -675,15 +678,16 @@ export class SessionStore {
    */
   async applyEnrichment(w: EnrichWrite): Promise<boolean> {
     const f = w.fields;
+    // `session_ref` is not written: it is the key the shipper finds the session by, so only the ingest sets it.
     const rows = await this.sql.unsafe(
       `UPDATE ais_session_file
-          SET session_ref = $3, parent_ref = COALESCE($4, parent_ref), agent_name = $5, title = $6, cwd = $7, project = $8, model = $9,
-              started_at = COALESCE(to_timestamp($10::double precision / 1000), started_at),
-              updated_at = COALESCE(to_timestamp($11::double precision / 1000), updated_at),
-              message_count = $12, indexed_bytes = $13, scan_state = $14::jsonb
-        WHERE id = $1 AND indexed_bytes = $2 AND $13::bigint <= committed_bytes
+          SET parent_ref = COALESCE($3, parent_ref), agent_name = $4, title = $5, cwd = $6, project = $7, model = $8,
+              started_at = COALESCE(to_timestamp($9::double precision / 1000), started_at),
+              updated_at = COALESCE(to_timestamp($10::double precision / 1000), updated_at),
+              message_count = $11, indexed_bytes = $12, scan_state = $13::jsonb
+        WHERE id = $1 AND indexed_bytes = $2 AND $12::bigint <= committed_bytes
         RETURNING id`,
-      [w.fileId, w.expectedIndexedBytes, f.sessionRef, f.parentRef, f.agentName, f.title, f.cwd, f.project, f.model, f.startedAt, f.updatedAt, f.messageCount, f.indexedBytes, JSON.stringify(w.state)],
+      [w.fileId, w.expectedIndexedBytes, f.parentRef, f.agentName, f.title, f.cwd, f.project, f.model, f.startedAt, f.updatedAt, f.messageCount, f.indexedBytes, JSON.stringify(w.state)],
     );
     return rows.length === 1;
   }
