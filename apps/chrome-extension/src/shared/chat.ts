@@ -1,5 +1,5 @@
 // Types shared by the service worker and the side panel for chats.
-import type { ChatBody, ChatCatalogProvider, ChatProvider, ChatSelection, ChatSummary } from "../../../../src/browser/chat-protocol.ts";
+import type { ChatBody, ChatCatalogProvider, ChatProvider, ChatSelection, ChatSummary, FavKey } from "../../../../src/browser/chat-protocol.ts";
 import { CHAT_PROVIDERS, MAX_CHATS_PER_WINDOW } from "../../../../src/browser/chat-protocol.ts";
 
 /** Shown by the hub and by the panel when a window has the most chats. */
@@ -7,14 +7,17 @@ export const CAP_MESSAGE = `You can have ${MAX_CHATS_PER_WINDOW} chats in one wi
 
 export interface ChatItem { seq: number; ts: number; body: ChatBody }
 export interface ChatView { summary: ChatSummary; items: ChatItem[]; pending?: { permission?: string } }
-export interface ChatPanelState { windowId: number; connected: boolean; chats: ChatView[]; catalog?: ChatCatalogProvider[]; cap: number; error?: string }
+/** `favourites` are the starred models: the gateway list, with the changes the user made that the gateway has not confirmed yet. */
+export interface ChatPanelState { windowId: number; connected: boolean; chats: ChatView[]; catalog?: ChatCatalogProvider[]; favourites?: FavKey[]; cap: number; error?: string }
 
 export type ChatPanelCommand =
   | { type: "ais-chat-create"; windowId: number; selection: ChatSelection; text?: string; tabIds: number[] }
   | { type: "ais-chat-prompt"; chatId: string; text: string } | { type: "ais-chat-cancel"; chatId: string }
   | { type: "ais-chat-permission"; chatId: string; requestId: string; optionId?: string }
   | { type: "ais-chat-link"; chatId: string; tabIds: number[] } | { type: "ais-chat-config"; chatId: string; model?: string; effort?: string }
-  | { type: "ais-chat-rename"; chatId: string; name: string } | { type: "ais-chat-close"; chatId: string } | { type: "ais-chat-catalog"; provider?: ChatProvider };
+  | { type: "ais-chat-rename"; chatId: string; name: string } | { type: "ais-chat-close"; chatId: string } | { type: "ais-chat-catalog"; provider?: ChatProvider }
+  /** Stars a model (`add`) or takes the star away (`remove`). */
+  | ({ type: "ais-chat-favourite"; op: "add" | "remove" } & FavKey);
 
 export type ChatCommandResult = { ok: true } | { ok: false; error: string };
 
@@ -47,6 +50,7 @@ export function parsePanelCommand(v: unknown): ChatPanelCommand | undefined {
     case "ais-chat-config": return isStr(v.chatId) && isOptStr(v.model) && isOptStr(v.effort) ? (v as unknown as ChatPanelCommand) : undefined;
     case "ais-chat-rename": return isStr(v.chatId) && isStr(v.name) ? (v as unknown as ChatPanelCommand) : undefined;
     case "ais-chat-catalog": return v.provider === undefined || (CHAT_PROVIDERS as readonly unknown[]).includes(v.provider) ? (v as unknown as ChatPanelCommand) : undefined;
+    case "ais-chat-favourite": return (v.op === "add" || v.op === "remove") && (CHAT_PROVIDERS as readonly unknown[]).includes(v.provider) && isStr(v.identity) && isStr(v.model) ? (v as unknown as ChatPanelCommand) : undefined;
     default: return undefined;
   }
 }

@@ -1,7 +1,7 @@
 // Background chat hub: keeps every chat's feed, talks to the gateway and serves the side panel.
 // All gateway frames reach the hub already checked by the protocol parsers.
-import type { ChatCatalogProvider, ChatFromExt, ChatProvider, ChatSummary, ChatToExt } from "../../../../src/browser/chat-protocol.ts";
-import { MAX_CHAT_TABS, MAX_CHATS_PER_WINDOW, parseChatFromExt, sessionIdForChat } from "../../../../src/browser/chat-protocol.ts";
+import type { ChatCatalogProvider, ChatFromExt, ChatProvider, ChatSummary, ChatToExt, FavChange, FavKey } from "../../../../src/browser/chat-protocol.ts";
+import { favId, MAX_CHAT_TABS, MAX_CHATS_PER_WINDOW, MAX_FAVOURITES, parseChatFromExt, sessionIdForChat } from "../../../../src/browser/chat-protocol.ts";
 import { nextChatColour } from "../shared/chat-palette.ts";
 import { CAP_MESSAGE } from "../shared/chat.ts";
 import type { ChatCommandResult, ChatItem, ChatPanelCommand, ChatPanelState, ChatView } from "../shared/chat.ts";
@@ -16,6 +16,9 @@ export const ALL_WINDOWS = -1;
 const STORE_KEY = "chatHub";
 export const OFFLINE_MESSAGE = "AIS is not connected to the gateway. Connect it in the extension panel, then try again.";
 const PERSIST_DELAY_MS = 250;
+/** Local storage keys of the starred models: the list the panel shows, and the list the gateway last reported. */
+export const FAVOURITES_KEY = "chatFavourites";
+export const FAVOURITES_SYNCED_KEY = "chatFavouritesSynced";
 
 export interface ChatHubDeps {
   /** Sends a frame to the gateway. Returns false when it cannot (offline). */
@@ -28,6 +31,8 @@ export interface ChatHubDeps {
   resumeSession?(sessionId: string): void;
   /** A chat ended: remove its cursor and pill from pages and clear its stop block. */
   endSession?(sessionId: string): void;
+  /** Local storage for the starred models. It is a cache: the gateway list wins once the panel is connected. Without it the stars last for the worker only. */
+  local?: ChromeApi["storage"];
   /** Timer for coalesced writes. Tests replace it. */
   timer?: { set(fn: () => void, ms: number): unknown; clear(handle: unknown): void };
 }
@@ -40,6 +45,12 @@ export class ChatHub {
   private readonly listeners = new Set<(windowId: number) => void>();
   private readonly catalogReqs = new Map<string, ChatProvider | undefined>();
   private catalog: ChatCatalogProvider[] | undefined;
+  /** The starred models the panel shows. */
+  private favs: FavKey[] = [];
+  /** The list the gateway reported last. A star in `favs` that is not here was made while offline. */
+  private favsSynced: FavKey[] = [];
+  /** True from a welcome until the first list of the gateway has been merged with the local one. */
+  private favsMerge = false;
   private connected = false;
   /** Panel error text per window. A reject that names no chat goes in `globalError` and shows in every window. */
   private readonly errors = new Map<number, string>();
@@ -52,6 +63,7 @@ export class ChatHub {
 
   /** Restores chats after a service worker restart. Call before the tab manager loads. */
   async load(): Promise<void> {
+    await this.loadFavourites();
     const raw = (await this.d.storage.get([STORE_KEY]))[STORE_KEY] as Stored | undefined;
     if (!raw || !Array.isArray(raw.chats)) return;
     for (const c of raw.chats) {
@@ -59,6 +71,19 @@ export class ChatHub {
       if (typeof id !== "string" || !Array.isArray(c.view.items) || this.chats.has(id) || c.view.summary.state === "closed") continue; // a closed chat never comes back
       this.chats.set(id, { view: c.view, provisional: false });
     }
+  }
+
+  private async loadFavourites(): Promise<void> {
+    if (!this.d.local) return;
+    try {
+      const r = await this.d.local.get([FAVOURITES_KEY, FAVOURITES_SYNCED_KEY]);
+      this.favs = cleanFavs(r[FAVOURITES_KEY]);
+      this.favsSynced = cleanFavs(r[FAVOURITES_SYNCED_KEY]);
+    } catch { /* no cache: the gateway list fills it */ }
+  }
+
+  private saveFavourites(): void {
+    void this.d.local?.set({ [FAVOURITES_KEY]: this.favs, [FAVOURITES_SYNCED_KEY]: this.favsSynced }).catch(() => { /* a full store keeps the list in memory */ });
   }
 
   /** Writes now, without waiting for the timer. Used on chat close and when the panel disconnects. */
@@ -71,7 +96,7 @@ export class ChatHub {
 
   state(windowId: number): ChatPanelState {
     const chats = [...this.chats.values()].filter(e => e.view.summary.windowId === windowId).map(e => e.view);
-    return { windowId, connected: this.connected, chats, ...(this.catalog ? { catalog: this.catalog } : {}), cap: MAX_CHATS_PER_WINDOW, ...(this.errors.get(windowId) ?? this.globalError ? { error: (this.errors.get(windowId) ?? this.globalError) as string } : {}) };
+    return { windowId, connected: this.connected, chats, ...(this.catalog ? { catalog: this.catalog } : {}), favourites: this.favs, cap: MAX_CHATS_PER_WINDOW, ...(this.errors.get(windowId) ?? this.globalError ? { error: (this.errors.get(windowId) ?? this.globalError) as string } : {}) };
   }
 
   subscribe(l: (windowId: number) => void): () => void {
@@ -120,6 +145,9 @@ export class ChatHub {
   onWelcome(): void {
     this.connected = true;
     this.d.send({ t: "chat.list" });
+    // The gateway sends the list on attach too. The first one after a welcome is merged with the stars of this browser.
+    this.favsMerge = true;
+    this.d.send({ t: "chat.fav.list" });
     for (const [chatId, e] of this.chats) { e.resumeFrom = lastSeq(e.view); this.d.send({ t: "chat.resume", chatId, afterSeq: e.resumeFrom }); }
     for (const chatId of this.chats.keys()) this.sendLinks(chatId);
     this.changed(ALL_WINDOWS, false);
@@ -164,8 +192,48 @@ export class ChatHub {
         this.changed(ALL_WINDOWS, false);
         return;
       }
+      case "chat.fav.list": return this.onFavourites(f.items);
       case "chat.reject": return this.onReject(f);
     }
+  }
+
+  /**
+   * The gateway list. The first one after a connect is merged with the local one once: a star made here that the gateway
+   * never reported goes up, and a star taken away here that the gateway still holds is removed there. After that the gateway list
+   * is the truth, and the panel follows it live.
+   */
+  private onFavourites(items: FavKey[]): void {
+    const gateway = new Set(items.map(favId));
+    let shown = items;
+    if (this.favsMerge) {
+      this.favsMerge = false;
+      const mine = new Set(this.favs.map(favId));
+      const known = new Set(this.favsSynced.map(favId));
+      const at = this.d.now();
+      const localOnly = this.favs.filter(f => !gateway.has(favId(f)) && !known.has(favId(f)));
+      const takenAway = this.favsSynced.filter(f => !mine.has(favId(f)) && gateway.has(favId(f)));
+      const changes: FavChange[] = [...localOnly.map(f => ({ ...f, op: "add" as const, at })), ...takenAway.map(f => ({ ...f, op: "remove" as const, at }))].slice(0, MAX_FAVOURITES);
+      if (changes.length > 0) this.d.send({ t: "chat.fav.set", changes });
+      const gone = new Set(takenAway.map(favId));
+      shown = [...items.filter(f => !gone.has(favId(f))), ...localOnly].slice(-MAX_FAVOURITES);
+    }
+    this.favsSynced = [...items];
+    this.favs = shown;
+    this.saveFavourites();
+    this.changed(ALL_WINDOWS, false);
+  }
+
+  private favourite(c: Extract<ChatPanelCommand, { type: "ais-chat-favourite" }>): ChatCommandResult {
+    const f: FavKey = { provider: c.provider, identity: c.identity, model: c.model };
+    const change: FavChange = { ...f, op: c.op, at: this.d.now() };
+    if (!parseChatFromExt({ t: "chat.fav.set", changes: [change] })) return this.fail("The favourite is not valid.");
+    const id = favId(f);
+    this.favs = c.op === "add" ? [...this.favs.filter(x => favId(x) !== id), f].slice(-MAX_FAVOURITES) : this.favs.filter(x => favId(x) !== id);
+    this.saveFavourites();
+    this.changed(ALL_WINDOWS, false);
+    // Offline, or on a gateway that does not know the frame: the star stays here and the next connect merges it.
+    this.d.send({ t: "chat.fav.set", changes: [change] });
+    return { ok: true };
   }
 
   private onEvent(chatId: string, seq: number, ts: number, body: ChatItem["body"]): void {
@@ -286,6 +354,7 @@ export class ChatHub {
       }
       case "ais-chat-rename": return this.known(c.chatId) ? this.send({ t: "chat.rename", chatId: c.chatId, name: c.name }) : this.fail("This chat no longer exists.");
       case "ais-chat-close": return this.close(c.chatId);
+      case "ais-chat-favourite": return this.favourite(c);
       case "ais-chat-catalog": {
         const reqId = this.d.newId();
         const r = this.send({ t: "chat.catalog", reqId, ...(c.provider !== undefined ? { provider: c.provider } : {}) });
@@ -342,6 +411,24 @@ export class ChatHub {
     void this.flush();
     return r;
   }
+}
+
+/** The valid stars of a stored list, without duplicates. */
+function cleanFavs(v: unknown): FavKey[] {
+  if (!Array.isArray(v)) return [];
+  const out: FavKey[] = [];
+  const seen = new Set<string>();
+  for (const raw of v) {
+    const f = raw as Partial<FavKey> | null;
+    const c = f && typeof f === "object" ? { t: "chat.fav.set", changes: [{ provider: f.provider, identity: f.identity, model: f.model, op: "add" }] } : undefined;
+    const ok = parseChatFromExt(c);
+    if (!ok || ok.t !== "chat.fav.set" || !ok.changes[0] || seen.has(favId(ok.changes[0]))) continue;
+    const { provider, identity, model } = ok.changes[0];
+    seen.add(favId(ok.changes[0]));
+    out.push({ provider, identity, model });
+    if (out.length >= MAX_FAVOURITES) break;
+  }
+  return out;
 }
 
 const lastSeq = (v: ChatView): number => v.items.at(-1)?.seq ?? 0;
