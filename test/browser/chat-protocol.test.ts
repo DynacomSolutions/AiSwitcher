@@ -147,6 +147,11 @@ describe("favourites frames", () => {
     expect(parseChatToExt({ t: "chat.fav.list", seq: 3, epoch: "e-1", items: [key] })).toEqual({ t: "chat.fav.list", seq: 3, epoch: "e-1", items: [key] } as never);
     for (const epoch of [5, "", "a b", "x".repeat(65), null]) expect(parseChatToExt({ t: "chat.fav.list", seq: 3, epoch, items: [key] })).toEqual({ t: "chat.fav.list", seq: 3, items: [key] } as never);
   });
+  test("the list frame keeps the refused entries that have a valid reason and skips the others", () => {
+    const refused = [{ ...key, reason: "cap" }, { ...key, reason: "stale" }, { ...key, reason: "other" }, { ...key }, 7];
+    expect(parseChatToExt({ t: "chat.fav.list", seq: 3, items: [key], refused })).toEqual({ t: "chat.fav.list", seq: 3, items: [key], refused: [{ ...key, reason: "cap" }, { ...key, reason: "stale" }] } as never);
+    expect(parseChatToExt({ t: "chat.fav.list", seq: 3, items: [key], refused: "x" })).toEqual({ t: "chat.fav.list", seq: 3, items: [key] } as never);
+  });
   test("an older build ignores the new frame: the parser it has returns undefined for a type it does not know", () => {
     expect(parseChatToExt({ t: "chat.future.thing", seq: 1 })).toBeUndefined();
   });

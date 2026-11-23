@@ -44,7 +44,8 @@ export interface GatewayMetrics {
   /** Seconds a chat pod took to start. */
   chatPodStart(seconds: number): void;
   /** A starred-model event: a socket or HTTP call, a change that flipped a star, a frame pushed to a panel, or an error. Unknown values are counted as "other". */
-  favourite?(event: string): void;
+  /** `reason` is set for `refused`: `stale` or `cap`. */
+  favourite?(event: string, reason?: string): void;
   /** Media parts replaced by a text note because the provider refused the file they name (media-recovery.ts). */
   mediaRemoved?(app: string, parts: number): void;
   /** An error event inside a response that began with HTTP 200 (stream or body). Labels are bounded by the implementation. */
@@ -242,8 +243,9 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.chatErrors.inc({ kind: (CHAT_ERROR_KINDS as readonly string[]).includes(kind) ? kind : "other" });
   }
 
-  favourite(event: string): void {
-    this.favourites.inc({ event: (FAVOURITE_EVENTS as readonly string[]).includes(event) ? event : "other" });
+  favourite(event: string, reason?: string): void {
+    const e = (FAVOURITE_EVENTS as readonly string[]).includes(event) ? event : "other";
+    this.favourites.inc(e === "refused" ? { event: e, reason: reason === "stale" || reason === "cap" ? reason : "other" } : { event: e });
   }
 
   chatPodStart(seconds: number): void {

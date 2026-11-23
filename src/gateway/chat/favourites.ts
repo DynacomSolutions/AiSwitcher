@@ -1,5 +1,5 @@
 // Starred models: the service between the store, the panels and the host daemons.
-import type { ChatToExt, FavChange, FavKey } from "../../browser/chat-protocol.ts";
+import type { ChatToExt, FavChange, FavRefusal } from "../../browser/chat-protocol.ts";
 import type { BrowserHub } from "../browser/hub.ts";
 import type { GatewayMetrics } from "../metrics.ts";
 import type { ChatBus } from "./bus.ts";
@@ -42,8 +42,8 @@ export class FavouritesService {
 
   constructor(private readonly d: FavouritesDeps) {}
 
-  private count(event: string): void {
-    this.d.metrics?.favourite?.(event);
+  private count(event: string, reason?: string): void {
+    this.d.metrics?.favourite?.(event, reason);
   }
 
   async start(): Promise<void> {
@@ -66,19 +66,22 @@ export class FavouritesService {
   }
 
   /** The frame a panel gets. The time of each star stays inside the gateway. */
-  frame(l: FavouriteList): Extract<ChatToExt, { t: "chat.fav.list" }> {
-    return { t: "chat.fav.list", seq: l.seq, ...(l.epoch ? { epoch: l.epoch } : {}), items: l.items.map(({ provider, identity, model }) => ({ provider, identity, model })) };
+  frame(l: FavouriteList, refused: FavRefusal[] = []): Extract<ChatToExt, { t: "chat.fav.list" }> {
+    return {
+      t: "chat.fav.list", seq: l.seq, ...(l.epoch ? { epoch: l.epoch } : {}), items: l.items.map(({ provider, identity, model }) => ({ provider, identity, model })),
+      ...(refused.length > 0 ? { refused: refused.map(({ provider, identity, model, reason }) => ({ provider, identity, model, reason })) } : {}),
+    };
   }
 
-  /** Applies changes and tells every replica. Returns the list after the call and the keys of the changes the store refused. */
-  async apply(changes: FavChange[], origin: string): Promise<FavouriteList & { refused: FavKey[] }> {
+  /** Applies changes and tells every replica. Returns the list after the call and the changes the store refused, each with its reason. */
+  async apply(changes: FavChange[], origin: string): Promise<FavouriteList & { refused: FavRefusal[] }> {
     const r = await this.d.store.apply(changes, origin, (this.d.now ?? Date.now)());
     if (r.changed) {
       this.count("change");
       // The bus delivers to this replica too. When the bus fails the local panels and waiters still hear of it.
       await this.d.bus.publish({ t: "favs", seq: r.seq }).catch(() => this.onNotice());
     }
-    for (let i = 0; i < r.refused.length; i += 1) this.count("refused");
+    for (const x of r.refused) this.count("refused", x.reason);
     return { ...(await this.d.store.list()), refused: r.refused };
   }
 

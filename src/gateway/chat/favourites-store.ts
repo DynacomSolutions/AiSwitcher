@@ -1,11 +1,15 @@
 // Starred models of the gateway owner. One list, last writer wins per model.
-import { favId, MAX_FAVOURITES, type FavChange, type FavKey } from "../../browser/chat-protocol.ts";
+import { favId, MAX_FAVOURITES, type FavChange, type FavKey, type FavRefusal } from "../../browser/chat-protocol.ts";
 
 export interface FavouriteItem extends FavKey { at: number }
 /** `epoch` is a random id made once with the store. A store that was reset or rebuilt has another one, so a client can tell "the list is new" from "the list is the same but changed". */
 export interface FavouriteList { epoch: string; seq: number; items: FavouriteItem[] }
-/** `refused` names the changes the store did not apply and the caller may want to retry or report: a change that lost to a newer one of the same model (a different state than now), and an add at the cap. */
-export interface FavouriteApplied { seq: number; changed: boolean; refused: FavKey[] }
+/**
+ * `refused` names the changes the store did not apply, each with its reason.
+ * `stale`: the change lost to a newer one of the same model that asks for another state. It is dead: the newer change wins everywhere, so nobody may send it again.
+ * `cap`: an add when the list is full. The caller may keep it and try again after a removal.
+ */
+export interface FavouriteApplied { seq: number; changed: boolean; refused: FavRefusal[] }
 
 /** Stars of the owner. A change names its time; the newest change of a model decides whether it is starred. */
 export interface FavouriteStore {
@@ -32,7 +36,7 @@ export class MemoryFavouriteStore implements FavouriteStore {
 
   async apply(changes: FavChange[], origin: string, nowMs: number): Promise<FavouriteApplied> {
     let changed = false;
-    const refused: FavKey[] = [];
+    const refused: FavRefusal[] = [];
     for (const c of changes) {
       const id = favId(c);
       const at = effectiveAt(c.at, nowMs);
@@ -42,7 +46,7 @@ export class MemoryFavouriteStore implements FavouriteStore {
       // A removal of a model with no row has nothing to remove: no row, no new version, no wake-up.
       if (!present && !cur) continue;
       if (cur && at < cur.at) {
-        if (cur.present !== present) refused.push(k);
+        if (cur.present !== present) refused.push({ ...k, reason: "stale" });
         continue;
       }
       if (cur && cur.present === present) {
@@ -51,7 +55,7 @@ export class MemoryFavouriteStore implements FavouriteStore {
         continue;
       }
       if (present && [...this.rows.values()].filter((r) => r.present).length >= MAX_FAVOURITES) {
-        refused.push(k);
+        refused.push({ ...k, reason: "cap" });
         continue;
       }
       this.counter += 1;

@@ -17,6 +17,9 @@ export const MAX_FAVOURITES = 200;
 export interface FavKey { provider: ChatProvider; identity: string; model: string }
 /** One star change. `at` is the time (epoch ms) the user made it, when the sender knows it: the gateway keeps the newest change of a model. */
 export interface FavChange extends FavKey { op: "add" | "remove"; at?: number }
+/** Why a store refused a change. `stale`: a newer change of the same model won, so the change is dead. `cap`: the list holds the most stars, so the add may be tried again after a removal. */
+export type FavRefusalReason = "stale" | "cap";
+export interface FavRefusal extends FavKey { reason: FavRefusalReason }
 /** One string per starred model. The names may hold `/` and `:`, so the id is a JSON array. */
 export const favId = (f: FavKey): string => JSON.stringify([f.provider, f.identity, f.model]);
 
@@ -47,7 +50,7 @@ export type ChatToExt =
   | { t: "chat.list"; chats: ChatSummary[] } | { t: "chat.reject"; chatId?: string; reqId?: string; code: ChatErrorCode; message: string }
   | { t: "chat.catalog"; reqId: string; providers: ChatCatalogProvider[] }
   /** The starred models, oldest first. `seq` grows with each change. `epoch` names the store: it changes when the gateway data was reset, so a client that sees a new epoch treats its last list as unknown. The gateway sends it after an attach, after a `chat.fav.list` and after every change. */
-  | { t: "chat.fav.list"; seq: number; items: FavKey[]; epoch?: string };
+  | { t: "chat.fav.list"; seq: number; items: FavKey[]; epoch?: string; refused?: FavRefusal[] };
 
 export const sessionIdForChat = (chatId: string): string => `chat:${chatId}`;
 
@@ -108,6 +111,13 @@ function favKey(v: unknown): FavKey | undefined {
   if (!isRec(v)) return undefined;
   const provider = oneOf(CHAT_PROVIDERS, v.provider), identity = sel(v.identity), model = sel(v.model);
   return provider && identity && model ? { provider, identity, model } : undefined;
+}
+
+export function favRefusal(v: unknown): FavRefusal | undefined {
+  const k = favKey(v);
+  if (!k || !isRec(v)) return undefined;
+  const reason = oneOf(["stale", "cap"] as const, v.reason);
+  return reason ? { ...k, reason } : undefined;
 }
 
 function favChange(v: unknown): FavChange | undefined {
@@ -278,7 +288,9 @@ export function parseChatToExt(v: unknown): ChatToExt | undefined {
       const seq = int(v.seq), items = list(v.items, MAX_FAVOURITES, favKey);
       // A bad epoch is dropped, not fatal: the list is still good.
       const epoch = typeof v.epoch === "string" && EPOCH_RE.test(v.epoch) ? v.epoch : undefined;
-      return seq !== undefined && items ? { t: "chat.fav.list", seq, items, ...(epoch !== undefined ? { epoch } : {}) } : undefined;
+      // A bad refusal entry is skipped: it must not hide the list.
+      const refused = Array.isArray(v.refused) ? v.refused.slice(0, MAX_FAVOURITES).map(favRefusal).filter((r): r is FavRefusal => r !== undefined) : undefined;
+      return seq !== undefined && items ? { t: "chat.fav.list", seq, items, ...(epoch !== undefined ? { epoch } : {}), ...(refused !== undefined && refused.length > 0 ? { refused } : {}) } : undefined;
     }
     default: return undefined;
   }

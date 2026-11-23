@@ -51,18 +51,18 @@ export function favouriteStoreContract(make: () => Promise<FavouriteStore>): voi
     expect(await models(s)).toEqual(["work/m1"]);
   });
 
-  test("a change the store does not apply is named in `refused`: a stale time or a full list", async () => {
+  test("a change the store does not apply is named in `refused`: a stale time or a full list, each with its reason", async () => {
     const s = await make();
     expect((await s.apply([add("m1", NOW - 3000)], "x", NOW)).refused).toEqual([]);
     await s.apply([remove("m1", NOW - 1000)], "x", NOW);
     // A late add loses to the newer removal: refused, and the star stays off.
-    expect((await s.apply([add("m1", NOW - 5000)], "x", NOW)).refused).toEqual([key("m1")]);
+    expect((await s.apply([add("m1", NOW - 5000)], "x", NOW)).refused).toEqual([{ ...key("m1"), reason: "stale" }]);
     // A late change that would leave the model as it is, is not a refusal.
     expect((await s.apply([remove("m1", NOW - 5000)], "x", NOW)).refused).toEqual([]);
     const many = Array.from({ length: MAX_FAVOURITES }, (_, i) => add(`c${i}`, NOW - 500 + i));
     await s.apply(many, "x", NOW);
     const full = await s.apply([add("one-more", NOW), add("c1", NOW)], "x", NOW);
-    expect(full).toMatchObject({ changed: false, refused: [key("one-more")] });
+    expect(full).toMatchObject({ changed: false, refused: [{ ...key("one-more"), reason: "cap" }] });
     expect((await s.list()).items.some((i) => i.model === "one-more")).toBe(false);
   });
 

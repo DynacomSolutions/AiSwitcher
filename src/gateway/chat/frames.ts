@@ -169,8 +169,9 @@ export class ChatFrames {
       case "chat.fav.set": {
         if (!this.d.favourites) return reject("unavailable", "Favourites are not available on this gateway.");
         this.d.metrics?.favourite?.(f.t === "chat.fav.list" ? "socket_list" : "socket_set");
-        const l = f.t === "chat.fav.set" ? await this.d.favourites.apply(f.changes, binding.name) : await this.d.favourites.list();
-        reply(this.d.favourites.frame(l));
+        // The reply to a set names the refused changes, so the panel can tell the user that a star did not fit. A push to other panels does not.
+        const applied = f.t === "chat.fav.set" ? await this.d.favourites.apply(f.changes, binding.name) : undefined;
+        reply(this.d.favourites.frame(applied ?? await this.d.favourites.list(), applied?.refused));
         return;
       }
       case "chat.catalog": {

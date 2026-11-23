@@ -83,7 +83,8 @@ export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
   const reset = state !== undefined && (gateway.seq < state.seq || (gateway.epoch !== undefined && state.epoch !== undefined && gateway.epoch !== state.epoch));
   const last = state && !reset ? state.synced : undefined;
   const changes = localChanges(settings.favorites, ctx, last, gateway.items, settings.mtimeMs);
-  // Stars that this round sent as adds and the gateway refused stay in T3 and are sent again next round.
+  // An add that the gateway refused because the list is full (`cap`) stays in T3 and is sent again next round.
+  // An add that lost to a newer change (`stale`) is dead: the newer change wins everywhere, so T3 follows the gateway list and the add is not kept or sent again.
   const keep = new Set<string>();
   if (changes.length > 0) {
     const posted = await d.client.post(d.origin ?? `t3:${homeKey(d.t3Home)}`, changes);
@@ -91,7 +92,7 @@ export async function syncOnce(d: FavSyncDeps): Promise<RoundResult> {
     const adds = new Set(changes.filter((c) => c.op === "add").map(favId));
     for (const k of posted.refused ?? []) {
       m && (m.s.refused += 1);
-      if (adds.has(favId(k))) keep.add(favId(k));
+      if (k.reason === "cap" && adds.has(favId(k))) keep.add(favId(k));
     }
     gateway = posted;
   }

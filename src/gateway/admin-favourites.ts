@@ -12,8 +12,8 @@ import type { GatewayMetrics } from "./metrics.ts";
  *                                   With `since` it answers at once when the list version differs, else when the list changes or after M ms (at most 25 s).
  * - GET answers 429 (with `Retry-After`) when this gateway already holds its most long polls (32), counted as `rate_limited`.
  * - POST /favourites                `{origin, changes: [{provider, identity, model, op: "add" | "remove", at?}]}` applies the changes
- *                                   (the newest change of a model wins) and answers with the list and the changes the store refused (`{seq, epoch, items, refused: [{provider, identity, model}]}`:
- *                                   a change that lost to a newer change of the same model, or an add when the list is full).
+ *                                   (the newest change of a model wins) and answers with the list and the changes the store refused (`{seq, epoch, items, refused: [{provider, identity, model, reason}]}`,
+ *                                   `reason` is `stale` (a newer change of the same model won: the change is dead) or `cap` (an add when the list is full)).
  */
 
 /** Longest a long poll waits. It is under the idle limit of the clients and proxies in front of the gateway. */
@@ -79,7 +79,7 @@ export function registerFavouritesAdmin(
     metrics?.favourite?.("http_post");
     try {
       const r = await svc.apply(changes, origin);
-      return c.json({ ...body(r), refused: r.refused.map(({ provider, identity, model }) => ({ provider, identity, model })) });
+      return c.json({ ...body(r), refused: r.refused.map(({ provider, identity, model, reason }) => ({ provider, identity, model, reason })) });
     } catch {
       metrics?.favourite?.("error");
       return err(503, "the favourites store is unavailable");

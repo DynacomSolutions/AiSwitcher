@@ -153,7 +153,7 @@ describe("one round", () => {
     expect((await readState(e.deps))?.synced).toEqual([key("a")]);
   });
 
-  test("a star the gateway refuses (full list) stays in T3, is not recorded as synced and goes up again later", async () => {
+  test("a star the gateway refuses (full list, `cap`) stays in T3, is not recorded as synced and goes up again later", async () => {
     const e = setup();
     for (let i = 0; i < 200; i++) await e.gw.star(key(`g${i}`), "add", Date.now() - 100_000 + i);
     await e.round();
@@ -167,6 +167,9 @@ describe("one round", () => {
     expect((await e.gw.store.list()).items.some((i) => i.model === "fresh")).toBe(false);
     expect((await readState(e.deps))?.synced.some((k) => k.model === "fresh")).toBe(false);
     expect(e.metrics.s.refused).toBe(1);
+    // It is sent again, and refused again, while the list stays full.
+    expect(await e.round()).toMatchObject({ status: "ok", pushed: 1 });
+    expect(e.favs().some((f) => f.model === "fresh")).toBe(true);
     // Room appears: the next round sends it again and it is accepted.
     await e.gw.star(key("g0"), "remove");
     await e.round();
@@ -174,6 +177,25 @@ describe("one round", () => {
     expect(e.favs().some((f) => f.model === "fresh")).toBe(true);
     expect((await readState(e.deps))?.synced.some((k) => k.model === "fresh")).toBe(true);
     expect(e.favs().some((f) => f.model === "g0")).toBe(false);
+  });
+
+  test("an add that lost to a newer removal (stale) is dropped from T3, not recorded as synced and not sent again", async () => {
+    const e = setup({ favorites: [{ provider: "t3-claude-work", model: "lost" }, { provider: "t3-claude-work", model: "ok" }] });
+    const when = new Date(Date.now() - 3 * 3600_000);
+    utimesSync(e.home.settings, when, when);
+    // The gateway holds a removal of "lost" that is newer than the T3 change.
+    await e.gw.star(key("lost"), "add", Date.now() - 5 * 3600_000);
+    await e.gw.star(key("lost"), "remove", Date.now() - 3600_000);
+    expect(await e.round()).toMatchObject({ status: "ok", pushed: 2, wrote: true });
+    expect(e.metrics.s.refused).toBe(1);
+    expect(e.favs()).toEqual([{ provider: "t3-claude-work", model: "ok" }]);
+    expect((await e.gw.store.list()).items.map((i) => i.model)).toEqual(["ok"]);
+    expect((await readState(e.deps))?.synced).toEqual([key("ok")]);
+    // The next rounds send nothing: the dead add is not re-sent.
+    const posts = e.gw.calls.posts;
+    expect(await e.round()).toMatchObject({ status: "ok", pushed: 0 });
+    expect(e.gw.calls.posts).toBe(posts);
+    expect(e.favs()).toEqual([{ provider: "t3-claude-work", model: "ok" }]);
   });
 
   test("a gateway star with no instance on this host is not written and does not come back as a removal", async () => {

@@ -32,7 +32,7 @@ export interface Applied {
  * Makes the mapped favourites of T3 equal to the gateway list.
  * - A favourite whose instance is not mapped stays where it is, untouched.
  * - A mapped favourite that the gateway does not list is dropped, unless its id is in `keep`. T3's order of the others is kept.
- *   `keep` holds the stars this host just sent that the gateway refused (full list, or a newer change): the next round sends them again,
+ *   `keep` holds the stars this host just sent that the gateway refused because its list is full: the next round sends them again,
  *   so they are not dropped and not recorded in `synced`.
  * - A gateway star that T3 does not hold is added at the end, in the instance of this home that fits it. A star with no fitting instance is left out.
  */

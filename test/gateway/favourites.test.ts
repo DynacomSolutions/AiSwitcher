@@ -95,6 +95,25 @@ test("chat.fav.set answers with the list, and every other panel on every replica
   for (const w of [wa, wb, wc]) expect(last(w).items.map((i: any) => i.model)).toEqual(["m2"]);
 });
 
+test("the reply to chat.fav.set names the refused changes with their reason, and a push to another panel does not", async () => {
+  const shared = newShared();
+  const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+  const r = await replica(shared, { a: "bind-a", b: "bind-b" }, metrics);
+  const wa = await r.connect("a");
+  const wb = await r.connect("b");
+  await r.send(wa, { t: "chat.fav.set", changes: [star("m1", "add", { at: Date.now() - 3000 }), star("m1", "remove", { at: Date.now() - 1000 })] });
+  // A late add loses to the newer removal.
+  await r.send(wa, { t: "chat.fav.set", changes: [star("m1", "add", { at: Date.now() - 9000 })] });
+  expect(wa.of("chat.fav.list").at(-1)!.refused).toEqual([{ provider: "claude", identity: "work", model: "m1", reason: "stale" }]);
+  // Fill the list, then one more add is refused for the cap.
+  await r.send(wa, { t: "chat.fav.set", changes: Array.from({ length: 200 }, (_, i) => star(`c${i}`)) });
+  expect(wa.of("chat.fav.list").at(-1)!.refused).toBeUndefined();
+  await r.send(wa, { t: "chat.fav.set", changes: [star("one-more")] });
+  expect(wa.of("chat.fav.list").at(-1)!.refused).toEqual([{ provider: "claude", identity: "work", model: "one-more", reason: "cap" }]);
+  expect(wb.of("chat.fav.list").every((m) => m.refused === undefined)).toBe(true);
+  expect(metrics.render()).toMatch(/ais_gateway_favourites_total\{event="refused",reason="cap"\} 1/);
+});
+
 test("a frame that is not valid is dropped and the socket still works", async () => {
   const r = await replica(newShared(), { a: "bind-a" });
   const ws = await r.connect("a");
@@ -173,10 +192,10 @@ test("POST names the changes the store refused, and the metrics count them", asy
   const h = await http();
   await post(h, { changes: [star("m1", "add", { at: Date.now() - 3000 }), star("m1", "remove", { at: Date.now() - 1000 })] });
   const res = (await (await post(h, { changes: [star("m1", "add", { at: Date.now() - 9000 }), star("m2")] })).json()) as any;
-  expect(res.refused).toEqual([{ provider: "claude", identity: "work", model: "m1" }]);
+  expect(res.refused).toEqual([{ provider: "claude", identity: "work", model: "m1", reason: "stale" }]);
   expect(res.items.map((i: any) => i.model)).toEqual(["m2"]);
   expect(((await (await post(h, { changes: [] })).json()) as any).refused).toEqual([]);
-  expect(h.metrics.render()).toMatch(/ais_gateway_favourites_total\{event="refused"\} 1/);
+  expect(h.metrics.render()).toMatch(/ais_gateway_favourites_total\{event="refused",reason="stale"\} 1/);
 });
 
 test("bad bodies are refused with 400", async () => {
