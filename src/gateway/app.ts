@@ -779,18 +779,18 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       else {
         exhausted.set(exKey(name), burstHoldUntil(res.headers, nowMs));
         holds.set(exKey(name), { kind: "burst", long: false });
-        void refreshFromSource(name);
       }
     } else if (res.status === 402 || res.status === 403 || (res.status === 429 && provesSubscriptionExhaustion(res.headers))) {
       if (res.status === 429) noteLimitReset(res.headers);
       holds.delete(exKey(name));
       bridgeUntilReading(name, exKey(name), exhaustedUntil(res.headers, nowMs));
     } else if (res.status === 429) {
-      // A burst 429 (no window rejected) is not about usage: its hold is the provider's retry-after. The source is still
-      // read again so the next pick sees current figures.
+      // A burst 429 (no window rejected) is not about usage: its hold is the provider's retry-after. The usage source is
+      // not read again for it: the busiest member answers burst 429s most often, and a fresh read for each one (per
+      // replica, past the shared reading) got its usage endpoint answering 429, so its reading went stale. The regular
+      // shared poll keeps the figure current.
       exhausted.set(exKey(name), burstHoldUntil(res.headers, nowMs));
       holds.set(exKey(name), { kind: "burst", long: false });
-      void refreshFromSource(name);
     }
   };
   /** Reads the member's usage from the source now (single-flight per member), so the next pick decides on real data. */
