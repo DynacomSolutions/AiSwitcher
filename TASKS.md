@@ -428,8 +428,8 @@ ETA: 2026-12-12 18:00 ICT
 | 296 | Spike: corpus size, gzip ratio, free space, restic cold read | done | claude | | | | 227 GB, almost all on one node. gzip 2.3x.<br>restic cold read 25 to 180 s: not for reads.<br>Owner decisions open: copies, flush gap, objectstore memory. |
 | 297 | Spike: age, Bun S3 client against HoardDB | done | claude | | | | age and HoardDB round trip pass.<br>Shipper needs its own SigV4 signer for If-None-Match and checksum. |
 | 298 | Migration 0014 and SessionStore | done | claude | | | | PR 750 merged. |
-| 299 | Ingest routes, scoped token, metrics, flag | todo | | | 20.298 | | |
-| 300 | Incremental indexers for Claude and Codex | todo | | | 20.302 | | |
+| 299 | Ingest routes, scoped token, metrics, flag | done | claude | | 20.298 | | PR 760 merged.<br>Review fixes: one PR, holder of the current generation only, anchor proof, input limits, object key prefix.<br>Object check hook stays unwired until row 20.306. |
+| 300 | Incremental indexers for Claude and Codex | done | claude | | 20.302 | | PR 759 merged. |
 | 301 | Enrichment loop on the gateway leader | todo | | | 20.298, 20.300, 20.297 | | |
 | 302 | Session readers as line iterables | done | claude | | | | PR 751 merged. |
 | 303 | Shipper in backup-client | todo | | | 20.299 | | .cluster code. |
