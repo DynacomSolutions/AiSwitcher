@@ -263,6 +263,7 @@ ETA: 2026-11-23 16:30 ICT
 | 286 | AIS Browser: approve group requests in the side panel and from a notification click | done | claude | browser-approve-ui | 6.284 | | Merged in PR 720, released in v0.5.97. |
 | 287 | AIS Browser: side panel from notification click, close_tab on frozen tabs | in_review | claude | browser-panel-gesture | 6.286 | 2026-11-23 16:30 ICT | macOS opened a full-screen popup.<br>sidePanel.open lost the user gesture after an await.<br>close_tab no longer attaches to discarded or unresponsive tabs. |
 | 288 | AIS Browser: close a whole tab group in one call (close_group) | in_progress | claude | browser-close-group | 6.287 | 2026-11-23 17:30 ICT | Owner ask: one call instead of 100 close_tab calls.<br>Same rules as close_tab; refuses the whole group if any tab is not closable. |
+| 289 | AIS Browser: a later session of the same chat regains its saved group | in_progress | claude | browser-saved-reclaim | 6.288 | 2026-11-23 18:00 ICT | Live: after a compaction the saved ContractFinder group was read-only.<br>Same identity and chat regain it as own, no tab moved. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-15 23:00 ICT

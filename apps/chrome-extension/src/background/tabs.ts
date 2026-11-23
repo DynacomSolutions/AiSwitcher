@@ -49,7 +49,7 @@ export type GrantResult = "ok" | "no_session" | "no_group" | "in_use";
 /** One tab of a saved group. `split` is a pair label (1, 2, ...) shared by the two tabs of a split view; absent when the tab is not in one. */
 export interface SavedTab { url: string; title: string; split?: number }
 /** A named tab group that outlives the agent session. `groupId` is -1 while the group is closed. `tabIds` are the live tab ids, used to check that a group id still means this group. */
-export interface SavedGroup { name: string; title: string; color: GroupColor; groupId: number; identity: string; tabIds: number[]; tabs: SavedTab[]; /** The session that last held the group: it regains the grant after idling out. */ holder?: string }
+export interface SavedGroup { name: string; title: string; color: GroupColor; groupId: number; identity: string; tabIds: number[]; tabs: SavedTab[]; /** The session that last held the group: it regains the grant after idling out. */ holder?: string; /** The chat (session label) that saved the group. A later session of the same identity and chat regains the group. Absent in entries from older versions. */ label?: string }
 /** One tab of an agent group record. `owned` is false for a tab that sits in the group but never belonged to the session (a tab the user added). */
 export interface AgentTab { id: number; url: string; adopted: boolean; owned: boolean; /** A tab of a group the user approved with request_group: no session of the chat closes or ungroups it. */ approved?: true }
 /** A group that an agent session created. It outlives the session and the browser run, and stays with the chat (identity plus label). */
@@ -338,6 +338,7 @@ export class TabManager {
       const entry: SavedGroup = same ?? { name, title: own ? name : info.title, color, groupId: gid, identity: ref.identity, tabIds: [], tabs: [] };
       entry.groupId = gid;
       entry.holder = ref.id;
+      if (ref.label !== "" && ref.chat !== true) entry.label = ref.label;
       await this.snapshotOf(entry, members);
       this.saved.set(name, entry);
       this.grants.set(gid, ref.id);
@@ -367,9 +368,12 @@ export class TabManager {
         let live = await this.liveTabs(g);
         if (!live && await this.relink(g)) live = await this.liveTabs(g);
         if (live) {
-          const r = await this.grant(g.groupId, ref.id);
-          if (r === "in_use") return { ok: false, code: "forbidden_tab", message: `Group "${name}" is in use by another session.` };
-          if (r !== "ok") return { ok: false, code: "bad_args", message: `Group "${name}" could not be opened (${r}).` };
+          // The chat that saved the group gets it back as its own: tabs owned, nothing moved. Any other session only gets the grant.
+          if (!(await this.regainSaved(ref, g, live))) {
+            const r = await this.grant(g.groupId, ref.id);
+            if (r === "in_use") return { ok: false, code: "forbidden_tab", message: `Group "${name}" is in use by another session.` };
+            if (r !== "ok") return { ok: false, code: "bad_args", message: `Group "${name}" could not be opened (${r}).` };
+          }
           g.holder = ref.id;
           this.stripSavedTabs(live.map(t => t.id), ref.id);
           this.persist();
@@ -398,6 +402,64 @@ export class TabManager {
       this.stripSavedTabs(live.map(t => t.id), ref.id);
       this.persist();
     }
+  }
+
+  /**
+   * A later session of the chat that saved an open group regains it as its own. All must hold: same identity; same chat (the saved label equals the
+   * session label, or an entry without a label and the chat's own agent record links the same live group); the session has no live own group with tabs;
+   * no live session holds the group (a call in progress counts as live). The state is then the one right after save_group: the group is granted to
+   * the session and every tab (the ones an agent record marks as owned, when one links the group) is session-own and adopted, so it outlives the
+   * session. Approved flags carry over from the earlier holder or the record. No tab is moved, activated, reloaded, ungrouped or closed.
+   */
+  private async regainSaved(ref: SessionRef, g: SavedGroup, live: TabInfo[]): Promise<boolean> {
+    if (ref.label === "" || ref.chat === true || g.identity !== ref.identity || g.groupId === -1) return false;
+    const records = this.chatRecords(ref.identity, ref.label).filter(r => r.groupId === g.groupId);
+    if (g.label !== undefined ? g.label !== ref.label : records.length === 0) return false;
+    const s = this.session(ref);
+    if (s.groupId !== -1 && s.tabIds.size > 0 && await this.api.tabGroups.get(s.groupId)) return false;
+    let rec: AgentGroup | undefined;
+    for (const r of records) if (await this.liveAgent(r)) { rec = r; break; }
+    if (g.label === undefined && !rec) return false;
+    // No await from here to the commit: the holder checks and the takeover are one step.
+    const gid = g.groupId;
+    const busy = (id: string): boolean => this.holderLive(id) || this.queues.has(id);
+    const granted = this.grants.get(gid);
+    if (granted !== undefined && granted !== ref.id && busy(granted)) return false;
+    if (g.holder !== undefined && g.holder !== ref.id && busy(g.holder)) return false;
+    for (const [oid, o] of this.sessions) if (oid !== ref.id && o.groupId === gid && busy(oid)) return false;
+    const liveIds = live.map(t => t.id);
+    const recOwned = rec ? rec.tabs.filter(x => x.owned && liveIds.includes(x.id)).map(x => x.id) : [];
+    const ids = recOwned.length > 0 ? recOwned : liveIds;
+    const approved = new Set<number>(rec ? rec.tabs.filter(x => x.approved === true && ids.includes(x.id)).map(x => x.id) : []);
+    for (const [oid, o] of this.sessions) {
+      if (oid === ref.id) continue;
+      for (const id of ids) if (o.approved?.has(id)) { approved.add(id); o.approved.delete(id); }
+      if (o.groupId === gid) o.groupId = -1;
+    }
+    this.stripSavedTabs(liveIds, ref.id);
+    this.grants.set(gid, ref.id);
+    g.holder = ref.id;
+    g.label = ref.label;
+    for (const id of ids) { s.tabIds.add(id); s.adopted.add(id); }
+    if (approved.size > 0) { s.approved ??= new Set(); for (const id of approved) s.approved.add(id); }
+    this.dropAgentGroup(gid); // the saved group keeps the group from now on
+    this.persist();
+    await this.persistSaved();
+    await this.refreshAgents();
+    return true;
+  }
+
+  /** The first call of a session: regains an open saved group of its own chat. */
+  private async reclaimSaved(ref: SessionRef): Promise<boolean> {
+    for (const g of [...this.saved.values()]) {
+      if (g.identity !== ref.identity || g.groupId === -1 || (g.label !== undefined && g.label !== ref.label)) continue;
+      if (g.label === undefined && this.chatRecords(ref.identity, ref.label).every(r => r.groupId !== g.groupId)) continue; // an older entry: only the chat's own record links it
+      const s = this.sessions.get(ref.id);
+      if (s && this.grants.get(g.groupId) === ref.id && g.tabIds.every(id => s.tabIds.has(id))) continue; // already fully this session's
+      const live = await this.liveTabs(g);
+      if (live && await this.regainSaved(ref, g, live)) return true;
+    }
+    return false;
   }
 
   private async recreate(ref: SessionRef, g: SavedGroup, warnings: string[]): Promise<OpenResult> {
@@ -601,7 +663,7 @@ export class TabManager {
       if (ref.label === "" || ref.chat === true) return false;
       if (await this.reclaimSession(ref)) return true;
       for (const r of this.chatRecords(ref.identity, ref.label)) if (await this.reclaimRecord(ref, r)) return true;
-      return false;
+      return this.reclaimSaved(ref);
     }
   }
 
