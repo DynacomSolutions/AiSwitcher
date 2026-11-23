@@ -81,7 +81,7 @@ test("a Kimi or Z.ai folder is refused with trailing slash, dot or dot-dot segme
 
 test("agent pod: no registry match, token from AIS_BROWSER_AGENT_TOKEN_FILE, no pool header", async () => {
   const readTokenPath = async (p: string) => (p === "/run/ais-browser/token" ? TOKEN : undefined);
-  const env = { CLAUDE_CONFIG_DIR: "/home/u/.claude/identities/swap", AIS_BROWSER_AGENT_TOKEN_FILE: "/run/ais-browser/token" };
+  const env = { CLAUDE_CONFIG_DIR: "/home/user/.claude/identities/swap", AIS_BROWSER_AGENT_TOKEN_FILE: "/run/ais-browser/token" };
   const h = await browserHeaders({ ...base, readTokenPath, env });
   expect(h.Authorization).toBe(`Bearer ${TOKEN}`);
   expect(h["X-AIS-Pool"]).toBeUndefined();
@@ -102,7 +102,7 @@ test("pod token file never overrides the registry or the Kimi and Z.ai refusal",
   const own = await browserHeaders({ ...base, readTokenPath, env: { CLAUDE_CONFIG_DIR: "/ids/alpha", AIS_BROWSER_AGENT_TOKEN_FILE: file } });
   expect(own.Authorization).toBe(`Bearer ${TOKEN}`);
   // Other-provider folders get nothing.
-  for (const d of ["/home/u/.claude/identities/kimi-dynacom", "/home/u/.claude/identities/zai-dynacom"]) {
+  for (const d of ["/home/user/.claude/identities/kimi-main", "/home/user/.claude/identities/zai-main"]) {
     expect(await browserHeaders({ ...base, readTokenPath, env: { CLAUDE_CONFIG_DIR: d, AIS_BROWSER_AGENT_TOKEN_FILE: file } })).toEqual({});
   }
 });
