@@ -3,6 +3,7 @@ import type { ChatCatalogProvider } from "../../../src/browser/chat-protocol.ts"
 import { selectable } from "../../../src/browser/chat-protocol.ts";
 import { buildPicker, choose, FAVOURITES, favKey, matchesQuery, menuKey, parseFavourites, pickerEntries, pickerRows, startTab, toggleFavourite } from "../src/sidepanel/chat/picker.ts";
 import { createPicker } from "../src/sidepanel/chat/picker-view.ts";
+import { providerIconSvg, providerMark } from "../src/sidepanel/chat/provider-icons.ts";
 import { asDoc, asEl, fakeDoc, walk } from "./fake-dom.ts";
 import type { FakeNode } from "./fake-dom.ts";
 
@@ -475,5 +476,41 @@ describe("picker view", () => {
       expect(menu(s).hidden).toBe(true);
       expect(s.pop().hidden).toBe(false);
     });
+  });
+});
+
+describe("provider marks", () => {
+  const providers = ["claude", "codex", "kimi", "grok", "zai", "opencode"] as const;
+  const names = { claude: "Claude", codex: "Codex", kimi: "Kimi", grok: "Grok", zai: "Z.ai", opencode: "OpenCode" };
+  for (const p of providers) {
+    test(`${p} renders an svg with a path and its name as the label`, () => {
+      const svg = providerIconSvg(asDoc(fakeDoc()), p, 16) as unknown as FakeNode;
+      expect(svg.tag).toBe("svg");
+      expect(svg.attrs["aria-label"]).toBe(names[p]);
+      expect(svg.attrs["role"]).toBe("img");
+      expect(svg.attrs["viewBox"]).toBe("0 0 24 24");
+      const paths = walk(svg).filter(n => n.tag === "path");
+      expect(paths.length).toBeGreaterThan(0);
+      expect(paths.every(n => (n.attrs["d"] ?? "").length > 10)).toBe(true);
+      expect(providerMark(p).name).toBe(names[p]);
+    });
+  }
+  test("no mark is a letter monogram", () => {
+    for (const p of providers) expect(providerIconSvg(asDoc(fakeDoc()), p, 16).textContent).toBe("");
+  });
+  test("an unknown provider gets a neutral mark", () => {
+    const svg = providerIconSvg(asDoc(fakeDoc()), undefined) as unknown as FakeNode;
+    expect(svg.attrs["aria-label"]).toBe("Provider");
+  });
+  test("the picker shows the mark of the selected provider on the button, the tabs and the headings", () => {
+    const s = (() => { const doc = fakeDoc(); const p = createPicker(asDoc(doc), { onOpen() {}, onPick() {}, onEffort() {}, onFavourite() {} }, "Model"); return { p, root: p.root as unknown as FakeNode }; })();
+    s.p.update({ ...buildPicker(catalog, { provider: "kimi", identity: "work", model: "k1" }) });
+    const labels = (n: FakeNode) => walk(n).filter(x => x.tag === "svg" && x.attrs["role"] === "img").map(x => x.attrs["aria-label"]);
+    expect(labels(s.p.button as unknown as FakeNode)).toEqual(["Kimi"]);
+    s.p.button.click();
+    const tabs = walk(s.root).filter(n => n.attrs["role"] === "tab");
+    expect(tabs.flatMap(labels)).toEqual(["Claude", "Kimi"]);
+    s.p.update({ ...buildPicker(catalog, { provider: "claude", identity: "work", model: "m1" }) });
+    expect(labels(s.p.button as unknown as FakeNode)).toEqual(["Claude"]);
   });
 });

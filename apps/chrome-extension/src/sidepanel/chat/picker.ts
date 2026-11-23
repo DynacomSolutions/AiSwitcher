@@ -4,7 +4,7 @@ import type { ChatCatalogProvider, ChatProvider, ChatSelection } from "../../../
 import { providerMark } from "./provider-icons.ts";
 
 export interface PickerModel {
-  button: { providerIcon: string; label: string };
+  button: { provider?: ChatProvider; label: string };
   groups: Array<{ provider: ChatProvider; identities: Array<{ name: string; kind: "identity" | "pool"; selected: boolean; models: Array<{ id: string; name: string; selected: boolean }> }> }>;
   efforts: string[];
   effort?: string;
@@ -48,7 +48,7 @@ export function buildPicker(catalog: ChatCatalogProvider[] | undefined, sel: Cha
   }
   const text = label ?? (sel && currentModel) ?? NO_MODEL;
   return {
-    button: { providerIcon: providerMark(sel?.provider).text, label: text },
+    button: { ...(sel !== undefined ? { provider: sel.provider } : {}), label: text },
     groups, efforts, ...(effort !== undefined && efforts.includes(effort) ? { effort } : {}),
     loading: catalog === undefined,
     ...(notice !== undefined ? { notice } : {}),
@@ -138,7 +138,8 @@ export interface PickerEntry {
   /** A locked chat cannot move to another identity. */
   disabled: boolean;
 }
-export interface PickerSection { heading: string | null; entries: PickerEntry[] }
+/** A search or favourites heading names a provider, so it carries the provider for its mark. */
+export interface PickerSection { heading: string | null; provider?: ChatProvider; entries: PickerEntry[] }
 
 export function pickerEntries(m: PickerModel): PickerEntry[] {
   const out: PickerEntry[] = [];
@@ -174,15 +175,16 @@ const identityHeading = (e: PickerEntry): string => (e.kind === "pool" ? `${e.id
 export function pickerRows(m: PickerModel, active: string, query: string): PickerSection[] {
   const all = pickerEntries(m);
   const sections: PickerSection[] = [];
-  const add = (heading: string | null, entry: PickerEntry): void => {
+  const add = (heading: string | null, entry: PickerEntry, marked = false): void => {
     const last = sections[sections.length - 1];
-    if (last && last.heading === heading) last.entries.push(entry); else sections.push({ heading, entries: [entry] });
+    if (last && last.heading === heading) last.entries.push(entry);
+    else sections.push({ heading, ...(marked ? { provider: entry.provider } : {}), entries: [entry] });
   };
   if (query.trim() !== "") {
-    for (const e of all.filter(x => matchesQuery(x, query))) add(where(e), e);
+    for (const e of all.filter(x => matchesQuery(x, query))) add(where(e), e, true);
   } else if (active === FAVOURITES) {
     const stars = new Set((m.favourites ?? []).map(favKey));
-    for (const e of all.filter(x => x.model !== undefined && stars.has(x.key))) add(where(e), e);
+    for (const e of all.filter(x => x.model !== undefined && stars.has(x.key))) add(where(e), e, true);
   } else {
     for (const e of all.filter(x => x.provider === active)) add(identityHeading(e), e);
   }
