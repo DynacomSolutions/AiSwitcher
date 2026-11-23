@@ -75,7 +75,10 @@ branch), an unreadable base (force-push) or a deleted file fails open to
 everything. The `test` job runs the privacy, identifier and secret scans, the
 mod validation and the typecheck on every event, then the selected tests.
 
-The full suite runs only per release, before publish.
+The full suite runs once per release. The `test` job in `release.yml` runs it
+in four round-robin shards (`scripts/ci/affected.ts --shard N --shards 4`) with
+a TimescaleDB service. The `build` job needs it, so a failing test blocks the
+publish.
 
 ## Local checks
 
