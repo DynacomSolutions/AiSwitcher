@@ -1,7 +1,7 @@
 // Small injectable facade over the chrome.* APIs the extension uses. Tests fake it.
 
 /** `splitViewId` is -1 when the tab is not in a split view (Chrome 140 and later report it). */
-export interface TabInfo { id: number; windowId: number; groupId: number; url: string; title: string; active: boolean; splitViewId: number; index: number; pinned: boolean }
+export interface TabInfo { id: number; windowId: number; groupId: number; url: string; title: string; active: boolean; splitViewId: number; index: number; pinned: boolean; /** Chrome unloaded the page (memory saver). It runs no script. */ discarded?: boolean; /** The page is frozen in the background. It runs no script. */ frozen?: boolean }
 
 /** The Chrome in use lacks an API (split view needs Chrome 155). The message is fit to show to an agent. */
 export class UnsupportedApiError extends Error {}
@@ -79,10 +79,16 @@ export interface ChromeApi {
   panel: {
     /** The last focused normal browser window, when there is one. */
     lastFocusedWindowId(): Promise<number | undefined>;
-    /** Opens the side panel in a window. Throws when Chrome refuses (no user gesture). */
+    /** Opens the side panel in a window. It calls chrome.sidePanel.open at once and returns its promise, so call it inside the user gesture handler with no await before it. Rejects when Chrome refuses. */
     openSidePanel(windowId: number): Promise<void>;
-    /** Opens an extension page in a small popup window and returns the id of its tab. `path` is relative to the extension root. */
-    openPopup(path: string, size: { width: number; height: number }): Promise<number | undefined>;
+    /** A normal window got focus. Not called for no window or for other window types. */
+    onWindowFocused(listener: (windowId: number) => void): void;
+    /** A window closed. */
+    onWindowRemoved(listener: (windowId: number) => void): void;
+    /** The position and size of a window, when known. */
+    windowBounds(windowId: number): Promise<{ left: number; top: number; width: number; height: number } | undefined>;
+    /** Opens an extension page in a popup window (normal state, never full screen) and returns the id of its tab. `path` is relative to the extension root. `left` and `top` place it. */
+    openPopup(path: string, size: { width: number; height: number; left?: number; top?: number }): Promise<number | undefined>;
     /** The text on the toolbar button. An empty text clears it. */
     setBadge(text: string): Promise<void>;
   };
@@ -112,7 +118,7 @@ function toTab(t: chrome.tabs.Tab): TabInfo {
   const split = (t as { splitViewId?: unknown }).splitViewId;
   const none = (chrome.tabs as unknown as SplitTabsApi).SPLIT_VIEW_ID_NONE ?? -1;
   const splitViewId = typeof split === "number" && split !== none ? split : -1;
-  return { id: t.id ?? -1, windowId: t.windowId, groupId: t.groupId ?? -1, url: t.url || t.pendingUrl || "", title: t.title ?? "", active: t.active, splitViewId, index: t.index, pinned: t.pinned };
+  return { id: t.id ?? -1, windowId: t.windowId, groupId: t.groupId ?? -1, url: t.url || t.pendingUrl || "", title: t.title ?? "", active: t.active, splitViewId, index: t.index, pinned: t.pinned, discarded: t.discarded === true, frozen: (t as { frozen?: unknown }).frozen === true };
 }
 
 /** Browser and extension pages. Agent tools never act on these, and the worker never lists them: an extension page can answer approvals. */
@@ -204,8 +210,12 @@ export function realChromeApi(): ChromeApi {
     },
     panel: {
       lastFocusedWindowId: async () => { try { return (await chrome.windows.getLastFocused({ windowTypes: ["normal"] })).id; } catch { return undefined; } },
-      openSidePanel: async windowId => { await chrome.sidePanel.open({ windowId }); },
-      openPopup: async (path, size) => (await chrome.windows.create({ url: chrome.runtime.getURL(path), type: "popup", ...size }))?.tabs?.[0]?.id,
+      // No async and no await: chrome.sidePanel.open needs the user gesture of the click handler that is still running.
+      openSidePanel: windowId => chrome.sidePanel.open({ windowId }),
+      onWindowFocused: listener => chrome.windows.onFocusChanged.addListener(id => { if (id !== chrome.windows.WINDOW_ID_NONE) listener(id); }, { windowTypes: ["normal"] }),
+      onWindowRemoved: listener => chrome.windows.onRemoved.addListener(id => listener(id)),
+      windowBounds: async windowId => { try { const w = await chrome.windows.get(windowId); return w.left === undefined || w.top === undefined || w.width === undefined || w.height === undefined ? undefined : { left: w.left, top: w.top, width: w.width, height: w.height }; } catch { return undefined; } },
+      openPopup: async (path, size) => (await chrome.windows.create({ url: chrome.runtime.getURL(path), type: "popup", state: "normal", ...size }))?.tabs?.[0]?.id,
       setBadge: async text => { await chrome.action.setBadgeText({ text }); },
     },
     debugger: {

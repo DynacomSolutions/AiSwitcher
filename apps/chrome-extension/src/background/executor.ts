@@ -479,6 +479,8 @@ export class Executor {
       const open = this.dialogs.get(tabId);
       if (open && !DIALOG_SAFE.has(tool)) throw this.dialogError(tabId, open);
       return this.watchDialogs(tabId, tool, async () => {
+        // close_tab attaches itself, and only for a live page: a discarded, frozen or unresponsive tab must still close.
+        if (tool === "close_tab") return this.tabTool(tool, req, sig, tab);
         // Attached before anything touches the page: a page that does not answer (a dialog Chrome never reported) ends the call here.
         await this.ensureAttached(sig, tabId);
         if (open) void this.markControlled(tabId, session); else await this.markControlled(tabId, session);
@@ -626,12 +628,20 @@ export class Executor {
         // Only tabs this session opened or adopted: tabs that merely sit in a granted group are the user's.
         if (!this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} was not opened by this session, so it cannot be closed.`);
         if (this.tabs.isApproved(session.id, tabId)) throw new ToolError("forbidden_tab", `Tab ${tabId} is in a group the user approved for this session. The session never closes these tabs.`);
-        // Attached first, so a "Leave site?" (beforeunload) dialog that closing raises is seen and ends the call instead of hanging it.
-        await this.ensureAttached(sig, tabId);
+        // A discarded or frozen page runs no script, so it cannot raise "Leave site?" and does not answer a debugger attach: close it directly.
+        const before = await this.api.tabs.get(tabId);
+        let unresponsive = false;
+        if (!before?.discarded && !before?.frozen) {
+          // Attached first, so a "Leave site?" (beforeunload) dialog that closing raises is seen and ends the call instead of hanging it.
+          // A page that does not answer the attach (UnresponsiveTab) is still closed below; a real dialog keeps the tab open and ends the call there.
+          try { await this.ensureAttached(sig, tabId); } catch (e) { if (!(e instanceof PageUnresponsive)) throw e; unresponsive = true; }
+        }
+        // A Stop or gateway abort during the attach (or on the discarded path) must leave the tab open.
+        this.throwIfAborted(sig);
         await this.api.tabs.remove(tabId);
         // A page that asks "Leave site?" keeps its tab open: its dialog ends this call (dialog_open) while we wait. Cancel keeps the tab, and its ownership.
         for (let waited = 0; await this.api.tabs.get(tabId); waited += CLOSE_POLL_MS) {
-          if (waited >= CLOSE_WAIT_MS) throw new ToolError("internal", `Tab ${tabId} is still open.`);
+          if (waited >= CLOSE_WAIT_MS) throw unresponsive ? new PageUnresponsive(tabId) : new ToolError("internal", `Tab ${tabId} is still open.`);
           await this.sleepFn(CLOSE_POLL_MS, sig);
         }
         this.tabs.forget(tabId);

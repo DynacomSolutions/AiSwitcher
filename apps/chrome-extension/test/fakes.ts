@@ -232,19 +232,39 @@ export class FakeChrome implements ChromeApi {
   /** The user clicks the body of the notification on screen (the latest one when no id is given). */
   clickNotificationBody(id = [...this.shown.keys()].at(-1)): void {
     if (id === undefined) throw new Error("No notification on screen.");
-    for (const l of this.notificationClickListeners) l(id);
+    this.dispatching = true;
+    try { for (const l of this.notificationClickListeners) l(id); } finally { this.dispatching = false; }
   }
   /** Windows the fake offers to the panel API, and what was opened. */
   focusedWindowId: number | undefined = 1;
   sidePanelFails = false;
   sidePanelOpened: number[] = [];
-  popupsOpened: Array<{ path: string; width: number; height: number; tabId: number }> = [];
+  popupsOpened: Array<{ path: string; width: number; height: number; left?: number; top?: number; tabId: number }> = [];
+  windowFocusListeners: Array<(windowId: number) => void> = [];
+  windowRemovedListeners: Array<(windowId: number) => void> = [];
+  /** Bounds the fake knows per window id. */
+  windowBoundsById = new Map<number, { left: number; top: number; width: number; height: number }>();
+  /** True when sidePanel.open ran before the event dispatch that caused it returned. */
+  sidePanelOpenedSync: boolean[] = [];
+  private dispatching = false;
+  /** A normal window gets focus. */
+  focusWindow(windowId: number): void { for (const l of this.windowFocusListeners) l(windowId); }
+  /** A window closes. */
+  closeWindow(windowId: number): void { for (const l of this.windowRemovedListeners) l(windowId); }
   badge = "";
   nextPopupTab = 900;
   panel = {
     lastFocusedWindowId: async () => this.focusedWindowId,
-    openSidePanel: async (windowId: number) => { if (this.sidePanelFails) throw new Error("sidePanel.open() may only be called in response to a user gesture."); this.sidePanelOpened.push(windowId); },
-    openPopup: async (path: string, size: { width: number; height: number }) => { const tabId = this.nextPopupTab++; this.popupsOpened.push({ path, ...size, tabId }); return tabId; },
+    openSidePanel: (windowId: number): Promise<void> => {
+      this.sidePanelOpenedSync.push(this.dispatching);
+      if (this.sidePanelFails) return Promise.reject(new Error("sidePanel.open() may only be called in response to a user gesture."));
+      this.sidePanelOpened.push(windowId);
+      return Promise.resolve();
+    },
+    onWindowFocused: (l: (windowId: number) => void) => { this.windowFocusListeners.push(l); },
+    onWindowRemoved: (l: (windowId: number) => void) => { this.windowRemovedListeners.push(l); },
+    windowBounds: async (windowId: number) => this.windowBoundsById.get(windowId),
+    openPopup: async (path: string, size: { width: number; height: number; left?: number; top?: number }) => { const tabId = this.nextPopupTab++; this.popupsOpened.push({ path, ...size, tabId }); return tabId; },
     setBadge: async (text: string) => { this.badge = text; },
   };
   /** The user presses a button of the notification on screen (the latest one when no id is given). */
