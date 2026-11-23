@@ -71,7 +71,7 @@ describe("ais t3 favourites sync", () => {
     const prev = process.env.AIS_SECRETS_FILE;
     process.env.AIS_SECRETS_FILE = "/nonexistent-favsync-secrets";
     try {
-      await expect(runT3Command(["favourites", "sync"], { once: true }, { out: () => {}, env: {} })).rejects.toThrow(/AIS_GATEWAY_ADMIN_URL and AIS_GATEWAY_ADMIN_TOKEN/);
+      await expect(runT3Command(["favourites", "sync"], { once: true }, { out: () => {}, env: {} })).rejects.toThrow(/AIS_GATEWAY_ADMIN_URL and AIS_GATEWAY_FAVOURITES_TOKEN \(or AIS_GATEWAY_ADMIN_TOKEN\)/);
     } finally {
       if (prev === undefined) delete process.env.AIS_SECRETS_FILE;
       else process.env.AIS_SECRETS_FILE = prev;

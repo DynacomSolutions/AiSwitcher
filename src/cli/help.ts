@@ -80,7 +80,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|codex-home|favourites-token ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -126,6 +126,10 @@ export const HELP: Record<string, HelpNode> = {
         "ais gateway t3-instance <instance-id> --driver=claude|grok|opencode|pi --app=<gateway app> [--name=<name>|--display-name=<name>] [--provider=<slug>] [--models=a,b,...] [--source=<identity>|none] [--like=<claude instance id, binary path only>] [--binary=<path>] [--check] [--remove]",
         "Create or update one T3 Code provider instance whose folder (<T3 home>/gateway/<id>) holds only the gateway app token: writes the instance into T3's settings.json (backup kept, other instances untouched), and for claude the folder settings.json (a full copy of the source identity config with the gateway base URL, models and no generic proxy; the source is found by the instance id, or --source=<identity>, or --source=none for a kimi or zai home) and .credentials.json (a cached oauthAccount in the folder .claude.json that is not the gateway account is removed), for grok a launcher in ~/.ais/t3/grok/<id> that reads the token at start, plus the usage auth.json, for opencode the folder opencode.json (gateway provider) with environment OPENCODE_CONFIG_DIR and XDG_DATA_HOME set to the folder and the usage auth.json (opencode-go entry), for pi (Pi coding agent, --models required) the folder models.json (anthropic-messages provider at the gateway base URL, key read from the token file with !cat, so no token inside) and settings.json (default provider and model), and the PI_CODING_AGENT_DIR instance environment; --provider sets the pi provider slug (default: the app's provider from the gateway admin API, else the app name); says created, updated or current; --check writes nothing and fails on a difference; --remove drops the instance entry and leaves the folder",
       ),
+      "favourites-token": sub(
+        "ais gateway favourites-token",
+        "Print the favourites-only token that is derived from the gateway admin token (env or ~/.secrets AIS_GATEWAY_ADMIN_TOKEN): HMAC-SHA256 of the admin token with the text ais-favourites-v1, as hex. The gateway accepts it on GET and POST /favourites only, so a T3 pod sidecar can run `ais t3 favourites sync` without the admin token (set it there as AIS_GATEWAY_FAVOURITES_TOKEN). It changes when the admin token changes. Seal the output into a Secret; the command prints nothing else",
+      ),
       "codex-home": sub(
         "ais gateway codex-home <codex home dir>... [--check]",
         "Set up Codex folders on the gateway so Codex and T3 Code show real usage limits: placeholder ChatGPT login (auth.json 0600, token from AIS_GATEWAY_APP_<APP>_TOKEN in ~/.secrets), chatgpt_base_url, requires_openai_auth; registers the folder in ~/.ais/gateway-codex-homes.json so app add/rotate refresh its token; --check only reports",
@@ -133,13 +137,13 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   t3: {
-    usage: "ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>]",
+    usage: "ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>] [--pool-names=<tool>=<name>,...] [--origin=<label>]",
     desc: "T3 Code: keep model favourites in step with the AIS gateway",
     examples: ["ais t3 favourites sync --once", "AIS_GATEWAY_ADMIN_URL=<admin url> AIS_GATEWAY_ADMIN_TOKEN=<token> T3CODE_HOME=<dir> ais t3 favourites sync"],
     subs: {
       favourites: sub(
-        "ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>]",
-        "Sync the model favourites of one T3 Code home with the AIS gateway list, in both directions, so a star in T3 shows in the Chrome side panel and the other way round. Changes only the favorites key of <T3 home>/userdata/settings.json (written next to the file and renamed, mode and owner kept); a favourite whose instance AIS does not manage is left alone. T3 reloads the file by itself. A removal in T3 is found by comparing with the last sync (kept in the AIS state folder). Env or ~/.secrets: AIS_GATEWAY_ADMIN_URL, AIS_GATEWAY_ADMIN_TOKEN; T3CODE_HOME or --t3-home picks the home (default ~/.t3). --once runs one round and exits; without it the command follows the file (watch plus a slow poll, --interval seconds, default 60) and the gateway (a held request, updates in about 5 s), and the profile-sync daemon runs it for this host. --metrics-listen serves GET /metrics (pulls, pushes, writes, errors) for a scraper; the same counters go to the AIS state folder for the console /metrics",
+        "ais t3 favourites sync [--once] [--t3-home=<dir>] [--metrics-listen=<host:port>] [--interval=<seconds>] [--pool-names=<tool>=<name>,...] [--origin=<label>]",
+        "Sync the model favourites of one T3 Code home with the AIS gateway list, in both directions, so a star in T3 shows in the Chrome side panel and the other way round. Changes only the favorites key of <T3 home>/userdata/settings.json (written next to the file and renamed, mode and owner kept); a favourite whose instance AIS does not manage is left alone. T3 reloads the file by itself. A removal in T3 is found by comparing with the last sync (kept in the AIS state folder). Env or ~/.secrets: AIS_GATEWAY_ADMIN_URL and AIS_GATEWAY_FAVOURITES_TOKEN (the favourites-only token from `ais gateway favourites-token`, preferred) or AIS_GATEWAY_ADMIN_TOKEN; T3CODE_HOME or --t3-home picks the home (default ~/.t3). --once runs one round and exits; without it the command follows the file (watch plus a slow poll, --interval seconds, default 60) and the gateway (a held request, updates in about 5 s), and the profile-sync daemon runs it for this host. --metrics-listen serves GET /metrics (pulls, pushes, writes, errors) for a scraper; the same counters go to the AIS state folder for the console /metrics. Pods: --pool-names (or AIS_T3_POOL_NAMES, for example claude=x,codex=x,kimi=x) gives the swap pool name of each tool when the identity files are missing; a tool with no pool name has its pool favourites left alone and is logged once. A favourite of a usage-only instance (an id that ends in -usage) is never synced. --origin (or AIS_T3_FAVOURITES_ORIGIN) is a short label for pods that share one T3CODE_HOME path: it goes in the origin that the gateway keeps and in the home metric label",
       ),
     },
   },

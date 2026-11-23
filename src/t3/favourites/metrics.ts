@@ -67,14 +67,14 @@ const HELP: Array<[keyof FavSyncSnapshot, string, string, string]> = [
   ["startedAt", "ais_t3_favourites_sync_started_timestamp_seconds", "gauge", "Unix time the sync process started."],
 ];
 
-/** Prometheus text for one or more T3 homes. `home` is a short hash, never a path. */
+/** Prometheus text for one or more T3 homes. `home` is a short hash with an optional label, never a path. */
 export function renderSnapshots(entries: Array<{ home: string; role?: string; pid?: number; s: FavSyncSnapshot }>): string {
   if (entries.length === 0) return "";
   const out: string[] = [];
   for (const [key, name, type, help] of HELP) {
     out.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`);
     for (const e of entries) {
-      const labels = [`home="${e.home.replace(/[^A-Za-z0-9]/g, "")}"`, ...(e.role !== undefined ? [`role="${e.role.replace(/[^a-z]/g, "")}"`] : []), ...(e.pid !== undefined ? [`pid="${Math.trunc(e.pid)}"`] : [])];
+      const labels = [`home="${e.home.replace(/[^A-Za-z0-9_-]/g, "")}"`, ...(e.role !== undefined ? [`role="${e.role.replace(/[^a-z]/g, "")}"`] : []), ...(e.pid !== undefined ? [`pid="${Math.trunc(e.pid)}"`] : [])];
       out.push(`${name}{${labels.join(",")}} ${e.s[key]}`);
     }
   }
@@ -91,7 +91,7 @@ function alive(pid: number): boolean {
   }
 }
 
-const SNAPSHOT_FILE = /^([A-Za-z0-9]+)\.(daemon|cli)-(\d+)\.metrics\.json$/;
+const SNAPSHOT_FILE = /^([A-Za-z0-9_-]+)\.(daemon|cli)-(\d+)\.metrics\.json$/;
 
 /** Reads every snapshot file in `dir` (`<home hash>.<role>-<pid>.metrics.json`). A missing folder, a bad file or a file of a process that is gone is skipped. */
 export function readSnapshots(dir: string): Array<{ home: string; role: FavSyncRole; pid: number; s: FavSyncSnapshot }> {
