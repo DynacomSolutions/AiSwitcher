@@ -5,8 +5,8 @@ import { codexAccountOf, jwtAccountId, parseCodexAuth, readCodexAuthText } from 
 import { readAliApiKey } from "../identities/ali-auth.ts";
 import { isGatewayAccessToken } from "../identities/claude-gateway-entry.ts";
 import { nativeStorePathFor } from "../identities/oauth-reconcile.ts";
-import { memberStoreEnabled } from "../identities/gateway-members.ts";
-import { recordLoginRevoked } from "../identities/gateway-revoked.ts";
+import { isMemberStoreTool, memberStoreEnabled } from "../identities/gateway-members.ts";
+import { readLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
 import { DEAD_REFRESH_CODES, effectiveGrantPaths, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -237,6 +237,10 @@ export class CredentialCache {
    * that very token, no refresh runs (ensureUsable and the 401 path never resend a dead refresh token). A new login changes it.
    */
   private readonly deadFor = new Map<string, string>();
+  /** Store signature (watched-file mtimes) at the moment a dead-grant diagnosis was made; a new login changes it. */
+  private readonly deadSignature = new Map<string, string | undefined>();
+  /** Confirmed no-credential liveness per member, keyed by the store signature it was read at (a rewrite invalidates it). */
+  private readonly liveness = new Map<string, { signature: string | undefined; dead: boolean }>();
   private readonly refresh: RefreshFn;
 
   constructor(private readonly deps: CredentialCacheDeps = {}) {
@@ -247,6 +251,37 @@ export class CredentialCache {
   async signature(provider: GatewayProvider, identity: string): Promise<string | undefined> {
     const id = await this.resolve(provider, identity);
     return mtimeSignature(provider, id, this.deps.claudeRegistryPath);
+  }
+
+  /**
+   * Cheap liveness probe for pool selection: true when the login is known-dead. It never refreshes and never calls the
+   * network. Selection drops a dead member before any send, so a streamed body (which cannot fail over) never lands on it.
+   */
+  async loggedOut(provider: GatewayProvider, identity: string): Promise<boolean> {
+    let id: Identity;
+    try {
+      id = await this.resolve(provider, identity);
+    } catch (err) {
+      // An unknown or retired identity can never serve.
+      return err instanceof GatewayCredentialError && (err.code === "unknown-identity" || err.code === "retired");
+    }
+    const key = `${provider}\u0000${id.name}`;
+    const signature = await mtimeSignature(provider, id, this.deps.claudeRegistryPath);
+    // A dead-grant diagnosis stands while the store still holds the very login it was made for.
+    if (this.deadFor.has(key) && signature !== undefined && this.deadSignature.get(key) === signature) return true;
+    // The durable marker (any gateway replica writes it) applies to the store copy's current refresh token only.
+    if (memberStoreEnabled() && isMemberStoreTool(provider) && readLoginRevoked(provider, id.name) !== undefined) return true;
+    // A plain identity with no credential is logged out. A second read confirms it (a store mid-rewrite is not dead).
+    const hit = this.liveness.get(key);
+    if (hit && hit.signature === signature) return hit.dead;
+    let cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
+    if (!cred) {
+      await new Promise((r) => setTimeout(r, 50));
+      cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
+    }
+    const dead = !cred && !isSwapPool(id);
+    this.liveness.set(key, { signature, dead });
+    return dead;
   }
 
   async get(provider: GatewayProvider, identity: string): Promise<ProviderCredential> {
@@ -305,6 +340,7 @@ export class CredentialCache {
     const staleDigest = createHash("sha256").update(staleToken).digest("hex");
     if (this.deadFor.get(key) === staleDigest) throw new GatewayCredentialError("login-dead", provider, identity);
     this.deadFor.delete(key);
+    this.deadSignature.delete(key);
     const now = (this.deps.now ?? Date.now)();
     const last = this.lastRefreshAt.get(key);
     if (last !== undefined && now - last < REFRESH_COOLDOWN_MS) throw new RefreshCooldownError(provider, identity);
@@ -319,6 +355,8 @@ export class CredentialCache {
       const revoked = err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode);
       if (revoked) {
         this.deadFor.set(key, staleDigest);
+        this.deadSignature.set(key, await mtimeSignature(provider, id, this.deps.claudeRegistryPath));
+        this.liveness.delete(key);
         await markLoginRevoked(provider, identity, err.oauthCode!, err.refreshFingerprint);
       }
       throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : revoked ? "login-dead" : "refresh-failed", provider, identity, err);
@@ -328,6 +366,8 @@ export class CredentialCache {
     if (next.accessToken !== staleToken && !isGatewayAccessToken(next.accessToken)) return next;
     if (result.outcome === "skipped-revoked") {
       this.deadFor.set(key, staleDigest);
+      this.deadSignature.set(key, await mtimeSignature(provider, id, this.deps.claudeRegistryPath));
+      this.liveness.delete(key);
       await markLoginRevoked(provider, identity, "revoked", result.beforeFingerprint);
     }
     // Detail from the refresher may carry local paths: surface only a reason code.
