@@ -434,6 +434,32 @@ if (!url && process.env.CI && !optOut) {
       expect(tree[0]).toMatchObject({ sessionRef: "s1", committedBytes: 9000 });
     });
 
+    test("tree() returns the nodes of the view ais_session_tree, the time filter applying to the newest generation", async () => {
+      const s = make();
+      const add = (kind: string, ref: string, generation: number, updated: string, identity: string | null = null) =>
+        admin`INSERT INTO ais_session_file (node, root, rel_path, generation, kind, origin, identity, session_ref, title, updated_at, committed_bytes, head_sha256)
+              VALUES ('n', '/r', ${`p/${kind}-${ref}-${generation}.jsonl`}, ${generation}, ${kind}, 'host', ${identity}, ${ref}, ${`${ref} g${generation}`}, ${updated}::timestamptz, ${100 + generation}, 'h')`;
+      await add("claude", "a", 0, "2026-11-20T00:00:00Z");
+      await add("claude", "a", 1, "2026-11-10T00:00:00Z"); // the newest generation is older: it alone decides
+      await add("claude", "b", 0, "2026-11-20T00:00:00Z");
+      await add("claude", "c", 0, "2026-11-12T00:00:00Z");
+      await add("claude", "c", 1, "2026-11-21T00:00:00Z", "idn");
+      await add("claude", "c", 2, "2026-11-22T00:00:00Z", "idn");
+      await add("codex", "a", 0, "2026-11-19T00:00:00Z");
+      await admin`INSERT INTO ais_session_file (node, root, rel_path, generation, kind, origin, session_ref, committed_bytes, head_sha256) VALUES ('n', '/r', 'p/none.jsonl', 0, 'claude', 'host', 'never-updated', 1, 'h')`;
+      for (const q of [{}, { sinceMs: Date.parse("2026-11-15T00:00:00Z") }, { kind: "claude" }, { kind: "claude", identity: "idn" }, { limit: 2 }]) {
+        const since = (q as { sinceMs?: number }).sinceMs;
+        const viewRows = await admin.unsafe(
+          `SELECT id FROM ais_session_tree WHERE ($1::double precision IS NULL OR updated_at >= to_timestamp($1::double precision / 1000)) AND ($2::text IS NULL OR kind = $2) AND ($3::text IS NULL OR identity = $3)
+            ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT $4`,
+          [since ?? null, (q as { kind?: string }).kind ?? null, (q as { identity?: string }).identity ?? null, (q as { limit?: number }).limit ?? 5000],
+        );
+        const got = await s.tree(q);
+        expect(got.map((r) => r.fileId)).toEqual(viewRows.map((r: { id: string }) => Number(r.id)));
+      }
+      expect((await s.tree({ kind: "claude" })).map((r) => r.title)).toEqual(["c g2", "b g0", "a g1", null]);
+    });
+
     test("the index records every path that held the session", async () => {
       const s = make();
       await s.ingest(req([part(0, 5000)]));
