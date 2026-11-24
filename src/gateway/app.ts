@@ -33,7 +33,7 @@ import type { UsageCounts } from "./usage.ts";
 export interface GatewayDeps {
   store: GatewayStore;
   ledger: LedgerBuffer;
-  creds: Pick<CredentialCache, "get" | "refreshAfter401"> & Partial<Pick<CredentialCache, "signature">>;
+  creds: Pick<CredentialCache, "get" | "refreshAfter401"> & Partial<Pick<CredentialCache, "signature" | "loggedOut">>;
   usageFor(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   /** Reads one member's usage from the source now and waits (single-flight); `usageFor` answers with it afterwards. */
   refreshUsage?(provider: GatewayProvider, identity: string): Promise<void>;

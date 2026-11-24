@@ -84,10 +84,11 @@ export async function memberUsages(
  * Pinned: the identity, unless its worst window is at or over the reserve.
  * Pool: the member with the lowest utilisation below the reserve; members with
  * no usage figure are allowed after those with one. A per-model window counts only for a request for that model.
+ * A member whose login is known-dead is never a candidate, on either path, so a streamed body (no failover) never lands on it.
  */
 export async function pickIdentity(
   app: GatewayApp,
-  deps: Pick<GatewayDeps, "usageFor" | "poolMembers">,
+  deps: Pick<GatewayDeps, "usageFor" | "poolMembers"> & Partial<Pick<GatewayDeps, "creds">>,
   exclude?: string | ReadonlySet<string>,
   model?: string,
 ): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" | "no-identities" }> {
@@ -100,6 +101,13 @@ export async function pickIdentity(
   let names = await allowedMembers(app, deps);
   // Nothing to choose from at all (as opposed to everything being full): say so.
   if (names.length === 0) return { reject: "no-identities" };
+  // Drop dead or logged-out logins before selection. A probe error keeps the member (the send and failover still guard it).
+  const creds = deps.creds;
+  if (creds?.loggedOut) {
+    const alive = await Promise.all(names.map(async (n) => ((await creds.loggedOut!(app.provider, n).catch(() => false)) ? undefined : n)));
+    names = alive.filter((n): n is string => n !== undefined);
+    if (names.length === 0) return { reject: "no-identities" };
+  }
   const skip = typeof exclude === "string" ? new Set([exclude]) : exclude;
   if (skip && skip.size > 0) names = names.filter((n) => !skip.has(n));
   const rows = await Promise.all(

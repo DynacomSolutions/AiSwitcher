@@ -333,6 +333,7 @@ export function watchCredentialReads(creds: GatewayDeps["creds"], alerter: Alert
     },
     refreshAfter401: (...a) => creds.refreshAfter401(...a),
     signature: (...a) => creds.signature?.(...a) ?? Promise.resolve(undefined),
+    loggedOut: (...a) => creds.loggedOut?.(...a) ?? Promise.resolve(false),
   } as GatewayDeps["creds"];
 }
 

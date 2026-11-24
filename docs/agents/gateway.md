@@ -938,7 +938,11 @@ placeholder login, plus `model_provider = "ais-gateway"`). Detection: `src/ident
 (`isGatewayRoutedPool`; codex: the entry in `auth.json` or the gateway provider in `config.toml`).
 
 How the gateway picks a member: per request, `src/gateway/select.ts` `pickIdentity` takes the member with the lowest
-utilisation below the app's reserve (unknown usage after known headroom); the local proxy's direct fallback path
+utilisation below the app's reserve (unknown usage after known headroom). A known-dead login is never a candidate on
+either path. `CredentialCache.loggedOut` is a cheap probe (no refresh, no network) that selection consults first. It
+reports a dead-grant diagnosis that still matches the store, a matching durable revoked marker, a retired or unknown
+identity, or a plain identity with no credential. Selection drops those members, so a streamed body (which cannot fail
+over) never lands on a logged-out login. The local proxy's direct fallback path
 (`defaultLocalMembers` in `src/gateway/local.ts`) tries the pool's `swapPool.active` first. There is no pinned member for
 pool apps (a pin is rejected, task 4.119). So for a routed pool:
 

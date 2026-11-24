@@ -381,6 +381,51 @@ describe("CredentialCache", () => {
   });
 });
 
+describe("CredentialCache.loggedOut (cheap liveness probe, no refresh, no network)", () => {
+  test("a healthy login is not dead", async () => {
+    expect(await makeCache().loggedOut("claude", "id1")).toBe(false);
+    expect(await makeCache().loggedOut("opencode", "id1")).toBe(false);
+  });
+
+  test("a plain identity with no credential is dead (claude and opencode)", async () => {
+    await rm(claudeFile(), { force: true });
+    expect(await makeCache().loggedOut("claude", "id1")).toBe(true);
+    await rm(join(work, "opencode", "data", "opencode", "auth.json"), { force: true });
+    expect(await makeCache().loggedOut("opencode", "id1")).toBe(true);
+  });
+
+  test("an unknown or retired identity is dead", async () => {
+    const unknown = new CredentialCache({ resolveConfigDir: async () => undefined });
+    expect(await unknown.loggedOut("claude", "nope")).toBe(true);
+    const retired = new CredentialCache({ resolveIdentity: async () => ({ name: "id1", label: "id1", configDir: join(work, "claude"), retired: true }) });
+    expect(await retired.loggedOut("claude", "id1")).toBe(true);
+  });
+
+  test("a swap pool with no credential is not dead (its members hold the logins)", async () => {
+    await rm(claudeFile(), { force: true });
+    const pool = new CredentialCache({ resolveIdentity: async (_p, name) => ({ name, label: name, configDir: join(work, "claude"), swapPool: { accounts: ["m1"], active: "m1" } }) });
+    expect(await pool.loggedOut("claude", "id1")).toBe(false);
+  });
+
+  test("a dead-grant diagnosis is dead while the store is unchanged, and live again after a new login", async () => {
+    const c = makeCache(async () => {
+      throw new OAuthRefreshError("token refresh rejected (HTTP 400 invalid_grant)", true, undefined, "invalid_grant");
+    });
+    await expect(c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001")).rejects.toBeInstanceOf(GatewayCredentialError);
+    expect(await c.loggedOut("claude", "id1")).toBe(true);
+    // A new login rewrites the store (new mtime): the diagnosis no longer applies.
+    await writeClaude("SYNTHETIC_FIXTURE-claude-access-0002", 1_800_000_900);
+    expect(await c.loggedOut("claude", "id1")).toBe(false);
+  });
+
+  test("the probe never refreshes: a dead-grant refresh hook is not called by it", async () => {
+    let calls = 0;
+    const c = makeCache(async () => { calls++; return refreshed(); });
+    await c.loggedOut("claude", "id1");
+    expect(calls).toBe(0);
+  });
+});
+
 describe("CredentialCache never serves a gateway app token upstream", () => {
   const GW = "aisg_SYNTHETIC_FIXTURE_gateway_token_0001";
   const writeHybrid = () => writeFile(claudeFile(), JSON.stringify({ claudeAiOauth: { accessToken: GW, refreshToken: "SYNTHETIC_FIXTURE-claude-refresh-0001", expiresAt: 4_102_444_800_000 } }));
