@@ -7,6 +7,7 @@ import { collectTargets, pendingUsageResult } from "../cli/usage/run.ts";
 import { tokscaleExportTimeoutMs, tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
 import { withUsableCwd } from "../shared/exec.ts";
 import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./scan-worker.ts";
+import { sessionsReaderMetrics } from "./sessions-db/metrics.ts";
 import { scanMetric } from "./scan-metrics.ts";
 import { markUsageSnapshotDirty, usageSnapshotTargetKey } from "../cli/usage/snapshot-dirty.ts";
 import {
@@ -582,6 +583,11 @@ async function spawnScanWorkerNow<T>(
       const errorText = await Promise.race([stderr, Bun.sleep(100).then(() => "")]);
       parsed = { ok: false, error: errorText.trim() || "scan worker produced no output", status: 500 };
     }
+    // The child counted its database reads: add them to this process, which serves /metrics.
+    if (parsed.readerMetrics !== undefined) {
+      sessionsReaderMetrics.merge(parsed.readerMetrics);
+      delete parsed.readerMetrics;
+    }
     return parsed;
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "scan worker failed", status: 500 };
@@ -603,5 +609,6 @@ export async function runScanWorkerStdio(): Promise<void> {
     return;
   }
   const result = await runScan(req);
+  result.readerMetrics = sessionsReaderMetrics.drain();
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

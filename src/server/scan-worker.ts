@@ -7,6 +7,8 @@ import { isKnownToolName } from "../cli/identities/resolve-tool.ts";
 import { hasTreeReader, readSessionTrees } from "../cli/sessions/tree.ts";
 import { ACTIVE_WINDOW_MS } from "../cli/sessions/shared.ts";
 import { DEFAULT_TAIL_TURNS, readTranscript } from "../cli/sessions/transcript.ts";
+import { readTranscriptWithSource, readTreeSlices, sourceForScan } from "./sessions-db/read.ts";
+import type { SessionsSourceHandle } from "./sessions-db/source.ts";
 
 /** The (tool, identity) target list for the tree/transcript scans. Retired
  * identities are included: their history stays viewable (they are only
@@ -65,6 +67,8 @@ export interface ScanRequest {
   /** Test injection only (never serialised to the real worker child):
    * synthetic registries so tests never touch the live home. */
   configs?: import("../identities/types.ts").ToolConfig[];
+  /** Test injection only (never serialised to the real worker child): the session source, instead of the one the environment picks. */
+  sessionsSource?: SessionsSourceHandle;
 }
 
 export interface ScanResult<T = unknown> {
@@ -72,6 +76,8 @@ export interface ScanResult<T = unknown> {
   payload?: T;
   error?: string;
   status?: number;
+  /** Set by the scan child only: its database session reader counters since start. The console process adds them to its own. */
+  readerMetrics?: unknown;
 }
 
 export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
@@ -107,7 +113,21 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
           `${scope}|${req.tool ?? "*"}|${req.identity ?? "*"}|${days}|${req.active ? "active" : "all"}`,
           async () => {
             const targets = await collectSessionTargets(req.tool, req.identity, req.configs);
-            const tools = await Promise.all(targets.map((t) => readSessionTrees(t.toolName, t.identity, req.active ? { days, activeWithinMs: ACTIVE_WINDOW_MS } : { days })));
+            const treeOpts = req.active ? { days, activeWithinMs: ACTIVE_WINDOW_MS } : { days };
+            const handle = req.sessionsSource ?? (await sourceForScan(process.env, req.tool));
+            let tools;
+            try {
+              tools = await readTreeSlices({
+                handle,
+                targets,
+                tool: req.tool,
+                identity: req.identity,
+                opts: treeOpts,
+                filesRead: (t) => readSessionTrees(t.toolName, t.identity, treeOpts),
+              });
+            } finally {
+              if (!req.sessionsSource) await handle.close();
+            }
             // A reader-less tool named explicitly still earns its honest
             // unavailable slice, even when no registry provides identities
             // for it (the WebUI shows "unavailable", not a silent gap).
@@ -134,7 +154,22 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
         const scope = req.configs?.map((c) => c.identitiesJsonPath).join(",") ?? "live";
         const { value, cached } = await transcriptCache.get(
           `${scope}|${target.toolName}|${target.identity.name}|${req.id}|${tail}`,
-          () => readTranscript(target.toolName, target.identity, req.id!, { tail }).then((t) => t ?? null),
+          async () => {
+            const handle = req.sessionsSource ?? (await sourceForScan(process.env, target.toolName));
+            try {
+              const t = await readTranscriptWithSource({
+                handle,
+                target,
+                identity: req.identity,
+                id: req.id!,
+                tail,
+                filesRead: () => readTranscript(target.toolName, target.identity, req.id!, { tail }),
+              });
+              return t ?? null;
+            } finally {
+              if (!req.sessionsSource) await handle.close();
+            }
+          },
         );
         // transcript === null => session not found (404 at the endpoint)
         payload = { transcript: value, cached };

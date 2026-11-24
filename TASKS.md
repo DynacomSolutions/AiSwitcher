@@ -438,7 +438,7 @@ ETA: 2026-12-12 18:00 ICT
 | 305 | Cluster: shipper values, recipient key, ingest secret | done | claude | | 20.303 | | .cluster PR 3305 merged.<br>Shipper stays off. |
 | 306 | Cluster: HoardDB read key, NetworkPolicy, env | in_progress | claude | | 20.297 | 2026-11-24 21:00 ICT | Draft .cluster PR 3255 gets the read key SealedSecret. |
 | 307 | Cluster: watchdog rules, metrics, Headlamp row | done | claude | | 20.303, 20.299 | | .cluster PR 3306 merged.<br>Alerts gated on the shipper flag, plus a restart-loop rule. |
-| 308 | Console reader from the database | todo | | | 20.301, 20.302, 20.306 | | AIS_SESSIONS_SOURCE switch. |
+| 308 | Console reader from the database | in_progress | claude | sessions-console-reader | 20.301, 20.302, 20.306 | 2026-11-24 21:30 ICT | AIS_SESSIONS_SOURCE switch, default files.<br>Identity resolution still open: rows show as (unassigned). |
 | 309 | Equivalence test and performance proof | todo | | | 20.308 | | |
 | 310 | Backfill per node with verification | todo | | | 20.305, 20.307 | | |
 | 311 | Reconcile drill and verify-host command | todo | | | 20.310 | | |
