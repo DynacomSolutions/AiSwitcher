@@ -1,5 +1,6 @@
 import type { GatewayDeps } from "./app.ts";
 import { upstreamHeaders } from "./app.ts";
+import { GatewayCredentialError } from "./credentials.ts";
 import { providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
 import { availableCount, claudeUsageBody, claudeUsageBodyOf, normalisePath, orgSegmentIndex, syntheticClaudeProfile, type AccountOp } from "./routes.ts";
@@ -224,6 +225,8 @@ function wantsResets(search: string): boolean {
   return v !== null && v !== "" && v !== "0" && v.toLowerCase() !== "false";
 }
 
+const NO_LOGIN_CODES: ReadonlySet<string> = new Set(["no-credential", "unknown-identity", "retired", "login-dead", "unmanaged-login"]);
+
 /** Forwards one account request. Never throws except for a client that has left. */
 export async function forwardAccount(r: AccountRequest): Promise<AccountResult> {
   const cls = `${r.app.provider}:${r.op}`;
@@ -231,12 +234,14 @@ export async function forwardAccount(r: AccountRequest): Promise<AccountResult> 
     return await run(r, cls);
   } catch (err) {
     if (r.signal.aborted) throw err;
+    // A member without a usable login is the client's case (4xx with the reason), never a server error.
+    if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) return { res: providerError(r.style, 409, err.clientMessage), cls };
     return { res: providerError(r.style, 502, "account request failed"), cls };
   }
 }
 
 async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
-  const noMember = (): AccountResult => ({ res: providerError(r.style, 503, "no login is available for this app"), cls });
+  const noMember = (): AccountResult => ({ res: providerError(r.style, 409, "no login is available for this app"), cls });
   let url = r.url;
   let owner: OwnerFinder | undefined;
 

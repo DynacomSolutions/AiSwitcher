@@ -254,8 +254,11 @@ speech call is not a model call); the daily token cap does.
     Codex 0.166 reads `account/rateLimits/read` from `<chatgpt_base_url>/wham/usage` when its config sets `chatgpt_base_url`
     and `auth.json` holds a placeholder ChatGPT login whose `access_token` is the app token (how T3 Code shows limits).
   - **kimi** `GET /usages` (`api.kimi.com/coding/v1/usages`), **zai** `GET /api/monitor/*` (`api.z.ai`), **opencode**
-    `GET /usage` (`opencode.ai/zen/go/v1/usage`): forwarded with the member's key. **grok** and **ali** have no account
-    endpoint AIS calls with the model key (ali usage needs a console cookie, not the API key): nothing is forwarded for them.
+    `GET /usage` (`opencode.ai/zen/go/v1/usage`), **grok** `GET /billing` (`cli-chat-proxy.grok.com/v1/billing`): forwarded
+    with the member's login. **ali** has no account endpoint AIS calls with the model key (ali usage needs a console
+    cookie, not the API key): `/usage`, `/usages` and `/billing` answer 404 and nothing is sent.
+  - **No usable login**: a pinned identity that is unknown, retired, logged out, unmanaged or without a credential, and a pool
+    with no member, answer 409 with the reason. An unknown app token is 401. These cases are never a 5xx.
   - **Never forwarded (403)**: paths that mint a durable credential of the member, which would bypass the gateway:
     `create_api_key`, `api_keys`, `oauth_tokens`, `setup_token`, `access_token`, `oauth/token`, `oauth/authorize`
     (Claude and ChatGPT). The owner should know the app can still see account detail, but never obtains a key.

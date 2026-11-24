@@ -1164,6 +1164,66 @@ describe("account API of the other providers", () => {
       expect(seen[0]!.headers.get("authorization") ?? seen[0]!.headers.get("x-api-key")).not.toContain("aisg_");
     });
   }
+  const fixtures: Array<[GatewayProvider, ApiStyle, string, unknown]> = [
+    ["kimi", "openai", "/v1/usages", { user: { membership: { level: "LEVEL_INTERMEDIATE" } }, usage: { limit: "100", remaining: "40" }, limits: [{ window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" }, detail: { limit: "100", remaining: "90" } }] }],
+    ["zai", "anthropic", "/api/monitor/usage/quota/limit", { code: 200, data: { level: "pro", limits: [{ type: "TOKENS_LIMIT", percentage: 12, nextResetTime: 1790000000000 }] } }],
+    ["opencode", "openai", "/usage", { plan: "go", windows: [{ label: "rolling", usedPercent: 7 }] }],
+    ["grok", "openai", "/v1/billing", { plan: "super", usage: { used: 3, limit: 50 } }],
+  ];
+  for (const [provider, style, path, fixture] of fixtures) {
+    test(`${provider} pool: ${path} is the provider's real body from the least-used member's login`, async () => {
+      await addApp("app", provider, style);
+      usage.a = { status: "live", maxUtilization: 80, capturedAt: "" };
+      usage.b = { status: "live", maxUtilization: 10, capturedAt: "" };
+      reply = () => Response.json(fixture);
+      const res = await call("app", path, { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(fixture as never);
+      expect(seen).toHaveLength(1);
+      const sent = seen[0]!.headers.get("authorization") ?? seen[0]!.headers.get("x-api-key");
+      expect(sent).toContain("tok-b");
+      expect(sent).not.toContain("aisg_");
+    });
+    test(`${provider}: a pinned app whose identity has no login gets 409, never 500`, async () => {
+      await addApp("app", provider, style, { target: { kind: "pin", identity: "ghost" } });
+      const { GatewayCredentialError } = await import("../../src/gateway/credentials.ts");
+      deps.creds = { get: async () => { throw new GatewayCredentialError("unknown-identity", provider, "ghost"); }, refreshAfter401: async () => { throw new Error("unused"); } } as unknown as GatewayDeps["creds"];
+      const res = await call("app", path, { method: "GET" });
+      expect(res.status).toBe(409);
+      expect(seen).toHaveLength(0);
+    });
+    test(`${provider}: a pool with no member gets 409, never 500`, async () => {
+      await addApp("app", provider, style);
+      deps.poolMembers = async () => [];
+      const res = await call("app", path, { method: "GET" });
+      expect(res.status).toBe(409);
+      expect(res.status).toBeLessThan(500);
+      expect(seen).toHaveLength(0);
+    });
+    test(`${provider}: an unknown app token is 401 and reaches no provider`, async () => {
+      await addApp("app", provider, style);
+      const res = await createGatewayApp(deps).request(`http://gw.test/app${path}`, { headers: { authorization: `Bearer ${WRONG_APP_TOKEN}` } });
+      expect(res.status).toBe(401);
+      expect(seen).toHaveLength(0);
+    });
+  }
+  test("ali has no account endpoint: usage and billing paths are 404, nothing goes upstream", async () => {
+    await addApp("app", "ali", "openai", { target: { kind: "pin", identity: "a" } });
+    for (const path of ["/usage", "/v1/usages", "/billing", "/v1/billing"]) {
+      expect((await call("app", path, { method: "GET" })).status).toBe(404);
+    }
+    expect(seen).toHaveLength(0);
+  });
+  for (const [provider, path] of [["claude", "/api/oauth/usage"], ["codex", "/backend-api/accounts/settings"]] as const) {
+    test(`${provider}: a pinned app whose identity has no login gets 409, never 500`, async () => {
+      await addApp("app", provider, provider === "claude" ? "anthropic" : "openai", { target: { kind: "pin", identity: "ghost" } });
+      const { GatewayCredentialError } = await import("../../src/gateway/credentials.ts");
+      deps.creds = { get: async () => { throw new GatewayCredentialError("unknown-identity", provider, "ghost"); }, refreshAfter401: async () => { throw new Error("unused"); } } as unknown as GatewayDeps["creds"];
+      const res = await call("app", path, { method: "GET" });
+      expect(res.status).toBe(409);
+      expect(seen).toHaveLength(0);
+    });
+  }
   test("an unknown app token reaches no provider on any of these paths", async () => {
     await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
     for (const path of ["/backend-api/plugins/featured", "/wham/usage"]) {
