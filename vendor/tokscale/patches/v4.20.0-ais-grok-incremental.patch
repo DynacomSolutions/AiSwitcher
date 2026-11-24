@@ -1,5 +1,5 @@
 diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
-index f976489..f4d46b0 100644
+index f976489..4bd8499 100644
 --- a/crates/tokscale-core/src/lib.rs
 +++ b/crates/tokscale-core/src/lib.rs
 @@ -3477,13 +3477,41 @@ fn parse_all_messages_streaming<S: MessageSink>(
@@ -57,7 +57,7 @@ index f976489..f4d46b0 100644
              );
              drop(env);
              assert_eq!(after_append, cold(home.path()), "{label}: append");
-@@ -15347,6 +15375,154 @@ mod tests {
+@@ -15347,6 +15375,263 @@ mod tests {
          }
      }
  
@@ -209,6 +209,115 @@ index f976489..f4d46b0 100644
 +        assert!(read * 10 < std::fs::metadata(&unified).unwrap().len() * 3);
 +    }
 +
++    /// A checkpoint and a cache entry from two different parses can share
++    /// every dedup key and still differ in content (here the model). The pair
++    /// must not be accepted: the resume gives way to the full parse, so a warm
++    /// scan equals a cold one.
++    #[test]
++    #[serial_test::serial]
++    fn ais_grok_incremental_rejects_checkpoint_and_entry_of_two_parses() {
++        let cache_home = tempfile::TempDir::new().unwrap();
++        let home = tempfile::TempDir::new().unwrap();
++        let sessions = home.path().join(".grok/sessions/%2Ftmp%2Fa");
++        ais_grok_session(&sessions.join("s1"), "grok-code", None);
++        ais_grok_session(&sessions.join("s2"), "grok-4", None);
++        let logs = home.path().join(".grok/logs");
++        std::fs::create_dir_all(&logs).unwrap();
++        let unified = logs.join("unified.jsonl");
++        let rows = |from: u32, to: u32| (from..to).map(ais_grok_row).collect::<String>();
++        std::fs::write(&unified, rows(0, 40)).unwrap();
++
++        let _env = redirect_cache_home(cache_home.path());
++        let first_fingerprint = message_cache::SourceFingerprint::from_grok_path(&unified).unwrap();
++        let from_first =
++            sessions::grok::parse_grok_unified_log_checkpointed(&unified, Some(&first_fingerprint));
++        assert_eq!(from_first.len(), 40);
++        // The entry of "another parse": same keys and count, another model.
++        let mut from_other = from_first.clone();
++        for message in &mut from_other {
++            message.model_id = "grok-other".to_string();
++        }
++        std::thread::sleep(std::time::Duration::from_millis(30));
++        ais_incremental_append(&unified, &rows(40, 43));
++        let grown_fingerprint = message_cache::SourceFingerprint::from_grok_path(&unified).unwrap();
++
++        let mixed = sessions::grok::resume_grok_unified_log(
++            &unified,
++            &from_other,
++            &first_fingerprint,
++            &grown_fingerprint,
++        );
++        assert!(mixed.is_none(), "a checkpoint and an entry of two parses must not resume");
++
++        // The matching pair resumes and equals a cold parse.
++        let resumed = sessions::grok::resume_grok_unified_log(
++            &unified,
++            &from_first,
++            &first_fingerprint,
++            &grown_fingerprint,
++        )
++        .expect("the matching pair resumes");
++        let cold_cache = tempfile::TempDir::new().unwrap();
++        let _cold_env = redirect_cache_home(cold_cache.path());
++        let cold = sessions::grok::parse_grok_unified_log_checkpointed(
++            &unified,
++            Some(&grown_fingerprint),
++        );
++        assert_eq!(ais_grok_rows(&resumed), ais_grok_rows(&cold));
++        assert_eq!(resumed.len(), 43);
++    }
++
++    /// A row appended after the checkpoint that repeats an earlier complete
++    /// row is a duplicate: a warm scan drops it, as a cold scan does.
++    #[test]
++    #[serial_test::serial]
++    fn ais_grok_incremental_drops_a_repeat_of_an_earlier_row() {
++        use sessions::grok::GROK_UNIFIED_BYTES_READ as GROK_BYTES;
++        use std::sync::atomic::Ordering;
++        let cache_home = tempfile::TempDir::new().unwrap();
++        let home = tempfile::TempDir::new().unwrap();
++        let sessions = home.path().join(".grok/sessions/%2Ftmp%2Fa");
++        ais_grok_session(&sessions.join("s1"), "grok-code", None);
++        ais_grok_session(&sessions.join("s2"), "grok-4", None);
++        let logs = home.path().join(".grok/logs");
++        std::fs::create_dir_all(&logs).unwrap();
++        let unified = logs.join("unified.jsonl");
++        let scan = |home: &std::path::Path| {
++            ais_grok_rows(&parse_all_messages_with_pricing_with_env_strategy(
++                home.to_str().unwrap(),
++                &["grok".to_string()],
++                None,
++                false,
++                &scanner::ScannerSettings::default(),
++            ))
++        };
++        std::fs::write(&unified, (0..12000).map(ais_grok_row).collect::<String>()).unwrap();
++        let env = redirect_cache_home(cache_home.path());
++        let before = GROK_BYTES.load(Ordering::Relaxed);
++        assert_eq!(scan(home.path()).len(), 12000);
++        let full_read = GROK_BYTES.load(Ordering::Relaxed) - before;
++        drop(env);
++
++        std::thread::sleep(std::time::Duration::from_millis(30));
++        // An exact copy of the first row, then one new row.
++        ais_incremental_append(&unified, &ais_grok_row(0));
++        ais_incremental_append(&unified, &ais_grok_row(12000));
++        let env = redirect_cache_home(cache_home.path());
++        let before = GROK_BYTES.load(Ordering::Relaxed);
++        let warm = scan(home.path());
++        let read = GROK_BYTES.load(Ordering::Relaxed) - before;
++        drop(env);
++        let cold_cache = tempfile::TempDir::new().unwrap();
++        let _cold_env = redirect_cache_home(cold_cache.path());
++        let cold = scan(home.path());
++        assert_eq!(cold.len(), 12001, "the repeated row is dropped");
++        assert_eq!(warm, cold);
++        assert!(
++            read * 3 < full_read,
++            "read {read} bytes, a full read is {full_read}"
++        );
++    }
++
      #[test]
      #[serial_test::serial]
      fn test_parse_all_messages_with_pricing_kimi_deduplicates_repeated_status_updates() {
@@ -226,7 +335,7 @@ index 86a1182..9cf3376 100644
          || dirs::config_dir().is_some()
          || cfg!(target_os = "macos") && crate::paths::home_dir().is_some()
 diff --git a/crates/tokscale-core/src/sessions/grok.rs b/crates/tokscale-core/src/sessions/grok.rs
-index 3c06980..b1bb9d9 100644
+index 3c06980..7e9baf2 100644
 --- a/crates/tokscale-core/src/sessions/grok.rs
 +++ b/crates/tokscale-core/src/sessions/grok.rs
 @@ -63,20 +63,20 @@ struct UnifiedSessionTree {
@@ -619,7 +728,7 @@ index 3c06980..b1bb9d9 100644
  }
  
  /// Metadata of the referenced sessions only: a session no inference row names
-@@ -2017,6 +2058,693 @@ fn hex_value(byte: u8) -> Option<u8> {
+@@ -2017,6 +2058,726 @@ fn hex_value(byte: u8) -> Option<u8> {
      }
  }
  
@@ -746,6 +855,7 @@ index 3c06980..b1bb9d9 100644
 +    model_by_pid_and_session: Vec<(i64, UnifiedGeneration, String, String)>,
 +    model_by_session: Vec<(String, String)>,
 +    message_count: u64,
++    /// Hash of the complete content of the first `message_count` messages.
 +    message_hash: u64,
 +    /// Hash of the fingerprint the cached entry of this parse carries.
 +    fingerprint_hash: u64,
@@ -769,11 +879,18 @@ index 3c06980..b1bb9d9 100644
 +
 +const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 +
++/// A hash of the complete content of the messages (model, session, workspace,
++/// timestamp, tokens, flags), not only of their dedup keys. A checkpoint and a
++/// cache entry that two different parses wrote can share every key and still
++/// differ in a model or a cost; the hash tells them apart.
 +fn messages_hash<'a>(messages: impl Iterator<Item = &'a UnifiedMessage>) -> u64 {
 +    let mut hash = FNV_OFFSET;
 +    for message in messages {
-+        let key = message.dedup_key.as_deref().unwrap_or("");
-+        hash = fnv_update(hash, key.as_bytes());
++        match bincode::serialize(message) {
++            Ok(bytes) => hash = fnv_update(hash, &bytes),
++            // A message that cannot be hashed never matches a checkpoint.
++            Err(_) => hash = fnv_update(hash, &[0x00]),
++        }
 +        hash = fnv_update(hash, &[0xff]);
 +    }
 +    hash
@@ -863,9 +980,34 @@ index 3c06980..b1bb9d9 100644
 +        .duration_since(std::time::UNIX_EPOCH)
 +        .map(|elapsed| elapsed.as_nanos())
 +        .unwrap_or(0);
++    remove_stale_checkpoint_temps(dir, std::time::SystemTime::now());
 +    let temp = dir.join(format!(".{}.{nanos}.tmp", std::process::id()));
 +    if std::fs::write(&temp, bytes).is_err() || std::fs::rename(&temp, &path).is_err() {
 +        let _ = std::fs::remove_file(&temp);
++    }
++}
++
++/// A scan killed between the write and the rename leaves a `.<pid>.<nanos>.tmp`
++/// file. Remove such files once they are an hour old.
++fn remove_stale_checkpoint_temps(dir: &Path, now: std::time::SystemTime) {
++    let Ok(entries) = std::fs::read_dir(dir) else {
++        return;
++    };
++    for entry in entries.flatten() {
++        let name = entry.file_name();
++        let name = name.to_string_lossy();
++        if !(name.starts_with('.') && name.ends_with(".tmp")) {
++            continue;
++        }
++        let stale = entry
++            .metadata()
++            .and_then(|metadata| metadata.modified())
++            .ok()
++            .and_then(|modified| now.duration_since(modified).ok())
++            .is_some_and(|age| age >= std::time::Duration::from_secs(3600));
++        if stale {
++            let _ = std::fs::remove_file(entry.path());
++        }
 +    }
 +}
 +
@@ -1313,3 +1455,39 @@ index 3c06980..b1bb9d9 100644
  #[cfg(test)]
  mod tests {
      use super::*;
+@@ -2056,6 +2817,35 @@ mod tests {
+         )
+     }
+ 
++    #[test]
++    fn ais_stale_checkpoint_temp_files_are_removed() {
++        let dir = tempfile::TempDir::new().unwrap();
++        let stale = dir.path().join(".1.2.tmp");
++        let fresh = dir.path().join(".3.4.tmp");
++        let kept = dir.path().join("0123456789abcdef.bin");
++        for path in [&stale, &fresh, &kept] {
++            std::fs::write(path, b"x").unwrap();
++        }
++        let now = std::time::SystemTime::now();
++        let old = now - std::time::Duration::from_secs(7200);
++        std::fs::File::options()
++            .write(true)
++            .open(&stale)
++            .unwrap()
++            .set_modified(old)
++            .unwrap();
++        std::fs::File::options()
++            .write(true)
++            .open(&kept)
++            .unwrap()
++            .set_modified(old)
++            .unwrap();
++        remove_stale_checkpoint_temps(dir.path(), now);
++        assert!(!stale.exists());
++        assert!(fresh.exists());
++        assert!(kept.exists());
++    }
++
+     fn write_unified_fixture(unified_jsonl: &str) -> (tempfile::TempDir, PathBuf) {
+         let temp = tempfile::TempDir::new().unwrap();
+         let logs_dir = temp.path().join(".grok/logs");
