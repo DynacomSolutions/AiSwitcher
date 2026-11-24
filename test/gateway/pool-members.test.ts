@@ -50,6 +50,56 @@ describe("appPoolMemberNames", () => {
   });
 });
 
+describe("appPoolMemberNames when the swap pools are retired", () => {
+  test("a provider whose only swap pool is retired has no members, never every login", () => {
+    const file = {
+      identities: [
+        { name: "alpha", label: "alpha", configDir: "/x/alpha" },
+        { name: "gamma", label: "gamma", configDir: "/x/gamma" },
+        { name: "old", label: "old", configDir: "/x/old", swapPool: { accounts: ["alpha", "gamma"] }, ...retired },
+      ],
+    } as unknown as IdentitiesFile;
+    expect(appPoolMemberNames(file)).toEqual([]);
+  });
+
+  test("a registry with no swap pool at all (grok, say) keeps every login that is not retired", () => {
+    const file = { identities: [{ name: "g1", label: "g1", configDir: "/x/g1" }, { name: "g2", label: "g2", configDir: "/x/g2" }] } as unknown as IdentitiesFile;
+    expect(appPoolMemberNames(file)).toEqual(["g1", "g2"]);
+  });
+
+  test("an active swap pool still gives its allowed members next to a retired one", () => {
+    const file = {
+      identities: [
+        { name: "alpha", label: "alpha", configDir: "/x/alpha" },
+        { name: "gamma", label: "gamma", configDir: "/x/gamma" },
+        { name: "live", label: "live", configDir: "/x/live", swapPool: { accounts: ["alpha", "gamma"], disallowed: ["gamma"] } },
+        { name: "old", label: "old", configDir: "/x/old", swapPool: { accounts: ["gamma"] }, ...retired },
+      ],
+    } as unknown as IdentitiesFile;
+    expect(appPoolMemberNames(file)).toEqual(["alpha"]);
+  });
+
+  test("a retired-only swap pool gives requests the no-identities answer", async () => {
+    const file = { identities: [{ name: "alpha", label: "alpha", configDir: "/x/alpha" }, { name: "old", label: "old", configDir: "/x/old", swapPool: { accounts: ["alpha"] }, ...retired }] } as unknown as IdentitiesFile;
+    const app: GatewayApp = { name: "pool", owner: "o", namespace: "n", provider: "claude", style: "anthropic", target: { kind: "pool" }, state: "active", createdAt: "2026-11-01T00:00:00.000Z" };
+    const poolMembers = async (p: string) => onlyManaged(p, appPoolMemberNames(file), poolManagementCheck({} as GatewayDeps["creds"], async () => true));
+    expect(await pickIdentity(app, { usageFor: async () => undefined, poolMembers })).toEqual({ reject: "no-identities" });
+  });
+
+  test("claude: the management gate and swap-pool membership together", async () => {
+    const file = {
+      identities: [
+        { name: "member", label: "member", configDir: "/x/member" },
+        { name: "unmanaged", label: "unmanaged", configDir: "/x/unmanaged" },
+        { name: "outside", label: "outside", configDir: "/x/outside" },
+        { name: "team-pool", label: "team-pool", configDir: "/x/pool", swapPool: { accounts: ["member", "unmanaged"] } },
+      ],
+    } as unknown as IdentitiesFile;
+    const isManaged = async (_t: string, id: string) => id !== "unmanaged";
+    expect(await onlyManaged("claude", appPoolMemberNames(file), poolManagementCheck({} as GatewayDeps["creds"], isManaged))).toEqual(["member"]);
+  });
+});
+
 describe("the pool management gate", () => {
   // "guest" is in the registry but not gateway-managed (no gateway copy); "member" is managed.
   const file = {

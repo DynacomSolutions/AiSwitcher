@@ -340,13 +340,15 @@ export function watchCredentialReads(creds: GatewayDeps["creds"], alerter: Alert
 /**
  * The identities a pool app may use: the allowed members of the provider's swap pools, the same pool `ais swap` and the
  * limits page show. An account that no swap pool lists (one kept for its own threads, say) is never a pool app member,
- * even when the gateway holds its login for a pinned app. A registry with no swap pool keeps every real login. Retired
+ * even when the gateway holds its login for a pinned app. A registry with no swap pool record keeps every real login; one whose pools are all retired has no members. Retired
  * identities and swap pool folders (which hold no login of their own) are never members.
  */
 export function appPoolMemberNames(file: IdentitiesFile): string[] {
   const real = file.identities.filter((i) => !isRetired(i) && !isSwapPool(i));
+  // No swap pool record at all (active or retired) keeps every real login. A provider that has one, but no active pool, has no
+  // members: a planned narrowing (a retired pool) must never widen the pool back to every login.
+  if (!file.identities.some(isSwapPool)) return real.map((i) => i.name);
   const pools = poolsOf(file);
-  if (pools.length === 0) return real.map((i) => i.name);
   const listed = new Set<string>();
   for (const pool of pools) {
     for (const name of allowedAccounts(pool)) listed.add(findIdentityByNameOrAlias(real, name)?.name ?? name);
