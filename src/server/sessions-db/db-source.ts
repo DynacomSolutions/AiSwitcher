@@ -166,13 +166,15 @@ export class SessionsDbSource {
 }
 
 /**
- * The parts of a window must reach the end of the stored bytes and, when they start inside the file, must fill the
+ * The parts of a window must reach the end of the stored bytes (or pass it, when an ingest ran between the two reads) and, when they start inside the file, must fill the
  * window (the query stops adding older parts only once the window is full). Anything else means a part row is missing,
  * and the text would be short with no error.
  */
 export function checkPartCoverage(parts: readonly SessionPartRow[], committedBytes: number, windowBytes: number): void {
   const last = parts[parts.length - 1];
-  if (!last || last.endOffset !== committedBytes) {
+  // The row and the parts come from two statements. An ingest can commit between them, so the parts may end after the
+  // row's cursor. Parts that end before it mean a part row is missing.
+  if (!last || last.endOffset < committedBytes) {
     throw new SessionsReadError("integrity", "the stored parts do not reach the end of the session");
   }
   const first = parts[0]!;

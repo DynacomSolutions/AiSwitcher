@@ -33,6 +33,8 @@ export interface OpenDeps {
 }
 
 export const PING_TIMEOUT_MS = 3000;
+/** Connect limit of `db` mode, where no files can answer, so a slow database is better than an error. */
+export const DB_CONNECT_TIMEOUT_MS = 10_000;
 
 const filesHandle = (mode: SessionsSourceMode, reason?: string): SessionsSourceHandle => ({
   mode,
@@ -49,10 +51,10 @@ function processCache(cap: number): PartCache {
   return sharedCache.cache;
 }
 
-function buildDb(cfg: SessionsReaderConfig, deps: OpenDeps): { db: SessionsDbSource; close: () => Promise<void> } {
+function buildDb(cfg: SessionsReaderConfig, deps: OpenDeps, mode: SessionsSourceMode): { db: SessionsDbSource; close: () => Promise<void> } {
   const metrics = deps.metrics ?? sessionsReaderMetrics;
   // The driver would wait about 30 s for a connection. A short connect timeout keeps a silent database from holding a read.
-  const store = deps.store ?? new SessionStore(cfg.databaseUrl, { poolMax: 2, connectTimeoutS: Math.max(1, Math.ceil((deps.pingTimeoutMs ?? PING_TIMEOUT_MS) / 1000)) });
+  const store = deps.store ?? new SessionStore(cfg.databaseUrl, { poolMax: 2, connectTimeoutS: Math.max(1, Math.ceil((mode === "auto" ? (deps.pingTimeoutMs ?? PING_TIMEOUT_MS) : DB_CONNECT_TIMEOUT_MS) / 1000)) });
   const loader = new PartLoader({
     source: deps.parts ?? new S3PartSource(cfg),
     identity: cfg.ageIdentity,
@@ -81,7 +83,7 @@ export async function openSessionsSource(env: Record<string, string | undefined>
     return filesHandle(mode, reason);
   }
   if (mode === "auto" && deps.skipProbe) return filesHandle(mode, "the database did not answer a moment ago");
-  const built = buildDb(cfg, deps);
+  const built = buildDb(cfg, deps, mode);
   if (mode === "auto") {
     try {
       await withTimeout(built.db.ping(), deps.pingTimeoutMs ?? PING_TIMEOUT_MS);

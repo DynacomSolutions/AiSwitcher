@@ -1119,9 +1119,9 @@ folders. The default stays the files. Row 20.312 moves the default.
 - Switch: `AIS_SESSIONS_SOURCE=files|db|auto`. An empty or unknown value means `files`.
   - `files`: no database is touched.
   - `db`: Claude and Codex sessions come from the database. Missing settings make a read fail, and the error names the
-    settings, never values. A failed read is an error (the tree slice carries `error`, a transcript answers `502`).
+    settings, never values. The driver connect limit is 10 s. A failed read is an error (the tree slice carries `error`, a transcript answers `502`).
   - `auto`: the database when its settings are complete and it answers a probe, else the files. The probe waits 3 s at most
-    (the driver connect timeout is 3 s too, and the pending connection closes in the background). A failed probe is
+    (the driver connect timeout is 3 s in this mode, and the pending connection closes in the background). A failed probe is
     reported to the console process, which tells the next scan children to use the files without probing for 60 s. A failed read, or a
     session that is not stored yet, falls back to the files for that request. The console logs the chosen source once at
     start (`sessions: reading db|files (...)`, no values).

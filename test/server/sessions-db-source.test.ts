@@ -131,6 +131,27 @@ describe("database transcript equals the file transcript", () => {
   });
 });
 
+describe("an ingest between the row read and the parts read", () => {
+  test("parts that end after the row cursor are read, not refused", async () => {
+    const { f } = await seed(3);
+    const row = (await f.store.filesOfSession("claude", SID))[0]!;
+    const parts = f.store.parts.get(row.fileId)!;
+    // The row was read before the last part committed: its cursor stops before the last part.
+    const last = parts[parts.length - 1]!;
+    const stale = { ...row, committedBytes: last.startOffset };
+    const real = f.store.filesOfSession.bind(f.store);
+    f.store.filesOfSession = async (k, r) => (await real(k, r)).map((x) => (x.fileId === row.fileId ? stale : x));
+    const dto = await f.db.readTranscript({ tool: "claude", identity: "testa", id: SID });
+    expect(dto!.turns.at(-1)!.text).toContain("Answer 9");
+  });
+  test("parts that end before the row cursor are still an integrity error", async () => {
+    const { f } = await seed(3);
+    const row = (await f.store.filesOfSession("claude", SID))[0]!;
+    f.store.parts.set(row.fileId, f.store.parts.get(row.fileId)!.slice(0, -1));
+    await expect(f.db.readTranscript({ tool: "claude", identity: "testa", id: SID })).rejects.toMatchObject({ kind: "integrity" });
+  });
+});
+
 describe("a part that fails its check gives an error, never wrong text", () => {
   test("same length, other content: hash differs", async () => {
     const { f } = await seed(2);
