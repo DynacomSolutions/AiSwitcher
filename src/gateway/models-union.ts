@@ -1,5 +1,6 @@
 import type { GatewayDeps } from "./app.ts";
 import { stripHopByHop, upstreamHeaders } from "./app.ts";
+import { GatewayCredentialError } from "./credentials.ts";
 import { providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
 import { routeFor } from "./routes.ts";
@@ -7,11 +8,10 @@ import { allowedMembers } from "./select.ts";
 import type { ApiStyle, GatewayApp } from "./types.ts";
 
 /**
- * Model lists for a pool app. Pool members can be on different plans, so one member's list is not what the pool can
- * serve: a request for a model only some members have still succeeds, because the model path fails over to the next
- * member. A collection (`GET /models`) is therefore the union of every member's list; a single model
- * (`GET /models/<id>`) is answered by the first member that has it. A pinned app has one identity and keeps the plain
- * pass-through.
+ * Model lists for an app, pool or pin. Pool members can be on different plans, so one member's list is not what the
+ * pool can serve: a request for a model only some members have still succeeds, because the model path fails over to the
+ * next member. A collection (`GET /models`) is therefore the union of every member's list; a single model
+ * (`GET /models/<id>`) is answered by the first member that has it. A pin is a one-member pool and uses the same path.
  *
  * Union rules: entries are matched by `slug` (Codex) or `id` (Anthropic and OpenAI style); the entry with the widest
  * visibility wins ("list" beats anything else, anything beats "hide"), and all its other fields come from the member
@@ -41,6 +41,15 @@ interface MemberAnswer {
   name: string;
   res?: Response;
   json?: unknown;
+  /** The member had no usable login. */
+  credErr?: GatewayCredentialError;
+}
+
+/** The answer when no member gave one and every member failed on its login: a dead login wins (401) over a transient one (502). */
+function credentialFailure(style: ApiStyle, answers: MemberAnswer[]): Response | undefined {
+  if (answers.length === 0 || !answers.every((a) => a.credErr !== undefined)) return undefined;
+  const err = answers.find((a) => a.credErr?.loggedOut)?.credErr ?? answers[0]!.credErr!;
+  return providerError(style, err.loggedOut ? 401 : 502, err.clientMessage);
 }
 
 export async function poolModels(input: PoolModelsInput): Promise<Response> {
@@ -52,6 +61,12 @@ export async function poolModels(input: PoolModelsInput): Promise<Response> {
     return providerError(style, 502, "model list unavailable");
   }
   if (names.length === 0) return providerError(style, 502, "model list unavailable");
+  // Leave out logged-out logins, as the pick does, but keep one name so that an answer (the login error) still comes back.
+  const loggedOut = deps.creds?.loggedOut;
+  if (loggedOut) {
+    const alive = (await Promise.all(names.map(async (n) => ((await loggedOut.call(deps.creds, app.provider, n).catch(() => false)) ? undefined : n)))).filter((n): n is string => n !== undefined);
+    if (alive.length > 0) names = alive;
+  }
   const adapter = adapterFor(app.provider);
   const incoming = new Headers(input.incoming);
   for (const h of CONDITIONAL) incoming.delete(h);
@@ -69,16 +84,18 @@ export async function poolModels(input: PoolModelsInput): Promise<Response> {
         json = undefined;
       }
       return { name, res: new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers }), json };
-    } catch {
+    } catch (err) {
       if (signal.aborted) throw new DOMException("aborted", "AbortError");
-      return { name };
+      return err instanceof GatewayCredentialError ? { name, credErr: err } : { name };
     }
   };
 
   if (input.single) {
     let first: Response | undefined;
+    const failed: MemberAnswer[] = [];
     for (const name of names) {
       const a = await ask(name);
+      failed.push(a);
       if (a.res?.ok) {
         if (first) await first.body?.cancel().catch(() => undefined);
         return passThrough(a.res);
@@ -86,7 +103,7 @@ export async function poolModels(input: PoolModelsInput): Promise<Response> {
       if (!first && a.res) first = a.res;
       else await a.res?.body?.cancel().catch(() => undefined);
     }
-    return first ? passThrough(first) : providerError(style, 502, "upstream request failed");
+    return first ? passThrough(first) : (credentialFailure(style, failed) ?? providerError(style, 502, "upstream request failed"));
   }
 
   const answers = await Promise.all(names.map(ask));
@@ -94,7 +111,7 @@ export async function poolModels(input: PoolModelsInput): Promise<Response> {
   if (lists.length === 0) {
     const first = answers.find((a) => a.res !== undefined)?.res;
     for (const a of answers) if (a.res && a.res !== first) await a.res.body?.cancel().catch(() => undefined);
-    return first ? passThrough(first) : providerError(style, 502, "upstream request failed");
+    return first ? passThrough(first) : (credentialFailure(style, answers) ?? providerError(style, 502, "upstream request failed"));
   }
   for (const a of answers) if (!lists.includes(a)) await a.res?.body?.cancel().catch(() => undefined);
   const merged = mergeModelLists(lists.map((a) => a.json));

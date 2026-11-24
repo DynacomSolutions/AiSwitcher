@@ -631,9 +631,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       return reject(429, "daily limit for list, search and speech calls reached", identityForRow, undefined, "side_daily_cap");
     }
   }
-  /** A pool app's model list: the union of its members' lists (or the first member that has the one model), see models-union.ts. */
-  const poolList = route?.kind === "upstream" && route.models !== undefined && app.target.kind === "pool" ? route : undefined;
-  if (route?.kind === "serve" || route?.kind === "account" || poolList) {
+  /** An app's model list: the union over its allowed members, see models-union.ts. A pin is a one-member pool. Listing consumes no quota, so it answers before any reserve pick. */
+  const modelsList = route?.kind === "upstream" && route.models !== undefined ? route : undefined;
+  if (route?.kind === "serve" || route?.kind === "account" || modelsList) {
     // Answered from the gateway's own pool state, or forwarded to the provider's account API with the member's login (no token rows). The daily cap still applies.
     if (app.dailyTokens !== undefined) {
       let usedNow = 0;
@@ -663,8 +663,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       record(who, out.res.status >= 400 ? "rejected" : "ok", out.res.status, undefined, false, undefined, undefined, out.cls);
       return out.res;
     }
-    if (poolList) {
-      const listed = await poolModels({ app, deps, style, url: poolList.url + url.search, incoming: req.headers, signal: ctrl.signal, single: poolList.models === "one" });
+    if (modelsList) {
+      const listed = await poolModels({ app, deps, style, url: modelsList.url + url.search, incoming: req.headers, signal: ctrl.signal, single: modelsList.models === "one" });
       req.signal.removeEventListener("abort", onAbort);
       if (listed.status < 400) {
         record(identityForRow, "ok", listed.status, undefined, false);

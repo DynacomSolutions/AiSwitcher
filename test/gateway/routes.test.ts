@@ -128,13 +128,15 @@ describe("model lists", () => {
     });
   }
 
-  test("a pinned app's list is the provider's answer for its one identity", async () => {
+  test("a pinned app's list is its one member's answer, through the same union path", async () => {
     await addApp("app", "codex", "openai", { target: { kind: "pin", identity: "b" } });
     reply = () => new Response(JSON.stringify({ models: [{ slug: "m1", visibility: "list" }] }), { headers: { "content-type": "application/json", etag: 'W/"upstream"' } });
     const res = await call("app", "/models?client_version=0.167.2", { method: "GET" });
     expect(seen).toHaveLength(1);
     expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-b");
-    expect(res.headers.get("etag")).toBe('W/"upstream"');
+    expect(await res.json()).toEqual({ models: [{ slug: "m1", visibility: "list" }] });
+    // The union path gives the list its own ETag, for a pin as for a pool.
+    expect(res.headers.get("etag")).toMatch(/^W\/"[0-9a-f]{32}"$/);
   });
 
   test("a single model id and the query string are forwarded", async () => {
@@ -275,6 +277,144 @@ describe("pool model lists are the union of every member's list", () => {
   test("the daily token cap still applies", async () => {
     await addApp("mc", "codex", "openai", { dailyTokens: 0 });
     const res = await call("mc", "/models", { method: "GET" });
+    expect(res.status).toBe(429);
+    expect(seen).toHaveLength(0);
+  });
+});
+
+describe("model lists never hit the reserve", () => {
+  const full: PoolUsage = { status: "live", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "week", utilization: 100, resetsAt: "2026-11-05T09:00:00.000Z" }] };
+  const jsonRes = (body: unknown, status = 200, headers: Record<string, string> = {}): Response => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+  const codexList = { models: [{ slug: "gpt-6.2-astra", visibility: "list", priority: 1 }] };
+
+  test("a pinned codex app at its reserve still lists models (the live empty-list bug)", async () => {
+    await addApp("cx", "codex", "openai", { target: { kind: "pin", identity: "a" }, reservePercent: 100 });
+    usage.a = full;
+    reply = () => jsonRes(codexList);
+    // The live client asks /backend-api/models. /models and /v1/models must answer the same.
+    // A codex client with chatgpt_base_url asks /backend-api/codex/models?client_version=...
+    for (const path of ["/models", "/v1/models", "/backend-api/models", "/backend-api/codex/models", "/backend-api/codex/models?client_version=1"]) {
+      seen = [];
+      const res = await call("cx", path, { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { models: Array<{ slug: string }> }).models.map((m) => m.slug)).toEqual(["gpt-6.2-astra"]);
+      expect(seen.map((s) => s.headers.get("authorization"))).toEqual(["Bearer tok-a"]);
+      expect(requests.at(-1)).toMatchObject({ app: "cx", provider: "codex", status: "ok", httpStatus: 200 });
+    }
+    expect(seen).toHaveLength(1);
+  });
+
+  test("only GET /codex/models is a list: the rest of /codex/* keeps the reserve", async () => {
+    await addApp("cx", "codex", "openai", { target: { kind: "pin", identity: "a" }, reservePercent: 100 });
+    usage.a = full;
+    reply = () => jsonRes(codexList);
+    for (const [method, path] of [["POST", "/backend-api/codex/models"], ["GET", "/backend-api/codex/models/x"], ["POST", "/backend-api/codex/responses"]] as const) {
+      seen = [];
+      const res = await call("cx", path, { method, ...(method === "POST" ? { body: "{}" } : {}) });
+      expect(res.status).toBe(429);
+      expect(seen).toHaveLength(0);
+    }
+  });
+
+  test("a pin with a dead login answers 401 on the list, not a bare 502", async () => {
+    const { GatewayCredentialError } = await import("../../src/gateway/credentials.ts");
+    await addApp("cx", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    deps.creds = { get: async () => { throw new GatewayCredentialError("login-dead", "codex", "a"); }, refreshAfter401: async () => { throw new Error("unused"); } } as unknown as GatewayDeps["creds"];
+    const res = await call("cx", "/models", { method: "GET" });
+    expect(res.status).toBe(401);
+    expect(seen).toHaveLength(0);
+  });
+
+  test("a transient login failure on every member answers 502 with the client message", async () => {
+    const { GatewayCredentialError } = await import("../../src/gateway/credentials.ts");
+    await addApp("mc", "codex", "openai");
+    deps.creds = { get: async () => { throw new GatewayCredentialError("refresh-failed", "codex", "a"); }, refreshAfter401: async () => { throw new Error("unused"); } } as unknown as GatewayDeps["creds"];
+    const res = await call("mc", "/models", { method: "GET" });
+    expect(res.status).toBe(502);
+  });
+
+  test("the union leaves out logged-out members, and keeps them when all are logged out", async () => {
+    await addApp("mc", "codex", "openai");
+    (deps.creds as unknown as { loggedOut: (p: string, n: string) => Promise<boolean> }).loggedOut = async (_p, n) => n === "a";
+    reply = () => jsonRes(codexList);
+    expect((await call("mc", "/models", { method: "GET" })).status).toBe(200);
+    expect(seen.map((s) => s.headers.get("authorization"))).toEqual(["Bearer tok-b"]);
+    seen = [];
+    (deps.creds as unknown as { loggedOut: () => Promise<boolean> }).loggedOut = async () => true;
+    const res = await call("mc", "/models", { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(seen.length).toBeGreaterThan(0);
+  });
+
+  test("a chat request of the same pinned app at its reserve still gets the native limit answer", async () => {
+    await addApp("cx", "codex", "openai", { target: { kind: "pin", identity: "a" }, reservePercent: 100 });
+    usage.a = full;
+    const res = await call("cx", "/v1/responses", { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe("usage_limit_reached");
+    expect(seen).toHaveLength(0);
+  });
+
+  test("a pinned claude app at its reserve lists models and reads one model", async () => {
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" }, reservePercent: 70 });
+    usage.a = { status: "live", maxUtilization: 90, capturedAt: NOW.toISOString() };
+    reply = (s) => jsonRes(s.url.endsWith("/claude-x") ? { type: "model", id: "claude-x" } : { data: [{ type: "model", id: "claude-x" }], has_more: false, first_id: "claude-x", last_id: "claude-x" });
+    const list = await call("cl", "/v1/models", { method: "GET" });
+    expect(list.status).toBe(200);
+    expect(((await list.json()) as { data: Array<{ id: string }> }).data.map((m) => m.id)).toEqual(["claude-x"]);
+    const one = await call("cl", "/v1/models/claude-x", { method: "GET" });
+    expect(one.status).toBe(200);
+    expect(await one.json()).toEqual({ type: "model", id: "claude-x" });
+  });
+
+  test("a pool with every member at its reserve still lists the union", async () => {
+    await addApp("mc", "codex", "openai", { reservePercent: 50 });
+    usage.a = full;
+    usage.b = full;
+    reply = (s) => jsonRes({ models: [{ slug: s.headers.get("authorization") === "Bearer tok-a" ? "m-a" : "m-b", visibility: "list", priority: 1 }] });
+    const res = await call("mc", "/models", { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { models: Array<{ slug: string }> }).models.map((m) => m.slug).sort()).toEqual(["m-a", "m-b"]);
+    expect(seen).toHaveLength(2);
+  });
+
+  test("an upstream quota answer for a pin's model list passes through unchanged", async () => {
+    await addApp("cx", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    usage.a = full;
+    const body = '{"error":{"type":"usage_limit_reached","message":"upstream says full SYNTHETIC_FIXTURE","resets_at":1793622600}}';
+    reply = () => new Response(body, { status: 429, headers: { "content-type": "application/json", "retry-after": "1234" } });
+    const res = await call("cx", "/models", { method: "GET" });
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe(body);
+    expect(res.headers.get("retry-after")).toBe("1234");
+    expect(requests.at(-1)).toMatchObject({ app: "cx", provider: "codex", status: "upstream_error", httpStatus: 429 });
+  });
+
+  test("no identities still rejects chat, and an empty pool cannot list", async () => {
+    await addApp("mc", "codex", "openai");
+    deps.poolMembers = async () => [];
+    const chat = await call("mc", "/v1/responses", { method: "POST", body: "{}" });
+    expect(chat.status).toBe(429);
+    expect(((await chat.json()) as { error: { message: string } }).error.message).toContain("no identities configured");
+    const list = await call("mc", "/models", { method: "GET" });
+    expect(list.status).toBe(502);
+    expect(seen).toHaveLength(0);
+  });
+
+  test("the daily side cap still applies to a pin's list at its reserve", async () => {
+    await addApp("cx", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    usage.a = full;
+    deps.sideDailyLimit = 1;
+    reply = () => jsonRes(codexList);
+    expect((await call("cx", "/models", { method: "GET" })).status).toBe(200);
+    const second = await call("cx", "/models", { method: "GET" });
+    expect(second.status).toBe(429);
+    expect(((await second.json()) as { error: { message: string } }).error.message).toContain("daily limit for list, search and speech calls");
+  });
+
+  test("the daily token cap still applies to a pin's list", async () => {
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" }, dailyTokens: 0 });
+    const res = await call("cl", "/v1/models", { method: "GET" });
     expect(res.status).toBe(429);
     expect(seen).toHaveLength(0);
   });
