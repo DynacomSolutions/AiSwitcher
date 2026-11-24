@@ -725,6 +725,8 @@ CLIProxyAPI's refresh journal):
   A claude row also carries `plan` (`type`, for example `claude_max`, `tier`, `checkedAt`, `stale`). It comes from
   the login's own `GET /api/oauth/profile`, read again every hour, so a plan upgrade shows without a new login.
   The `subscriptionType` saved in a login file is written at login and is never the plan source.
+  Codex, kimi and zai rows carry `planLabel`, the short plan display label of their limits fetch. The console
+  maps both forms onto the row's `plan` display label (`mapGatewayLimitRow`).
   The reads come from the same 45 s cache the proxy selects on: a request never waits on a fresh fetch
   and never refreshes a token. An identity with no reading yet answers `status: "unavailable"` and fills
   in behind. The console Limits page merges these rows over its host scan (`src/server/gateway-limits.ts`).
@@ -942,7 +944,13 @@ placeholder login, plus `model_provider = "ais-gateway"`). Detection: `src/ident
 (`isGatewayRoutedPool`; codex: the entry in `auth.json` or the gateway provider in `config.toml`).
 
 How the gateway picks a member: per request, `src/gateway/select.ts` `pickIdentity` takes the member with the lowest
-utilisation below the app's reserve (unknown usage after known headroom); the local proxy's direct fallback path
+utilisation below the app's reserve (unknown usage after known headroom). A pool only offers logins the gateway manages.
+`poolManagementCheck` (serve.ts) gates the member list through `onlyManaged`, even without a credential store. An opencode
+identity is a member only while the gateway holds a credential copy for it, so a non-gateway identity is never a candidate.
+A known-dead login is also never a candidate on either path. `CredentialCache.loggedOut` is a cheap probe (no refresh, no
+network) that selection consults first. It reports a dead-grant diagnosis that still matches the store, a matching durable
+revoked marker, a retired or unknown identity, or a plain identity with no credential. Selection drops those members, so a
+streamed body (which cannot fail over) never lands on a logged-out login. The local proxy's direct fallback path
 (`defaultLocalMembers` in `src/gateway/local.ts`) tries the pool's `swapPool.active` first. There is no pinned member for
 pool apps (a pin is rejected, task 4.119). So for a routed pool:
 

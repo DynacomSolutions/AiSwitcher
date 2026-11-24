@@ -147,6 +147,28 @@ function labelAndCategoryFor(mins: number | undefined): { label: string; categor
   return { label: `~${Math.round(mins / 60)}h`, category };
 }
 
+/** Short display label for the wire's planType (app-server snapshot or
+ * wham/usage plan_type). Known ChatGPT plan names only: an unknown value
+ * yields undefined, never a guessed label. */
+export function codexPlanLabel(planType: string | null | undefined): string | undefined {
+  switch ((planType ?? "").toLowerCase()) {
+    case "free":
+      return "Free";
+    case "go":
+      return "Go";
+    case "plus":
+      return "Plus";
+    case "pro":
+      return "Pro";
+    case "team":
+      return "Team";
+    case "enterprise":
+      return "Enterprise";
+    default:
+      return undefined;
+  }
+}
+
 /** rateLimitReachedType/spendControlReached live at the snapshot level (they
  * describe why the account overall got throttled, not a specific window), so
  * the same note is attached to every window built from one snapshot. */
@@ -384,6 +406,7 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
       const overage = overageFromSnapshot(snapshot);
       const manualReset = manualResetFromWire(payload?.rateLimitResetCredits);
       const extraUsage = extraUsageFromCredits(snapshot);
+      const plan = codexPlanLabel(snapshot.planType);
       return {
         ...base,
         windows,
@@ -392,6 +415,7 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
         ...(overage ? { overage } : {}),
         ...(extraUsage ? { extraUsage } : {}),
         ...(manualReset ? { manualReset } : {}),
+        ...(plan ? { plan } : {}),
       };
     } finally {
       try {
@@ -598,7 +622,8 @@ export async function fetchCodexLimitsViaStore(identity: Identity, deps: CodexSt
     const snapshot = snapshotFromWham(await res.json(), nowMs);
     if (!snapshot) return { ...base, windows: [], status: "unavailable", error: "usage endpoint returned no rate-limit windows" };
     const extraUsage = extraUsageFromCredits(snapshot);
-    return { ...base, windows: buildWindows(snapshot), status: "live", capturedAt: new Date(nowMs).toISOString(), ...(extraUsage ? { extraUsage } : {}) };
+    const plan = codexPlanLabel(snapshot.planType);
+    return { ...base, windows: buildWindows(snapshot), status: "live", capturedAt: new Date(nowMs).toISOString(), ...(extraUsage ? { extraUsage } : {}), ...(plan ? { plan } : {}) };
   } catch (err) {
     return { ...base, windows: [], status: "unavailable", error: errorMessage(err) };
   }

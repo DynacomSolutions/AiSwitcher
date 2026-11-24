@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { windowsFromZaiQuotaResponse, type ZaiQuotaResponseWire } from "../../../src/cli/limits/zai-limits.ts";
+import { fetchZaiQuotaForKey, windowsFromZaiQuotaResponse, zaiPlanLabel, type ZaiQuotaResponseWire } from "../../../src/cli/limits/zai-limits.ts";
 
 /** Same formatting the adapter itself applies, recomputed here so the
  * assertions pin the epoch-ms->display-string mapping without hardcoding
@@ -64,5 +64,41 @@ describe("windowsFromZaiQuotaResponse", () => {
 
   test("an empty payload yields no windows", () => {
     expect(windowsFromZaiQuotaResponse({})).toEqual([]);
+  });
+});
+
+describe("zaiPlanLabel", () => {
+  test("title-cases the wire's own level word", () => {
+    expect(zaiPlanLabel("max")).toBe("Max");
+    expect(zaiPlanLabel("pro")).toBe("Pro");
+    expect(zaiPlanLabel("lite")).toBe("Lite");
+  });
+
+  test("absent or empty levels yield undefined, never a guess", () => {
+    expect(zaiPlanLabel(undefined)).toBeUndefined();
+    expect(zaiPlanLabel("")).toBeUndefined();
+    expect(zaiPlanLabel("   ")).toBeUndefined();
+  });
+});
+
+describe("fetchZaiQuotaForKey plan label", () => {
+  const limits = [{ type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: 1, nextResetTime: 1784314903145 }];
+
+  test("the quota level rides the outcome; an absent level stays absent", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: string | URL | Request) => Response.json({ success: true, data: { level: "max", limits } })) as typeof fetch;
+    try {
+      expect((await fetchZaiQuotaForKey("zai-key-SYNTHETIC_FIXTURE")).plan).toBe("Max");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    globalThis.fetch = (async (_url: string | URL | Request) => Response.json({ success: true, data: { limits } })) as typeof fetch;
+    try {
+      const outcome = await fetchZaiQuotaForKey("zai-key-SYNTHETIC_FIXTURE");
+      expect(outcome.windows).toHaveLength(1);
+      expect(outcome.plan).toBeUndefined();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });

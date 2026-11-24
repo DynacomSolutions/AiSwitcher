@@ -208,6 +208,9 @@ export interface OpencodeGoQuotaOutcome {
   error?: string;
   /** The endpoint answered 200 but the key has no usable Go plan: no windows, or every window untouched with no reset. */
   noPlan?: boolean;
+  /** Plan display label. The quota endpoint serves the Go plan only, so an
+   * active-plan read names it. Absent on a failed or plan-less read. */
+  plan?: string;
 }
 
 /** The live Go-plan quota read for ONE OpenCode Go credential: a legacy
@@ -247,7 +250,8 @@ export async function fetchOpencodeGoQuotaForKey(apiKey: string): Promise<Openco
   if (windows.every((w) => w.usedPercent === 0 && w.resetsAtMs === undefined)) {
     return { windows, noPlan: true };
   }
-  return { windows };
+  // This endpoint reports the Go plan's own dollar windows: a serving read is a Go plan.
+  return { windows, plan: "Go" };
 }
 
 /** Canonical provider ids `fetchOpencodeLimits` will answer for, from a cheap
@@ -322,6 +326,7 @@ export async function fetchOpencodeLimits(identity: Identity, explicitTool = fal
             windows: outcome.windows,
             status: "live",
             capturedAt: new Date().toISOString(),
+            ...(outcome.plan ? { plan: outcome.plan } : {}),
           },
     );
   }

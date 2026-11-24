@@ -283,6 +283,11 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
               {result.identity.name}
             </span>
             <ToolBadge tool={result.toolName} />
+            {result.plan ? (
+              <Badge variant="secondary" title="Account plan">
+                {result.plan}
+              </Badge>
+            ) : null}
           </div>
           <StatusBadge status={result.status} />
         </div>

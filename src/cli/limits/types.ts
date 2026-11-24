@@ -152,6 +152,13 @@ export interface ToolLimitResult {
   manualReset?: ManualResetInfo;
   /** See ExtraUsageInfo. Present only on a live fetch that reported it. */
   extraUsage?: ExtraUsageInfo;
+  /** Short human-readable account plan label, e.g. "Max 20x", "Pro", "Team",
+   * "Plus", "Standard", "Go". Set only from real wire data the provider
+   * exposes (claude's profile plan, codex's planType, kimi's membership level,
+   * zai's quota level, an active OpenCode Go quota read). Absent means the
+   * provider exposes no plan or it could not be read: render nothing then,
+   * never a guessed label. */
+  plan?: string;
 }
 
 /** What a single-provider fetcher returns: a complete result EXCEPT the
