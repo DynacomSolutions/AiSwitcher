@@ -1,5 +1,6 @@
 import type { GatewayDeps } from "./app.ts";
 import { upstreamHeaders } from "./app.ts";
+import { GatewayCredentialError } from "./credentials.ts";
 import { providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
 import { availableCount, claudeUsageBody, claudeUsageBodyOf, normalisePath, orgSegmentIndex, syntheticClaudeProfile, type AccountOp } from "./routes.ts";
@@ -132,11 +133,13 @@ type OwnerFinder = (names: string[]) => Promise<string | undefined>;
 
 async function chooseMember(r: AccountRequest, owner?: OwnerFinder): Promise<string | undefined> {
   if (r.app.target.kind === "pin") return canon(r, r.app.target.identity);
-  let names: string[];
-  try {
-    names = await allowedMembers(r.app, r.deps);
-  } catch {
-    return undefined;
+  // A failed lookup (unreadable registry, failed login check) is a server-side failure: it throws, and the caller answers 502.
+  let names = await allowedMembers(r.app, r.deps);
+  // Same filter as pickIdentity: drop logged-out members. A probe error keeps the member.
+  const creds = r.deps.creds;
+  if (creds?.loggedOut) {
+    const alive = await Promise.all(names.map(async (n) => ((await creds.loggedOut!(r.app.provider, n).catch(() => false)) ? undefined : n)));
+    names = alive.filter((n): n is string => n !== undefined);
   }
   if (names.length === 0) return undefined;
   if (owner && names.length > 1) {
@@ -203,7 +206,9 @@ async function memberOrg(r: AccountRequest, name: string): Promise<string | unde
     if (typeof org !== "string" || org === "") return undefined;
     r.state.orgs.set(key, { org, until: nowMs + ORG_TTL_MS });
     return org;
-  } catch {
+  } catch (err) {
+    // A member without a usable login is the client's case (409), not an upstream failure.
+    if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) throw err;
     return undefined;
   }
 }
@@ -224,6 +229,8 @@ function wantsResets(search: string): boolean {
   return v !== null && v !== "" && v !== "0" && v.toLowerCase() !== "false";
 }
 
+const NO_LOGIN_CODES: ReadonlySet<string> = new Set(["no-credential", "unknown-identity", "retired", "login-dead", "unmanaged-login"]);
+
 /** Forwards one account request. Never throws except for a client that has left. */
 export async function forwardAccount(r: AccountRequest): Promise<AccountResult> {
   const cls = `${r.app.provider}:${r.op}`;
@@ -231,12 +238,14 @@ export async function forwardAccount(r: AccountRequest): Promise<AccountResult> 
     return await run(r, cls);
   } catch (err) {
     if (r.signal.aborted) throw err;
+    // A member without a usable login is the client's case (4xx with the reason), never a server error.
+    if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) return { res: providerError(r.style, 409, r.app.target.kind === "pin" ? err.clientMessage : "no login is available for this app"), cls };
     return { res: providerError(r.style, 502, "account request failed"), cls };
   }
 }
 
 async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
-  const noMember = (): AccountResult => ({ res: providerError(r.style, 503, "no login is available for this app"), cls });
+  const noMember = (): AccountResult => ({ res: providerError(r.style, 409, "no login is available for this app"), cls });
   let url = r.url;
   let owner: OwnerFinder | undefined;
 
@@ -245,7 +254,12 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
     const ctx = { app: r.app, cache: {}, style: r.style, deps: r.deps, signal: r.signal };
     const served = await claudeUsageBody(ctx);
     if (!wantsResets(r.search)) return { res: json(served), cls };
-    const member = await chooseMember(r);
+    let member: string | undefined;
+    try {
+      member = await chooseMember(r);
+    } catch {
+      member = undefined;
+    }
     if (!member) return { res: json(served), cls };
     try {
       const res = await callAs(r, member, { method: "GET", url: r.url + r.search });

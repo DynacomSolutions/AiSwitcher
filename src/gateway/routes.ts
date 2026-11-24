@@ -212,6 +212,8 @@ function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, pat
     if (provider === "kimi" && /^(?:\/v1)?\/usages$/.test(path)) return { kind: "account", op: "forward", url: `${KIMI_V1}/usages` };
     if (provider === "zai" && /^\/api\/monitor\/.+/.test(path)) return { kind: "account", op: "forward", url: `https://api.z.ai${orig}` };
     if (provider === "opencode" && /^(?:\/v1)?\/usage$/.test(path)) return { kind: "account", op: "forward", url: "https://opencode.ai/zen/go/v1/usage" };
+    // ali has no account endpoint AIS can call with the model key: a clear 404, never a pass-through to the model host.
+    if (provider === "ali" && /^(?:\/v1)?\/(?:usages?|billing)$/.test(path)) return { kind: "deny", status: 404 };
     if (provider === "grok" && /^(?:\/v1)?\/billing$/.test(path)) return { kind: "account", op: "forward", url: "https://cli-chat-proxy.grok.com/v1/billing" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits$/.test(path)) return { kind: "serve", name: "codex-reset-credits" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)?\/accounts\/check(?:\/[^/]+)?$/.test(path)) return { kind: "serve", name: "codex-accounts-check" };
