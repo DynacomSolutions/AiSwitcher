@@ -1123,3 +1123,43 @@ cwd, project, model, times, message count, parent). It is off by default.
   `ais_sessions_enrich_bytes_total{kind="plain|object"}`, `ais_sessions_indexer_errors_total{kind}`,
   `ais_sessions_indexer_last_success_timestamp_seconds`, `ais_sessions_enrich_leader`, and, on the leader only,
   `ais_sessions_unindexed_files`, `ais_sessions_unindexed_bytes`, `ais_sessions_enrich_lag_seconds`.
+
+## Console Sessions page from the database (`src/server/sessions-db/`)
+
+The console Sessions page (`/api/sessions/tree`, `/api/sessions/transcript`) can read the session store instead of the host
+folders. The default stays the files. Row 20.312 moves the default.
+
+- Switch: `AIS_SESSIONS_SOURCE=files|db|auto`. An empty or unknown value means `files`.
+  - `files`: no database is touched.
+  - `db`: Claude and Codex sessions come from the database. Missing settings make a read fail, and the error names the
+    settings, never values. The driver connect limit is 10 s. A failed read is an error (the tree slice carries `error`, a transcript answers `502`).
+  - `auto`: the database when its settings are complete and it answers a probe, else the files. The probe waits 3 s at most
+    (the driver connect timeout is 3 s in this mode, and the pending connection closes in the background). A failed probe is
+    reported to the console process, which tells the next scan children to use the files without probing for 60 s. A failed read, or a
+    session that is not stored yet, falls back to the files for that request. The console logs the chosen source once at
+    start (`sessions: reading db|files (...)`, no values).
+  - Every other tool (Pi, Grok, Kimi, Zai, Ali) reads files in every mode until its kind is shipped.
+- Settings: `AIS_SESSIONS_DATABASE_URL` (else `AIS_GATEWAY_DATABASE_URL`), plus the object store and age settings of the
+  enrichment loop (`AIS_SESSIONS_S3_ENDPOINT`, `_BUCKET`, `_PREFIX`, `_REGION`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY`,
+  `AIS_SESSIONS_AGE_IDENTITY`). The key only needs read rights. `AIS_SESSIONS_ENRICH` is not needed.
+  `AIS_SESSIONS_READ_WINDOW_BYTES` (4 MiB, at most 16 MiB) is the transcript tail window.
+  `AIS_SESSIONS_PART_CACHE_BYTES` (32 MiB, 0 turns it off, at most 512 MiB) caps the decrypted part cache.
+- Integrity: a transcript read checks that the stored parts reach the committed size of the file and, when the window
+  starts inside the file, that they fill the window. A missing part row gives an integrity error, never short text.
+- Tree: one indexed query on `ais_session_tree` per tool (`updated_at` inside the window). Slices follow the registry
+  identities. A session whose `identity` is still null (identity resolution is not built yet) shows in a slice named
+  `(unassigned)`, unless the request names an identity. The transcript of such a session is read with identity `(unassigned)`
+  in `db` and `auto` mode (files mode keeps the "no identity" error). A request for a named identity never finds a session
+  that has no identity. Node fields follow the file reader (Claude counts messages for
+  sessions only, Codex shows no count).
+- Transcript: the last parts that cover the window are fetched, age decrypted, gunzipped and checked (length and SHA-256
+  against the part row), then split into lines and given to the same normalisers as the file reader (`claudeTranscriptFromLines`,
+  `codexTranscriptFromLines`). One part is held at a time. A part that fails a check throws: the page shows an error and
+  never wrong text. A session that fits the window gives the same payload as the file. A larger one has `truncated: true`,
+  `totalTurns` counts the window only, and `session` (title, folder, times) comes from the index.
+- The scan child is short-lived, so it returns its counters and the console process adds them. The part cache lives per
+  process, so it helps only where the read runs in a long-lived process.
+- Metrics (job `ais-console`): `ais_console_sessions_source{source}`, `ais_console_sessions_read_requests_total{kind,source,outcome}`,
+  `ais_console_sessions_read_errors_total{kind}`, `ais_console_sessions_parts_total{source="fetch|cache"}`,
+  `ais_console_sessions_part_bytes_total{kind}`, `ais_console_sessions_part_fetch_seconds` (histogram),
+  `ais_console_sessions_read_last_error_timestamp_seconds`.

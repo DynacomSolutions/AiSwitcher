@@ -865,6 +865,14 @@ Errors: `400` missing/unknown tool or parameters, `404` when the session
 id does not exist (or its store vanished), `504` when the scan child
 overruns its deadline.
 
+With `AIS_SESSIONS_SOURCE=db` (or `auto`, see `docs/agents/gateway.md`) Claude and
+Codex transcripts come from the session store. A session that fits the 4 MiB
+read window gives the same payload as the file reader. A larger session
+decodes its tail only: `truncated` is `true`, `totalTurns` counts the turns of
+that window, and `session` takes title, folder and times from the index. A
+part that fails its integrity check answers `502`. The default source is
+`files`.
+
 Contract notes:
 
 - Roles: `user`, `assistant`, `tool` (ONE tool invocation: `toolName` +

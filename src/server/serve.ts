@@ -242,6 +242,9 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   // Readiness also waits for the first limits panel build (see warmLimitsThenReady). That build reads the host scan and the gateway.
   // A failed gateway read does not stop it: the panel is built without that part and is kept for a short time only.
 
+  // Resolve the Sessions page source once and log it (AIS_SESSIONS_SOURCE, default files). A failure here never stops the console.
+  void import("./sessions-db/source.ts").then((m) => m.announceSessionsSource()).catch(() => undefined);
+
   const server = Bun.serve({
     port,
     hostname: host,

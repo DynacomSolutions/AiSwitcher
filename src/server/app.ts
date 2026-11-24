@@ -36,6 +36,7 @@ import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import * as claudeResets from "./claude-resets.ts";
 import { poolsUsage, type PoolsUsageResponse } from "./pools-usage.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
+import { sessionsReaderMetrics } from "./sessions-db/metrics.ts";
 import { favouritesStateDir, readSnapshots, renderSnapshots } from "../t3/favourites/metrics.ts";
 import { renderReadinessMetrics } from "./limits-warm.ts";
 import type { ResetExpiryNotifier } from "./reset-expiry-push.ts";
@@ -188,7 +189,7 @@ export function createWidgetService(deps: ConsoleAppDeps, linkBase?: string): Wi
 export function createApp(deps: ConsoleAppDeps): Hono {
   const app = new Hono();
 
-  app.get("/metrics", (c) => c.text(renderScanMetrics() + renderReadinessMetrics() + renderSnapshots(readSnapshots(favouritesStateDir())), 200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" }));
+  app.get("/metrics", (c) => c.text(renderScanMetrics() + sessionsReaderMetrics.render().join("\n") + "\n" + renderReadinessMetrics() + renderSnapshots(readSnapshots(favouritesStateDir())), 200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" }));
 
   app.onError((err, c) => {
     if (err instanceof HttpError) return c.json({ error: err.message }, err.status as 400);

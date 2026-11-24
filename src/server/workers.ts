@@ -7,6 +7,8 @@ import { collectTargets, pendingUsageResult } from "../cli/usage/run.ts";
 import { tokscaleExportTimeoutMs, tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
 import { withUsableCwd } from "../shared/exec.ts";
 import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./scan-worker.ts";
+import { sessionsReaderMetrics } from "./sessions-db/metrics.ts";
+import { dbProbeSuspended, noteDbProbeFailure, takeProbeFailed } from "./sessions-db/probe-cache.ts";
 import { scanMetric } from "./scan-metrics.ts";
 import { markUsageSnapshotDirty, usageSnapshotTargetKey } from "../cli/usage/snapshot-dirty.ts";
 import {
@@ -536,7 +538,7 @@ async function spawnScanWorkerNow<T>(
   params: Omit<ScanRequest, "kind">,
   timeoutMs: number,
 ): Promise<ScanResult<T>> {
-  const req: ScanRequest = { kind, ...params };
+  const req: ScanRequest = { kind, ...params, ...(dbProbeSuspended() ? { skipDbProbe: true } : {}) };
   const args = baseArgs();
   const isolatedGroup = Bun.which("setsid") !== null;
   let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
@@ -582,6 +584,13 @@ async function spawnScanWorkerNow<T>(
       const errorText = await Promise.race([stderr, Bun.sleep(100).then(() => "")]);
       parsed = { ok: false, error: errorText.trim() || "scan worker produced no output", status: 500 };
     }
+    // The child counted its database reads: add them to this process, which serves /metrics.
+    if (parsed.dbProbeFailed) noteDbProbeFailure();
+    delete parsed.dbProbeFailed;
+    if (parsed.readerMetrics !== undefined) {
+      sessionsReaderMetrics.merge(parsed.readerMetrics);
+      delete parsed.readerMetrics;
+    }
     return parsed;
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "scan worker failed", status: 500 };
@@ -603,5 +612,7 @@ export async function runScanWorkerStdio(): Promise<void> {
     return;
   }
   const result = await runScan(req);
+  result.readerMetrics = sessionsReaderMetrics.drain();
+  if (takeProbeFailed()) result.dbProbeFailed = true;
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
