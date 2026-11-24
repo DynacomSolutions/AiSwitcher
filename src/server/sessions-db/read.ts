@@ -17,9 +17,9 @@ export interface SessionTarget {
 export const requestMayUseDb = (tool: string | undefined): boolean => tool === undefined || isDbSessionTool(tool);
 
 /** Opens the source for one scan, or a files handle when the request never needs the database. */
-export async function sourceForScan(env: Record<string, string | undefined>, tool: string | undefined): Promise<SessionsSourceHandle> {
+export async function sourceForScan(env: Record<string, string | undefined>, tool: string | undefined, skipProbe = false): Promise<SessionsSourceHandle> {
   if (!requestMayUseDb(tool)) return openSessionsSource({ ...env, AIS_SESSIONS_SOURCE: "files" });
-  return openSessionsSource(env);
+  return openSessionsSource(env, { skipProbe });
 }
 
 const messageOf = (err: unknown): string => (err instanceof SessionsReadError ? err.message : "the sessions database could not be read");

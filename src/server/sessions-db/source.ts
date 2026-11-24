@@ -5,6 +5,7 @@ import { SessionsDbSource, type SessionsReadStore } from "./db-source.ts";
 import { sessionsReaderMetrics, type SessionsReaderMetrics } from "./metrics.ts";
 import { PartCache } from "./part-cache.ts";
 import { PartLoader } from "./part-lines.ts";
+import { markProbeFailedHere } from "./probe-cache.ts";
 
 /** What a read uses: the files, or the database (the tools it holds) with the files for the rest. */
 export interface SessionsSourceHandle {
@@ -27,7 +28,11 @@ export interface OpenDeps {
   cache?: PartCache;
   /** Milliseconds `auto` waits for the database to answer (default 3000). */
   pingTimeoutMs?: number;
+  /** `auto` only: a recent probe failed (the console process knows), so use the files without probing. */
+  skipProbe?: boolean;
 }
+
+export const PING_TIMEOUT_MS = 3000;
 
 const filesHandle = (mode: SessionsSourceMode, reason?: string): SessionsSourceHandle => ({
   mode,
@@ -46,7 +51,8 @@ function processCache(cap: number): PartCache {
 
 function buildDb(cfg: SessionsReaderConfig, deps: OpenDeps): { db: SessionsDbSource; close: () => Promise<void> } {
   const metrics = deps.metrics ?? sessionsReaderMetrics;
-  const store = deps.store ?? new SessionStore(cfg.databaseUrl, { poolMax: 2 });
+  // The driver would wait about 30 s for a connection. A short connect timeout keeps a silent database from holding a read.
+  const store = deps.store ?? new SessionStore(cfg.databaseUrl, { poolMax: 2, connectTimeoutS: Math.max(1, Math.ceil((deps.pingTimeoutMs ?? PING_TIMEOUT_MS) / 1000)) });
   const loader = new PartLoader({
     source: deps.parts ?? new S3PartSource(cfg),
     identity: cfg.ageIdentity,
@@ -74,12 +80,15 @@ export async function openSessionsSource(env: Record<string, string | undefined>
     if (mode === "db") throw new Error(`${SESSIONS_SOURCE_ENV}=db needs ${missing.join(", ")}`);
     return filesHandle(mode, reason);
   }
+  if (mode === "auto" && deps.skipProbe) return filesHandle(mode, "the database did not answer a moment ago");
   const built = buildDb(cfg, deps);
   if (mode === "auto") {
     try {
-      await withTimeout(built.db.ping(), deps.pingTimeoutMs ?? 3000);
+      await withTimeout(built.db.ping(), deps.pingTimeoutMs ?? PING_TIMEOUT_MS);
     } catch {
-      await built.close().catch(() => undefined);
+      // Close in the background: close() waits for the pending connect, which can take about 30 s on a silent database.
+      void built.close().catch(() => undefined);
+      markProbeFailedHere();
       return filesHandle(mode, "the database did not answer");
     }
   }

@@ -1120,7 +1120,9 @@ folders. The default stays the files. Row 20.312 moves the default.
   - `files`: no database is touched.
   - `db`: Claude and Codex sessions come from the database. Missing settings make a read fail, and the error names the
     settings, never values. A failed read is an error (the tree slice carries `error`, a transcript answers `502`).
-  - `auto`: the database when its settings are complete and it answers within 3 s, else the files. A failed read, or a
+  - `auto`: the database when its settings are complete and it answers a probe, else the files. The probe waits 3 s at most
+    (the driver connect timeout is 3 s too, and the pending connection closes in the background). A failed probe is
+    reported to the console process, which tells the next scan children to use the files without probing for 60 s. A failed read, or a
     session that is not stored yet, falls back to the files for that request. The console logs the chosen source once at
     start (`sessions: reading db|files (...)`, no values).
   - Every other tool (Pi, Grok, Kimi, Zai, Ali) reads files in every mode until its kind is shipped.
@@ -1129,9 +1131,13 @@ folders. The default stays the files. Row 20.312 moves the default.
   `AIS_SESSIONS_AGE_IDENTITY`). The key only needs read rights. `AIS_SESSIONS_ENRICH` is not needed.
   `AIS_SESSIONS_READ_WINDOW_BYTES` (4 MiB, at most 16 MiB) is the transcript tail window.
   `AIS_SESSIONS_PART_CACHE_BYTES` (32 MiB, 0 turns it off, at most 512 MiB) caps the decrypted part cache.
+- Integrity: a transcript read checks that the stored parts reach the committed size of the file and, when the window
+  starts inside the file, that they fill the window. A missing part row gives an integrity error, never short text.
 - Tree: one indexed query on `ais_session_tree` per tool (`updated_at` inside the window). Slices follow the registry
   identities. A session whose `identity` is still null (identity resolution is not built yet) shows in a slice named
-  `(unassigned)`, unless the request names an identity. Node fields follow the file reader (Claude counts messages for
+  `(unassigned)`, unless the request names an identity. The transcript of such a session is read with identity `(unassigned)`
+  in `db` and `auto` mode (files mode keeps the "no identity" error). A request for a named identity never finds a session
+  that has no identity. Node fields follow the file reader (Claude counts messages for
   sessions only, Codex shows no count).
 - Transcript: the last parts that cover the window are fetched, age decrypted, gunzipped and checked (length and SHA-256
   against the part row), then split into lines and given to the same normalisers as the file reader (`claudeTranscriptFromLines`,

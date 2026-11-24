@@ -112,7 +112,11 @@ export class SessionsDbSource {
       } catch {
         throw new SessionsReadError("store", "the sessions database could not be read");
       }
-      const row = args.identity === undefined ? rows[0] : (rows.find((r) => r.identity === args.identity) ?? rows.find((r) => r.identity === null));
+      // The slice names decide: a session with no identity yet belongs to the unassigned slice only.
+      const row =
+        args.identity === undefined
+          ? rows[0]
+          : rows.find((r) => (args.identity === UNASSIGNED_IDENTITY ? r.identity === null : r.identity === args.identity));
       if (!row) {
         m.request("transcript", "db", "ok");
         return undefined;
@@ -123,10 +127,11 @@ export class SessionsDbSource {
       } catch {
         throw new SessionsReadError("store", "the sessions database could not be read");
       }
-      if (parts.length === 0) {
+      if (parts.length === 0 && row.committedBytes === 0) {
         m.request("transcript", "db", "ok");
         return undefined;
       }
+      checkPartCoverage(parts, row.committedBytes, this.o.windowBytes);
       const windowed = parts[0]!.startOffset > 0;
       const identity = { name: row.identity ?? args.identity ?? UNASSIGNED_IDENTITY } as Identity;
       const tail = Math.min(Math.max(1, args.tail ?? DEFAULT_TAIL_TURNS), MAX_TAIL_TURNS);
@@ -157,6 +162,22 @@ export class SessionsDbSource {
       m.error(readErrorKind(err));
       throw err;
     }
+  }
+}
+
+/**
+ * The parts of a window must reach the end of the stored bytes and, when they start inside the file, must fill the
+ * window (the query stops adding older parts only once the window is full). Anything else means a part row is missing,
+ * and the text would be short with no error.
+ */
+export function checkPartCoverage(parts: readonly SessionPartRow[], committedBytes: number, windowBytes: number): void {
+  const last = parts[parts.length - 1];
+  if (!last || last.endOffset !== committedBytes) {
+    throw new SessionsReadError("integrity", "the stored parts do not reach the end of the session");
+  }
+  const first = parts[0]!;
+  if (first.startOffset > 0 && last.endOffset - first.startOffset < windowBytes) {
+    throw new SessionsReadError("integrity", "a stored part before the window is missing");
   }
 }
 

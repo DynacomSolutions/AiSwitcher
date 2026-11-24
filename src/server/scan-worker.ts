@@ -9,6 +9,10 @@ import { ACTIVE_WINDOW_MS } from "../cli/sessions/shared.ts";
 import { DEFAULT_TAIL_TURNS, readTranscript } from "../cli/sessions/transcript.ts";
 import { readTranscriptWithSource, readTreeSlices, sourceForScan } from "./sessions-db/read.ts";
 import type { SessionsSourceHandle } from "./sessions-db/source.ts";
+import { isDbSessionTool, UNASSIGNED_IDENTITY } from "./sessions-db/db-source.ts";
+import { sessionsSourceMode } from "./sessions-db/config.ts";
+import type { Identity } from "../identities/types.ts";
+import type { SessionTool } from "../cli/sessions/types.ts";
 
 /** The (tool, identity) target list for the tree/transcript scans. Retired
  * identities are included: their history stays viewable (they are only
@@ -69,6 +73,8 @@ export interface ScanRequest {
   configs?: import("../identities/types.ts").ToolConfig[];
   /** Test injection only (never serialised to the real worker child): the session source, instead of the one the environment picks. */
   sessionsSource?: SessionsSourceHandle;
+  /** Set by the console process: a recent probe of the session database failed, so `auto` uses the files without probing. */
+  skipDbProbe?: boolean;
 }
 
 export interface ScanResult<T = unknown> {
@@ -78,6 +84,8 @@ export interface ScanResult<T = unknown> {
   status?: number;
   /** Set by the scan child only: its database session reader counters since start. The console process adds them to its own. */
   readerMetrics?: unknown;
+  /** Set by the scan child only: its `auto` probe of the session database failed. The console process then skips probes for a while. */
+  dbProbeFailed?: boolean;
 }
 
 export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
@@ -114,7 +122,7 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
           async () => {
             const targets = await collectSessionTargets(req.tool, req.identity, req.configs);
             const treeOpts = req.active ? { days, activeWithinMs: ACTIVE_WINDOW_MS } : { days };
-            const handle = req.sessionsSource ?? (await sourceForScan(process.env, req.tool));
+            const handle = req.sessionsSource ?? (await sourceForScan(process.env, req.tool, req.skipDbProbe));
             let tools;
             try {
               tools = await readTreeSlices({
@@ -147,7 +155,16 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
       }
       case "transcript": {
         if (typeof req.id !== "string" || !req.id) throw new HttpError(400, '"id" is required');
-        const targets = await collectSessionTargets(req.tool, req.identity, req.configs);
+        // The tree shows sessions with no identity yet in an "(unassigned)" slice. The database can read them: no registry
+        // identity exists for them. The files cannot, so files mode keeps the usual error.
+        const unassigned =
+          req.identity === UNASSIGNED_IDENTITY &&
+          req.tool !== undefined &&
+          isDbSessionTool(req.tool) &&
+          (req.sessionsSource ? req.sessionsSource.used === "db" : sessionsSourceMode(process.env) !== "files");
+        const targets = unassigned
+          ? [{ toolName: req.tool as SessionTool, identity: { name: UNASSIGNED_IDENTITY } as Identity }]
+          : await collectSessionTargets(req.tool, req.identity, req.configs);
         if (targets.length === 0) throw new HttpError(404, "no matching identity for transcript read");
         const target = targets[0]!;
         const tail = typeof req.tail === "number" && Number.isFinite(req.tail) ? req.tail : DEFAULT_TAIL_TURNS;
@@ -155,15 +172,17 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
         const { value, cached } = await transcriptCache.get(
           `${scope}|${target.toolName}|${target.identity.name}|${req.id}|${tail}`,
           async () => {
-            const handle = req.sessionsSource ?? (await sourceForScan(process.env, target.toolName));
+            const handle = req.sessionsSource ?? (await sourceForScan(process.env, target.toolName, req.skipDbProbe));
             try {
+              // `auto` found no database: no registry identity exists for this slice, so the files cannot answer.
+              if (unassigned && handle.used !== "db") await collectSessionTargets(req.tool, req.identity, req.configs);
               const t = await readTranscriptWithSource({
                 handle,
                 target,
                 identity: req.identity,
                 id: req.id!,
                 tail,
-                filesRead: () => readTranscript(target.toolName, target.identity, req.id!, { tail }),
+                filesRead: () => (unassigned ? Promise.resolve(undefined) : readTranscript(target.toolName, target.identity, req.id!, { tail })),
               });
               return t ?? null;
             } finally {
