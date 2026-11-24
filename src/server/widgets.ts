@@ -8,7 +8,8 @@ import { PollCache } from "./expensive.ts";
  * outside `WidgetService`. */
 
 // The types below copy the widget panel contract. Do not add fields, except the optional agent fields on `Row`
-// (`tool`, `pool`, `identity`, `identitySource`, `sessionId`, `activeIdentity`, `identities`). A reader that does not know them ignores them.
+// (`tool`, `pool`, `identity`, `identitySource`, `sessionId`, `activeIdentity`, `identities`) and the optional `meta.resetsAt` on `Row`.
+// The dashboard needs `meta.resetsAt` (ISO 8601 UTC) to draw a reset countdown on each limit bar. A reader that does not know a field ignores it.
 
 export type PanelStatus = "ok" | "warn" | "crit" | "unknown";
 
@@ -34,6 +35,8 @@ export interface Row {
   sessionId?: string | null;
   activeIdentity?: string | null;
   identities?: AgentIdentityLike[];
+  /** Limit rows only: when the window resets, as an ISO 8601 UTC string. Absent when the source gives no reset. */
+  meta?: { resetsAt?: string };
 }
 
 export interface AgentIdentityLike {
@@ -227,6 +230,17 @@ const asList = (v: unknown): Obj[] => (Array.isArray(v) ? (v as Obj[]) : []);
 const asNumber = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 const asString = (v: unknown): string => (typeof v === "string" ? v : "");
 
+/** The reset time of a limit window in epoch milliseconds, from `resetsAtMs` or an ISO `resetsAt`. */
+function resetMs(w: Obj): number | undefined {
+  const ms = asNumber(w.resetsAtMs);
+  if (ms !== undefined) return Number.isFinite(new Date(ms).getTime()) ? ms : undefined;
+  if (typeof w.resetsAt === "string") {
+    const parsed = Date.parse(w.resetsAt);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
 function countLine(parts: Array<[number, string]>): string {
   return parts.filter(([n]) => n > 0).map(([n, label]) => `${n} ${label}`).join(", ");
 }
@@ -244,13 +258,17 @@ async function limitsPanel(sources: WidgetSources): Promise<PanelBody> {
     const identity = asString((result.identity as Obj | undefined)?.name) || "unknown";
     const label = `${provider} / ${identity}`;
     const windows = asList(result.windows);
-    const entries: Array<{ name: string; used: number }> = [];
+    const entries: Array<{ name: string; used: number; resetMs?: number }> = [];
     const best = (kind: string, predicate: (w: Obj) => boolean, name: string): void => {
-      const used = windows
-        .filter((w) => w.category === kind && predicate(w))
-        .map((w) => asNumber(w.usedPercent))
-        .filter((n): n is number => n !== undefined);
-      if (used.length > 0) entries.push({ name, used: Math.max(...used) });
+      const matching = windows.filter((w) => w.category === kind && predicate(w));
+      const used = matching.map((w) => asNumber(w.usedPercent)).filter((n): n is number => n !== undefined);
+      if (used.length === 0) return;
+      const max = Math.max(...used);
+      // The reset of the fullest window. If it has none, the earliest reset of the matching windows.
+      const fullest = matching.find((w) => asNumber(w.usedPercent) === max);
+      const resets = matching.map(resetMs).filter((n): n is number => n !== undefined);
+      const reset = (fullest ? resetMs(fullest) : undefined) ?? (resets.length > 0 ? Math.min(...resets) : undefined);
+      entries.push({ name, used: max, ...(reset !== undefined ? { resetMs: reset } : {}) });
     };
     best("session", () => true, "5-hour");
     best("week", (w) => !w.model, "Weekly");
@@ -258,9 +276,9 @@ async function limitsPanel(sources: WidgetSources): Promise<PanelBody> {
     for (const w of windows) {
       const used = asNumber(w.usedPercent);
       if (w.category === "week" && typeof w.model === "string" && w.model !== "" && used !== undefined) {
-        entries.push({ name: `Weekly (${w.model})`, used });
+        entries.push({ name: `Weekly (${w.model})`, used, resetMs: resetMs(w) });
       }
-      if (w.category === "other" && used !== undefined) entries.push({ name: `Other (${asString(w.label).slice(0, 40)})`, used });
+      if (w.category === "other" && used !== undefined) entries.push({ name: `Other (${asString(w.label).slice(0, 40)})`, used, resetMs: resetMs(w) });
     }
     if (result.status === "unavailable" || entries.length === 0) {
       rows.push({ label, detail: "No limit data", value: "-", status: "unknown" });
@@ -268,7 +286,14 @@ async function limitsPanel(sources: WidgetSources): Promise<PanelBody> {
     }
     for (const entry of entries) {
       const fraction = clamp01(entry.used / 100);
-      rows.push({ label, detail: entry.name, value: pct(fraction), fraction, status: levelOfFraction(fraction) });
+      rows.push({
+        label,
+        detail: entry.name,
+        value: pct(fraction),
+        fraction,
+        status: levelOfFraction(fraction),
+        ...(entry.resetMs !== undefined ? { meta: { resetsAt: new Date(entry.resetMs).toISOString() } } : {}),
+      });
     }
   }
   const count = (s: PanelStatus) => rows.filter((r) => r.status === s).length;

@@ -169,6 +169,54 @@ describe("panel mapping", () => {
     expect(Object.fromEntries(model.rows.map((r) => [r.label, r.status]))).toEqual({ "P / a": "warn", "P / b": "crit", "P / c": "ok" });
   });
 
+  test("limits: rows carry meta.resetsAt as ISO UTC from resetsAt or resetsAtMs, and omit meta without a reset", async () => {
+    const ms = Date.parse("2026-11-20T15:00:00.000Z");
+    const src = sources({
+      limits: async () => ({
+        results: [
+          limitsResult("anthropic", "a", [
+            { label: "session (5h)", category: "session", usedPercent: 50, resetsAt: "2026-11-20T13:00:00+02:00" },
+            { label: "week (all)", category: "week", usedPercent: 20 },
+            { label: "week (Model)", category: "week", usedPercent: 30, model: "Model", resetsAtMs: ms },
+          ]),
+          limitsResult("openai", "b", [{ label: "month", category: "month", usedPercent: 10, resetsAtMs: ms }]),
+          limitsResult("openai", "c", [{ label: "session (5h)", category: "session", usedPercent: 5, resetsAt: "not a date" }]),
+        ],
+      }),
+    });
+    const model = await panel("limits", src);
+    const find = (label: string, detail: string) => model.rows.find((r) => r.label === label && r.detail === detail)!;
+    expect(find("Anthropic / a", "5-hour").meta).toEqual({ resetsAt: "2026-11-20T11:00:00.000Z" });
+    expect(find("Anthropic / a", "Weekly")).not.toHaveProperty("meta");
+    expect(find("Anthropic / a", "Weekly (Model)").meta).toEqual({ resetsAt: "2026-11-20T15:00:00.000Z" });
+    expect(find("OpenAI / b", "Monthly").meta).toEqual({ resetsAt: "2026-11-20T15:00:00.000Z" });
+    expect(find("OpenAI / c", "5-hour")).not.toHaveProperty("meta");
+    // Other fields stay as they were.
+    expect(find("Anthropic / a", "5-hour")).toMatchObject({ fraction: 0.5, value: "50%", status: "ok" });
+  });
+
+  test("limits: a group takes the reset of its fullest window, else the earliest reset", async () => {
+    const src = sources({
+      limits: async () => ({
+        results: [
+          limitsResult("p", "a", [
+            { label: "x", category: "session", usedPercent: 10, resetsAt: "2026-11-20T11:00:00.000Z" },
+            { label: "y", category: "session", usedPercent: 90, resetsAt: "2026-11-20T14:00:00.000Z" },
+          ]),
+          limitsResult("p", "b", [
+            { label: "x", category: "session", usedPercent: 10, resetsAt: "2026-11-20T16:00:00.000Z" },
+            { label: "y", category: "session", usedPercent: 90 },
+            { label: "z", category: "session", usedPercent: 20, resetsAt: "2026-11-20T12:00:00.000Z" },
+          ]),
+        ],
+      }),
+    });
+    const model = await panel("limits", src);
+    const reset = (label: string) => model.rows.find((r) => r.label === label)?.meta?.resetsAt;
+    expect(reset("P / a")).toBe("2026-11-20T14:00:00.000Z");
+    expect(reset("P / b")).toBe("2026-11-20T12:00:00.000Z");
+  });
+
   test("identities: counts per state, retired and pools excluded", async () => {
     const model = await panel("identities");
     expect(model.link).toBe(`${BASE}/auth`);
