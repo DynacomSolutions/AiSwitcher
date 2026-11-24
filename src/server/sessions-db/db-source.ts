@@ -188,7 +188,7 @@ export function checkPartCoverage(parts: readonly SessionPartRow[], committedByt
  * messages for sessions only (not subagents), Codex shows no count, a Codex thread with no start record starts at its
  * last write, and a title that is not known yet gets the reader's placeholder.
  */
-function nodeOf(row: SessionTreeRow, kind: DbSessionTool, identity: string, opts: WindowOpts): TreeNodeDto {
+export function nodeOf(row: SessionTreeRow, kind: DbSessionTool, identity: string, opts: WindowOpts): TreeNodeDto {
   const isChild = row.parentRef !== null;
   const title = row.title ?? (kind === "claude" ? (isChild ? truncateLabel(row.agentName ?? row.sessionRef) : "(no user message)") : "(no summary)");
   const startedMs = row.startedAt ?? (kind === "codex" ? row.updatedAt : null);
