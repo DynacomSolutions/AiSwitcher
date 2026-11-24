@@ -128,6 +128,16 @@ describe("aggregateLimitResults", () => {
     ]);
     expect(merged.map((r) => `${r.provider}/${r.identity.name}`)).toEqual(["anthropic/acme", "kimi/acme", "anthropic/other"]);
   });
+
+  test("the merged row inherits a duplicate source's plan label when the winner has none", () => {
+    const merged = aggregateLimitResults([
+      row({ toolName: "zai", provider: "zai", identity: identity("acme"), status: "live", windows: [{ label: "session", category: "session", usedPercent: 10 }] }),
+      row({ toolName: "pi", provider: "zai", identity: identity("acme"), status: "live", windows: [{ label: "session", category: "session", usedPercent: 10 }], plan: "Max" }),
+    ]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.toolName).toBe("zai");
+    expect(merged[0]!.plan).toBe("Max");
+  });
 });
 
 describe("runBatched", () => {

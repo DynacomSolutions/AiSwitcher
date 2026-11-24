@@ -317,6 +317,9 @@ export interface ToolLimitResult {
   extraUsage?: ExtraUsageInfo;
   manualReset?: ManualResetInfo;
   account?: AccountInfo;
+  /** Short account plan label from real wire data, e.g. "Max 20x", "Plus", "Go".
+   * Absent when the provider exposes no plan or it could not be read: render nothing then. */
+  plan?: string;
 }
 
 export interface LimitsResponse {

@@ -417,3 +417,17 @@ describe("column-width wrapping and minute rounding", () => {
     expect(formatClock(LOCAL(2026, 9, 12, 2, 59) + 59_900, LNOW)).toBe("Mon 03:00");
   });
 });
+
+describe("plan label", () => {
+  test("the plan label rides the identity branch", () => {
+    const report = formatLimitsReport([{ ...claudeAcme(), plan: "Max 20x" }], NOW, "⠋", { width: 100, columns: false });
+    expect(report).toContain("identity-a  (Identity A)  [Max 20x]");
+  });
+
+  test("an absent plan renders nothing extra", () => {
+    const report = formatLimitsReport([claudeAcme()], NOW, "⠋", { width: 100, columns: false });
+    expect(report).toContain("identity-a  (Identity A)");
+    expect(report).not.toContain("[Max");
+    expect(report).not.toContain("[]");
+  });
+});

@@ -203,6 +203,23 @@ What the rule means in practice, now enforced in both pipelines:
   (the WebUI mirrors this with a sub-line per Bedrock row and the TUI's
   REAL $ column reads the same `realCost` payload field).
 
+- **The account plan label is real wire data only (`ToolLimitResult.plan`).**
+  Each fetcher maps its own wire's plan name to a short display label:
+  claude's profile plan (`claudePlanLabel`, type plus rate-limit tier, e.g.
+  "Max 20x"), codex's `planType` ("Plus", "Pro", "Team", "Enterprise"),
+  kimi's `user.membership.level` (LEVEL_ prefix stripped, title-cased),
+  zai's quota `data.level` (title-cased), and an active OpenCode Go quota
+  read ("Go": that endpoint serves the Go plan only). Grok's billing config
+  and ali's gateway usage carry no plan name, so those fetchers never set
+  the field. An unknown plan value yields undefined, never a guess. Absent
+  renders nothing in every view (web badge, CLI identity branch). The
+  gateway rows carry the same label: claude's `plan` object is mapped in
+  `mapGatewayLimitRow`, the other providers ride `PoolUsage.planLabel`.
+  Aggregation inherits a duplicate source's label when the winner has none
+  (same account). Claude's limits fetch reuses the shared plan reader
+  (`claudePlanLabelFor` over `currentPlan`): its hourly profile cache and
+  failure backoff apply, and no new endpoint is polled.
+
 Verification should cover aggregation when native and multi-provider clients
 share a credential, fallback to an available result when one source fails,
 and omission of empty sources unless explicitly requested.

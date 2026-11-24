@@ -189,7 +189,9 @@ function worstWindow(r: ToolLimitResult) {
 
 function identityHeading(result: ToolLimitResult): string {
   const { name, label } = result.identity;
-  return label.toLowerCase() === name.toLowerCase() ? bold(name) : `${bold(name)}  ${dim(`(${label})`)}`;
+  const heading = label.toLowerCase() === name.toLowerCase() ? bold(name) : `${bold(name)}  ${dim(`(${label})`)}`;
+  // The account plan label rides the identity branch; absent renders nothing.
+  return result.plan ? `${heading}  ${dim(`[${result.plan}]`)}` : heading;
 }
 
 /** Every member of the pool; the active one is starred and marked. */

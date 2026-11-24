@@ -721,6 +721,8 @@ CLIProxyAPI's refresh journal):
   A claude row also carries `plan` (`type`, for example `claude_max`, `tier`, `checkedAt`, `stale`). It comes from
   the login's own `GET /api/oauth/profile`, read again every hour, so a plan upgrade shows without a new login.
   The `subscriptionType` saved in a login file is written at login and is never the plan source.
+  Codex, kimi and zai rows carry `planLabel`, the short plan display label of their limits fetch. The console
+  maps both forms onto the row's `plan` display label (`mapGatewayLimitRow`).
   The reads come from the same 45 s cache the proxy selects on: a request never waits on a fresh fetch
   and never refreshes a token. An identity with no reading yet answers `status: "unavailable"` and fills
   in behind. The console Limits page merges these rows over its host scan (`src/server/gateway-limits.ts`).

@@ -352,3 +352,29 @@ describe("reset grants from the gateway", () => {
     }
   });
 });
+
+describe("mapGatewayLimitRow: plan labels", () => {
+  test("a claude row's profile plan maps to the short display label", () => {
+    const row = claudeRow(upstreamBody(), { plan: { type: "claude_max", tier: "default_claude_max_20x", checkedAt: STAMP } });
+    expect(mapGatewayLimitRow(row)!.plan).toBe("Max 20x");
+    expect(mapGatewayLimitRow(claudeRow(upstreamBody(), { plan: { type: "claude_pro", checkedAt: STAMP } }))!.plan).toBe("Pro");
+    expect(mapGatewayLimitRow(claudeRow(upstreamBody()))!.plan).toBeUndefined();
+  });
+
+  test("an unavailable claude row keeps a known plan; an unknown type yields none", () => {
+    const cold = { provider: "claude", identity: "m1", status: "unavailable" as const, windows: [], plan: { type: "claude_team", checkedAt: STAMP } };
+    expect(mapGatewayLimitRow(cold)!.plan).toBe("Team");
+    expect(mapGatewayLimitRow({ ...cold, plan: { type: "claude_future", checkedAt: STAMP } })!.plan).toBeUndefined();
+  });
+
+  test("codex, kimi and zai rows ride the short planLabel; absent stays absent", () => {
+    const row = (provider: string, over: Partial<GatewayLimitRow> = {}): GatewayLimitRow => ({
+      provider, identity: "w1", status: "live", windows: [{ label: "session", utilization: 10, resetsAt: RESET_SESSION }], capturedAt: STAMP, ...over,
+    });
+    expect(mapGatewayLimitRow(row("codex", { planLabel: "Pro" }))!.plan).toBe("Pro");
+    expect(mapGatewayLimitRow(row("kimi", { planLabel: "Standard" }))!.plan).toBe("Standard");
+    expect(mapGatewayLimitRow(row("zai", { planLabel: "Max" }))!.plan).toBe("Max");
+    expect(mapGatewayLimitRow(row("codex"))!.plan).toBeUndefined();
+    expect(mapGatewayLimitRow(row("kimi", { planLabel: "" }))!.plan).toBeUndefined();
+  });
+});
