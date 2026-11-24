@@ -1,6 +1,6 @@
 import { readdir, readFile, stat, chmod } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { writeFileAtomic } from "./pool/fs.ts";
 import { t3Paths } from "./t3-anthropic-proxy.ts";
@@ -14,9 +14,16 @@ import { t3Paths } from "./t3-anthropic-proxy.ts";
  *   display_name, max_context_size, capabilities); keys AIS does not derive stay on a model that is still served.
  * - OpenCode (`opencode.json`): `provider.<p>.models` of a provider with `options.baseURL` is set to the gateway's ids;
  *   an entry that stays keeps its own keys, `name` follows the gateway.
+ * - ZCode (the Z.ai ACP agent's personal provider config, a JSON file): the gateway provider's `personalModelIds` and
+ *   `modelOrder` are set to the gateway's ids, and its `providerModelRules` gain one entry per gateway model. A rule that
+ *   stays keeps its own keys. The config file is found from the ZCode ACP launcher named in T3 Code's settings.json.
  *
  * Everything else in each file is left as it is. A list that cannot be read (network, 401, empty) changes nothing.
  * The host profile-sync daemon runs `syncT3GatewayModels` on a timer, so a new gateway model appears without a command.
+ *
+ * Clients that list models themselves are not written: grok-build fetches the gateway list into its own models_cache.json,
+ * and Codex fetches it through its CLI. The glm-acp-agent advertises a built-in list (or `ACP_GLM_AVAILABLE_MODELS`), but
+ * T3 Code stores its key redacted in settings.json, so AIS cannot read a key to fetch that list.
  */
 
 export interface GatewayModel {
@@ -362,6 +369,175 @@ async function syncOpencodeFolder(dir: string, opts: SyncOptions): Promise<Folde
   return results;
 }
 
+/** The ZCode personal provider config rules that point at an HTTP base with a key AIS can read. */
+export function zcodeGatewayProviders(config: Json): { providerId: string; baseUrl: string; apiKey: string }[] {
+  const inner = isObj(config.config) ? config.config : {};
+  const rulesRoot = isObj(inner.providerConfigRules) ? inner.providerConfigRules : {};
+  const rules = Array.isArray(rulesRoot.providerRules) ? rulesRoot.providerRules : [];
+  const out: { providerId: string; baseUrl: string; apiKey: string }[] = [];
+  for (const r of rules) {
+    if (!isObj(r)) continue;
+    const providerId = str(r.providerId);
+    const rc = isObj(r.config) ? r.config : {};
+    const api = isObj(rc.api) ? rc.api : {};
+    const access = isObj(rc.access) ? rc.access : {};
+    const baseUrl = str(api.baseUrl);
+    const apiKey = str(access.apiKey);
+    if (providerId && baseUrl && apiKey) out.push({ providerId, baseUrl, apiKey });
+  }
+  return out;
+}
+
+/** The `personalModelIds` a ZCode provider rule lists now. */
+export function zcodeModelIds(config: Json, providerId: string): string[] {
+  const inner = isObj(config.config) ? config.config : {};
+  const rulesRoot = isObj(inner.providerConfigRules) ? inner.providerConfigRules : {};
+  const rules = Array.isArray(rulesRoot.providerRules) ? rulesRoot.providerRules : [];
+  for (const r of rules) {
+    if (!isObj(r) || r.providerId !== providerId) continue;
+    const rc = isObj(r.config) ? r.config : {};
+    return Array.isArray(rc.personalModelIds) ? rc.personalModelIds.filter((x): x is string => typeof x === "string") : [];
+  }
+  return [];
+}
+
+/**
+ * New ZCode config whose gateway provider lists exactly `models` (gateway order). `personalModelIds` and `modelOrder`
+ * become the gateway ids. The provider's `providerModelRules` gain one entry per model: a rule that stays keeps its keys
+ * (its `contextWindow` follows the gateway when the gateway gives one), a new model gets the gateway's context and output
+ * limits when present. Rules of other providers, `manualProviderModelRules` and every other key stay. A
+ * `defaultModelSelection` naming a model that is gone moves to the first gateway model. Idempotent.
+ */
+export function transformZcodeConfig(config: Json, providerId: string, models: GatewayModel[]): Json {
+  const ids = models.map((m) => m.id);
+  const served = new Set(ids);
+  const out: Json = { ...config };
+  const inner: Json = isObj(out.config) ? { ...out.config } : {};
+
+  const rulesRoot: Json = isObj(inner.providerConfigRules) ? { ...inner.providerConfigRules } : {};
+  const rules = Array.isArray(rulesRoot.providerRules) ? rulesRoot.providerRules : [];
+  rulesRoot.providerRules = rules.map((r) => {
+    if (!isObj(r) || r.providerId !== providerId) return r;
+    const rc: Json = isObj(r.config) ? { ...r.config } : {};
+    rc.personalModelIds = [...ids];
+    rc.modelOrder = [...ids];
+    return { ...r, config: rc };
+  });
+  inner.providerConfigRules = rulesRoot;
+
+  const modelRoot: Json = isObj(inner.modelConfigRules) ? { ...inner.modelConfigRules } : {};
+  const oldRules = Array.isArray(modelRoot.providerModelRules) ? modelRoot.providerModelRules : [];
+  const otherRules = oldRules.filter((r) => isObj(r) && r.providerId !== providerId);
+  const ownRules = models.map((m) => {
+    const old = oldRules.find((r) => isObj(r) && r.providerId === providerId && r.modelId === m.id);
+    if (isObj(old)) {
+      const oc: Json = isObj(old.config) ? { ...old.config } : {};
+      if (m.contextLength) oc.properties = { ...(isObj(oc.properties) ? oc.properties : {}), contextWindow: m.contextLength };
+      return { ...old, config: oc };
+    }
+    const nc: Json = {};
+    if (m.contextLength) nc.properties = { contextWindow: m.contextLength };
+    if (m.maxOutput) nc.optionSpecs = { maxOutputTokens: { max: m.maxOutput } };
+    return { modelId: m.id, providerId, config: nc };
+  });
+  modelRoot.providerModelRules = [...otherRules, ...ownRules];
+  inner.modelConfigRules = modelRoot;
+
+  const dms = isObj(inner.defaultModelSelection) ? { ...inner.defaultModelSelection } : undefined;
+  if (dms && dms.providerId === providerId && typeof dms.modelId === "string" && !served.has(dms.modelId) && models.length > 0) {
+    dms.modelId = models[0]!.id;
+    inner.defaultModelSelection = dms;
+  }
+  out.config = inner;
+  return out;
+}
+
+/**
+ * The ZCode personal provider config path a launcher exports (`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`), with `$HOME` and
+ * `~` expanded. Undefined when the launcher does not name one (it is not a ZCode launcher).
+ */
+export function zcodeConfigPathFromLauncher(launcherText: string, home: string): string | undefined {
+  const m = /ZCODE_PERSONAL_PROVIDER_CONFIG_FILE\s*=\s*["']?([^"'\s]+)/.exec(launcherText);
+  if (!m) return undefined;
+  let p = m[1]!.replace(/\$\{HOME\}|\$HOME/g, home);
+  if (p.startsWith("~/")) p = join(home, p.slice(2));
+  return isAbsolute(p) ? p : undefined;
+}
+
+async function syncZcodeConfigFile(file: string, opts: SyncOptions): Promise<FolderResult[]> {
+  const dir = dirname(file);
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch {
+    return [];
+  }
+  let config: Json;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!isObj(parsed)) throw new Error("not an object");
+    config = parsed;
+  } catch (e) {
+    return [{ dir, file, provider: "?", status: "failed", fileIds: [], error: `${file}: ${errText(e)}` }];
+  }
+  const results: FolderResult[] = [];
+  let changed = false;
+  for (const p of zcodeGatewayProviders(config)) {
+    const fileIds = zcodeModelIds(config, p.providerId);
+    try {
+      const models = await fetchGatewayModels(p.baseUrl, p.apiKey, {}, opts);
+      const next = transformZcodeConfig(config, p.providerId, models);
+      const same = JSON.stringify(next) === JSON.stringify(config);
+      if (!same) {
+        config = next;
+        changed = true;
+      }
+      results.push({ dir, file, provider: p.providerId, status: same ? "current" : "updated", gatewayIds: models.map((m) => m.id), fileIds });
+    } catch (e) {
+      results.push({ dir, file, provider: p.providerId, status: "failed", fileIds, error: errText(e) });
+    }
+  }
+  if (!opts.check && changed) await writeKeepingMode(file, `${JSON.stringify(config, null, 2)}\n`);
+  return results;
+}
+
+/**
+ * ZCode ACP instances list only the models their personal provider config names. Find each instance's launcher in T3
+ * Code's settings.json, read the config path it exports, and sync that file. Settings or a launcher that cannot be read
+ * changes nothing. grok-build and glm-acp-agent launchers name no ZCode config, so they are left alone.
+ */
+async function syncZcodeAcpInstances(opts: SyncOptions): Promise<FolderResult[]> {
+  const home = opts.home ?? homedir();
+  const t3Home = t3Paths({ ...(opts.home ? { home: opts.home } : {}), ...(opts.env ? { env: opts.env } : {}) }).t3Home;
+  let settings: Json;
+  try {
+    const parsed: unknown = JSON.parse(await readFile(join(t3Home, "userdata", "settings.json"), "utf8"));
+    if (!isObj(parsed)) return [];
+    settings = parsed;
+  } catch {
+    return [];
+  }
+  const instances = isObj(settings.providerInstances) ? settings.providerInstances : {};
+  const results: FolderResult[] = [];
+  const seen = new Set<string>();
+  for (const inst of Object.values(instances)) {
+    if (!isObj(inst) || inst.driver !== "acpRegistry") continue;
+    const commandPath = str(isObj(inst.config) ? inst.config.commandPath : undefined);
+    if (!commandPath) continue;
+    let launcher: string;
+    try {
+      launcher = await readFile(commandPath, "utf8");
+    } catch {
+      continue;
+    }
+    const file = zcodeConfigPathFromLauncher(launcher, home);
+    if (!file || seen.has(file)) continue;
+    seen.add(file);
+    results.push(...(await syncZcodeConfigFile(file, opts)));
+  }
+  return results;
+}
+
 /** Every T3 gateway folder's model lists, synced (or checked) against the gateway. No folders: empty result. */
 export async function syncT3GatewayModels(opts: SyncOptions = {}): Promise<FolderResult[]> {
   const root = join(t3Paths({ ...(opts.home ? { home: opts.home } : {}), ...(opts.env ? { env: opts.env } : {}) }).t3Home, "gateway");
@@ -369,13 +545,14 @@ export async function syncT3GatewayModels(opts: SyncOptions = {}): Promise<Folde
   try {
     names = (await readdir(root, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name).sort();
   } catch {
-    return [];
+    names = [];
   }
   const results: FolderResult[] = [];
   for (const name of names) {
     const dir = join(root, name);
     results.push(...(await syncKimiFolder(dir, opts)), ...(await syncOpencodeFolder(dir, opts)));
   }
+  results.push(...(await syncZcodeAcpInstances(opts)));
   return results;
 }
 
