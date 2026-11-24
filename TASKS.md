@@ -161,7 +161,7 @@ ETA: 2026-11-28 18:00 ICT
 | 161 | Gateway: built-in usage proxy for T3 Code Claude limits | done | claude-20261110-gw-claude-usage-proxy | gateway-cluster-usage-proxy | 4.159 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/453.<br>CONNECT proxy runs in the cluster gateway (port 47132, cert-manager leaf). |
 | 162 | Usage proxy: HTTPS_PROXY on a Claude folder always comes with a loopback NO_PROXY | done | claude-20261110-gw-codex-usage | claude-proxy-no-proxy | 4.161 | | Incident 10 Nov 03:55-03:59 ICT: HTTPS_PROXY was set by hand on the swap identity, whose ANTHROPIC_BASE_URL is the loopback `ais gateway local` proxy; Claude Code sent every model call to the CONNECT proxy, which answered 405, so the whole pool failed (38 failed turns). NO_PROXY added by hand at 03:59.<br>Fix: one writer (`ais gateway claude-proxy`) that always adds loopback NO_PROXY, a check test, an `ais doctor` guard, and a 405 body that names the cause.<br>Merged PR #456 (2b8ed57). Live check passes on the swap identity and all 9 T3 Claude folders. |
 | 163 | Console: working Grok and Kimi logins show as expired | done | claude-20261110-gw-codex-usage | grok-expiry-iso | | | Grok writes `expires_at` as an ISO date; the console expiry reader used parseFloat, read only the year (2026 s after 1970) and showed every login as expired. The logins themselves were valid; the refresher already parsed ISO. Fixed in src/server/auth.ts findExpiry with a test.<br>Also: a lapsed access token with a refresh token (Kimi tokens last 15 min) was shown as expired although the tool renews it on next use; now ok with "renewed with the refresh token on next use". |
-| 165 | Gateway: full account API for apps on every provider | todo | | gateway-claude-account-api | | | Deferred: merged https://github.com/DynacomSolutions/AiSwitcher/pull/464; live proof for every provider not done.<br>Full account API per provider through the member login. |
+| 165 | Gateway: full account API for apps on every provider | in_progress | gateway-account-api-all | gateway-account-api-all | | 2026-11-25 12:00 ICT | Started 24 Nov on owner request.<br>First part merged https://github.com/DynacomSolutions/AiSwitcher/pull/464.<br>Needs every provider, then Opus review and live proof after release. |
 | 166 | Gateway: an account at its limit shows "No limits reported" in T3 | done | claude-20261110-gw-codex-usage | gw-usage-keep-last | | | An account at its weekly limit showed no limits: Anthropic's usage API answers 429 for an account at its limit, the gateway usage cache replaced the last figure with nothing, and the served usage had null windows. A reading with no figure now keeps the last one. |
 | 167 | AIS: T3 Code Anthropic account API via gateway (`ais gateway t3-proxy`) | done | claude-20261110-gw-codex-usage | t3-anthropic-proxy | 4.165 | | Moves a hand-made host setup into a command: a preload that sends only the T3 server binary's api.anthropic.com requests through the gateway CONNECT proxy, and the service.env keys that load it. HTTPS_PROXY is never written (it would break every T3 child); `ais doctor` reports it. Not proven live. |
 | 168 | Swap and pools with gateway-routed members and pool folders | done | claude-20261110-swap-gateway | swap-gateway-support | 4.167 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/471. |
@@ -177,10 +177,12 @@ ETA: 2026-11-28 18:00 ICT
 | 215 | T3 Code ACP agents: a failed turn shows its error in the thread | done | claude | acp-turn-errors | | | Before: a failed kimi-code turn showed an empty, completed turn; Grok and Z.ai showed "Internal error".<br>Fix: `ais gateway t3-acp` starts the three agents behind an AIS relay that reports the reason.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/575 (0dfb643), released v0.5.65, installed on the host.<br>Live 2026-11-18: relay set on 4 provider instances, `--check` passes, a new Kimi session in T3 Code runs behind `ais __acp_relay` and answers. |
 | 218 | Gateway pool: no member 429 to the agent while a member has headroom | done | claude | gw-pool-failover-wait | 4.139 | | Owner report 19 Nov 01:06 ICT: T3 pool agent got "weekly limit, resets 2am" while one member had 71% headroom.<br>Fix: failover waits out short holds; with no member left, the pool answers natively with the earliest pool reset.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/596 (e0ef5e1); dev/ais-gateway pods run it. |
 | 220 | Gateway: a revoked app stays revoked, its old tokens never work again | done | claude | gateway-revoke-revive | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/599 (41dfaf3), live on all 6 replicas.<br>Revoked name: add, rotate and admin PUT and mint give 409.<br>Leaked revoked tokens give 401 on every replica. |
+| 317 | Pool apps use only the swap pool members | in_progress | claude | gateway-pool-follows-swap-pool | | 2026-11-25 02:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/783 had no owner.<br>Merge main (PR 786 changed the same code), then Opus review, then merge. |
+| 318 | Pool never selects a dead or non-gateway member | done | agent | opencode-pool-skip-dead | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/786. |
 | 245 | T3 gateway homes get agent-guard when AIS creates or updates them | done | claude | t3-home-agent-guard | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/650 (ee78d3b).<br>Ships in v0.5.80. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-20 14:00 ICT
+ETA: 2026-11-25 06:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -225,7 +227,9 @@ ETA: 2026-11-20 14:00 ICT
 | 241 | Limit answers use the true reset of the full window | done | agent | gw-limit-true-reset | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/642 (ccecd57), Opus review fixed.<br>Live on all 6 cluster gateway pods (binary has fetchOpencodeUsage).<br>Not yet seen live: a real limit answer with the weekly reset. |
 | 244 | Release tests stop failing on the Kimi refresh and SIGTERM drain checks | done | agent | fix-release-flaky-tests | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/648 (9e41445). |
 | 246 | Kimi and Grok threads snooze at a usage limit and resume at the reset | blocked | agent | acp-limit-snooze | 5.229 | | Merged #657 and #782 (in-turn retry watch).<br>Live proof 24 Nov on v0.5.113: both stuck Kimi threads snoozed to the reset, visible notice, turn cancelled.<br>Resume task not created: schedule_task fails via the ACP MCP bridge; the snooze tool works there.<br>Reset Fri 27 Nov 10:31 ICT. |
-| 255 | Usage collector: Grok log re-read (~0.9 GB per cycle) | todo | | | 5.133 | | Split from 5.133.<br>Each cycle re-reads the whole Grok log. |
+| 255 | Usage collector: Grok log re-read (~0.9 GB per cycle) | in_progress | claude | grok-log-incremental | 5.133 | 2026-11-25 06:00 ICT | Split from 5.133.<br>Each cycle re-reads the whole Grok log. |
+| 319 | Limits page shows the plan label per account | done | agent | limits-plan-label | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/787. |
+| 320 | T3 model lists auto-enumerate for every gateway provider (zai, grok) | in_progress | agent | | | 2026-11-25 01:00 ICT | Worker of the Kimi quota thread (Thomas). |
 ## 6. Browser control extension
 ETA: 2026-11-23 16:30 ICT
 
@@ -261,7 +265,7 @@ ETA: 2026-11-23 16:30 ICT
 | 284 | AIS Browser: keep a tab when Chrome replaces it (new tab id) | done | claude | browser-tab-replaced | 6.269 | | Live: one ContractFinder tab got a new id and left sessionTabs.<br>The extension had no tabs.onReplaced listener.<br>request_group allowClose: an agent closes a group after the user approves it.<br>Merged in PR 717, released in v0.5.96. |
 | 285 | AIS Browser: harden tab replace and allowClose | done | claude | browser-replace-hardening | 6.284 | | Review notes from PR 717.<br>Ignore a replace into a known tab, refuse allowClose while an approval record is unlinked.<br>Merged in PR 719. |
 | 286 | AIS Browser: approve group requests in the side panel and from a notification click | done | claude | browser-approve-ui | 6.284 | | Merged in PR 720, released in v0.5.97. |
-| 287 | AIS Browser: side panel from notification click, close_tab on frozen tabs | in_review | claude | browser-panel-gesture | 6.286 | 2026-11-23 16:30 ICT | macOS opened a full-screen popup.<br>sidePanel.open lost the user gesture after an await.<br>close_tab no longer attaches to discarded or unresponsive tabs. |
+| 287 | AIS Browser: side panel from notification click, close_tab on frozen tabs | done | claude | browser-panel-gesture | 6.286 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/722.<br>Side panel opens from a notification click; close_tab skips discarded tabs. |
 | 288 | AIS Browser: close a whole tab group in one call (close_group) | done | claude | browser-close-group | 6.287 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/728, released v0.5.100.<br>Refuses saved, granted and protected tabs; all or nothing. |
 | 289 | AIS Browser: a later session of the same chat regains its saved group | done | claude | browser-saved-reclaim | 6.288 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/731, released v0.5.101.<br>Saved entries now store label and owned/approved flags.<br>Live: ContractFinder re-saved, 34 expired tabs closed, 66 tabs in 33 splits. |
 
@@ -317,7 +321,7 @@ ETA: 2026-11-12 03:00 ICT
 | 181 | Release test: shared browser lock test accepts either renewal winning the lock first | done | claude | fix-ali-lock-test-order | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/496 (130d6c5).<br>v0.5.47 release failed on macOS: "two renewals take turns" asserted a before b; b won the lock, turns were still exclusive.<br>Test now checks no overlap in either order. |
 
 ## 13. Codex clients through the gateway
-ETA: 2026-11-23 21:00 ICT
+ETA: 2026-12-12 18:00 ICT
 Keep new codex releases working against the AIS gateway placeholder login.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -331,7 +335,7 @@ Keep new codex releases working against the AIS gateway placeholder login.
 | 292 | Console: gateway row without a login shows missing | done | claude | console-auth-sessions-add | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/741, released v0.5.105. |
 | 293 | Console: add identity into the gateway store | done | claude | console-auth-sessions-add | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/741 and .cluster #3232 (store key), released v0.5.105.<br>Live form checked by screenshot. |
 | 294 | Console: first login of a new identity goes to the gateway store | done | claude | console-auth-sessions-add | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/741, released v0.5.105. |
-| 295 | Sessions in the AIS database (HoardDB) | in_progress | claude | | | | Owner decision: session index in Postgres, transcripts in HoardDB object storage.<br>Console Sessions page reads from there, not host folders.<br>Design done, build in epic 20. |
+| 295 | Sessions in the AIS database (HoardDB) | in_progress | claude | | | 2026-12-12 18:00 ICT | Owner decision: session index in Postgres, transcripts in HoardDB object storage.<br>Console Sessions page reads from there, not host folders.<br>Design done, build in epic 20. |
 
 ## 14. Gateway survives any node loss
 ETA: 2026-11-15 23:00 ICT
@@ -438,7 +442,7 @@ ETA: 2026-12-12 18:00 ICT
 | 305 | Cluster: shipper values, recipient key, ingest secret | done | claude | | 20.303 | | .cluster PR 3305 merged.<br>Shipper stays off. |
 | 306 | Cluster: HoardDB read key, NetworkPolicy, env | done | claude | | 20.297 | | .cluster PR 3255 merged.<br>Read-only key on the whole bucket (no prefix scope).<br>List works, PUT refused, from both pods. |
 | 307 | Cluster: watchdog rules, metrics, Headlamp row | done | claude | | 20.303, 20.299 | | .cluster PR 3306 merged.<br>Alerts gated on the shipper flag, plus a restart-loop rule. |
-| 308 | Console reader from the database | in_progress | claude | sessions-console-reader | 20.301, 20.302, 20.306 | 2026-11-25 01:00 ICT | AIS_SESSIONS_SOURCE switch. |
+| 308 | Console reader from the database | in_review | claude | sessions-console-reader | 20.301, 20.302, 20.306 | 2026-11-25 01:30 ICT | AIS_SESSIONS_SOURCE switch.<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/785, CI green.<br>Opus review found 3 db-mode faults; fixes go to the row worker. |
 | 309 | Equivalence test and performance proof | todo | | | 20.308 | | |
 | 310 | Backfill per node with verification | in_progress | claude | sessions-backfill | 20.305, 20.307 | 2026-11-25 03:00 ICT | Smallest node first, largest node last. |
 | 311 | Reconcile drill and verify-host command | todo | | | 20.310 | | |
