@@ -396,6 +396,15 @@ Returns the exact `ToolLimitResult[]` shape the CLI's JSON mode emits
 min 5) controls staleness tolerance. Concurrent identical requests share one
 upstream fetch.
 
+A row carries `plan` (short display label, e.g. `"Max 20x"`, `"Pro"`,
+`"Team"`, `"Plus"`, `"Standard"`, `"Max"`, `"Go"`) only when real wire data
+names the account plan: claude's profile plan (type and rate-limit tier),
+codex's `planType`, kimi's `user.membership.level`, zai's quota `data.level`,
+or an active OpenCode Go quota read. Grok and ali expose no plan on their
+wires, so their rows never carry one. An absent `plan` means the provider
+exposes no plan or it could not be read; clients render nothing then, never
+a guessed label.
+
 When the gateway admin API is configured (`AIS_GATEWAY_ADMIN_URL` and
 `AIS_GATEWAY_ADMIN_TOKEN`), the cluster gateway is the source of truth for
 the identities it manages: its `GET /limits` rows replace the host-scan rows
@@ -855,6 +864,14 @@ the TTL).
 Errors: `400` missing/unknown tool or parameters, `404` when the session
 id does not exist (or its store vanished), `504` when the scan child
 overruns its deadline.
+
+With `AIS_SESSIONS_SOURCE=db` (or `auto`, see `docs/agents/gateway.md`) Claude and
+Codex transcripts come from the session store. A session that fits the 4 MiB
+read window gives the same payload as the file reader. A larger session
+decodes its tail only: `truncated` is `true`, `totalTurns` counts the turns of
+that window, and `session` takes title, folder and times from the index. A
+part that fails its integrity check answers `502`. The default source is
+`files`.
 
 Contract notes:
 

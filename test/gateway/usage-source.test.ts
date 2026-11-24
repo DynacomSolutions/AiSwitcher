@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { pickIdentity } from "../../src/gateway/select.ts";
-import { createUsageSource, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
+import { createUsageSource as createUsageSourceRaw, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
 import { MemoryUsageReadings, type UsageReadings } from "../../src/gateway/usage-readings.ts";
+
+/** The source with a silent log by default, so the tests print no `usage-read` lines. A test that reads the log passes its own. */
+const createUsageSource = (o: Parameters<typeof createUsageSourceRaw>[0]): ReturnType<typeof createUsageSourceRaw> => createUsageSourceRaw({ log: () => {}, ...o });
 import type { GatewayApp } from "../../src/gateway/types.ts";
 
 const live = (u: number): PoolUsage => ({ status: "live", maxUtilization: u, capturedAt: "2026-11-02T00:00:00.000Z" });
@@ -506,5 +509,79 @@ describe("usage source with shared readings", () => {
     await shared.save("claude", "id3", live(3), 0);
     await src.prefill("claude", "id3");
     expect(reads.at(-1)).toBe("claude/shared");
+  });
+});
+
+describe("usage read outcome log", () => {
+  test("a member's failing upstream read is logged once when it starts and once when it recovers", async () => {
+    const answers: PoolUsage[] = [
+      live(10),
+      { status: "rate-limited", maxUtilization: 10, error: "usage endpoint answered HTTP 429", capturedAt: "2026-11-02T00:00:00.000Z" },
+      { status: "rate-limited", maxUtilization: 10, error: "usage endpoint answered HTTP 429", capturedAt: "2026-11-02T00:00:00.000Z" },
+      live(20),
+    ];
+    let t = 0;
+    const logs: string[] = [];
+    const src = createUsageSource({ fetchUsage: async () => answers.shift(), ttlMs: 10, now: () => t, log: (l) => void logs.push(l) });
+    for (let i = 0; i < 4; i++) {
+      await src.get("claude", "id1");
+      await src.idle();
+      t += 20;
+    }
+    expect(logs.map((l) => JSON.parse(l))).toEqual([
+      { event: "usage-read", provider: "claude", identity: "id1", outcome: "failed", error: "usage endpoint answered HTTP 429" },
+      { event: "usage-read", provider: "claude", identity: "id1", outcome: "recovered" },
+    ]);
+  });
+});
+
+describe("usage read log", () => {
+  const events = (logs: string[]): Array<{ event: string; provider: string; identity: string; outcome: string; error?: string }> => logs.map((l) => JSON.parse(l));
+  const none = { status: "unavailable", capturedAt: "x" } as PoolUsage;
+
+  test("a provider with no usage reader (grok) logs nothing and gives no figure", async () => {
+    const logs: string[] = [];
+    const src = createUsageSource({ fetchUsage: async () => undefined, log: (l) => void logs.push(l) });
+    await src.prefill("grok", "id1");
+    expect(await src.get("grok", "id1")).toBeUndefined();
+    await src.idle();
+    expect(logs).toEqual([]);
+  });
+
+  test("a provider with a reader logs a failure once and the recovery once, with the error text in the log only", async () => {
+    const logs: string[] = [];
+    let next: PoolUsage = { ...none, error: "HTTP 500" };
+    let t = 0;
+    const src = createUsageSource({ fetchUsage: async () => next, ttlMs: 1000, now: () => t, log: (l) => void logs.push(l) });
+    await src.prefill("claude", "id1");
+    t += 5000;
+    next = { ...none, error: "HTTP 502" }; // another error text: still failed, no second line
+    await src.prefill("claude", "id1");
+    t += 5000;
+    next = live(10);
+    await src.prefill("claude", "id1");
+    expect(events(logs)).toEqual([{ event: "usage-read", provider: "claude", identity: "id1", outcome: "failed", error: "HTTP 500" }, { event: "usage-read", provider: "claude", identity: "id1", outcome: "recovered" }]);
+  });
+
+  test("a thrown fetch logs a failure with the error text", async () => {
+    const logs: string[] = [];
+    const src = createUsageSource({ fetchUsage: async () => { throw new Error("boom"); }, log: (l) => void logs.push(l) });
+    await src.prefill("claude", "id1");
+    expect(events(logs)).toEqual([{ event: "usage-read", provider: "claude", identity: "id1", outcome: "failed", error: "boom" }]);
+  });
+
+  test("a young shared reading marks a failed member recovered", async () => {
+    const logs: string[] = [];
+    const shared = new MemoryUsageReadings();
+    let t = 1_000_000;
+    let fail = true;
+    const src = createUsageSource({ fetchUsage: async () => (fail ? none : live(10)), shared, ttlMs: 45_000, now: () => t, log: (l) => void logs.push(l) });
+    await src.prefill("claude", "id1");
+    expect(events(logs).map((e) => e.outcome)).toEqual(["failed"]);
+    fail = false;
+    await shared.save("claude", "id1", live(20), 0);
+    t += 60_000;
+    await src.prefill("claude", "id1");
+    expect(events(logs).map((e) => e.outcome)).toEqual(["failed", "recovered"]);
   });
 });

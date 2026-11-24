@@ -121,7 +121,7 @@ export function parseGrantFile(text: string | undefined): GrantFile | undefined 
 }
 
 /** Maps the limits windows of one or more fetches onto a pool usage reading. */
-export function usageFromLimits(results: Array<{ status: string; windows: LimitWindow[]; error?: string; manualReset?: ManualResetInfo }>, error?: string): PoolUsage {
+export function usageFromLimits(results: Array<{ status: string; windows: LimitWindow[]; error?: string; manualReset?: ManualResetInfo; plan?: string }>, error?: string): PoolUsage {
   const capturedAt = new Date().toISOString();
   const live = results.filter((r) => r.status !== "unavailable");
   const windows = live.flatMap((r) => r.windows);
@@ -131,10 +131,12 @@ export function usageFromLimits(results: Array<{ status: string; windows: LimitW
   }
   const maxUtilization = Math.max(...windows.map((w) => w.usedPercent));
   const manualReset = live.find((r) => r.manualReset)?.manualReset;
+  const planLabel = live.find((r) => r.plan)?.plan;
   return {
     status: maxUtilization >= 100 ? "rate-limited" : "live",
     maxUtilization,
     ...(manualReset ? { manualReset } : {}),
+    ...(planLabel ? { planLabel } : {}),
     windows: windows.map((w) => ({
       label: w.label,
       utilization: w.usedPercent,

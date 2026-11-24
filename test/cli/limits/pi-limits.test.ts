@@ -79,4 +79,26 @@ describe("fetchPiLimits", () => {
     expect(explicit).toHaveLength(1);
     expect(explicit[0]!.error).toContain("no fetchable Pi providers");
   });
+
+  test("zai and opencode-go rows carry the plan label of their quota read", async () => {
+    const identity = await makeIdentity({
+      zai: { type: "api_key", key: "zai-key-SYNTHETIC_FIXTURE" },
+      "opencode-go": { type: "api_key", key: "go-key-SYNTHETIC_FIXTURE" },
+    });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      if (String(url).includes("/api/monitor/usage/quota/limit")) {
+        return Response.json({ success: true, data: { level: "max", limits: [{ type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: 1, nextResetTime: 1784314903145 }] } });
+      }
+      return Response.json({ usage: { rolling: { status: "ok", percent: 5, resetsAt: "2026-11-24T20:00:00Z" } } });
+    }) as typeof fetch;
+    try {
+      const results = await fetchPiLimits(identity);
+      const byProvider = new Map(results.map((r) => [r.provider, r]));
+      expect(byProvider.get("zai")?.plan).toBe("Max");
+      expect(byProvider.get("opencode-go")?.plan).toBe("Go");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
 });

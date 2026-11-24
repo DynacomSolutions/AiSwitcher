@@ -2,7 +2,7 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 import type { Identity } from "../../identities/types.ts";
-import { FRESH_READ_TTL_MS, freshLastGood, fetchUsageBodyWithResets, manualResetFromCedarEmber, carriedManualReset, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
+import { FRESH_READ_TTL_MS, freshLastGood, fetchUsageBodyWithResets, manualResetFromCedarEmber, carriedManualReset, fetchMemberResets, extraUsageFromBody, claudePlanLabelFor } from "../../identities/claude-usage-api.ts";
 import { claudeReadsViaGateway, fetchClaudeLimitsViaGateway, type ClaudeGatewayUsageDeps } from "../../identities/claude-gateway-usage.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
@@ -210,6 +210,8 @@ export interface ClaudeLimitsDeps extends ClaudeGatewayUsageDeps {
   run?: (binaryPath: string, args: string[], identity: Identity, timeoutMs: number) => Promise<{ stdout: string; exitCode: number; timedOut: boolean }>;
   resolveBinary?: () => string;
   fetchResets?: typeof fetchMemberResets;
+  /** Plan label read; defaults to the shared plan reader (hourly profile cache). */
+  fetchPlanLabel?: typeof claudePlanLabelFor;
   /** Probe guard; defaults to the AIS_LIMITS_PROBE environment variable. */
   isProbe?: boolean;
   now?: () => number;
@@ -311,6 +313,8 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
     const manualReset =
       manualResetFromCedarEmber((body as { cedar_ember?: unknown }).cedar_ember) ??
       carriedManualReset((await loadLastGood(identity, cacheDir))?.manualReset);
+    // The shared plan reader answers from its hourly cache; no extra endpoint is polled here.
+    const plan = await (deps.fetchPlanLabel ?? claudePlanLabelFor)(identity, deps, cacheDir);
     const live: FetchedLimitResult = {
       ...base,
       windows: apiWindows,
@@ -319,6 +323,7 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
       ...(overage ? { overage } : {}),
       ...(extraUsage ? { extraUsage } : {}),
       ...(manualReset ? { manualReset } : {}),
+      ...(plan ? { plan } : {}),
     };
     await saveLastGood(identity, live, cacheDir);
     return live;
@@ -456,6 +461,7 @@ async function probeViaSpawn(
   const overage = overageFromUsageText(usageStdout);
   // Non-fatal and sequential: it may refresh the token, which must not race the /usage spawn above.
   const manualReset = (await (deps.fetchResets ?? fetchMemberResets)(identity)) ?? carriedManualReset((await loadLastGood(identity, cacheDir))?.manualReset);
+  const plan = await (deps.fetchPlanLabel ?? claudePlanLabelFor)(identity, deps, cacheDir);
   return {
     ...base,
     windows,
@@ -463,5 +469,6 @@ async function probeViaSpawn(
     capturedAt: new Date().toISOString(),
     ...(overage ? { overage } : {}),
     ...(manualReset ? { manualReset } : {}),
+    ...(plan ? { plan } : {}),
   };
 }

@@ -11,6 +11,9 @@ import type { SharedReading, UsageReadings } from "./usage-readings.ts";
 
 export const USAGE_TTL_MS = 45_000;
 
+/** The providers with a usage reader: `fetchPoolUsage` (claude, codex, kimi, zai) and the OpenCode Go read. Others (grok, ali) have no source. */
+const USAGE_READER_PROVIDERS: ReadonlySet<string> = new Set(["claude", "codex", "kimi", "zai", "opencode"]);
+
 /** `fresh`: read the source now, past any short-lived shared cache (claude's one-minute last-good file). */
 export type FetchUsage = (provider: GatewayProvider, identity: string, opts?: { fresh?: boolean }) => Promise<PoolUsage | undefined>;
 
@@ -90,6 +93,23 @@ export function createUsageSource(opts: {
   const hasFigure = (v: PoolUsage | undefined): boolean => !!v && (v.noPlan === true || (v.status !== "unavailable" && ((v.windows?.length ?? 0) > 0 || typeof v.maxUtilization === "number")));
   const log = opts.log ?? ((line: string) => console.warn(line));
   let sharedDown = false;
+  /** The last upstream read state per member (`ok` or `failed`), so a change is logged once, not every poll. */
+  const lastState = new Map<string, "ok" | "failed">();
+  /** Logs when a member's usage read starts or stops failing: a stale figure is otherwise silent. The error text goes in the log line only. */
+  const setState = (provider: GatewayProvider, identity: string, state: "ok" | "failed", error?: string): void => {
+    const key = keyOf(provider, identity);
+    const before = lastState.get(key);
+    if (before === state || (before === undefined && state === "ok")) return;
+    lastState.set(key, state);
+    log(JSON.stringify({ event: "usage-read", provider, identity, outcome: state === "failed" ? "failed" : "recovered", ...(state === "failed" ? { error } : {}) }));
+  };
+  /** Notes one upstream read. A provider with no usage reader has no source, so it never counts as a failure. */
+  const noteOutcome = (provider: GatewayProvider, identity: string, u: PoolUsage | undefined, backoff: boolean): void => {
+    if (!USAGE_READER_PROVIDERS.has(provider)) return;
+    const failed = backoff || !hasFigure(u);
+    if (failed) setState(provider, identity, "failed", u?.error ?? (u ? u.status : "no reading"));
+    else setState(provider, identity, "ok");
+  };
   const sharedMs = opts.sharedTimeoutMs ?? 1500;
   const claimWaitMs = opts.claimWaitMs ?? 3000;
   const claimHoldMs = opts.claimHoldMs ?? 15_000;
@@ -129,6 +149,7 @@ export function createUsageSource(opts: {
       let claimed = false;
       const useShared = (s: SharedReading): void => {
         opts.onRead?.(provider, "shared");
+        if (USAGE_READER_PROVIDERS.has(provider)) setState(provider, identity, "ok");
         entries.set(key, { value: s.reading, at: now() - s.ageMs + jitter() });
       };
       /** No figure upstream: the newer of the local figure and the shared one, always stale (display only). */
@@ -170,6 +191,7 @@ export function createUsageSource(opts: {
         // For claude, "rate-limited" with a figure is the usage endpoint's 429 backoff repeating the last good read: old
         // figures, so stale (shown, never refused on). Codex says "rate-limited" for a live reading at 100%: that one stands.
         const backoff = provider === "claude" && u?.status === "rate-limited";
+        noteOutcome(provider, identity, u, backoff);
         const at = now();
         let value: PoolUsage | undefined;
         if (hasFigure(u)) {
@@ -183,7 +205,8 @@ export function createUsageSource(opts: {
           value = await noFigure(prev);
         }
         entries.set(key, { value, at });
-      } catch {
+      } catch (err) {
+        noteOutcome(provider, identity, { status: "unavailable", error: err instanceof Error ? err.message : String(err), capturedAt: "" } as PoolUsage, false);
         // Keep the old figure; retry after the next ttl.
         entries.set(key, { value: await noFigure(entries.get(key)?.value), at: now() });
       } finally {

@@ -53,7 +53,7 @@ export function hasTreeReader(tool: SessionTool): boolean {
  * vanished record) render as roots at depth 0 but KEEP their parentId so a
  * UI can show a stub. Input order is preserved; cycles (corrupt data)
  * terminate at depth 0 rather than looping. */
-function computeDepths(nodes: TreeNodeDto[]): TreeNodeDto[] {
+export function computeDepths(nodes: TreeNodeDto[]): TreeNodeDto[] {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const depths = new Map<string, number>();
   const inProgress = new Set<string>();

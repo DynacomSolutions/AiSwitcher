@@ -256,6 +256,8 @@ export interface SessionStoreOptions {
   sql?: SQL;
   /** Pool size when the store opens its own connection (default: the driver default). */
   poolMax?: number;
+  /** Seconds the driver waits for a connection (default: the driver default, about 30). */
+  connectTimeoutS?: number;
   hooks?: SessionStoreHooks;
 }
 
@@ -377,7 +379,11 @@ export class SessionStore {
 
   constructor(url: string, opts: SessionStoreOptions = {}) {
     this.ownsSql = !opts.sql;
-    this.sql = opts.sql ?? (opts.poolMax ? new SQL(url, { max: opts.poolMax }) : new SQL(url));
+    this.sql =
+      opts.sql ??
+      (opts.poolMax || opts.connectTimeoutS
+        ? new SQL(url, { ...(opts.poolMax ? { max: opts.poolMax } : {}), ...(opts.connectTimeoutS ? { connectionTimeout: opts.connectTimeoutS } : {}) })
+        : new SQL(url));
     this.hooks = opts.hooks ?? {};
   }
 

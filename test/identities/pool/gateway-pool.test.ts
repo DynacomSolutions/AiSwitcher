@@ -218,7 +218,7 @@ describe("codex usage of a routed member", () => {
     expect(snapshotFromWham({}, 0)).toBeUndefined();
   });
 
-  const gatewayRow = { provider: "codex", identity: "a", status: "live", capturedAt: "2026-11-23T10:00:00.000Z", windows: [{ label: "session", utilization: 3, resetsAt: "2026-11-23T14:00:00.000Z" }, { label: "week", utilization: 0, resetsAt: "2026-11-30T10:00:00.000Z" }], extraUsage: { enabled: true, available: true, label: "credits 12" } };
+  const gatewayRow = { provider: "codex", identity: "a", status: "live", capturedAt: "2026-11-23T10:00:00.000Z", windows: [{ label: "session", utilization: 3, resetsAt: "2026-11-23T14:00:00.000Z" }, { label: "week", utilization: 0, resetsAt: "2026-11-30T10:00:00.000Z" }], extraUsage: { enabled: true, available: true, label: "credits 12" }, planLabel: "Pro" };
   const withAdminSecrets = async () => {
     await writeFile(join(root, "secrets"), `AIS_GATEWAY_ADMIN_URL=https://gw.test/admin/\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_admin_token\n`);
   };
@@ -236,6 +236,7 @@ describe("codex usage of a routed member", () => {
     expect(r.windows.map((w) => w.usedPercent)).toEqual([3, 0]);
     expect(r.extraUsage).toMatchObject({ enabled: true, available: true });
     expect(r.overage).toBeUndefined();
+    expect(r.plan).toBe("Pro");
     expect(r.identity.name).toBe("a");
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe("https://gw.test/admin/limits?provider=codex&identity=a");
@@ -292,6 +293,7 @@ describe("codex usage of a routed member", () => {
       const r = await fetchCodexLimits({ name: "a", label: "a", configDir: join(members, "codex", "a") }, { fetchImpl, now: () => T0 * 1000 });
       expect(r.status).toBe("live");
       expect(r.windows.map((w) => w.usedPercent)).toEqual([42, 7]);
+      expect(r.plan).toBe("Pro");
       expect(calls).toHaveLength(1);
       // the gateway reads chatgpt.com with its own store copy and never calls its own admin API
       expect(calls[0]).toContain("/backend-api/wham/usage");
