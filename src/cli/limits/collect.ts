@@ -318,6 +318,8 @@ export function aggregateLimitResults(results: ToolLimitResult[]): ToolLimitResu
       ...winner,
       provider,
       ...(errors.length ? { error: errors.join("; ") } : {}),
+      // Same account: a plan label one source read stands for the merged row too.
+      ...(winner.plan === undefined && loser.plan !== undefined ? { plan: loser.plan } : {}),
     });
   }
   return [...grouped.values()];

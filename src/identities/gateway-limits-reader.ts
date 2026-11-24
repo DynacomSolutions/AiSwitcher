@@ -2,7 +2,7 @@ import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { categorizeByLabel, categorizeByMinutes } from "../cli/limits/bucket.ts";
 import type { ExtraUsageInfo, LimitCategory, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult } from "../cli/limits/types.ts";
 import { providerForTool } from "../cli/usage/providers.ts";
-import { resetGrantKind } from "./claude-usage-api.ts";
+import { claudePlanLabel, resetGrantKind } from "./claude-usage-api.ts";
 import type { Identity, ToolConfig } from "./types.ts";
 
 /**
@@ -23,6 +23,10 @@ export interface GatewayLimitRow {
   windows?: Array<{ label: string; utilization: number; resetsAt?: string; model?: string }>;
   extraUsage?: ExtraUsageInfo;
   manualReset?: ManualResetInfo;
+  /** Claude: the profile plan the gateway reads hourly (type and rate-limit tier). */
+  plan?: { type: string; tier?: string; checkedAt?: string; stale?: boolean };
+  /** Other providers: the short plan display label from the limits fetch. */
+  planLabel?: string;
   error?: string;
 }
 
@@ -115,6 +119,17 @@ function overageFromExtraUsage(extra: ExtraUsageInfo): OverageInfo {
   return extra.available ? { active: true, label: "using extra usage" } : { active: false, label: "out of extra usage" };
 }
 
+/** Plan display label of a gateway row: claude's profile plan object, or the
+ * short label the other providers' adapters carry. Absent stays absent. */
+function rowPlanLabel(r: Record<string, unknown>): string | undefined {
+  if (r.provider === "claude") {
+    const p = r.plan as { type?: unknown; tier?: unknown } | null | undefined;
+    if (!p || typeof p.type !== "string" || p.type === "") return undefined;
+    return claudePlanLabel({ type: p.type, ...(typeof p.tier === "string" ? { tier: p.tier } : {}) });
+  }
+  return typeof r.planLabel === "string" && r.planLabel !== "" ? r.planLabel : undefined;
+}
+
 /**
  * Maps one admin limits row to the console's ToolLimitResult shape. A stale reading shows as "cached";
  * a reading with no figure shows as "unavailable" with an honest reason. The identity carries the name
@@ -141,6 +156,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
     });
   }
   const capturedAt = typeof r.capturedAt === "string" ? r.capturedAt : undefined;
+  const plan = rowPlanLabel(r);
   if (r.status === "unavailable" || windows.length === 0) {
     const resetOnly = r.provider === "claude" ? parseManualReset(r.manualReset) : undefined;
     return {
@@ -150,6 +166,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
       status: "unavailable",
       error: typeof r.error === "string" && r.error ? r.error : "no usage reading from the gateway yet",
       ...(capturedAt ? { capturedAt } : {}),
+      ...(plan ? { plan } : {}),
     };
   }
   const extraUsage = parseExtraUsage(r.extraUsage);
@@ -158,6 +175,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
     ...base,
     windows,
     ...(manualReset ? { manualReset } : {}),
+    ...(plan ? { plan } : {}),
     // "rate-limited" with a figure is a live reading at 100% (codex/kimi/zai) or a stale claude backoff (stale: true).
     status: r.stale === true ? "cached" : "live",
     ...(capturedAt ? { capturedAt } : {}),

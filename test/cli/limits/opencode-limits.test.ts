@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  fetchOpencodeGoQuotaForKey,
   fetchOpencodeLimits,
   fetchableOpencodeProviders,
   pendingOpencodeProviders,
@@ -183,6 +184,7 @@ describe("fetchOpencodeLimits", () => {
       expect(results).toHaveLength(1);
       expect(results[0]!.provider).toBe("opencode-go");
       expect(results[0]!.status).toBe("live");
+      expect(results[0]!.plan).toBe("Go");
       expect(authorizations).toEqual(["Bearer SYNTHETIC_FIXTURE-fresh-v2-opencode-access"]);
     } finally {
       globalThis.fetch = realFetch;
@@ -206,6 +208,29 @@ describe("fetchOpencodeLimits", () => {
     const explicit = await fetchOpencodeLimits(identity, true);
     expect(explicit).toHaveLength(1);
     expect(explicit[0]!.error).toContain("no fetchable OpenCode providers");
+  });
+
+  test("an active Go read names the Go plan; a plan-less read leaves the plan absent", async () => {
+    const realFetch = globalThis.fetch;
+    const active = { usage: { rolling: { status: "ok", percent: 5, resetsAt: "2026-11-24T20:00:00Z" }, weekly: { status: "ok", percent: 42, resetsAt: "2026-11-30T00:00:00Z" } } };
+    globalThis.fetch = (async (_url: string | URL | Request) => Response.json(active)) as typeof fetch;
+    try {
+      const outcome = await fetchOpencodeGoQuotaForKey("go-key-SYNTHETIC_FIXTURE");
+      expect(outcome.windows).toHaveLength(2);
+      expect(outcome.plan).toBe("Go");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    // A key with no plan answers 200 with untouched windows and no resets.
+    const untouched = { usage: { rolling: { status: "ok", percent: 0 }, weekly: { status: "ok", percent: 0 } } };
+    globalThis.fetch = (async (_url: string | URL | Request) => Response.json(untouched)) as typeof fetch;
+    try {
+      const outcome = await fetchOpencodeGoQuotaForKey("go-key-SYNTHETIC_FIXTURE");
+      expect(outcome.noPlan).toBe(true);
+      expect(outcome.plan).toBeUndefined();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   test("a null-active imported v2 row is usable and seeds the pending provider list without any auth.json", async () => {

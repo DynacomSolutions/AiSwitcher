@@ -135,3 +135,31 @@ describe("fetchClaudeLimits rate limiting", () => {
     expect(result.error).toContain("rate-limited");
   });
 });
+
+describe("fetchClaudeLimits plan label", () => {
+  const id = { name: "acct", label: "Acct", configDir: "/nonexistent/acct" };
+  const cacheDir = () => mkdtempSync(join(tmpdir(), "ais-limits-"));
+  const ok = async () => ({ body: { five_hour: { utilization: 42, resets_at: "2026-10-12T00:00:00Z" } } });
+  const common = { reconcile: async () => undefined as never };
+
+  test("a live read carries the plan label, and the fresh cached read keeps it without a new plan read", async () => {
+    const dir = cacheDir();
+    const live = await fetchClaudeLimits(id, { ...common, cacheDir: dir, fetchBody: ok, fetchPlanLabel: async () => "Max 20x" });
+    expect(live.plan).toBe("Max 20x");
+    const reused = await fetchClaudeLimits(id, {
+      ...common,
+      cacheDir: dir,
+      fetchBody: ok,
+      fetchPlanLabel: async () => {
+        throw new Error("the fresh cached read must not read the plan again");
+      },
+    });
+    expect(reused.plan).toBe("Max 20x");
+  });
+
+  test("an unreadable plan leaves the field absent, never a guess", async () => {
+    const result = await fetchClaudeLimits(id, { ...common, cacheDir: cacheDir(), fetchBody: ok, fetchPlanLabel: async () => undefined });
+    expect(result.status).toBe("live");
+    expect(result.plan).toBeUndefined();
+  });
+});

@@ -70,6 +70,21 @@ export interface ClaudePlan {
   stale?: boolean;
 }
 
+/** Short display label for a profile plan. The tier's multiplier names the
+ * Max variant ("Max 20x"). Known types only: an unknown type yields
+ * undefined, never a guessed label. */
+export function claudePlanLabel(plan: { type: string; tier?: string }): string | undefined {
+  const type = plan.type.toLowerCase();
+  if (type.includes("max")) {
+    const multiplier = /(\d+)x/.exec(plan.tier ?? "");
+    return multiplier ? `Max ${multiplier[1]}x` : "Max";
+  }
+  if (type.includes("enterprise")) return "Enterprise";
+  if (type.includes("team")) return "Team";
+  if (type.includes("pro")) return "Pro";
+  return undefined;
+}
+
 function num(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
@@ -364,6 +379,18 @@ async function savePlanTry(member: Identity, nowMs: number, cacheDir: string): P
   }
 }
 
+/** Plan display label for one account, from the shared plan reader above.
+ * Reuses its hourly profile cache and failure backoff: a fresh cached plan
+ * answers with no network call, and no new endpoint is added. Undefined
+ * when no login or no plan is readable. */
+export async function claudePlanLabelFor(member: Identity, deps: FetchUsageDeps = {}, cacheDir?: string): Promise<string | undefined> {
+  const dir = cacheDir ?? deps.cacheDir ?? aisCacheDir();
+  const { token } = await usableAccessToken(member, deps);
+  if (!token) return undefined;
+  const plan = await currentPlan(member, token, deps, dir, deps.now?.() ?? Date.now());
+  return plan ? claudePlanLabel(plan) : undefined;
+}
+
 /** Raw usage body including the `cedar_ember` reset grants, from one request; `error` on ANY failure (never throws). */
 export async function fetchUsageBodyWithResets(
   member: Identity,
@@ -445,8 +472,10 @@ async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir:
     // without it the last seen grant list stays, marked stale.
     const { extraUsage: _old, manualReset: prevReset, ...prev } = (await loadLastGood(member, cacheDir)) ?? { toolName: "claude" as const };
     const manualReset = manualResetFromCedarEmber((body as { cedar_ember?: unknown } | null)?.cedar_ember, nowMs) ?? carriedManualReset(prevReset, nowMs);
-    await saveLastGood(member, { ...prev, toolName: "claude", identity: member, windows: windowsFromUsageBody(body), status: "live", capturedAt, ...(usage.extraUsage ? { extraUsage: usage.extraUsage } : {}), ...(manualReset ? { manualReset } : {}) }, cacheDir);
     const plan = await currentPlan(member, token, deps, cacheDir, nowMs);
+    const planLabel = plan ? claudePlanLabel(plan) : undefined;
+    // The shared last-good read carries the plan label too, so `ais limits` serves it from its fresh-cache path.
+    await saveLastGood(member, { ...prev, toolName: "claude", identity: member, windows: windowsFromUsageBody(body), status: "live", capturedAt, ...(usage.extraUsage ? { extraUsage: usage.extraUsage } : {}), ...(manualReset ? { manualReset } : {}), ...(planLabel ? { plan: planLabel } : {}) }, cacheDir);
     return { ...usage, ...(manualReset ? { manualReset } : {}), ...(plan ? { plan } : {}) };
   }
   return usage;

@@ -66,6 +66,8 @@ export interface PoolUsage {
   manualReset?: ManualResetInfo;
   /** Claude: the plan Anthropic reports for the login now (type and rate-limit tier), read again every hour. */
   plan?: { type: string; tier?: string; checkedAt: string; stale?: boolean };
+  /** Other providers: the short plan display label from the limits fetch (codex planType, kimi membership, zai level). */
+  planLabel?: string;
   error?: string;
   retryAfterSeconds?: number;
   capturedAt: string;

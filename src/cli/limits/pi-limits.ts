@@ -58,6 +58,7 @@ async function kimiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry
     status: "live",
     windows: outcome.windows,
     ...(outcome.overage ? { overage: outcome.overage } : {}),
+    ...(outcome.plan ? { plan: outcome.plan } : {}),
   });
 }
 
@@ -65,7 +66,7 @@ function result(
   toolName: "pi",
   provider: string,
   identity: Identity,
-  fields: Pick<ToolLimitResult, "status" | "windows"> & { error?: string; overage?: OverageInfo },
+  fields: Pick<ToolLimitResult, "status" | "windows"> & { error?: string; overage?: OverageInfo; plan?: string },
 ): ToolLimitResult {
   return {
     toolName,
@@ -75,6 +76,7 @@ function result(
     status: fields.status,
     ...(fields.error ? { error: fields.error } : {}),
     ...(fields.overage ? { overage: fields.overage } : {}),
+    ...(fields.plan ? { plan: fields.plan } : {}),
     ...(fields.status === "live" ? { capturedAt: new Date().toISOString() } : {}),
   };
 }
@@ -89,7 +91,7 @@ async function zaiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry)
   if (typeof entry.key !== "string" || entry.key.length === 0) return undefined;
   const outcome = await fetchZaiQuotaForKey(entry.key);
   if (outcome.error || !outcome.windows) return unavailable(toolName, "zai", identity, outcome.error ?? "quota fetch failed");
-  return result(toolName, "zai", identity, { status: "live", windows: outcome.windows });
+  return result(toolName, "zai", identity, { status: "live", windows: outcome.windows, ...(outcome.plan ? { plan: outcome.plan } : {}) });
 }
 
 /** OpenCode Go has a REAL quota endpoint (found 2026-09-03 after the user
@@ -100,7 +102,7 @@ async function opencodeGoResult(toolName: "pi", identity: Identity, entry: PiAut
   if (typeof entry.key !== "string" || entry.key.length === 0) return undefined;
   const outcome = await fetchOpencodeGoQuotaForKey(entry.key);
   if (outcome.error || !outcome.windows) return unavailable(toolName, "opencode-go", identity, outcome.error ?? "quota fetch failed");
-  return result(toolName, "opencode-go", identity, { status: "live", windows: outcome.windows });
+  return result(toolName, "opencode-go", identity, { status: "live", windows: outcome.windows, ...(outcome.plan ? { plan: outcome.plan } : {}) });
 }
 
 /** The auth.json entries this adapter will act on, in file order, with every

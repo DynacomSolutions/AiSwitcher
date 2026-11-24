@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  codexPlanLabel,
   isCodexAuthRejectionError,
   extraUsageFromCredits,
   isTransientCodexLimitsError,
@@ -8,6 +9,25 @@ import {
   type RateLimitResetCreditsWire,
   type RateLimitSnapshotWire,
 } from "../../../src/cli/limits/codex-limits.ts";
+
+describe("codexPlanLabel", () => {
+  test("maps the known ChatGPT plan types to short display labels", () => {
+    expect(codexPlanLabel("plus")).toBe("Plus");
+    expect(codexPlanLabel("pro")).toBe("Pro");
+    expect(codexPlanLabel("team")).toBe("Team");
+    expect(codexPlanLabel("enterprise")).toBe("Enterprise");
+    expect(codexPlanLabel("free")).toBe("Free");
+    expect(codexPlanLabel("go")).toBe("Go");
+    expect(codexPlanLabel("PRO")).toBe("Pro");
+  });
+
+  test("absent or unknown plan types yield undefined, never a guess", () => {
+    expect(codexPlanLabel(undefined)).toBeUndefined();
+    expect(codexPlanLabel(null)).toBeUndefined();
+    expect(codexPlanLabel("")).toBeUndefined();
+    expect(codexPlanLabel("future_tier")).toBeUndefined();
+  });
+});
 
 describe("extraUsageFromCredits", () => {
   test("maps the credits block", () => {

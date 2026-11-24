@@ -49,6 +49,15 @@ export interface ZaiQuotaResponseWire {
   data?: { limits?: ZaiLimitWire[]; level?: string };
 }
 
+/** Short display label for the quota wire's plan level (`data.level`,
+ * confirmed live as "max" on a GLM Coding Max account). Title-cases the
+ * wire's own word. An absent or empty level yields undefined. */
+export function zaiPlanLabel(level: string | undefined): string | undefined {
+  const words = (level ?? "").trim().split(/[\s_]+/).filter(Boolean);
+  if (words.length === 0) return undefined;
+  return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+}
+
 /** The web-tools monthly allowance is a distinct resource (call counts, not
  * tokens) from the two TOKENS_LIMIT windows — labeled "web tools" and
  * bucketed "other" rather than "month", so it never reads as directly
@@ -100,6 +109,8 @@ function errorMessage(err: unknown): string {
 
 export interface ZaiQuotaOutcome {
   windows?: LimitWindow[];
+  /** Plan level display label, when the quota body reports one. */
+  plan?: string;
   error?: string;
 }
 
@@ -140,7 +151,8 @@ export async function fetchZaiQuotaForKey(apiKey: string): Promise<ZaiQuotaOutco
   if (windows.length === 0) {
     return { error: "zai reported no quota windows" };
   }
-  return { windows };
+  const plan = zaiPlanLabel(payload.data?.level);
+  return { windows, ...(plan ? { plan } : {}) };
 }
 
 /**
@@ -167,5 +179,5 @@ export async function fetchZaiLimits(identity: Identity): Promise<FetchedLimitRe
   if (outcome.error || !outcome.windows) {
     return { ...base, windows: [], status: "unavailable", error: outcome.error };
   }
-  return { ...base, windows: outcome.windows, status: "live", capturedAt: new Date().toISOString() };
+  return { ...base, windows: outcome.windows, status: "live", capturedAt: new Date().toISOString(), ...(outcome.plan ? { plan: outcome.plan } : {}) };
 }

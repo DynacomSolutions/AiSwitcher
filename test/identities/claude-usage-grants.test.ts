@@ -53,3 +53,10 @@ test("usageFromLimits carries manualReset additively", () => {
   expect(usageFromLimits([{ status: "live", windows: [win], manualReset }]).manualReset).toEqual(manualReset);
   expect(usageFromLimits([{ status: "live", windows: [win] }]).manualReset).toBeUndefined();
 });
+
+test("usageFromLimits carries the plan label of a live read", () => {
+  const win = { label: "week", category: "week" as const, usedPercent: 10 };
+  expect(usageFromLimits([{ status: "live", windows: [win], plan: "Standard" }]).planLabel).toBe("Standard");
+  expect(usageFromLimits([{ status: "live", windows: [win] }]).planLabel).toBeUndefined();
+  expect(usageFromLimits([{ status: "unavailable", windows: [], plan: "Standard" }]).planLabel).toBeUndefined();
+});

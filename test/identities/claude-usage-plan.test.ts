@@ -1,8 +1,9 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PLAN_TTL_MS, fetchMemberUsage } from "../../src/identities/claude-usage-api.ts";
+import { loadLastGood } from "../../src/cli/limits/claude-limits.ts";
+import { PLAN_TTL_MS, claudePlanLabel, claudePlanLabelFor, fetchMemberUsage } from "../../src/identities/claude-usage-api.ts";
 import { claudeAdapter } from "../../src/identities/pool/claude-adapter.ts";
 
 function setup() {
@@ -66,4 +67,44 @@ test("no plan is made up when the profile never answered", async () => {
   const u = await fetchMemberUsage(identity, { fetchImpl, cacheDir, claudeRegistryPath, noRefresh: true, fresh: true });
   expect(u.status).toBe("live");
   expect(u.plan).toBeUndefined();
+});
+
+describe("claudePlanLabel", () => {
+  test("maps the known profile plans to short display labels", () => {
+    expect(claudePlanLabel({ type: "claude_max", tier: "default_claude_max_20x" })).toBe("Max 20x");
+    expect(claudePlanLabel({ type: "claude_max", tier: "default_claude_max_5x" })).toBe("Max 5x");
+    expect(claudePlanLabel({ type: "claude_max" })).toBe("Max");
+    expect(claudePlanLabel({ type: "claude_pro", tier: "default_claude_ai" })).toBe("Pro");
+    expect(claudePlanLabel({ type: "claude_team" })).toBe("Team");
+    expect(claudePlanLabel({ type: "claude_enterprise" })).toBe("Enterprise");
+  });
+
+  test("an unknown plan type yields undefined, never a guess", () => {
+    expect(claudePlanLabel({ type: "claude_future" })).toBeUndefined();
+    expect(claudePlanLabel({ type: "" })).toBeUndefined();
+  });
+});
+
+describe("claudePlanLabelFor", () => {
+  test("reads the label through the shared plan reader and reuses its hourly cache", async () => {
+    const { identity, cacheDir, claudeRegistryPath } = setup();
+    const { fetchImpl, calls } = fake(() => Response.json({ organization: { organization_type: "claude_max", rate_limit_tier: "default_claude_max_20x" } }));
+    const deps = { fetchImpl, cacheDir, claudeRegistryPath, noRefresh: true };
+    expect(await claudePlanLabelFor(identity, deps)).toBe("Max 20x");
+    expect(await claudePlanLabelFor(identity, deps)).toBe("Max 20x");
+    expect(calls.profile).toBe(1);
+  });
+
+  test("a profile that never answered yields undefined", async () => {
+    const { identity, cacheDir, claudeRegistryPath } = setup();
+    const { fetchImpl } = fake(() => new Response("{}", { status: 500 }));
+    expect(await claudePlanLabelFor(identity, { fetchImpl, cacheDir, claudeRegistryPath, noRefresh: true })).toBeUndefined();
+  });
+
+  test("a live usage read writes the plan label into the shared last-good file", async () => {
+    const { identity, cacheDir, claudeRegistryPath } = setup();
+    const { fetchImpl } = fake(() => Response.json({ organization: { organization_type: "claude_team" } }));
+    await fetchMemberUsage(identity, { fetchImpl, cacheDir, claudeRegistryPath, noRefresh: true, fresh: true });
+    expect((await loadLastGood(identity, cacheDir))?.plan).toBe("Team");
+  });
 });

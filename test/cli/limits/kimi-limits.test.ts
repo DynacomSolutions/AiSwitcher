@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
+  fetchKimiUsageForCredentials,
+  kimiPlanLabel,
   overageFromBoosterWallet,
   windowsFromUsagesResponse,
   type KimiBoosterWalletWire,
@@ -218,5 +220,54 @@ describe("overageFromBoosterWallet", () => {
   test("a non-numeric monthlyUsed is skipped rather than guessed at", () => {
     const wallet = { monthlyUsed: { priceInCents: "not-a-number" } } as unknown as KimiBoosterWalletWire;
     expect(overageFromBoosterWallet(wallet)).toBeUndefined();
+  });
+});
+
+describe("kimiPlanLabel", () => {
+  test("strips the LEVEL_ prefix and title-cases the words", () => {
+    expect(kimiPlanLabel("LEVEL_STANDARD")).toBe("Standard");
+    expect(kimiPlanLabel("LEVEL_PRO")).toBe("Pro");
+    expect(kimiPlanLabel("LEVEL_TEAM_PREMIUM")).toBe("Team Premium");
+    expect(kimiPlanLabel("standard")).toBe("Standard");
+  });
+
+  test("absent or empty levels yield undefined, never a guess", () => {
+    expect(kimiPlanLabel(undefined)).toBeUndefined();
+    expect(kimiPlanLabel("")).toBeUndefined();
+    expect(kimiPlanLabel("LEVEL_")).toBeUndefined();
+  });
+});
+
+describe("fetchKimiUsageForCredentials plan label", () => {
+  // Synthetic credential: a valid token far from expiry, so no refresh runs.
+  const credentials = { access_token: "kimi-access-SYNTHETIC_FIXTURE", expires_at: Math.floor(Date.now() / 1000) + 3600 };
+  const refreshCtx = { lockDir: "/nonexistent/lock", reread: async () => undefined };
+  const persist = async () => {};
+  const limits = [
+    { window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" }, detail: { limit: "100", used: "1", remaining: "99", resetTime: "2026-11-24T08:00:00Z" } },
+  ];
+
+  test("the membership level rides the outcome", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: string | URL | Request) => Response.json({ user: { membership: { level: "LEVEL_STANDARD" } }, limits })) as typeof fetch;
+    try {
+      const outcome = await fetchKimiUsageForCredentials(credentials, persist, refreshCtx);
+      expect(outcome.windows).toHaveLength(1);
+      expect(outcome.plan).toBe("Standard");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("a body without membership leaves the plan absent", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: string | URL | Request) => Response.json({ limits })) as typeof fetch;
+    try {
+      const outcome = await fetchKimiUsageForCredentials(credentials, persist, refreshCtx);
+      expect(outcome.windows).toHaveLength(1);
+      expect(outcome.plan).toBeUndefined();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });
