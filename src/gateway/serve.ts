@@ -353,6 +353,25 @@ async function defaultPoolMembers(provider: GatewayProvider): Promise<string[]> 
   return appPoolMemberNames(await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath));
 }
 
+/**
+ * Whether a pool may offer an identity's login: the gateway must manage it. The refresh management check decides for the
+ * tools it covers. OpenCode has no refresh, so an identity is managed only while the gateway holds a credential copy for it.
+ * This gate runs even without a credential store, so a non-gateway identity is never a pool candidate.
+ */
+export function poolManagementCheck(
+  creds: GatewayDeps["creds"],
+  isManaged?: (tool: string, identity: string) => Promise<boolean>,
+): (tool: string, identity: string) => Promise<boolean> {
+  return async (tool, identity) => {
+    if ((GATEWAY_REFRESH_TOOLS as readonly string[]).includes(tool)) return isManaged ? isManaged(tool, identity) : true;
+    if (tool === "opencode") {
+      const dead = creds.loggedOut ? await creds.loggedOut(tool, identity).catch(() => false) : false;
+      return !dead;
+    }
+    return true;
+  };
+}
+
 /** Allowed, non-retired members of pool `pool` in `file`, or undefined when the file has no such pool. */
 export function browserPoolMemberNames(file: IdentitiesFile, pool: string): string[] | undefined {
   const found = findPool(file, pool);
@@ -737,12 +756,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     onRead: (provider, source) => metrics.usageRead(provider, source),
     onSharedError: () => metrics.usageSharedError(),
   });
-  // An unrestricted pool app uses real logins only, and of those only the ones the gateway manages.
+  // An unrestricted pool app uses real logins only, and of those only the ones the gateway manages. The management gate
+  // always runs (even without a credential store), so a non-gateway identity is never a candidate.
+  const poolManaged = poolManagementCheck(creds, isManaged);
   const poolMembers =
     hooks.poolMembers ??
-    (isManaged
-      ? async (provider: GatewayProvider): Promise<string[]> => onlyManaged(provider, await defaultPoolMembers(provider), isManaged)
-      : defaultPoolMembers);
+    (async (provider: GatewayProvider): Promise<string[]> => onlyManaged(provider, await defaultPoolMembers(provider), poolManaged));
   const browserPoolMembers = hooks.browserPoolMembers ?? defaultBrowserPoolMembers;
   const browserIdentityExists = hooks.browserIdentityExists ?? defaultBrowserIdentityExists;
 
