@@ -442,9 +442,9 @@ ETA: 2026-12-12 18:00 ICT
 | 305 | Cluster: shipper values, recipient key, ingest secret | done | claude | | 20.303 | | .cluster PR 3305 merged.<br>Shipper stays off. |
 | 306 | Cluster: HoardDB read key, NetworkPolicy, env | done | claude | | 20.297 | | .cluster PR 3255 merged.<br>Read-only key on the whole bucket (no prefix scope).<br>List works, PUT refused, from both pods. |
 | 307 | Cluster: watchdog rules, metrics, Headlamp row | done | claude | | 20.303, 20.299 | | .cluster PR 3306 merged.<br>Alerts gated on the shipper flag, plus a restart-loop rule. |
-| 308 | Console reader from the database | in_review | claude | sessions-console-reader | 20.301, 20.302, 20.306 | 2026-11-25 01:30 ICT | AIS_SESSIONS_SOURCE switch.<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/785, CI green.<br>Opus review found 3 db-mode faults; fixes go to the row worker.<br>Identity resolution still open: rows show as (unassigned). |
+| 308 | Console reader from the database | done | claude | sessions-console-reader | 20.301, 20.302, 20.306 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/785 (9e06016).<br>AIS_SESSIONS_SOURCE switch, default files.<br>Two Opus reviews, all faults fixed.<br>Identity resolution still open: rows show as (unassigned). |
 | 309 | Equivalence test and performance proof | todo | | | 20.308 | | |
-| 310 | Backfill per node with verification | in_progress | claude | sessions-backfill | 20.305, 20.307 | 2026-11-25 03:00 ICT | Smallest node first, largest node last. |
+| 310 | Backfill per node with verification | in_progress | claude | sessions-backfill | 20.305, 20.307 | 2026-11-25 23:59 ICT | .cluster PR https://github.com/DynacomSolutions/.cluster/pull/3327 (phase 1).<br>Smallest node first, largest node last.<br>Largest nodes wait for a 24 h object store check. |
 | 311 | Reconcile drill and verify-host command | todo | | | 20.310 | | |
 | 312 | Cut over Claude and Codex to the database | todo | | | 20.309, 20.310 | | |
 | 313 | Pi, Grok and Kimi sessions in the database | todo | | | 20.312 | | |
