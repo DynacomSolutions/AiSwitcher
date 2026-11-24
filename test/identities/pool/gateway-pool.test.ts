@@ -491,6 +491,7 @@ describe("claude: gateway-routed pools and members", () => {
     const member = { name: "c", label: "c", configDir: dirOf("c") };
     const seen: Array<{ url: string; auth: string }> = [];
     const fetchImpl = (async (url: string, init: RequestInit) => {
+      if (url.endsWith("/api/oauth/profile")) return new Response("{}", { status: 404 }); // the hourly plan read
       seen.push({ url, auth: (init.headers as Record<string, string>).Authorization ?? "" });
       return new Response(JSON.stringify({ five_hour: { utilization: 12, resets_at: null }, seven_day: { utilization: 34, resets_at: null } }), { status: 200 });
     }) as unknown as typeof fetch;

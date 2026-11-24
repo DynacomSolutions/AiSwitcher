@@ -64,6 +64,8 @@ export interface PoolUsage {
   extraUsage?: ExtraUsageInfo;
   /** Claude reset grants (cedar_ember) of the member, for display and the console's spend buttons. */
   manualReset?: ManualResetInfo;
+  /** Claude: the plan Anthropic reports for the login now (type and rate-limit tier), read again every hour. */
+  plan?: { type: string; tier?: string; checkedAt: string; stale?: boolean };
   error?: string;
   retryAfterSeconds?: number;
   capturedAt: string;

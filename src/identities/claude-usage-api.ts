@@ -54,9 +54,20 @@ export interface MemberUsage {
   extraUsage?: ExtraUsageInfo;
   /** Reset grants (cedar_ember); carried over, marked stale, when a read omitted them. */
   manualReset?: ManualResetInfo;
+  /** The plan Anthropic reports for the login now (its profile), so an upgrade shows without a new login. */
+  plan?: ClaudePlan;
   error?: string;
   retryAfterSeconds?: number;
   capturedAt: string;
+}
+
+/** The login's plan from GET /api/oauth/profile, e.g. type `claude_max`, tier `default_claude_max_20x`. */
+export interface ClaudePlan {
+  type: string;
+  tier?: string;
+  checkedAt: string;
+  /** The latest profile read failed: this is the last plan read. */
+  stale?: boolean;
 }
 
 function num(value: unknown): number | undefined {
@@ -284,6 +295,75 @@ function getUsage(token: string, url: string, deps: FetchUsageDeps, cliUserAgent
   });
 }
 
+const CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
+/** How often the plan is read again: a plan changes rarely, but an upgrade must show without a new login. */
+export const PLAN_TTL_MS = 60 * 60_000;
+
+function planPath(member: Identity, cacheDir: string): string {
+  return join(cacheDir, "claude-plan", `${encodeURIComponent(member.name)}.json`);
+}
+
+async function loadPlan(member: Identity, cacheDir: string): Promise<ClaudePlan | undefined> {
+  try {
+    const p = JSON.parse(await readFile(planPath(member, cacheDir), "utf8")) as Partial<ClaudePlan>;
+    if (typeof p.type !== "string" || typeof p.checkedAt !== "string") return undefined;
+    return { type: p.type, ...(typeof p.tier === "string" ? { tier: p.tier } : {}), checkedAt: p.checkedAt, ...(p.stale ? { stale: true } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
+async function savePlan(member: Identity, plan: ClaudePlan, cacheDir: string): Promise<void> {
+  const path = planPath(member, cacheDir);
+  try {
+    await mkdir(join(cacheDir, "claude-plan"), { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify(plan));
+    await rename(tmp, path);
+  } catch {
+    // Bookkeeping only; never fail a usage read over it.
+  }
+}
+
+/** The plan from the profile, read again once the last read is older than PLAN_TTL_MS. A failed read keeps the last plan, marked stale. */
+async function currentPlan(member: Identity, token: string, deps: FetchUsageDeps, cacheDir: string, nowMs: number): Promise<ClaudePlan | undefined> {
+  const last = await loadPlan(member, cacheDir);
+  if (last && nowMs - Date.parse(last.checkedAt) < PLAN_TTL_MS) return last;
+  const triedAt = await loadPlanTry(member, cacheDir);
+  // A failed read is not tried again at every usage poll; the last plan stands, marked stale.
+  if (last && nowMs - triedAt < PLAN_RETRY_MS) return { ...last, stale: true };
+  try {
+    const res = await getUsage(token, CLAUDE_PROFILE_URL, deps);
+    if (res.ok) {
+      const org = ((await res.json().catch(() => undefined)) as { organization?: { organization_type?: unknown; rate_limit_tier?: unknown } } | undefined)?.organization;
+      if (typeof org?.organization_type === "string" && org.organization_type !== "") {
+        const plan: ClaudePlan = { type: org.organization_type, ...(typeof org.rate_limit_tier === "string" && org.rate_limit_tier ? { tier: org.rate_limit_tier } : {}), checkedAt: new Date(nowMs).toISOString() };
+        await savePlan(member, plan, cacheDir);
+        return plan;
+      }
+    } else await res.body?.cancel().catch(() => undefined);
+  } catch {
+    // fall through: keep the last plan
+  }
+  await savePlanTry(member, nowMs, cacheDir);
+  return last ? { ...last, stale: true } : undefined;
+}
+
+const PLAN_RETRY_MS = 5 * 60_000;
+const planTryPath = (member: Identity, cacheDir: string): string => `${planPath(member, cacheDir)}.tried`;
+async function loadPlanTry(member: Identity, cacheDir: string): Promise<number> {
+  const n = Number(await readFile(planTryPath(member, cacheDir), "utf8").catch(() => ""));
+  return Number.isFinite(n) ? n : 0;
+}
+async function savePlanTry(member: Identity, nowMs: number, cacheDir: string): Promise<void> {
+  try {
+    await mkdir(join(cacheDir, "claude-plan"), { recursive: true });
+    await writeFile(planTryPath(member, cacheDir), String(nowMs));
+  } catch {
+    // Bookkeeping only.
+  }
+}
+
 /** Raw usage body including the `cedar_ember` reset grants, from one request; `error` on ANY failure (never throws). */
 export async function fetchUsageBodyWithResets(
   member: Identity,
@@ -315,7 +395,9 @@ export async function fetchMemberUsage(member: Identity, deps: FetchUsageDeps = 
   // A login the gateway holds: the gateway read is the only source (it polls Anthropic itself; a second poll draws a 429).
   if (claudeReadsViaGateway(member, deps.memberRoot)) return fetchMemberUsageViaGateway(member, deps);
   const cacheDir = deps.cacheDir ?? aisCacheDir();
-  const usage = await readMemberUsage(member, deps, cacheDir);
+  const read = await readMemberUsage(member, deps, cacheDir);
+  const cachedPlan = read.plan ? undefined : await loadPlan(member, cacheDir);
+  const usage = cachedPlan ? { ...read, plan: cachedPlan } : read;
   if (usage.status === "live") return usage;
   const last = await loadLastGood(member, cacheDir);
   const age = Date.parse(usage.capturedAt) - Date.parse(last?.capturedAt ?? "");
@@ -364,7 +446,8 @@ async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir:
     const { extraUsage: _old, manualReset: prevReset, ...prev } = (await loadLastGood(member, cacheDir)) ?? { toolName: "claude" as const };
     const manualReset = manualResetFromCedarEmber((body as { cedar_ember?: unknown } | null)?.cedar_ember, nowMs) ?? carriedManualReset(prevReset, nowMs);
     await saveLastGood(member, { ...prev, toolName: "claude", identity: member, windows: windowsFromUsageBody(body), status: "live", capturedAt, ...(usage.extraUsage ? { extraUsage: usage.extraUsage } : {}), ...(manualReset ? { manualReset } : {}) }, cacheDir);
-    return manualReset ? { ...usage, manualReset } : usage;
+    const plan = await currentPlan(member, token, deps, cacheDir, nowMs);
+    return { ...usage, ...(manualReset ? { manualReset } : {}), ...(plan ? { plan } : {}) };
   }
   return usage;
 }
