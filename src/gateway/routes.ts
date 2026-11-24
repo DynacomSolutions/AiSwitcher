@@ -43,7 +43,7 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
  *   ChatGPT account detail: `deny`, answered 404 with no upstream call and no login.
  */
 export type Route =
-  | { kind: "upstream"; url: string; side: boolean; /** A model list: "list" the collection, "one" a single model. A pool app gets the pool's answer (models-union.ts). */ models?: "list" | "one" }
+  | { kind: "upstream"; url: string; side: boolean; /** A model list: "list" the collection, "one" a single model. Every app gets the union over its allowed members (models-union.ts). A pin is a one-member pool. */ models?: "list" | "one" }
   | { kind: "serve"; name: ServedName }
   | { kind: "account"; op: AccountOp; url: string; /** false: not counted against the daily side limit (telemetry and the like). */ count?: false }
   | { kind: "deny"; status: 403 | 404 };

@@ -108,7 +108,8 @@ either, `add` a new app under a new name and `revoke` the old one. A revoked nam
 ## Out of capacity
 
 When every allowed pool member is over its limit or reserve (or a pinned member is), claude and codex apps answer
-in the provider's own limit shape, so the CLI shows its built-in limit message and resets:
+in the provider's own limit shape, so the CLI shows its built-in limit message and resets. This applies to model
+calls. A model list is never refused by the reserve (see "Extra routes" below).
 
 - claude: `429` with a `rate_limit_error` body and the `anthropic-ratelimit-unified-*` headers (status `rejected`,
   reset in epoch seconds, representative claim, 5h and 7d families) plus `retry-after`.
@@ -219,13 +220,15 @@ speech call is not a model call); the daily token cap does.
 
 - **Model lists**, `GET /models` or `/v1/models` (and `/models/<id>` where the
   provider has it), for every provider. ali has no upstream list, so the gateway
-  lists the models AIS knows. A pool app gets what the pool can serve, not one
+  lists the models AIS knows. An app gets what its allowed members can serve, not one
   member's plan (`src/gateway/models-union.ts`, board 13.190): the list is the union of every member
   the app may use (matched by `slug` or `id`; "list" visibility beats "hide", and
   that entry's fields come from a member that lists it; Codex entries in `priority`
   order; its own ETag), and `/models/<id>` is answered by the first member that has
   it. A member that fails is left out; if none lists, the first member's answer
-  stands. Conditional headers are not sent on. A pinned app keeps the plain pass-through.
+  stands. Conditional headers are not sent on. A pin is a one-member pool and uses
+  the same path. A model list consumes no quota. The reserve never refuses it, and
+  an upstream quota answer passes through unchanged.
 - **kimi** `POST /search` and `POST /fetch` (also under `/v1`), sent to the Kimi
   Coding `search` and `fetch` services. UNPROVEN live.
 - **codex** `POST /v1/audio/transcriptions` (or `/transcribe`), sent to ChatGPT's

@@ -7,11 +7,10 @@ import { allowedMembers } from "./select.ts";
 import type { ApiStyle, GatewayApp } from "./types.ts";
 
 /**
- * Model lists for a pool app. Pool members can be on different plans, so one member's list is not what the pool can
- * serve: a request for a model only some members have still succeeds, because the model path fails over to the next
- * member. A collection (`GET /models`) is therefore the union of every member's list; a single model
- * (`GET /models/<id>`) is answered by the first member that has it. A pinned app has one identity and keeps the plain
- * pass-through.
+ * Model lists for an app, pool or pin. Pool members can be on different plans, so one member's list is not what the
+ * pool can serve: a request for a model only some members have still succeeds, because the model path fails over to the
+ * next member. A collection (`GET /models`) is therefore the union of every member's list; a single model
+ * (`GET /models/<id>`) is answered by the first member that has it. A pin is a one-member pool and uses the same path.
  *
  * Union rules: entries are matched by `slug` (Codex) or `id` (Anthropic and OpenAI style); the entry with the widest
  * visibility wins ("list" beats anything else, anything beats "hide"), and all its other fields come from the member
