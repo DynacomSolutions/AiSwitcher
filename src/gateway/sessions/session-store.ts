@@ -565,16 +565,26 @@ export class SessionStore {
     }
   }
 
-  /** One node per session, newest first. Reads the view `ais_session_tree`. */
+  /**
+   * One node per session, newest first. A session is its tool and session id; its node is the row of its newest
+   * generation (what the view `ais_session_tree` returns). The view cannot use the time filter: `DISTINCT ON` runs
+   * before it, so a read sorts every row of the table. This query filters first, on the index of `updated_at`, then
+   * keeps a row only when no newer generation of the same session exists (unique index `kind, session_ref,
+   * generation`, one row per generation, so the generation alone decides the winner). Only the columns of the node
+   * are read: `scan_state` can be large.
+   */
   async tree(q: SessionTreeQuery = {}): Promise<SessionTreeRow[]> {
     const limit = Math.min(Math.max(Math.trunc(q.limit ?? 5000), 1), 50000);
     const rows = await this.sql.unsafe(
-      `SELECT * FROM ais_session_tree
-        WHERE ($1::double precision IS NULL OR updated_at >= to_timestamp($1::double precision / 1000))
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR identity = $3)
-          AND ($4::text IS NULL OR project = $4)
-        ORDER BY updated_at DESC NULLS LAST, id DESC
+      `SELECT f.id, f.node, f.root, f.rel_path, f.generation, f.kind, f.origin, f.pool, f.identity, f.session_ref, f.parent_ref, f.agent_name,
+              f.title, f.cwd, f.project, f.model, f.started_at, f.updated_at, f.message_count, f.committed_bytes, f.committed_lines, f.indexed_bytes
+         FROM ais_session_file f
+        WHERE ($1::double precision IS NULL OR f.updated_at >= to_timestamp($1::double precision / 1000))
+          AND ($2::text IS NULL OR f.kind = $2)
+          AND ($3::text IS NULL OR f.identity = $3)
+          AND ($4::text IS NULL OR f.project = $4)
+          AND NOT EXISTS (SELECT 1 FROM ais_session_file g WHERE g.kind = f.kind AND g.session_ref = f.session_ref AND g.generation > f.generation)
+        ORDER BY f.updated_at DESC NULLS LAST, f.id DESC
         LIMIT $5`,
       [q.sinceMs ?? null, q.kind ?? null, q.identity ?? null, q.project ?? null, limit],
     );
