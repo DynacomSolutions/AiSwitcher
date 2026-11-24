@@ -1,0 +1,1315 @@
+diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
+index f976489..f4d46b0 100644
+--- a/crates/tokscale-core/src/lib.rs
++++ b/crates/tokscale-core/src/lib.rs
+@@ -3477,13 +3477,41 @@ fn parse_all_messages_streaming<S: MessageSink>(
+             // Use a Grok-aware fingerprint: legacy output depends on session
+             // sidecars, while unified output reads metadata across the complete
+             // sessions tree; all of those inputs must invalidate cached output.
+-            load_or_parse_source_with_fingerprint(
++            // AIS: a unified log leaves a checkpoint, so a grown log reads only
++            // its appended bytes (see `resume_grok_unified_log`).
++            let unified = path.file_name().and_then(|name| name.to_str()) == Some("unified.jsonl");
++            let resume = |path: &Path,
++                          entry: &message_cache::CachedSourceEntry,
++                          fingerprint: &message_cache::SourceFingerprint| {
++                sessions::grok::resume_grok_unified_log(
++                    path,
++                    &entry.messages,
++                    &entry.fingerprint,
++                    fingerprint,
++                )
++                .map(|messages| SourceParse {
++                    messages,
++                    cacheable: true,
++                    claude_checkpoint: None,
++                })
++            };
++            load_or_parse_resumable_source(
+                 message_cache::CacheIdentity::for_client(ClientId::Grok),
+                 path,
+                 &source_cache,
+                 pricing,
++                HistoryRetention::LiveFileOnly,
+                 message_cache::SourceFingerprint::check_grok_path_samples_only,
+-                sessions::grok::parse_grok_file,
++                |path, fingerprint| SourceParse {
++                    messages: if unified {
++                        sessions::grok::parse_grok_unified_log_checkpointed(path, fingerprint)
++                    } else {
++                        sessions::grok::parse_grok_file(path)
++                    },
++                    cacheable: true,
++                    claude_checkpoint: None,
++                },
++                unified.then_some(&resume as ResumeSource<'_>),
+             )
+         })
+         .collect();
+@@ -15294,8 +15322,8 @@ mod tests {
+             assert!(parsed(), "{label}: grown log must re-parse");
+             assert_eq!(
+                 metadata_reads(),
+-                vec!["s1", "s2", "s3"],
+-                "{label}: append reads"
++                vec!["s2"],
++                "{label}: an append reads only the newly referenced session"
+             );
+             drop(env);
+             assert_eq!(after_append, cold(home.path()), "{label}: append");
+@@ -15347,6 +15375,154 @@ mod tests {
+         }
+     }
+ 
++    fn ais_grok_row(index: u32) -> String {
++        let sid = if index % 2 == 0 { "s1" } else { "s2" };
++        // Distinct prompt tokens keep every row's dedup key distinct.
++        ais_grok_inference(sid, 11, index % 60, 1000 + index)
++    }
++
++    /// A grown unified log is read from its checkpoint: every cycle returns
++    /// the messages of a cold full read, and a warm cycle reads only the
++    /// appended bytes. A partial last line, a truncated or replaced log, new
++    /// subagent evidence and a changed session fall back to the full parse.
++    #[test]
++    #[serial_test::serial]
++    fn ais_grok_incremental_log_matches_full_read_and_reads_only_new_bytes() {
++        use std::sync::atomic::Ordering;
++        let cache_home = tempfile::TempDir::new().unwrap();
++        let home = tempfile::TempDir::new().unwrap();
++        let sessions = home.path().join(".grok/sessions/%2Ftmp%2Fa");
++        ais_grok_session(&sessions.join("s1"), "grok-code", None);
++        ais_grok_session(&sessions.join("s2"), "grok-4", None);
++        let logs = home.path().join(".grok/logs");
++        std::fs::create_dir_all(&logs).unwrap();
++        let unified = logs.join("unified.jsonl");
++        let scan = |home: &std::path::Path| {
++            ais_grok_rows(&parse_all_messages_with_pricing_with_env_strategy(
++                home.to_str().unwrap(),
++                &["grok".to_string()],
++                None,
++                false,
++                &scanner::ScannerSettings::default(),
++            ))
++        };
++        let cold = |home: &std::path::Path| {
++            let fresh_cache = tempfile::TempDir::new().unwrap();
++            let _env = redirect_cache_home(fresh_cache.path());
++            scan(home)
++        };
++        let bytes = || GROK_BYTES.load(Ordering::Relaxed);
++        use sessions::grok::GROK_UNIFIED_BYTES_READ as GROK_BYTES;
++        let tick = || std::thread::sleep(std::time::Duration::from_millis(30));
++
++        let mut next = 0u32;
++        let mut chunk = |rows: u32| {
++            let mut text = String::new();
++            for _ in 0..rows {
++                text.push_str(&ais_grok_row(next));
++                next += 1;
++            }
++            text
++        };
++        std::fs::write(&unified, chunk(30000)).unwrap();
++        let env = redirect_cache_home(cache_home.path());
++        let before = bytes();
++        let first = scan(home.path());
++        let full_read = bytes() - before;
++        assert_eq!(first.len(), 30000);
++        drop(env);
++        assert_eq!(first, cold(home.path()), "first scan");
++        let log_size = std::fs::metadata(&unified).unwrap().len();
++
++        // Several appended chunks: equal totals, only new bytes read.
++        for round in 0..3 {
++            tick();
++            ais_incremental_append(&unified, &chunk(5));
++            let env = redirect_cache_home(cache_home.path());
++            let before = bytes();
++            let warm = scan(home.path());
++            let read = bytes() - before;
++            drop(env);
++            assert_eq!(warm.len(), 30000 + 5 * (round + 1));
++            assert_eq!(warm, cold(home.path()), "append round {round}");
++            assert!(
++                read * 20 < full_read,
++                "round {round}: read {read} bytes, a full read is {full_read}"
++            );
++            eprintln!(
++                "AIS_GROK_INCREMENTAL log={log_size} full_read_per_cycle={full_read} incremental_read_per_cycle={read}"
++            );
++        }
++
++        // A partial last line is not counted until its newline arrives.
++        tick();
++        let row = chunk(1);
++        let (head, rest) = row.split_at(row.len() / 2);
++        ais_incremental_append(&unified, head);
++        let env = redirect_cache_home(cache_home.path());
++        let with_partial = scan(home.path());
++        drop(env);
++        assert_eq!(with_partial.len(), 30015);
++        assert_eq!(with_partial, cold(home.path()), "partial line");
++        tick();
++        ais_incremental_append(&unified, rest);
++        let env = redirect_cache_home(cache_home.path());
++        let completed = scan(home.path());
++        drop(env);
++        assert_eq!(completed.len(), 30016);
++        assert_eq!(completed, cold(home.path()), "completed line");
++
++        // A truncated log, and a replaced log that is larger than the old one.
++        for (label, contents) in [("truncated", chunk(40)), ("replaced", chunk(30500))] {
++            tick();
++            std::fs::write(&unified, &contents).unwrap();
++            let env = redirect_cache_home(cache_home.path());
++            let warm = scan(home.path());
++            drop(env);
++            assert_eq!(warm, cold(home.path()), "{label}");
++        }
++        // A rotation: a new file at the same path.
++        tick();
++        std::fs::rename(&unified, logs.join("unified.old")).unwrap();
++        std::fs::write(&unified, chunk(30500)).unwrap();
++        let env = redirect_cache_home(cache_home.path());
++        let rotated = scan(home.path());
++        drop(env);
++        assert_eq!(rotated, cold(home.path()), "rotated");
++
++        // New subagent evidence changes earlier attribution: full parse.
++        tick();
++        ais_incremental_append(
++            &unified,
++            "{\"ts\":\"2026-11-01T00:01:00Z\",\"pid\":11,\"msg\":\"subagent spawn credentials\",\"ctx\":{\"subagent_id\":\"s2\",\"model\":\"grok-5\"}}\n",
++        );
++        ais_incremental_append(&unified, &chunk(3));
++        let env = redirect_cache_home(cache_home.path());
++        let with_evidence = scan(home.path());
++        drop(env);
++        assert_eq!(with_evidence, cold(home.path()), "subagent evidence");
++
++        // A session an earlier row used changes its model: full parse.
++        tick();
++        ais_grok_session(&sessions.join("s1"), "grok-5", None);
++        ais_incremental_append(&unified, &chunk(3));
++        let env = redirect_cache_home(cache_home.path());
++        let changed = scan(home.path());
++        drop(env);
++        assert_eq!(changed, cold(home.path()), "session metadata change");
++
++        // After a fallback the next cycle is incremental again.
++        tick();
++        ais_incremental_append(&unified, &chunk(4));
++        let env = redirect_cache_home(cache_home.path());
++        let before = bytes();
++        let again = scan(home.path());
++        let read = bytes() - before;
++        drop(env);
++        assert_eq!(again, cold(home.path()), "after fallback");
++        assert!(read * 10 < std::fs::metadata(&unified).unwrap().len() * 3);
++    }
++
+     #[test]
+     #[serial_test::serial]
+     fn test_parse_all_messages_with_pricing_kimi_deduplicates_repeated_status_updates() {
+diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/src/message_cache.rs
+index 86a1182..9cf3376 100644
+--- a/crates/tokscale-core/src/message_cache.rs
++++ b/crates/tokscale-core/src/message_cache.rs
+@@ -333,7 +333,7 @@ thread_local! {
+     static FULL_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+ }
+ 
+-fn cache_dir() -> Option<PathBuf> {
++pub(crate) fn cache_dir() -> Option<PathBuf> {
+     if crate::paths::is_config_dir_overridden()
+         || dirs::config_dir().is_some()
+         || cfg!(target_os = "macos") && crate::paths::home_dir().is_some()
+diff --git a/crates/tokscale-core/src/sessions/grok.rs b/crates/tokscale-core/src/sessions/grok.rs
+index 3c06980..b1bb9d9 100644
+--- a/crates/tokscale-core/src/sessions/grok.rs
++++ b/crates/tokscale-core/src/sessions/grok.rs
+@@ -63,20 +63,20 @@ struct UnifiedSessionTree {
+     workspaces: Vec<UnifiedWorkspace>,
+ }
+ 
+-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+ struct UnifiedChildScope {
+     pid: i64,
+     generation: UnifiedGeneration,
+     session_id: String,
+ }
+ 
+-#[derive(Debug, Clone, PartialEq, Eq)]
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ enum UnifiedModelEvidence {
+     Unique(String),
+     Conflict,
+ }
+ 
+-#[derive(Debug, Default)]
++#[derive(Debug, Default, Clone, PartialEq)]
+ struct UnifiedChildEvidence {
+     known_scopes: HashSet<UnifiedChildScope>,
+     child_models: HashMap<UnifiedChildScope, UnifiedModelEvidence>,
+@@ -745,94 +745,93 @@ fn parse_grok_unified_log_file_with_prefix(path: &Path, prefix_len: u64) -> Vec<
+     parse_grok_unified_log_snapshot(path, &mut file, prefix_len)
+ }
+ 
+-fn parse_grok_unified_log_snapshot(
+-    path: &Path,
+-    file: &mut std::fs::File,
+-    prefix_len: u64,
+-) -> Vec<UnifiedMessage> {
+-    #[cfg(test)]
+-    GROK_UNIFIED_PARSED_PATHS
+-        .lock()
+-        .unwrap()
+-        .push(path.to_path_buf());
+-    let fallback_timestamp = file_modified_timestamp_ms(path);
+-    // Two streamed passes over the same bounded prefix; the log is never
+-    // held in memory whole.
+-    let evidence = collect_unified_child_evidence(BufReader::new(&mut *file).take(prefix_len));
+-    if file.seek(SeekFrom::Start(0)).is_err() {
+-        return Vec::new();
+-    }
+-
+-    let metadata_by_session = read_unified_session_metadata(path, &evidence.referenced_session_ids);
+-    let mut generations = HashMap::new();
+-    let mut fallback_model_by_pid: HashMap<UnifiedProcessKey, String> = HashMap::new();
+-    let mut model_by_pid_and_session: HashMap<UnifiedProcessSessionKey, String> = HashMap::new();
+-    let mut model_by_session = HashMap::new();
+-    let mut seen = HashSet::new();
+-    let mut messages = Vec::new();
+-
+-    for line in lossy_lines(BufReader::new(file).take(prefix_len)) {
++/// AIS: the state of the unified-log parse after a number of lines. A
++/// checkpoint stores it so a later scan continues from its offset.
++#[derive(Default)]
++struct UnifiedParseState {
++    generations: HashMap<i64, UnifiedGeneration>,
++    fallback_model_by_pid: HashMap<UnifiedProcessKey, String>,
++    model_by_pid_and_session: HashMap<UnifiedProcessSessionKey, String>,
++    model_by_session: HashMap<String, String>,
++    seen: HashSet<String>,
++    messages: Vec<UnifiedMessage>,
++    /// A row without a timestamp took the log's mtime, which changes with
++    /// every append, so such a parse is never resumed.
++    used_fallback_timestamp: bool,
++}
++
++impl UnifiedParseState {
++    fn process_line(
++        &mut self,
++        line: &str,
++        evidence: &UnifiedChildEvidence,
++        metadata_by_session: &HashMap<String, GrokMetadata>,
++        fallback_timestamp: i64,
++    ) {
+         if line.trim().is_empty() {
+-            continue;
++            return;
+         }
+ 
+-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+-            continue;
++        let Ok(value) = serde_json::from_str::<Value>(line) else {
++            return;
+         };
+ 
+         if let Some(pid) = unified_log_process_start_pid(&value) {
+             // The unified log survives process restarts, so an OS-reused PID
+             // must not inherit model authority from the previous process.
+-            advance_unified_generation(&mut generations, pid);
+-            continue;
++            advance_unified_generation(&mut self.generations, pid);
++            return;
+         }
+ 
+         let message_name = value.get("msg").and_then(Value::as_str);
+         match message_name {
+             Some("subagent read parent config (live)") => {
+                 if let Some((pid, model_id)) = unified_log_parent_model(&value) {
+-                    let generation = current_unified_generation(&mut generations, pid);
+-                    fallback_model_by_pid.insert((pid, generation), model_id);
++                    let generation = current_unified_generation(&mut self.generations, pid);
++                    self.fallback_model_by_pid
++                        .insert((pid, generation), model_id);
+                 }
+-                continue;
++                return;
+             }
+             Some("subagent model resolved") => {
+                 if let Some((pid, model_id)) = unified_log_parent_model(&value) {
+-                    let generation = current_unified_generation(&mut generations, pid);
+-                    fallback_model_by_pid.insert((pid, generation), model_id);
+-                    continue;
++                    let generation = current_unified_generation(&mut self.generations, pid);
++                    self.fallback_model_by_pid
++                        .insert((pid, generation), model_id);
++                    return;
+                 }
+             }
+             Some("subagent spawn credentials") => {
+                 if let Some((pid, model_id)) = unified_log_parent_model(&value) {
+-                    let generation = current_unified_generation(&mut generations, pid);
+-                    fallback_model_by_pid.insert((pid, generation), model_id);
++                    let generation = current_unified_generation(&mut self.generations, pid);
++                    self.fallback_model_by_pid
++                        .insert((pid, generation), model_id);
+                 }
+-                if let Some(scope) = unified_child_scope(&value, &mut generations) {
++                if let Some(scope) = unified_child_scope(&value, &mut self.generations) {
+                     if let Some(model_id) = unified_spawn_model(&value) {
+                         if unique_child_model(&evidence, &scope) == Some(model_id.as_str()) {
+-                            model_by_pid_and_session
++                            self.model_by_pid_and_session
+                                 .entry((scope.pid, scope.generation, scope.session_id))
+                                 .or_insert(model_id);
+                         }
+                     }
+                 }
+-                continue;
++                return;
+             }
+             Some("subagent completed") | Some("subagent failed") => {
+-                if let Some(scope) = unified_child_scope(&value, &mut generations) {
++                if let Some(scope) = unified_child_scope(&value, &mut self.generations) {
+                     if let Some(model_id) = unified_terminal_model(&value) {
+                         if unique_terminal_model(&evidence, &scope) == Some(model_id.as_str()) {
+                             // A terminal record is fallback evidence, never a
+                             // rewrite of a model established by an earlier
+                             // exact event.
+-                            model_by_pid_and_session
++                            self.model_by_pid_and_session
+                                 .entry((scope.pid, scope.generation, scope.session_id))
+                                 .or_insert(model_id);
+                         }
+                     }
+                 }
+-                continue;
++                return;
+             }
+             _ => {}
+         }
+@@ -840,81 +839,86 @@ fn parse_grok_unified_log_snapshot(
+         if let Some((pid, session_id, model_id)) = unified_log_model_change(&value) {
+             match (pid, session_id) {
+                 (Some(pid), Some(session_id)) => {
+-                    let generation = current_unified_generation(&mut generations, pid);
+-                    model_by_pid_and_session.insert((pid, generation, session_id), model_id);
++                    let generation = current_unified_generation(&mut self.generations, pid);
++                    self.model_by_pid_and_session
++                        .insert((pid, generation, session_id), model_id);
+                 }
+                 (None, Some(session_id)) => {
+-                    model_by_pid_and_session.retain(|key, _| {
++                    self.model_by_pid_and_session.retain(|key, _| {
+                         key.2 != session_id || evidence.child_session_ids.contains(&key.2)
+                     });
+-                    model_by_session.insert(session_id, model_id);
++                    self.model_by_session.insert(session_id, model_id);
+                 }
+                 (Some(pid), None) => {
+-                    let generation = current_unified_generation(&mut generations, pid);
+-                    fallback_model_by_pid.insert((pid, generation), model_id);
++                    let generation = current_unified_generation(&mut self.generations, pid);
++                    self.fallback_model_by_pid
++                        .insert((pid, generation), model_id);
+                 }
+                 (None, None) => {}
+             }
+-            continue;
++            return;
+         }
+ 
+         if message_name != Some("shell.turn.inference_done") {
+-            continue;
++            return;
+         }
+ 
+         let Some(session_id) =
+             extract_string(value.get("sid")).filter(|session_id| !session_id.trim().is_empty())
+         else {
+-            continue;
++            return;
+         };
+         let Some(context) = value.get("ctx") else {
+-            continue;
++            return;
+         };
+         let Some(prompt_tokens) = required_non_negative_i64(context.get("prompt_tokens")) else {
+-            continue;
++            return;
+         };
+         let Some(completion_tokens) = required_non_negative_i64(context.get("completion_tokens"))
+         else {
+-            continue;
++            return;
+         };
+         let Some(mut cached_prompt_tokens) =
+             optional_non_negative_i64(context.get("cached_prompt_tokens"))
+         else {
+-            continue;
++            return;
+         };
+         let Some(reasoning_tokens) = optional_non_negative_i64(context.get("reasoning_tokens"))
+         else {
+-            continue;
++            return;
+         };
+         cached_prompt_tokens = cached_prompt_tokens.min(prompt_tokens);
+ 
+         let loop_index = match context.get("loop_index") {
+             Some(value) => {
+                 let Some(loop_index) = required_non_negative_i64(Some(value)) else {
+-                    continue;
++                    return;
+                 };
+                 loop_index
+             }
+             None => 1,
+         };
+         let Some(pid) = optional_non_negative_i64(value.get("pid")) else {
+-            continue;
++            return;
+         };
+         let timestamp = value
+             .get("ts")
+             .and_then(parse_timestamp_value)
+-            .unwrap_or(fallback_timestamp);
++            .unwrap_or_else(|| {
++                self.used_fallback_timestamp = true;
++                fallback_timestamp
++            });
+         let reasoning = reasoning_tokens.min(completion_tokens);
+         let dedup_key = unified_log_dedup_key(&session_id, &value);
+-        if !seen.insert(dedup_key.clone()) {
+-            continue;
++        if !self.seen.insert(dedup_key.clone()) {
++            return;
+         }
+ 
+         let metadata = metadata_by_session
+             .get(&session_id)
+             .cloned()
+             .unwrap_or_else(|| fallback_unified_metadata(&session_id, fallback_timestamp));
+-        let generation = current_unified_generation(&mut generations, pid);
++        let generation = current_unified_generation(&mut self.generations, pid);
+         let child_scope = value.get("pid").map(|_| UnifiedChildScope {
+             pid,
+             generation,
+@@ -927,7 +931,8 @@ fn parse_grok_unified_log_snapshot(
+             .as_ref()
+             .is_some_and(|scope| has_conflicting_child_evidence(&evidence, scope));
+         let known_child_session = evidence.child_session_ids.contains(&session_id);
+-        let exact_model = model_by_pid_and_session
++        let exact_model = self
++            .model_by_pid_and_session
+             .get(&(pid, generation, session_id.clone()))
+             .cloned();
+         let model_id = if model_attribution_conflicted {
+@@ -943,9 +948,9 @@ fn parse_grok_unified_log_snapshot(
+         } else if known_child_session {
+             UNKNOWN_MODEL.to_string()
+         } else {
+-            model_by_session
++            self.model_by_session
+                 .get(&session_id)
+-                .or_else(|| fallback_model_by_pid.get(&(pid, generation)))
++                .or_else(|| self.fallback_model_by_pid.get(&(pid, generation)))
+                 .cloned()
+                 .or_else(|| metadata.model_id.clone())
+                 .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
+@@ -970,16 +975,51 @@ fn parse_grok_unified_log_snapshot(
+         // Each unified-log row is one model request. User interaction turns
+         // remain tracked separately by `is_turn_start`.
+         message.message_count = 1;
+-        messages.push(message);
++        self.messages.push(message);
++    }
++}
++
++fn parse_grok_unified_log_snapshot(
++    path: &Path,
++    file: &mut std::fs::File,
++    prefix_len: u64,
++) -> Vec<UnifiedMessage> {
++    #[cfg(test)]
++    GROK_UNIFIED_PARSED_PATHS
++        .lock()
++        .unwrap()
++        .push(path.to_path_buf());
++    let fallback_timestamp = file_modified_timestamp_ms(path);
++    // Two streamed passes over the same bounded prefix; the log is never
++    // held in memory whole.
++    let evidence =
++        collect_unified_child_evidence(BufReader::new(CountedRead(&mut *file)).take(prefix_len));
++    if file.seek(SeekFrom::Start(0)).is_err() {
++        return Vec::new();
+     }
+ 
+-    messages
++    let metadata_by_session = read_unified_session_metadata(path, &evidence.referenced_session_ids);
++    let mut state = UnifiedParseState::default();
++    for line in lossy_lines(BufReader::new(CountedRead(file)).take(prefix_len)) {
++        state.process_line(&line, &evidence, &metadata_by_session, fallback_timestamp);
++    }
++    state.messages
+ }
+ 
+ fn collect_unified_child_evidence(reader: impl BufRead) -> UnifiedChildEvidence {
+     let mut evidence = UnifiedChildEvidence::default();
+     let mut generations = HashMap::new();
++    collect_unified_child_evidence_into(reader, &mut evidence, &mut generations);
++    evidence
++}
+ 
++/// AIS: the evidence pass over `reader`, continuing from a given evidence and
++/// generation map, so a checkpoint can feed it only the bytes after it.
++fn collect_unified_child_evidence_into(
++    reader: impl BufRead,
++    evidence: &mut UnifiedChildEvidence,
++    generations: &mut HashMap<i64, UnifiedGeneration>,
++) {
+     for line in lossy_lines(reader) {
+         if line.trim().is_empty() {
+             continue;
+@@ -988,7 +1028,7 @@ fn collect_unified_child_evidence(reader: impl BufRead) -> UnifiedChildEvidence
+             continue;
+         };
+         if let Some(pid) = unified_log_process_start_pid(&value) {
+-            advance_unified_generation(&mut generations, pid);
++            advance_unified_generation(&mut *generations, pid);
+             continue;
+         }
+ 
+@@ -1012,7 +1052,7 @@ fn collect_unified_child_evidence(reader: impl BufRead) -> UnifiedChildEvidence
+             continue;
+         };
+         evidence.child_session_ids.insert(subagent_id);
+-        let Some(scope) = unified_child_scope(&value, &mut generations) else {
++        let Some(scope) = unified_child_scope(&value, &mut *generations) else {
+             continue;
+         };
+         evidence.known_scopes.insert(scope.clone());
+@@ -1033,8 +1073,6 @@ fn collect_unified_child_evidence(reader: impl BufRead) -> UnifiedChildEvidence
+             record_model_evidence(&mut evidence.terminal_models, &scope, model_id);
+         }
+     }
+-
+-    evidence
+ }
+ 
+ /// Dispatch between Grok's legacy per-session updates and its newer unified
+@@ -1600,10 +1638,13 @@ fn fallback_unified_metadata(session_id: &str, timestamp: i64) -> GrokMetadata {
+ /// The session ids the inference rows in a unified log's first `log_len`
+ /// bytes reference (see [`UnifiedChildEvidence::referenced_session_ids`]).
+ fn grok_unified_referenced_session_ids(path: &Path, log_len: u64) -> HashSet<String> {
+-    let Ok(file) = std::fs::File::open(path) else {
++    let Ok(mut file) = std::fs::File::open(path) else {
+         return HashSet::new();
+     };
+-    collect_unified_child_evidence(BufReader::new(file).take(log_len)).referenced_session_ids
++    // AIS: reads only the bytes after the log's checkpoint, if it has one.
++    scan_unified_evidence(path, &mut file, log_len)
++        .map(|scan| scan.full().referenced_session_ids.clone())
++        .unwrap_or_default()
+ }
+ 
+ /// Metadata of the referenced sessions only: a session no inference row names
+@@ -2017,6 +2058,693 @@ fn hex_value(byte: u8) -> Option<u8> {
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// AIS: incremental unified-log parse.
++//
++// Grok appends to `logs/unified.jsonl` all the time, so the log changes on
++// every collector cycle and used to be read three times in full per cycle (the
++// fingerprint's referenced-session scan and the parse's two passes). A
++// checkpoint stored beside the message cache remembers the parse state at the
++// end of the last complete line. A later scan checks that the log still starts
++// with the same bytes, then reads only what was appended. Every doubt (a
++// rotated or truncated log, a changed prefix sample, new subagent evidence, a
++// changed session, a row without a timestamp) falls back to the full parse, so
++// the messages always equal a full read of the complete lines.
++// ---------------------------------------------------------------------------
++
++const CHECKPOINT_VERSION: u32 = 1;
++const CHECKPOINT_WINDOW: u64 = 64 * 1024;
++const CHECKPOINT_DIRNAME: &str = "ais-grok-unified-v1";
++
++/// AIS: bytes read from unified logs (test instrumentation).
++#[cfg(test)]
++pub(crate) static GROK_UNIFIED_BYTES_READ: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
++struct CountedRead<R>(R);
++
++impl<R: Read> Read for CountedRead<R> {
++    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++        let read = self.0.read(buf)?;
++        #[cfg(test)]
++        GROK_UNIFIED_BYTES_READ.fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
++        Ok(read)
++    }
++}
++
++type ScopeModels = Vec<(UnifiedChildScope, UnifiedModelEvidence)>;
++
++#[derive(serde::Serialize, serde::Deserialize)]
++struct EvidenceWire {
++    known_scopes: Vec<UnifiedChildScope>,
++    child_models: ScopeModels,
++    terminal_scopes: Vec<UnifiedChildScope>,
++    terminal_models: ScopeModels,
++    child_session_ids: Vec<String>,
++    referenced_session_ids: Vec<String>,
++}
++
++impl From<&UnifiedChildEvidence> for EvidenceWire {
++    fn from(evidence: &UnifiedChildEvidence) -> Self {
++        fn models(map: &HashMap<UnifiedChildScope, UnifiedModelEvidence>) -> ScopeModels {
++            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
++        }
++        Self {
++            known_scopes: evidence.known_scopes.iter().cloned().collect(),
++            child_models: models(&evidence.child_models),
++            terminal_scopes: evidence.terminal_scopes.iter().cloned().collect(),
++            terminal_models: models(&evidence.terminal_models),
++            child_session_ids: evidence.child_session_ids.iter().cloned().collect(),
++            referenced_session_ids: evidence.referenced_session_ids.iter().cloned().collect(),
++        }
++    }
++}
++
++impl From<EvidenceWire> for UnifiedChildEvidence {
++    fn from(wire: EvidenceWire) -> Self {
++        Self {
++            known_scopes: wire.known_scopes.into_iter().collect(),
++            child_models: wire.child_models.into_iter().collect(),
++            terminal_scopes: wire.terminal_scopes.into_iter().collect(),
++            terminal_models: wire.terminal_models.into_iter().collect(),
++            child_session_ids: wire.child_session_ids.into_iter().collect(),
++            referenced_session_ids: wire.referenced_session_ids.into_iter().collect(),
++        }
++    }
++}
++
++/// What the parse took from one referenced session's files. `found` is false
++/// when the session directory did not exist (the parse used the fallback).
++#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
++struct SessionWire {
++    session_id: String,
++    found: bool,
++    model_id: Option<String>,
++    workspace_key: Option<String>,
++    workspace_label: Option<String>,
++}
++
++impl SessionWire {
++    fn from_metadata(session_id: &str, metadata: Option<&GrokMetadata>) -> Self {
++        Self {
++            session_id: session_id.to_string(),
++            found: metadata.is_some(),
++            model_id: metadata.and_then(|m| m.model_id.clone()),
++            workspace_key: metadata.and_then(|m| m.workspace_key.clone()),
++            workspace_label: metadata.and_then(|m| m.workspace_label.clone()),
++        }
++    }
++
++    fn metadata(&self) -> Option<GrokMetadata> {
++        self.found.then(|| GrokMetadata {
++            session_id: self.session_id.clone(),
++            model_id: self.model_id.clone(),
++            // Never read for a message (see `message_from_tokens`).
++            timestamp: 0,
++            workspace_key: self.workspace_key.clone(),
++            workspace_label: self.workspace_label.clone(),
++        })
++    }
++}
++
++#[derive(serde::Serialize, serde::Deserialize)]
++struct UnifiedCheckpoint {
++    version: u32,
++    /// Bytes of the log the state covers; ends just after a newline.
++    offset: u64,
++    inode: u64,
++    digest: u64,
++    scan_generations: Vec<(i64, UnifiedGeneration)>,
++    evidence: EvidenceWire,
++    parse_generations: Vec<(i64, UnifiedGeneration)>,
++    fallback_model_by_pid: Vec<(i64, UnifiedGeneration, String)>,
++    model_by_pid_and_session: Vec<(i64, UnifiedGeneration, String, String)>,
++    model_by_session: Vec<(String, String)>,
++    message_count: u64,
++    message_hash: u64,
++    /// Hash of the fingerprint the cached entry of this parse carries.
++    fingerprint_hash: u64,
++    sessions: Vec<SessionWire>,
++}
++
++fn fingerprint_hash(fingerprint: &crate::message_cache::SourceFingerprint) -> Option<u64> {
++    Some(fnv_update(
++        FNV_OFFSET,
++        &bincode::serialize(fingerprint).ok()?,
++    ))
++}
++
++fn fnv_update(mut hash: u64, bytes: &[u8]) -> u64 {
++    for byte in bytes {
++        hash ^= u64::from(*byte);
++        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++    }
++    hash
++}
++
++const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
++
++fn messages_hash<'a>(messages: impl Iterator<Item = &'a UnifiedMessage>) -> u64 {
++    let mut hash = FNV_OFFSET;
++    for message in messages {
++        let key = message.dedup_key.as_deref().unwrap_or("");
++        hash = fnv_update(hash, key.as_bytes());
++        hash = fnv_update(hash, &[0xff]);
++    }
++    hash
++}
++
++fn log_inode(file: &std::fs::File) -> u64 {
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::MetadataExt;
++        file.metadata().map(|metadata| metadata.ino()).unwrap_or(0)
++    }
++    #[cfg(not(unix))]
++    {
++        let _ = file;
++        0
++    }
++}
++
++fn read_window(file: &mut std::fs::File, start: u64, len: u64) -> Option<Vec<u8>> {
++    file.seek(SeekFrom::Start(start)).ok()?;
++    let mut buffer = vec![0; usize::try_from(len).ok()?];
++    CountedRead(&mut *file).read_exact(&mut buffer).ok()?;
++    Some(buffer)
++}
++
++/// A sampled digest of the first `offset` bytes: the offset, the first 64 KiB
++/// and the 64 KiB before the offset.
++fn prefix_digest(file: &mut std::fs::File, offset: u64) -> Option<u64> {
++    let window = CHECKPOINT_WINDOW.min(offset);
++    let mut hash = fnv_update(FNV_OFFSET, &offset.to_le_bytes());
++    hash = fnv_update(hash, &read_window(file, 0, window)?);
++    hash = fnv_update(hash, &read_window(file, offset - window, window)?);
++    Some(hash)
++}
++
++/// The length of the complete-line prefix of the first `len` bytes: it ends
++/// just after the last newline. A final line without one is still being
++/// written and counts once its newline arrives.
++fn complete_line_prefix(file: &mut std::fs::File, len: u64) -> u64 {
++    let mut end = len;
++    while end > 0 {
++        let start = end.saturating_sub(CHECKPOINT_WINDOW);
++        let Some(chunk) = read_window(file, start, end - start) else {
++            return 0;
++        };
++        if let Some(position) = chunk.iter().rposition(|byte| *byte == b'\n') {
++            return start + position as u64 + 1;
++        }
++        end = start;
++    }
++    0
++}
++
++fn checkpoint_path(log: &Path) -> Option<PathBuf> {
++    let name = fnv_update(FNV_OFFSET, log.to_string_lossy().as_bytes());
++    Some(
++        crate::message_cache::cache_dir()?
++            .join(CHECKPOINT_DIRNAME)
++            .join(format!("{name:016x}.bin")),
++    )
++}
++
++fn load_checkpoint(log: &Path) -> Option<UnifiedCheckpoint> {
++    let bytes = std::fs::read(checkpoint_path(log)?).ok()?;
++    let checkpoint: UnifiedCheckpoint = bincode::deserialize(&bytes).ok()?;
++    (checkpoint.version == CHECKPOINT_VERSION).then_some(checkpoint)
++}
++
++fn remove_checkpoint(log: &Path) {
++    if let Some(path) = checkpoint_path(log) {
++        let _ = std::fs::remove_file(path);
++    }
++}
++
++fn write_checkpoint(log: &Path, checkpoint: &UnifiedCheckpoint) {
++    let Some(path) = checkpoint_path(log) else {
++        return;
++    };
++    let Ok(bytes) = bincode::serialize(checkpoint) else {
++        return;
++    };
++    let Some(dir) = path.parent() else { return };
++    if std::fs::create_dir_all(dir).is_err() {
++        return;
++    }
++    let nanos = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|elapsed| elapsed.as_nanos())
++        .unwrap_or(0);
++    let temp = dir.join(format!(".{}.{nanos}.tmp", std::process::id()));
++    if std::fs::write(&temp, bytes).is_err() || std::fs::rename(&temp, &path).is_err() {
++        let _ = std::fs::remove_file(&temp);
++    }
++}
++
++fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
++    values.sort();
++    values
++}
++
++fn build_checkpoint(
++    file: &mut std::fs::File,
++    offset: u64,
++    scan_generations: &HashMap<i64, UnifiedGeneration>,
++    evidence: &UnifiedChildEvidence,
++    state: &UnifiedParseState,
++    message_count: u64,
++    message_hash: u64,
++    fingerprint_hash: u64,
++    sessions: Vec<SessionWire>,
++) -> Option<UnifiedCheckpoint> {
++    Some(UnifiedCheckpoint {
++        version: CHECKPOINT_VERSION,
++        offset,
++        inode: log_inode(file),
++        digest: prefix_digest(file, offset)?,
++        scan_generations: sorted(scan_generations.iter().map(|(k, v)| (*k, *v)).collect()),
++        evidence: evidence.into(),
++        parse_generations: sorted(state.generations.iter().map(|(k, v)| (*k, *v)).collect()),
++        fallback_model_by_pid: sorted(
++            state
++                .fallback_model_by_pid
++                .iter()
++                .map(|((pid, generation), model)| (*pid, *generation, model.clone()))
++                .collect(),
++        ),
++        model_by_pid_and_session: sorted(
++            state
++                .model_by_pid_and_session
++                .iter()
++                .map(|((pid, generation, sid), model)| {
++                    (*pid, *generation, sid.clone(), model.clone())
++                })
++                .collect(),
++        ),
++        model_by_session: sorted(
++            state
++                .model_by_session
++                .iter()
++                .map(|(sid, model)| (sid.clone(), model.clone()))
++                .collect(),
++        ),
++        message_count,
++        message_hash,
++        fingerprint_hash,
++        sessions,
++    })
++}
++
++/// The checkpoint when it still describes the start of `file`: same inode,
++/// same sampled prefix, not past the complete-line prefix of the file.
++fn valid_checkpoint(
++    log: &Path,
++    file: &mut std::fs::File,
++    complete: u64,
++) -> Option<UnifiedCheckpoint> {
++    let checkpoint = load_checkpoint(log)?;
++    let valid = checkpoint.offset <= complete
++        && checkpoint.inode == log_inode(file)
++        && prefix_digest(file, checkpoint.offset) == Some(checkpoint.digest);
++    valid.then_some(checkpoint)
++}
++
++/// The evidence of the complete lines of the first `log_len` bytes (reading
++/// only the bytes after a valid checkpoint), and the evidence with a final
++/// unterminated line added when there is one. The fingerprint and the parse
++/// both use it.
++struct UnifiedEvidenceScan {
++    /// Up to the last newline.
++    complete: UnifiedChildEvidence,
++    generations: HashMap<i64, UnifiedGeneration>,
++    complete_len: u64,
++    /// Including the unterminated last line; `None` when there is none.
++    with_tail: Option<UnifiedChildEvidence>,
++}
++
++impl UnifiedEvidenceScan {
++    fn full(&self) -> &UnifiedChildEvidence {
++        self.with_tail.as_ref().unwrap_or(&self.complete)
++    }
++}
++
++fn scan_unified_evidence(
++    log: &Path,
++    file: &mut std::fs::File,
++    log_len: u64,
++) -> Option<UnifiedEvidenceScan> {
++    let complete_len = complete_line_prefix(file, log_len);
++    let (mut evidence, mut generations, start) = match valid_checkpoint(log, file, complete_len) {
++        Some(checkpoint) => (
++            checkpoint.evidence.into(),
++            checkpoint.scan_generations.into_iter().collect(),
++            checkpoint.offset,
++        ),
++        None => (UnifiedChildEvidence::default(), HashMap::new(), 0),
++    };
++    file.seek(SeekFrom::Start(start)).ok()?;
++    collect_unified_child_evidence_into(
++        BufReader::new(CountedRead(&mut *file)).take(complete_len - start),
++        &mut evidence,
++        &mut generations,
++    );
++    let with_tail = if log_len > complete_len {
++        let mut full = evidence.clone();
++        let mut full_generations = generations.clone();
++        file.seek(SeekFrom::Start(complete_len)).ok()?;
++        collect_unified_child_evidence_into(
++            BufReader::new(CountedRead(&mut *file)).take(log_len - complete_len),
++            &mut full,
++            &mut full_generations,
++        );
++        Some(full)
++    } else {
++        None
++    };
++    Some(UnifiedEvidenceScan {
++        complete: evidence,
++        generations,
++        complete_len,
++        with_tail,
++    })
++}
++
++/// The messages of a final line without a newline, parsed against the state
++/// after the complete lines. They are returned but never checkpointed: the
++/// next scan reads that line again once its newline has arrived.
++fn parse_unterminated_tail(
++    file: &mut std::fs::File,
++    complete_len: u64,
++    log_len: u64,
++    state: &mut UnifiedParseState,
++    evidence: &UnifiedChildEvidence,
++    metadata_by_session: &HashMap<String, GrokMetadata>,
++    fallback_timestamp: i64,
++) -> Option<()> {
++    if log_len <= complete_len {
++        return Some(());
++    }
++    file.seek(SeekFrom::Start(complete_len)).ok()?;
++    for line in lossy_lines(BufReader::new(CountedRead(&mut *file)).take(log_len - complete_len)) {
++        state.process_line(&line, evidence, metadata_by_session, fallback_timestamp);
++    }
++    Some(())
++}
++
++/// AIS: the parse of a unified log that also leaves a checkpoint behind.
++pub(crate) fn parse_grok_unified_log_checkpointed(
++    path: &Path,
++    fingerprint: Option<&crate::message_cache::SourceFingerprint>,
++) -> Vec<UnifiedMessage> {
++    if path.file_name().and_then(|name| name.to_str()) != Some("unified.jsonl") {
++        return parse_grok_file(path);
++    }
++    let Ok(mut file) = std::fs::File::open(path) else {
++        return Vec::new();
++    };
++    let log_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
++    #[cfg(test)]
++    GROK_UNIFIED_PARSED_PATHS
++        .lock()
++        .unwrap()
++        .push(path.to_path_buf());
++    let fallback_timestamp = file_modified_timestamp_ms(path);
++    let complete_len = complete_line_prefix(&mut file, log_len);
++    let mut evidence = UnifiedChildEvidence::default();
++    let mut scan_generations = HashMap::new();
++    if file.seek(SeekFrom::Start(0)).is_err() {
++        return Vec::new();
++    }
++    collect_unified_child_evidence_into(
++        BufReader::new(CountedRead(&mut file)).take(log_len),
++        &mut evidence,
++        &mut scan_generations,
++    );
++    // Evidence of the complete lines alone, to know if the tail adds any.
++    let mut complete_evidence = UnifiedChildEvidence::default();
++    let mut complete_generations = HashMap::new();
++    if log_len > complete_len {
++        if file.seek(SeekFrom::Start(0)).is_err() {
++            return Vec::new();
++        }
++        collect_unified_child_evidence_into(
++            BufReader::new(CountedRead(&mut file)).take(complete_len),
++            &mut complete_evidence,
++            &mut complete_generations,
++        );
++    } else {
++        complete_evidence = evidence.clone();
++        complete_generations = scan_generations.clone();
++    }
++    if file.seek(SeekFrom::Start(0)).is_err() {
++        return Vec::new();
++    }
++    let metadata_by_session = read_unified_session_metadata(path, &evidence.referenced_session_ids);
++    let mut state = UnifiedParseState::default();
++    for line in lossy_lines(BufReader::new(CountedRead(&mut file)).take(complete_len)) {
++        state.process_line(&line, &evidence, &metadata_by_session, fallback_timestamp);
++    }
++    let complete_flag = state.used_fallback_timestamp;
++    let complete_message_count = state.messages.len();
++    let mut checkpoint = None;
++    if !complete_flag && without_refs(&evidence) == without_refs(&complete_evidence) {
++        if let Some(fingerprint_hash) = fingerprint.and_then(fingerprint_hash) {
++            let mut sessions: Vec<SessionWire> = complete_evidence
++                .referenced_session_ids
++                .iter()
++                .map(|sid| SessionWire::from_metadata(sid, metadata_by_session.get(sid)))
++                .collect();
++            sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
++            checkpoint = build_checkpoint(
++                &mut file,
++                complete_len,
++                &complete_generations,
++                &complete_evidence,
++                &state,
++                complete_message_count as u64,
++                messages_hash(state.messages.iter()),
++                fingerprint_hash,
++                sessions,
++            );
++        }
++    }
++    match checkpoint {
++        Some(checkpoint) => write_checkpoint(path, &checkpoint),
++        None => remove_checkpoint(path),
++    }
++    if parse_unterminated_tail(
++        &mut file,
++        complete_len,
++        log_len,
++        &mut state,
++        &evidence,
++        &metadata_by_session,
++        fallback_timestamp,
++    )
++    .is_none()
++    {
++        remove_checkpoint(path);
++    }
++    state.messages
++}
++
++fn without_refs(evidence: &UnifiedChildEvidence) -> UnifiedChildEvidence {
++    let mut copy = evidence.clone();
++    copy.referenced_session_ids.clear();
++    copy
++}
++
++/// The session ids whose files differ between two fingerprints of the same
++/// unified log (changed, added or removed).
++fn changed_session_ids(
++    old: &crate::message_cache::SourceFingerprint,
++    new: &crate::message_cache::SourceFingerprint,
++) -> HashSet<String> {
++    fn session_of(suffix: &str) -> Option<&str> {
++        let rest = suffix
++            .strip_prefix("sessions-session:")
++            .or_else(|| suffix.strip_prefix("sessions-file:"))?;
++        // `sessions/<workspace>/<session>[/<file>]`
++        rest.split('/').nth(2)
++    }
++    let mut changed = HashSet::new();
++    let old_by_suffix: HashMap<&str, _> = old
++        .related_files
++        .iter()
++        .map(|related| (related.suffix.as_str(), related))
++        .collect();
++    let new_by_suffix: HashMap<&str, _> = new
++        .related_files
++        .iter()
++        .map(|related| (related.suffix.as_str(), related))
++        .collect();
++    for (suffix, related) in &old_by_suffix {
++        if new_by_suffix.get(suffix) != Some(related) {
++            changed.extend(session_of(suffix).map(str::to_string));
++        }
++    }
++    for suffix in new_by_suffix.keys() {
++        if !old_by_suffix.contains_key(suffix) {
++            changed.extend(session_of(suffix).map(str::to_string));
++        }
++    }
++    changed
++}
++
++/// AIS: continue the parse of a grown unified log from its checkpoint.
++/// `cached` holds the messages the previous scan cached for the log. Returns
++/// every message a full parse gives, reading only the appended bytes, or
++/// `None` when only a full parse is safe.
++pub(crate) fn resume_grok_unified_log(
++    path: &Path,
++    cached: &[UnifiedMessage],
++    old_fingerprint: &crate::message_cache::SourceFingerprint,
++    new_fingerprint: &crate::message_cache::SourceFingerprint,
++) -> Option<Vec<UnifiedMessage>> {
++    if path.file_name().and_then(|name| name.to_str()) != Some("unified.jsonl") {
++        return None;
++    }
++    let mut file = std::fs::File::open(path).ok()?;
++    let log_len = file.metadata().ok()?.len();
++    let complete_len = complete_line_prefix(&mut file, log_len);
++    let checkpoint = valid_checkpoint(path, &mut file, complete_len)?;
++    if fingerprint_hash(old_fingerprint)? != checkpoint.fingerprint_hash {
++        return None;
++    }
++    let new_fingerprint_hash = fingerprint_hash(new_fingerprint)?;
++    let count = usize::try_from(checkpoint.message_count).ok()?;
++    let old = cached.get(..count)?;
++    if messages_hash(old.iter()) != checkpoint.message_hash {
++        return None;
++    }
++
++    let old_evidence: UnifiedChildEvidence = checkpoint.evidence.into();
++    let scan = scan_unified_evidence(path, &mut file, log_len)?;
++    // Appended subagent evidence can change how earlier rows are attributed.
++    let old_plain = without_refs(&old_evidence);
++    if without_refs(&scan.complete) != old_plain || without_refs(scan.full()) != old_plain {
++        return None;
++    }
++    let evidence = scan.full();
++
++    // Sessions to read again: new ones, ones that were missing, and ones whose
++    // files changed. Every other session keeps the metadata of its last read.
++    let stored: HashMap<String, SessionWire> = checkpoint
++        .sessions
++        .into_iter()
++        .map(|wire| (wire.session_id.clone(), wire))
++        .collect();
++    let mut to_read: HashSet<String> = evidence
++        .referenced_session_ids
++        .difference(&old_evidence.referenced_session_ids)
++        .cloned()
++        .collect();
++    to_read.extend(
++        stored
++            .values()
++            .filter(|wire| !wire.found)
++            .map(|wire| wire.session_id.clone()),
++    );
++    to_read.extend(
++        changed_session_ids(old_fingerprint, new_fingerprint)
++            .into_iter()
++            .filter(|sid| stored.contains_key(sid)),
++    );
++    let fresh = read_unified_session_metadata(path, &to_read);
++    let mut metadata_by_session: HashMap<String, GrokMetadata> = stored
++        .values()
++        .filter(|wire| !to_read.contains(&wire.session_id))
++        .filter_map(|wire| wire.metadata().map(|m| (wire.session_id.clone(), m)))
++        .collect();
++    for sid in &to_read {
++        let wire = SessionWire::from_metadata(sid, fresh.get(sid));
++        // A session earlier rows already used must give the same.
++        if stored.get(sid).is_some_and(|previous| previous != &wire) {
++            return None;
++        }
++        if let Some(metadata) = fresh.get(sid) {
++            metadata_by_session.insert(sid.clone(), metadata.clone());
++        }
++    }
++    let mut sessions: Vec<SessionWire> = Vec::new();
++    for sid in &scan.complete.referenced_session_ids {
++        sessions.push(match stored.get(sid) {
++            Some(wire) if !to_read.contains(sid) => wire.clone(),
++            _ => SessionWire::from_metadata(sid, fresh.get(sid)),
++        });
++    }
++    sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
++
++    let mut state = UnifiedParseState {
++        generations: checkpoint.parse_generations.into_iter().collect(),
++        fallback_model_by_pid: checkpoint
++            .fallback_model_by_pid
++            .into_iter()
++            .map(|(pid, generation, model)| ((pid, generation), model))
++            .collect(),
++        model_by_pid_and_session: checkpoint
++            .model_by_pid_and_session
++            .into_iter()
++            .map(|(pid, generation, sid, model)| ((pid, generation, sid), model))
++            .collect(),
++        model_by_session: checkpoint.model_by_session.into_iter().collect(),
++        seen: old
++            .iter()
++            .filter_map(|message| message.dedup_key.clone())
++            .collect(),
++        messages: Vec::new(),
++        used_fallback_timestamp: false,
++    };
++    #[cfg(test)]
++    GROK_UNIFIED_PARSED_PATHS
++        .lock()
++        .unwrap()
++        .push(path.to_path_buf());
++    let fallback_timestamp = file_modified_timestamp_ms(path);
++    file.seek(SeekFrom::Start(checkpoint.offset)).ok()?;
++    for line in
++        lossy_lines(BufReader::new(CountedRead(&mut file)).take(complete_len - checkpoint.offset))
++    {
++        state.process_line(&line, evidence, &metadata_by_session, fallback_timestamp);
++    }
++    if state.used_fallback_timestamp {
++        return None;
++    }
++
++    let mut messages = old.to_vec();
++    messages.extend(state.messages.drain(..));
++    let message_hash = messages_hash(messages.iter());
++    match build_checkpoint(
++        &mut file,
++        complete_len,
++        &scan.generations,
++        &scan.complete,
++        &state,
++        messages.len() as u64,
++        message_hash,
++        new_fingerprint_hash,
++        sessions,
++    ) {
++        Some(checkpoint) => write_checkpoint(path, &checkpoint),
++        None => remove_checkpoint(path),
++    }
++    // `state.seen` now holds the complete lines; the tail only adds rows.
++    parse_unterminated_tail(
++        &mut file,
++        complete_len,
++        log_len,
++        &mut state,
++        evidence,
++        &metadata_by_session,
++        fallback_timestamp,
++    )?;
++    messages.append(&mut state.messages);
++    Some(messages)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;

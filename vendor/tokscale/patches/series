@@ -4,3 +4,4 @@ v4.20.0-ais-scope.patch
 v4.20.0-ais-segments.patch
 v4.20.0-ais-grok.patch
 v4.20.0-ais-checkpoint.patch
+v4.20.0-ais-grok-incremental.patch
