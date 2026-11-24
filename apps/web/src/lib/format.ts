@@ -50,6 +50,17 @@ export function durationSince(iso: string, nowMs: number = Date.now()): string {
   return parts.join(" ");
 }
 
+/** Countdown to an epoch-milliseconds instant: "2d 3h", "3h 14m", "14m" or "now".
+ * Days drop minutes. A due or past instant reads "now". The result is never negative. */
+export function countdownUntil(ms: number, nowMs: number = Date.now()): string {
+  const minutes = Math.floor(Math.max(0, ms - nowMs) / 60_000);
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
 /** Server uptime, e.g. "2d 4h", "12m", "42s". */
 export function formatUptime(totalSeconds: number): string {
   const days = Math.floor(totalSeconds / 86400);
