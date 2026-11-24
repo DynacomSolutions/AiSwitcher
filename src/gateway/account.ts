@@ -133,11 +133,13 @@ type OwnerFinder = (names: string[]) => Promise<string | undefined>;
 
 async function chooseMember(r: AccountRequest, owner?: OwnerFinder): Promise<string | undefined> {
   if (r.app.target.kind === "pin") return canon(r, r.app.target.identity);
-  let names: string[];
-  try {
-    names = await allowedMembers(r.app, r.deps);
-  } catch {
-    return undefined;
+  // A failed lookup (unreadable registry, failed login check) is a server-side failure: it throws, and the caller answers 502.
+  let names = await allowedMembers(r.app, r.deps);
+  // Same filter as pickIdentity: drop logged-out members. A probe error keeps the member.
+  const creds = r.deps.creds;
+  if (creds?.loggedOut) {
+    const alive = await Promise.all(names.map(async (n) => ((await creds.loggedOut!(r.app.provider, n).catch(() => false)) ? undefined : n)));
+    names = alive.filter((n): n is string => n !== undefined);
   }
   if (names.length === 0) return undefined;
   if (owner && names.length > 1) {
@@ -204,7 +206,9 @@ async function memberOrg(r: AccountRequest, name: string): Promise<string | unde
     if (typeof org !== "string" || org === "") return undefined;
     r.state.orgs.set(key, { org, until: nowMs + ORG_TTL_MS });
     return org;
-  } catch {
+  } catch (err) {
+    // A member without a usable login is the client's case (409), not an upstream failure.
+    if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) throw err;
     return undefined;
   }
 }
@@ -235,7 +239,7 @@ export async function forwardAccount(r: AccountRequest): Promise<AccountResult> 
   } catch (err) {
     if (r.signal.aborted) throw err;
     // A member without a usable login is the client's case (4xx with the reason), never a server error.
-    if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) return { res: providerError(r.style, 409, err.clientMessage), cls };
+    if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) return { res: providerError(r.style, 409, r.app.target.kind === "pin" ? err.clientMessage : "no login is available for this app"), cls };
     return { res: providerError(r.style, 502, "account request failed"), cls };
   }
 }
@@ -250,7 +254,12 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
     const ctx = { app: r.app, cache: {}, style: r.style, deps: r.deps, signal: r.signal };
     const served = await claudeUsageBody(ctx);
     if (!wantsResets(r.search)) return { res: json(served), cls };
-    const member = await chooseMember(r);
+    let member: string | undefined;
+    try {
+      member = await chooseMember(r);
+    } catch {
+      member = undefined;
+    }
     if (!member) return { res: json(served), cls };
     try {
       const res = await callAs(r, member, { method: "GET", url: r.url + r.search });

@@ -1207,6 +1207,61 @@ describe("account API of the other providers", () => {
       expect(seen).toHaveLength(0);
     });
   }
+  for (const [provider, style, path] of [["claude", "anthropic", "/api/oauth/account"], ["codex", "openai", "/backend-api/accounts/settings"]] as const) {
+    test(`${provider}: an empty pool gives 409`, async () => {
+      await addApp("app", provider, style);
+      deps.poolMembers = async () => [];
+      expect((await call("app", path, { method: "GET" })).status).toBe(409);
+      expect(seen).toHaveLength(0);
+    });
+    test(`${provider}: a failed member lookup gives 5xx, not 409`, async () => {
+      await addApp("app", provider, style);
+      deps.poolMembers = async () => {
+        throw new Error("registry unreadable");
+      };
+      const res = await call("app", path, { method: "GET" });
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(seen).toHaveLength(0);
+    });
+    test(`${provider}: a refresh-failed login stays 502`, async () => {
+      await addApp("app", provider, style, { target: { kind: "pin", identity: "a" } });
+      const { GatewayCredentialError } = await import("../../src/gateway/credentials.ts");
+      deps.creds = { get: async () => { throw new GatewayCredentialError("refresh-failed", provider, "a"); }, refreshAfter401: async () => { throw new Error("unused"); } } as unknown as GatewayDeps["creds"];
+      expect((await call("app", path, { method: "GET" })).status).toBe(502);
+    });
+    test(`${provider} pool: a logged-out member is skipped although it is less used`, async () => {
+      await addApp("app", provider, style);
+      usage.a = { status: "live", maxUtilization: 5, capturedAt: "" };
+      usage.b = { status: "live", maxUtilization: 50, capturedAt: "" };
+      (deps.creds as unknown as { loggedOut: (p: string, n: string) => Promise<boolean> }).loggedOut = async (_p, n) => n === "a";
+      const res = await call("app", path, { method: "GET" });
+      expect(res.status).toBe(200);
+      expect(seen[0]!.headers.get("authorization")).toContain("tok-b");
+    });
+    test(`${provider} pool: every member logged out gives 409`, async () => {
+      await addApp("app", provider, style);
+      (deps.creds as unknown as { loggedOut: () => Promise<boolean> }).loggedOut = async () => true;
+      const res = await call("app", path, { method: "GET" });
+      expect(res.status).toBe(409);
+      expect(await res.text()).not.toContain("tok-");
+    });
+  }
+  test("a pool 409 for a dead login names no member", async () => {
+    await addApp("app", "claude", "anthropic");
+    const { GatewayCredentialError } = await import("../../src/gateway/credentials.ts");
+    deps.creds = { get: async () => { throw new GatewayCredentialError("login-dead", "claude", "member-secret-name"); }, refreshAfter401: async () => { throw new Error("unused"); } } as unknown as GatewayDeps["creds"];
+    const res = await call("app", "/api/oauth/account", { method: "GET" });
+    expect(res.status).toBe(409);
+    expect(await res.text()).not.toContain("member-secret-name");
+  });
+  test("claude pinned organisation call with a dead login gives 409, not 502", async () => {
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+    const { GatewayCredentialError } = await import("../../src/gateway/credentials.ts");
+    deps.creds = { get: async () => { throw new GatewayCredentialError("login-dead", "claude", "a"); }, refreshAfter401: async () => { throw new Error("unused"); } } as unknown as GatewayDeps["creds"];
+    const res = await call("cl", "/api/organizations/org-stale/reset_rate_limits", { method: "POST", body: '{"grant_id":"g"}' });
+    expect(res.status).toBe(409);
+    expect(seen).toHaveLength(0);
+  });
   test("ali has no account endpoint: usage and billing paths are 404, nothing goes upstream", async () => {
     await addApp("app", "ali", "openai", { target: { kind: "pin", identity: "a" } });
     for (const path of ["/usage", "/v1/usages", "/billing", "/v1/billing"]) {

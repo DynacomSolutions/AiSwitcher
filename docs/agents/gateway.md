@@ -258,7 +258,9 @@ speech call is not a model call); the daily token cap does.
     with the member's login. **ali** has no account endpoint AIS calls with the model key (ali usage needs a console
     cookie, not the API key): `/usage`, `/usages` and `/billing` answer 404 and nothing is sent.
   - **No usable login**: a pinned identity that is unknown, retired, logged out, unmanaged or without a credential, and a pool
-    with no member, answer 409 with the reason. An unknown app token is 401. These cases are never a 5xx.
+    with no member (or with every member logged out), answer 409. A pinned app gets the reason; a pool app gets a generic text
+    that names no member. A pool call skips logged-out members, as model calls do. An unknown app token is 401. Server-side
+    failures answer 5xx: a failed member lookup, a failed token refresh (`refresh-failed`) or an unreadable organisation.
   - **Never forwarded (403)**: paths that mint a durable credential of the member, which would bypass the gateway:
     `create_api_key`, `api_keys`, `oauth_tokens`, `setup_token`, `access_token`, `oauth/token`, `oauth/authorize`
     (Claude and ChatGPT). The owner should know the app can still see account detail, but never obtains a key.
