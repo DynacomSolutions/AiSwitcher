@@ -435,9 +435,9 @@ ETA: 2026-12-12 18:00 ICT
 | 302 | Session readers as line iterables | done | claude | | | | PR 751 merged. |
 | 303 | Shipper in backup-client | done | claude | | 20.299 | | .cluster PR 3273 merged.<br>Python SigV4 signer for If-None-Match and checksum.<br>One copy per session, 120 s flush gap. |
 | 304 | Shipper fast lane and hot set | in_progress | claude | sessions-fast-lane | 20.303 | 2026-11-24 19:00 ICT | |
-| 305 | Cluster: shipper values, recipient key, ingest secret | in_progress | claude | sessions-shipper-values | 20.303 | 2026-11-24 19:00 ICT | .cluster PR. |
-| 306 | Cluster: HoardDB read key, NetworkPolicy, env | blocked_on_owner | Thomas | | 20.297 | | Draft .cluster PR 3255 is ready except the read key.<br>Owner step: share the HoardDB admin API token item in Cloudwarden with the MCP account, through an org collection.<br>Then the agent creates the read key (tenant platform-backups, bucket agent-sessions, scope read). |
-| 307 | Cluster: watchdog rules, metrics, Headlamp row | in_progress | claude | sessions-watchdog | 20.303, 20.299 | 2026-11-24 19:00 ICT | .cluster PR. |
+| 305 | Cluster: shipper values, recipient key, ingest secret | done | claude | | 20.303 | | .cluster PR 3305 merged.<br>Shipper stays off. |
+| 306 | Cluster: HoardDB read key, NetworkPolicy, env | in_progress | claude | | 20.297 | 2026-11-24 21:00 ICT | Draft .cluster PR 3255 gets the read key SealedSecret. |
+| 307 | Cluster: watchdog rules, metrics, Headlamp row | done | claude | | 20.303, 20.299 | | .cluster PR 3306 merged.<br>Alerts gated on the shipper flag, plus a restart-loop rule. |
 | 308 | Console reader from the database | todo | | | 20.301, 20.302, 20.306 | | AIS_SESSIONS_SOURCE switch. |
 | 309 | Equivalence test and performance proof | todo | | | 20.308 | | |
 | 310 | Backfill per node with verification | todo | | | 20.305, 20.307 | | |
