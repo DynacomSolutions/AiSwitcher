@@ -139,6 +139,33 @@ The patches add these AIS-only surfaces:
   unreferenced session is never looked up. An entry written before this
   change is rebuilt once.
 
+- A grown Grok unified log is read from its checkpoint
+  (`patches/v4.20.0-ais-grok-incremental.patch`). Grok appends to the log all
+  the time, so each scan read all of it three times (the fingerprint's
+  referenced-session scan and the parse's two passes). The parse now stores
+  its state in `ais-grok-unified-v1/` in the cache directory: the offset after
+  the last complete line, the file inode, a sampled digest of the prefix (the
+  first and last 64 KiB), the child evidence, the model maps, the per-session
+  metadata it used, a hash of the full content of the messages (model, session,
+  workspace, timestamp, tokens and flags, not only their keys) and a hash of the
+  fingerprint it belongs to. A checkpoint and a cache entry that two different
+  parses wrote never match, so they are never used together. A later scan
+  checks the inode and the digest, then reads only the bytes after the offset
+  and adds the new messages to the cached ones. A final line without a newline
+  is parsed for that scan but never checkpointed, so it is read again when its
+  newline arrives. A scan removes checkpoint temporary files that are an hour
+  old. A truncated, rotated or replaced log, new subagent evidence, a
+  referenced session that changed or appeared, or any mismatch with the cached
+  entry falls back to the full parse. A complete row without a timestamp takes
+  the log's mtime, which changes with every append, and a log with no
+  messages leaves no cache entry to resume from. Such a log is parsed in full
+  on every scan.
+  The prefix digest is sampled: a rewrite of the bytes between the two 64 KiB
+  windows that keeps the length is not detected. Grok only appends to this log,
+  so a scan accepts that risk, as the Claude and Codex sections do for their
+  checkpoints. For a log that only grows, and is not rewritten in place,
+  totals equal a full read.
+
 - `TOKSCALE_AIS_CHECKPOINT_SECS=<n>` commits the message cache during a long
   scan (`patches/v4.20.0-ais-checkpoint.patch`). Upstream wrote the cache
   once, after every source was parsed, so a cold scan killed by AIS's export
@@ -179,8 +206,8 @@ bash scripts/build-tokscale-ais.sh
 
 The helper downloads only the pinned release archive, verifies its checksum and
 licence, applies the patches in the order `patches/series` lists them
-(`v4.20.0-ais.patch`, `-ais-io`, `-ais-scope`, `-ais-segments`, `-ais-grok`, then
-`-ais-checkpoint`), runs the patch tests, and installs to
+(`v4.20.0-ais.patch`, `-ais-io`, `-ais-scope`, `-ais-segments`, `-ais-grok`,
+`-ais-checkpoint`, then `-ais-grok-incremental`), runs the patch tests, and installs to
 `$AIS_TOKSCALE_SHARED_BIN` or `~/.ais/cache/usage/native-tokscale/tokscale`.
 Pass an absolute output path as its first argument to build elsewhere. It
 removes its temporary source and build tree after completion.
