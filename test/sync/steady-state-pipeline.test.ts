@@ -226,8 +226,11 @@ test.skipIf(process.platform !== "linux" || !rsync)("conflict-prone trees conver
   expect(bytes(localEntry)).toBeLessThan(70_000_000);
   expect(localEntry.write_bytes).toBeLessThan(1_000_000);
   expect(remoteAis.length).toBeGreaterThan(0);
+  // Each remote ais process reads its own source at start; that baseline grows with the code base
+  // (about 10.05 MB on 24 Nov 2026). The budget leaves room for it and still sits far below the
+  // ~90 MB a re-staged history would cost, which is what this assertion guards against.
   for (const e of remoteAis) {
-    expect(bytes(e)).toBeLessThan(10_000_000);
+    expect(bytes(e)).toBeLessThan(12_000_000);
     expect(e.write_bytes).toBeLessThan(1_000_000);
   }
   for (const e of steady.entries.filter((e) => e.argv.startsWith("rsync"))) expect(bytes(e)).toBeLessThan(1_000_000);
