@@ -345,11 +345,11 @@ loopback defaults. Set `--port` or
 `AIS_GATEWAY_CONNECT_PROXY_PORT` to change the derived port. An explicit proxy URL always wins. T3 must be restarted to
 apply a change; the command never restarts it.
 
-### T3 Code model lists (Kimi ACP, OpenCode)
+### T3 Code model lists (Kimi ACP, OpenCode, ZCode)
 
-kimi-code and OpenCode do not list the models of a custom provider: they show only what their config names. AIS keeps
-those lists equal to the gateway's `GET <base>/models` (`src/identities/t3-gateway-models.ts`). It scans every folder
-under `~/.t3/gateway/` (`T3CODE_HOME` honoured):
+kimi-code, OpenCode and ZCode do not list the models of a custom provider: they show only what their config names. AIS
+keeps those lists equal to the gateway's `GET <base>/models` (`src/identities/t3-gateway-models.ts`). It scans every folder
+under `~/.t3/gateway/` (`T3CODE_HOME` honoured), and reads the ZCode ACP launcher named in T3 Code's settings.json:
 
 - `config.toml` (kimi-code, `KIMI_CODE_HOME`): for each `[providers.<p>]` with `type = "kimi"`, `base_url` and `api_key`,
   the `[models.<id>]` blocks of that provider become one per gateway model, in gateway order: `provider`, `model`,
@@ -361,6 +361,17 @@ under `~/.t3/gateway/` (`T3CODE_HOME` honoured):
 - `opencode.json`: for each `provider.<p>` with `options.baseURL`, `options.apiKey` and a `models` map, the map becomes the
   gateway ids; an entry that stays keeps its keys and `name` follows the gateway. `{file:...}` and `{env:...}` in the key,
   base URL and headers are resolved as OpenCode does; the request sends the provider's headers (`x-opencode-session`).
+- ZCode personal provider config (JSON): for each `acpRegistry` instance in settings.json whose launcher exports
+  `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, that file's gateway provider rule (an `api.baseUrl` with an `access.apiKey`) has its
+  `personalModelIds` and `modelOrder` set to the gateway ids, in gateway order. Its `providerModelRules` gain one entry per
+  model: a rule that stays keeps its keys (`contextWindow` follows the gateway when the gateway gives one), a new model gets
+  the gateway's context and output limits when present. Rules of other providers, `manualProviderModelRules` and every other
+  key stay. A `defaultModelSelection` naming a model that is gone moves to the first gateway model.
+
+Clients that list models themselves are not written. grok-build fetches the gateway list into its own `models_cache.json`,
+and Codex fetches it through its CLI (the pool list is the union of the members). The glm-acp-agent advertises a built-in
+list (or `ACP_GLM_AVAILABLE_MODELS`), but T3 Code stores its key redacted in settings.json, so AIS cannot read a key to fetch
+that list. It is left as it is.
 
 A list that cannot be read (network error, non-2xx such as an expired upstream key, empty list) leaves the file as it is.
 Files keep their mode. The host profile-sync daemon (`ais __profile_sync_daemon`) runs the sync at start and every

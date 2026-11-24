@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { runT3ModelsCommand } from "../../src/cli/gateway/t3-models.ts";
 import type { GatewayCliDeps } from "../../src/cli/gateway/apps.ts";
-import { kimiCapabilities, parseGatewayModels, syncT3GatewayModels, transformKimiConfig } from "../../src/identities/t3-gateway-models.ts";
+import { kimiCapabilities, parseGatewayModels, syncT3GatewayModels, transformKimiConfig, transformZcodeConfig, zcodeConfigPathFromLauncher } from "../../src/identities/t3-gateway-models.ts";
 import { createT3ModelsTicker } from "../../src/sync/t3-models-ticker.ts";
 
 const root = await mkdtemp(join(tmpdir(), "ais-t3models-"));
@@ -217,4 +217,154 @@ test("ticker: first tick runs, then waits the interval; one pass at a time; repe
   await ticker.idle();
   expect(calls).toBe(2);
   expect(logs.length).toBe(1);
+});
+
+const ZCODE_KEY = "aisg_SYNTHETIC_FIXTURE_zcode";
+const ZCODE_BASE = "https://gw.example.test/gateway/t3-zai/v1";
+
+/** A ZCode personal provider config: one gateway provider plus a second provider AIS must not touch. */
+const zcodeConfig = (models: string[]) => ({
+  schemaVersion: 1,
+  config: {
+    providerConfigRules: {
+      providerRules: [
+        {
+          providerId: "ais-gateway",
+          providerName: "Z.AI (gateway)",
+          config: {
+            group: "standard-personal",
+            access: { type: "api-key", apiKey: ZCODE_KEY },
+            api: { type: "openai-chat-completions", baseUrl: ZCODE_BASE },
+            personalModelIds: [...models],
+            modelOrder: [...models],
+          },
+        },
+        { providerId: "other", providerName: "Other", config: { group: "standard-personal", personalModelIds: ["other-1"], modelOrder: ["other-1"] } },
+      ],
+    },
+    modelConfigRules: {
+      providerModelRules: [
+        ...models.map((id) => ({ modelId: id, providerId: "ais-gateway", config: { properties: { contextWindow: 200000 }, optionSpecs: { maxOutputTokens: { max: 8192 } } } })),
+        { modelId: "other-1", providerId: "other", config: { properties: { contextWindow: 1000 } } },
+      ],
+      manualProviderModelRules: [],
+    },
+    defaultModelSelection: { providerId: "ais-gateway", modelId: models[0] ?? "glm-5.3" },
+  },
+});
+
+/** Writes a ZCode ACP instance (settings.json + launcher + provider config) and a grok launcher that must be ignored. */
+async function setupZcode(h: string, models: string[]): Promise<{ configFile: string }> {
+  const launcherDir = join(h, ".local", "share", "zcode");
+  await mkdir(launcherDir, { recursive: true });
+  const launcherPath = join(launcherDir, "zcode-acp-launch");
+  await writeFile(launcherPath, '#!/bin/sh\nexport ZCODE_HOME="$HOME/.zcode"\nexport ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.zcode/v2/provider_config.json"\nexec node server "$@"\n');
+  const grokDir = join(h, ".ais", "t3", "acp");
+  await mkdir(grokDir, { recursive: true });
+  const grokLauncher = join(grokDir, "grok-build");
+  await writeFile(grokLauncher, '#!/bin/sh\nexec grok "$@"\n');
+  const userdata = join(h, ".t3", "userdata");
+  await mkdir(userdata, { recursive: true });
+  await writeFile(
+    join(userdata, "settings.json"),
+    JSON.stringify({
+      providerInstances: {
+        "t3-zcode-x": { driver: "acpRegistry", enabled: true, config: { source: "local", commandPath: launcherPath, commandArgs: [] } },
+        "t3-grok-x": { driver: "acpRegistry", enabled: true, config: { source: "registry", agentId: "grok-build", commandPath: grokLauncher } },
+      },
+    }),
+  );
+  const configDir = join(h, ".zcode", "v2");
+  await mkdir(configDir, { recursive: true });
+  const configFile = join(configDir, "provider_config.json");
+  await writeFile(configFile, `${JSON.stringify(zcodeConfig(models), null, 2)}\n`);
+  return { configFile };
+}
+
+test("zcodeConfigPathFromLauncher: expands $HOME and ~, ignores a non-ZCode launcher", () => {
+  expect(zcodeConfigPathFromLauncher('export ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.zcode/v2/provider_config.json"', "/h")).toBe("/h/.zcode/v2/provider_config.json");
+  expect(zcodeConfigPathFromLauncher("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=~/.zcode/v2/provider_config.json", "/h")).toBe("/h/.zcode/v2/provider_config.json");
+  expect(zcodeConfigPathFromLauncher('#!/bin/sh\nexec grok "$@"', "/h")).toBeUndefined();
+});
+
+test("transformZcodeConfig: gateway ids, derived context, keeps other providers, moves a gone default, idempotent", () => {
+  const config = zcodeConfig(["glm-old", "glm-5.3"]) as Record<string, any>;
+  const models = parseGatewayModels({ data: [{ id: "glm-5.3", context_length: 1000000 }, { id: "glm-5.4", limit: { context: 500000, output: 64000 } }] });
+  const out = transformZcodeConfig(config, "ais-gateway", models) as Record<string, any>;
+  const rule = out.config.providerConfigRules.providerRules.find((r: any) => r.providerId === "ais-gateway");
+  expect(rule.config.personalModelIds).toEqual(["glm-5.3", "glm-5.4"]);
+  expect(rule.config.modelOrder).toEqual(["glm-5.3", "glm-5.4"]);
+  expect(rule.config.access.apiKey).toBe(ZCODE_KEY);
+  const rules = out.config.modelConfigRules.providerModelRules;
+  expect(rules.find((r: any) => r.modelId === "glm-old")).toBeUndefined();
+  const kept = rules.find((r: any) => r.modelId === "glm-5.3");
+  expect(kept.config.properties.contextWindow).toBe(1000000); // the gateway updates the window
+  expect(kept.config.optionSpecs.maxOutputTokens.max).toBe(8192); // a hand-set output limit stays
+  const added = rules.find((r: any) => r.modelId === "glm-5.4");
+  expect(added.config.properties.contextWindow).toBe(500000);
+  expect(added.config.optionSpecs.maxOutputTokens.max).toBe(64000);
+  expect(rules.find((r: any) => r.modelId === "other-1").config.properties.contextWindow).toBe(1000);
+  const otherRule = out.config.providerConfigRules.providerRules.find((r: any) => r.providerId === "other");
+  expect(otherRule.config.personalModelIds).toEqual(["other-1"]);
+  expect(out.config.modelConfigRules.manualProviderModelRules).toEqual([]);
+  expect(out.config.defaultModelSelection.modelId).toBe("glm-5.3"); // glm-old is gone
+  expect(out.schemaVersion).toBe(1);
+  expect(transformZcodeConfig(out, "ais-gateway", models)).toEqual(out);
+});
+
+test("sync: a ZCode ACP config follows the gateway; mode kept; unrelated keys stay", async () => {
+  const { home: h } = await home();
+  const { configFile } = await setupZcode(h, ["glm-5.3", "glm-5.3-flash"]);
+  await chmod(configFile, 0o600);
+  const doFetch = fakeFetch({ [`${ZCODE_BASE}/models`]: { body: { data: [{ id: "glm-5.3" }, { id: "glm-5.3-flash" }, { id: "glm-5.4" }] } } });
+  const results = await syncT3GatewayModels({ home: h, env: {}, fetch: doFetch });
+  expect(results.map((r) => [r.provider, r.status])).toEqual([["ais-gateway", "updated"]]);
+
+  const cfg = JSON.parse(await readFile(configFile, "utf8"));
+  const rule = cfg.config.providerConfigRules.providerRules.find((r: any) => r.providerId === "ais-gateway");
+  expect(rule.config.personalModelIds).toEqual(["glm-5.3", "glm-5.3-flash", "glm-5.4"]);
+  expect(rule.config.modelOrder).toEqual(["glm-5.3", "glm-5.3-flash", "glm-5.4"]);
+  expect(rule.config.access.apiKey).toBe(ZCODE_KEY);
+  const rules = cfg.config.modelConfigRules.providerModelRules;
+  const kept = rules.find((r: any) => r.modelId === "glm-5.3");
+  expect(kept.config.properties.contextWindow).toBe(200000); // the gateway gave no window, the hand-set one stays
+  expect(kept.config.optionSpecs.maxOutputTokens.max).toBe(8192);
+  expect(rules.find((r: any) => r.modelId === "glm-5.4")).toBeTruthy();
+  expect(rules.find((r: any) => r.modelId === "other-1").config.properties.contextWindow).toBe(1000);
+  expect(cfg.config.defaultModelSelection.modelId).toBe("glm-5.3");
+  expect((await stat(configFile)).mode & 0o777).toBe(0o600);
+
+  const after = await readFile(configFile, "utf8");
+  const again = await syncT3GatewayModels({ home: h, env: {}, fetch: doFetch });
+  expect(again.map((r) => r.status)).toEqual(["current"]);
+  expect(await readFile(configFile, "utf8")).toBe(after);
+});
+
+test("sync: a ZCode list that cannot be read leaves the file as it is", async () => {
+  const { home: h } = await home();
+  const { configFile } = await setupZcode(h, ["glm-5.3"]);
+  const before = await readFile(configFile, "utf8");
+  const url = `${ZCODE_BASE}/models`;
+  for (const route of [{ status: 401, body: { error: { code: "api_key_expired" } } }, { body: { data: [] } }]) {
+    const [r] = await syncT3GatewayModels({ home: h, env: {}, fetch: fakeFetch({ [url]: route }) });
+    expect(r!.status).toBe("failed");
+    expect(await readFile(configFile, "utf8")).toBe(before);
+  }
+  const [r] = await syncT3GatewayModels({ home: h, env: {}, fetch: fakeFetch({ [url]: { status: 401, body: { error: { code: "api_key_expired" } } } }) });
+  expect(r!.error).toContain("api_key_expired");
+  expect(r!.error).not.toContain(ZCODE_KEY);
+});
+
+test("sync: no settings.json means no ZCode pass; a grok-only launcher is ignored", async () => {
+  const { home: h } = await home();
+  expect(await syncT3GatewayModels({ home: h, env: {}, fetch: fakeFetch({}) })).toEqual([]);
+  // A settings.json with only a grok-build ACP instance names no ZCode config: still nothing to sync.
+  const userdata = join(h, ".t3", "userdata");
+  await mkdir(userdata, { recursive: true });
+  const grokDir = join(h, ".ais", "t3", "acp");
+  await mkdir(grokDir, { recursive: true });
+  const grokLauncher = join(grokDir, "grok-build");
+  await writeFile(grokLauncher, '#!/bin/sh\nexec grok "$@"\n');
+  await writeFile(join(userdata, "settings.json"), JSON.stringify({ providerInstances: { "t3-grok-x": { driver: "acpRegistry", config: { agentId: "grok-build", commandPath: grokLauncher } } } }));
+  expect(await syncT3GatewayModels({ home: h, env: {}, fetch: fakeFetch({}) })).toEqual([]);
 });
