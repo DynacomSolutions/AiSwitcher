@@ -433,7 +433,7 @@ ETA: 2026-12-12 18:00 ICT
 | 300 | Incremental indexers for Claude and Codex | done | claude | | 20.302 | | PR 759 merged. |
 | 301 | Enrichment loop on the gateway leader | done | claude | | 20.298, 20.300, 20.297 | | PR 761 merged.<br>Off unless AIS_SESSIONS_ENRICH=1.<br>Identity and pool resolution not built yet. |
 | 302 | Session readers as line iterables | done | claude | | | | PR 751 merged. |
-| 303 | Shipper in backup-client | in_progress | claude | sessions-shipper | 20.299 | 2026-11-24 20:00 | .cluster code.<br>Python SigV4 signer for If-None-Match and checksum. |
+| 303 | Shipper in backup-client | done | claude | | 20.299 | | .cluster PR 3273 merged.<br>Python SigV4 signer for If-None-Match and checksum.<br>One copy per session, 120 s flush gap. |
 | 304 | Shipper fast lane and hot set | todo | | | 20.303 | | |
 | 305 | Cluster: shipper values, recipient key, ingest secret | todo | | | 20.303 | | .cluster PR. |
 | 306 | Cluster: HoardDB read key, NetworkPolicy, env | blocked_on_owner | Thomas | | 20.297 | | Draft .cluster PR 3255 is ready except the read key.<br>Owner step: share the HoardDB admin API token item in Cloudwarden with the MCP account, through an org collection.<br>Then the agent creates the read key (tenant platform-backups, bucket agent-sessions, scope read). |
