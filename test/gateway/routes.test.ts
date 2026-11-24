@@ -292,13 +292,58 @@ describe("model lists never hit the reserve", () => {
     usage.a = full;
     reply = () => jsonRes(codexList);
     // The live client asks /backend-api/models. /models and /v1/models must answer the same.
-    for (const path of ["/models", "/v1/models", "/backend-api/models"]) {
+    // A codex client with chatgpt_base_url asks /backend-api/codex/models?client_version=...
+    for (const path of ["/models", "/v1/models", "/backend-api/models", "/backend-api/codex/models", "/backend-api/codex/models?client_version=1"]) {
       seen = [];
       const res = await call("cx", path, { method: "GET" });
       expect(res.status).toBe(200);
       expect(((await res.json()) as { models: Array<{ slug: string }> }).models.map((m) => m.slug)).toEqual(["gpt-6.2-astra"]);
       expect(seen.map((s) => s.headers.get("authorization"))).toEqual(["Bearer tok-a"]);
+      expect(requests.at(-1)).toMatchObject({ app: "cx", provider: "codex", status: "ok", httpStatus: 200 });
     }
+    expect(seen).toHaveLength(1);
+  });
+
+  test("only GET /codex/models is a list: the rest of /codex/* keeps the reserve", async () => {
+    await addApp("cx", "codex", "openai", { target: { kind: "pin", identity: "a" }, reservePercent: 100 });
+    usage.a = full;
+    reply = () => jsonRes(codexList);
+    for (const [method, path] of [["POST", "/backend-api/codex/models"], ["GET", "/backend-api/codex/models/x"], ["POST", "/backend-api/codex/responses"]] as const) {
+      seen = [];
+      const res = await call("cx", path, { method, ...(method === "POST" ? { body: "{}" } : {}) });
+      expect(res.status).toBe(429);
+      expect(seen).toHaveLength(0);
+    }
+  });
+
+  test("a pin with a dead login answers 401 on the list, not a bare 502", async () => {
+    const { GatewayCredentialError } = await import("../../src/gateway/credentials.ts");
+    await addApp("cx", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    deps.creds = { get: async () => { throw new GatewayCredentialError("login-dead", "codex", "a"); }, refreshAfter401: async () => { throw new Error("unused"); } } as unknown as GatewayDeps["creds"];
+    const res = await call("cx", "/models", { method: "GET" });
+    expect(res.status).toBe(401);
+    expect(seen).toHaveLength(0);
+  });
+
+  test("a transient login failure on every member answers 502 with the client message", async () => {
+    const { GatewayCredentialError } = await import("../../src/gateway/credentials.ts");
+    await addApp("mc", "codex", "openai");
+    deps.creds = { get: async () => { throw new GatewayCredentialError("refresh-failed", "codex", "a"); }, refreshAfter401: async () => { throw new Error("unused"); } } as unknown as GatewayDeps["creds"];
+    const res = await call("mc", "/models", { method: "GET" });
+    expect(res.status).toBe(502);
+  });
+
+  test("the union leaves out logged-out members, and keeps them when all are logged out", async () => {
+    await addApp("mc", "codex", "openai");
+    (deps.creds as unknown as { loggedOut: (p: string, n: string) => Promise<boolean> }).loggedOut = async (_p, n) => n === "a";
+    reply = () => jsonRes(codexList);
+    expect((await call("mc", "/models", { method: "GET" })).status).toBe(200);
+    expect(seen.map((s) => s.headers.get("authorization"))).toEqual(["Bearer tok-b"]);
+    seen = [];
+    (deps.creds as unknown as { loggedOut: () => Promise<boolean> }).loggedOut = async () => true;
+    const res = await call("mc", "/models", { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(seen.length).toBeGreaterThan(0);
   });
 
   test("a chat request of the same pinned app at its reserve still gets the native limit answer", async () => {
@@ -342,6 +387,7 @@ describe("model lists never hit the reserve", () => {
     expect(res.status).toBe(429);
     expect(await res.text()).toBe(body);
     expect(res.headers.get("retry-after")).toBe("1234");
+    expect(requests.at(-1)).toMatchObject({ app: "cx", provider: "codex", status: "upstream_error", httpStatus: 429 });
   });
 
   test("no identities still rejects chat, and an empty pool cannot list", async () => {
