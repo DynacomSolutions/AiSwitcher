@@ -23,10 +23,14 @@
  *   allow option within `AUTO_ANSWER_MS` (no person answers that fast: the thread's mode approves by itself);
  * - otherwise `cancelled`, which agents report as a cancelled request, never as a user's rejection.
  *
+ * A long usage-limit retry inside an open kimi turn was measured on 24 Nov 2026. kimi-code sleeps until the reset. The
+ * turn never ends, so the thread looks running for days. While a prompt is open the relay watches the agent's log for a
+ * 429 retry whose reset is over two minutes away. It snoozes the thread, sends the client a notice and cancels the turn.
+ *
  * Every other line passes unchanged, byte for byte. A line this code cannot read passes unchanged too.
  */
 import { redactText } from "../gateway/upstream-error.ts";
-import { endpointFromServers, type LimitSnoozer, type McpEndpoint } from "./limit-snooze.ts";
+import { endpointFromServers, resetFromText, type LimitSnoozer, type McpEndpoint } from "./limit-snooze.ts";
 
 /** Why a turn failed, from the agent's own records. */
 export interface TurnFailure {
@@ -51,6 +55,8 @@ export interface RelayAdapter {
   promptStarting?(sessionId: string): unknown;
   /** The outcome of the turn in `sessionId` whose prompt gave `mark`. */
   turnOutcome?(sessionId: string, mark: unknown): Promise<TurnOutcome>;
+  /** A long usage-limit retry inside the open turn whose prompt gave `mark`, or undefined. Implemented for kimi only. */
+  inTurnLimit?(sessionId: string, mark: unknown): Promise<TurnFailure | undefined>;
 }
 
 export interface RelayOptions {
@@ -76,6 +82,11 @@ export const ERROR_SOURCE = "ais-acp-relay";
 export const EMPTY_TURN_NOTICE = "[No reply: the agent ended this turn without any output and gave no reason.]";
 export const BUSY_TURN_NOTICE =
   "[No reply: the agent is busy with a turn it started by itself (for example when background work ended). That turn's output does not reach this thread. Wait until it is done, then send the message again.]";
+
+/** The notice a thread gets when a long usage-limit retry inside an open turn is stopped and the thread is snoozed. */
+export function inTurnLimitNotice(resetIso: string): string {
+  return `[Usage limit reached. The turn was stopped and this thread is snoozed until the reset. Resets at ${resetIso}.]`;
+}
 /** A permission answer quicker than this came from the client's mode, not from a person. */
 export const AUTO_ANSWER_MS = 250;
 const MESSAGE_MAX = 500;
@@ -241,6 +252,46 @@ export class AcpRelay {
   /** A failed prompt: a usage limit with a reset time snoozes the thread. Fire and forget. */
   private limitFailure(sessionId: string, text: string, status?: number, code?: string): void {
     this.opts.limit?.onFailure(sessionId, { text, ...(status !== undefined ? { status } : {}), ...(code !== undefined ? { code } : {}) });
+  }
+
+  /** Whether any prompt is open. The process runs the in-turn limit watch only while one is. */
+  hasOpenPrompts(): boolean {
+    return this.prompts.size > 0;
+  }
+
+  /**
+   * One pass of the in-turn limit watch. For each open prompt it asks the adapter for a long usage-limit retry. The first
+   * one for a session and reset snoozes the thread, gives the client a notice and cancels the sleeping turn. It returns
+   * the notice lines for the process to write to the client. The snoozer dedupes, so a later pass sends nothing. Never
+   * throws.
+   */
+  async watchInTurnLimits(): Promise<string[]> {
+    const out: string[] = [];
+    const adapter = this.opts.adapter;
+    const limit = this.opts.limit;
+    if (!limit || !adapter?.inTurnLimit || this.prompts.size === 0) return out;
+    const inTurnLimit = adapter.inTurnLimit.bind(adapter);
+    const seen = new Set<string>();
+    for (const p of this.prompts.values()) {
+      if (seen.has(p.sessionId)) continue;
+      seen.add(p.sessionId);
+      let failure: TurnFailure | undefined;
+      try {
+        failure = await inTurnLimit(p.sessionId, p.mark);
+      } catch {
+        continue;
+      }
+      if (!failure) continue;
+      const reset = resetFromText(failure.message, this.now());
+      if (!reset) continue;
+      const acted = limit.onInTurnLimit(p.sessionId, { text: failure.message, ...(failure.status !== undefined ? { status: failure.status } : {}), ...(failure.code !== undefined ? { code: failure.code } : {}) });
+      if (!acted) continue;
+      const resetIso = reset.toISOString();
+      this.opts.log?.(`acp-relay: in-turn usage limit, thread snoozed until ${resetIso}, turn cancelled`);
+      out.push(JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: p.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: inTurnLimitNotice(resetIso) } } } }));
+      this.opts.toAgent?.(JSON.stringify({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: p.sessionId } }));
+    }
+    return out;
   }
 
   /** A line the agent sent. Returns the lines the client gets: the same line, or the changed answer to a prompt. */

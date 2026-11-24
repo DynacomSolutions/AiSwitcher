@@ -232,9 +232,35 @@ export class LimitSnoozer {
       const key = `${sessionId}|${reset.toISOString()}`;
       if (this.done.has(key)) return;
       this.done.add(key);
-      void this.run(sessionId, endpoint, reset, key);
+      void this.run(sessionId, endpoint, reset, key, true);
     } catch {
       // never changes the answer
+    }
+  }
+
+  /**
+   * A long usage-limit retry inside an open prompt. The agent sleeps until the reset, so the turn never ends on its own.
+   * Snooze the thread and schedule the resume. The resume is not registered for `onSuccess` deletion: the cancelled turn
+   * ends "ok" and must not delete it. Returns true only for the first snooze of this session and reset. Never throws.
+   */
+  onInTurnLimit(sessionId: string, failure: LimitFailure): boolean {
+    try {
+      if (!isLimitFailure(failure)) return false;
+      const reset = resetFromText(failure.text, this.nowMs());
+      if (!reset) return false;
+      const endpoint = this.endpoints.get(sessionId);
+      if (!endpoint) {
+        this.opts.log?.("acp-relay: in-turn usage limit with a reset time, but no T3 MCP server known for this session");
+        return false;
+      }
+      const key = `${sessionId}|${reset.toISOString()}`;
+      if (this.done.has(key)) return false;
+      this.done.add(key);
+      void this.run(sessionId, endpoint, reset, key, false);
+      return true;
+    } catch {
+      // never changes the answer
+      return false;
     }
   }
 
@@ -258,7 +284,8 @@ export class LimitSnoozer {
     }
   }
 
-  private async run(sessionId: string, endpoint: McpEndpoint, reset: Date, key: string): Promise<void> {
+  /** `registerResume` false keeps the resume task out of the map `onSuccess` deletes from (an in-turn limit). */
+  private async run(sessionId: string, endpoint: McpEndpoint, reset: Date, key: string, registerResume: boolean): Promise<void> {
     try {
       await this.caller.call(endpoint, "t3_thread_organize", { action: "snooze", snoozedUntil: reset.toISOString() });
       const runAtMs = reset.getTime() + RESUME_DELAY_MS;
@@ -271,7 +298,7 @@ export class LimitSnoozer {
         this.opts.log?.(`acp-relay: thread snoozed until ${reset.toISOString()}; no resume for a subagent thread`);
         return;
       }
-      if (taskId !== undefined) this.scheduled.set(sessionId, { taskId, runAtMs, endpoint, key });
+      if (taskId !== undefined && registerResume) this.scheduled.set(sessionId, { taskId, runAtMs, endpoint, key });
       this.opts.log?.(`acp-relay: thread snoozed until ${reset.toISOString()}, resume scheduled`);
     } catch (err) {
       this.opts.log?.(`acp-relay: snooze or resume failed: ${ownMessage(err)}`);

@@ -13,6 +13,9 @@ import { kimiAdapter, kimiHome } from "./kimi-turn.ts";
 import { LimitSnoozer } from "./limit-snooze.ts";
 import { AcpRelay, type RelayAdapter } from "./relay.ts";
 
+/** How often the in-turn limit watch reads the agent's log while a prompt is open. */
+export const IN_TURN_WATCH_MS = 3000;
+
 /** Splits a byte stream into lines, keeping each line's bytes. */
 export class LineSplitter {
   private pending: Buffer[] = [];
@@ -59,6 +62,8 @@ export interface RelayProcessOptions {
   limit?: LimitSnoozer | false;
   /** See RelayOptions.answerIdlePermissions. */
   answerIdlePermissions?: boolean;
+  /** The in-turn limit watch interval. Default IN_TURN_WATCH_MS. Only used when the adapter has inTurnLimit. */
+  inTurnWatchMs?: number;
 }
 
 /** Starts the agent and relays until it exits. Resolves with the exit code this process should end with. */
@@ -84,6 +89,8 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
 
   return new Promise<number>((resolve) => {
     let done = false;
+    let watchTimer: ReturnType<typeof setTimeout> | undefined;
+    let watchBusy = false;
     const signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT", "SIGHUP"];
     const forward = (signal: NodeJS.Signals) => {
       child.kill(signal);
@@ -93,6 +100,7 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     const finish = (code: number) => {
       if (done) return;
       done = true;
+      stopWatch();
       for (const [s, h] of handlers) process.off(s, h);
       resolve(code);
     };
@@ -107,6 +115,7 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
           // Tracking a prompt must never stop it from being sent.
         }
       }
+      scheduleWatch(); // a prompt may have opened
       if (child.stdin.writable) child.stdin.write(bytes);
       flushHeld();
     });
@@ -135,6 +144,8 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
         }
         if (!out || (out.length === 1 && out[0] === text)) await write(Buffer.concat([line, NEWLINE]));
         else await write(Buffer.from(out.map((o) => `${o}\n`).join(""), "utf8"));
+        if (relay.hasOpenPrompts()) scheduleWatch();
+        else stopWatch(); // the last prompt was answered: no poll work
       });
     };
     child.stdout.on("data", (chunk: Buffer) => {
@@ -144,6 +155,33 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
       clientGone = true; // nothing more can be written
       child.kill("SIGTERM");
     });
+
+    // In-turn limit watch: read the agent's log only while a prompt is open. kimi-code sleeps through a long limit retry.
+    const watchMs = opts.inTurnWatchMs ?? IN_TURN_WATCH_MS;
+    function stopWatch(): void {
+      if (watchTimer !== undefined) {
+        clearTimeout(watchTimer);
+        watchTimer = undefined;
+      }
+    }
+    function scheduleWatch(): void {
+      if (done || watchBusy || watchTimer !== undefined || !opts.adapter?.inTurnLimit || !relay.hasOpenPrompts()) return;
+      watchTimer = setTimeout(() => {
+        watchTimer = undefined;
+        if (!done && relay.hasOpenPrompts()) void watchPass();
+      }, watchMs);
+    }
+    async function watchPass(): Promise<void> {
+      watchBusy = true;
+      try {
+        const lines = await relay.watchInTurnLimits();
+        if (lines.length > 0) chain = chain.then(() => write(Buffer.from(lines.map((l) => `${l}\n`).join(""), "utf8")));
+      } catch {
+        // the watch never breaks the relay
+      }
+      watchBusy = false;
+      scheduleWatch();
+    }
 
     child.on("error", (err) => {
       log(`acp-relay: cannot start ${opts.command}: ${err.message}`);

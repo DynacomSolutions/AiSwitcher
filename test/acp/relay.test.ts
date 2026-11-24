@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { AcpRelay, AUTO_ANSWER_MS, BUSY_TURN_NOTICE, describeError, EMPTY_TURN_NOTICE, ERROR_SOURCE, failureMessage, TURN_FAILED_CODE, type TurnFailure, type TurnOutcome } from "../../src/acp/relay.ts";
+import { AcpRelay, AUTO_ANSWER_MS, BUSY_TURN_NOTICE, describeError, EMPTY_TURN_NOTICE, ERROR_SOURCE, failureMessage, inTurnLimitNotice, TURN_FAILED_CODE, type TurnFailure, type TurnOutcome } from "../../src/acp/relay.ts";
 import { LineSplitter } from "../../src/acp/relay-process.ts";
+import { LimitSnoozer, type McpCaller, type McpEndpoint } from "../../src/acp/limit-snooze.ts";
 
 const prompt = (id: number | string, sessionId = "s1") => JSON.stringify({ jsonrpc: "2.0", id, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: "SYNTHETIC_FIXTURE prompt" }] } });
 const update = (kind: string, sessionId = "s1") => JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: kind, content: { type: "text", text: "x" } } } });
@@ -334,5 +335,93 @@ describe("a turn the agent started itself", () => {
     expect(await r.fromAgent(endTurn(1))).toEqual([endTurn(1)]);
     r.fromClient(prompt(2));
     expect(JSON.parse((await r.fromAgent(endTurn(2)))[0]!).params.update.content.text).toBe(EMPTY_TURN_NOTICE);
+  });
+});
+
+describe("in-turn limit watch", () => {
+  const NOW = Date.parse("2026-11-24T12:00:00Z");
+  const RESET = "2026-11-27T03:31:45.000Z";
+  const EP: McpEndpoint = { url: "http://127.0.0.1:1/mcp", authorization: ["Bear", "er SYNTHETIC"].join("") };
+  const longFailure: TurnFailure = { message: `You've hit your usage limit (SYNTHETIC_FIXTURE). Resets at ${RESET}.`, code: "APIProviderRateLimitError", status: 429 };
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+
+  function watchRelay(failure: TurnFailure | undefined, withInTurn = true, outcome?: TurnOutcome) {
+    const calls: Array<[string, Record<string, unknown>]> = [];
+    const caller: McpCaller = {
+      async call(_e, tool, args) {
+        calls.push([tool, args]);
+        if (tool === "schedule_task") return { scheduledTask: { scheduledTaskId: "task-1", boundThreadId: "thread-1" } };
+        if (tool === "t3_thread_read") return { thread: { relationshipToParent: null } };
+        return {};
+      },
+    };
+    const limit = new LimitSnoozer({ caller, now: () => NOW, log: () => {} });
+    limit.setEndpoint("s1", EP);
+    const toAgent: string[] = [];
+    const logs: string[] = [];
+    const adapter = { promptStarting: () => 0, ...(withInTurn ? { inTurnLimit: async () => failure } : {}), ...(outcome !== undefined ? { turnOutcome: async () => outcome } : {}) };
+    const r = new AcpRelay({ adapter, limit, toAgent: (l) => toAgent.push(l), log: (l) => logs.push(l), now: () => NOW });
+    return { r, calls, toAgent, logs };
+  }
+
+  test("a long limit inside an open prompt snoozes, gives a notice and cancels the turn", async () => {
+    const { r, calls, toAgent } = watchRelay(longFailure);
+    r.fromClient(prompt(1));
+    const out = await r.watchInTurnLimits();
+    expect(out.length).toBe(1);
+    const notice = JSON.parse(out[0]!);
+    expect(notice.method).toBe("session/update");
+    expect(notice.params.update.sessionUpdate).toBe("agent_message_chunk");
+    expect(notice.params.update.content.text).toBe(inTurnLimitNotice("2026-11-27T03:31:45.000Z"));
+    expect(JSON.parse(toAgent[0]!)).toEqual({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: "s1" } });
+    await tick();
+    expect(calls.map((c) => c[0])).toEqual(["t3_thread_organize", "schedule_task", "t3_thread_read"]);
+    expect(calls[0]![1]).toEqual({ action: "snooze", snoozedUntil: "2026-11-27T03:31:45.000Z" });
+  });
+
+  test("a second pass sends nothing more (one snooze, notice and cancel per reset)", async () => {
+    const { r, calls, toAgent } = watchRelay(longFailure);
+    r.fromClient(prompt(1));
+    expect((await r.watchInTurnLimits()).length).toBe(1);
+    expect((await r.watchInTurnLimits()).length).toBe(0);
+    await tick();
+    expect(toAgent.length).toBe(1);
+    expect(calls.length).toBe(3);
+  });
+
+  test("no open prompt, no inTurnLimit, or no limit found: no notice, cancel or call", async () => {
+    const noPrompt = watchRelay(longFailure);
+    expect(await noPrompt.r.watchInTurnLimits()).toEqual([]);
+    expect(noPrompt.toAgent).toEqual([]);
+    const noMethod = watchRelay(longFailure, false);
+    noMethod.r.fromClient(prompt(1));
+    expect(await noMethod.r.watchInTurnLimits()).toEqual([]);
+    const noLimit = watchRelay(undefined);
+    noLimit.r.fromClient(prompt(1));
+    expect(await noLimit.r.watchInTurnLimits()).toEqual([]);
+    await tick();
+    expect(noPrompt.calls.length + noMethod.calls.length + noLimit.calls.length).toBe(0);
+  });
+
+  test("a cancelled end that reads ok keeps the resume and does not snooze again", async () => {
+    const { r, calls } = watchRelay(longFailure, true, "ok");
+    r.fromClient(prompt(1));
+    await r.watchInTurnLimits();
+    await tick();
+    expect(await r.fromAgent(endTurn(1))).toEqual([endTurn(1)]); // the cancelled answer passes unchanged
+    await tick();
+    expect(calls.filter((c) => c[0] === "delete_scheduled_task").length).toBe(0);
+    expect(calls.filter((c) => c[0] === "t3_thread_organize").length).toBe(1);
+  });
+
+  test("a cancelled end that still reads failed does not snooze a second time", async () => {
+    const { r, calls } = watchRelay(longFailure, true, longFailure);
+    r.fromClient(prompt(1));
+    await r.watchInTurnLimits();
+    await tick();
+    const out = await r.fromAgent(endTurn(1));
+    expect(JSON.parse(out[0]!).error.code).toBe(TURN_FAILED_CODE); // the failed answer still becomes an error
+    await tick();
+    expect(calls.filter((c) => c[0] === "t3_thread_organize").length).toBe(1); // the done set dedupes
   });
 });

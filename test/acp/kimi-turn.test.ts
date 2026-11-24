@@ -132,3 +132,75 @@ test("kimiHome: KIMI_CODE_HOME, or ~/.kimi-code", () => {
   expect(kimiHome({ KIMI_CODE_HOME: "/x/kimi" }, "/srv/u")).toBe("/x/kimi");
   expect(kimiHome({}, "/srv/u")).toBe("/srv/u/.kimi-code");
 });
+
+// In-turn limit watch: a long usage-limit retry inside an open turn. The clock is fixed so the horizon is deterministic.
+const NOW_MS = Date.parse("2026-11-24T12:00:00Z");
+const LONG_RESET = "2026-11-27T03:31:45.000Z"; // about 71 h away
+const SHORT_RESET = "2026-11-24T12:00:30Z"; // 30 s away, under the two-minute horizon
+const retry = (o: { status?: number; name?: string; message?: string } = {}) =>
+  line({
+    type: "turn.step.retrying", agentId: "main", turnId: 0, step: 1, failedAttempt: 1, nextAttempt: 2, maxAttempts: 10,
+    delayMs: 256304000, errorName: o.name ?? "APIProviderRateLimitError",
+    errorMessage: o.message ?? `You've hit your usage limit (SYNTHETIC_FIXTURE). Resets at ${LONG_RESET}.`,
+    statusCode: o.status ?? 429, time: 5000,
+  });
+const inTurnAdapter = (home: string) => kimiAdapter(home, { now: () => NOW_MS });
+
+test("inTurnLimit: a 429 retry with a reset over two minutes away is a long limit", async () => {
+  const { home, log } = await session("session_it1");
+  await writeFile(log, prompted());
+  const a = inTurnAdapter(home);
+  const mark = a.promptStarting!("session_it1");
+  await appendFile(log, retry());
+  expect(await a.inTurnLimit!("session_it1", mark)).toEqual({
+    message: `You've hit your usage limit (SYNTHETIC_FIXTURE). Resets at ${LONG_RESET}.`,
+    code: "APIProviderRateLimitError", status: 429,
+  });
+});
+
+test("inTurnLimit: a short burst, no reset text, or a non-limit error is ignored", async () => {
+  const { home, log } = await session("session_it2");
+  await writeFile(log, "");
+  const a = inTurnAdapter(home);
+  const cases = [
+    retry({ message: `Rate limit (SYNTHETIC_FIXTURE). Resets at ${SHORT_RESET}.` }), // burst under the horizon
+    retry({ message: "You've hit your usage limit (SYNTHETIC_FIXTURE)." }), // no reset text
+    retry({ status: 500, name: "APIProviderError", message: `Server error (SYNTHETIC_FIXTURE). Resets at ${LONG_RESET}.` }), // not a limit
+  ];
+  for (const c of cases) {
+    const mark = a.promptStarting!("session_it2");
+    await appendFile(log, c);
+    expect(await a.inTurnLimit!("session_it2", mark)).toBeUndefined();
+  }
+});
+
+test("inTurnLimit: a rate-limit error name is enough without a 429 status", async () => {
+  const { home, log } = await session("session_it3");
+  await writeFile(log, "");
+  const a = inTurnAdapter(home);
+  const mark = a.promptStarting!("session_it3");
+  await appendFile(log, line({ type: "turn.step.retrying", errorName: "APIProviderRateLimitError", errorMessage: `Usage limit (SYNTHETIC_FIXTURE). Resets at ${LONG_RESET}.`, time: 5000 }));
+  expect((await a.inTurnLimit!("session_it3", mark))?.code).toBe("APIProviderRateLimitError");
+});
+
+test("inTurnLimit: only retries after the prompt mark count, and the newest one wins", async () => {
+  const { home, log } = await session("session_it4");
+  await writeFile(log, retry()); // a retry of an earlier turn
+  const a = inTurnAdapter(home);
+  const mark = a.promptStarting!("session_it4");
+  expect(await a.inTurnLimit!("session_it4", mark)).toBeUndefined(); // before the mark
+  await appendFile(log, retry());
+  expect((await a.inTurnLimit!("session_it4", mark))?.status).toBe(429);
+  await appendFile(log, retry({ message: `Rate limit (SYNTHETIC_FIXTURE). Resets at ${SHORT_RESET}.` })); // newest is a burst
+  expect(await a.inTurnLimit!("session_it4", mark)).toBeUndefined();
+});
+
+test("inTurnLimit: a turn.ended line is not a retry, and an unknown session gives nothing", async () => {
+  const { home, log } = await session("session_it5");
+  await writeFile(log, "");
+  const a = inTurnAdapter(home);
+  const mark = a.promptStarting!("session_it5");
+  await appendFile(log, ended("failed", { code: "provider.rate_limit", message: `Usage limit (SYNTHETIC_FIXTURE). Resets at ${LONG_RESET}.`, retryable: true, details: { statusCode: 429 } }));
+  expect(await a.inTurnLimit!("session_it5", mark)).toBeUndefined();
+  expect(await a.inTurnLimit!("session_missing", mark)).toBeUndefined();
+});

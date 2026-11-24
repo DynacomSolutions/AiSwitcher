@@ -159,6 +159,44 @@ describe("resume task lifecycle", () => {
   });
 });
 
+describe("in-turn limit snooze", () => {
+  const failure = { text: `You've hit your usage limit (SYNTHETIC_FIXTURE). Resets at ${RESET}.`, status: 429, code: "provider.rate_limit" };
+  test("snoozes and schedules once, and a cancelled end does not delete the resume", async () => {
+    const { limit, calls } = setup();
+    limit.setEndpoint("s1", EP);
+    expect(limit.onInTurnLimit("s1", failure)).toBe(true);
+    await tick();
+    expect(calls.map((c) => c[1])).toEqual(["t3_thread_organize", "schedule_task", "t3_thread_read"]);
+    expect(calls[0]![2]).toEqual({ action: "snooze", snoozedUntil: "2026-11-20T15:00:00.000Z" });
+    expect(limit.onInTurnLimit("s1", failure)).toBe(false); // one snooze per session and reset
+    await tick();
+    expect(calls.length).toBe(3);
+    limit.onSuccess("s1"); // the cancelled turn ends ok: the resume must survive
+    await tick();
+    expect(calls.some((c) => c[1] === "delete_scheduled_task")).toBe(false);
+  });
+  test("a subagent thread keeps the snooze and loses the resume", async () => {
+    const { limit, calls, logs } = setup({ subagent: true });
+    limit.setEndpoint("s1", EP);
+    expect(limit.onInTurnLimit("s1", failure)).toBe(true);
+    await tick();
+    expect(calls.map((c) => c[1])).toEqual(["t3_thread_organize", "schedule_task", "t3_thread_read", "delete_scheduled_task"]);
+    expect(logs[0]).toContain("subagent");
+  });
+  test("no reset, a non-limit failure, or no endpoint: nothing happens", async () => {
+    const { limit, calls } = setup();
+    limit.setEndpoint("s1", EP);
+    expect(limit.onInTurnLimit("s1", { text: "Usage limit reached.", status: 429 })).toBe(false);
+    expect(limit.onInTurnLimit("s1", { text: `Bad request. Resets at ${RESET}.`, status: 400, code: "provider.api_error" })).toBe(false);
+    await tick();
+    expect(calls.length).toBe(0);
+    const other = setup();
+    expect(other.limit.onInTurnLimit("s1", failure)).toBe(false); // no endpoint known
+    await tick();
+    expect(other.calls.length).toBe(0);
+  });
+});
+
 describe("native Grok limit notification", () => {
   const complete = (stopReason: string, agentResult?: unknown) => JSON.stringify({ jsonrpc: "2.0", method: "_x.ai/session/prompt_complete", params: { sessionId: "s1", stopReason, agentResult } });
   test("rate_limit with the reset in agentResult snoozes", async () => {
