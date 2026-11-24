@@ -718,6 +718,9 @@ CLIProxyAPI's refresh journal):
   one row per managed identity of claude, codex, kimi and zai (pool members plus the pins of active apps,
   canonical names, deduplicated). Each row carries the usage source's reading: `status`, `capturedAt`,
   `stale`, `maxUtilization`, `windows[]` (`label`, `utilization`, `resetsAt`, `model`) and `extraUsage`.
+  A claude row also carries `plan` (`type`, for example `claude_max`, `tier`, `checkedAt`, `stale`). It comes from
+  the login's own `GET /api/oauth/profile`, read again every hour, so a plan upgrade shows without a new login.
+  The `subscriptionType` saved in a login file is written at login and is never the plan source.
   The reads come from the same 45 s cache the proxy selects on: a request never waits on a fresh fetch
   and never refreshes a token. An identity with no reading yet answers `status: "unavailable"` and fills
   in behind. The console Limits page merges these rows over its host scan (`src/server/gateway-limits.ts`).

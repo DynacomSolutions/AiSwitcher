@@ -472,7 +472,8 @@ describe("usage api", () => {
   describe("shared fetch throttle", () => {
     const body = JSON.stringify({ five_hour: { utilization: 10, resets_at: "2030-01-01T00:00:00Z" }, seven_day: { utilization: 96 } });
     const counting = (make: () => Response) => {
-      const f = { calls: 0, impl: (async () => (f.calls++, make())) as unknown as typeof fetch };
+      // Counts usage reads only: the hourly plan read (profile) is not a usage read.
+      const f = { calls: 0, impl: (async (url: unknown) => (String(url).endsWith("/api/oauth/profile") ? new Response("{}", { status: 404 }) : (f.calls++, make()))) as unknown as typeof fetch };
       return f;
     };
 

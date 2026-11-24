@@ -25,7 +25,7 @@ test("the gateway usage poll reads the reset grants (cedar_ember) and carries th
     return Response.json({ ...usage, cedar_ember: cedar });
   }) as unknown as typeof fetch;
   const poll = await claudeAdapter.fetchUsage(identity, { fetchImpl, cacheDir, claudeRegistryPath, noRefresh: true, fresh: true });
-  expect(seen).toEqual([{ url: CLAUDE_RESETS_URL, ua: CLAUDE_RESETS_USER_AGENT }]);
+  expect(seen.filter((r) => !r.url.endsWith("/api/oauth/profile"))).toEqual([{ url: CLAUDE_RESETS_URL, ua: CLAUDE_RESETS_USER_AGENT }]);
   expect(poll.status).toBe("live");
   expect(poll.manualReset).toMatchObject({ availableCount: 2, label: "Full reset", grants: [{ id: "full-reset-2611", kind: "full", resetsLeft: 2, usableNow: true }] });
 });
