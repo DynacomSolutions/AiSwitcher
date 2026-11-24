@@ -814,7 +814,13 @@ describe("route-all-via-gateway: accounts the gateway admin list names", () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       calls.push(`${String(input)} ${(init?.headers as Record<string, string> | undefined)?.authorization ?? ""}`);
-      return Response.json({ logins: [{ provider: "claude", identity: "member-a", renewedBy: "gateway" }, { provider: "codex", identity: "member-b", renewedBy: "gateway" }] });
+      return Response.json({
+        logins: [
+          { provider: "claude", identity: "member-a", renewedBy: "gateway", lastRefreshAt: "2030-01-01T11:00:00.000Z", expiresAt: null, lastError: null, revoked: false },
+          { provider: "codex", identity: "member-b", renewedBy: "gateway", lastRefreshAt: null, expiresAt: "2030-01-01T18:00:00.000Z", lastError: null, revoked: false },
+          { provider: "claude", identity: "member-c", renewedBy: "gateway", lastRefreshAt: "2030-01-01T11:00:00.000Z", expiresAt: null, lastError: null, revoked: true },
+        ],
+      });
     }) as unknown as typeof fetch;
     try {
       const set = await adminHeldAccounts(secrets);
@@ -825,6 +831,82 @@ describe("route-all-via-gateway: accounts the gateway admin list names", () => {
     } finally {
       globalThis.fetch = realFetch;
     }
+  });
+});
+
+describe("route-all-via-gateway: the admin list names an account without a live grant", () => {
+  const adminEntry = (provider: string, identity: string, over: Record<string, unknown> = {}) => ({
+    provider, identity, renewedBy: "gateway", lastRefreshAt: "2030-01-01T11:00:00.000Z", lastRefreshReplica: null, lastError: null, expiresAt: "2030-01-01T18:00:00.000Z", nextRefreshAt: null, revoked: false, ...over,
+  });
+  const piAuth = (dirName: string) => join(dirOf(".pi", dirName), "auth.json");
+  const piCopy = JSON.stringify({ "openai-codex": { type: "oauth", access: "pi-at", refresh: "rt-pi-other", expires: 1 } });
+
+  /** Runs route-all with the real admin filter against a mocked admin answer. */
+  async function routeWithAdmin(logins: unknown[], extra: Partial<RouteAllOptions> = {}) {
+    const secrets = join(home, "admin-secrets");
+    await writeFile(secrets, "AIS_GATEWAY_ADMIN_URL=http://admin.invalid\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n");
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json({ logins })) as unknown as typeof fetch;
+    try {
+      return await routeAllViaGateway({ ...opts, ...extra, gatewayHeld: () => adminHeldAccounts(secrets) });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  const cases: [string, Record<string, unknown>][] = [
+    ["is revoked", { revoked: true }],
+    ["has an error newer than its last success", { lastError: { at: "2030-01-01T11:30:00.000Z", code: "invalid_grant", detail: "the provider answered a dead-grant code" } }],
+    ["has no expiry and no refresh time", { expiresAt: null, lastRefreshAt: null }],
+  ];
+
+  for (const [what, over] of cases) {
+    test(`an entry that ${what} is not held: the local login and pi's copy stay`, async () => {
+      await writeFile(piAuth("alpha"), piCopy);
+      const r = await routeWithAdmin([adminEntry("claude", "beta", over), adminEntry("codex", "alpha", over)]);
+      expect(claudeLine(r, "beta")?.status).toBe("refused");
+      expect(claudeLine(r, "beta")?.detail).toContain("no gateway heartbeat");
+      expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("refused");
+      expect(await readFile(join(dirOf(".claude", "beta"), ".credentials.json"), "utf8")).toBe(claudeLogin("beta"));
+      expect(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+      expect(await readFile(piAuth("alpha"), "utf8")).toBe(piCopy);
+      expect((await files(dirOf(".claude", "beta"))).filter((f) => f.includes(".pre-gateway."))).toEqual([]);
+      expect((await files(dirOf(".pi", "alpha"))).filter((f) => f.includes(".pre-gateway."))).toEqual([]);
+      expect(hasMemberCopy("claude", "beta", opts.memberRoot)).toBe(false);
+    });
+  }
+
+  test("an entry with a live grant is held: it is routed and pi's copy goes", async () => {
+    await writeFile(piAuth("alpha"), piCopy);
+    const r = await routeWithAdmin([adminEntry("claude", "beta"), adminEntry("codex", "alpha")]);
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+    expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("routed");
+    expect(JSON.parse(await readFile(piAuth("alpha"), "utf8"))["openai-codex"]).toBeUndefined();
+  });
+
+  test("an empty admin list falls back to the heartbeat for an account the heartbeat holds", async () => {
+    await heartbeat(["claude/alpha", "claude/beta"]);
+    const r = await routeWithAdmin([]);
+    expect(claudeLine(r, "alpha")?.status).toBe("routed");
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+    expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("refused"); // not in the heartbeat either
+    expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(true);
+  });
+
+  test("a dead admin entry does not hide a heartbeat that holds the account", async () => {
+    await heartbeat(["claude/beta"]);
+    const r = await routeWithAdmin([adminEntry("claude", "beta", { revoked: true })]);
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+    expect(hasMemberCopy("claude", "beta", opts.memberRoot)).toBe(true);
+  });
+
+  test("a swap pool member with a dead admin entry does not count as held", async () => {
+    await registry("claude", ".claude", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
+    await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), claudeLogin("alpha"));
+    const dead = { revoked: true };
+    const r = await routeWithAdmin([adminEntry("claude", "alpha", dead), adminEntry("claude", "beta", dead)]);
+    expect(claudeLine(r, "pool")?.status).toBe("refused");
+    expect(await readFile(join(dirOf(".claude", "pool"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
   });
 });
 

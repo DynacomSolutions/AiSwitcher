@@ -23,7 +23,7 @@ import { accountInfoFor } from "../../identities/account-info.ts";
 import { recordLoginReplaced } from "../../gateway/login-replaced.ts";
 import { pushOwnerLogin } from "../../gateway/owner-store-push.ts";
 import { loadSyncConfig, syncConfigPath } from "../../sync/config.ts";
-import { loadGatewayRenewal } from "../../server/gateway-renewal.ts";
+import { loadGatewayRenewal, type GatewayRenewalLoginDto } from "../../server/gateway-renewal.ts";
 import { appTokenKey, defaultSecretsPath, readSecretsKey } from "../gateway/secrets-file.ts";
 
 export { backupUnique, classifyLogin, loginFreshness };
@@ -32,7 +32,7 @@ export { backupUnique, classifyLogin, loginFreshness };
  * `ais identities route-all-via-gateway [--dry-run]`: points every local agent identity at the AIS gateway.
  *
  * Per identity, under the account's refresh lock (the lock the gateway takes before it refreshes the login):
- *   1. the gateway must demonstrably hold the account: its admin API (`GET /logins/renewal`) lists it, or (admin API not
+ *   1. the gateway must demonstrably hold the account: its admin API (`GET /logins/renewal`) lists it with a live grant (not revoked, a renewal signal, no newer error), or (admin API not
  *      configured or unreadable) a fresh heartbeat from a gateway built with the member store names it with a successful
  *      renewal. An account the admin list names needs no local login: the folder gets the gateway entry after its login
  *      (logged out or not) is backed up, the member store is not written, and pi's copy of it is removed after a backup
@@ -202,7 +202,17 @@ const NOT_RENEWED = "the gateway holds this account but has not yet renewed it s
 export async function adminHeldAccounts(secretsPath?: string): Promise<Set<string> | undefined> {
   const view = await loadGatewayRenewal(secretsPath ? { secretsPath } : {}).catch(() => undefined);
   if (view?.state !== "ok") return undefined;
-  return new Set(view.logins.map((l) => `${l.provider}/${l.identity}`));
+  return new Set(view.logins.filter(renewalHolds).map((l) => `${l.provider}/${l.identity}`));
+}
+
+/**
+ * Whether one admin renewal entry shows a live gateway grant. The list names every managed account, so an entry counts
+ * only when it is not revoked, shows a renewal signal (a refresh time or an expiry; the gateway claims a login only after
+ * a successful renewal) and has no error newer than its last success (`lastError` is set only while no later refresh
+ * succeeded). Every other entry takes the heartbeat and member-store checks.
+ */
+export function renewalHolds(l: Pick<GatewayRenewalLoginDto, "revoked" | "lastError" | "lastRefreshAt" | "expiresAt">): boolean {
+  return !l.revoked && !l.lastError && (l.lastRefreshAt !== null || l.expiresAt !== null);
 }
 
 /** Why the running gateway does not demonstrably hold this account, or undefined when it does. */
