@@ -107,3 +107,21 @@ describe("host sync and sticky ownership", () => {
     expect(await isStickyOwned("claude", "acme", guard.ownedFile)).toBe(true);
   });
 });
+
+describe("sync guard registry paths", () => {
+  test("the guard reads the registry at the config path in force when it runs, never a path copied at module load", async () => {
+    const { CLAUDE_CONFIG } = await import("../../src/identities/tool-configs.ts");
+    const saved = CLAUDE_CONFIG.identitiesJsonPath;
+    const home = await tmp();
+    const entry = (name: string) => JSON.stringify({ version: 1, identities: [{ name, label: name, configDir: join(home, ".claude/identities", name) }] });
+    await put(home, ".claude/identities.json", entry("acme"));
+    await put(home, "elsewhere/claude-identities.json", entry("other"));
+    try {
+      (CLAUDE_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = join(home, "elsewhere", "claude-identities.json");
+      expect([...(await loadGatewayGuard(home)).native.keys()]).toEqual([".claude/identities/other/.credentials.json"]);
+    } finally {
+      (CLAUDE_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved;
+    }
+    expect([...(await loadGatewayGuard(home)).native.keys()]).toEqual([FOLDER]);
+  });
+});

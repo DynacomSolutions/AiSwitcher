@@ -41,11 +41,8 @@ import { CLAUDE_CONFIG, CODEX_CONFIG, PI_CONFIG } from "../identities/tool-confi
 
 export const PI_PROVIDER_OF: Record<MemberStoreTool, string> = { claude: "anthropic", codex: "openai-codex" };
 
-const REGISTRY_OF: Record<MemberStoreTool | "pi", string> = {
-  claude: CLAUDE_CONFIG.identitiesJsonPath,
-  codex: CODEX_CONFIG.identitiesJsonPath,
-  pi: PI_CONFIG.identitiesJsonPath,
-};
+/** Read at call time, never copied at import: a module that first loads while a config path is overridden would keep the override for good. */
+const registryOf = (tool: MemberStoreTool | "pi"): string => ({ claude: CLAUDE_CONFIG, codex: CODEX_CONFIG, pi: PI_CONFIG })[tool].identitiesJsonPath;
 
 export interface GuardedLogin {
   tool: MemberStoreTool;
@@ -89,7 +86,7 @@ export async function loadGatewayGuard(home: string = homedir(), registries: Par
   for (const tool of [...MEMBER_STORE_TOOLS, "pi"] as const) {
     let identities;
     try {
-      identities = (await loadIdentitiesFile(registries[tool] ?? rerooted(REGISTRY_OF[tool], home))).identities;
+      identities = (await loadIdentitiesFile(registries[tool] ?? rerooted(registryOf(tool), home))).identities;
     } catch {
       continue;
     }
