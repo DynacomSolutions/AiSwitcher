@@ -17,7 +17,7 @@ import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { PgRefreshBackend } from "./pg-refresh-backend.ts";
 import { bounded, guardRefresh, JOURNAL_RETENTION_MS, RefreshGuardRetryable, RefreshRefused, type RefreshGuardBackend } from "./refresh-guard.ts";
 import { isRetired } from "../identities/retired.ts";
-import { allowedAccounts, findPool, isSwapPool } from "../identities/pool/swap-pool.ts";
+import { allowedAccounts, findPool, isSwapPool, poolsOf } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { isOperationalPath, publicHostsFromEnv, viaPublicHost } from "./public-host.ts";
@@ -336,9 +336,21 @@ export function watchCredentialReads(creds: GatewayDeps["creds"], alerter: Alert
   } as GatewayDeps["creds"];
 }
 
-/** The identities an unrestricted pool app may use: real logins only. A swap pool's folder holds no login of its own, so it is never a member. */
+/**
+ * The identities a pool app may use: the allowed members of the provider's swap pools, the same pool `ais swap` and the
+ * limits page show. An account that no swap pool lists (one kept for its own threads, say) is never a pool app member,
+ * even when the gateway holds its login for a pinned app. A registry with no swap pool keeps every real login. Retired
+ * identities and swap pool folders (which hold no login of their own) are never members.
+ */
 export function appPoolMemberNames(file: IdentitiesFile): string[] {
-  return file.identities.filter((i) => !isRetired(i) && !isSwapPool(i)).map((i) => i.name);
+  const real = file.identities.filter((i) => !isRetired(i) && !isSwapPool(i));
+  const pools = poolsOf(file);
+  if (pools.length === 0) return real.map((i) => i.name);
+  const listed = new Set<string>();
+  for (const pool of pools) {
+    for (const name of allowedAccounts(pool)) listed.add(findIdentityByNameOrAlias(real, name)?.name ?? name);
+  }
+  return real.filter((i) => listed.has(i.name)).map((i) => i.name);
 }
 
 /** The names the gateway manages, in order. A name for a tool the check does not cover stays (the check answers true for it). */

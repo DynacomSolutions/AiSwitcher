@@ -76,8 +76,12 @@ tokens cannot be shown: the gateway keeps only prefixes and hashes.
 
 - `--identity=<id>` pins the app to one AIS identity. Use it when the app needs one
   specific account.
-- `--pool` lets the gateway pick among the provider's identities by headroom. The app
-  follows the live pool: a new member is used at once. There is no member list, and
+- `--pool` lets the gateway pick among the provider's swap pool members by headroom. The
+  members are the allowed accounts of the provider's swap pools in the registry (the pool
+  `ais swap` and the limits page show), never every login the gateway holds: an account
+  kept for its own threads (a pinned `t3-claude-<id>` app) stays out unless a swap pool
+  lists it. A registry with no swap pool uses every real login that is not retired.
+  The app follows the live pool: a new member is used at once. There is no member list, and
   `--identities` and `target.identities` are refused (admin API 400: "pool apps follow
   the live pool; member lists are not accepted"). An old stored list is ignored.
   Prefer the pool unless there is a reason to pin.
@@ -956,6 +960,9 @@ pool apps (a pin is rejected, task 4.119). So for a routed pool:
 - Codex pool creation accepts members whose login the gateway holds.
 - The pool keeps the refresh write-through away: a member's refresh never writes into a routed pool folder (claude and
   codex, `poolStoreDirsFor`).
+- Usage reads: the gateway logs `{"event":"usage-read","outcome":"failed","error":...}` when a member's upstream usage
+  read starts failing, and `"outcome":"recovered"` when it reads again, once per change (`src/gateway/usage-source.ts`).
+  Its figure is otherwise kept, marked stale, with no other trace.
 - AIS sync and the live inbox never put an arriving login over a routed pool's entry (`kept-pool-entry`, logged); other
   pool files merge as before (`src/sync/gateway-guard.ts`).
 - Usage: `ais swap status`, `ais limits`, the console and the gateway's own pool choice read a routed member's usage from

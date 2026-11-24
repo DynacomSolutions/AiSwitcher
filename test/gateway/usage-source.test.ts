@@ -508,3 +508,26 @@ describe("usage source with shared readings", () => {
     expect(reads.at(-1)).toBe("claude/shared");
   });
 });
+
+describe("usage read outcome log", () => {
+  test("a member's failing upstream read is logged once when it starts and once when it recovers", async () => {
+    const answers: PoolUsage[] = [
+      live(10),
+      { status: "rate-limited", maxUtilization: 10, error: "usage endpoint answered HTTP 429", capturedAt: "2026-11-02T00:00:00.000Z" },
+      { status: "rate-limited", maxUtilization: 10, error: "usage endpoint answered HTTP 429", capturedAt: "2026-11-02T00:00:00.000Z" },
+      live(20),
+    ];
+    let t = 0;
+    const logs: string[] = [];
+    const src = createUsageSource({ fetchUsage: async () => answers.shift(), ttlMs: 10, now: () => t, log: (l) => void logs.push(l) });
+    for (let i = 0; i < 4; i++) {
+      await src.get("claude", "id1");
+      await src.idle();
+      t += 20;
+    }
+    expect(logs.map((l) => JSON.parse(l))).toEqual([
+      { event: "usage-read", provider: "claude", identity: "id1", outcome: "failed", error: "usage endpoint answered HTTP 429" },
+      { event: "usage-read", provider: "claude", identity: "id1", outcome: "recovered" },
+    ]);
+  });
+});

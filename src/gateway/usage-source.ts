@@ -90,6 +90,18 @@ export function createUsageSource(opts: {
   const hasFigure = (v: PoolUsage | undefined): boolean => !!v && (v.noPlan === true || (v.status !== "unavailable" && ((v.windows?.length ?? 0) > 0 || typeof v.maxUtilization === "number")));
   const log = opts.log ?? ((line: string) => console.warn(line));
   let sharedDown = false;
+  /** The last upstream read outcome per member ("ok" or the error), so a change is logged once, not every poll. */
+  const lastOutcome = new Map<string, string>();
+  /** Logs when a member's upstream usage read starts or stops failing: a stale figure is otherwise silent. */
+  const noteOutcome = (provider: GatewayProvider, identity: string, u: PoolUsage | undefined, backoff: boolean): void => {
+    const failed = backoff || !hasFigure(u);
+    const outcome = failed ? (u?.error ?? (u ? u.status : "no reading")) : "ok";
+    const key = keyOf(provider, identity);
+    const before = lastOutcome.get(key);
+    if (before === outcome || (before === undefined && outcome === "ok")) return;
+    lastOutcome.set(key, outcome);
+    log(JSON.stringify({ event: "usage-read", provider, identity, outcome: failed ? "failed" : "recovered", ...(failed ? { error: outcome } : {}) }));
+  };
   const sharedMs = opts.sharedTimeoutMs ?? 1500;
   const claimWaitMs = opts.claimWaitMs ?? 3000;
   const claimHoldMs = opts.claimHoldMs ?? 15_000;
@@ -170,6 +182,7 @@ export function createUsageSource(opts: {
         // For claude, "rate-limited" with a figure is the usage endpoint's 429 backoff repeating the last good read: old
         // figures, so stale (shown, never refused on). Codex says "rate-limited" for a live reading at 100%: that one stands.
         const backoff = provider === "claude" && u?.status === "rate-limited";
+        noteOutcome(provider, identity, u, backoff);
         const at = now();
         let value: PoolUsage | undefined;
         if (hasFigure(u)) {
@@ -183,7 +196,8 @@ export function createUsageSource(opts: {
           value = await noFigure(prev);
         }
         entries.set(key, { value, at });
-      } catch {
+      } catch (err) {
+        noteOutcome(provider, identity, { status: "unavailable", error: err instanceof Error ? err.message : String(err), capturedAt: "" } as PoolUsage, false);
         // Keep the old figure; retry after the next ttl.
         entries.set(key, { value: await noFigure(entries.get(key)?.value), at: now() });
       } finally {
