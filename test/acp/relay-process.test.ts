@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import { kimiAdapter } from "../../src/acp/kimi-turn.ts";
 import { adapterFor, runAcpRelay } from "../../src/acp/relay-process.ts";
 import { EMPTY_TURN_NOTICE, TURN_FAILED_CODE } from "../../src/acp/relay.ts";
+import { LimitSnoozer, type McpCaller, type McpEndpoint } from "../../src/acp/limit-snooze.ts";
 
 const root = await mkdtemp(join(tmpdir(), "ais-acp-relay-"));
 afterAll(() => rm(root, { recursive: true, force: true }));
@@ -25,6 +26,8 @@ const log = process.env.FAKE_WIRE_LOG;
 fs.writeFileSync(process.env.FAKE_SEEN, JSON.stringify({ args: process.argv.slice(2), marker: process.env.FAKE_MARKER }));
 const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
 const ended = (reason, error) => fs.appendFileSync(log, JSON.stringify({ type: "turn.ended", time: 1, reason, ...(error ? { error } : {}) }) + "\\n");
+const retrying = (reset) => fs.appendFileSync(log, JSON.stringify({ type: "turn.step.retrying", agentId: "main", turnId: 0, step: 1, failedAttempt: 1, nextAttempt: 2, maxAttempts: 10, delayMs: 256304000, errorName: "APIProviderRateLimitError", errorMessage: "You've hit your usage limit (SYNTHETIC_FIXTURE). Resets at " + reset + ".", statusCode: 429, time: 5000 }) + "\\n");
+let openPrompt = null;
 let buf = "";
 process.stdin.on("data", (d) => {
   buf += d;
@@ -40,9 +43,14 @@ process.stdin.on("data", (d) => {
       if (text === "fail") { ended("failed", { code: "provider.api_error", message: "Invalid request Error", retryable: false, details: { statusCode: 400 } }); send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } }); }
       else if (text === "ok") { send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "session_fake", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } } }); ended("completed"); send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } }); }
       else if (text === "empty") send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } });
+      else if (text === "limit") { openPrompt = m.id; retrying(process.env.FAKE_RESET); } // sleeps until cancelled
+      else if (text === "burst") { openPrompt = m.id; retrying(process.env.FAKE_BURST_RESET); } // short reset, no snooze
       else if (text === "rpc") send({ jsonrpc: "2.0", id: m.id, error: { code: -32603, message: "Internal error", data: { details: "API error (status 500): upstream down" } } });
       else if (text === "exit") process.exit(7);
       else if (text === "wake") { send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } }); setTimeout(() => send({ jsonrpc: "2.0", id: "perm-1", method: "session/request_permission", params: { sessionId: "session_fake", options: [{ optionId: "approve", name: "Approve once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }], toolCall: { toolCallId: "t1", title: "Bash" } } }), 50); }
+    } else if (m.method === "session/cancel") {
+      ended("cancelled");
+      if (openPrompt !== null) { send({ jsonrpc: "2.0", id: openPrompt, result: { stopReason: "end_turn" } }); openPrompt = null; }
     } else if (m.id === "perm-1") {
       fs.writeFileSync(process.env.FAKE_SEEN + ".perm", JSON.stringify(m));
       send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "session_fake", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "permission answered" } } } });
@@ -52,7 +60,9 @@ process.stdin.on("data", (d) => {
 process.stdin.on("end", () => process.exit(0));
 `;
 
-async function start(name: string) {
+async function start(name: string, opts: { limit?: LimitSnoozer; inTurnWatchMs?: number } = {}) {
+  const reset = new Date(Date.now() + 3 * 3600_000).toISOString(); // a long reset, over the two-minute horizon
+  const burstReset = new Date(Date.now() + 30_000).toISOString(); // a short burst reset, under the horizon
   const dir = join(root, name);
   const home = join(dir, "kimi-home");
   const logDir = join(home, "sessions", "wd_synthetic", "session_fake", "agents", "main");
@@ -79,11 +89,13 @@ async function start(name: string) {
   const exit = runAcpRelay({
     command: process.execPath,
     args: [script, "acp", "--flag=value with space"],
-    env: { ...process.env, FAKE_WIRE_LOG: wire, FAKE_SEEN: seen, FAKE_MARKER: "SYNTHETIC_FIXTURE_env" },
+    env: { ...process.env, FAKE_WIRE_LOG: wire, FAKE_SEEN: seen, FAKE_MARKER: "SYNTHETIC_FIXTURE_env", FAKE_RESET: reset, FAKE_BURST_RESET: burstReset },
     adapter: kimiAdapter(home),
     stdin,
     stdout,
     log: (l) => notes.push(l),
+    ...(opts.limit ? { limit: opts.limit } : {}),
+    ...(opts.inTurnWatchMs !== undefined ? { inTurnWatchMs: opts.inTurnWatchMs } : {}),
   });
   let read = 0;
   /** The next `count` lines the client gets. */
@@ -102,7 +114,7 @@ async function start(name: string) {
   };
   const send = (o: unknown) => stdin.write(`${JSON.stringify(o)}\n`);
   const prompt = (id: number, text: string) => send({ jsonrpc: "2.0", id, method: "session/prompt", params: { sessionId: "session_fake", prompt: [{ type: "text", text }] } });
-  return { stdin, send, prompt, next, exit, notes, seen, lines };
+  return { stdin, send, prompt, next, exit, notes, seen, lines, reset, burstReset };
 }
 
 test("a client talks to the agent through the relay: failed, good, empty and error turns", async () => {
@@ -182,7 +194,9 @@ test("an agent that cannot start gives 127 and a note", async () => {
 }, 30_000);
 
 test("adapterFor: kimi-code reads its session log, other agents have no adapter", () => {
-  expect(adapterFor("kimi-code", { KIMI_CODE_HOME: join(root, "h") })?.turnOutcome).toBeDefined();
+  const kimi = adapterFor("kimi-code", { KIMI_CODE_HOME: join(root, "h") });
+  expect(kimi?.turnOutcome).toBeDefined();
+  expect(kimi?.inTurnLimit).toBeDefined(); // the in-turn watch is kimi-specific
   expect(adapterFor("grok-build", {})).toBeUndefined();
   expect(adapterFor("glm-acp-agent", {})).toBeUndefined();
 });
@@ -204,4 +218,83 @@ test("regression: a permission request from a turn the agent started itself is a
   expect(t.notes).toContain("acp-relay: permission asked with no prompt open, nobody can answer: cancelled");
   t.stdin.end();
   expect(await t.exit).toBe(0);
+});
+
+describe("in-turn limit watch (end to end)", () => {
+  const EP: McpEndpoint = { url: "http://127.0.0.1:1/mcp", authorization: ["Bear", "er SYNTHETIC"].join("") };
+  const stdioServer = { name: "t3-code", command: "t3", args: ["acp-mcp-bridge"], env: [{ name: "T3_ACP_MCP_ENDPOINT", value: EP.url }, { name: "T3_ACP_MCP_AUTHORIZATION", value: EP.authorization }] };
+  function snoozer(subagent = false) {
+    const calls: Array<[string, Record<string, unknown>]> = [];
+    const caller: McpCaller = {
+      async call(_e, tool, args) {
+        calls.push([tool, args]);
+        if (tool === "schedule_task") return { scheduledTask: { scheduledTaskId: "task-1", boundThreadId: "thread-1" } };
+        if (tool === "t3_thread_read") return { thread: { relationshipToParent: subagent ? "subagent" : null } };
+        return {};
+      },
+    };
+    return { calls, limit: new LimitSnoozer({ caller, log: () => {} }) };
+  }
+  const newSession = (a: Awaited<ReturnType<typeof start>>) => a.send({ jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: "/x", mcpServers: [stdioServer] } });
+
+  test("a long limit retry snoozes, notifies and cancels the sleeping turn", async () => {
+    const { calls, limit } = snoozer();
+    const a = await start("inturn-long", { limit, inTurnWatchMs: 40 });
+    newSession(a);
+    await a.next(1);
+    a.prompt(2, "limit");
+    const [notice, answer] = await a.next(2); // the notice, then the cancelled turn's answer
+    expect(notice!.method).toBe("session/update");
+    expect(notice!.params.update.sessionUpdate).toBe("agent_message_chunk");
+    expect(notice!.params.update.content.text).toContain("Usage limit");
+    expect(notice!.params.update.content.text).toContain(a.reset);
+    expect(answer!.id).toBe(2);
+    expect(answer!.result.stopReason).toBe("end_turn");
+    expect(calls.map((c) => c[0])).toEqual(["t3_thread_organize", "schedule_task", "t3_thread_read"]);
+    expect(calls[0]![1]).toEqual({ action: "snooze", snoozedUntil: a.reset });
+    expect(calls.some((c) => c[0] === "delete_scheduled_task")).toBe(false); // the resume survives the cancelled end
+    a.stdin.end();
+    expect(await a.exit).toBe(0);
+  }, 30_000);
+
+  test("a subagent thread snoozes without a resume", async () => {
+    const { calls, limit } = snoozer(true);
+    const a = await start("inturn-sub", { limit, inTurnWatchMs: 40 });
+    newSession(a);
+    await a.next(1);
+    a.prompt(2, "limit");
+    const [notice, answer] = await a.next(2);
+    expect(notice!.params.update.content.text).toContain(a.reset);
+    expect(answer!.id).toBe(2);
+    expect(calls.map((c) => c[0])).toEqual(["t3_thread_organize", "schedule_task", "t3_thread_read", "delete_scheduled_task"]);
+    a.stdin.end();
+    expect(await a.exit).toBe(0);
+  }, 30_000);
+
+  test("a short burst retry does not snooze, notify or cancel", async () => {
+    const { calls, limit } = snoozer();
+    const a = await start("inturn-burst", { limit, inTurnWatchMs: 40 });
+    newSession(a);
+    await a.next(1);
+    a.prompt(2, "burst");
+    await new Promise((r) => setTimeout(r, 250)); // several poll intervals
+    expect(calls.length).toBe(0);
+    expect(a.lines.length).toBe(1); // only the session/new answer, no notice
+    a.stdin.end();
+    expect(await a.exit).toBe(0);
+  }, 30_000);
+
+  test("a completed turn with the watch on makes no limit calls and ends cleanly", async () => {
+    const { calls, limit } = snoozer();
+    const a = await start("inturn-ok", { limit, inTurnWatchMs: 40 });
+    newSession(a);
+    await a.next(1);
+    a.prompt(2, "ok");
+    const [chunk, answer] = await a.next(2);
+    expect(chunk!.params.update.content.text).toBe("hello");
+    expect(answer!.id).toBe(2);
+    expect(calls.length).toBe(0);
+    a.stdin.end();
+    expect(await a.exit).toBe(0);
+  }, 30_000);
 });
