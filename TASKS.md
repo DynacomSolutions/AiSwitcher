@@ -345,7 +345,7 @@ AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gat
 | 199 | Host clients reach the gateway without the local ClusterIP (node failover) | done | claude | gateway-node-loss | 14.195 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/536, released v0.5.53; host relay on, Claude folders and T3 env point at it.<br>Live proof: client with the cluster service range dropped, real `claude -p` answered through a replica on another node; relay also failed over by itself during a real host reboot. |
 
 ## 15. Gateway logins never revoked by AIS
-ETA: 2026-11-21 23:30 ICT
+ETA: 2026-11-24 08:00 ICT
 One refresher per login across replicas and hosts, early renewal, a dead grant never sent again, renewal state visible on the WebUI and in metrics.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -359,6 +359,7 @@ One refresher per login across replicas and hosts, early renewal, a dead grant n
 | 231 | Kimi login has one refresher: the gateway usage poll no longer rotates it, pools hold no refresh token | done | claude | kimi-single-refresher | 15.221 | | Was 226 (id taken by 11.226).<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/611 (00b8524), Opus review fixed.<br>Live: kimi journal chain continuous, one renewal per tick. |
 | 227 | Credential store holds only logins the gateway manages; WebUI ownership from the gateway list | done | claude | store-owned-matches-gateway | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/612 (375b818), Opus review fixed.<br>Prune removed 2 stale rows; live host copies kept. |
 | 260 | No false folder-login warning for a gateway-routed claude folder | done | claude | folder-gateway-mismatch | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/679 (5bc9eb2), released v0.5.86.<br>Host route-all reset the stale cached account.<br>Live WebUI pod 0.5.86: no mismatch on any identity. |
+| 316 | Route-all routes every account the gateway holds | in_progress | claude | route-all-gateway-held | | 2026-11-24 08:00 ICT | Gateway admin list decides held: live grants only (not revoked, renewal signal, no newer error). Heartbeat and member store are the fallback.<br>Logged-out claude folders and codex folders with a pi copy are routed, not refused.<br>Local login is backed up first. |
 
 ## 16. Console data on Headlamp dashboards
 ETA: 2026-11-20 19:00 ICT

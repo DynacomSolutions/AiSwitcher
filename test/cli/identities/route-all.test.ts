@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { backupUnique, classifyLogin, codexConfigRouted, codexKeyHelperPath, heldProblem, routeAllViaGateway, routeCodexConfigText, runRouteAllViaGateway, type RouteAllOptions } from "../../../src/cli/identities/route-all.ts";
+import { adminHeldAccounts, backupUnique, classifyLogin, codexConfigRouted, codexKeyHelperPath, heldProblem, routeAllViaGateway, routeCodexConfigText, runRouteAllViaGateway, type RouteAllOptions } from "../../../src/cli/identities/route-all.ts";
 import { writeHeartbeat } from "../../../src/identities/gateway-heartbeat.ts";
 import { isGatewayManagedHere, listGatewayManagedAccounts } from "../../../src/identities/gateway-managed.ts";
 import { hasMemberCopy, memberDir } from "../../../src/identities/gateway-members.ts";
@@ -67,6 +67,7 @@ beforeEach(async () => {
     procRoot: join(home, "proc"),
     port: 47140,
     now: () => NOW,
+    gatewayHeld: async () => undefined,
     storePush: async () => "pushed (test stub)",
     hostname: "routing-host-SYNTHETIC",
     out: () => {},
@@ -702,6 +703,210 @@ describe("route-all-via-gateway: pi's copy of the login", () => {
     r = await routeAllViaGateway(opts);
     expect(claudeLine(r, "alpha")?.detail).toContain("pi identity other holds this login's refresh token");
     expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
+  });
+});
+
+describe("route-all-via-gateway: accounts the gateway admin list names", () => {
+  const held = (...keys: string[]) => ({ gatewayHeld: async () => new Set(keys) });
+  const piAuth = (dirName: string) => join(dirOf(".pi", dirName), "auth.json");
+  const loggedOut = JSON.stringify({ claudeAiOauth: { accessToken: "", scopes: ["user:inference"] } });
+
+  test("a logged-out claude folder the gateway holds is routed with the gateway entry and settings; nothing enters the member store", async () => {
+    const dir = dirOf(".claude", "alpha");
+    await writeFile(join(dir, ".credentials.json"), loggedOut);
+    // no heartbeat, no member store copy: only the admin list says the gateway holds it
+    const refused = await routeAllViaGateway(opts);
+    expect(claudeLine(refused, "alpha")?.status).toBe("refused");
+    expect(claudeLine(refused, "alpha")?.detail).toContain("no refreshable login");
+
+    const dry = await routeAllViaGateway({ ...opts, ...held("claude/alpha"), dryRun: true });
+    expect(claudeLine(dry, "alpha")?.status).toBe("would-route");
+    expect(await readFile(join(dir, ".credentials.json"), "utf8")).toBe(loggedOut);
+
+    const r = await routeAllViaGateway({ ...opts, ...held("claude/alpha") });
+    expect(claudeLine(r, "alpha")?.status).toBe("routed");
+    expect(claudeLine(r, "alpha")?.detail).toContain("the gateway holds this account");
+    const entry = JSON.parse(await readFile(join(dir, ".credentials.json"), "utf8"));
+    expect(entry.claudeAiOauth.accessToken).toBe(CLAUDE_KEY);
+    expect(entry.claudeAiOauth.refreshToken).toBeFalsy();
+    const settings = JSON.parse(await readFile(join(dir, "settings.json"), "utf8"));
+    expect(settings.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:47140/claude");
+    expect(settings.env.KEEP).toBe("1");
+    expect(settings.apiKeyHelper).toBeUndefined();
+    const backups = (await files(dir)).filter((f) => f.startsWith(".credentials.json.pre-gateway."));
+    expect(backups.length).toBe(1);
+    expect(await readFile(join(dir, backups[0]!), "utf8")).toBe(loggedOut);
+    expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
+
+    // a second run changes nothing
+    const before = await files(dir);
+    const again = await routeAllViaGateway({ ...opts, ...held("claude/alpha") });
+    expect(claudeLine(again, "alpha")?.status).toBe("already-routed");
+    expect(await files(dir)).toEqual(before);
+  });
+
+  test("a folder with a real login the gateway holds is backed up and routed without the heartbeat proof or a store write", async () => {
+    const dir = dirOf(".claude", "beta");
+    const r = await routeAllViaGateway({ ...opts, ...held("claude/beta") });
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+    const backups = (await files(dir)).filter((f) => f.startsWith(".credentials.json.pre-gateway."));
+    expect(await readFile(join(dir, backups[0]!), "utf8")).toBe(claudeLogin("beta"));
+    expect(hasMemberCopy("claude", "beta", opts.memberRoot)).toBe(false);
+    expect(JSON.parse(await readFile(join(dir, ".credentials.json"), "utf8")).claudeAiOauth.accessToken).toBe(CLAUDE_KEY);
+  });
+
+  test("an account the list does not name keeps the old checks (heartbeat, member store)", async () => {
+    await writeFile(join(dirOf(".claude", "alpha"), ".credentials.json"), loggedOut);
+    const r = await routeAllViaGateway({ ...opts, ...held("claude/member-a", "codex/alpha") });
+    expect(claudeLine(r, "alpha")?.status).toBe("refused");
+    expect(claudeLine(r, "beta")?.status).toBe("refused");
+    expect(claudeLine(r, "beta")?.detail).toContain("no gateway heartbeat");
+    expect(await readFile(join(dirOf(".claude", "beta"), ".credentials.json"), "utf8")).toBe(claudeLogin("beta"));
+  });
+
+  test("a held account still refuses while a session runs in the folder", async () => {
+    const dir = join(opts.procRoot!, "5101");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "cmdline"), "claude\0");
+    await writeFile(join(dir, "environ"), `CLAUDE_CONFIG_DIR=${dirOf(".claude", "beta")}\0`);
+    const r = await routeAllViaGateway({ ...opts, ...held("claude/beta") });
+    expect(claudeLine(r, "beta")?.status).toBe("refused");
+    expect(claudeLine(r, "beta")?.detail).toContain("running Claude Code session");
+    expect(await readFile(join(dirOf(".claude", "beta"), ".credentials.json"), "utf8")).toBe(claudeLogin("beta"));
+  });
+
+  test("pi's different copy of a held codex account is backed up and removed, then the folder is routed", async () => {
+    await writeFile(piAuth("alpha"), JSON.stringify({ "openai-codex": { type: "oauth", access: "pi-at", refresh: "rt-pi-other", expires: 1 }, "kimi-coding": { type: "oauth", access: "k", refresh: "kr" } }));
+    const refused = await routeAllViaGateway(opts);
+    expect(refused.lines.find((l) => l.tool === "codex")?.status).toBe("refused");
+
+    const r = await routeAllViaGateway({ ...opts, ...held("codex/alpha") });
+    const line = r.lines.find((l) => l.tool === "codex");
+    expect(line?.status).toBe("routed");
+    expect(line?.detail).toContain("removed its openai-codex entry (the gateway holds this account");
+    const after = JSON.parse(await readFile(piAuth("alpha"), "utf8"));
+    expect(after["openai-codex"]).toBeUndefined();
+    expect(after["kimi-coding"]).toBeDefined();
+    const backups = (await files(dirOf(".pi", "alpha"))).filter((f) => f.startsWith("auth.json.pre-gateway."));
+    expect(JSON.parse(await readFile(join(dirOf(".pi", "alpha"), backups[0]!), "utf8"))["openai-codex"].refresh).toBe("rt-pi-other");
+    const auth = JSON.parse(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8"));
+    expect(auth.OPENAI_API_KEY).toBe(CODEX_KEY);
+    expect(auth.tokens).toBeUndefined();
+    expect(hasMemberCopy("codex", "alpha", opts.memberRoot)).toBe(false);
+  });
+
+  test("a running pi session still blocks removing pi's copy of a held account", async () => {
+    await writeFile(piAuth("alpha"), JSON.stringify({ "openai-codex": { type: "oauth", access: "pi-at", refresh: "rt-pi-other", expires: 1 } }));
+    const dir = join(opts.procRoot!, "5201");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "cmdline"), "node\0/usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js\0");
+    await writeFile(join(dir, "environ"), `PI_CODING_AGENT_DIR=${join(home, "elsewhere")}\0`);
+    const r = await routeAllViaGateway({ ...opts, ...held("codex/alpha") });
+    expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("refused");
+    expect(JSON.parse(await readFile(piAuth("alpha"), "utf8"))["openai-codex"].refresh).toBe("rt-pi-other");
+  });
+
+  test("adminHeldAccounts reads provider/identity from the admin API and is undefined when it is not configured or fails", async () => {
+    const secrets = join(home, "admin-secrets");
+    expect(await adminHeldAccounts(secrets)).toBeUndefined(); // no admin URL or token (setup-env clears the env)
+    await writeFile(secrets, "AIS_GATEWAY_ADMIN_URL=http://admin.invalid\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n");
+    const realFetch = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      calls.push(`${String(input)} ${(init?.headers as Record<string, string> | undefined)?.authorization ?? ""}`);
+      return Response.json({
+        logins: [
+          { provider: "claude", identity: "member-a", renewedBy: "gateway", lastRefreshAt: "2030-01-01T11:00:00.000Z", expiresAt: null, lastError: null, revoked: false },
+          { provider: "codex", identity: "member-b", renewedBy: "gateway", lastRefreshAt: null, expiresAt: "2030-01-01T18:00:00.000Z", lastError: null, revoked: false },
+          { provider: "claude", identity: "member-c", renewedBy: "gateway", lastRefreshAt: "2030-01-01T11:00:00.000Z", expiresAt: null, lastError: null, revoked: true },
+        ],
+      });
+    }) as unknown as typeof fetch;
+    try {
+      const set = await adminHeldAccounts(secrets);
+      expect([...(set ?? [])].sort()).toEqual(["claude/member-a", "codex/member-b"]);
+      expect(calls[0]).toContain("http://admin.invalid/logins/renewal");
+      globalThis.fetch = (async () => new Response("no", { status: 500 })) as unknown as typeof fetch;
+      expect(await adminHeldAccounts(secrets)).toBeUndefined();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
+describe("route-all-via-gateway: the admin list names an account without a live grant", () => {
+  const adminEntry = (provider: string, identity: string, over: Record<string, unknown> = {}) => ({
+    provider, identity, renewedBy: "gateway", lastRefreshAt: "2030-01-01T11:00:00.000Z", lastRefreshReplica: null, lastError: null, expiresAt: "2030-01-01T18:00:00.000Z", nextRefreshAt: null, revoked: false, ...over,
+  });
+  const piAuth = (dirName: string) => join(dirOf(".pi", dirName), "auth.json");
+  const piCopy = JSON.stringify({ "openai-codex": { type: "oauth", access: "pi-at", refresh: "rt-pi-other", expires: 1 } });
+
+  /** Runs route-all with the real admin filter against a mocked admin answer. */
+  async function routeWithAdmin(logins: unknown[], extra: Partial<RouteAllOptions> = {}) {
+    const secrets = join(home, "admin-secrets");
+    await writeFile(secrets, "AIS_GATEWAY_ADMIN_URL=http://admin.invalid\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n");
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json({ logins })) as unknown as typeof fetch;
+    try {
+      return await routeAllViaGateway({ ...opts, ...extra, gatewayHeld: () => adminHeldAccounts(secrets) });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  const cases: [string, Record<string, unknown>][] = [
+    ["is revoked", { revoked: true }],
+    ["has an error newer than its last success", { lastError: { at: "2030-01-01T11:30:00.000Z", code: "invalid_grant", detail: "the provider answered a dead-grant code" } }],
+    ["has no expiry and no refresh time", { expiresAt: null, lastRefreshAt: null }],
+  ];
+
+  for (const [what, over] of cases) {
+    test(`an entry that ${what} is not held: the local login and pi's copy stay`, async () => {
+      await writeFile(piAuth("alpha"), piCopy);
+      const r = await routeWithAdmin([adminEntry("claude", "beta", over), adminEntry("codex", "alpha", over)]);
+      expect(claudeLine(r, "beta")?.status).toBe("refused");
+      expect(claudeLine(r, "beta")?.detail).toContain("no gateway heartbeat");
+      expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("refused");
+      expect(await readFile(join(dirOf(".claude", "beta"), ".credentials.json"), "utf8")).toBe(claudeLogin("beta"));
+      expect(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+      expect(await readFile(piAuth("alpha"), "utf8")).toBe(piCopy);
+      expect((await files(dirOf(".claude", "beta"))).filter((f) => f.includes(".pre-gateway."))).toEqual([]);
+      expect((await files(dirOf(".pi", "alpha"))).filter((f) => f.includes(".pre-gateway."))).toEqual([]);
+      expect(hasMemberCopy("claude", "beta", opts.memberRoot)).toBe(false);
+    });
+  }
+
+  test("an entry with a live grant is held: it is routed and pi's copy goes", async () => {
+    await writeFile(piAuth("alpha"), piCopy);
+    const r = await routeWithAdmin([adminEntry("claude", "beta"), adminEntry("codex", "alpha")]);
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+    expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("routed");
+    expect(JSON.parse(await readFile(piAuth("alpha"), "utf8"))["openai-codex"]).toBeUndefined();
+  });
+
+  test("an empty admin list falls back to the heartbeat for an account the heartbeat holds", async () => {
+    await heartbeat(["claude/alpha", "claude/beta"]);
+    const r = await routeWithAdmin([]);
+    expect(claudeLine(r, "alpha")?.status).toBe("routed");
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+    expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("refused"); // not in the heartbeat either
+    expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(true);
+  });
+
+  test("a dead admin entry does not hide a heartbeat that holds the account", async () => {
+    await heartbeat(["claude/beta"]);
+    const r = await routeWithAdmin([adminEntry("claude", "beta", { revoked: true })]);
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+    expect(hasMemberCopy("claude", "beta", opts.memberRoot)).toBe(true);
+  });
+
+  test("a swap pool member with a dead admin entry does not count as held", async () => {
+    await registry("claude", ".claude", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
+    await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), claudeLogin("alpha"));
+    const dead = { revoked: true };
+    const r = await routeWithAdmin([adminEntry("claude", "alpha", dead), adminEntry("claude", "beta", dead)]);
+    expect(claudeLine(r, "pool")?.status).toBe("refused");
+    expect(await readFile(join(dirOf(".claude", "pool"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
   });
 });
 

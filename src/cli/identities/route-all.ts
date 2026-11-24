@@ -23,6 +23,7 @@ import { accountInfoFor } from "../../identities/account-info.ts";
 import { recordLoginReplaced } from "../../gateway/login-replaced.ts";
 import { pushOwnerLogin } from "../../gateway/owner-store-push.ts";
 import { loadSyncConfig, syncConfigPath } from "../../sync/config.ts";
+import { loadGatewayRenewal, type GatewayRenewalLoginDto } from "../../server/gateway-renewal.ts";
 import { appTokenKey, defaultSecretsPath, readSecretsKey } from "../gateway/secrets-file.ts";
 
 export { backupUnique, classifyLogin, loginFreshness };
@@ -31,8 +32,11 @@ export { backupUnique, classifyLogin, loginFreshness };
  * `ais identities route-all-via-gateway [--dry-run]`: points every local agent identity at the AIS gateway.
  *
  * Per identity, under the account's refresh lock (the lock the gateway takes before it refreshes the login):
- *   1. the gateway must demonstrably hold the account: a fresh heartbeat from a gateway built with the member store names
- *      it with a successful renewal;
+ *   1. the gateway must demonstrably hold the account: its admin API (`GET /logins/renewal`) lists it with a live grant (not revoked, a renewal signal, no newer error), or (admin API not
+ *      configured or unreadable) a fresh heartbeat from a gateway built with the member store names it with a successful
+ *      renewal. An account the admin list names needs no local login: the folder gets the gateway entry after its login
+ *      (logged out or not) is backed up, the member store is not written, and pi's copy of it is removed after a backup
+ *      whatever its age (the gateway's copy is the live one);
  *   2. no running session may use the folder: a Claude Code or Codex session started before the switch keeps the old login
  *      in memory and later refreshes it with the single-use refresh token the gateway now renews, which kills the gateway's
  *      copy (`refresh_token_reused`); Codex also writes that login back over the gateway entry. A session scan that cannot
@@ -109,6 +113,12 @@ export interface RouteAllOptions {
    * account, provably fresher than the store copy, no running session, no other holder.
    */
   afterLogin?: boolean;
+  /**
+   * The accounts ("tool/identity") the gateway holds, read from its admin API (`GET /logins/renewal`); undefined when the
+   * admin API is not configured or cannot be read (the heartbeat and the member store then decide). Default: the admin
+   * API named in the secrets file or env. Tests pass a fixed answer.
+   */
+  gatewayHeld?: () => Promise<Set<string> | undefined>;
   /** Tests: replaces the push of an adopted login to the PostgreSQL store (default pushOwnerLogin). Returns a note. */
   storePush?: (tool: MemberStoreTool, identity: string, root: string) => Promise<string>;
   /**
@@ -183,6 +193,27 @@ const FILES_OF: Record<MemberStoreTool, string[]> = {
 /* ------------------------------------------------------------------ gateway holds the account */
 
 const NOT_RENEWED = "the gateway holds this account but has not yet renewed it successfully";
+
+/**
+ * The accounts the gateway admin API lists (provider/identity), or undefined when it is not configured or not readable.
+ * The gateway keeps logins in the PostgreSQL credential store, so this list is the authority on what it holds; no host
+ * login copy is read, refreshed or synced for it.
+ */
+export async function adminHeldAccounts(secretsPath?: string): Promise<Set<string> | undefined> {
+  const view = await loadGatewayRenewal(secretsPath ? { secretsPath } : {}).catch(() => undefined);
+  if (view?.state !== "ok") return undefined;
+  return new Set(view.logins.filter(renewalHolds).map((l) => `${l.provider}/${l.identity}`));
+}
+
+/**
+ * Whether one admin renewal entry shows a live gateway grant. The list names every managed account, so an entry counts
+ * only when it is not revoked, shows a renewal signal (a refresh time or an expiry; the gateway claims a login only after
+ * a successful renewal) and has no error newer than its last success (`lastError` is set only while no later refresh
+ * succeeded). Every other entry takes the heartbeat and member-store checks.
+ */
+export function renewalHolds(l: Pick<GatewayRenewalLoginDto, "revoked" | "lastError" | "lastRefreshAt" | "expiresAt">): boolean {
+  return !l.revoked && !l.lastError && (l.lastRefreshAt !== null || l.expiresAt !== null);
+}
 
 /** Why the running gateway does not demonstrably hold this account, or undefined when it does. */
 export function heldProblem(tool: string, name: string, hb: GatewayHeartbeat | undefined, nowMs: number): string | undefined {
@@ -400,7 +431,7 @@ interface HoldersOutcome {
  *    identity holding the same refresh token is refused. Removing needs no running pi session at all: one pi instance
  *    reads every pi identity's auth.json.
  */
-async function holdersProblem(identity: Identity, ctx: ToolContext, localText: string | undefined): Promise<HoldersOutcome> {
+async function holdersProblem(identity: Identity, ctx: ToolContext, localText: string | undefined, gatewayHeld = false): Promise<HoldersOutcome> {
   const { tool, root } = ctx;
   const storeText = hasMemberCopy(tool, identity.name, root) ? await readText(join(memberDir(tool, identity.name, root), memberLoginFile(tool))) : undefined;
   const tokens = new Set([refreshOf(tool, localText), refreshOf(tool, storeText)].filter(nonEmpty));
@@ -448,8 +479,9 @@ async function holdersProblem(identity: Identity, ctx: ToolContext, localText: s
     // pi's copy: claude compares access-token expiry (ms), codex the last refresh (pi: the token's iat, seconds).
     const piFresh = tool === "claude" ? (entry.grant.expires_at !== undefined ? entry.grant.expires_at * 1000 : undefined) : entry.grant.minted_at;
     const older = piFresh !== undefined && fresh > 0 && piFresh < fresh;
-    if (!same && !older) return { refused: `pi identity ${pi.name} holds a different copy of this login (${provider}) that is not provably older than the one the gateway gets: pi may have refreshed it, so that refresh token may already be spent; nothing changed. Run ais auth sync --tool=pi to converge the copies, then run this again`, piRemovals: [] };
-    piRemovals.push({ name: pi.name, dir: pi.configDir, path, provider, refresh: rt, why: same ? "the same login" : "an older copy" });
+    // The gateway holds this account (its admin list names it): its copy is the live one, so pi's copy goes whatever its age.
+    if (!same && !older && !gatewayHeld) return { refused: `pi identity ${pi.name} holds a different copy of this login (${provider}) that is not provably older than the one the gateway gets: pi may have refreshed it, so that refresh token may already be spent; nothing changed. Run ais auth sync --tool=pi to converge the copies, then run this again`, piRemovals: [] };
+    piRemovals.push({ name: pi.name, dir: pi.configDir, path, provider, refresh: rt, why: same ? "the same login" : older ? "an older copy" : "the gateway holds this account, its copy is authoritative" });
   }
   if (piRemovals.length > 0) {
     const scan = await sessionsIn("pi", null, ctx.opts);
@@ -636,6 +668,8 @@ interface ToolContext {
   piIdentities: Identity[];
   /** This host's name, for the routing record. */
   host: string;
+  /** Accounts ("tool/identity") the gateway admin API lists, or undefined when it could not be asked. */
+  adminHeld: Set<string> | undefined;
   /** Pools routed, already routed or (dry run) about to be routed by this run: they hold no member login. */
   routedPools: Set<string>;
   /** Live members of each pool, by pool name. */
@@ -682,21 +716,25 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   }
   const kind = classifyLogin(tool, await readText(join(dir, memberLoginFile(tool))));
   const stored = hasMemberCopy(tool, identity.name, root);
-  if (kind === "none" && !stored) return { ...line, status: "refused", detail: "no refreshable login in this folder (logged out, API key or Bedrock); nothing for the gateway to hold" };
-  if (kind === "gateway" && !stored) return { ...line, status: "refused", detail: "the folder already holds the gateway entry but the member store has no login for it; restore the login from its .pre-gateway backup first" };
-  if (kind === "login") {
+  // An owner sign-in is reported on (attention), never refused, for sessions and other holders.
+  const owner = opts.afterLogin === true;
+  // The gateway admin list is the authority on what the gateway holds (it keeps logins in the PostgreSQL credential store, not
+  // only in this host's member store). A held account needs no local login: the folder gets the gateway entry, any local login
+  // is backed up first, and nothing is read, refreshed or written into the member store. An owner sign-in keeps its own path.
+  const held = !owner && ctx.adminHeld?.has(`${tool}/${identity.name}`) === true;
+  if (!held && kind === "none" && !stored) return { ...line, status: "refused", detail: "no refreshable login in this folder (logged out, API key or Bedrock), and the gateway does not list this account; nothing for the gateway to hold" };
+  if (!held && kind === "gateway" && !stored) return { ...line, status: "refused", detail: "the folder already holds the gateway entry but the member store has no login for it; restore the login from its .pre-gateway backup first" };
+  if (!held && kind === "login") {
     // After a sign-in on a routed identity the gateway only has to hold the account; that it has not yet renewed it successfully (its login is dead) is the reason for the sign-in.
     // An owner sign-in needs no proof that the gateway renewed the old login: the owner chose this account.
     const problem = heldProblem(tool, identity.name, ctx.hb, now());
     if (problem && !(opts.afterLogin && stored)) return { ...line, status: "refused", detail: problem };
   }
-  // An owner sign-in is reported on (attention), never refused, for sessions and other holders.
-  const owner = opts.afterLogin === true;
   const reported: string[] = [];
   const busy = await sessionsProblem(tool, dir, opts);
   if (busy && !owner) return { ...line, status: "refused", detail: busy };
   if (busy) reported.push(`WARNING: ${busy}`);
-  let holders = await holdersProblem(identity, ctx, await readText(join(dir, memberLoginFile(tool))));
+  let holders = await holdersProblem(identity, ctx, await readText(join(dir, memberLoginFile(tool))), held);
   if (holders.refused && !owner) return { ...line, status: "refused", detail: holders.refused };
   if (holders.refused) {
     reported.push(`WARNING: ${holders.refused}`);
@@ -704,13 +742,14 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   }
   if (opts.dryRun) {
     const pi = holders.piRemovals.map((r) => `; pi identity ${r.name}'s ${r.provider} entry would be removed (backed up)`).join("");
-    return { ...line, status: "would-route", detail: `${kind === "login" ? "login would move to the member store, local files backed up, then replaced" : "gateway entry would be completed"}${pi}` };
+    const what = held ? "the gateway holds this account: local files would be backed up, then the gateway entry written" : kind === "login" ? "login would move to the member store, local files backed up, then replaced" : "gateway entry would be completed";
+    return { ...line, status: "would-route", detail: `${what}${pi}` };
   }
 
   const notes: string[] = [...reported];
   let removedPi = false;
   let accountChange: RouteLine["accountChange"];
-  if (kind === "login") {
+  if (kind === "login" && !held) {
     await mkdir(root, { recursive: true, mode: 0o700 });
     await chmod(root, 0o700);
   }
@@ -721,14 +760,14 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     const busyNow = await sessionsProblem(tool, dir, opts);
     if (busyNow && !owner) return busyNow;
     const localText = await readText(join(dir, memberLoginFile(tool)));
-    let holdersNow = await holdersProblem(identity, ctx, localText);
+    let holdersNow = await holdersProblem(identity, ctx, localText, held);
     if (holdersNow.refused && !owner) return holdersNow.refused;
     if (holdersNow.refused) holdersNow = { piRemovals: [] };
     const nowKind = classifyLogin(tool, localText);
-    const plan = nowKind === "login" ? await planStoreMove(tool, identity, localText!, root, owner) : {};
+    const plan = nowKind === "login" && !held ? await planStoreMove(tool, identity, localText!, root, owner) : {};
     if (plan.refused) return plan.refused;
     accountChange = plan.accountChange;
-    if (nowKind !== "login" && !hasMemberCopy(tool, identity.name, root)) return "the login disappeared while waiting for the lock; nothing changed";
+    if (!held && nowKind !== "login" && !hasMemberCopy(tool, identity.name, root)) return "the login disappeared while waiting for the lock; nothing changed";
     // pi's copy goes first: a failure here (PiChanged, EACCES) leaves the store and the folder as they were.
     for (const r of holdersNow.piRemovals) notes.push(await removePiCopy(r, now));
     removedPi = holdersNow.piRemovals.length > 0;
@@ -743,16 +782,17 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
         if (note) notes.push(note);
       }
       // Nothing local changes unless the store demonstrably holds a usable login now.
-      if (!hasMemberCopy(tool, identity.name, root)) throw Object.assign(new Error("the member store copy could not be confirmed after writing it"), { code: "EVERIFY" });
+      if (!held && !hasMemberCopy(tool, identity.name, root)) throw Object.assign(new Error("the member store copy could not be confirmed after writing it"), { code: "EVERIFY" });
       if (tool === "codex") await ensureCodexHelper(helper);
       const routing = await routingNow(identity, ctx, localText);
       notes.push(...(tool === "claude" ? await applyClaude(dir, token, base, routing, now) : await applyCodex(dir, token, base, helper, routing, now)));
       if (tool === "claude") notes.push(...(await syncFolderAccount(identity, root, now)));
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.name : "error");
-      if (nowKind !== "login") return `failed while completing the gateway entry (${code}); the member store still holds the login`;
+      if (nowKind !== "login") return `failed while completing the gateway entry (${code}); ${held ? "the gateway still holds the login" : "the member store still holds the login"}`;
       return `failed while switching (${code}); ${await rollBack(tool, identity, localText!, root, wroteStore, now)}${removedPi ? `; ${notes.filter((n) => n.startsWith("pi identity")).join("; ")}` : ""}`;
     }
+    if (held) notes.push("the gateway holds this account (admin list); its copy is the live login, the local login was only backed up");
     return undefined;
   });
   if (outcome) return { ...line, status: "refused", detail: outcome };
@@ -844,7 +884,7 @@ async function routePool(pool: Identity, ctx: ToolContext): Promise<RouteLine> {
     if (await isSymlink(join(dir, f))) return { ...line, status: "refused", detail: `${f} is a symlink (shared with other folders?); not written through` };
   }
   const members = ctx.membersOf.get(pool.name) ?? [];
-  const problems = members.map((m) => heldProblem(tool, m.name, ctx.hb, now()));
+  const problems = members.map((m) => (ctx.adminHeld?.has(`${tool}/${m.name}`) ? undefined : heldProblem(tool, m.name, ctx.hb, now())));
   if (!problems.some((p) => p === undefined)) {
     return { ...line, status: "refused", detail: `swap pool folder: the gateway holds none of its members (${members.length === 0 ? "the pool has no members" : `${members[0]!.name}: ${problems[0]}`}), so its sessions would get no account; nothing changed` };
   }
@@ -918,9 +958,10 @@ async function routePool(pool: Identity, ctx: ToolContext): Promise<RouteLine> {
 async function alreadyRouted(identity: Identity, ctx: ToolContext): Promise<RouteLine> {
   const { tool, root, opts, now } = ctx;
   const line = { tool, identity: identity.name, status: "already-routed" as const };
-  const notes: string[] = hasMemberCopy(tool, identity.name, root) ? [] : ["the gateway member store holds no login for it"];
+  const notes: string[] = hasMemberCopy(tool, identity.name, root) || ctx.adminHeld?.has(`${tool}/${identity.name}`) ? [] : ["the gateway member store holds no login for it"];
   const loginPath = join(identity.configDir, memberLoginFile(tool));
-  const holders = await holdersProblem(identity, ctx, await readText(loginPath));
+  const adminHeld = ctx.adminHeld?.has(`${tool}/${identity.name}`) === true;
+  const holders = await holdersProblem(identity, ctx, await readText(loginPath), adminHeld);
   const done = (attention: boolean): RouteLine => ({ ...line, ...(attention ? { attention: true } : {}), ...(notes.length > 0 ? { detail: notes.join("; ") } : {}) });
   if (holders.refused) {
     notes.push(`but ${holders.refused}`);
@@ -938,7 +979,7 @@ async function alreadyRouted(identity: Identity, ctx: ToolContext): Promise<Rout
   }
   const problem = await withOauthRefreshLocks([identity.configDir, memberDir(tool, identity.name, root)], async () => {
     const entryText = await readText(loginPath);
-    const again = await holdersProblem(identity, ctx, entryText);
+    const again = await holdersProblem(identity, ctx, entryText, adminHeld);
     if (again.refused) return again.refused;
     for (const r of again.piRemovals) notes.push(await removePiCopy(r, now));
     if (needsRecord && entryText !== undefined && routingOf(entryText) === undefined && classifyLogin(tool, entryText) === "gateway") {
@@ -973,6 +1014,7 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
   const lines: RouteLine[] = [];
   const unroutedTools: RouteReport["unroutedTools"] = [];
   const hb = await readHeartbeat(opts.heartbeatPath);
+  const adminHeld = opts.afterLogin ? undefined : await (opts.gatewayHeld ?? (() => adminHeldAccounts(opts.secretsPath)))().catch(() => undefined);
   const helper = codexKeyHelperPath(opts.home ?? homedir());
   for (const tool of ROUTE_TOOLS) {
     if (opts.only && opts.only.tool !== tool) continue;
@@ -994,7 +1036,7 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
     }
     const pools = accounts.filter((a) => a.swapPool);
     const membersOf = new Map(pools.map((p) => [p.name, (p.swapPool?.accounts ?? []).map((n) => accounts.find((a) => a.name === n && !a.swapPool)).filter((a): a is Identity => a !== undefined)]));
-    const ctx: ToolContext = { tool, token, base: await gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts), host: opts.hostname ?? hostname(), routedPools: new Set(), membersOf };
+    const ctx: ToolContext = { tool, token, base: await gatewayBase(tool, opts), helper, root, hb, adminHeld, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts), host: opts.hostname ?? hostname(), routedPools: new Set(), membersOf };
     // Pools first: a routed pool no longer holds its members' logins, so they can be routed in the same run.
     for (const identity of [...pools, ...accounts.filter((a) => !a.swapPool)]) {
       if (opts.only && opts.only.identity !== identity.name) continue;
