@@ -227,6 +227,14 @@ describe("codex helpers", () => {
     expect(await usage([], "unavailable")).toMatchObject({ status: "unavailable", error: "nope" });
   });
 
+  test("fetchUsage carries the limits fetch's plan label", async () => {
+    const member: Identity = { name: "a", label: "a", configDir: dirOf("a") };
+    const result = await codexAdapter.fetchUsage(member, {
+      fetchCodexLimits: async () => ({ toolName: "codex" as const, identity: member, status: "live" as const, windows: [{ label: "week", category: "week" as const, usedPercent: 7 }], plan: "Pro" }),
+    });
+    expect(result.planLabel).toBe("Pro");
+  });
+
   test("fetchUsage gives reset times as ISO from the epoch, not the yearless display string", async () => {
     const member: Identity = { name: "a", label: "a", configDir: dirOf("a") };
     const resetsAtMs = Date.parse("2026-11-02T13:00:00.000Z");

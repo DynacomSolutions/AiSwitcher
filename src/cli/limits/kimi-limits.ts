@@ -82,6 +82,15 @@ export interface KimiUsagesResponseWire {
   boosterWallet?: KimiBoosterWalletWire;
 }
 
+/** Short display label for the wire's membership level (`user.membership.level`,
+ * e.g. "LEVEL_STANDARD"). Strips the LEVEL_ prefix and title-cases the words.
+ * An absent or empty level yields undefined, never a guessed label. */
+export function kimiPlanLabel(level: string | undefined): string | undefined {
+  const words = (level ?? "").replace(/^LEVEL_/i, "").split("_").filter(Boolean);
+  if (words.length === 0) return undefined;
+  return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+}
+
 /** Pure mapping from the wire shape to an OverageInfo, exported so tests can
  * exercise it without any network. Returns undefined when `monthlyUsed` isn't
  * a usable number — either the account has never touched Extra Usage (the
@@ -375,6 +384,8 @@ function errorMessage(err: unknown): string {
 export interface KimiUsageOutcome {
   windows?: LimitWindow[];
   overage?: OverageInfo;
+  /** Membership level display label, when the usages body reports one. */
+  plan?: string;
   error?: string;
 }
 
@@ -478,7 +489,8 @@ export async function fetchKimiUsageForCredentials(
     return { error: "kimi reported no quota windows" };
   }
   const overage = overageFromBoosterWallet(payload.boosterWallet);
-  return { windows, ...(overage ? { overage } : {}) };
+  const plan = kimiPlanLabel(payload.user?.membership?.level);
+  return { windows, ...(overage ? { overage } : {}), ...(plan ? { plan } : {}) };
 }
 
 /**
@@ -547,5 +559,6 @@ export async function fetchKimiLimits(identity: Identity, opts: { noRefresh?: bo
     status: "live",
     capturedAt: new Date().toISOString(),
     ...(outcome.overage ? { overage: outcome.overage } : {}),
+    ...(outcome.plan ? { plan: outcome.plan } : {}),
   };
 }

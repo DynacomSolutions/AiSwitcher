@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { IdentitiesFile } from "../../src/identities/types.ts";
-import { appPoolMemberNames } from "../../src/gateway/serve.ts";
+import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
+import type { GatewayDeps } from "../../src/gateway/app.ts";
+import { appPoolMemberNames, onlyManaged, poolManagementCheck } from "../../src/gateway/serve.ts";
+import { pickIdentity } from "../../src/gateway/select.ts";
+import type { GatewayApp } from "../../src/gateway/types.ts";
 
 describe("appPoolMemberNames", () => {
   test("an unrestricted pool app never gets a swap pool or a retired identity as a member", () => {
@@ -13,5 +17,52 @@ describe("appPoolMemberNames", () => {
       ],
     } as unknown as IdentitiesFile;
     expect(appPoolMemberNames(file)).toEqual(["alpha", "gamma"]);
+  });
+});
+
+describe("the pool management gate", () => {
+  // "guest" is in the registry but not gateway-managed (no gateway copy); "member" is managed.
+  const file = {
+    identities: [
+      { name: "member", label: "member", configDir: "/x/member" },
+      { name: "guest", label: "guest", configDir: "/x/guest" },
+    ],
+  } as unknown as IdentitiesFile;
+  const live = (u: number): PoolUsage => ({ status: "live", maxUtilization: u, capturedAt: "2026-11-24T00:00:00.000Z" });
+  const opencodePool: GatewayApp = {
+    name: "pool", owner: "o", namespace: "n", provider: "opencode", style: "openai",
+    target: { kind: "pool" }, state: "active", createdAt: "2026-11-01T00:00:00.000Z",
+  };
+  // The gateway holds a credential copy for "member" only, so the probe reports "guest" as logged out / absent.
+  const creds = { loggedOut: async (_p: string, id: string) => id === "guest" } as unknown as GatewayDeps["creds"];
+
+  test("an unmanaged identity present in the registry is excluded, even on a gateway with no management check", async () => {
+    const names = appPoolMemberNames(file);
+    expect(names).toEqual(["member", "guest"]);
+    // No isManaged passed: an unmanaged gateway. The opencode gate still drops the identity with no gateway copy.
+    const kept = await onlyManaged("opencode", names, poolManagementCheck(creds));
+    expect(kept).toEqual(["member"]);
+  });
+
+  test("pool selection never offers the unmanaged identity, on the known or the unknown path", async () => {
+    const poolMembers = async (p: string) => onlyManaged(p, appPoolMemberNames(file), poolManagementCheck(creds));
+    // The managed member is full and the unmanaged one has no figure: without the gate the unknown fallback would pick it.
+    const deps = { usageFor: async (_p: string, id: string) => (id === "member" ? live(100) : undefined), poolMembers };
+    expect(await pickIdentity(opencodePool, deps)).toEqual({ reject: "no-headroom" });
+    // With headroom on the managed member, it is chosen and the unmanaged one is never a candidate.
+    const headroom = { usageFor: async (_p: string, id: string) => (id === "member" ? live(10) : undefined), poolMembers };
+    expect(await pickIdentity(opencodePool, headroom)).toEqual({ identity: "member" });
+  });
+
+  test("the refresh management check still decides for a refresh tool", async () => {
+    const isManaged = async (_tool: string, id: string) => id === "member";
+    const kept = await onlyManaged("claude", ["member", "guest"], poolManagementCheck(creds, isManaged));
+    expect(kept).toEqual(["member"]);
+  });
+
+  test("a probe error keeps the member (fail-open), never silently dropping a healthy login", async () => {
+    const failing = { loggedOut: async () => { throw new Error("probe blew up"); } } as unknown as GatewayDeps["creds"];
+    const kept = await onlyManaged("opencode", ["member", "guest"], poolManagementCheck(failing));
+    expect(kept).toEqual(["member", "guest"]);
   });
 });

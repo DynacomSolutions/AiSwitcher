@@ -9,6 +9,7 @@ import { memberDir } from "../../src/identities/gateway-members.ts";
 import { refreshFingerprint } from "../../src/identities/gateway-routed.ts";
 import { readLoginRevoked, revokedMarkerPath } from "../../src/identities/gateway-revoked.ts";
 import { OAuthRefreshError } from "../../src/identities/oauth-refresh.ts";
+import { CredentialCache } from "../../src/gateway/credentials.ts";
 
 let root: string;
 const saved = { dir: process.env.AIS_GATEWAY_MEMBERS_DIR, store: process.env.AIS_GATEWAY_MEMBER_STORE };
@@ -84,5 +85,22 @@ describe("the gateway records a dead member login for the portal", () => {
   test("a rejection that names no grant writes nothing", async () => {
     await expect(wrap(async () => { throw new OAuthRefreshError("rejected", true, undefined, "token_revoked"); })("codex", id, {})).rejects.toThrow();
     expect(readLoginRevoked("codex", "work")).toBeUndefined();
+  });
+});
+
+describe("loggedOut reads the durable revoked marker", () => {
+  const cache = () => new CredentialCache({ resolveIdentity: async () => ({ name: "work", label: "work", configDir: memberDir("codex", "work") }) });
+
+  test("a marker matching the store's current login is dead", async () => {
+    await expect(wrap(async () => { throw new OAuthRefreshError("rejected", true, fp("one"), "invalid_grant"); })("codex", id, {})).rejects.toThrow();
+    expect(readLoginRevoked("codex", "work")).toBeDefined();
+    expect(await cache().loggedOut("codex", "work")).toBe(true);
+  });
+
+  test("a fresh (non-matching) marker after a new login is not dead", async () => {
+    await expect(wrap(async () => { throw new OAuthRefreshError("rejected", true, fp("one"), "invalid_grant"); })("codex", id, {})).rejects.toThrow();
+    await writeFile(join(memberDir("codex", "work"), "auth.json"), login("two"));
+    expect(readLoginRevoked("codex", "work")).toBeUndefined();
+    expect(await cache().loggedOut("codex", "work")).toBe(false);
   });
 });

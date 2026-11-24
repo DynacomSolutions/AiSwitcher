@@ -396,6 +396,15 @@ Returns the exact `ToolLimitResult[]` shape the CLI's JSON mode emits
 min 5) controls staleness tolerance. Concurrent identical requests share one
 upstream fetch.
 
+A row carries `plan` (short display label, e.g. `"Max 20x"`, `"Pro"`,
+`"Team"`, `"Plus"`, `"Standard"`, `"Max"`, `"Go"`) only when real wire data
+names the account plan: claude's profile plan (type and rate-limit tier),
+codex's `planType`, kimi's `user.membership.level`, zai's quota `data.level`,
+or an active OpenCode Go quota read. Grok and ali expose no plan on their
+wires, so their rows never carry one. An absent `plan` means the provider
+exposes no plan or it could not be read; clients render nothing then, never
+a guessed label.
+
 When the gateway admin API is configured (`AIS_GATEWAY_ADMIN_URL` and
 `AIS_GATEWAY_ADMIN_TOKEN`), the cluster gateway is the source of truth for
 the identities it manages: its `GET /limits` rows replace the host-scan rows
