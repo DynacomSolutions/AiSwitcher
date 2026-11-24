@@ -197,6 +197,8 @@ export function routeFor(provider: GatewayProvider, style: ApiStyle, method: str
     // ChatGPT's account API (plugins, accounts, wham, ...) is forwarded with the member's login. Model traffic (`/codex/*`)
     // has its own pass-through, ledger and caps, so it is not reachable this way, and the bare prefix names nothing.
     if (path === "" || path === "/") return { kind: "deny", status: 404 };
+    // The codex client lists models at GET /codex/models (with ?client_version=): that is a list, so it uses the union path.
+    if (m === "GET" && path === "/codex/models") return modelsRoute(provider, style, "");
     // Model traffic (`/codex/*`) goes through the model path: ledger, caps, pool selection and failover.
     if (/^\/codex(?:\/|$)/.test(path)) return { kind: "upstream", url: `${CODEX_BACKEND}${origPath}`, side: false };
     return { kind: "account", op: "forward", url: `${CODEX_BACKEND}${origPath}` };
