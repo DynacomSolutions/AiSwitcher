@@ -5,6 +5,7 @@ import { ToolBadge } from "@/components/badges";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { ResetCountdown } from "@/components/reset-countdown";
 import { useLimitsQuery, usePoolsUsageQuery, useUsageQuery } from "@/hooks/queries";
 import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, formatTokens } from "@/lib/format";
@@ -105,7 +106,11 @@ function PoolCard({ pool }: { pool: PoolSummary }) {
               </span>
               {m.worstResetsAtMs !== undefined || m.extraUsage ? (
                 <div className="col-span-3 space-y-0.5 text-xs text-muted-foreground">
-                  {m.worstResetsAtMs !== undefined ? <div>Resets {formatResetTimes(m.worstResetsAtMs)}</div> : null}
+                  {m.worstResetsAtMs !== undefined ? (
+                    <div>
+                      Resets {formatResetTimes(m.worstResetsAtMs)} · <ResetCountdown ms={m.worstResetsAtMs} />
+                    </div>
+                  ) : null}
                   {m.extraUsage ? <div>{creditsNote(m.extraUsage)}</div> : null}
                 </div>
               ) : null}

@@ -7,6 +7,7 @@ import { ToolBadge } from "@/components/badges";
 import { ProviderLabel } from "@/components/provider-icon";
 import { PoolUsageCards } from "@/components/pool-usage-cards";
 import { ResetPushToggle } from "@/components/reset-push-toggle";
+import { ResetCountdown } from "@/components/reset-countdown";
 import { GlobalUsageCards } from "@/components/usage-counter";
 import { PageTabRedirect, PageTabs, usePageTab, type PageTab } from "@/components/page-tabs";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
@@ -66,10 +67,14 @@ function WindowRow({ window }: { window: LimitWindow }) {
         <span className="shrink-0 font-medium tabular-nums">{pct.toFixed(1)}%</span>
       </div>
       <Progress value={pct} indicatorClassName={windowTone(pct)} />
-      {(window.resetsAt || window.note) && (
+      {(window.resetsAt || window.resetsAtMs !== undefined || window.note) && (
         <div className="flex items-baseline justify-between gap-3 text-xs text-muted-foreground">
           <span className="min-w-0 truncate" title={window.resetsAtMs !== undefined ? formatResetTimes(window.resetsAtMs) : undefined}>
-            {window.resetsAtMs !== undefined ? formatResetTimes(window.resetsAtMs) : (window.resetsAt ?? "")}
+            {window.resetsAtMs !== undefined ? (
+              <>
+                {formatResetTimes(window.resetsAtMs)} · <ResetCountdown ms={window.resetsAtMs} />
+              </>
+            ) : (window.resetsAt ?? "")}
           </span>
           {window.note ? (
             <span className="shrink-0 text-amber-600 dark:text-amber-400">{window.note}</span>
