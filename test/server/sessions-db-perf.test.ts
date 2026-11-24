@@ -19,13 +19,20 @@ import { encryptPart } from "./sessions-db-kit.ts";
  * - transcript tail, 4 MiB window: p95 under 400 ms warm (parts cached), under 800 ms cold (every part fetched,
  *   decrypted and unzipped; the object store answers in 10 ms a part, a LAN figure).
  *
- * The measured numbers print as one JSON line and, when AIS_PERF_REPORT names a file, go to that file.
+ * The measured numbers print as one JSON line and, when AIS_PERF_REPORT names a file, go to that file. The report always
+ * holds the design targets and the measured numbers.
+ *
+ * Which run enforces which limit: the release workflow sets AIS_PERF_STRICT=1 and fails at the design target. Pull request
+ * runs (and local runs) fail at twice the target, because a busy shared runner can add tens of milliseconds to a p95 and a
+ * pull request must not fail on that. A tree p95 near the design target in the report is still a signal to look at.
  */
 
 const url = process.env.AIS_GATEWAY_TEST_DATABASE_URL;
 const optOut = process.env.AIS_GATEWAY_TEST_NO_DATABASE === "1";
 
 export const TARGETS = { treeP95Ms: 300, warmP95Ms: 400, coldP95Ms: 800 } as const;
+/** The factor of the target that fails a run: 1 in the release run (AIS_PERF_STRICT=1), else 2. */
+const LIMIT_FACTOR = process.env.AIS_PERF_STRICT === "1" ? 1 : 2;
 const TOTAL_ROWS = 100_000;
 const RECENT_ROWS = 15_000; // rows updated within the last 30 days
 const MIB = 1024 * 1024;
@@ -147,7 +154,7 @@ if (!url && process.env.CI && !optOut) {
     await store?.close();
     if (process.env.AIS_PERF_KEEP !== "1") await admin`TRUNCATE ais_session_file RESTART IDENTITY CASCADE`;
     await admin.close();
-    const out = { rows: TOTAL_ROWS, targets: TARGETS, ...report };
+    const out = { rows: TOTAL_ROWS, targets: TARGETS, failsAtFactor: LIMIT_FACTOR, ...report };
     console.log(`SESSIONS_PERF ${JSON.stringify(out)}`);
     if (process.env.AIS_PERF_REPORT) await writeFile(process.env.AIS_PERF_REPORT, `${JSON.stringify(out, null, 2)}\n`);
   });
@@ -174,7 +181,7 @@ if (!url && process.env.CI && !optOut) {
       expect(got.length).toBeGreaterThan(10_000);
     }, 120_000);
 
-    test(`tree, 30 days, ${RECENT_ROWS} nodes: p95 under ${TARGETS.treeP95Ms} ms`, async () => {
+    test(`tree, 30 days, ${RECENT_ROWS} nodes: target p95 under ${TARGETS.treeP95Ms} ms`, async () => {
       const db = source(new PartCache(MIB));
       const targets = ["claude", "codex"].flatMap((tool) => Array.from({ length: 6 }, (_, i) => ({ tool: tool as "claude" | "codex", identity: `identity-${i}` })));
       const run = async (): Promise<{ ms: number; nodes: number }> => {
@@ -200,10 +207,10 @@ if (!url && process.env.CI && !optOut) {
         q.push(performance.now() - t0);
       }
       report.tree = { nodes, runs: samples.length, p50Ms: round(median(samples)), p95Ms: round(p95(samples)), queryClaudeP50Ms: round(median(q)), queryClaudeP95Ms: round(p95(q)) };
-      expect(p95(samples)).toBeLessThan(TARGETS.treeP95Ms);
+      expect(p95(samples)).toBeLessThan(TARGETS.treeP95Ms * LIMIT_FACTOR);
     }, 120_000);
 
-    test(`transcript tail, 4 MiB window, warm: p95 under ${TARGETS.warmP95Ms} ms`, async () => {
+    test(`transcript tail, 4 MiB window, warm: target p95 under ${TARGETS.warmP95Ms} ms`, async () => {
       const cache = new PartCache(64 * MIB);
       const db = source(cache);
       const read = async (): Promise<number> => {
@@ -218,10 +225,10 @@ if (!url && process.env.CI && !optOut) {
       const samples: number[] = [];
       for (let i = 0; i < 40; i++) samples.push(await read());
       report.transcriptWarm = { runs: samples.length, p50Ms: round(median(samples)), p95Ms: round(p95(samples)) };
-      expect(p95(samples)).toBeLessThan(TARGETS.warmP95Ms);
+      expect(p95(samples)).toBeLessThan(TARGETS.warmP95Ms * LIMIT_FACTOR);
     }, 120_000);
 
-    test(`transcript tail, 4 MiB window, cold: p95 under ${TARGETS.coldP95Ms} ms`, async () => {
+    test(`transcript tail, 4 MiB window, cold: target p95 under ${TARGETS.coldP95Ms} ms`, async () => {
       delayed.delayMs = 10;
       const samples: number[] = [];
       let parts = 0;
@@ -236,7 +243,7 @@ if (!url && process.env.CI && !optOut) {
         parts = (await store.tailParts((await store.filesOfSession("claude", TAIL_REF))[0]!.fileId, 4 * MIB)).length;
       }
       report.transcriptCold = { runs: samples.length, partsPerRead: parts, objectStoreDelayMsPerPart: 10, p50Ms: round(median(samples)), p95Ms: round(p95(samples)) };
-      expect(p95(samples)).toBeLessThan(TARGETS.coldP95Ms);
+      expect(p95(samples)).toBeLessThan(TARGETS.coldP95Ms * LIMIT_FACTOR);
     }, 120_000);
   });
 }

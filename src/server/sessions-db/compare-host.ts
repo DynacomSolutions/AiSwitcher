@@ -67,6 +67,8 @@ export interface Explained {
 
 export interface HostReport {
   node: string;
+  /** True when `updatedAt` was compared exactly for every tool. */
+  strict: boolean;
   days: number;
   perTool: { tool: DbSessionTool; comparison: TreeComparison; share: number }[];
   explained: Explained[];
@@ -100,11 +102,11 @@ export interface HostCompareArgs {
   configDirs: readonly string[];
   days: number;
   now?: number;
-  /** `updatedAt` gap (ms) that counts as equal. Default `UPDATED_TOLERANCE_MS`. */
-  updatedToleranceMs?: number;
+  /** Exact `updatedAt` for Codex too (no tolerance). Claude is always exact. */
+  strict?: boolean;
 }
 
-/** Codex: file mtime against the last record time. A write delay of a few ms, never a second. */
+/** Codex only: file mtime against the last record time. A write delay of a few ms, never a second. Claude has none. */
 export const UPDATED_TOLERANCE_MS = 1000;
 
 export async function compareHost(args: HostCompareArgs): Promise<HostReport> {
@@ -122,7 +124,7 @@ export async function compareHost(args: HostCompareArgs): Promise<HostReport> {
     const rows = args.rows.filter((r) => r.kind === tool && r.updatedAt !== null && r.updatedAt >= (opts.now ?? Date.now()) - args.days * 86_400_000);
     dbWithoutIdentity += rows.filter((r) => r.identity === null).length;
     const db = computeDepths(rows.map((r) => nodeOf(r, tool, r.identity ?? UNASSIGNED_IDENTITY, opts)));
-    const comparison = compareTreeNodes(files, db, { updatedToleranceMs: args.updatedToleranceMs ?? UPDATED_TOLERANCE_MS });
+    const comparison = compareTreeNodes(files, db, { updatedToleranceMs: tool === "codex" && !args.strict ? UPDATED_TOLERANCE_MS : 0 });
     perTool.push({ tool, comparison, share: equalShare(comparison) });
     for (const diff of comparison.diffs) explained.push({ diff, tool, ...(await explain(tool, diff, rowsByRef, args.configDirs)) });
   }
@@ -134,6 +136,7 @@ export async function compareHost(args: HostCompareArgs): Promise<HostReport> {
   const union = filesNodes + dbNodes - matched;
   return {
     node: args.node,
+    strict: args.strict === true,
     days: args.days,
     perTool,
     explained,
@@ -178,7 +181,7 @@ export function formatHostReport(r: HostReport): string {
   const out: string[] = [];
   const pct = (x: number): string => `${(x * 100).toFixed(2)}%`;
   out.push(`Host ${r.node}, window ${r.days} days`);
-  out.push(`Compared fields: ${COMPARED_FIELDS.join(", ")} (joined on tool and id; identity is not compared; updatedAt equal within ${UPDATED_TOLERANCE_MS} ms)`);
+  out.push(`Compared fields: ${COMPARED_FIELDS.join(", ")} (joined on tool and id; identity is not compared; ${r.strict ? "updatedAt exact" : `updatedAt of Codex equal within ${UPDATED_TOLERANCE_MS} ms, Claude exact`})`);
   for (const t of r.perTool) {
     const c = t.comparison;
     out.push(`  ${t.tool}: files ${c.filesNodes}, database ${c.dbNodes}, matched ${c.matched}, equal ${c.equal}, share ${pct(t.share)}`);

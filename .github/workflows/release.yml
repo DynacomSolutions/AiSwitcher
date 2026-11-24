@@ -57,6 +57,8 @@ jobs:
         env:
           AIS_REQUIRE_LIVE_TEST_TOOLS: "1"
           AIS_GATEWAY_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/gateway_test
+          # The release run enforces the design targets of the console reader exactly. PR runs allow twice the target.
+          AIS_PERF_STRICT: "1"
         run: |
           files=$(bun run scripts/ci/affected.ts --shard "${{ matrix.shard }}" --shards 4)
           bun test $files

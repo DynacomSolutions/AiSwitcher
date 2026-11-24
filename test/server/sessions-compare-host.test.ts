@@ -37,7 +37,7 @@ async function seed(codexMtimeSkewMs = 0) {
   return { dir, rows };
 }
 
-const run = (dir: string, rows: SessionTreeRow[]) => compareHost({ node: "node-a", rows, configDirs: [dir], days: 400, now: NOW });
+const run = (dir: string, rows: SessionTreeRow[], strict = false) => compareHost({ node: "node-a", rows, configDirs: [dir], days: 400, now: NOW, strict });
 
 describe("host comparison", () => {
   test("equal trees: every node matches, the missing identity is reported and not compared", async () => {
@@ -66,6 +66,21 @@ describe("host comparison", () => {
     const r2 = await run(dir2, rows2);
     expect(r2.equal).toBe(3);
     expect(r2.unexplained).toBe(1);
+  });
+
+  test("the tolerance is for Codex only: a Claude gap of 500 ms is a difference, and --strict makes Codex exact", async () => {
+    const { dir, rows } = await seed();
+    const skewed = rows.map((r) => (r.sessionRef === SID2 && r.updatedAt !== null ? { ...r, updatedAt: r.updatedAt + 500 } : r));
+    const r = await run(dir, skewed);
+    expect(r).toMatchObject({ matched: 4, equal: 3, unexplained: 1 });
+    expect(r.explained[0]).toMatchObject({ tool: "claude", diff: { kind: "field", field: "updatedAt" } });
+    expect(r.explained[0]!.diff).not.toHaveProperty("tolerated");
+    expect(r.explained[0]!.reason).toBeUndefined();
+    const { dir: dir2, rows: rows2 } = await seed(3);
+    expect((await run(dir2, rows2)).unexplained).toBe(0);
+    const strict = await run(dir2, rows2, true);
+    expect(strict).toMatchObject({ equal: 3, unexplained: 1, strict: true });
+    expect(formatHostReport(strict)).toContain("updatedAt exact");
   });
 
   test("a host file that the tool removed after the ship is explained", async () => {
