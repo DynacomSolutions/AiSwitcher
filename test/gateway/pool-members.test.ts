@@ -96,3 +96,33 @@ describe("the pool management gate", () => {
     expect(kept).toEqual(["member", "guest"]);
   });
 });
+
+describe("swap-pool membership and the management gates together", () => {
+  const file = {
+    identities: [
+      { name: "member", label: "member", configDir: "/x/member" },
+      { name: "dead", label: "dead", configDir: "/x/dead" },
+      { name: "outside", label: "outside", configDir: "/x/outside" },
+      { name: "team-pool", label: "team-pool", configDir: "/x/pool", swapPool: { accounts: ["member", "dead"], disallowed: [], active: "member" } },
+    ],
+  } as unknown as IdentitiesFile;
+  const live = (u: number): PoolUsage => ({ status: "live", maxUtilization: u, capturedAt: "2026-11-24T00:00:00.000Z" });
+  const app: GatewayApp = {
+    name: "pool", owner: "o", namespace: "n", provider: "opencode", style: "openai",
+    target: { kind: "pool" }, state: "active", createdAt: "2026-11-01T00:00:00.000Z",
+  };
+  const creds = { loggedOut: async (_p: string, id: string) => id === "dead" } as unknown as GatewayDeps["creds"];
+  const poolMembers = async (p: string) => onlyManaged(p, appPoolMemberNames(file), poolManagementCheck(creds));
+
+  test("a member outside the swap pool and a dead swap-pool member are never picked", async () => {
+    expect(await poolMembers("opencode")).toEqual(["member"]);
+    // The outside and dead accounts have the most headroom (or no figure), yet only the live pool member can win.
+    const usageFor = async (_p: string, id: string) => (id === "member" ? live(90) : id === "outside" ? live(1) : undefined);
+    expect(await pickIdentity(app, { usageFor, poolMembers })).toEqual({ identity: "member" });
+  });
+
+  test("a full live member rejects the request rather than falling back to an outside or dead account", async () => {
+    const usageFor = async (_p: string, id: string) => (id === "member" ? live(100) : undefined);
+    expect(await pickIdentity(app, { usageFor, poolMembers })).toEqual({ reject: "no-headroom" });
+  });
+});
