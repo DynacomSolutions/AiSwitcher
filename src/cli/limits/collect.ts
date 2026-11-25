@@ -1,3 +1,4 @@
+import { recordAdapterFor } from "../../identities/pool/record-adapter.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import type { ParsedArgs } from "../args.ts";
 import { isRetired } from "../../identities/retired.ts";
@@ -110,6 +111,8 @@ export async function collectLimitTargets(
         skippedRetired ??= identity.name;
         continue;
       }
+      // A record-only pool (grok, opencode, zai) holds no login: its members are probed on their own.
+      if (isSwapPool(identity) && recordAdapterFor(cfg.toolName) !== undefined) continue;
       if (isSwapPool(identity) && !canonicalPools.has(identity.name)) {
         // The filter may have named the duplicate: the canonical record stands in for it.
         const canonical = canonicalPool(file, identity);

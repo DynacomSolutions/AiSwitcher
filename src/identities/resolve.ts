@@ -1,3 +1,4 @@
+import { recordAdapterFor } from "./pool/record-adapter.ts";
 import type { IdentitiesFile, ResolveOptions, ResolvedIdentity, ToolConfig } from "./types.ts";
 import { expandPath, matchDirectory } from "./match.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile, saveIdentitiesFile } from "./store.ts";
@@ -80,10 +81,11 @@ export async function resolveIdentity(
   if (opts.explicitPoolFlag) {
     const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
     const pool = findPool(file, opts.explicitPoolFlag);
-    if (!pool) {
+    // A record-only pool (grok, opencode, zai) has no pool folder to launch.
+    if (!pool || recordAdapterFor(cfg.toolName) !== undefined) {
       throw new UnknownPoolError(
         opts.explicitPoolFlag,
-        poolsOf(file).map((p) => p.name),
+        recordAdapterFor(cfg.toolName) ? [] : poolsOf(file).map((p) => p.name),
       );
     }
     return { identity: pool, configDirValue: expandPath(pool.configDir), source: "flag" };
