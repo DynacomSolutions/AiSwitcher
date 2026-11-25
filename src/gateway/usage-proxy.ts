@@ -81,6 +81,11 @@ export interface UsageProxyOptions {
   connectTarget?(host: string, port: number): { host: string; port: number };
   log?(line: string): void;
   tlsRecheckMs?: number;
+  /**
+   * Called once when the listener is gone without a call to `stop`: a server error or an unexpected close. The caller
+   * closes this proxy and starts a new one. Never called after `stop`.
+   */
+  onDown?(reason: string): void;
 }
 
 export interface RunningUsageProxy {
@@ -285,13 +290,27 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
     await tlsServer.stop(true).catch(() => undefined);
     throw err;
   }
-  // An error after the listener is up must be logged, never thrown as an unhandled event that ends the process.
-  server.on("error", (err: Error) => log(`gateway: connect-proxy listener error (${err.message})`));
+  // An error or an unexpected close after the listener is up is logged and reported once, never thrown as an unhandled event that ends the process.
+  let stopped = false;
+  let reportedDown = false;
+  const down = (reason: string): void => {
+    if (stopped || reportedDown) return;
+    reportedDown = true;
+    log(`gateway: connect-proxy listener down (${reason})`);
+    opts.onDown?.(reason);
+  };
+  server.on("error", (err: Error) => down(err.message));
+  server.on("close", () => down("closed"));
   return {
     port: (server.address() as net.AddressInfo).port,
     stop: async (force = true) => {
+      stopped = true;
       clearInterval(recheck);
-      server.close();
+      try {
+        server.close();
+      } catch {
+        // Already closed.
+      }
       await tlsServer.stop(force);
     },
   };

@@ -203,6 +203,8 @@ describe("serve lifecycle", () => {
       expect(await status(`${base(g)}/healthz`)).toBe(200); // far inside the 5 minute limit
       const down = await metricsOf(g);
       expect(down).toContain("ais_gateway_connect_proxy_up 0\n");
+      expect(down).toContain("ais_gateway_ready 0\n"); // the metric agrees with /readyz
+      expect(g.ready()).toBe(false);
       expect(down).toMatch(/ais_gateway_connect_proxy_start_failures_total [3-9]\d*\n/);
       expect(errors.filter((e) => e.includes("connect proxy not started (Error EADDRINUSE)")).length).toBeGreaterThanOrEqual(3);
       succeed = true;
@@ -211,6 +213,8 @@ describe("serve lifecycle", () => {
       expect(up).toContain("ais_gateway_connect_proxy_up 1\n");
       expect(up).toContain("ais_gateway_connect_proxy_down_seconds 0\n");
       expect(up).toContain("ais_gateway_ready 1\n");
+      expect(g.ready()).toBe(true);
+      expect(g.connectPort).toBe(4321); // read after the retry succeeded
       const settled = calls;
       await Bun.sleep(60);
       expect(calls).toBe(settled); // no further attempt once it listens
@@ -244,9 +248,9 @@ describe("serve lifecycle", () => {
       await waitFor(async () => (await status(`${base(g)}/healthz`)) === 200);
     });
 
-    test("stop ends the retries, and a start that finishes while stopping is closed", async () => {
+    test("stop ends the retries, and a start that finishes while stopping is closed with force", async () => {
       let calls = 0;
-      let stopped = 0;
+      const stopped: Array<boolean | undefined> = [];
       let finish!: () => void;
       const slow = new Promise<void>((r) => (finish = r));
       const g = await bootConnect({
@@ -254,17 +258,74 @@ describe("serve lifecycle", () => {
           calls += 1;
           if (calls < 2) throw new Error("not yet");
           await slow;
-          return { port: 4322, stop: async () => void (stopped += 1) };
+          return { port: 4322, stop: async (force?: boolean) => void stopped.push(force) };
         },
       });
       await waitFor(() => calls === 2);
       const stopping = g.stop();
       finish();
       await stopping;
-      expect(stopped).toBe(1);
+      expect(stopped).toEqual([true]);
       const settled = calls;
       await Bun.sleep(60);
       expect(calls).toBe(settled);
+    });
+
+    test("a listener that dies after start makes the replica not ready, then it is restarted and ready again", async () => {
+      let clock = Date.parse("2026-11-26T00:00:00.000Z");
+      const downs: Array<() => void> = [];
+      const stops: Array<boolean | undefined> = [];
+      let port = 5000;
+      let healthy = true;
+      const g = await bootConnect({
+        now: () => new Date(clock),
+        startConnectProxy: async (o) => {
+          if (!healthy) throw new Error("still failing");
+          downs.push(() => o.onDown?.("closed"));
+          return { port: port++, stop: async (force?: boolean) => void stops.push(force) };
+        },
+      });
+      expect(g.connectPort).toBe(5000);
+      await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+      healthy = false;
+      downs[0]!();
+      expect(g.ready()).toBe(false);
+      expect(g.connectPort).toBeUndefined();
+      expect(await text(`${base(g)}/readyz`)).toEqual({ status: 503, body: "connect proxy not listening\n" });
+      expect(await metricsOf(g)).toContain("ais_gateway_connect_proxy_up 0\n");
+      expect(stops).toEqual([true]); // the dead proxy was closed
+      clock += 300_000;
+      expect(await status(`${base(g)}/healthz`)).toBe(503); // down for the limit: the kubelet restarts the container
+      healthy = true;
+      await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+      expect(g.connectPort).toBe(5001);
+      expect(await status(`${base(g)}/healthz`)).toBe(200);
+      downs[0]!(); // a second report from the old proxy is ignored
+      expect(g.ready()).toBe(true);
+    });
+
+    test("a start that hangs is given up after the attempt limit, and a late finish is closed", async () => {
+      const stops: Array<boolean | undefined> = [];
+      let calls = 0;
+      let finish!: () => void;
+      const hang = new Promise<void>((r) => (finish = r));
+      const g = await bootConnect({
+        connectRetry: { initialMs: 5, maxMs: 20, attemptTimeoutMs: 30 },
+        startConnectProxy: async () => {
+          calls += 1;
+          if (calls === 1) {
+            await hang;
+            return { port: 6000, stop: async (force?: boolean) => void stops.push(force) };
+          }
+          return { port: 6001, stop: async () => {} };
+        },
+      });
+      await waitFor(() => g.connectPort === 6001); // the first attempt timed out; a second one worked
+      expect(await metricsOf(g)).toContain("ais_gateway_connect_proxy_start_failures_total 1\n");
+      finish();
+      await waitFor(() => stops.length === 1);
+      expect(stops).toEqual([true]);
+      expect(g.connectPort).toBe(6001);
     });
 
     test("without a CONNECT proxy configured nothing changes: /readyz and /healthz answer 200 and the gauge is absent", async () => {

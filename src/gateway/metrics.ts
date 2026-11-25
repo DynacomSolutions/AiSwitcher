@@ -458,7 +458,7 @@ export class PrometheusMetrics implements GatewayMetrics {
     out.push("# HELP ais_gateway_public_hosts_configured Public host names configured (AIS_GATEWAY_PUBLIC_HOSTS); 0 means operational endpoints answer on every host.", "# TYPE ais_gateway_public_hosts_configured gauge", `ais_gateway_public_hosts_configured ${this.publicHostCount}`);
     out.push("# HELP ais_gateway_app_notices_up 1 while this replica receives app change notices (revokes reach it at once), 0 while it relies on the timed refresh.", "# TYPE ais_gateway_app_notices_up gauge", `ais_gateway_app_notices_up ${this.appNoticesUp()}`);
     const rd = this.readiness();
-    out.push("# HELP ais_gateway_ready 1 while /readyz answers 200, else 0.", "# TYPE ais_gateway_ready gauge", `ais_gateway_ready ${rd.ready ? 1 : 0}`);
+    out.push("# HELP ais_gateway_ready 1 while /readyz answers 200 (including a listening CONNECT proxy when one is configured), else 0.", "# TYPE ais_gateway_ready gauge", `ais_gateway_ready ${rd.ready ? 1 : 0}`);
     out.push("# HELP ais_gateway_readiness_state 1 for the current readiness state (cold, warm, timeout, draining), 0 for the others.", "# TYPE ais_gateway_readiness_state gauge");
     for (const st of ["cold", "warm", "timeout", "draining"]) out.push(`ais_gateway_readiness_state{state="${st}"} ${rd.state === st ? 1 : 0}`);
     const cp = this.connectProxy();
