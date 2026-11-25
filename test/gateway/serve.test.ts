@@ -1486,6 +1486,21 @@ describe("usage warm readiness", () => {
     expect(row?.maxUtilization).toBe(42);
   });
 
+  test("N2: the pool headroom gauge is set only after warm-up, and falls to 0 when the pool has no members", async () => {
+    await seed();
+    let finish!: () => void;
+    const slow = new Promise<void>((r) => (finish = r));
+    let members = ["id1"];
+    const WEEK = { status: "live" as const, maxUtilization: 20, windows: [{ label: "weekly", utilization: 20 }], capturedAt: "2026-11-20T00:00:00.000Z" };
+    const g = await boot({ usageFor: undefined, poolMembers: async () => members, gaugeMs: 20, fetchUsage: async () => (await slow, WEEK) });
+    await Bun.sleep(120);
+    expect(await metricsText(g)).not.toContain("ais_gateway_pool_members_with_headroom{");
+    finish();
+    await waitFor(async () => (await metricsText(g)).includes('ais_gateway_pool_members_with_headroom{provider="claude",threshold="0.9"} 1'));
+    members = [];
+    await waitFor(async () => (await metricsText(g)).includes('ais_gateway_pool_members_with_headroom{provider="claude",threshold="0.9"} 0'));
+  });
+
   test("a never-resolving fetch times out, warns with the identity, and the gateway turns ready", async () => {
     await seed();
     const warnings: string[] = [];

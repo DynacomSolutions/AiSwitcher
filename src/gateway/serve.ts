@@ -1203,8 +1203,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   /** Pool members below the weekly-use threshold, per provider with a pool: the figure behind the low-headroom alert. */
   async function poolHeadroomTick(): Promise<void> {
     for (const provider of POOL_HEADROOM_PROVIDERS) {
-      const members = await appDeps.poolMembers(provider);
-      if (members.length === 0) continue;
+      const members = await appDeps.poolMembers(provider).catch(() => undefined);
+      if (members === undefined || members.length === 0) {
+        // No member, or the read failed: the gauge reads 0, never the figure of an earlier tick.
+        metrics.poolHeadroom(provider, POOL_HEADROOM_PERCENT, 0, 0);
+        continue;
+      }
       let reading = 0;
       let room = 0;
       for (const m of members) {

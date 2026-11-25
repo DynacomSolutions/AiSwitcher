@@ -5,9 +5,11 @@
  * within minutes. The hold answers `200 text/event-stream` at once and sends an SSE `ping` every few seconds. The client
  * has its headers, so its 10 minute request timeout is over, and its stream idle watchdog sees data. The gateway replays
  * the buffered request against the pool from time to time. When a member has room, the replay answer becomes the rest of
- * the stream. When the replay fails for another reason, the stream ends with an SSE `error` event in the provider's shape.
+ * the stream. When the replay meets a 429 (a full pool or a provider limit), the hold continues. When the replay fails for
+ * another reason, the stream ends with an SSE `error` event in the provider's shape.
  *
- * A shutdown ends every hold at once with a retryable `overloaded_error` event, so a held request never blocks a drain.
+ * A shutdown ends every hold at once with a socket reset before any message event. Claude Code retries a reset as a stream.
+ * An SSE `error` event before `message_start` would make it resend the request without streaming, and that request is never held.
  */
 
 export interface PoolHoldLimits {
@@ -65,13 +67,94 @@ export class PoolHoldGate {
   }
 }
 
-/** True when the buffered JSON request body asks for a stream. */
-export function wantsStream(bytes: Uint8Array): boolean {
-  try {
-    const j = JSON.parse(new TextDecoder().decode(bytes)) as { stream?: unknown };
-    return j.stream === true;
-  } catch {
-    return false;
+/**
+ * True when the top-level `stream` key of the buffered JSON request body is `true`. A bounded scan, as `scanModel`: it
+ * allocates nothing for the body, skips nested values by depth and the last duplicate key wins, as in JSON.parse.
+ */
+export function wantsStream(b: Uint8Array): boolean {
+  const n = b.length;
+  let i = 0;
+  const ws = (): void => {
+    while (i < n && (b[i] === 0x20 || b[i] === 0x0a || b[i] === 0x0d || b[i] === 0x09)) i++;
+  };
+  /** Index of the closing quote of the string that opens at `from`, or -1. */
+  const str = (from: number): number => {
+    let j = from + 1;
+    while (j < n) {
+      const c = b[j];
+      if (c === 0x5c) j += 2;
+      else if (c === 0x22) return j;
+      else j++;
+    }
+    return -1;
+  };
+  /** Moves `i` past one JSON value. */
+  const skip = (): boolean => {
+    const c = b[i];
+    if (c === 0x22) {
+      const e = str(i);
+      if (e < 0) return false;
+      i = e + 1;
+      return true;
+    }
+    if (c === 0x7b || c === 0x5b) {
+      let depth = 0;
+      while (i < n) {
+        const d = b[i];
+        if (d === 0x22) {
+          const e = str(i);
+          if (e < 0) return false;
+          i = e + 1;
+          continue;
+        }
+        if (d === 0x7b || d === 0x5b) depth++;
+        else if (d === 0x7d || d === 0x5d) {
+          depth--;
+          if (depth === 0) {
+            i++;
+            return true;
+          }
+        }
+        i++;
+      }
+      return false;
+    }
+    const from = i;
+    while (i < n && b[i] !== 0x2c && b[i] !== 0x7d && b[i] !== 0x20 && b[i] !== 0x0a && b[i] !== 0x0d && b[i] !== 0x09) i++;
+    return i > from;
+  };
+  ws();
+  if (b[i] !== 0x7b) return false;
+  i++;
+  let stream = false;
+  for (;;) {
+    ws();
+    if (b[i] === 0x7d) return stream;
+    if (b[i] === 0x2c) {
+      i++;
+      continue;
+    }
+    if (b[i] !== 0x22) return false;
+    const ke = str(i);
+    if (ke < 0) return false;
+    let isStream = false;
+    let escaped = false;
+    for (let k = i + 1; k < ke; k++) if (b[k] === 0x5c) escaped = true;
+    if (escaped) {
+      try {
+        isStream = JSON.parse(new TextDecoder().decode(b.subarray(i, ke + 1))) === "stream"; // only the key text, never the body
+      } catch {
+        return false;
+      }
+    } else isStream = ke - i === 7 && b[i + 1] === 0x73 && b[i + 2] === 0x74 && b[i + 3] === 0x72 && b[i + 4] === 0x65 && b[i + 5] === 0x61 && b[i + 6] === 0x6d;
+    i = ke + 1;
+    ws();
+    if (b[i] !== 0x3a) return false;
+    i++;
+    ws();
+    const from = i;
+    if (!skip()) return false;
+    if (isStream) stream = i - from === 4 && b[from] === 0x74 && b[from + 1] === 0x72 && b[from + 2] === 0x75 && b[from + 3] === 0x65;
   }
 }
 
@@ -101,11 +184,19 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
   const finish = (event: Parameters<NonNullable<HeldStreamInput["onEvent"]>>[0]): void => {
     if (done) return;
     done = true;
+    input.drain?.removeEventListener("abort", onDrain);
     input.gate.leave(input.bytes);
     input.onEvent?.(event);
   };
   /** Ends the wait: the client went away or the gateway stops. A stream that is already served ends only when the client goes. */
   const waitSignal = input.drain ? AbortSignal.any([ctrl.signal, input.drain]) : ctrl.signal;
+  /** Ends a replay that has not answered yet when the gateway stops. After the answer the served stream runs on. */
+  const replayCtrl = new AbortController();
+  let replaying = false;
+  const onDrain = (): void => {
+    if (replaying) replayCtrl.abort();
+  };
+  input.drain?.addEventListener("abort", onDrain, { once: true });
   input.onEvent?.("held");
   const stream = new ReadableStream<Uint8Array>({
     start(c) {
@@ -115,6 +206,14 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
           return true;
         } catch {
           return false;
+        }
+      };
+      /** A socket reset before any message event: Claude Code retries it as a stream, an SSE error event it would not. */
+      const reset = (): void => {
+        try {
+          c.error(new Error("gateway is restarting"));
+        } catch {
+          // already closed by a cancel
         }
       };
       const end = (): void => {
@@ -129,9 +228,8 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
         try {
           for (;;) {
             if (input.drain?.aborted) {
-              send(sse("error", { type: "error", error: { type: "overloaded_error", message: "gateway is restarting, retry" } }));
               finish("drained");
-              return end();
+              return reset();
             }
             if (ctrl.signal.aborted) {
               finish("cancelled");
@@ -152,21 +250,32 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
             if (sinceCheck < input.limits.checkMs) continue;
             sinceCheck = 0;
             let res: Response;
+            replaying = true;
             try {
-              res = await input.replay(ctrl.signal);
+              res = await input.replay(AbortSignal.any([ctrl.signal, replayCtrl.signal]));
             } catch {
               if (waitSignal.aborted) continue;
               send(sse("error", { type: "error", error: { type: "api_error", message: "gateway error" } }));
               finish("failed");
               return end();
+            } finally {
+              replaying = false;
             }
-            if (fullPoolAnswers.has(res)) {
+            if (input.drain?.aborted && !res.ok) {
+              // The shutdown aborted the replay: the proxy turns that into an error answer. The loop top resets the stream.
+              await res.body?.cancel().catch(() => undefined);
+              continue;
+            }
+            // A 429 of any kind (a full pool, a provider limit) means the pool is still full: the hold goes on.
+            if (res.status === 429 || fullPoolAnswers.has(res)) {
               await res.body?.cancel().catch(() => undefined);
               continue;
             }
             if (res.ok && res.body) {
               // The replay is the real answer: its body is the rest of the stream. Its end ends the hold.
               finish("served");
+              const note = replayNote(res.headers);
+              if (note) send(note);
               const reader = res.body.getReader();
               ctrl.signal.addEventListener("abort", () => void reader.cancel().catch(() => undefined), { once: true });
               try {
@@ -199,6 +308,16 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
     },
   });
   return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" } });
+}
+
+/**
+ * The 200 headers went out when the hold began, so the real answer's `request-id` and rate-limit headers cannot be sent as
+ * headers. They go as one SSE comment line, which every SSE parser skips and a person reading a trace can still find.
+ */
+function replayNote(h: Headers): Uint8Array | undefined {
+  const parts: string[] = [];
+  for (const [k, v] of h) if (k === "request-id" || k === "x-request-id" || k.startsWith("anthropic-ratelimit-unified-")) parts.push(`${k}=${v.replace(/[\r\n]/g, " ").slice(0, 200)}`);
+  return parts.length > 0 ? enc.encode(`: ais-replay ${parts.join(" ")}\n\n`) : undefined;
 }
 
 /** The SSE error event for a replay answer that is not a stream: the provider's own error object when it has one. */
