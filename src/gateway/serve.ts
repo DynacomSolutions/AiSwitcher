@@ -629,7 +629,7 @@ export async function pushRefreshed(
   }
   // Whatever the listed paths missed (or a failed push left behind) goes too: every tracked file of the account that changed.
   await mirror.pushAccountDirty(account);
-  const lost = failed.find((f) => !mirror.tracks(f.path));
+  const lost = failed.find((f) => !mirror.tracks(f.path, account));
   if (lost) throw lost.err;
 }
 

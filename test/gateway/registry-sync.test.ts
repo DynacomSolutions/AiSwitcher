@@ -358,6 +358,21 @@ describe("tombstones with times", () => {
     expect((mergeIdentity(b, a) as { addedAt?: number }).addedAt).toBe(20);
   });
 
+  test("an entry without addedAt that the host's base did not list is a re-add; one the base listed stays covered", () => {
+    const store = regOf([dated("a")], [{ name: "b", at: 1000 }]);
+    const host = regOf([dated("a"), dated("b")]);
+    expect(JSON.parse(mergeRegistries(host, store, { baseNames: ["a"] })!.toString()).identities.map((i: { name: string }) => i.name)).toEqual(["a", "b"]);
+    expect(JSON.parse(mergeRegistries(host, store, { baseNames: ["a", "b"] })!.toString()).identities.map((i: { name: string }) => i.name)).toEqual(["a"]);
+  });
+
+  test("markAdded stamps the time and clears the tombstone", async () => {
+    const { markAdded } = await import("../../src/identities/tombstones.ts");
+    const file = { identities: [{ name: "x" }], deleted: [{ name: "x", at: 1 }, { name: "y", at: 1 }] } as { identities: Array<{ name: string; addedAt?: number }>; deleted?: Array<{ name: string; at: number }> };
+    markAdded(file, file.identities[0]!);
+    expect(typeof file.identities[0]!.addedAt).toBe("number");
+    expect(file.deleted).toEqual([{ name: "y", at: 1 }]);
+  });
+
   test("portableIdentitiesFile and mergeRegistryConflict keep the tombstones", async () => {
     const { portableIdentitiesFile, mergeRegistryConflict } = await import("../../src/sync/registry.ts");
     const { CLAUDE_CONFIG } = await import("../../src/identities/tool-configs.ts");

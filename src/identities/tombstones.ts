@@ -42,3 +42,9 @@ export const tombstoneCovers = (tombstone: Tombstone | undefined, identity: unkn
   const added = addedAtOf(identity);
   return added === undefined || added <= tombstone.at;
 };
+
+/** Stamps a new identity with its add time and clears its name's tombstone: a name created again is no longer deleted. */
+export function markAdded(file: { deleted?: Array<{ name: string; at: number }> }, identity: { name: string; addedAt?: number }): void {
+  identity.addedAt = Date.now();
+  if (file.deleted) file.deleted = file.deleted.filter((t) => t.name !== identity.name);
+}

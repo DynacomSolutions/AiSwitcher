@@ -1,3 +1,4 @@
+import { markAdded } from "../../identities/tombstones.ts";
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "../../identities/types.ts";
 import { isCodexLoginMethod } from "../../identities/types.ts";
 import { normaliseIdentityColour } from "../../identities/colour.ts";
@@ -66,16 +67,14 @@ export function createIdentity(file: IdentitiesFile, input: CreateIdentityInput)
 
   const identity: Identity = {
     name: input.name,
-    addedAt: Date.now(),
     label: input.label,
     ...(input.description ? { description: input.description } : {}),
     configDir: input.configDir,
     ...(input.directories?.length ? { directories: input.directories } : {}),
     ...(input.aliases?.length ? { aliases: input.aliases } : {}),
   };
+  markAdded(file, identity);
   file.identities.push(identity);
-  // A name created again is no longer deleted.
-  if (file.deleted) file.deleted = file.deleted.filter((t) => t.name !== input.name);
   return identity;
 }
 

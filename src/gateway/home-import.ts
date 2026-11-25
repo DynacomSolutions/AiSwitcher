@@ -131,6 +131,24 @@ export async function collectImportEntries(home: string = homedir()): Promise<Im
   return out;
 }
 
+/** True for a JSON object with more than one top-level entry (a shared pi auth.json, claude with mcpOAuth). */
+const isMultiEntry = (text: string): boolean => {
+  try {
+    const v = JSON.parse(text) as unknown;
+    return typeof v === "object" && v !== null && !Array.isArray(v) && Object.keys(v).length > 1;
+  } catch {
+    return false;
+  }
+};
+
+const sameJsonText = (a: string, b: string): boolean => {
+  try {
+    return JSON.stringify(JSON.parse(a)) === JSON.stringify(JSON.parse(b));
+  } catch {
+    return false;
+  }
+};
+
 const relOf = (home: string, abs: string): string | undefined => {
   const r = relative(home, abs);
   return r === "" || r.startsWith("..") || r.startsWith(sep) ? undefined : r.split(sep).join("/");
@@ -185,25 +203,32 @@ export async function importHome(
         report.skipped.push({ path: rel, why: "the store already has a heartbeat" });
         return;
       }
-      if (e.kind === "login") {
+      const multi = e.kind === "login" && isMultiEntry(content.toString("utf8")) && mergeByKey(content.toString("utf8"), row.content.toString("utf8")) !== undefined;
+      if (e.kind === "login" && !multi) {
         if (!isFresher(content.toString("utf8"), row.content.toString("utf8"))) {
           report.skipped.push({ path: rel, why: "the store's grant is as fresh or fresher" });
           return;
         }
       }
       let body = content;
-      if (e.kind === "login" && losesLogin(content.toString("utf8"), row.content.toString("utf8"))) {
-        // A mixed file (a gateway entry beside a fresher real one) is merged per entry; it is pushed only when the merge loses nothing.
-        const merged = mergeByKey(content.toString("utf8"), row.content.toString("utf8"));
-        if (!merged || losesLogin(merged.toString("utf8"), row.content.toString("utf8"))) {
+      if (e.kind === "login") {
+        // A multi-entry login (pi auth.json, claude with mcpOAuth) is merged per entry: the older token of one entry never replaces a newer one,
+        // and a gateway entry never replaces a real one. It is pushed only when the merge loses nothing and differs from the row.
+        const merged = multi ? mergeByKey(content.toString("utf8"), row.content.toString("utf8")) : undefined;
+        if (merged) {
+          if (losesLogin(merged.toString("utf8"), row.content.toString("utf8"))) {
+            report.skipped.push({ path: rel, why: "it would replace a login the gateway can renew with one it cannot" });
+            return;
+          }
+          if (sameJsonText(merged.toString("utf8"), row.content.toString("utf8"))) {
+            report.skipped.push({ path: rel, why: "the store's grant is as fresh or fresher" });
+            return;
+          }
+          body = merged;
+        } else if (losesLogin(content.toString("utf8"), row.content.toString("utf8"))) {
           report.skipped.push({ path: rel, why: "it would replace a login the gateway can renew with one it cannot" });
           return;
         }
-        if (sha256Hex(merged) === row.sha256) {
-          report.skipped.push({ path: rel, why: "the store's grant is as fresh or fresher" });
-          return;
-        }
-        body = merged;
       }
       if (e.kind === "registry") {
         const last = await readRegistryBase(home, rel);

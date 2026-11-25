@@ -112,7 +112,7 @@ describe("pushRefreshed raises only for files that really failed", () => {
     pushAccountDirty: async () => {
       if (o.dirty) throw o.dirty;
     },
-    tracks: () => o.tracked,
+    tracks: (_a: string, _acc: string) => o.tracked,
   });
   const run = (m: ReturnType<typeof fake>) => pushRefreshed(m as never, "claude", identity, [], async () => ["/h/alpha/.credentials.json"]);
 

@@ -112,7 +112,9 @@ export function mergeRegistries(host: string, store: string, opts: { baseNames?:
     const other = theirs.get(i.name);
     // The newer add wins when the two sides hold different creations of one name.
     const entry = other && (addedAtOf(other) ?? 0) > (addedAtOf(i) ?? 0) ? other : i;
-    if (covered(entry)) continue;
+    // An older host (no addedAt) that re-added a name its base did not list made a new entry: the tombstone does not cover it.
+    const readded = entry === i && addedAtOf(i) === undefined && baseNames !== undefined && !baseNames.has(i.name);
+    if (!readded && covered(entry)) continue;
     const pool = entry.swapPool;
     const otherPool = (entry === i ? other : i)?.swapPool;
     if (isObject(pool) && Array.isArray(pool.accounts) && isObject(otherPool) && Array.isArray(otherPool.accounts)) {

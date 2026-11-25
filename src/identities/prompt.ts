@@ -4,6 +4,7 @@ import { styleText } from "node:util";
 import * as clack from "@clack/prompts";
 import type { Identity, IdentitiesFile, ToolConfig } from "./types.ts";
 import { expandPath, isValidIdentityKey, parseDirectoryPattern } from "./match.ts";
+import { markAdded } from "./tombstones.ts";
 import { saveIdentitiesFile } from "./store.ts";
 import { PromptCancelledError, PromptTimeoutError, InvalidIdentitiesFileError, UnknownPoolError } from "./errors.ts";
 import { writeZaiAuthFile } from "./zai-auth.ts";
@@ -295,6 +296,7 @@ async function createIdentityFlow(
     ...(aliases.length ? { aliases } : {}),
   };
 
+  markAdded(identitiesFile, identity);
   identitiesFile.identities.push(identity);
   await saveIdentitiesFile(cfg.identitiesJsonPath, identitiesFile);
 

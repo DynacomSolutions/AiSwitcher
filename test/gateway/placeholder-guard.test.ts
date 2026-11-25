@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { gatewayEntryText } from "../../src/identities/claude-gateway-entry.ts";
 import { grantFreshness, HomeMirror, isFresher, isPlaceholderLogin, isRefreshableLogin, mergeByKey } from "../../src/gateway/home-mirror.ts";
 import { importHome } from "../../src/gateway/home-import.ts";
+import { pushRefreshed } from "../../src/gateway/serve.ts";
+import type { Identity } from "../../src/identities/types.ts";
 import { startHostSync } from "../../src/gateway/host-sync.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type PgHomeStore, type PutResult } from "../../src/gateway/home-store.ts";
@@ -335,5 +337,36 @@ describe("host sync pass", () => {
     expect(await readFile(join(home, LOGIN), "utf8")).toContain("s2");
     expect(warnings.some((w) => w.includes("import failed"))).toBe(true);
     await sync.stop();
+  });
+});
+
+describe("importHome merges every multi-entry login per entry", () => {
+  test("the older refresh token of one entry never replaces the newer one in the row", async () => {
+    const PI = ".pi/agent/auth.json";
+    const e = (tag: string, exp: number) => ({ type: "oauth", access: `SYNTHETIC_FIXTURE-a-${tag}`, refresh: `SYNTHETIC_FIXTURE-r-${tag}`, expires: exp });
+    const home = await tmp();
+    const store = new FakeStore();
+    // Host: entry one is newer, entry two is older. Row: the reverse.
+    store.seed(PI, JSON.stringify({ one: e("one-old", 1_790_000_000_000), two: e("two-new", 1_796_000_000_000) }));
+    await put(home, PI, JSON.stringify({ one: e("one-new", 1_795_000_000_000), two: e("two-old", 1_791_000_000_000), }));
+    await importHome(asStore(store), { home, entries: [{ abs: join(home, PI), account: "pi/a", kind: "login" }] });
+    const row = JSON.parse(store.text(PI)!);
+    expect(row.one.refresh).toBe("SYNTHETIC_FIXTURE-r-one-new");
+    expect(row.two.refresh).toBe("SYNTHETIC_FIXTURE-r-two-new");
+  });
+});
+
+describe("pushRefreshed account check", () => {
+  test("a failed push of a file tracked under another account still raises", async () => {
+    const identity = { name: "alpha", label: "a", configDir: "/h/alpha" } as Identity;
+    const m = {
+      push: async () => {
+        throw new Error("db down");
+      },
+      pushAccountDirty: async () => undefined,
+      // Tracked, but under another account: a failed push of it is not retried by this account's dirty pass.
+      tracks: (_abs: string, account?: string) => account !== "claude/alpha",
+    };
+    await expect(pushRefreshed(m as never, "claude", identity, [], async () => ["/h/alpha/.credentials.json"])).rejects.toThrow("db down");
   });
 });

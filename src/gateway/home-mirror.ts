@@ -541,10 +541,10 @@ export class HomeMirror {
     }
   }
 
-  /** True when the file at `abs` has a recorded base: a push that failed for it is retried by pushAccountDirty. */
-  tracks(abs: string): boolean {
+  /** True when the file at `abs` has a recorded base under `account`: a push that failed for it is retried by pushAccountDirty. */
+  tracks(abs: string, account: string): boolean {
     const rel = this.rel(abs);
-    return rel !== undefined && this.bases.has(rel);
+    return rel !== undefined && this.bases.has(rel) && this.kinds.get(rel)?.account === account;
   }
 
   /** Pushes the account's tracked files whose local copy differs from their base (a push that missed them). No account lock: call it inside one. */

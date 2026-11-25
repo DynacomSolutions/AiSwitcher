@@ -4,6 +4,7 @@ import { HttpHomeStore, StoreApiError } from "../gateway/home-store-http.ts";
 import type { HomeFileMeta, HomeStoreClient } from "../gateway/home-store.ts";
 import { hostStoreConfig } from "../gateway/host-sync.ts";
 import { isValidIdentityKey } from "../identities/match.ts";
+import { markAdded } from "../identities/tombstones.ts";
 import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias, parseIdentitiesFile } from "../identities/store.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -160,6 +161,7 @@ export async function addGatewayIdentity(toolRaw: string, raw: unknown, deps: Ga
       configDir,
       ...(tool === "codex" && sample.codexLoginMethod ? { codexLoginMethod: sample.codexLoginMethod } : {}),
     };
+    markAdded(file as { deleted?: Array<{ name: string; at: number }> }, entry);
     identities.push(entry);
     if (pool && !pool.swapPool!.accounts.includes(input.name)) pool.swapPool!.accounts.push(input.name);
 
