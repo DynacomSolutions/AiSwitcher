@@ -10,7 +10,10 @@
  *   agent's process group; this process ends with the agent's exit code.
  * - The agent runs in its own process group (`detached`), so a signal reaches what it started too (an MCP server, a shell
  *   script's child). If this process is killed without a chance to forward (SIGKILL), the agent sees its stdin close and
- *   ends by itself, and the scope the relay runs in (a systemd scope stop) still kills the whole group.
+ *   ends by itself, and the scope the relay runs in (a systemd scope stop) still kills the whole group. Nothing in this
+ *   process can handle SIGKILL, so that scope stop is the only backstop for a relay that is killed.
+ * - After the agent's `exit` (and the short stdout drain) the relay sends SIGTERM to the agent's process group, on every exit
+ *   path, so a helper the agent left behind (an MCP server that holds stdout) does not outlive the relay.
  * - When the agent ends (an exit code, a signal, or no end after a signal sent to this process) while a `session/prompt`
  *   is still open, each open request gets one JSON-RPC error that says why. Without it the client sees only a closed
  *   stream and shows its default text ("Provider turn failed."). A prompt the agent answered is never answered twice.
@@ -78,11 +81,10 @@ export interface AgentEnd {
   signal: NodeJS.Signals | null;
   /** The first signal this process received, when it did. */
   relaySignal?: NodeJS.Signals;
-  /**
-   * The agent did not finish in `graceMs` after that signal and was stopped by the relay. `agentEnded` says that its
-   * process had ended but its output stayed open (so what it started kept it open).
-   */
-  timedOut?: { graceMs: number; agentEnded?: boolean };
+  /** The agent did not finish in `graceMs` after that signal and was stopped by the relay. */
+  timedOut?: { graceMs: number };
+  /** The agent process ended, but its stdout stayed open for `drainMs` after that, so the relay stopped waiting for it. */
+  outputOpen?: { drainMs: number };
   /** The agent could not start. */
   startError?: string;
   /** The last agent stderr text (raw; redacted here). */
@@ -99,11 +101,12 @@ export function agentEndMessage(e: AgentEnd): string {
     const secs = Number((e.timedOut.graceMs / 1000).toFixed(1));
     const span = `${secs} ${secs === 1 ? "second" : "seconds"}`;
     const signal = e.relaySignal ?? "a signal";
-    if (e.timedOut.agentEnded) parts.push(`its process ended, but its output stayed open for more than ${span} after the relay received ${signal}, so the relay stopped what was left.`);
-    else parts.push(`it did not end within ${span} after the relay received ${signal}, so the relay stopped it.`);
+    parts.push(`it did not end within ${span} after the relay received ${signal}, so the relay stopped it.`);
+  } else {
+    if (e.signal) parts.push(`it was ended by ${e.signal}.`);
+    else parts.push(e.code === 0 ? "it exited with code 0 before it answered." : `it exited with code ${e.code ?? "unknown"}.`);
+    if (e.outputOpen) parts.push(`Its output stayed open for ${e.outputOpen.drainMs} ms after that, so the relay stopped waiting for it.`);
   }
-  else if (e.signal) parts.push(`it was ended by ${e.signal}.`);
-  else parts.push(e.code === 0 ? "it exited with code 0 before it answered." : `it exited with code ${e.code ?? "unknown"}.`);
   if (e.relaySignal) parts.push(`The relay received ${e.relaySignal} first, so something outside the agent stopped its process group or systemd scope.`);
   else if (e.signal) parts.push("The relay received no signal, so only the agent process was stopped.");
   const tailLines = (e.stderrTail ?? "").split(/\r?\n/);
@@ -208,8 +211,9 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
       signalAgent(signal);
       // The agent gets a short moment to end. If it does not, its group is stopped and its open prompts are answered here.
       graceTimer ??= setTimeout(() => {
+        if (agentExited) return; // the agent ended inside the grace time: its exit handler ends the relay after the short drain
         signalAgent("SIGKILL");
-        void end({ agent: agentName, code: null, signal: null, ...(relaySignal ? { relaySignal } : {}), timedOut: { graceMs, ...(agentExited ? { agentEnded: true } : {}) }, stderrTail, ...(stderrCut ? { stderrCut } : {}) }, 128 + (signalNumber(relaySignal ?? "SIGTERM") ?? 15));
+        void end({ agent: agentName, code: null, signal: null, ...(relaySignal ? { relaySignal } : {}), timedOut: { graceMs }, stderrTail, ...(stderrCut ? { stderrCut } : {}) }, 128 + (signalNumber(relaySignal ?? "SIGTERM") ?? 15));
       }, graceMs);
     };
     const handlers = signals.map((s) => [s, () => forward(s)] as const);
@@ -338,19 +342,27 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
       agentExited = true;
       let proceeded = false;
       let drainTimer: ReturnType<typeof setTimeout> | undefined;
-      const proceed = () => {
+      const proceed = (drainTimedOut = false) => {
         if (proceeded) return;
         proceeded = true;
         if (drainTimer !== undefined) clearTimeout(drainTimer);
+        // Nothing the agent started stays behind: stop the rest of its process group (ESRCH: it is already empty).
+        if (child.pid !== undefined && process.platform !== "win32") {
+          try {
+            process.kill(-child.pid, "SIGTERM");
+          } catch {
+            // no process left in the group
+          }
+        }
         const rest = fromAgent.rest();
         chain = chain.then(() => (rest.length > 0 ? write(rest) : undefined));
-        void end({ agent: agentName, code, signal, ...(relaySignal ? { relaySignal } : {}), stderrTail, ...(stderrCut ? { stderrCut } : {}) }, code ?? (signal ? 128 + (signalNumber(signal) ?? 15) : 1));
+        void end({ agent: agentName, code, signal, ...(relaySignal ? { relaySignal } : {}), ...(drainTimedOut ? { outputOpen: { drainMs: STDOUT_DRAIN_MS } } : {}), stderrTail, ...(stderrCut ? { stderrCut } : {}) }, code ?? (signal ? 128 + (signalNumber(signal) ?? 15) : 1));
       };
       if (stdoutEnded) return proceed();
       // The last bytes of stdout can arrive after `exit`: wait for them, but only a short time.
-      drainTimer = setTimeout(proceed, STDOUT_DRAIN_MS);
-      child.stdout.once("end", proceed);
-      child.stdout.once("error", proceed);
+      drainTimer = setTimeout(() => proceed(true), STDOUT_DRAIN_MS);
+      child.stdout.once("end", () => proceed());
+      child.stdout.once("error", () => proceed());
     });
   });
 }

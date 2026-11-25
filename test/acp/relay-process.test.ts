@@ -373,6 +373,40 @@ describe("an agent whose helper process keeps its output open", () => {
     expect(out).not.toContain("late");
   }, 30_000);
 
+  test("a helper that holds stdout after the agent exits is stopped, and the message says the agent exited", async () => {
+    const dir = join(root, "orphan-stdout");
+    await mkdir(dir, { recursive: true });
+    const pidFile = join(dir, "helper.pid");
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let out = "";
+    stdout.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `read l; (sleep 31 & echo $! > ${pidFile}; wait) & while [ ! -s ${pidFile} ]; do sleep 0.05; done; exit 3`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false });
+    stdin.write(PROMPT);
+    const pid = Number(await waitFor(pidFile));
+    expect(await done).toBe(3);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(alive(pid)).toBe(false);
+    const err = JSON.parse(out.trim().split("\n")[0]!);
+    expect(err.error.message).toContain("it exited with code 3. Its output stayed open for 500 ms after that, so the relay stopped waiting for it.");
+    expect(err.error.message).not.toContain("more than");
+  }, 30_000);
+
+  test("a helper that closed its output is stopped too after a normal exit", async () => {
+    const dir = join(root, "orphan-normal");
+    await mkdir(dir, { recursive: true });
+    const pidFile = join(dir, "helper.pid");
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `read l; sleep 31 >/dev/null 2>&1 </dev/null & echo $! > ${pidFile}; exit 0`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false });
+    stdin.write(PROMPT);
+    const pid = Number(await waitFor(pidFile));
+    expect(await done).toBe(0);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(alive(pid)).toBe(false);
+  }, 30_000);
+
   test("a signal reaches the agent's helper too: nothing is left running after the relay ends", async () => {
     const dir = join(root, "orphan");
     await mkdir(dir, { recursive: true });
@@ -414,12 +448,17 @@ test("the end message separates an agent that did not end from one whose output 
   const base = { agent: "zcode", code: null, signal: null, relaySignal: "SIGTERM" as const };
   expect(agentEndMessage({ ...base, timedOut: { graceMs: 1000 } })).toContain("it did not end within 1 second after the relay received SIGTERM, so the relay stopped it.");
   expect(agentEndMessage({ ...base, timedOut: { graceMs: 3000 } })).toContain("it did not end within 3 seconds after");
-  expect(agentEndMessage({ ...base, timedOut: { graceMs: 1000, agentEnded: true } })).toContain("its process ended, but its output stayed open for more than 1 second after the relay received SIGTERM");
+  // the agent ended and its output stayed open: the message says the agent ended, never "more than N seconds"
+  const open = agentEndMessage({ agent: "zcode", code: 3, signal: null, outputOpen: { drainMs: 500 } });
+  expect(open).toContain("it exited with code 3. Its output stayed open for 500 ms after that, so the relay stopped waiting for it.");
+  expect(open).not.toContain("more than");
+  expect(agentEndMessage({ agent: "zcode", code: null, signal: "SIGKILL", outputOpen: { drainMs: 500 } })).toContain("it was ended by SIGKILL. Its output stayed open for 500 ms after that");
+  expect(agentEndMessage({ agent: "zcode", code: 0, signal: null })).not.toContain("output stayed open");
 });
 
 test("a stderr tail that was cut loses its partial first line, and secrets in it are redacted", () => {
   const idKey = `${"0123456789abcdef".repeat(2)}.${"AbCdEfGh".repeat(2)}`; // built here, not written out: no key-shaped literal
-  const tail = ["ial first line", "fatal: password=hunter2extra", "token: abcdef", `x-api-key: ${idKey}`].join("\n");
+  const tail = ["ial first line", "fatal: password=hunter2extra", "token: SYNTHETIC_FIXTURE_tok", `x-api-key: ${idKey}`].join("\n");
   const cut = agentEndMessage({ agent: "zcode", code: 1, signal: null, stderrTail: tail, stderrCut: true });
   expect(cut).not.toContain("ial first line");
   expect(cut).toContain("fatal: password=[redacted]");
