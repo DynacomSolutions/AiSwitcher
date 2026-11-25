@@ -19,7 +19,12 @@ import { aisStateDir } from "../shared/ais-home.ts";
 export interface RegistryBase {
   version: number;
   sha: string;
+  /** Identity names the registry listed at this base: a host tombstone applies only to these, any other name is a re-add. */
+  names?: string[];
 }
+
+/** How long a tombstone stays in the registry after its delete, even when the store no longer lists the name. */
+export const TOMBSTONE_KEEP_MS = 90 * 86_400_000;
 
 export const registryBasesPath = (home: string): string => join(aisStateDir(home), "gateway-registry-bases.json");
 
@@ -37,7 +42,9 @@ async function readAll(home: string): Promise<Record<string, RegistryBase>> {
     const out: Record<string, RegistryBase> = {};
     for (const [path, b] of Object.entries(raw.bases ?? {})) {
       const rec = b as Partial<RegistryBase> | null;
-      if (rec && typeof rec.sha === "string" && typeof rec.version === "number") out[path] = { sha: rec.sha, version: rec.version };
+      if (rec && typeof rec.sha === "string" && typeof rec.version === "number") {
+        out[path] = { sha: rec.sha, version: rec.version, ...(Array.isArray(rec.names) ? { names: rec.names.filter((n): n is string => typeof n === "string") } : {}) };
+      }
     }
     return out;
   } catch {
@@ -53,7 +60,7 @@ export const readRegistryBase = async (home: string, rel: string): Promise<Regis
 export const writeRegistryBase = (home: string, rel: string, base: RegistryBase): Promise<void> =>
   serial(async () => {
     const all = await readAll(home);
-    if (all[rel]?.sha === base.sha && all[rel]?.version === base.version) return;
+    if (all[rel]?.sha === base.sha && all[rel]?.version === base.version && JSON.stringify(all[rel]?.names) === JSON.stringify(base.names)) return;
     all[rel] = base;
     const file = registryBasesPath(home);
     await mkdir(dirname(file), { recursive: true, mode: 0o700 });
@@ -69,10 +76,10 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "obj
  * Merges a host registry and a store registry per identity name. An identity on one side only is kept. An identity on both
  * sides takes the host entry, with the union of the two swapPool `accounts` lists (host order first). Other top-level keys
  * take the host value. Tombstones (`deleted`, identities/tombstones.ts) of both sides apply: an identity a tombstone covers is
- * dropped from the result, whichever side lists it, unless the entry was added after the delete. A tombstone stays only while the
- * store registry still lists its name. Undefined when either text is not a registry object with an `identities` array.
+ * dropped from the result, whichever side lists it, unless the entry was added after the delete. A tombstone stays for 90 days, and as long as
+ * the store registry lists its name. Undefined when either text is not a registry object with an `identities` array.
  */
-export function mergeRegistries(host: string, store: string): Buffer | undefined {
+export function mergeRegistries(host: string, store: string, opts: { baseNames?: readonly string[]; now?: number } = {}): Buffer | undefined {
   let h: unknown;
   let s: unknown;
   try {
@@ -88,7 +95,11 @@ export function mergeRegistries(host: string, store: string): Buffer | undefined
     return m;
   };
   const theirs = named(s.identities);
-  const tombs = new Map(mergeTombstones(parseTombstones(h.deleted), parseTombstones(s.deleted)).map((t) => [t.name, t]));
+  // A tombstone only the host holds applies to names the host's base listed. Any other name was added since: a re-add, whatever the clocks say.
+  const storeTombs = new Set(parseTombstones(s.deleted).map((t) => t.name));
+  const baseNames = opts.baseNames ? new Set(opts.baseNames) : undefined;
+  const ignored = new Set(parseTombstones(h.deleted).filter((t) => baseNames && !storeTombs.has(t.name) && !baseNames.has(t.name)).map((t) => t.name));
+  const tombs = new Map(mergeTombstones(parseTombstones(h.deleted).filter((t) => !ignored.has(t.name)), parseTombstones(s.deleted)).map((t) => [t.name, t]));
   const covered = (i: Record<string, unknown>): boolean => tombstoneCovers(tombs.get(i.name as string), i);
   const identities: unknown[] = [];
   const seen = new Set<string>();
@@ -112,7 +123,8 @@ export function mergeRegistries(host: string, store: string): Buffer | undefined
   for (const i of s.identities) if (!(isObject(i) && typeof i.name === "string" && (seen.has(i.name) || covered(i)))) identities.push(i);
   const { deleted: _hd, ...hostRest } = h;
   const { deleted: _sd, ...storeRest } = s;
-  const keep = [...tombs.values()].filter((t) => theirs.has(t.name));
+  const now = opts.now ?? Date.now();
+  const keep = [...tombs.values()].filter((t) => theirs.has(t.name) || (t.at > 0 && now - t.at < TOMBSTONE_KEEP_MS));
   return Buffer.from(`${JSON.stringify({ ...storeRest, ...hostRest, identities, ...(keep.length > 0 ? { deleted: keep } : {}) }, null, 2)}\n`);
 }
 

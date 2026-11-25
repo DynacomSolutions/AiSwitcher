@@ -55,6 +55,7 @@ export type ReconcileOutcome = "same" | "wrote" | "pushed" | "kept" | "conflict"
 interface Base {
   version: number;
   sha: string;
+  names?: string[];
 }
 
 const ACCESS_FIELDS = /^(access_token|accessToken|access|OPENAI_API_KEY)$/;
@@ -249,6 +250,18 @@ const sameJson = (a: Buffer, b: Buffer): boolean => {
   }
 };
 
+/** Identity names in the registry file at `abs`, when the file still has the hash `sha` (the base it is recorded for). */
+async function registryNamesAt(abs: string, sha: string): Promise<string[] | undefined> {
+  const text = await readFile(abs, "utf8").catch(() => undefined);
+  if (text === undefined || sha256Hex(text) !== sha) return undefined;
+  try {
+    const list = (JSON.parse(text) as { identities?: unknown }).identities;
+    return Array.isArray(list) ? list.flatMap((i) => (typeof (i as { name?: unknown })?.name === "string" ? [(i as { name: string }).name] : [])) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const readLocal = async (abs: string): Promise<Buffer | undefined> => readFile(abs).catch(() => undefined);
 
 export class HomeMirror {
@@ -407,7 +420,7 @@ export class HomeMirror {
     // A host file that drops an identity the store holds is merged, never pushed as is: removal goes through retire.
     const drops = droppedIdentities(local.toString("utf8"), row.content.toString("utf8")).length > 0;
     if (last && last.sha === row.sha256 && !drops) return put(local);
-    const merged = mergeRegistries(local.toString("utf8"), row.content.toString("utf8"));
+    const merged = mergeRegistries(local.toString("utf8"), row.content.toString("utf8"), last?.names ? { baseNames: last.names } : {});
     // No merge is possible (the host file is no registry): never push it over identities the store holds.
     if (!merged) return drops ? write() : put(local);
     if (sha256Hex(merged) === row.sha256) return write();
@@ -417,9 +430,11 @@ export class HomeMirror {
 
   /** Remembers the version and hash a path was last in step at; a registry under a file store also goes to the state directory. */
   private async setBase(path: string, version: number, sha: string): Promise<void> {
-    this.bases.set(path, { version, sha });
-    if (!this.fileStore || this.kinds.get(path)?.kind !== "registry") return;
-    await writeRegistryBase(this.home, path, { version, sha }).catch((err: unknown) => this.warn(`could not record the sync state of ${path} (${(err as Error).name})`));
+    const registry = this.fileStore && this.kinds.get(path)?.kind === "registry";
+    const names = registry ? await registryNamesAt(this.abs(path), sha) : undefined;
+    this.bases.set(path, { version, sha, ...(names ? { names } : {}) });
+    if (!registry) return;
+    await writeRegistryBase(this.home, path, { version, sha, ...(names ? { names } : {}) }).catch((err: unknown) => this.warn(`could not record the sync state of ${path} (${(err as Error).name})`));
   }
 
   /**
@@ -524,6 +539,12 @@ export class HomeMirror {
       if (!row) throw new Error(`gateway store: write of ${rel} was refused and its row is gone`);
       if ((await this.reconcile(row)) === "conflict") throw new Error(`gateway store: write of ${rel} lost a race that stayed unresolved`);
     }
+  }
+
+  /** True when the file at `abs` has a recorded base: a push that failed for it is retried by pushAccountDirty. */
+  tracks(abs: string): boolean {
+    const rel = this.rel(abs);
+    return rel !== undefined && this.bases.has(rel);
   }
 
   /** Pushes the account's tracked files whose local copy differs from their base (a push that missed them). No account lock: call it inside one. */

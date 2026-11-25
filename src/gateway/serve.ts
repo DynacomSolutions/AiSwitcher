@@ -606,6 +606,33 @@ export async function refreshPushPaths(tool: RefreshableTool, identity: Identity
   return [...new Set([...(await grantPaths(tool, identity)), ...written, ...member])];
 }
 
+/**
+ * Pushes the files of a refreshed account, then every other tracked file of it that changed. It throws only for a file that really
+ * failed: a listed file whose push failed but that is tracked is retried by the dirty pass, and that pass's own error counts.
+ */
+export async function pushRefreshed(
+  mirror: Pick<HomeMirror, "push" | "pushAccountDirty" | "tracks">,
+  tool: RefreshableTool,
+  identity: Identity,
+  written: string[],
+  grantPaths: (tool: RefreshableTool, identity: Identity) => Promise<string[]>,
+): Promise<void> {
+  const account = `${tool}/${identity.name}`;
+  const paths = await refreshPushPaths(tool, identity, written, grantPaths);
+  const failed: Array<{ path: string; err: unknown }> = [];
+  for (const path of paths) {
+    try {
+      await mirror.push([path], account, "login");
+    } catch (err) {
+      failed.push({ path, err });
+    }
+  }
+  // Whatever the listed paths missed (or a failed push left behind) goes too: every tracked file of the account that changed.
+  await mirror.pushAccountDirty(account);
+  const lost = failed.find((f) => !mirror.tracks(f.path));
+  if (lost) throw lost.err;
+}
+
 export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {}): Promise<RunningGateway> {
   if (opts.adminToken.length < MIN_ADMIN_TOKEN_LENGTH) throw new Error(`gateway: the admin token (AIS_GATEWAY_ADMIN_TOKEN) must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters`);
   if (opts.sessions) {
@@ -689,18 +716,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
             run: (account, fn) => mirror.withAccount(`${account.provider}/${account.identity}`, fn),
             pull: async (tool, identity) => mirror.pullAccount(`${tool}/${identity.name}`, await grantPaths(tool, identity)),
             push: async (tool, identity, written) => {
-              const account = `${tool}/${identity.name}`;
-              let first: unknown;
-              try {
-                await mirror.push(await refreshPushPaths(tool, identity, written, grantPaths), account, "login");
-              } catch (err) {
-                first = err;
-              }
-              // Whatever the listed paths missed (or a failed push left behind) goes too: every tracked file of the account that changed.
-              await mirror.pushAccountDirty(account).catch((err) => {
-                throw first ?? err;
-              });
-              alerter.recover("credential-store-write-failed", account);
+              await pushRefreshed(mirror, tool, identity, written, grantPaths);
+              alerter.recover("credential-store-write-failed", `${tool}/${identity.name}`);
             },
           },
           onStoreWriteFailed: (account) => alerter.raise("credential-store-write-failed", `${account.provider}/${account.identity}`, `the gateway could not write the ${account.provider} login "${account.identity}" to the credential store after a refresh; the new token only exists on this replica until it can (check the database)`),

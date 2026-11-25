@@ -157,7 +157,7 @@ describe("admin store routes: rotated refresh tokens and the real server", () =>
     expect(asked.every(([p, i, fp]) => p === "claude" && i === "alpha" && !fp!.includes("SYNTHETIC_FIXTURE"))).toBe(true);
   });
 
-  test("a placeholder login over a refreshable login row is refused with 409 placeholder and the row is unchanged", async () => {
+  test("a placeholder login over a refreshable login row is refused with 422 placeholder and the row is unchanged", async () => {
     const { app, server } = setup();
     const path = "x/.credentials.json";
     const real = grant("r-live", 1_795_635_411_000);
@@ -239,7 +239,7 @@ describe("admin store routes: rotated refresh tokens and the real server", () =>
     expect((await fetchPut(app, path, reg(["a"], ["b"]), null, "registry", v)).status).toBe(200);
   });
 
-  test("a registry push that drops an identity the store registry holds is refused with 409 drops-identities; retire and adds pass", async () => {
+  test("a registry push that drops an identity the store registry holds is refused with 422 drops-identities; retire and adds pass", async () => {
     const { app, server } = setup();
     const path = ".claude/identities.json";
     const reg = (...names: Array<string | [string, boolean]>): string =>

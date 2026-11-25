@@ -12,7 +12,7 @@ import { loadIdentitiesFile } from "../identities/store.ts";
 import type { Identity } from "../identities/types.ts";
 import { loadGatewayGuard } from "../sync/gateway-guard.ts";
 import { storeMayHoldLogin } from "./host-login-gate.ts";
-import { isFresher, isPlaceholderLogin, isRefreshableLogin, isReplacedLogin, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
+import { isFresher, isPlaceholderLogin, isRefreshableLogin, isReplacedLogin, losesLogin, mergeByKey, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
 import { sha256Hex, type HomeFileKind, type HomeStoreClient } from "./home-store.ts";
 import { droppedIdentities, mergeRegistries, readRegistryBase } from "./registry-sync.ts";
 import type { RefreshGuardBackend } from "./refresh-guard.ts";
@@ -142,25 +142,25 @@ export async function importHome(
 ): Promise<ImportReport> {
   const home = opts.home ?? homedir();
   const report: ImportReport = { added: [], updated: [], unchanged: [], skipped: [] };
-  for (const e of opts.entries ?? (await collectImportEntries(home))) {
+  const handle = async (e: ImportEntry): Promise<void> => {
     const rel = relOf(home, e.abs);
     if (!rel) {
       report.skipped.push({ path: e.abs, why: "outside HOME" });
-      continue;
+      return;
     }
     const content = e.content ?? (await readFile(e.abs).catch(() => undefined));
-    if (!content) continue;
+    if (!content) return;
     // A placeholder or a file without a refresh token is no login: it never reaches the store, whatever the row holds.
     // Only a tool's main login file is checked: the member account record (.claude.json) holds no refresh token and travels as is.
     if (e.kind === "login" && MAIN_LOGIN_FILES.has(basename(rel))) {
       const text = content.toString("utf8");
       if (isPlaceholderLogin(text)) {
         report.skipped.push({ path: rel, why: "it holds a gateway placeholder, not a login" });
-        continue;
+        return;
       }
       if (!isRefreshableLogin(text)) {
         report.skipped.push({ path: rel, why: "it holds no refresh token" });
-        continue;
+        return;
       }
     }
     const once = async (): Promise<void> => {
@@ -192,6 +192,19 @@ export async function importHome(
         }
       }
       let body = content;
+      if (e.kind === "login" && losesLogin(content.toString("utf8"), row.content.toString("utf8"))) {
+        // A mixed file (a gateway entry beside a fresher real one) is merged per entry; it is pushed only when the merge loses nothing.
+        const merged = mergeByKey(content.toString("utf8"), row.content.toString("utf8"));
+        if (!merged || losesLogin(merged.toString("utf8"), row.content.toString("utf8"))) {
+          report.skipped.push({ path: rel, why: "it would replace a login the gateway can renew with one it cannot" });
+          return;
+        }
+        if (sha256Hex(merged) === row.sha256) {
+          report.skipped.push({ path: rel, why: "the store's grant is as fresh or fresher" });
+          return;
+        }
+        body = merged;
+      }
       if (e.kind === "registry") {
         const last = await readRegistryBase(home, rel);
         if (last && last.sha === sha256Hex(content)) {
@@ -200,7 +213,7 @@ export async function importHome(
         }
         // A host copy that drops an identity the store holds is merged, never pushed as is: removal goes through retire.
         if (!last || last.sha !== row.sha256 || droppedIdentities(content.toString("utf8"), row.content.toString("utf8")).length > 0) {
-          const merged = mergeRegistries(content.toString("utf8"), row.content.toString("utf8"));
+          const merged = mergeRegistries(content.toString("utf8"), row.content.toString("utf8"), last?.names ? { baseNames: last.names } : {});
           if (!merged && droppedIdentities(content.toString("utf8"), row.content.toString("utf8")).length > 0) {
             report.skipped.push({ path: rel, why: "the host copy is no registry and would drop identities the store holds" });
             return;
@@ -236,6 +249,14 @@ export async function importHome(
         await lock.release();
       }
     } else await once();
+    };
+  for (const e of opts.entries ?? (await collectImportEntries(home))) {
+    // One refused or broken file never stops the import, nor the host sync pass around it.
+    try {
+      await handle(e);
+    } catch (err) {
+      report.skipped.push({ path: relOf(home, e.abs) ?? e.abs, why: `import failed (${(err as Error).message})` });
+    }
   }
   return report;
 }

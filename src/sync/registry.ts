@@ -131,6 +131,8 @@ export function mergeIdentity(primary: Identity, secondary: Identity): Identity 
     aliases: mergeStrings(primary.aliases, secondary.aliases),
   };
   mergeRetirement(merged, primary, secondary);
+  const addedAt = Math.max(...[primary, secondary].flatMap((i) => (typeof i.addedAt === "number" ? [i.addedAt] : [])));
+  if (Number.isFinite(addedAt)) merged.addedAt = addedAt;
   mergeSwapPool(merged, primary, secondary);
   return merged;
 }

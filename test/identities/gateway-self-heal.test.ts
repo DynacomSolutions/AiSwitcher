@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { gatewayEntryText } from "../../src/identities/claude-gateway-entry.ts";
 import { hasMemberCopy, memberDir } from "../../src/identities/gateway-members.ts";
 import { HomeMirror } from "../../src/gateway/home-mirror.ts";
-import { refreshPushPaths } from "../../src/gateway/serve.ts";
+import { pushRefreshed, refreshPushPaths } from "../../src/gateway/serve.ts";
 import { writeGrantThroughStores } from "../../src/identities/oauth-refresh.ts";
 import type { Identity } from "../../src/identities/types.ts";
 
@@ -100,5 +100,32 @@ describe("the healed member copy reaches the store", () => {
     const rel = [...rows.keys()].find((k) => k.endsWith("members/claude/alpha/.credentials.json"));
     expect(rel).toBeDefined();
     expect(rows.get(rel!)!.text).toContain("SYNTHETIC_FIXTURE-refresh");
+  });
+});
+
+describe("pushRefreshed raises only for files that really failed", () => {
+  const identity = { name: "alpha", label: "a", configDir: "/h/alpha" } as Identity;
+  const fake = (o: { push?: Error; dirty?: Error; tracked: boolean }) => ({
+    push: async () => {
+      if (o.push) throw o.push;
+    },
+    pushAccountDirty: async () => {
+      if (o.dirty) throw o.dirty;
+    },
+    tracks: () => o.tracked,
+  });
+  const run = (m: ReturnType<typeof fake>) => pushRefreshed(m as never, "claude", identity, [], async () => ["/h/alpha/.credentials.json"]);
+
+  test("a listed file that failed but is tracked and pushed by the dirty pass is no failure", async () => {
+    await expect(run(fake({ push: new Error("db down"), tracked: true }))).resolves.toBeUndefined();
+  });
+  test("a listed file that failed and is not tracked stays a failure", async () => {
+    await expect(run(fake({ push: new Error("db down"), tracked: false }))).rejects.toThrow("db down");
+  });
+  test("a dirty file that failed is a failure", async () => {
+    await expect(run(fake({ dirty: new Error("still down"), tracked: true }))).rejects.toThrow("still down");
+  });
+  test("no failure at all", async () => {
+    await expect(run(fake({ tracked: true }))).resolves.toBeUndefined();
   });
 });

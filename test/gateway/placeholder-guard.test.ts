@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { gatewayEntryText } from "../../src/identities/claude-gateway-entry.ts";
 import { grantFreshness, HomeMirror, isFresher, isPlaceholderLogin, isRefreshableLogin, mergeByKey } from "../../src/gateway/home-mirror.ts";
 import { importHome } from "../../src/gateway/home-import.ts";
+import { startHostSync } from "../../src/gateway/host-sync.ts";
+import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type PgHomeStore, type PutResult } from "../../src/gateway/home-store.ts";
 
 /** A gateway placeholder login (an app token, far-future expiry, no refresh token) never beats or replaces a real login. */
@@ -241,5 +243,97 @@ describe("one refused file never starves the later ones", () => {
     await put(home, b, real("rb3", 1_797_000_000_000));
     await expect(mirror.pushAccountDirty("claude/a")).resolves.toBeUndefined();
     expect(store.text(b)).toBe(real("rb3", 1_797_000_000_000));
+  });
+});
+
+describe("importHome with a mixed login file", () => {
+  const PI = ".pi/agent/auth.json";
+  const piReal = { anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE-pa", refresh: "SYNTHETIC_FIXTURE-pr", expires: 1_795_000_000_000 }, "openai-codex": { type: "oauth", access: "SYNTHETIC_FIXTURE-ca", refresh: "SYNTHETIC_FIXTURE-cr", expires: 1_795_000_000_000 } };
+  const piMixed = { anthropic: { type: "oauth", access: "aisg_SYNTHETIC_FIXTURE_token", expires: 4_102_444_800_000 }, "openai-codex": { type: "oauth", access: "SYNTHETIC_FIXTURE-ca2", refresh: "SYNTHETIC_FIXTURE-cr2", expires: 1_796_000_000_000 } };
+
+  test("a fresher real entry is merged in and the gateway entry never replaces the real one", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    store.seed(PI, JSON.stringify(piReal));
+    await put(home, PI, JSON.stringify(piMixed));
+    const rep = await importHome(asStore(store), { home, entries: [{ abs: join(home, PI), account: "pi/a", kind: "login" }] });
+    const row = JSON.parse(store.text(PI)!);
+    expect(row.anthropic.refresh).toBe("SYNTHETIC_FIXTURE-pr");
+    expect(row.anthropic.access.startsWith("aisg_")).toBe(false);
+    expect(row["openai-codex"].refresh).toBe("SYNTHETIC_FIXTURE-cr2");
+    expect(rep.updated).toEqual([PI]);
+  });
+
+  test("a claude file with real mcpOAuth beside a placeholder claudeAiOauth keeps the real login", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    const mcp = { s: { accessToken: "SYNTHETIC_FIXTURE-m", refreshToken: "SYNTHETIC_FIXTURE-mr", expiresAt: 1_796_000_000_000 } };
+    store.seed(LOGIN, JSON.stringify({ claudeAiOauth: JSON.parse(real("x")).claudeAiOauth, mcpOAuth: { s: { ...mcp.s, expiresAt: 1_795_000_000_000 } } }));
+    await put(home, LOGIN, JSON.stringify({ claudeAiOauth: JSON.parse(PLACEHOLDER).claudeAiOauth, mcpOAuth: mcp }));
+    await importHome(asStore(store), { home, entries: [{ abs: join(home, LOGIN), account: "claude/alpha", kind: "login" }] });
+    const row = JSON.parse(store.text(LOGIN)!);
+    expect(row.claudeAiOauth.refreshToken).toBe("SYNTHETIC_FIXTURE-r-x");
+    expect(row.mcpOAuth.s.refreshToken).toBe("SYNTHETIC_FIXTURE-mr");
+  });
+
+  test("a merge that would still lose a login is skipped, not pushed", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    store.seed(PI, JSON.stringify(piReal));
+    await put(home, PI, JSON.stringify({ anthropic: piMixed.anthropic, "openai-codex": { ...piReal["openai-codex"] } }));
+    const rep = await importHome(asStore(store), { home, entries: [{ abs: join(home, PI), account: "pi/a", kind: "login" }] });
+    expect(store.puts).toEqual([]);
+    expect(rep.updated).toEqual([]);
+  });
+
+  test("one failing entry is reported skipped and the later entries still import", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    const b = ".claude/identities/beta/.credentials.json";
+    store.seed(LOGIN, real("old", 1_790_000_000_000));
+    store.seed(b, real("oldb", 1_790_000_000_000));
+    await put(home, LOGIN, real("new", 1_796_000_000_000));
+    await put(home, b, real("newb", 1_796_000_000_000));
+    const put0 = store.put.bind(store);
+    store.put = async (path, content, o) => {
+      if (path === LOGIN) throw new Error("refused");
+      return put0(path, content, o);
+    };
+    const rep = await importHome(asStore(store), {
+      home,
+      entries: [
+        { abs: join(home, LOGIN), account: "claude/alpha", kind: "login" },
+        { abs: join(home, b), account: "claude/beta", kind: "login" },
+      ],
+    });
+    expect(rep.skipped.some((s) => s.path === LOGIN)).toBe(true);
+    expect(store.text(b)).toBe(real("newb", 1_796_000_000_000));
+  });
+});
+
+describe("host sync pass", () => {
+  test("a failing first import never stops the sync: the mirror still starts and follows the store", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    store.seed(LOGIN, real("s1", 1_795_000_000_000));
+    const warnings: string[] = [];
+    const sync = startHostSync(undefined, {
+      home,
+      store: asStore(store),
+      lock: new MemoryRefreshBackend(),
+      importEntries: async () => {
+        throw new Error("import broke");
+      },
+      pollMs: 20,
+      importMs: 60_000,
+      warn: (m: string) => warnings.push(m),
+    });
+    await sync.ready;
+    expect(await readFile(join(home, LOGIN), "utf8")).toBe(real("s1", 1_795_000_000_000));
+    store.seed(LOGIN, real("s2", 1_796_000_000_000));
+    for (let i = 0; i < 60 && !(await readFile(join(home, LOGIN), "utf8")).includes("s2"); i++) await Bun.sleep(25);
+    expect(await readFile(join(home, LOGIN), "utf8")).toContain("s2");
+    expect(warnings.some((w) => w.includes("import failed"))).toBe(true);
+    await sync.stop();
   });
 });

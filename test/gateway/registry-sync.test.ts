@@ -332,6 +332,32 @@ describe("tombstones with times", () => {
     expect(store).toContain("b");
   });
 
+  test("a host-only tombstone applies only to names the host's base listed; any other name is a re-add", () => {
+    const store = regOf([dated("a"), dated("b", 900)]);
+    const host = regOf([dated("a")], [{ name: "b", at: 1000 }]);
+    const out = JSON.parse(mergeRegistries(host, store, { baseNames: ["a"] })!.toString()) as { identities: Array<{ name: string }>; deleted?: unknown[] };
+    expect(out.identities.map((i) => i.name)).toEqual(["a", "b"]);
+    expect(out.deleted).toBeUndefined();
+    const listed = JSON.parse(mergeRegistries(host, store, { baseNames: ["a", "b"] })!.toString()) as { identities: Array<{ name: string }> };
+    expect(listed.identities.map((i) => i.name)).toEqual(["a"]);
+  });
+
+  test("a tombstone is kept for 90 days even when the store no longer lists the name", () => {
+    const day = 86_400_000;
+    const recent = merge(regOf([dated("a")], [{ name: "b", at: Date.now() - 2 * day }]), regOf([dated("a")]));
+    expect(recent.deleted?.map((t) => t.name)).toEqual(["b"]);
+    const old = merge(regOf([dated("a")], [{ name: "b", at: Date.now() - 100 * day }]), regOf([dated("a")]));
+    expect(old.deleted).toBeUndefined();
+  });
+
+  test("mergeIdentity keeps the larger addedAt whichever side wins", async () => {
+    const { mergeIdentity } = await import("../../src/sync/registry.ts");
+    const a = { name: "x", label: "x", configDir: "~/x", addedAt: 10 } as never;
+    const b = { name: "x", label: "x", configDir: "~/x", addedAt: 20 } as never;
+    expect((mergeIdentity(a, b) as { addedAt?: number }).addedAt).toBe(20);
+    expect((mergeIdentity(b, a) as { addedAt?: number }).addedAt).toBe(20);
+  });
+
   test("portableIdentitiesFile and mergeRegistryConflict keep the tombstones", async () => {
     const { portableIdentitiesFile, mergeRegistryConflict } = await import("../../src/sync/registry.ts");
     const { CLAUDE_CONFIG } = await import("../../src/identities/tool-configs.ts");
