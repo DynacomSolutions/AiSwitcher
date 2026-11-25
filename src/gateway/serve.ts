@@ -28,6 +28,7 @@ import type { SessionsIngestStore } from "./admin-sessions.ts";
 import { createAdminApp, limitsIdentities, LIMITS_PROVIDERS, type IdentityState } from "./admin.ts";
 import { createWarmGate, positiveIntEnv } from "../shared/warm-gate.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
+import { weeklyUtilisation } from "./native-limit.ts";
 import { createGatewayApp, markGatewayResponse, styleForPath, type GatewayDeps } from "./app.ts";
 import { authBrowserToken } from "./browser/auth.ts";
 import { BrowserHub, type HubOptions } from "./browser/hub.ts";
@@ -302,6 +303,10 @@ export function instrumentRefresh(
 }
 
 /** A successful upstream answer for an identity proves its login works: clear any open refresh alert for it. */
+/** Providers whose pool headroom is exported, and the weekly use in percent below which a member counts as having room. */
+const POOL_HEADROOM_PROVIDERS: GatewayProvider[] = ["claude", "codex"];
+const POOL_HEADROOM_PERCENT = 90;
+
 export function recoverOnSuccess<M extends GatewayMetrics>(inner: M, alerter: Alerter): M {
   return new Proxy(inner, {
     get(target, prop, receiver) {
@@ -810,7 +815,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const browser = relay ?? hub;
   metrics.browserGauges = { connected: () => hub.connected().length, sessions: () => hub.activeSessions() };
 
+  /** Aborts when the gateway stops: requests held for a full pool end at once, so they never block the drain. */
+  const drainCtrl = new AbortController();
   const appDeps: GatewayDeps = {
+    drainSignal: drainCtrl.signal,
     store,
     ledger,
     creds,
@@ -1192,6 +1200,26 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       revoked: nowDead !== undefined && fingerprint !== undefined && nowDead === fingerprint,
     });
   }
+  /** Pool members below the weekly-use threshold, per provider with a pool: the figure behind the low-headroom alert. */
+  async function poolHeadroomTick(): Promise<void> {
+    for (const provider of POOL_HEADROOM_PROVIDERS) {
+      const members = await appDeps.poolMembers(provider).catch(() => undefined);
+      if (members === undefined || members.length === 0) {
+        // No member, or the read failed: the gauge reads 0, never the figure of an earlier tick.
+        metrics.poolHeadroom(provider, POOL_HEADROOM_PERCENT, 0, 0);
+        continue;
+      }
+      let reading = 0;
+      let room = 0;
+      for (const m of members) {
+        const w = weeklyUtilisation(await appDeps.usageFor(provider, m).catch(() => undefined));
+        if (w === undefined) continue;
+        reading++;
+        if (w < POOL_HEADROOM_PERCENT) room++;
+      }
+      metrics.poolHeadroom(provider, POOL_HEADROOM_PERCENT, room, reading);
+    }
+  }
   /** Every replica, every tick: seed from the journal, then re-read every managed login's gauges. */
   let gaugeRunning = false;
   async function gaugeTick(): Promise<void> {
@@ -1199,6 +1227,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     gaugeRunning = true;
     try {
       await seedFromJournal();
+      if (usageGate.isReady()) await poolHeadroomTick().catch(() => undefined); // never before the warm-up: a read would start a fetch of its own
       for (const tool of GATEWAY_REFRESH_TOOLS) {
         for (const account of await renewalAccounts(tool).catch(() => [] as Identity[])) {
           if (draining) return;
@@ -1435,6 +1464,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       draining = true;
+      drainCtrl.abort();
       // The chat drain starts at once: new prompts are refused and asks end as cancelled. Turns in flight finish. It is awaited below, after the servers stop.
       const chatDrain = chat?.broker.drain().catch(() => undefined);
       usageGate.drain();

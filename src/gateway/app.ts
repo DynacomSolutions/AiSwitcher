@@ -10,6 +10,7 @@ import { createCallRoutes, type CallHub } from "./browser/routing.ts";
 import { checkCaps, dayStartIct } from "./caps.ts";
 import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
 import { providerError } from "./errors.ts";
+import { CLIENT_RETRY_AFTER_CAP_SECONDS, PoolHoldGate, fullPoolAnswers, heldReplays, heldStreamResponse, poolHoldFromEnv, wantsStream } from "./pool-hold.ts";
 import type { LedgerBuffer } from "./ledger-buffer.ts";
 import { clientFamily, sessionKeyFromBodyTail, sessionKeyFromHeaders } from "./session-key.ts";
 import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadRequest, KnownBadFiles, MAX_FILE_CHECKS, MEDIA_REMOVED_HEADER, mediaAware, mentionedFileIds, rejectedUpload, withoutFiles, type FileVerdict } from "./media-recovery.ts";
@@ -65,6 +66,10 @@ export interface GatewayDeps {
   sideCountHealth?(ok: boolean): void;
   /** Waits `ms` or until `signal` aborts; tests inject a fake clock. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** Aborts when the gateway stops: a request held for a full pool ends at once with a retryable error (pool-hold.ts). */
+  drainSignal?: AbortSignal;
+  /** Limits of the full-pool hold (pool-hold.ts). Defaults come from AIS_GATEWAY_POOL_HOLD_* variables. */
+  poolHold?: Partial<import("./pool-hold.ts").PoolHoldLimits>;
 }
 
 /** Side-count database calls in flight at once for the whole gateway process (all apps share one gate); the rest queue for a slot. */
@@ -456,8 +461,10 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   /** Quota holds (proven exhaustion, model-scoped): the time from which one request may probe the member again, by hold key. */
   const probes = new Map<string, number>();
   const knownBad = new KnownBadFiles();
+  const holdGate = new PoolHoldGate({ ...poolHoldFromEnv(), ...deps.poolHold });
+  const hold: HoldCtl = { gate: holdGate, replay: (r) => handle(r) };
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   const chatDeps = deps.chat ? { chat: deps.chat } : {};
@@ -471,7 +478,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -521,8 +528,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   let sessionKey: string | undefined = sessionKeyFromHeaders(req.headers);
   const client = clientFamily(req.headers.get("user-agent"));
   let recorded = false;
+  /** True for a replay of a held request, and for a request that may be held: its 429 refusals write no row (see `startHold`). */
+  let quietRefusals = false;
   const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string, reason?: string, upstream?: UpstreamErrorSummary): void => {
     if (recorded) return;
+    // A replay of a held request, and a request that is about to be held, write no refusal row: the hold writes one row when it ends.
+    if (quietRefusals && status === "rejected" && httpStatus === 429) return;
     recorded = true;
     const latencyMs = Math.round(performance.now() - started);
     const c = counts ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -861,6 +872,68 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     await (deps.sleep ?? defaultSleep)(Math.min(Math.max(soonest - now, SHORT_HOLD_MIN_SLEEP_MS), left), req.signal);
     return !req.signal.aborted;
   };
+  /** Claude pool traffic is the only traffic the full-pool hold covers. A side route and a pinned app keep their own answers. */
+  const claudePool = app.target.kind === "pool" && app.provider === "claude" && !side;
+  /** This request is a replay of a held request: it never starts a second hold and writes no refusal row. */
+  const replaying = heldReplays.has(req);
+  /** True when this request is a streamed request that a hold could keep (the replica cap is checked when it starts). */
+  const holdable = (): boolean => claudePool && !replaying && body.kind === "buffered" && !req.signal.aborted && !deps.drainSignal?.aborted && wantsStream(body.bytes);
+  /** Answers that are a started hold, so the caller does not count them as refusals. */
+  const heldMarks = new WeakSet<Response>();
+  /**
+   * Holds the streamed request open (pool-hold.ts) in place of the 429 that the client would get, and returns the held
+   * answer. Returns undefined when it cannot be held. The ledger gets one row when the hold ends without an answer.
+   */
+  const startHold = (limitText: string, reason: string): Response | undefined => {
+    if (!holdable() || body.kind !== "buffered") return undefined;
+    const bytes = body.bytes;
+    if (!hold.gate.tryEnter(bytes.length)) return undefined;
+    req.signal.removeEventListener("abort", onAbort);
+    log(JSON.stringify({ event: "pool_hold", app: app.name, provider: app.provider, ...(model !== undefined ? { model } : {}) }));
+    const heldRes = heldStreamResponse({
+      limits: hold.gate.limits,
+      gate: hold.gate,
+      bytes: bytes.length,
+      now: deps.now,
+      sleep: deps.sleep ?? defaultSleep,
+      drain: deps.drainSignal,
+      limitMessage: limitText,
+      onEvent: (e) => {
+        deps.metrics.poolHold?.(app.name, e);
+        // A served replay wrote its own row with the real status. Any other end writes the one row of this request.
+        quietRefusals = false;
+        if (e === "timeout") record(identityForRow, "rejected", 429, undefined, true, undefined, model, `${reason}:hold_timeout`);
+        else if (e === "cancelled") record(identityForRow, "client_aborted", 499, undefined, true, undefined, model, "hold_cancelled");
+        else if (e === "drained") record(identityForRow, "rejected", 503, undefined, true, undefined, model, "hold_drained");
+      },
+      replay: (signal) => {
+        // The replay body is the buffered bytes: its own length is the truth, whatever framing the original request had.
+        const headers = new Headers(req.headers);
+        headers.set("content-length", String(bytes.length));
+        headers.delete("transfer-encoding");
+        const again = new Request(req.url, { method: req.method, headers, body: bytes, signal });
+        heldReplays.add(again);
+        return hold.replay(again);
+      },
+    });
+    heldMarks.add(heldRes);
+    return heldRes;
+  };
+  /**
+   * A 429 that the gateway would return to a Claude pool request means the pool is full. A streamed request is held; any
+   * other request keeps a retry-after the client accepts (55 s, as Claude Code ends a request on more than 60 s).
+   */
+  const holdOrCap = async (out: Response, why: string): Promise<Response> => {
+    fullPoolAnswers.add(out);
+    if (!replaying) {
+      const limitText = await out.clone().text().then((t) => { try { return (JSON.parse(t) as { error?: { message?: string } }).error?.message ?? why; } catch { return why; } }).catch(() => why);
+      const held = startHold(limitText, why);
+      if (held) return held;
+    }
+    const ra = Number(out.headers.get("retry-after"));
+    if (Number.isFinite(ra) && ra > CLIENT_RETRY_AFTER_CAP_SECONDS) out.headers.set("retry-after", String(CLIENT_RETRY_AFTER_CAP_SECONDS));
+    return out;
+  };
   /**
    * The answer for a pool that is out of capacity. When a member would be free without the short holds, the answer is
    * about the hold, not about usage. Else the provider's native limit answer, whose reset is the earliest across the pool
@@ -929,11 +1002,22 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   }
   const pick = picked;
   if ("reject" in pick) {
-    deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
     const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
     const reason = pick.reject === "no-headroom" && app.target.kind === "pool" && (await exhaustedNames()).size > 0 ? "no-headroom:exhausted" : pick.reject;
+    // A request that may be held writes its refusal metric and row only when it is not held after all.
+    const mayHold = pick.reject !== "no-identities" && holdable();
+    quietRefusals = replaying || mayHold;
+    if (!quietRefusals) deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
     // Out of capacity (or at the reserve): answer in the provider's own limit shape so its CLI shows its built-in limit handling.
-    const out = await outOfCapacity(pick.reject, reason, why);
+    let out = await outOfCapacity(pick.reject, reason, why);
+    if (out && claudePool && out.status === 429 && pick.reject !== "no-identities") out = await holdOrCap(out, why);
+    if (!replaying && mayHold && !(out && heldMarks.has(out))) {
+      // Not held (the replica is at its cap): the refusal is counted and written as for any other.
+      quietRefusals = false;
+      deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : "no_headroom");
+      if (out?.status === 429) record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
+    }
+    quietRefusals = replaying;
     if (out) return out;
     return reject(429, why, identityForRow, model, reason);
   }
@@ -1121,7 +1205,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       if (!cur) throw credErr;
       if (quota) {
         // No member is left: the client gets the pool's own out-of-capacity answer, not the last member's 429.
-        const out = await outOfCapacity("no-headroom", "no-headroom:exhausted");
+        quietRefusals = replaying || holdable();
+        let out = await outOfCapacity("no-headroom", "no-headroom:exhausted");
+        if (out && claudePool && out.status === 429) {
+          out = await holdOrCap(out, "no pool member has headroom below the reserve");
+          quietRefusals = false;
+          if (!replaying && !heldMarks.has(out)) record(identity, "rejected", 429, undefined, false, undefined, model, "no-headroom:exhausted");
+        }
+        quietRefusals = replaying;
         if (out) {
           await discard(cur);
           req.signal.removeEventListener("abort", onAbort);
@@ -1202,6 +1293,26 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
   }
 
+  if (up.status === 429 && claudePool) {
+    // A provider 429 that reaches the client means the pool is full for this request. A replay of a held request only reports it.
+    if (replaying) {
+      await discard(up);
+      req.signal.removeEventListener("abort", onAbort);
+      return new Response(null, { status: 429 });
+    }
+    if (holdable()) {
+      const p = await peek(up, ERROR_PEEK_BYTES);
+      up = p.res;
+      const message = (p.whole ? summariseUpstreamError(p.bytes)?.message : undefined) ?? "upstream rate limit";
+      quietRefusals = false;
+      const held = startHold(redactText(message, 200), "upstream-429");
+      if (held) {
+        await discard(up);
+        return held;
+      }
+    }
+  }
+
   // The upstream has answered: no replay is possible or needed any more, so the request bytes can go.
   body = { kind: "none" };
   releaseBody?.();
@@ -1209,6 +1320,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   headers.delete(SUBSCRIPTION_EXHAUSTED_HEADER);
   if (mediaRemoved > 0) headers.set(MEDIA_REMOVED_HEADER, String(mediaRemoved));
   stripHopByHop(headers);
+  if (up.status === 429 && claudePool) {
+    // Not held (not streamed, or over the cap): keep a retry-after that Claude Code accepts.
+    const ra = Number(headers.get("retry-after"));
+    if (Number.isFinite(ra) && ra > CLIENT_RETRY_AFTER_CAP_SECONDS) headers.set("retry-after", String(CLIENT_RETRY_AFTER_CAP_SECONDS));
+  }
   if (headers.has("content-encoding")) {
     headers.delete("content-encoding");
     headers.delete("content-length");
@@ -1305,6 +1421,12 @@ const BURST_HOLD_DEFAULT_MS = 15_000;
 /** How often (per member, per replica) one request may probe a member held for quota while the pool has no headroom. */
 const QUOTA_PROBE_INTERVAL_MS = 5 * 60_000;
 /** Longest a request waits in total for short member holds to end before the client gets the 429. */
+/** The full-pool hold of one replica, and the way it sends a buffered request through the proxy again. */
+interface HoldCtl {
+  gate: PoolHoldGate;
+  replay(req: Request): Promise<Response>;
+}
+
 const SHORT_HOLD_WAIT_BUDGET_MS = 90_000;
 const SHORT_HOLD_MAX_WAITS = 8;
 const SHORT_HOLD_MIN_SLEEP_MS = 250;

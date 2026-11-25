@@ -212,3 +212,16 @@ export function fullWindowReset(usages: Array<PoolUsage | undefined>, reservePer
   const info = summariseLimit(full, reservePercent, now);
   return info.guessed || full.length === 0 ? undefined : Math.max(info.resetAtSec, nowSec + 1);
 }
+
+/**
+ * A member's weekly use in percent: the fullest weekly (long) window that applies to every model. Without a weekly window it is the
+ * fullest window of any kind. Undefined when the reading has no figure or the member has no plan that can serve.
+ */
+export function weeklyUtilisation(usage: PoolUsage | undefined): number | undefined {
+  if (!usage || usage.noPlan) return undefined;
+  const nums = (usage.windows ?? []).filter((w) => w.model === undefined && slotOf(w.label) === "long" && Number.isFinite(w.utilization)).map((w) => w.utilization);
+  if (nums.length > 0) return Math.max(...nums);
+  const any = (usage.windows ?? []).filter((w) => w.model === undefined && Number.isFinite(w.utilization)).map((w) => w.utilization);
+  if (any.length > 0) return Math.max(...any);
+  return typeof usage.maxUtilization === "number" && Number.isFinite(usage.maxUtilization) ? usage.maxUtilization : undefined;
+}

@@ -67,6 +67,10 @@ export interface GatewayMetrics {
   streamError?(e: { app: string; provider: string; event: string; errorType?: string | undefined }): void;
   /** Requests currently queued for request-body budget. */
   bodyBudgetWaiting?(n: number): void;
+  /** A request held open for a full pool: it started (held), got served after the wait, failed, ran out of time, ended by a shutdown, or its client left. */
+  poolHold?(app: string, event: "held" | "served" | "failed" | "timeout" | "drained" | "cancelled"): void;
+  /** Members of a provider's pool with a weekly figure, and how many of them are below `threshold` percent weekly use. No member names. */
+  poolHeadroom?(provider: string, threshold: number, withHeadroom: number, withReading: number): void;
   /** Seconds a request waited for body budget (0 when it did not have to wait). */
   bodyBudgetWait?(seconds: number): void;
 }
@@ -173,6 +177,9 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly loginExpiry = new Gauge("ais_gateway_login_expiry_timestamp_seconds", "Unix time the stored login's access token expires.");
   private readonly loginLifetime = new Gauge("ais_gateway_login_lifetime_seconds", "Access-token lifetime of the stored login (expiry minus mint time, or the provider default when the mint time is unknown).");
   private readonly loginRevokedGauge = new Gauge("ais_gateway_login_revoked", "1 while the stored login is diagnosed dead (only a new login helps), else 0.");
+  private readonly poolHolds = new Counter("ais_gateway_pool_holds_total", "Requests held open for a full pool, by app and event (held, served, failed, timeout, drained, cancelled).");
+  private readonly poolHeadroomGauge = new Gauge("ais_gateway_pool_members_with_headroom", "Pool members whose weekly use is below the threshold percent, by provider. Members without a reading are not counted.");
+  private readonly poolReadingsGauge = new Gauge("ais_gateway_pool_members_with_reading", "Pool members with a weekly usage reading, by provider.");
   private readonly rejections = new Counter("ais_gateway_rejections_total", "Requests rejected before reaching a provider.");
   private readonly failovers = new Counter("ais_gateway_failovers_total", "Requests retried on another pool member.");
   private readonly failOpens = new Counter("ais_gateway_fail_open_total", "Safety checks skipped so the request could proceed.");
@@ -339,6 +346,15 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.budgetWaiting = n;
   }
 
+  poolHold(app: string, event: "held" | "served" | "failed" | "timeout" | "drained" | "cancelled"): void {
+    this.poolHolds.inc({ app, event });
+  }
+
+  poolHeadroom(provider: string, threshold: number, withHeadroom: number, withReading: number): void {
+    this.poolHeadroomGauge.set({ provider, threshold: String(threshold / 100) }, withHeadroom);
+    this.poolReadingsGauge.set({ provider }, withReading);
+  }
+
   bodyBudgetWait(seconds: number): void {
     this.budgetCount += 1;
     this.budgetSum += seconds;
@@ -417,9 +433,9 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors, this.favourites, this.sessionsRequests, this.sessionsRecords, this.sessionsPartsTotal, this.sessionsBytes, this.sessionsErrors]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.poolHolds, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors, this.favourites, this.sessionsRequests, this.sessionsRecords, this.sessionsPartsTotal, this.sessionsBytes, this.sessionsErrors]) out.push(...c.render());
     out.push(...this.sessionsSeconds.render(), ...this.sessionsLagSeconds.render());
-    for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge]) out.push(...g.render());
+    for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge, this.poolHeadroomGauge, this.poolReadingsGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
     out.push(`ais_gateway_upstream_seconds_bucket{le="+Inf"} ${this.durationCount}`, `ais_gateway_upstream_seconds_sum ${this.durationSum}`, `ais_gateway_upstream_seconds_count ${this.durationCount}`);
