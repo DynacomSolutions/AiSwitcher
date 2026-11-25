@@ -184,7 +184,6 @@ ETA: 2026-11-28 18:00 ICT
 | 245 | T3 gateway homes get agent-guard when AIS creates or updates them | done | claude | t3-home-agent-guard | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/650 (ee78d3b).<br>Ships in v0.5.80. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-26 00:30 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -233,8 +232,10 @@ ETA: 2026-11-26 00:30 ICT
 | 319 | Limits page shows the plan label per account | done | agent | limits-plan-label | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/787. |
 | 320 | T3 model lists auto-enumerate for every gateway provider (zai, grok) | done | agent | t3-models-all-providers | | | ZCode: merged https://github.com/DynacomSolutions/AiSwitcher/pull/792.<br>Live 25 Nov on v0.5.121: `ais gateway t3-models --check` reports current for kimi (6), opencode (37) and ZCode (13 models).<br>Grok lists its own models. T3 shows the same 4 models as the gateway. |
 | 323 | Console limits: countdown beside each reset time | done | claude | identities-reset-countdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/797.<br>Live on v0.5.115 limits page (screenshot checked). |
-| 336 | Limits page: keep the reset countdown fully visible on each card | in_progress | agent | limits-countdown-clip | | 2026-11-26 00:30 ICT | On v0.5.121 the reset line clips at 1280 px: 23 of 23 lines on one tab.<br>Follow-up to 5.323.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/831 (370bb0f) at 00:06 ICT (17:06 GMT).<br>CI green. The console image builds now.<br>Live check expected 00:30 ICT. |
+| 336 | Limits page: keep the reset countdown fully visible on each card | done | agent | limits-countdown-clip | | | On v0.5.121 the reset line clips at 1280 px: 23 of 23 lines on one tab.<br>Follow-up to 5.323.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/831 (370bb0f) at 00:06 ICT 26 Nov (17:06 GMT 25 Nov).<br>Release v0.5.123 published 00:41 ICT (17:41 GMT).<br>Live 00:57 to 01:02 ICT 26 Nov (17:57 to 18:02 GMT 25 Nov) on the newest image: 1280 px and 390 px, 3 tabs each, 0 problems. |
 | 337 | Limits page: Codex accounts show their plan badge | done | agent | codex-plan-label | | | `codexPlanLabel` knew six plan types only. Live accounts send `promax` and `self_serve_business_prolite`.<br>Follow-up to 5.319.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/826 (6ff55b2) at 22:55 ICT (15:55 GMT).<br>Release v0.5.122 published 23:39 ICT (16:39 GMT).<br>Live at 00:04 ICT (17:04 GMT): 3 Codex cards show Promax and Self Serve Business Prolite. |
+| 339 | Release v0.5.123: recalibrate the sync read-budget test | done | agent | sync-io-budget | | | Two release runs failed in the sync steady-state test: a warm phase read 21.8 MB against a budget of 21.6 MB.<br>Fixed part of the budget 20 MB to 28 MB.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/836 (e73988b) at 00:36 ICT 26 Nov (17:36 GMT 25 Nov).<br>Release v0.5.123 published 00:41 ICT (17:41 GMT); release run green 00:44 ICT (17:44 GMT). |
+| 340 | Rotate two Kimi gateway app tokens shown in a T3 thread | blocked_on_owner | agent | | | | Two gateway apps have names that start with `t3-kimi-`. Their app tokens appeared in the tool output of one T3 thread (24 Nov 16:32 ICT, 25 Nov 21:03 ICT).<br>Needed from Thomas: a decision. Rotate the two tokens or keep them.<br>If rotate, the agent runs `ais gateway app rotate <app>` for each app, then `ais gateway t3-instances sync`. |
 ## 6. Browser control extension
 ETA: 2026-11-23 16:30 ICT
 
