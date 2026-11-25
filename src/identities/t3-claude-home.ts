@@ -32,10 +32,19 @@ export const GATEWAY_ENV_KEYS: readonly string[] = [
 /** Env keys that may differ between a home and its source: gateway auth, routing, proxy and CA settings. */
 export const isAuthEnvKey = (key: string): boolean =>
   key.startsWith("ANTHROPIC_") || GATEWAY_ENV_KEYS.includes(key) || /^(CLAUDE_CODE_USE_|CLAUDE_CODE_OAUTH|CLAUDE_CODE_API_KEY|AWS_|GOOGLE_APPLICATION|VERTEX|OPENAI_)/.test(key);
-export const isAllowedEnvKey = (key: string): boolean => isAuthEnvKey(key) || key === "NODE_EXTRA_CA_CERTS" || /^no_proxy$/i.test(key);
+export const isAllowedEnvKey = (key: string): boolean => isAuthEnvKey(key) || key === "NODE_EXTRA_CA_CERTS" || /^no_proxy$/i.test(key) || key in TELEMETRY_OFF_ENV;
 
 /** Top-level settings keys that hold login or credential routing. They are never copied from the source: the home keeps its own. */
 export const AUTH_SETTINGS_KEYS: readonly string[] = ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "forceLoginMethod", "forceLoginOrgUUID", "otelHeadersHelper"];
+
+/**
+ * Telemetry opt-outs forced into every T3 Claude home (owner order, 25 Nov 2026). They stop sends, so they are exempt from
+ * the third-party filter. CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is not set: it also stops model listing and auth fetches.
+ */
+export const TELEMETRY_OFF_ENV: Readonly<Record<string, string>> = { DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1", DO_NOT_TRACK: "1" };
+const isTelemetryOffKey = (key: string): boolean => key in TELEMETRY_OFF_ENV;
+/** Telemetry opt-out keys of an env that are missing or have a wrong value. */
+export const missingTelemetryOff = (env: unknown): string[] => Object.entries(TELEMETRY_OFF_ENV).filter(([k, v]) => obj(env)?.[k] !== v).map(([k]) => k);
 
 /** Gateway values of the attribution keys (no tool attribution in commits or PRs). */
 export const GATEWAY_ATTRIBUTION: Json = { attribution: { commit: "", pr: "" }, includeCoAuthoredBy: false, gitAttribution: false };
@@ -174,10 +183,11 @@ export function composeT3ClaudeSettings(source: Json, own: Json, opts: T3ClaudeC
     out[key] = merged;
   }
   if (restricted) {
-    out.env = Object.fromEntries(Object.entries(out.env as Json).filter(([k, v]) => !isThirdPartySender(k) && !sendsThirdParty(v)));
+    out.env = Object.fromEntries(Object.entries(out.env as Json).filter(([k, v]) => isTelemetryOffKey(k) || (!isThirdPartySender(k) && !sendsThirdParty(v))));
     for (const key of ["enabledPlugins", "pluginConfigs", "extraKnownMarketplaces"]) if (key in out) out[key] = filterKeys(out[key], isThirdPartySender);
     if (out.statusLine !== undefined && sendsThirdParty(out.statusLine)) delete out.statusLine;
   }
+  out.env = { ...(out.env as Json), ...TELEMETRY_OFF_ENV };
   return out;
 }
 
@@ -306,7 +316,8 @@ function diffSettings(expected: Json, actual: Json, restricted: boolean, modelHo
       const strip = (e: unknown) => Object.fromEntries(Object.entries(obj(e) ?? {}).filter(([n]) => !isAllowedEnvKey(n) && !(modelHome && isModelEnvKey(n))));
       const actualEnv = obj(actual.env) ?? {};
       if (stable(strip(expected.env)) !== stable(strip(actual.env))) bad.push("env");
-      else if (restricted && Object.entries(actualEnv).some(([n, v]) => isThirdPartySender(n) || sendsThirdParty(v))) bad.push("env");
+      else if (missingTelemetryOff(actualEnv).length > 0) bad.push("env");
+      else if (restricted && Object.entries(actualEnv).some(([n, v]) => !isTelemetryOffKey(n) && (isThirdPartySender(n) || sendsThirdParty(v)))) bad.push("env");
       else if (restricted && "ANTHROPIC_BASE_URL" in actualEnv && !isAisGatewayUrl(actualEnv.ANTHROPIC_BASE_URL)) bad.push("env");
     } else if (k === "hooks") {
       const have = hookKeys(actual.hooks);

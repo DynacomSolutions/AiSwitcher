@@ -25,12 +25,14 @@ async function scratch(serviceEnv?: string): Promise<{ home: string; opts: { hom
   return { home, opts: { home, env: {} }, envFile };
 }
 
+// Removing the proxy leaves the telemetry opt-outs: they are independent of the proxy.
+const TELEMETRY = "T3CODE_TELEMETRY_ENABLED=false\nDISABLE_TELEMETRY=1\nDISABLE_ERROR_REPORTING=1\nDO_NOT_TRACK=1\nKIMI_DISABLE_TELEMETRY=1\n";
 const input = { preloadPath: "/h/.ais/t3/anthropic-proxy.cjs", proxyUrl: "https://proxy.example.test:47132", caPath: "/h/.ais/ca.pem" };
 
 test("upsert keeps other lines and order, appends the keys", () => {
   const out = upsertServiceEnv("T3CODE_LAN=1\n# note\nOTHER=x\n", input);
   expect(out).toBe(
-    `T3CODE_LAN=1\n# note\nOTHER=x\nNODE_OPTIONS=--require ${input.preloadPath}\nAIS_T3_ANTHROPIC_PROXY=${input.proxyUrl}\nNODE_EXTRA_CA_CERTS=${input.caPath}\n`,
+    `T3CODE_LAN=1\n# note\nOTHER=x\nNODE_OPTIONS=--require ${input.preloadPath}\nAIS_T3_ANTHROPIC_PROXY=${input.proxyUrl}\nNODE_EXTRA_CA_CERTS=${input.caPath}\n${TELEMETRY}`,
   );
 });
 
@@ -102,13 +104,13 @@ test("check reports each problem and writes nothing; remove undoes only ours", a
   expect(r.changed).toBe(true);
   const removed = await import("../../src/identities/t3-anthropic-proxy.ts").then((m) => m.removeT3Proxy(s.opts));
   expect(removed.changed).toBe(true);
-  expect(await readFile(s.envFile, "utf8")).toBe("NODE_OPTIONS=--trace-warnings\nT3CODE_LAN=1\n");
+  expect(await readFile(s.envFile, "utf8")).toBe(`NODE_OPTIONS=--trace-warnings\nT3CODE_LAN=1\n${TELEMETRY}`);
   await expect(stat(t3Paths(s.opts).preload)).rejects.toThrow();
 });
 
 test("removeFromServiceEnv drops the NODE_OPTIONS line when only our --require was in it", () => {
   const text = upsertServiceEnv("K=1\n", input);
-  expect(removeFromServiceEnv(text, input.preloadPath)).toBe("K=1\n");
+  expect(removeFromServiceEnv(text, input.preloadPath)).toBe(`K=1\n${TELEMETRY}`);
 });
 
 test("derives the T3 endpoint from the configured gateway host and port", () => {
@@ -131,7 +133,7 @@ test("CLI: install, --check exit and --remove, with a derived remote endpoint", 
     expect(lines.join("\n")).toContain("Restart T3 Code");
     await runT3ProxyCommand([], { check: true }, deps, s.opts);
     await runT3ProxyCommand([], { remove: true }, deps, s.opts);
-    expect(await readFile(s.envFile, "utf8")).toBe("T3CODE_LAN=1\n");
+    expect(await readFile(s.envFile, "utf8")).toBe(`T3CODE_LAN=1\n${TELEMETRY}`);
   } finally {
     if (saved !== undefined) process.env.AIS_GATEWAY_CONNECT_PROXY_URL = saved;
     else delete process.env.AIS_GATEWAY_CONNECT_PROXY_URL;

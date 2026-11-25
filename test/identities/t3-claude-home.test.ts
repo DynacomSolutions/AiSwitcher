@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyT3Instance } from "../../src/identities/t3-instance.ts";
-import { composeT3ClaudePluginFiles, composeT3ClaudeSettings, diffT3ClaudeHome, hookKeys, isThirdPartySender, planT3ClaudeHome } from "../../src/identities/t3-claude-home.ts";
+import { TELEMETRY_OFF_ENV, composeT3ClaudePluginFiles, composeT3ClaudeSettings, diffT3ClaudeHome, hookKeys, isThirdPartySender, planT3ClaudeHome } from "../../src/identities/t3-claude-home.ts";
 import { isNoThirdParty, noThirdPartyNames, t3ClaudeSource } from "../../src/shared/t3-claude-source.ts";
 import { createClaudeCliRunner, localisePluginPaths, updateAllClaudePlugins, type ClaudeCliRunner } from "../../src/shared/claude-plugin-update.ts";
 import { syncT3ClaudeHomes } from "../../src/shared/t3-claude-sync.ts";
@@ -103,7 +103,7 @@ test("restricted source never gets Jev, typesafe or telemetry plugins, hooks or 
 
 test("composeT3ClaudeSettings keeps the home's own gateway env and drops nothing else", () => {
   const out = composeT3ClaudeSettings({ env: { A: "1", ANTHROPIC_BASE_URL: "src" }, theme: "dark" }, { env: { ANTHROPIC_BASE_URL: "own", ANTHROPIC_MODEL: "m" } });
-  expect(out.env).toEqual({ A: "1", ANTHROPIC_BASE_URL: "own", ANTHROPIC_MODEL: "m" });
+  expect(out.env).toEqual({ A: "1", ANTHROPIC_BASE_URL: "own", ANTHROPIC_MODEL: "m", ...TELEMETRY_OFF_ENV });
   expect(out.theme).toBe("dark");
 });
 
@@ -267,7 +267,7 @@ test("restricted filter checks env values, http hooks, status line and wide name
     {},
     RESTRICTED,
   );
-  expect(out.env).toEqual({ OK: "1" });
+  expect(out.env).toEqual({ OK: "1", ...TELEMETRY_OFF_ENV });
   expect(hookKeys(out.hooks)).toEqual(["Stop\t\t/ok.sh"]);
   expect(out.statusLine).toBeUndefined();
   expect(Object.keys(out.enabledPlugins as object)).toEqual(["ok@m"]);
@@ -296,7 +296,7 @@ test("source auth keys are never copied and the home keeps its own", () => {
     { apiKeyHelper: "/own.sh", env: { ANTHROPIC_BASE_URL: "own" } },
   );
   expect(out.apiKeyHelper).toBe("/own.sh");
-  expect(out.env).toEqual({ KEEP: "1", ANTHROPIC_BASE_URL: "own" });
+  expect(out.env).toEqual({ KEEP: "1", ANTHROPIC_BASE_URL: "own", ...TELEMETRY_OFF_ENV });
 });
 
 test("home-only enabledPlugins stay and are allowed, except third-party senders when restricted", async () => {

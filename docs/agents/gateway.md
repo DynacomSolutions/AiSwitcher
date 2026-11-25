@@ -1284,3 +1284,19 @@ folders. The default stays the files. Row 20.312 moves the default.
   `ais_console_sessions_read_errors_total{kind}`, `ais_console_sessions_parts_total{source="fetch|cache"}`,
   `ais_console_sessions_part_bytes_total{kind}`, `ais_console_sessions_part_fetch_seconds` (histogram),
   `ais_console_sessions_read_last_error_timestamp_seconds`.
+
+## Telemetry is off for T3 and its agents
+
+Owner order, 25 Nov 2026. `ais` enforces it in three places.
+
+- `~/.t3/service.env`: `T3CODE_TELEMETRY_ENABLED=false`, `DISABLE_TELEMETRY=1`, `DISABLE_ERROR_REPORTING=1`,
+  `DO_NOT_TRACK=1`, `KIMI_DISABLE_TELEMETRY=1`. T3 passes them to every child. `ais gateway t3-telemetry` sets them.
+  `ais gateway t3-proxy` also sets them. `--check` and `ais doctor` report a missing or wrong value.
+- T3 Claude homes: `settings.json` env holds `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING` and `DO_NOT_TRACK`
+  (`TELEMETRY_OFF_ENV`). They are exempt from the third-party filter, because they stop sends. `t3-claude-sync` repairs them.
+  Never set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: it also stops model listing and auth.
+- Codex homes (identity folders, `t3-codex-*`, `codex-pool*`): `config.toml` holds `[analytics] enabled = false`,
+  `[feedback] enabled = false` and `[otel]` exporters `none`. The profile-sync daemon repairs them every 10 minutes
+  (`t3-telemetry-ticker.ts`). `ais gateway codex-home` also sets them.
+
+Never patch T3. A cluster T3 pod takes its env from the chart (`deployment.yaml`), not from `service.env`.
