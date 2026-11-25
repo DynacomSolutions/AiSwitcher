@@ -64,6 +64,10 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     const { runT3InstanceCommand } = await import("./t3-instance.ts");
     return runT3InstanceCommand(rest, flags, merged);
   }
+  if (sub === "t3-instances") {
+    const { runT3InstancesCommand } = await import("./t3-instances.ts");
+    return runT3InstancesCommand(rest, flags, merged);
+  }
   if (sub === "favourites-token") {
     const { runFavouritesTokenCommand } = await import("./favourites-token.ts");
     return runFavouritesTokenCommand(rest, merged);
@@ -74,7 +78,7 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     const { runCodexHomeCommand } = await import("./codex-home.ts");
     return runCodexHomeCommand(rest, flags, merged);
   }
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|codex-home|favourites-token ...  (ais gateway --help)");
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|t3-instances|codex-home|favourites-token ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");

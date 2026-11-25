@@ -42,6 +42,8 @@ export interface T3InstanceOptions {
   home?: string;
   env?: Record<string, string | undefined>;
   secretsPath?: string;
+  /** The app token, when the caller has it (a pod reads it from a mounted file). Without it the secrets file is read. */
+  token?: string;
   now?: () => number;
   /** Fetch used for the gateway profile lookup (claude only). Injectable for tests. */
   fetch?: (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
@@ -63,7 +65,7 @@ export interface T3InstanceResult {
 type Json = Record<string, unknown>;
 const obj = (v: unknown): Json | undefined => (typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Json) : undefined);
 
-function stable(v: unknown): string {
+export function stable(v: unknown): string {
   if (Array.isArray(v)) return `[${v.map(stable).join(",")}]`;
   const o = obj(v);
   if (o) return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stable(o[k])}`).join(",")}}`;
@@ -196,7 +198,7 @@ async function backupSettings(backupsDir: string, before: string, now: number): 
   }
 }
 
-async function writeSettings(path: string, before: string | undefined, settings: Json, backupsDir: string, now: number): Promise<string | undefined> {
+export async function writeSettings(path: string, before: string | undefined, settings: Json, backupsDir: string, now: number): Promise<string | undefined> {
   let backup: string | undefined;
   let mode = 0o600;
   let indent: string | number = 2;
@@ -260,7 +262,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     return { status: "removed", changes, ...(backup ? { backup } : {}), folder };
   }
 
-  const token = await readSecretsKey(appTokenKey(opts.app), opts.secretsPath);
+  const token = opts.token ?? (await readSecretsKey(appTokenKey(opts.app), opts.secretsPath));
   if (!token || !token.startsWith(GATEWAY_TOKEN_PREFIX)) throw new Error(`No gateway token (${GATEWAY_TOKEN_PREFIX}...) for app ${opts.app} in the secrets file`);
   const displayName = opts.name ?? opts.id;
   const models = opts.models ?? [];
