@@ -6,7 +6,8 @@ import { registerStoreAdmin, type StoreAdminDeps } from "./admin-store.ts";
 import { registerFavouritesAdmin } from "./admin-favourites.ts";
 import { registerSessionsAdmin, type SessionsAdminDeps } from "./admin-sessions.ts";
 import { favouritesToken } from "./favourites-token.ts";
-import { instanceAppToken, instancesToken } from "./instances-token.ts";
+import { instanceAppToken, instanceTokenExpiry, instanceTokenWindow, instancesToken } from "./instances-token.ts";
+import { instanceIdsForApp } from "../t3/instances/plan.ts";
 import type { FavouritesService } from "./chat/favourites.ts";
 import type { GatewayMetrics } from "./metrics.ts";
 import type { LoginRenewal } from "./renewal.ts";
@@ -334,7 +335,8 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const apps = await read.listApps();
     // The t3-instances scope sees names, provider, mode, target and namespace only: no owner, models, limits or token data.
     if (c.get("scope" as never) === ("instances" as never)) {
-      return c.json({ apps: apps.filter((a) => a.state === "active").map((a) => ({ name: a.name, namespace: a.namespace, provider: a.provider, style: a.style, state: a.state, target: a.target.kind === "pool" ? { kind: "pool" as const } : a.target })) });
+      const allowed = new Set(deps.instances?.namespaces ?? []);
+      return c.json({ apps: apps.filter((a) => a.state === "active" && allowed.has(a.namespace)).map((a) => ({ name: a.name, namespace: a.namespace, provider: a.provider, style: a.style, state: a.state, target: a.target.kind === "pool" ? { kind: "pool" as const } : a.target })) });
     }
     return c.json({ apps: await Promise.all(apps.map((a) => appView(read, a))) });
   });
@@ -355,29 +357,31 @@ export function createAdminApp(deps: AdminDeps): Hono {
       log("refused", { reason: "namespace" });
       return Response.json({ error: "the app is outside the namespaces of this credential" }, { status: 403 });
     }
-    const nowMs = deps.now().getTime();
-    const records = await read.tokensFor(name);
-    // A generation whose record has an expiry (the app token was rotated) is skipped, so the answer is never a dying token.
-    for (let generation = 0; generation < 16; generation++) {
-      const t = instanceAppToken(deps.adminToken, name, generation);
-      const found = records.find((r) => r.prefix === t.prefix && r.hash === t.hash);
-      if (found?.expiresAt !== undefined) continue;
-      if (!found) {
-        try {
-          await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: deps.now().toISOString() });
-        } catch (e) {
-          if (e instanceof AppRevokedError) {
-            log("refused", { reason: "revoked" });
-            return err(404, "no such app");
-          }
-          throw e;
-        }
-      }
-      log(found ? "served" : "minted", { prefix: t.prefix, generation, at: new Date(nowMs).toISOString() });
-      return c.json({ app: name, token: t.token, prefix: t.prefix });
+    // Only an app that one of the T3 instance shapes uses gets a token: an app that no instance maps to has no use for one.
+    if (instanceIdsForApp({ name: app.name, provider: app.provider, state: app.state, target: app.target }).length === 0) {
+      log("refused", { reason: "no instance uses this app" });
+      return Response.json({ error: "no T3 instance uses this app" }, { status: 403 });
     }
-    log("refused", { reason: "too many rotations" });
-    return err(409, "too many rotations of this app token; ask an administrator");
+    const nowMs = deps.now().getTime();
+    const window = instanceTokenWindow(nowMs);
+    const expiresAt = instanceTokenExpiry(window);
+    const records = await read.tokensFor(name);
+    // One token per app and window. Rotating the app's own token does not touch it (it already has an expiry); a leak is closed by rotating the admin token.
+    const t = instanceAppToken(deps.adminToken, name, 0, window);
+    const found = records.some((r) => r.prefix === t.prefix && r.hash === t.hash);
+    if (!found) {
+      try {
+        await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: deps.now().toISOString(), expiresAt });
+      } catch (e) {
+        if (e instanceof AppRevokedError) {
+          log("refused", { reason: "revoked" });
+          return err(404, "no such app");
+        }
+        throw e;
+      }
+    }
+    log(found ? "served" : "minted", { prefix: t.prefix, expiresAt });
+    return c.json({ app: name, token: t.token, prefix: t.prefix, expiresAt });
   });
 
   hono.get("/apps/:name", async (c) => {

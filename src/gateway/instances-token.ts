@@ -15,11 +15,20 @@ export function instancesToken(adminToken: string): string {
   return createHmac("sha256", adminToken).update(SCOPE_CONTEXT).digest("hex");
 }
 
+/** A scope-minted app token lives one window (7 days) plus an overlap, so a sync that runs every few minutes always holds a fresh one. */
+export const INSTANCE_TOKEN_WINDOW_MS = 7 * 24 * 3600 * 1000;
+export const INSTANCE_TOKEN_OVERLAP_MS = 24 * 3600 * 1000;
+
+export const instanceTokenWindow = (nowMs: number): number => Math.floor(nowMs / INSTANCE_TOKEN_WINDOW_MS);
+/** When the token of a window stops working (ISO). A record with any other expiry was ended by a rotation of the app. */
+export const instanceTokenExpiry = (window: number): string => new Date((window + 1) * INSTANCE_TOKEN_WINDOW_MS + INSTANCE_TOKEN_OVERLAP_MS).toISOString();
+
 /**
- * The app token that the scope hands to a T3 instance. It is derived from the admin token, the app and a generation, so the
- * same call gives the same token and the store holds one record per generation, not one per call. The gateway stores only the hash.
+ * The app token that the scope hands to a T3 instance. It is derived from the admin token, the app, a generation (app rotations)
+ * and a time window, so the same call in the same window gives the same token and the store holds one record per window, not one
+ * per call. The gateway stores only the hash. After a leak, rotate the admin token: every derived token then stops matching.
  */
-export function instanceAppToken(adminToken: string, app: string, generation: number): { token: string; prefix: string; hash: string } {
-  const part = (label: string): Buffer => createHmac("sha256", adminToken).update(`${APP_CONTEXT}\n${app}\n${generation}\n${label}`).digest();
+export function instanceAppToken(adminToken: string, app: string, generation: number, window: number): { token: string; prefix: string; hash: string } {
+  const part = (label: string): Buffer => createHmac("sha256", adminToken).update(`${APP_CONTEXT}\n${app}\n${generation}\n${window}\n${label}`).digest();
   return tokenFromBytes(part("prefix"), part("secret"));
 }
