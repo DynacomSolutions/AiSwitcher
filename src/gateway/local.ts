@@ -7,7 +7,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { hostname, networkInterfaces } from "node:os";
 import { ERROR_PEEK_BYTES, GATEWAY_MARK_HEADER, isQuotaBody, peek, readBody, stripHopByHop, upstreamHeaders, type Body } from "./app.ts";
 import { GatewayCredentialError, loginCommand, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
-import { providerError } from "./errors.ts";
+import { GATEWAY_UPSTREAM_HEADER, providerError } from "./errors.ts";
 import { enableMemberStore } from "../identities/gateway-members.ts";
 import { LOCAL_GATEWAY_ROUTES } from "./local-routes.ts";
 import { ensureLocalTls } from "./local-tls.ts";
@@ -244,7 +244,7 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     } catch {
       names = [];
     }
-    if (names.length === 0) return providerError(style, 502, "no local login available for direct mode");
+    if (names.length === 0) return providerError(style, 502, "no local login is available for direct mode", "no_local_login");
     let lastQuota: Response | undefined;
     let lastDead: GatewayCredentialError | undefined;
     let lastTransient: GatewayCredentialError | undefined;
@@ -267,35 +267,36 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
           } else lastTransient = err;
           continue;
         }
-        if (!replayable) return clean(up);
+        if (!replayable) return clean(up, provider);
         const q = await isQuota(up);
         if (!q.quota) {
           if (lastQuota) await discard(lastQuota);
-          return clean(q.res);
+          return clean(q.res, provider);
         }
         // Quota or unusable for this model: remember the answer, try the next member.
         if (lastQuota) await discard(lastQuota);
         lastQuota = q.res;
       }
-      if (lastQuota) return clean(lastQuota);
+      if (lastQuota) return clean(lastQuota, provider);
       // Every member is exhausted: a dead login wins over a transient failure in the message.
       if (lastDead) throw lastDead;
       if (lastTransient) throw lastTransient;
-      return providerError(style, 502, "direct upstream request failed");
+      return providerError(style, 502, "no member could be tried in direct mode", "direct_failed");
     } catch (err) {
       if (lastQuota) await discard(lastQuota);
       if (signal.aborted) return new Response(null, { status: 499 });
       if (err instanceof GatewayCredentialError) {
         deps.log(`gateway-local: direct ${tool} credential problem (${err.code})`);
-        return providerError(style, err.loggedOut ? 401 : 502, err.clientMessage);
+        return providerError(style, err.loggedOut ? 401 : 502, err.clientMessage, err.loggedOut ? "login_dead" : "credential_unavailable");
       }
-      return providerError(style, 502, "direct upstream request failed");
+      return providerError(style, 502, "the connection to the upstream provider failed in direct mode", "upstream_unreachable");
     }
   }
 
   /** Response headers fit for the client: hop-by-hop removed, decoded bodies lose their encoding header. */
-  function clean(up: Response): Response {
+  function clean(up: Response, provider?: string): Response {
     const headers = new Headers(up.headers);
+    if (provider !== undefined && !headers.has(GATEWAY_UPSTREAM_HEADER)) headers.set(GATEWAY_UPSTREAM_HEADER, provider);
     stripHopByHop(headers);
     if (headers.has("content-encoding")) {
       headers.delete("content-encoding");
@@ -328,16 +329,16 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     const slash = url.pathname.indexOf("/", 1);
     const first = url.pathname.slice(1, slash === -1 ? undefined : slash);
     const route = ROUTES[first];
-    if (!route) return providerError("openai", 404, "not found");
+    if (!route) return providerError("openai", 404, "no such local route", "unknown_route");
     const rest = slash === -1 ? "" : url.pathname.slice(slash);
     const { tool, app, style } = route;
-    if (!(await authorised(req, app))) return providerError(style, 401, "invalid or missing local gateway key");
+    if (!(await authorised(req, app))) return providerError(style, 401, "invalid or missing local gateway key", "bad_token");
 
     let body: Body;
     try {
       body = await readBody(req);
     } catch {
-      return req.signal.aborted ? new Response(null, { status: 499 }) : providerError(style, 400, "request body could not be read");
+      return req.signal.aborted ? new Response(null, { status: 499 }) : providerError(style, 400, "request body could not be read", "body_unreadable");
     }
     const replayable = body.kind !== "stream";
 
@@ -357,11 +358,11 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
         return clean(res);
       } catch (err) {
         if (isProbe) probing = false;
-        if (err instanceof RemoteIdle) return providerError(style, 504, "cluster gateway did not answer in time");
-        if (err instanceof RemoteOther) return providerError(style, 502, "cluster gateway connection failed");
+        if (err instanceof RemoteIdle) return providerError(style, 504, "the cluster gateway did not answer in time", "remote_timeout");
+        if (err instanceof RemoteOther) return providerError(style, 502, "the connection to the cluster gateway failed", "remote_connection_failed");
         if (!(err instanceof RemoteFailure)) return new Response(null, { status: 499 });
         remoteFailed(err.reason, isProbe);
-        if (!replayable) return err.response ? clean(err.response) : providerError(style, 502, "cluster gateway unreachable");
+        if (!replayable) return err.response ? clean(err.response) : providerError(style, 502, "the cluster gateway is unreachable", "remote_unreachable");
         if (err.response) await discard(err.response);
       }
     }
@@ -494,7 +495,7 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
       reusePort: true,
       idleTimeout: 0,
       ...(tls ? { tls } : {}),
-      fetch: (req) => gateway.handle(req).catch(() => providerError("openai", 500, "gateway error")),
+      fetch: (req) => gateway.handle(req).catch(() => providerError("openai", 500, "internal error in the local gateway", "internal_error")),
     });
   const deadline = Date.now() + (opts.bindRetryMs ?? 0);
   const bind = async (port: number, tls?: { cert: string; key: string }): Promise<ReturnType<typeof Bun.serve>> => {

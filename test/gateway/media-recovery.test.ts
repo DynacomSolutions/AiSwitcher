@@ -258,7 +258,7 @@ describe("a session poisoned by a failed upload", () => {
   test("an upload the provider marked as failed is answered as an error, so the client keeps no file id", async () => {
     const res = await upload(REJECT_MARK);
     expect(res.status).toBe(422);
-    expect(JSON.parse(res.text)).toMatchObject({ error: { type: "invalid_request_error", message: "upload rejected by provider: image moderation unavailable" } });
+    expect(JSON.parse(res.text)).toMatchObject({ error: { type: "invalid_request_error", message: "AIS gateway: upload rejected by provider: image moderation unavailable" } });
     expect(res.text).not.toContain("file_synthetic");
     const r = await rows();
     expect(r[0]).toMatchObject({ status: "upstream_error", httpStatus: 422 });

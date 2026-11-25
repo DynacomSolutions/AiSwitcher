@@ -461,7 +461,7 @@ describe("a served hold, an unserved stream and the pings (unit)", () => {
     m.ctl.enqueue(enc.encode("event: message_start\ndata: {}\n\n"));
     await readUntil(reader, "message_start");
     m.ctl.error(new Error("cut"));
-    expect(await readUntil(reader, "event: error")).toContain("upstream stream failed");
+    expect(await readUntil(reader, "event: error")).toContain("the upstream stream broke");
   });
 
   test("F5: pings continue while a replay is in flight", async () => {

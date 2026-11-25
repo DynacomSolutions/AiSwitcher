@@ -1,7 +1,7 @@
 import type { GatewayDeps } from "./app.ts";
 import { upstreamHeaders } from "./app.ts";
 import { GatewayCredentialError } from "./credentials.ts";
-import { providerError } from "./errors.ts";
+import { GATEWAY_UPSTREAM_HEADER, providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
 import { availableCount, claudeUsageBody, claudeUsageBodyOf, normalisePath, orgSegmentIndex, syntheticClaudeProfile, type AccountOp } from "./routes.ts";
 import { allowedMembers, utilisationOf } from "./select.ts";
@@ -214,8 +214,8 @@ async function memberOrg(r: AccountRequest, name: string): Promise<string | unde
 }
 
 /** The provider's answer, without its connection-level headers. */
-function relay(res: Response): Response {
-  const headers = new Headers();
+function relay(res: Response, provider: string): Response {
+  const headers = new Headers({ [GATEWAY_UPSTREAM_HEADER]: provider });
   for (const h of ["content-type", "retry-after", "cache-control"]) {
     const v = res.headers.get(h);
     if (v) headers.set(h, v);
@@ -239,13 +239,13 @@ export async function forwardAccount(r: AccountRequest): Promise<AccountResult> 
   } catch (err) {
     if (r.signal.aborted) throw err;
     // A member without a usable login is the client's case (4xx with the reason), never a server error.
-    if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) return { res: providerError(r.style, 409, r.app.target.kind === "pin" ? err.clientMessage : "no login is available for this app"), cls };
-    return { res: providerError(r.style, 502, "account request failed"), cls };
+    if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) return { res: providerError(r.style, 409, r.app.target.kind === "pin" ? err.clientMessage : "no login is available for this app", "no_login"), cls };
+    return { res: providerError(r.style, 502, "the account request to the provider failed", "account_request_failed"), cls };
   }
 }
 
 async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
-  const noMember = (): AccountResult => ({ res: providerError(r.style, 409, "no login is available for this app"), cls });
+  const noMember = (): AccountResult => ({ res: providerError(r.style, 409, "no login is available for this app", "no_login"), cls });
   let url = r.url;
   let owner: OwnerFinder | undefined;
 
@@ -285,7 +285,7 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
     const u = new URL(url);
     const n = normalisePath(u.pathname);
     orgAt = n ? orgSegmentIndex(n.nsegs) : -1;
-    if (!n || orgAt < 0) return { res: providerError(r.style, 502, "account organisation unavailable"), cls }; // fail closed
+    if (!n || orgAt < 0) return { res: providerError(r.style, 502, "the account organisation could not be found", "account_org_unavailable"), cls }; // fail closed
     segs = n.segs;
     const grant = r.method === "POST" && n.nsegs[orgAt + 1] === "reset_rate_limits" && n.nsegs.length === orgAt + 2 ? jsonField(r.body, "grant_id") : undefined;
     if (grant) owner = (names) => firstMemberWhere(r, names, CLAUDE_RESETS_PROBE, (b) => grantIds(b).includes(grant));
@@ -299,7 +299,7 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
   if (orgAt >= 0) {
     // The organisation sent upstream is always the member's own; if it cannot be read, nothing is sent.
     const org = await memberOrg(r, member);
-    if (!org) return { res: providerError(r.style, 502, "account organisation unavailable"), identity: member, cls };
+    if (!org) return { res: providerError(r.style, 502, "the account organisation could not be found", "account_org_unavailable"), identity: member, cls };
     const out = [...segs];
     out[1] = "api";
     if (orgAt === 4) out[2] = "oauth";
@@ -310,7 +310,7 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
   if (r.op === "claude-usage") return pinnedUsage(r, member, url, cls);
   if (r.op === "forward" && r.method === "GET" && r.app.target.kind === "pin" && normalisePath(new URL(url).pathname)?.norm === "/api/oauth/profile") return pinnedProfile(r, member, url, cls);
   const res = await callAs(r, member, { method: r.method, url: url + r.search, ...(r.body ? { body: r.body } : {}) });
-  return { res: relay(res), identity: member, cls };
+  return { res: relay(res, r.app.provider), identity: member, cls };
 }
 
 /**
@@ -325,7 +325,7 @@ async function pinnedProfile(r: AccountRequest, member: string, url: string, cls
   } catch (err) {
     if (r.signal.aborted) throw err;
   }
-  if (res && !(res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500)) return { res: relay(res), identity: member, cls };
+  if (res && !(res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500)) return { res: relay(res, r.app.provider), identity: member, cls };
   if (res) await discard(res);
   return { res: syntheticClaudeProfile(r.app, "Claude"), identity: member, cls };
 }
@@ -385,7 +385,7 @@ async function pinnedUsage(r: AccountRequest, member: string, url: string, cls: 
     // Claude Code remembers a 429 (and 401, 403) per bearer for about an hour, but not a 5xx: never relay Anthropic's 429.
     return { res: json({ type: "error", error: { type: "api_error", message: "usage is temporarily unavailable" } }, 503), identity: member, cls };
   }
-  return { res: relay(res), identity: member, cls };
+  return { res: relay(res, r.app.provider), identity: member, cls };
 }
 
 /** Reads a request body of at most `cap` bytes; undefined once the cap is passed (the rest is not read). */

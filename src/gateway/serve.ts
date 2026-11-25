@@ -1127,7 +1127,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       return new Response(dbOk() ? "ready\n" : "ready, database unreachable\n");
     }
     if (path === "/metrics") return new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } });
-    if (!warmed) return providerError(await styleForPath({ store }, path), 503, "gateway is starting");
+    if (!warmed) return providerError(await styleForPath({ store }, path), 503, "the gateway is starting and is not ready yet", "starting");
     srv.timeout(req, 0); // A long generation is not idle.
     return proxy.fetch(req, { ip: srv.requestIP(req)?.address });
   }

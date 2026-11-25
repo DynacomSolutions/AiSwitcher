@@ -400,7 +400,7 @@ async function codexUsage(ctx: ServeContext): Promise<Response> {
       const resetAt = Number.isFinite(parsed) ? Math.floor(parsed / 1000) : nowSec + seconds;
       return { used_percent: Math.max(0, Math.round(w.utilization)), limit_window_seconds: seconds, reset_after_seconds: Math.max(0, resetAt - nowSec), reset_at: resetAt };
     });
-  if (windows.length === 0) return providerError(ctx.style, 502, "usage unavailable");
+  if (windows.length === 0) return providerError(ctx.style, 502, "no usage figures are available for this app", "usage_unavailable");
   const full = windows.some((w) => w.used_percent >= 100);
   return json({
     plan_type: "pro",
@@ -433,7 +433,7 @@ export function claudeStyleWindows(best: PoolUsage | undefined): { five_hour: { 
 
 async function claudeStyleUsage(ctx: ServeContext): Promise<Response> {
   const mapped = claudeStyleWindows(await leastUsed(ctx));
-  if (!mapped) return providerError(ctx.style, 502, "usage unavailable");
+  if (!mapped) return providerError(ctx.style, 502, "no usage figures are available for this app", "usage_unavailable");
   return json({ ...mapped, seven_day_opus: null, seven_day_sonnet: null, extra_usage: null });
 }
 
@@ -502,7 +502,7 @@ async function readResetCredits(ctx: ServeContext): Promise<Response> {
   try {
     names = await allowedMembers(ctx.app, ctx.deps);
   } catch {
-    return providerError(ctx.style, 502, "reset credits unavailable");
+    return providerError(ctx.style, 502, "reset credit figures are not available for this app", "reset_credits_unavailable");
   }
   let total = 0;
   let known = 0;
@@ -525,6 +525,6 @@ async function readResetCredits(ctx: ServeContext): Promise<Response> {
       }
     }),
   );
-  if (names.length > 0 && known === 0) return providerError(ctx.style, 502, "reset credits unavailable");
+  if (names.length > 0 && known === 0) return providerError(ctx.style, 502, "reset credit figures are not available for this app", "reset_credits_unavailable");
   return json({ available_count: total });
 }

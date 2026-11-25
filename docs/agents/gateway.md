@@ -122,6 +122,18 @@ AIS usage readings plus the resets in the members' own 429 answers during the re
 A pinned app passes a real 429 through unchanged. Other providers keep the generic gateway error, and a pool of such
 a provider passes the last upstream 429 through.
 
+A pool also fails over, before any content, on an upstream overload or server error: HTTP 529, 500, 502, 503 or 504, or an
+Anthropic event stream whose first event is an `overloaded_error` or `api_error` (sent inside a 200). Only a bounded
+prefix of a stream is read, and a normal stream flows on at once. Each other member gets the replayed body once. An
+overload is not quota, so no member is held back. When every member fails, the last upstream answer returns unchanged
+with its request id. Pinned apps and bodies that cannot be replayed pass the answer through. Each retry counts in
+`ais_gateway_failovers_total{reason}` and writes one `failover` log line.
+
+Answers the gateway builds itself carry `x-ais-gateway-error: <reason>`, and their message starts with `AIS gateway: `
+(limit answers keep their `You've hit your ... limit` opening and name the gateway inside the brackets). They never use
+status 529 or `overloaded_error`: those belong to the provider. Answers that pass through from a provider carry
+`x-ais-gateway-upstream: <provider>`.
+
 Claude Code in API-key mode (the gateway token via `apiKeyHelper`) retries a 429 only when `retry-after` is
 60 s or less; a longer wait ends the request with `Request rejected (429)`.
 
