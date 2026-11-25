@@ -15,10 +15,17 @@ export interface RetryInfo {
 }
 
 /**
+ * `rest` is the path after the app name, as the client sends it. The provider base holds the version for the OpenAI-style
+ * providers, so the client path may have none (`/responses`, `/chat/completions`) or a version (`/v1/...`, `/v4/...`). Codex
+ * also sends `/backend-api/codex/...`, and Z.AI's own base path. Nothing else matches (`/v1/files`, `/messages/batches`).
+ */
+const MODEL_CALL_PATH = /^(?:\/v\d+|(?:\/backend-api)?\/codex|\/api\/(?:coding\/)?paas\/v\d+)?\/(?:messages|chat\/completions|responses(?:\/compact)?|completions)\/?$/;
+
+/**
  * True for a call that asks a model for an answer (messages, chat completions, responses, completions). Only these may
  * fail over on an overload: a create call such as a file upload or a message batch may have taken effect already.
  */
-export const isModelCall = (method: string, rest: string): boolean => method.toUpperCase() === "POST" && /^\/(?:v1|backend-api\/codex)\/(?:messages|chat\/completions|responses(?:\/compact)?|completions)\/?$/.test(rest);
+export const isModelCall = (method: string, rest: string): boolean => method.toUpperCase() === "POST" && MODEL_CALL_PATH.test(rest);
 
 /** HTTP statuses that fail over: 529 is Anthropic's overload, the others are server errors. */
 const RETRY_STATUSES = new Set([500, 502, 503, 504, 529]);

@@ -43,6 +43,7 @@ describe("pool failover on overload and server errors before content", () => {
   let logs: string[];
   let failovers: Array<{ app: string; reason: string }>;
   let token = "";
+  const tokens: Record<string, string> = {};
 
   beforeEach(async () => {
     clock = T0.getTime();
@@ -82,6 +83,13 @@ describe("pool failover on overload and server errors before content", () => {
     const t = generateToken();
     await store.addToken({ app: app.name, prefix: t.prefix, hash: t.hash, createdAt: T0.toISOString() });
     token = t.token;
+    // Pool apps of the OpenAI-style providers: the path after the app name carries no /v1 (the provider base holds it).
+    for (const [name, provider] of [["cx", "codex"], ["km", "kimi"], ["zz", "zai"]] as const) {
+      await store.putApp({ ...mk(name, { kind: "pool" }), provider, style: "openai" });
+      const tt = generateToken();
+      await store.addToken({ app: name, prefix: tt.prefix, hash: tt.hash, createdAt: T0.toISOString() });
+      tokens[name] = tt.token;
+    }
   });
   afterEach(async () => {
     await upstream.stop(true);
@@ -360,8 +368,25 @@ describe("pool failover on overload and server errors before content", () => {
     expect(who).toEqual(["a", "b"]);
   });
 
+  test.each([
+    ["cx", "/cx/responses"],
+    ["cx", "/cx/responses/compact"],
+    ["cx", "/cx/backend-api/codex/responses"],
+    ["km", "/km/chat/completions"],
+    ["zz", "/zz/chat/completions"],
+  ])("an OpenAI-style pool app %s at %s fails over on a 529 as clients really send it", async (_name, path) => {
+    handler = (m) => (m === "a" ? overloaded(529, "req_a") : new Response('{"ok":true}', { headers: { "content-type": "application/json" } }));
+    const res = await createGatewayApp(deps).request(`http://gw.test${path}`, {
+      method: "POST", body: JSON.stringify({ model: "m", stream: false }), headers: { authorization: `Bearer ${tokens[path.split("/")[1]!]}`, "content-type": "application/json" },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('{"ok":true}');
+    expect(who).toEqual(["a", "b"]);
+    expect(failovers).toEqual([{ app: path.split("/")[1]!, reason: "overloaded" }]);
+  });
+
   test("isModelCall matches model-call routes only", () => {
-    for (const p of ["/v1/messages", "/v1/messages/", "/v1/chat/completions", "/v1/responses", "/v1/completions", "/backend-api/codex/responses", "/backend-api/codex/responses/compact"]) {
+    for (const p of ["/v1/messages", "/v1/messages/", "/v1/chat/completions", "/v1/responses", "/v1/completions", "/backend-api/codex/responses", "/backend-api/codex/responses/compact", "/responses", "/responses/compact", "/chat/completions", "/v4/chat/completions", "/api/coding/paas/v4/chat/completions", "/api/paas/v4/chat/completions", "/messages"]) {
       expect(isModelCall("POST", p)).toBe(true);
     }
     for (const p of ["/v1/threads/t1/messages", "/v1/messages/count_tokens", "/v1/messages/batches", "/v1/files", "/x/v1/messages", "/v1/responses/resp_1/cancel"]) {
