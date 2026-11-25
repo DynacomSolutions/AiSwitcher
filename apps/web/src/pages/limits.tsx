@@ -67,7 +67,7 @@ function WindowRow({ window }: { window: LimitWindow }) {
         <span className="shrink-0 font-medium tabular-nums">{pct.toFixed(1)}%</span>
       </div>
       <Progress value={pct} indicatorClassName={windowTone(pct)} />
-      {/* The times wrap inside the card. The countdown is one piece that moves down with the separator. */}
+      {/* The times wrap inside the card. The separator stays on the times. The countdown is one piece that wraps alone. */}
       {(window.resetsAt || window.resetsAtMs !== undefined || window.note) && (
         <div
           data-slot="reset-line"
@@ -81,7 +81,8 @@ function WindowRow({ window }: { window: LimitWindow }) {
             {window.resetsAtMs !== undefined ? (
               <>
                 {formatResetTimes(window.resetsAtMs)}
-                {" ·\u00a0"}
+                {/* A non-breaking space binds the separator to the times, so a wrapped line never starts with it. */}
+                {"\u00a0· "}
                 <ResetCountdown ms={window.resetsAtMs} />
               </>
             ) : (window.resetsAt ?? "")}
