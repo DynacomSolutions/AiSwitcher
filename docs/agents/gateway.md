@@ -152,6 +152,10 @@ The served answer sends its `request-id` and `anthropic-ratelimit-unified-*` val
   `AIS_GATEWAY_POOL_HOLD_CHECK_S`, `AIS_GATEWAY_POOL_HOLD_PING_S`.
 - Other full-pool answers (not streamed, over the replay cap, or a hold over its limit) keep the native 429 shape, but
   `retry-after` is capped at 55 s, so the client retries (up to 10 times) instead of ending the request.
+  A non-streamed request against a full pool gets `retry-after: 55`. The client retries for about 9 minutes, then it
+  fails. The snooze text of the limit answer reaches the client only after these retries.
+- A served stream keeps its body in the held-bytes count until the stream ends, because the request body stays in memory
+  while the stream runs. The 256 MiB cap therefore holds when many holds are served at once.
 - Unknown reset (the 300 s default) is held the same way: the hold looks at the pool, not at the reset text.
 - Pod drain: a held request is not an in-flight upstream call. On SIGTERM the process aborts one drain signal. Every hold
   ends at once with a socket reset before any message event (`controller.error()`, `ECONNRESET` in a Bun client), and it
