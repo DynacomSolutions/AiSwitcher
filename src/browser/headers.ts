@@ -7,6 +7,7 @@ import { CLAUDE_CONFIG, CODEX_CONFIG } from "../identities/tool-configs.ts";
 import type { IdentitiesFile } from "../identities/types.ts";
 import { identityForConfigDir } from "../shared/browser-wiring.ts";
 import { launchHeaders } from "./mcp-launch.ts";
+import { stableChatId } from "./chat-id.ts";
 import { readTokenFile, resolvePoolAuth } from "./mcp-shim.ts";
 import { launchSessionLabel } from "./session-label.ts";
 
@@ -73,7 +74,7 @@ export async function browserHeaders(i: HeadersInput): Promise<Record<string, st
     if (!fromRegistry && i.env[BROWSER_TOKEN_FILE_ENV]) token = await (i.readTokenPath ?? readTrimmed)(i.env[BROWSER_TOKEN_FILE_ENV]!);
     if (!token) return {};
     const label = await (i.label ?? launchSessionLabel)(i.env, tool, i.cwd).catch(() => "");
-    return { Authorization: `Bearer ${token}`, ...launchHeaders({ label, pool }) };
+    return { Authorization: `Bearer ${token}`, ...launchHeaders({ label, pool, chatId: stableChatId(i.env) }) };
   } catch {
     return {};
   }

@@ -13,7 +13,7 @@ export type BrowserErrorCode = "paused_by_user" | "stopped_by_user" | "no_browse
 
 export interface CallRequest {
   id: string;
-  session: { id: string; identity: string; label: string; color?: string; chat?: true };
+  session: { id: string; identity: string; label: string; /** Stable id of the chat that survives a change of session id (context compaction). Absent from an older shim. */ chatId?: string; color?: string; chat?: true };
   tool: BrowserTool | typeof SESSION_END_TOOL;
   args: Record<string, unknown>;
 }

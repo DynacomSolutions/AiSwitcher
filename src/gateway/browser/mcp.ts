@@ -19,6 +19,7 @@ const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const MAX_LABEL = 80;
 const MAX_LABEL_HEADER = 1024;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const CHAT_ID = ID;
 const POOL = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$/;
 
 interface RpcMessage { jsonrpc?: string; id?: string | number | null; method?: string; params?: Record<string, unknown> }
@@ -29,6 +30,8 @@ export interface McpHeaders {
   /** True when `sessionId` came from `Mcp-Session-Id`. */
   fromMcpSession: boolean;
   label: string;
+  /** `X-AIS-Chat-Id`: stable across compaction. Absent from an older client. */
+  chatId?: string;
   pool?: string;
 }
 
@@ -56,10 +59,12 @@ export function parseMcpHeaders(get: (name: string) => string | null): ParsedMcp
       return { ok: false, error: "x-ais-session-label: bad encoding" };
     }
   }
+  const chatId = raw("x-ais-chat-id");
+  if (chatId !== undefined && !CHAT_ID.test(chatId)) return { ok: false, error: "x-ais-chat-id: invalid id" };
   const pool = raw("x-ais-pool");
   if (pool !== undefined && !POOL.test(pool)) return { ok: false, error: "x-ais-pool: invalid name" };
   const sessionId = xid ?? mid;
-  return { ok: true, value: { ...(sessionId ? { sessionId } : {}), fromMcpSession: xid === undefined && mid !== undefined, label, ...(pool ? { pool } : {}) } };
+  return { ok: true, value: { ...(sessionId ? { sessionId } : {}), fromMcpSession: xid === undefined && mid !== undefined, label, ...(chatId ? { chatId } : {}), ...(pool ? { pool } : {}) } };
 }
 
 const shellQuote = (s: string): string => (/^[A-Za-z0-9_./:=@%+,-]+$/.test(s) ? s : `'${s.replace(/'/g, "'\\''")}'`);
@@ -139,7 +144,7 @@ export function createMcpRoutes(deps: CallDeps): Hono {
     if (!(await poolAllows(h.pool, identity))) return errorResult(`forbidden: this token is not a member of pool ${h.pool}. The launch uses the token it started with: if the member was removed, retired or got a new token, restart the session to pick up the new token.`);
     const { browser, ...args } = (typeof p.arguments === "object" && p.arguments !== null && !Array.isArray(p.arguments) ? p.arguments : {}) as Record<string, unknown>;
     if (name === "upload_file" && args.paths !== undefined) return errorResult(uploadPathsError(sessionId, { ...args, ...(typeof browser === "string" ? { browser } : {}) }, h.label));
-    const out = await caller(identity, { ...(typeof browser === "string" ? { browser } : {}), session: { id: sessionId, identity, label: h.label }, tool: name, args }, signal, scope);
+    const out = await caller(identity, { ...(typeof browser === "string" ? { browser } : {}), session: { id: sessionId, identity, label: h.label, ...(h.chatId ? { chatId: h.chatId } : {}) }, tool: name, args }, signal, scope);
     if ("error" in out.body && !("ok" in out.body)) return errorResult(`${out.status === 400 ? "bad_args" : out.status === 403 ? "forbidden" : "internal"}: ${out.body.error}`);
     return mapCallResult(out.body as Parameters<typeof mapCallResult>[0]);
   }
@@ -277,7 +282,7 @@ export function createMcpRoutes(deps: CallDeps): Hono {
       return json(403, { error: "not a member of that pool. Restart the session to pick up the new token." });
     }
     // The extension closes the tabs this session created. The notice is best-effort, as the stdio shim's end notice was.
-    await caller(a.identity, { session: { id: h.sessionId, identity: a.identity, label: h.label }, tool: SESSION_END_TOOL, args: {} }, req.signal).catch(() => undefined);
+    await caller(a.identity, { session: { id: h.sessionId, identity: a.identity, label: h.label, ...(h.chatId ? { chatId: h.chatId } : {}) }, tool: SESSION_END_TOOL, args: {} }, req.signal).catch(() => undefined);
     count("delete", "ok");
     return new Response(null, { status: 204 });
   });

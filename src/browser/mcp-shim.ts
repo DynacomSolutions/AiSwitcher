@@ -11,6 +11,7 @@ import { CLAUDE_CONFIG, CODEX_CONFIG } from "../identities/tool-configs.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { chatNameResolver, type ChatTool } from "./chat-name.ts";
 import { sessionName } from "./session-label.ts";
+import { stableChatId } from "./chat-id.ts";
 import { BROWSER_TOOLS, SESSION_END_TOOL, type CallResult } from "./protocol.ts";
 import { mcpTools } from "./tool-schemas.ts";
 import { BROWSER_INSTRUCTIONS, LATEST_VERSION, STOPPED_BY_USER_NOTE, SUPPORTED_VERSIONS, errorResult, mapCallResult, type McpContent } from "./mcp-core.ts";
@@ -36,7 +37,7 @@ export interface ShimContext {
   gatewayUrl(): Promise<string | undefined>;
   /** Agent token, resolved on each call. */
   token(): Promise<string | undefined>;
-  session: { id: string; identity: string; label: string };
+  session: { id: string; identity: string; label: string; /** Stable chat id (T3 thread id). Absent: the label alone keys the chat. */ chatId?: string };
   /** The session's current chat name, looked up on each call (cached briefly). Absent: `session.label` is used as is. */
   chatName?(): Promise<string>;
   /**
@@ -83,7 +84,7 @@ async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal
     const auth = await ctx.resolveAuth();
     if (auth.error !== undefined || !auth.identity) return errorResult(auth.error ?? "internal: cannot resolve the active pool member");
     token = auth.token;
-    session = { id: ctx.session.id, identity: auth.identity, label: session.label };
+    session = { id: ctx.session.id, identity: auth.identity, label: session.label, ...(ctx.session.chatId ? { chatId: ctx.session.chatId } : {}) };
     url = await ctx.gatewayUrl();
   } else {
     [url, token] = await Promise.all([ctx.gatewayUrl(), ctx.token()]);
@@ -249,7 +250,7 @@ export function contextFromSpec(spec: ContextSpec): ShimContext {
     gatewayUrl: async () => spec.gateway || env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL")),
     token: () => readToken(env, spec.configDir),
     ...(spec.pool ? { resolveAuth: () => resolvePoolAuth(spec.pool!, spec.poolTool ?? tool ?? "claude", spec.registryPath) } : {}),
-    session: { id: spec.id, identity: spec.identity, label: sessionName(env, tool, spec.cwd) },
+    session: { id: spec.id, identity: spec.identity, label: sessionName(env, tool, spec.cwd), ...(stableChatId(env) ? { chatId: stableChatId(env)! } : {}) },
     fetch: spec.fetch ?? fetch,
     inflight: new Map(),
   };
