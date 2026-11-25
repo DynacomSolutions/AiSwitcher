@@ -13,19 +13,26 @@ export async function runT3TelemetryCommand(args: string[], flags: ParsedArgs["f
   if (args.length > 0) throw new CliUsageError("Usage: ais gateway t3-telemetry [--check]");
   const check = boolFlag(flags, "check");
   let bad = 0;
-  if (check) {
-    for (const p of await checkT3Telemetry(opts)) {
-      bad += 1;
-      deps.out(`t3-telemetry: ${p}`);
+  let envError: string | undefined;
+  try {
+    if (check) {
+      for (const p of await checkT3Telemetry(opts)) {
+        bad += 1;
+        deps.out(`t3-telemetry: ${p}`);
+      }
+    } else {
+      const r = await installT3Telemetry(opts);
+      deps.out(`t3-telemetry: ${r.serviceEnv} ${r.changed ? "updated" : "already current"}${r.backup ? ` (backup ${r.backup})` : ""}`);
     }
-  } else {
-    const r = await installT3Telemetry(opts);
-    deps.out(`t3-telemetry: ${r.serviceEnv} ${r.changed ? "updated" : "already current"}${r.backup ? ` (backup ${r.backup})` : ""}`);
+  } catch (e) {
+    envError = e instanceof Error ? e.message : String(e);
+    deps.out(`t3-telemetry: service.env: ${envError}`);
   }
   for (const r of await syncCodexTelemetry({ ...(opts.home ? { home: opts.home } : {}), ...(opts.env ? { env: opts.env } : {}), check })) {
     deps.out(`t3-telemetry: codex ${describeCodexTelemetryResult(r)}`);
     if (r.status === "drift" || r.status === "failed") bad += 1;
   }
+  if (envError !== undefined) throw new Error(`t3-telemetry: service.env failed: ${envError}`);
   if (bad > 0) throw new Error(check ? "t3-telemetry: telemetry is not off everywhere" : "t3-telemetry: a Codex home failed");
   if (!check) deps.out("Restart T3 Code to apply the service.env change (not restarted by this command).");
 }

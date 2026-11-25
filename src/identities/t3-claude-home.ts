@@ -32,7 +32,7 @@ export const GATEWAY_ENV_KEYS: readonly string[] = [
 /** Env keys that may differ between a home and its source: gateway auth, routing, proxy and CA settings. */
 export const isAuthEnvKey = (key: string): boolean =>
   key.startsWith("ANTHROPIC_") || GATEWAY_ENV_KEYS.includes(key) || /^(CLAUDE_CODE_USE_|CLAUDE_CODE_OAUTH|CLAUDE_CODE_API_KEY|AWS_|GOOGLE_APPLICATION|VERTEX|OPENAI_)/.test(key);
-export const isAllowedEnvKey = (key: string): boolean => isAuthEnvKey(key) || key === "NODE_EXTRA_CA_CERTS" || /^no_proxy$/i.test(key) || key in TELEMETRY_OFF_ENV;
+export const isAllowedEnvKey = (key: string): boolean => isAuthEnvKey(key) || key === "NODE_EXTRA_CA_CERTS" || /^no_proxy$/i.test(key) || Object.hasOwn(TELEMETRY_OFF_ENV, key);
 
 /** Top-level settings keys that hold login or credential routing. They are never copied from the source: the home keeps its own. */
 export const AUTH_SETTINGS_KEYS: readonly string[] = ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "forceLoginMethod", "forceLoginOrgUUID", "otelHeadersHelper"];
@@ -42,7 +42,7 @@ export const AUTH_SETTINGS_KEYS: readonly string[] = ["apiKeyHelper", "awsAuthRe
  * the third-party filter. CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is not set: it also stops model listing and auth fetches.
  */
 export const TELEMETRY_OFF_ENV: Readonly<Record<string, string>> = { DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1", DO_NOT_TRACK: "1" };
-const isTelemetryOffKey = (key: string): boolean => key in TELEMETRY_OFF_ENV;
+const isTelemetryOffKey = (key: string): boolean => Object.hasOwn(TELEMETRY_OFF_ENV, key);
 /** Telemetry opt-out keys of an env that are missing or have a wrong value. */
 export const missingTelemetryOff = (env: unknown): string[] => Object.entries(TELEMETRY_OFF_ENV).filter(([k, v]) => obj(env)?.[k] !== v).map(([k]) => k);
 

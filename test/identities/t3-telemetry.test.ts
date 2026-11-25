@@ -1,12 +1,12 @@
-import { afterAll, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { afterAll, expect, spyOn, test } from "bun:test";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { runT3TelemetryCommand } from "../../src/cli/gateway/t3-telemetry.ts";
 import { applyCodexTelemetryOff, codexTelemetryProblems, syncCodexTelemetry } from "../../src/identities/codex-telemetry.ts";
 import { codexGatewayHomeProblem, configureCodexGatewayHome } from "../../src/identities/codex-gateway-home.ts";
-import { composeT3ClaudeSettings, diffT3ClaudeHome, missingTelemetryOff, TELEMETRY_OFF_ENV } from "../../src/identities/t3-claude-home.ts";
+import { composeT3ClaudeSettings, diffT3ClaudeHome, isAllowedEnvKey, missingTelemetryOff, TELEMETRY_OFF_ENV } from "../../src/identities/t3-claude-home.ts";
 import { checkT3Proxy, checkT3Telemetry, installT3Telemetry, missingTelemetryKeys, T3_TELEMETRY_ENV, t3ProxyDoctorProblems, upsertServiceEnv, upsertTelemetryOff } from "../../src/identities/t3-anthropic-proxy.ts";
 import { createT3TelemetryTicker } from "../../src/sync/t3-telemetry-ticker.ts";
 
@@ -172,4 +172,143 @@ test("ticker: repairs Codex homes, logs a service.env problem once per change", 
   await ticker.tick();
   await ticker.idle();
   expect(logs.length).toBe(2);
+});
+
+const parsedWithout = (text: string) => {
+  const t = parseToml(text) as Record<string, Record<string, unknown>>;
+  for (const [k, keys] of Object.entries({ analytics: ["enabled"], feedback: ["enabled"], otel: ["exporter", "trace_exporter", "metrics_exporter"] })) {
+    for (const key of keys) delete t[k]?.[key];
+    if (t[k] && Object.keys(t[k]!).length === 0) delete t[k];
+  }
+  return t;
+};
+
+test("codex config: awkward shapes keep every other key", () => {
+  const cases: Record<string, string> = {
+    dotted: `analytics.enabled = true\nfeedback.enabled = true\nname = "x"\n`,
+    crlf: `name = "x"\r\n[analytics]\r\nenabled = true\r\n`,
+    noNewline: `name = "x"\n[otel]\nexporter = "otlp"`,
+    arrays: `[[hooks]]\nname = "a"\n[[hooks]]\nname = "b"\n[analytics]\nenabled = true\n`,
+    quoted: `["analytics"]\n"enabled" = true\n[ "mcp_servers" . "a b" ]\nurl = "u"\n`,
+    otelTable: `[otel]\nenvironment = "prod"\n[otel.exporter_extra]\nx = 1\n`,
+  };
+  for (const [name, text] of Object.entries(cases)) {
+    let out: string;
+    try {
+      out = applyCodexTelemetryOff(text);
+    } catch (e) {
+      expect(String(e)).toMatch(/cannot set|refused|not valid/); // refusing is also safe
+      continue;
+    }
+    expect(codexTelemetryProblems(out), name).toEqual([]);
+    expect(parsedWithout(out), name).toEqual(parsedWithout(text));
+  }
+});
+
+test("codex config: top-level dotted otel.exporter and [otel.exporter.*] subtables are refused", () => {
+  expect(() => applyCodexTelemetryOff(`otel.exporter = "otlp"\n`)).toThrow();
+  expect(() => applyCodexTelemetryOff(`[otel.exporter."otlp-http"]\nendpoint = "https://x"\n`)).toThrow();
+});
+
+test("codex config: a header line inside a multi-line string is refused when the edit would lose keys", () => {
+  const text = `[mcp_servers.docs]\nnote = """\n[analytics]\n"""\nenabled = false\n`;
+  expect(() => applyCodexTelemetryOff(text)).toThrow(/other keys|cannot set/);
+  const unchanged = `[mcp_servers.docs]\nnote = """\n[analytics]\nenabled = true\n"""\n`;
+  expect(() => applyCodexTelemetryOff(unchanged)).toThrow(); // refused, never a silent wrong edit
+});
+
+test("codex config: invalid TOML is refused", () => {
+  expect(() => applyCodexTelemetryOff(`a = = 1\n`)).toThrow(/not valid TOML/);
+});
+
+test("syncCodexTelemetry: a refused edit leaves the file, backs up a good edit, and continues", async () => {
+  const home = await fresh();
+  const gw = join(home, ".t3", "gateway");
+  const bad = `[mcp_servers.docs]\nnote = """\n[analytics]\n"""\nenabled = false\n`;
+  await mkdir(join(gw, "codex-pool-a"), { recursive: true });
+  await mkdir(join(gw, "codex-pool-b"), { recursive: true });
+  await writeFile(join(gw, "codex-pool-a", "config.toml"), bad);
+  await writeFile(join(gw, "codex-pool-b", "config.toml"), CODEX);
+  const opts = { home, env: {}, identityDirs: [] };
+  const res = await syncCodexTelemetry(opts);
+  expect(res.map((r) => r.status)).toEqual(["failed", "updated"]);
+  expect(await readFile(join(gw, "codex-pool-a", "config.toml"), "utf8")).toBe(bad);
+  expect((await readdir(join(gw, "codex-pool-a"))).sort()).toEqual(["config.toml"]);
+  const filesB = await readdir(join(gw, "codex-pool-b"));
+  expect(filesB.some((f) => f.startsWith("config.toml.pre-telemetry-off."))).toBe(true);
+  expect(filesB.some((f) => f.includes(".tmp-"))).toBe(false);
+  const backup = filesB.find((f) => f.startsWith("config.toml.pre-telemetry-off."))!;
+  expect(await readFile(join(gw, "codex-pool-b", backup), "utf8")).toBe(CODEX);
+  const check = await syncCodexTelemetry({ ...opts, check: true });
+  expect(check.map((r) => r.status)).toEqual(["drift", "current"]);
+});
+
+test("gateway codex home: configure warns and still writes the gateway config when the telemetry edit is refused", async () => {
+  const dir = join(root, "gwhome-refused");
+  await mkdir(dir, { recursive: true });
+  const base = `model_provider = "ais-gateway"\n[model_providers.ais-gateway]\nbase_url = "https://gw.example.com/gateway/t3-demo"\nwire_api = "responses"\n`;
+  await writeFile(join(dir, "config.toml"), `${base}[otel.exporter."otlp-http"]\nendpoint = "https://x"\n`);
+  const warn = spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    await configureCodexGatewayHome(dir, "SYNTHETIC_FIXTURE-token");
+    expect(warn).toHaveBeenCalledTimes(1);
+  } finally {
+    warn.mockRestore();
+  }
+  expect(await readFile(join(dir, "auth.json"), "utf8")).toContain("ais-t3-demo");
+  expect(await readFile(join(dir, "config.toml"), "utf8")).toContain("chatgpt_base_url");
+  expect(await codexGatewayHomeProblem(dir)).toMatch(/telemetry/);
+});
+
+test("ais gateway t3-telemetry: a forbidden proxy key in service.env still repairs the Codex homes, then fails", async () => {
+  const home = await fresh();
+  const gw = join(home, ".t3", "gateway", "t3-codex-a");
+  await mkdir(gw, { recursive: true });
+  await writeFile(join(gw, "config.toml"), CODEX);
+  await writeFile(join(home, ".t3", "service.env"), "HTTPS_PROXY=http://x:1\n");
+  const lines: string[] = [];
+  const deps = { out: (l: string) => lines.push(l) } as never;
+  await expect(runT3TelemetryCommand([], {}, deps, { home, env: {} })).rejects.toThrow(/service\.env failed/);
+  expect(codexTelemetryProblems(await readFile(join(gw, "config.toml"), "utf8"))).toEqual([]);
+});
+
+test("ais gateway t3-telemetry: a refused Codex home does not stop the others and exits non-zero", async () => {
+  const home = await fresh();
+  const a = join(home, ".t3", "gateway", "t3-codex-a");
+  const b = join(home, ".t3", "gateway", "t3-codex-b");
+  await mkdir(a, { recursive: true });
+  await mkdir(b, { recursive: true });
+  await writeFile(join(a, "config.toml"), `[otel.exporter."otlp-http"]\nendpoint = "https://x"\n`);
+  await writeFile(join(b, "config.toml"), CODEX);
+  await writeFile(join(home, ".t3", "service.env"), "T3CODE_LAN=1\n");
+  const deps = { out: () => undefined } as never;
+  await expect(runT3TelemetryCommand([], {}, deps, { home, env: {} })).rejects.toThrow(/Codex home failed/);
+  expect(codexTelemetryProblems(await readFile(join(b, "config.toml"), "utf8"))).toEqual([]);
+  await expect(runT3TelemetryCommand([], { check: true }, deps, { home, env: {} })).rejects.toThrow(/not off/);
+});
+
+test("ticker: a failed Codex home is logged and the other homes are still reported", async () => {
+  const logs: string[] = [];
+  const ticker = createT3TelemetryTicker({ codex: async () => [{ dir: "/a", status: "failed", changes: [], error: "refused" }, { dir: "/b", status: "updated", changes: ["analytics.enabled"] }], serviceEnv: async () => [], now: () => 0, log: (m) => logs.push(m), intervalMs: 10 });
+  await ticker.tick();
+  await ticker.idle();
+  expect(logs.join("\n")).toMatch(/\/a: failed refused/);
+  expect(logs.join("\n")).toMatch(/\/b: updated/);
+});
+
+test("service.env: the last copy of a duplicate key wins", () => {
+  expect(missingTelemetryKeys("DO_NOT_TRACK=0\nDO_NOT_TRACK=1\n")).not.toContain("DO_NOT_TRACK=1");
+  expect(missingTelemetryKeys("DO_NOT_TRACK=1\nDO_NOT_TRACK=0\n")).toContain("DO_NOT_TRACK=1");
+});
+
+test("claude home: built-in object key names are not exempt from the third-party filter", () => {
+  expect(isAllowedEnvKey("toString")).toBe(false);
+  expect(isAllowedEnvKey("constructor")).toBe(false);
+  expect(isAllowedEnvKey("DISABLE_TELEMETRY")).toBe(true);
+  const env = JSON.parse('{"toString":"jev.example","constructor":"typesafe","FOO":"1"}') as Record<string, string>;
+  const out = composeT3ClaudeSettings({ env }, {}, { noThirdParty: true });
+  const e = out.env as Record<string, string>;
+  expect(Object.hasOwn(e, "toString")).toBe(false);
+  expect(Object.hasOwn(e, "constructor")).toBe(false);
+  expect(e.FOO).toBe("1");
 });

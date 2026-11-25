@@ -1,8 +1,9 @@
-import { readdir, readFile, stat, chmod } from "node:fs/promises";
+import { chmod, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { parse as parseToml } from "smol-toml";
 import { expandPath } from "./match.ts";
-import { writeFileAtomic } from "./pool/fs.ts";
+import { fsyncDir } from "./pool/fs.ts";
 import { loadIdentitiesFile } from "./store.ts";
 import { CODEX_CONFIG } from "./tool-configs.ts";
 import { t3Paths } from "./t3-anthropic-proxy.ts";
@@ -40,8 +41,39 @@ export function codexTelemetryProblems(text: string): string[] {
   return bad;
 }
 
-/** Pure: the config.toml text with the telemetry keys set. Idempotent. Throws when the result still does not parse to the wanted values. */
+const isTable = (v: unknown): v is Table => typeof v === "object" && v !== null && !Array.isArray(v) && !(v instanceof Date);
+
+/** A parsed config without the telemetry keys ais manages (and without tables that this leaves empty). */
+function withoutManaged(parsed: Table): Table {
+  const copy = structuredClone(parsed);
+  for (const [table, keys] of Object.entries(CODEX_TELEMETRY_OFF)) {
+    const t = copy[table];
+    if (!isTable(t)) continue;
+    for (const k of Object.keys(keys)) delete t[k];
+    if (Object.keys(t).length === 0) delete copy[table];
+  }
+  return copy;
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a instanceof Date || b instanceof Date) return a instanceof Date && b instanceof Date && String(a) === String(b) && a.getTime() === b.getTime();
+  if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => sameValue(v, b[i]));
+  if (isTable(a) || isTable(b)) {
+    if (!isTable(a) || !isTable(b)) return false;
+    const ka = Object.keys(a);
+    return ka.length === Object.keys(b).length && ka.every((k) => Object.hasOwn(b, k) && sameValue(a[k], b[k]));
+  }
+  return Object.is(a, b);
+}
+
+/** Pure: the config.toml text with the telemetry keys set. Idempotent. Throws when the result does not parse to the wanted values, or differs from the input in any other key. */
 export function applyCodexTelemetryOff(text: string): string {
+  let before: Table;
+  try {
+    before = parseToml(text) as Table;
+  } catch {
+    throw new Error("config.toml is not valid TOML; left unchanged");
+  }
   if (codexTelemetryProblems(text).length === 0) return text;
   let lines = text.split("\n");
   if (lines[lines.length - 1] === "") lines.pop();
@@ -77,8 +109,35 @@ export function applyCodexTelemetryOff(text: string): string {
   }
   const next = `${lines.join("\n")}\n`;
   const left = codexTelemetryProblems(next);
-  if (left.length > 0) throw new Error(`cannot set ${left.join(", ")} in config.toml (set by hand, for example as an inline table)`);
+  if (left.length > 0) throw new Error(`cannot set ${left.join(", ")}: edit config.toml by hand (for example when a key is an inline table)`);
+  if (!sameValue(withoutManaged(before), withoutManaged(parseToml(next) as Table))) throw new Error("refused to edit config.toml: the edit would change other keys; left unchanged");
   return next;
+}
+
+/**
+ * Writes config.toml with a backup of the old text, a flushed temp file and a re-read check. Aborts when the file changed
+ * since `before` was read. The temp file is removed when the rename fails.
+ */
+export async function writeCodexConfig(path: string, before: string, next: string, now: number = Date.now()): Promise<void> {
+  const mode = (await stat(path)).mode & 0o777;
+  const temp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  try {
+    const handle = await open(temp, "w", 0o600);
+    try {
+      await handle.writeFile(next);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await chmod(temp, mode);
+    if ((await readFile(path, "utf8")) !== before) throw new Error("config.toml changed while it was edited; left unchanged");
+    await writeFile(`${path}.pre-telemetry-off.${Math.floor(now / 1000)}`, before, { mode: 0o600 });
+    await rename(temp, path);
+  } catch (e) {
+    await unlink(temp).catch(() => undefined);
+    throw e;
+  }
+  await fsyncDir(join(path, ".."));
 }
 
 export interface CodexTelemetryResult {
@@ -139,9 +198,7 @@ export async function syncCodexTelemetry(opts: CodexTelemetryOptions = {}): Prom
       continue;
     }
     try {
-      const mode = (await stat(path)).mode & 0o777;
-      await writeFileAtomic(path, applyCodexTelemetryOff(text));
-      await chmod(path, mode);
+      await writeCodexConfig(path, text, applyCodexTelemetryOff(text));
       results.push({ dir, status: "updated", changes });
     } catch (e) {
       results.push({ dir, status: "failed", changes: [], error: e instanceof Error ? e.message : String(e) });

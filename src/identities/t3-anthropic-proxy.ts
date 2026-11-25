@@ -211,7 +211,7 @@ export function missingTelemetryKeys(text: string): string[] {
   const values = new Map<string, string>();
   for (const line of toLines(text)) {
     const kv = parseLine(line);
-    if (kv && !values.has(kv.key)) values.set(kv.key, kv.value);
+    if (kv) values.set(kv.key, kv.value); // the last copy wins
   }
   return Object.entries(T3_TELEMETRY_ENV).filter(([k, v]) => values.get(k) !== v).map(([k, v]) => `${k}=${v}`);
 }
@@ -258,7 +258,7 @@ export function missingKeys(text: string, preloadPath: string): string[] {
   const values = new Map<string, string>();
   for (const line of toLines(text)) {
     const kv = parseLine(line);
-    if (kv && !values.has(kv.key)) values.set(kv.key, kv.value);
+    if (kv) values.set(kv.key, kv.value); // the last copy wins
   }
   const missing: string[] = [];
   if (!hasRequire(optionTokens(values.get(KEY_OPTIONS) ?? ""), preloadPath)) missing.push(`${KEY_OPTIONS} (--require ${preloadPath})`);

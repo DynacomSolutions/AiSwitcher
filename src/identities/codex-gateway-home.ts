@@ -247,7 +247,13 @@ export async function configureCodexGatewayHome(dir: string, token: string): Pro
   const { base, route } = localText === text ? read : parseGatewayProvider(localText);
   await mkdir(dir, { recursive: true });
   await writeFileAtomic(join(dir, "auth.json"), buildCodexGatewayAuth(app, token));
-  const next = applyCodexTelemetryOff(transformCodexGatewayConfig(localText, base, app, route));
+  const transformed = transformCodexGatewayConfig(localText, base, app, route);
+  let next = transformed;
+  try {
+    next = applyCodexTelemetryOff(transformed);
+  } catch (e) {
+    console.error(`ais: warning: telemetry not turned off in ${join(dir, "config.toml")}: ${e instanceof Error ? e.message : String(e)}`);
+  }
   if (next !== text) {
     const path = join(dir, "config.toml");
     const mode = (await stat(path)).mode & 0o777;
