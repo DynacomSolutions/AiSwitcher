@@ -384,11 +384,7 @@ export async function writeT3ClaudeHome(files: T3ClaudeFile[]): Promise<string[]
   return written;
 }
 
-/**
- * Folder names in `<T3 home>/gateway` that are Claude homes with their own settings.json. The retired Claude-driver homes
- * for Kimi and Z.ai (`t3-claude-kimi-*`, `t3-claude-zai-*`) are not listed: those providers use the ACP instances
- * (`t3-<provider>-pool-acp`), and `ais gateway t3-instances sync` removes the old instance entries.
- */
+/** Folder names in `<T3 home>/gateway` that are Claude homes with their own settings.json. */
 export async function listT3ClaudeHomes(gatewayDir: string): Promise<string[]> {
   let names: string[];
   try {
@@ -396,5 +392,5 @@ export async function listT3ClaudeHomes(gatewayDir: string): Promise<string[]> {
   } catch {
     return [];
   }
-  return names.filter((n) => /^(?:t3-)?claude-/.test(n) && !/^(?:t3-)?claude-(?:kimi|zai)(?:-|$)/.test(n)).sort();
+  return names.filter((n) => /^(?:t3-)?claude-/.test(n)).sort();
 }
