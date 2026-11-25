@@ -1,4 +1,4 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, mkdir, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { Admin, connect, type GatewayCliDeps } from "../../cli/gateway/apps.ts";
 import { readSecretsKey } from "../../cli/gateway/secrets-file.ts";
@@ -47,12 +47,22 @@ export async function syncT3InstancesLive(deps: GatewayCliDeps, opts: LiveSyncOp
   if (!root) throw new Error("Proxy base URL unknown: set AIS_GATEWAY_PROXY_URL in ~/.secrets");
   const apps = await fetchGatewayApps(admin);
   const out: LiveSyncOptions & { apps: GatewayApp[] } = { ...opts, apps };
+  let extra: SyncItem[] = [];
   if (scoped && url) {
     // The apps the plan uses, asked one by one, now. A refused or unknown app has no token: the sync skips it and keeps its instance.
     const tokens = new Map<string, string | undefined>();
+    const keep = new Set<string>();
+    const failed: SyncItem[] = [];
     for (const name of new Set(planT3Instances(apps).map((p) => p.app))) {
-      const { status, json } = await admin.call("POST", `/apps/${encodeURIComponent(name)}/instance-token`, undefined, [403, 404]);
-      tokens.set(name, status < 300 && typeof json.token === "string" ? json.token : undefined);
+      try {
+        const { status, json } = await admin.call("POST", `/apps/${encodeURIComponent(name)}/instance-token`, undefined, [403, 404]);
+        tokens.set(name, status < 300 && typeof json.token === "string" ? json.token : undefined);
+      } catch (e) {
+        // A gateway error on one app does not stop the run: that app keeps its instance and its token file, and the run reports it.
+        failed.push({ id: name, status: "failed", detail: `instance token: ${e instanceof Error ? e.message : String(e)}` });
+        tokens.set(name, undefined);
+        keep.add(name);
+      }
     }
     out.tokenFor = async (name) => tokens.get(name);
     if (opts.tokenDir && !opts.check) {
@@ -63,7 +73,13 @@ export async function syncT3InstancesLive(deps: GatewayCliDeps, opts: LiveSyncOp
         await writeFileAtomic(file, `${token}\n`);
         await chmod(file, 0o600);
       }
+      // A token file of an app that is gone (or has no token now) is deleted. An app whose call failed keeps its file.
+      for (const f of await readdir(opts.tokenDir).catch(() => [] as string[])) {
+        if (!tokens.get(f) && !keep.has(f) && !f.startsWith(".")) await rm(join(opts.tokenDir, f), { force: true });
+      }
     }
+    extra = failed;
   }
-  return syncT3Instances({ ...out, gatewayRoot: root, ...(deps.secretsPath ? { secretsPath: deps.secretsPath } : {}) });
+  const items = await syncT3Instances({ ...out, gatewayRoot: root, ...(deps.secretsPath ? { secretsPath: deps.secretsPath } : {}) });
+  return [...items, ...extra];
 }

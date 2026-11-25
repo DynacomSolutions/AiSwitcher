@@ -495,7 +495,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
   let usage: UsageResult[] | undefined;
   // opencode: the usage writer reads the instance from settings.json and the folder opencode.json, so a check with
   // either still to be written has nothing to read yet; the changes list already reports it.
-  const usageReady = !opts.batch && opts.driver === "grok" || (opts.driver === "opencode" && (!check || (toWrite.length === 0 && !entryChanged)));
+  const usageReady = !opts.batch && (opts.driver === "grok" || (opts.driver === "opencode" && (!check || (toWrite.length === 0 && !entryChanged))));
   if (usageReady) {
     usage = (await syncT3UsageCredentials({ home, ...(opts.env ? { env: opts.env } : {}), ...(opts.secretsPath ? { secretsPath: opts.secretsPath } : {}), check })).filter((r) => r.id === opts.id);
     for (const r of usage) if (r.status === "updated") changes.push(`usage credential ${r.file}`);

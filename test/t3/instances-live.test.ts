@@ -58,3 +58,19 @@ test("a host with both tokens uses the admin path only", async () => {
   await syncT3InstancesLive(deps(), { home, env: {} });
   expect(calls.map((c) => `${c.method} ${c.path} ${c.auth}`)).toEqual(["GET /apps Bearer adm"]);
 });
+
+test("a stale token file of a removed app is deleted, and a 5xx on one app keeps its file and does not stop the run", async () => {
+  const tokenDir = join(home, "run");
+  await mkdir(tokenDir, { recursive: true });
+  await writeFile(join(tokenDir, "gone-app"), "aisg_old\n");
+  await writeFile(join(tokenDir, "t3-zai-pool"), "aisg_zai_old\n");
+  const flaky = (async (url: string, init: RequestInit) => {
+    if (new URL(url).pathname === "/apps/t3-zai-pool/instance-token") return new Response("boom", { status: 502 });
+    return fetchStub(url, init);
+  }) as unknown as typeof fetch;
+  const items = await syncT3InstancesLive({ ...deps(), fetch: flaky }, { home, env: {}, tokenDir, flavour: "pod", binaryDir: "/opt/agents" });
+  await expect(stat(join(tokenDir, "gone-app"))).rejects.toThrow();
+  expect((await readFile(join(tokenDir, "t3-zai-pool"), "utf8")).trim()).toBe("aisg_zai_old");
+  expect((await readFile(join(tokenDir, "t3-kimi-pool"), "utf8")).trim()).toBe("aisg_fromgw");
+  expect(items.some((i) => i.id === "t3-zai-pool" && i.status === "failed")).toBe(true);
+});
