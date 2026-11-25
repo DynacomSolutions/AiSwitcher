@@ -294,12 +294,15 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
   return (
     <Card className="gap-4">
       <CardHeader className="space-y-0">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="truncate font-medium" title={result.identity.name}>
-              {result.identity.name}
-            </span>
-            <ToolBadge tool={result.toolName} />
+        {/* A plan badge that leaves less than 4rem for the name goes onto a second line, under the name. */}
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex min-w-0 grow flex-wrap items-center gap-2">
+            <div className="flex min-w-0 grow items-center gap-2">
+              <span className="w-0 min-w-16 grow truncate font-medium" title={result.identity.name}>
+                {result.identity.name}
+              </span>
+              <ToolBadge tool={result.toolName} />
+            </div>
             {result.plan ? (
               <Badge variant="secondary" title="Account plan">
                 {result.plan}
