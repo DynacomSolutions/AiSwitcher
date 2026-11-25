@@ -164,8 +164,8 @@ export const HELP: Record<string, HelpNode> = {
         "path prints the folder to Load unpacked (~/.ais/browser-extension); update installs the latest ais-browser-extension.zip release asset there atomically (gh, else GITHUB_TOKEN/GH_TOKEN), or --from=<zip> for a local file",
       ),
       headers: sub(
-        "ais browser headers [--tool=claude|codex] [--config-dir=<dir>]",
-        "Prints the JSON headers (bearer token of the session's identity or pool member, session id, session name, chat id, pool) for the gateway MCP endpoint /browser/mcp. Claude runs it as headersHelper of the shared-skills plugin, Codex as http_headers_helper. Prints {} for a folder with no identity, a Kimi or Z.ai folder, or no token. Not for manual use: it prints a token",
+        "ais browser headers [--tool=claude|codex] [--config-dir=<dir>] [--reveal]",
+        "Prints the JSON headers (bearer token of the session's identity or pool member, session id, session name, chat id, pool) for the gateway MCP endpoint /browser/mcp. Claude runs it as headersHelper of the shared-skills plugin, Codex as http_headers_helper. Prints {} for a folder with no identity, a Kimi or Z.ai folder, or no token. By default the bearer token is masked (first 4 characters, then an ellipsis). --reveal prints the real token: only the Claude and Codex helper entries use it. Agents must never use --reveal",
       ),
       "codex-config": sub(
         "ais browser codex-config [<codex home>...] [--check] [--remove]",

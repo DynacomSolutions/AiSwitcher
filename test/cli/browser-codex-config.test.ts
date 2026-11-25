@@ -18,7 +18,7 @@ const home = (name: string, text?: string): string => {
 test("block holds url, helper command with the folder, timeout, and no token", () => {
   const b = codexBlock(GW, "/bin/ais", "/h/x");
   expect(b).toContain('url = "https://gw.example.test/gateway/browser/mcp"');
-  expect(b).toContain(`http_headers_helper = ${JSON.stringify("'/bin/ais' browser headers --tool=codex --config-dir='/h/x'")}`);
+  expect(b).toContain(`http_headers_helper = ${JSON.stringify("'/bin/ais' browser headers --tool=codex --reveal --config-dir='/h/x'")}`);
   expect(b).toContain("tool_timeout_sec = 135");
   expect(b).not.toMatch(/bearer|token/i);
 });
@@ -49,7 +49,7 @@ test("shell-quotes paths with spaces and quotes", () => {
   const b = codexBlock(GW, "/my bin/ais", "/h/it's here");
   const line = b.split("\n").find((l) => l.startsWith("http_headers_helper"))!;
   const cmd = JSON.parse(line.slice("http_headers_helper = ".length)) as string;
-  expect(cmd).toBe("'/my bin/ais' browser headers --tool=codex --config-dir='/h/it'\\''s here'");
+  expect(cmd).toBe("'/my bin/ais' browser headers --tool=codex --reveal --config-dir='/h/it'\\''s here'");
 });
 
 test("skips folders that are missing, not Codex, Kimi, Z.ai or have an own entry, and goes on", async () => {
