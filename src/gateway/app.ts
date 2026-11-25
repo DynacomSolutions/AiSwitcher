@@ -22,7 +22,7 @@ import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
 import { poolModels } from "./models-union.ts";
-import { errorTypeOfBody, firstEventOf, retryReasonForStatus, retryReasonForStreamError, type FirstEvent, type RetryInfo } from "./overload.ts";
+import { errorTypeOfBody, firstEventOf, isModelCall, retryReasonForStatus, retryReasonForStreamError, type FirstEvent, type RetryInfo } from "./overload.ts";
 import { collapseSlashes, PIN_FORWARD, routeFor, serveRoute, sideDailyLimitFromEnv, type AccountOp, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity, usageForModel, utilisationOf } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
@@ -1133,7 +1133,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
    * is decided on its first event line and flows on unchanged. The response returned carries every byte read.
    */
   const retryable = async (res: Response): Promise<{ retry?: RetryInfo; res: Response }> => {
-    if (side) return { res };
+    if (side || !isModelCall(req.method, rest)) return { res };
     const requestId = upstreamRequestId(res.headers);
     if (retryReasonForStatus(res.status) !== undefined) {
       const p = await peek(res, ERROR_PEEK_BYTES);
@@ -1151,6 +1151,20 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       return { retry: { reason, http: res.status, ...(p.first.errorType ? { errorType: p.first.errorType } : {}), ...(id ? { requestId: id } : {}) }, res: p.res };
     }
     return { res };
+  };
+
+  /**
+   * `retryable`, but a body that breaks while it is read gives a failed result (no `res`, a `server_error` retry) and
+   * not an exception, so the next member still gets the request. A client that is gone still throws.
+   */
+  const classify = async (res: Response): Promise<{ retry?: RetryInfo; res?: Response }> => {
+    try {
+      return await retryable(res);
+    } catch (err) {
+      if (req.signal.aborted || ctrl.signal.aborted) throw err;
+      await discard(res);
+      return { retry: { reason: "server_error", http: res.status, errorType: "read_failed" } };
+    }
   };
 
   identity = await canon(pick.identity);
@@ -1211,15 +1225,19 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       let quota = false;
       /** Set while the answer in `cur` is an overload or server error: the next member gets the request. It is not quota, so no member is held back for it. */
       let retry: RetryInfo | undefined;
+      /** Members that answered an overload or server error: not asked again for this request, whatever a short-hold wait clears. */
+      const overloaded = new Set<string>();
       if (cur) {
         const q = await isQuota(cur);
         cur = q.res;
         quota = q.quota;
         if (quota) holdQuota(pick.identity, cur);
         else {
-          const o = await retryable(cur);
+          const o = await classify(cur);
           cur = o.res;
           retry = o.retry;
+          if (retry) overloaded.add(pick.identity);
+          if (!cur) credErr = credErr ?? new Error("upstream answer unreadable");
         }
       }
       // Every quota answer before the first byte marks that member exhausted until its reset (or briefly for a burst
@@ -1229,7 +1247,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       let name = pick.identity;
       while (quota || !cur || retry) {
         tried.add(name);
-        const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried]), model);
+        const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried, ...overloaded]), model);
         if (!("identity" in next)) {
           // Everyone left is only briefly held: wait for the first to free, then try the pool again from the top.
           if (quota && cur && (await waitForShortHold())) {
@@ -1257,25 +1275,31 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
           continue;
         }
         const sq = await isQuota(second);
+        // The new answer is read before the old one goes: a body that breaks leaves the old answer standing.
+        const o = sq.quota ? { res: sq.res, retry: undefined as RetryInfo | undefined } : await classify(sq.res);
+        if (!o.res) {
+          overloaded.add(name);
+          credErr = credErr ?? new Error("upstream answer unreadable");
+          if (!cur) retry = o.retry;
+          continue;
+        }
         const left = quota ? "quota" : retry ? retry.reason : "credential";
+        const from = identity;
+        const to = await canon(next.identity);
         if (cur) await discard(cur);
         deps.metrics.failover(app.name, left);
         try {
-          log(JSON.stringify({ event: "failover", app: app.name, reason: left, ...(retry ? { http: retry.http, ...(retry.errorType ? { errorType: retry.errorType } : {}), ...(retry.requestId ? { requestId: retry.requestId } : {}) } : {}) }));
+          log(JSON.stringify({ event: "failover", app: app.name, reason: left, from, to, ...(retry ? { http: retry.http, ...(retry.errorType ? { errorType: retry.errorType } : {}), ...(retry.requestId ? { requestId: retry.requestId } : {}) } : {}) }));
         } catch {
           // Observation must never affect the response.
         }
-        cur = sq.res;
-        identity = await canon(next.identity);
+        cur = o.res;
+        identity = to;
         servedBy = next.identity;
         quota = sq.quota;
-        retry = undefined;
+        retry = o.retry;
         if (quota) holdQuota(name, cur);
-        else {
-          const o = await retryable(cur);
-          cur = o.res;
-          retry = o.retry;
-        }
+        else if (retry) overloaded.add(name);
       }
       if (!cur) throw credErr;
       if (quota) {
@@ -1380,7 +1404,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       up = p.res;
       const message = (p.whole ? summariseUpstreamError(p.bytes)?.message : undefined) ?? "upstream rate limit";
       quietRefusals = false;
-      const held = startHold(redactText(message, 200), "upstream-429");
+      const held = startHold(`AIS gateway: provider said ${redactText(message, 200)}`, "upstream-429");
       if (held) {
         await discard(up);
         return held;

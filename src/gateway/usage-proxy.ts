@@ -3,6 +3,7 @@ import net from "node:net";
 import { join } from "node:path";
 import { X509Certificate } from "node:crypto";
 import { queryCarriesToken } from "./app.ts";
+import { GATEWAY_ERROR_HEADER, GATEWAY_MESSAGE_PREFIX } from "./errors.ts";
 import { collapseSlashes } from "./routes.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 import { GATEWAY_TOKEN_PREFIX } from "../identities/claude-gateway-entry.ts";
@@ -140,32 +141,32 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
     const o = typeof opts.passthroughOrigin === "function" ? opts.passthroughOrigin(host) : (opts.passthroughOrigin ?? `https://${host}`);
     return o.replace(/\/+$/, "");
   };
-  const denied = (status: number, type: string, message: string): Response => Response.json({ type: "error", error: { type, message } }, { status });
+  const denied = (status: number, type: string, message: string, reason: string): Response => Response.json({ type: "error", error: { type, message: `${GATEWAY_MESSAGE_PREFIX}${message}` } }, { status, headers: { [GATEWAY_ERROR_HEADER]: reason } });
 
   async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const host = url.hostname.toLowerCase();
     const target = Object.hasOwn(INTERCEPTED_HOSTS, host) ? INTERCEPTED_HOSTS[host] : undefined;
     // Not one of ours: never forwarded.
-    if (!target) return new Response("misdirected request\n", { status: 421 });
+    if (!target) return new Response(`${GATEWAY_MESSAGE_PREFIX}misdirected request, this host is not intercepted\n`, { status: 421, headers: { [GATEWAY_ERROR_HEADER]: "misdirected_host" } });
     const path = collapseSlashes(url.pathname);
     const token = tokenOf(req.headers);
     if (token?.startsWith(GATEWAY_TOKEN_PREFIX)) {
       // A gateway token is never handed to the real host, known or not.
       const app = await opts.appForToken(token, target.providers).catch(() => undefined);
-      if (!app) return denied(401, "authentication_error", "invalid AIS gateway token");
+      if (!app) return denied(401, "authentication_error", "invalid gateway token", "bad_token");
       const servePath = (app.provider === "kimi" || app.provider === "zai") && app.style !== "anthropic" ? undefined : target.servePath(req.method, path, app.provider);
       if (servePath === undefined) {
         // On api.anthropic.com a kimi or zai app gets an Anthropic-shaped 404; the other hosts keep their 403.
-        return target.providers.length > 1 ? denied(404, "not_found_error", "not found") : denied(403, "permission_error", "this request is not available with an AIS gateway token");
+        return target.providers.length > 1 ? denied(404, "not_found_error", "this path is not served for a gateway token on this host", "path_not_served") : denied(403, "permission_error", "this request is not available with a gateway token", "path_not_served");
       }
-      const res = await opts.serve(app.name, servePath, req).catch(() => Response.json({ type: "error", error: { type: "api_error", message: "gateway error" } }, { status: 502 }));
+      const res = await opts.serve(app.name, servePath, req).catch(() => Response.json({ type: "error", error: { type: "api_error", message: `${GATEWAY_MESSAGE_PREFIX}the gateway could not answer this request` } }, { status: 502, headers: { [GATEWAY_ERROR_HEADER]: "internal_error" } }));
       log(`gateway: connect-proxy ${host} ${req.method} ${servePath.split("/").slice(0, 3).join("/")} for app ${app.name}: ${res.status}`);
       return res;
     }
     // A gateway token in a place tokenOf did not read (query, extra text, doubled header) is never sent upstream.
     if (queryCarriesToken(url.search) || [...req.headers.values()].some((v) => v.toLowerCase().includes(GATEWAY_TOKEN_PREFIX))) {
-      return denied(401, "authentication_error", "invalid AIS gateway token");
+      return denied(401, "authentication_error", "invalid gateway token", "bad_token");
     }
     const headers = hopClean(req.headers);
     headers.delete("host");
@@ -178,7 +179,7 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
       const res = await doFetch(`${originFor(host)}${url.pathname}${url.search}`, init);
       return new Response(res.body, { status: res.status, statusText: res.statusText, headers: hopClean(res.headers) });
     } catch {
-      return new Response("bad gateway\n", { status: 502 });
+      return new Response(`${GATEWAY_MESSAGE_PREFIX}could not reach the upstream host\n`, { status: 502, headers: { [GATEWAY_ERROR_HEADER]: "upstream_unreachable" } });
     }
   }
 

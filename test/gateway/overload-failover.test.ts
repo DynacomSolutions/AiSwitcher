@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { createGatewayApp, type GatewayDeps } from "../../src/gateway/app.ts";
+import { createGatewayApp, peekFirstEvent, type GatewayDeps } from "../../src/gateway/app.ts";
+import { GatewayCredentialError } from "../../src/gateway/credentials.ts";
 import { GATEWAY_ERROR_HEADER, GATEWAY_UPSTREAM_HEADER } from "../../src/gateway/errors.ts";
 import { firstEventOf } from "../../src/gateway/overload.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
@@ -238,6 +239,135 @@ describe("pool failover on overload and server errors before content", () => {
     expect(who).toHaveLength(2);
     expect(who[0]).not.toBe(who[1]!);
     expect(failovers).toEqual([{ app: "pool", reason: "overloaded" }]);
+  });
+
+  const quota429 = (): Response => new Response("{}", { status: 429, headers: { "content-type": "application/json", "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(Math.floor((T0.getTime() + 3 * HOURS) / 1000)), "retry-after": "10800" } });
+  const three = () => {
+    deps.poolMembers = async () => ["a", "b", "c"];
+    usage = { a: live(10), b: live(20), c: live(30) };
+  };
+
+  test("an error event split across two chunks is still seen", async () => {
+    const whole = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}\n\n`;
+    const cut = 30;
+    handler = (m) =>
+      m === "a"
+        ? new Response(new ReadableStream<Uint8Array>({ async start(c) { c.enqueue(enc.encode(whole.slice(0, cut))); await Bun.sleep(20); c.enqueue(enc.encode(whole.slice(cut))); c.close(); } }), { headers: { "content-type": "text/event-stream" } })
+        : okStream();
+    const res = await post(createGatewayApp(deps), { stream: true });
+    expect(await res.text()).toContain("message_start");
+    expect(who).toEqual(["a", "b"]);
+  });
+
+  test("peekFirstEvent puts every byte it read back in front of the rest", async () => {
+    const whole = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: "x" } })}\n\nevent: ping\ndata: {}\n\n`;
+    const parts = [whole.slice(0, 12), whole.slice(12, 40), whole.slice(40)];
+    const src = new Response(new ReadableStream<Uint8Array>({ start(c) { for (const q of parts) c.enqueue(enc.encode(q)); c.close(); } }), { headers: { "content-type": "text/event-stream", "x-k": "v" } });
+    const p = await peekFirstEvent(src, 64 * 1024);
+    expect(p.first).toMatchObject({ state: "error", errorType: "api_error" });
+    expect(p.res.headers.get("x-k")).toBe("v");
+    expect(await p.res.text()).toBe(whole);
+  });
+
+  test("a stream with CRLF line ends is read the same way", async () => {
+    handler = (m) => (m === "a" ? new Response(`event: error\r\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}\r\n\r\n`, { headers: { "content-type": "text/event-stream" } }) : okStream());
+    const res = await post(createGatewayApp(deps), { stream: true });
+    expect(await res.text()).toContain("message_start");
+    expect(who).toEqual(["a", "b"]);
+    expect(firstEventOf(enc.encode("event: message_start\r\ndata: {}\r\n\r\n")).state).toBe("pass");
+  });
+
+  test("quota then overload then a healthy member: the third member answers", async () => {
+    three();
+    handler = (m) => (m === "a" ? quota429() : m === "b" ? overloaded(529, "req_b") : okStream());
+    const res = await post(createGatewayApp(deps), { stream: true });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("message_start");
+    expect(who).toEqual(["a", "b", "c"]);
+    expect(failovers.map((f) => f.reason)).toEqual(["quota", "overloaded"]);
+  });
+
+  test("overload then quota then a healthy member: the third member answers", async () => {
+    three();
+    handler = (m) => (m === "a" ? overloaded(529, "req_a") : m === "b" ? quota429() : okStream());
+    const res = await post(createGatewayApp(deps), { stream: true });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("message_start");
+    expect(who).toEqual(["a", "b", "c"]);
+    expect(failovers.map((f) => f.reason)).toEqual(["overloaded", "quota"]);
+  });
+
+  test("a credential failure on the first member, an overload on the second, then a healthy third", async () => {
+    three();
+    const get = deps.creds.get.bind(deps.creds);
+    deps.creds = { ...deps.creds, get: async (p: GatewayApp["provider"], id: string) => { if (id === "a") throw new GatewayCredentialError("refresh-failed", p, id); return get(p, id); } } as GatewayDeps["creds"];
+    handler = (m) => (m === "b" ? overloaded(529, "req_b") : okStream());
+    const res = await post(createGatewayApp(deps), { stream: true });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("message_start");
+    expect(who).toEqual(["b", "c"]);
+  });
+
+  test("a body that breaks while it is read does not end the request: the next member answers", async () => {
+    const real = deps.fetch;
+    deps.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const auth = new Headers(init?.headers).get("authorization");
+      if (auth === "Bearer tok-a") {
+        who.push("a");
+        return Promise.resolve(new Response(new ReadableStream<Uint8Array>({ pull(c) { c.error(new Error("connection reset")); } }), { headers: { "content-type": "text/event-stream" } }));
+      }
+      return real(input, init);
+    }) as typeof fetch;
+    const res = await post(createGatewayApp(deps), { stream: true });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("message_start");
+    expect(who).toEqual(["a", "b"]);
+  });
+
+  test("a second member whose body breaks leaves the first member's overload answer standing", async () => {
+    const real = deps.fetch;
+    deps.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const auth = new Headers(init?.headers).get("authorization");
+      if (auth === "Bearer tok-b") {
+        who.push("b");
+        return Promise.resolve(new Response(new ReadableStream<Uint8Array>({ pull(c) { c.error(new Error("connection reset")); } }), { headers: { "content-type": "text/event-stream" } }));
+      }
+      return real(input, init);
+    }) as typeof fetch;
+    handler = () => overloaded(529, "req_a");
+    const res = await post(createGatewayApp(deps));
+    expect(res.status).toBe(529);
+    expect(await res.text()).toBe(OVERLOAD_BODY("req_a"));
+    expect(res.headers.get("request-id")).toBe("req_a");
+    expect(who).toEqual(["a", "b"]);
+  });
+
+  test("a short-hold wait never sends the request back to a member that overloaded", async () => {
+    let bCalls = 0;
+    handler = (m) => (m === "a" ? overloaded(529, "req_a") : bCalls++ === 0 ? new Response("{}", { status: 429, headers: { "content-type": "application/json" } }) : okStream());
+    const res = await post(createGatewayApp(deps), { stream: false });
+    expect(who.filter((m) => m === "a")).toHaveLength(1);
+    expect(who.filter((m) => m === "b").length).toBeLessThanOrEqual(2);
+    expect(res.status).toBe(200);
+  });
+
+  test("the failover log line names the member left and the member tried", async () => {
+    handler = (m) => (m === "a" ? overloaded(529, "req_a") : okStream());
+    await (await post(createGatewayApp(deps))).text();
+    const line = logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return {}; } }).find((l) => l.event === "failover");
+    expect(line).toMatchObject({ from: "a", to: "b" });
+  });
+
+  test("a file upload or a message batch never fails over on an overload", async () => {
+    handler = () => overloaded(529, "req_a");
+    for (const path of ["/pool/v1/files", "/pool/v1/messages/batches"]) {
+      who.length = 0;
+      const res = await createGatewayApp(deps).request(`http://gw.test${path}`, { method: "POST", body: "{}", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" } });
+      expect(res.status).toBe(529);
+      expect(await res.text()).toBe(OVERLOAD_BODY("req_a"));
+      expect(who).toEqual(["a"]);
+    }
+    expect(failovers).toEqual([]);
   });
 
   test("firstEventOf decides on the first event line, waits for a whole error event, and passes odd input", () => {

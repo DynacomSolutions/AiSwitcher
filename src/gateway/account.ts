@@ -1,7 +1,7 @@
 import type { GatewayDeps } from "./app.ts";
 import { upstreamHeaders } from "./app.ts";
 import { GatewayCredentialError } from "./credentials.ts";
-import { GATEWAY_UPSTREAM_HEADER, providerError } from "./errors.ts";
+import { GATEWAY_ERROR_HEADER, GATEWAY_UPSTREAM_HEADER, providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
 import { availableCount, claudeUsageBody, claudeUsageBodyOf, normalisePath, orgSegmentIndex, syntheticClaudeProfile, type AccountOp } from "./routes.ts";
 import { allowedMembers, utilisationOf } from "./select.ts";
@@ -383,7 +383,9 @@ async function pinnedUsage(r: AccountRequest, member: string, url: string, cls: 
     const covered = fallback();
     if (covered) return covered;
     // Claude Code remembers a 429 (and 401, 403) per bearer for about an hour, but not a 5xx: never relay Anthropic's 429.
-    return { res: json({ type: "error", error: { type: "api_error", message: "usage is temporarily unavailable" } }, 503), identity: member, cls };
+    const unavailable = json({ type: "error", error: { type: "api_error", message: "AIS gateway: usage is temporarily unavailable" } }, 503);
+    unavailable.headers.set(GATEWAY_ERROR_HEADER, "usage_unavailable");
+    return { res: unavailable, identity: member, cls };
   }
   return { res: relay(res, r.app.provider), identity: member, cls };
 }

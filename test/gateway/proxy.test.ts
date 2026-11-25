@@ -1860,7 +1860,7 @@ describe("native limit answers", () => {
   test("an upstream 429 whose text already ends in a reset time passes through byte for byte", async () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pin", identity: "id1" } }));
     usage.id1 = live(10);
-    const own = '{"error":{"message":"You\'ve hit your usage limit (AIS gateway: all pool members are at their limit; resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z.","type":"rate_limit_error"}}';
+    const own = '{"error":{"message":"You\'ve hit your usage limit (resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T12:30:00.000Z.","type":"rate_limit_error"}}';
     handler = () => new Response(own, { status: 429, headers: { "content-type": "application/json" } });
     const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);

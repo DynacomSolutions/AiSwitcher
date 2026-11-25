@@ -7,7 +7,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { hostname, networkInterfaces } from "node:os";
 import { ERROR_PEEK_BYTES, GATEWAY_MARK_HEADER, isQuotaBody, peek, readBody, stripHopByHop, upstreamHeaders, type Body } from "./app.ts";
 import { GatewayCredentialError, loginCommand, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
-import { GATEWAY_UPSTREAM_HEADER, providerError } from "./errors.ts";
+import { GATEWAY_ERROR_HEADER, GATEWAY_UPSTREAM_HEADER, providerError } from "./errors.ts";
 import { enableMemberStore } from "../identities/gateway-members.ts";
 import { LOCAL_GATEWAY_ROUTES } from "./local-routes.ts";
 import { ensureLocalTls } from "./local-tls.ts";
@@ -307,7 +307,7 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
 
   function admitted(req: Request, url: URL): Response | undefined {
     const host = (req.headers.get("host") ?? url.host).toLowerCase();
-    if (!deps.allowedHosts().includes(host)) return new Response("forbidden\n", { status: 403 });
+    if (!deps.allowedHosts().includes(host)) return new Response("AIS gateway: this host name is not allowed\n", { status: 403, headers: { [GATEWAY_ERROR_HEADER]: "host_not_allowed" } });
     return undefined;
   }
 
