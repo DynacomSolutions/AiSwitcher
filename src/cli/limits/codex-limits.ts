@@ -166,9 +166,9 @@ const PLAN_PLACEHOLDERS: ReadonlySet<string> = new Set(["unknown", "none", "null
 /** Short display label for the wire's planType (app-server snapshot or
  * wham/usage plan_type). A known plan name keeps its short label. Any other
  * value shows the words of the wire in title case, split on `_` and on
- * whitespace, as `kimiPlanLabel` and `zaiPlanLabel` do. An absent, empty or
- * placeholder value yields undefined. The label is real wire data only: no
- * plan name is invented here. */
+ * whitespace. Each word is title-cased as `kimiPlanLabel` and `zaiPlanLabel`
+ * do. An absent, empty or placeholder value yields undefined. The label is
+ * real wire data only: no plan name is invented here. */
 export function codexPlanLabel(planType: string | null | undefined): string | undefined {
   const value = (planType ?? "").trim();
   const key = value.toLowerCase();
