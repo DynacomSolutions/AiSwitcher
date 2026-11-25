@@ -26,9 +26,10 @@ export async function allowedBindings(identity: string, connected: BrowserBindin
  * identity is `pool:<P>` and the tab group title is the session name alone; the caller was already checked
  * to be a live member of P.
  */
-export function forwardedSession(b: BrowserBinding, identity: string, id: string, label: string): { id: string; identity: string; label: string } {
-  if (b.target.kind !== "pool") return { id, identity, label };
-  return { id, identity: `pool:${b.target.pool}`, label: (label || shortSessionId(id)).slice(0, 80) };
+export function forwardedSession(b: BrowserBinding, identity: string, id: string, label: string, chatId?: string): { id: string; identity: string; label: string; chatId?: string } {
+  const chat = chatId ? { chatId } : {};
+  if (b.target.kind !== "pool") return { id, identity, label, ...chat };
+  return { id, identity: `pool:${b.target.pool}`, label: (label || shortSessionId(id)).slice(0, 80), ...chat };
 }
 
 /** A chat call may use one binding and the tabs linked to the chat. Nothing else. */
@@ -95,6 +96,8 @@ export function createBrowserCaller(deps: CallDeps): (identity: string, body: un
       if (invalid) return reject(400, invalid);
     }
     const label = typeof body.session.label === "string" ? body.session.label.slice(0, 80) : "";
+    // The chat id is optional: an older shim sends none. A malformed one is dropped, never an error.
+    const chatId = typeof body.session.chatId === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body.session.chatId) ? body.session.chatId : undefined;
 
     const connected = deps.hub.connected();
     // A chat scope replaces the identity rules: the one binding that made the chat, and only if it is connected.
@@ -108,7 +111,7 @@ export function createBrowserCaller(deps: CallDeps): (identity: string, body: un
         if (typeof t !== "number" || !scope.linked.has(t)) return fail(id, tool, "forbidden_tab", `Tab ${typeof t === "number" || typeof t === "string" ? String(t).slice(0, 40) : "(none)"} is not linked to this chat.`);
       }
     }
-    const session = (b: BrowserBinding, sid: string): CallRequest["session"] => ({ ...forwardedSession(b, identity, sid, label), ...(scope ? { color: scope.color, chat: true as const } : {}) });
+    const session = (b: BrowserBinding, sid: string): CallRequest["session"] => ({ ...forwardedSession(b, identity, sid, label, scope ? undefined : chatId), ...(scope ? { color: scope.color, chat: true as const } : {}) });
     if (tool === "list_browsers") {
       deps.metrics?.browserCall(tool, "ok", 0);
       return { status: 200, body: { id, ok: true, content: [{ type: "text", text: JSON.stringify(allowed.map(summary)) }] } satisfies CallResult };

@@ -406,10 +406,10 @@ export class Executor {
         this.throwIfAborted(sig);
         const { groupId } = a("close_group");
         if (session.chat === true) throw new ToolError("forbidden_tab", "A chat cannot close a tab group.");
-        const rule = this.tabs.checkClose(session, groupId);
-        if (!rule.ok) throw new ToolError(rule.code, rule.message);
         // The tab set is read once. A tab added to the group later is never closed.
         const members = (await this.api.tabs.query()).filter(t => t.groupId === groupId);
+        const rule = this.tabs.checkClose(session, groupId, members.map(t => t.id));
+        if (!rule.ok) throw new ToolError(rule.code, rule.message);
         if (members.length === 0) throw new ToolError("bad_args", `Group ${groupId} no longer exists or has no tab.`);
         // One tab that this session may not close refuses the whole call, and nothing is closed.
         for (const t of members) {
@@ -426,7 +426,7 @@ export class Executor {
           const refusal = this.closeRefusal(session, t.id);
           if (refusal) throw new ToolError("forbidden_tab", `${refusal} Group ${groupId} is not closed and no tab was closed.`);
         }
-        if (this.tabs.checkClose(session, groupId).ok !== true) throw new ToolError("forbidden_tab", `Group ${groupId} changed. It is not closed and no tab was closed.`);
+        if (this.tabs.checkClose(session, groupId, ids).ok !== true) throw new ToolError("forbidden_tab", `Group ${groupId} changed. It is not closed and no tab was closed.`);
         // A Stop or gateway abort here leaves every tab open.
         this.throwIfAborted(sig);
         // No debugger attach: like a discarded tab, the tabs close in one call. A page that asks "Leave site?" stays open and is reported below.
@@ -482,7 +482,7 @@ export class Executor {
         const closable = meta!.closable;
         const done = await this.tabs.takeGroup(session, groupId, meta!.tabIds, closable);
         if (!done.ok) throw new ToolError(done.code, done.message);
-        return text(JSON.stringify({ groupId, approved: true, tabCount: done.tabCount, note: closable ? "The group is now your own group. You can close its tabs with close_tab, and the session end closes them. A tab that an earlier approval protected stays protected." : "The group is now your own group and every tab is adopted. The session end closes and ungroups none of them." }));
+        return text(JSON.stringify({ groupId, approved: true, tabCount: done.tabCount, ...(done.allowCloseSkipped ? { allowCloseSkipped: true } : {}), note: closable && done.allowCloseSkipped ? "The group is now your own group and every tab is adopted. allowClose was not applied: an earlier approval may protect some tabs and they could not be told apart, so the session end closes none of them." : closable ? "The group is now your own group. You can close its tabs with close_tab, and the session end closes them. A tab that an earlier approval protected stays protected." : "The group is now your own group and every tab is adopted. The session end closes and ungroups none of them." }));
       }
       case "adopt_tab": {
         const { tabId } = a("adopt_tab");
