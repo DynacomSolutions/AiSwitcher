@@ -165,3 +165,31 @@ test("a rotated Kimi token keeps the model lines of the config.toml", async () =
   expect(text).toContain('[models."gateway/x"]');
   expect(text.match(/api_key/g)).toHaveLength(1);
 });
+
+test("gatewayDir moves every instance folder and the default stays under the T3 home", async () => {
+  const dir = join(home, "elsewhere");
+  await run(APPS, { gatewayDir: dir });
+  const s = await settings();
+  expect(s.providerInstances["t3-kimi-pool-acp"].environment[0].value).toBe(join(dir, "t3-kimi-pool-acp"));
+  expect(s.providerInstances["t3-grok-pool"].environment.find((e: { name: string }) => e.name === "GROK_HOME").value).toBe(join(dir, "t3-grok-pool"));
+  expect(await readFile(join(dir, "t3-kimi-pool-acp", "config.toml"), "utf8")).toContain(TOKEN);
+  expect(await readdir(join(home, ".t3", "gateway")).catch(() => [])).toEqual([]);
+});
+
+test("accent colour follows the provider and the pool, and a colour set by hand is kept", async () => {
+  const pin = (name: string, provider: string, identity: string) => app(name, provider, { kind: "pin", identity });
+  const tokenFor = async () => LIVE;
+  const apps = [...APPS, pin("t3-claude-org", "claude", "org"), pin("t3-codex-org", "codex", "org")];
+  await run(apps, { tokenFor });
+  const s = await settings();
+  expect(s.providerInstances[POOL_CLAUDE].accentColor).toBe("#c62d2d");
+  expect(s.providerInstances["codex-pool"].accentColor).toBe("#c62d2d");
+  expect(s.providerInstances["t3-kimi-pool-acp"].accentColor).toBe("#c62d2d");
+  expect(s.providerInstances["t3-claude-org"].accentColor).toBe("#df25eb");
+  expect(s.providerInstances["t3-codex-org"].accentColor).toBe("#c355c6");
+  s.providerInstances["t3-codex-org"].accentColor = "#111111";
+  await writeFile(settingsPath, JSON.stringify(s));
+  await run(apps, { tokenFor });
+  expect((await settings()).providerInstances["t3-codex-org"].accentColor).toBe("#111111");
+  expect((await run(apps, { tokenFor })).every((i) => i.status === "current")).toBe(true);
+});

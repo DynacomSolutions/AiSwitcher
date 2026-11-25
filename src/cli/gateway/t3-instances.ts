@@ -3,7 +3,7 @@ import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import type { GatewayCliDeps } from "./apps.ts";
 
-const USAGE = "Usage: ais gateway t3-instances sync [--check] [--flavour=host|pod] [--binary-dir=<dir>] [--token-dir=<dir>] [--only-missing]";
+const USAGE = "Usage: ais gateway t3-instances sync [--check] [--flavour=host|pod] [--binary-dir=<dir>] [--token-dir=<dir>] [--gateway-dir=<dir>] [--only-missing]";
 
 /**
  * `ais gateway t3-instances sync`: reads the gateway app list now and makes T3 Code's provider instances match it
@@ -17,7 +17,8 @@ export async function runT3InstancesCommand(args: string[], flags: ParsedArgs["f
   if (flavour !== "host" && flavour !== "pod") throw new CliUsageError(`--flavour must be host or pod. ${USAGE}`);
   const binaryDir = stringFlag(flags, "binary-dir");
   const tokenDir = stringFlag(flags, "token-dir");
-  const items = await syncT3InstancesLive(deps, { check, flavour, ...(boolFlag(flags, "only-missing") ? { onlyMissing: true } : {}), ...(binaryDir ? { binaryDir } : {}), ...(tokenDir ? { tokenDir } : {}), ...opts });
+  const gatewayDir = stringFlag(flags, "gateway-dir") ?? (opts.env ?? process.env).AIS_T3_GATEWAY_DIR;
+  const items = await syncT3InstancesLive(deps, { check, flavour, ...(boolFlag(flags, "only-missing") ? { onlyMissing: true } : {}), ...(binaryDir ? { binaryDir } : {}), ...(tokenDir ? { tokenDir } : {}), ...(gatewayDir ? { gatewayDir } : {}), ...opts });
   let differs = 0;
   let failed = 0;
   for (const i of items) {

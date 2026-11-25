@@ -30,6 +30,8 @@ export interface SyncT3InstancesOptions {
   binaryDir?: string;
   home?: string;
   env?: Record<string, string | undefined>;
+  /** Folder that holds one home folder per instance. Default `<T3 home>/gateway` (a pod: its mounted gateway homes). */
+  gatewayDir?: string;
   secretsPath?: string;
   /** A folder that holds one token file per app (`<dir>/<app>`), as in a pod. Without it the secrets file is read. */
   tokenDir?: string;
@@ -90,7 +92,7 @@ interface Ctx {
   now: () => number;
 }
 
-const folderOf = (c: Ctx, id: string): string => join(c.t3Home, "gateway", id);
+const folderOf = (c: Ctx, id: string): string => join(c.o.gatewayDir ?? join(c.t3Home, "gateway"), id);
 
 /** Writes one entry into settings.json (backup kept). Returns whether it differs from the current one. */
 async function putEntry(c: Ctx, id: string, build: (existing: Json | undefined) => Json): Promise<boolean> {
@@ -124,12 +126,28 @@ async function claudeSource(c: Ctx, id: string): Promise<T3InstanceOptions["sour
   return "none";
 }
 
+const POOL_ACCENT = "#c62d2d";
+const PIN_ACCENT: Record<string, string> = { claude: "#df25eb", codex: "#c355c6" };
+
+/** Gives an instance its provider accent colour when it has none. A colour set by hand stays. */
+async function putAccent(c: Ctx, p: PlannedInstance, item: SyncItem): Promise<SyncItem> {
+  const colour = p.who === "pool" ? POOL_ACCENT : PIN_ACCENT[p.provider];
+  if (!colour || item.status === "skipped" || item.status === "failed") return item;
+  if (c.check && item.status === "created") return item;
+  const changed = await putEntry(c, p.id, (existing) => (existing && typeof existing.accentColor !== "string" ? { ...existing, accentColor: colour } : (existing ?? {})));
+  return changed && item.status === "current" ? { ...item, status: "updated" } : item;
+}
+
 async function applyOne(c: Ctx, p: PlannedInstance): Promise<SyncItem> {
+  return putAccent(c, p, await applyInstance(c, p));
+}
+
+async function applyInstance(c: Ctx, p: PlannedInstance): Promise<SyncItem> {
   if (c.o.onlyMissing && (await hasInstance(c, p.id))) return { id: p.id, status: "current" };
   const url = `${c.o.gatewayRoot.replace(/\/+$/, "")}/${p.app}`;
   const token = c.o.tokenFor ? (await c.o.tokenFor(p.app))?.trim() : c.o.tokenDir ? (await fileText(join(c.o.tokenDir, p.app)))?.trim() : await readSecretsKey(appTokenKey(p.app), c.o.secretsPath);
   if (!token || !token.startsWith(GATEWAY_TOKEN_PREFIX)) return { id: p.id, status: "skipped", detail: `no gateway token for app ${p.app}` };
-  const base = { token, home: c.home, ...(c.o.env ? { env: c.o.env } : {}), ...(c.o.secretsPath ? { secretsPath: c.o.secretsPath } : {}), check: c.check, now: c.now };
+  const base = { token, home: c.home, ...(c.o.gatewayDir ? { gatewayDir: c.o.gatewayDir } : {}), ...(c.o.env ? { env: c.o.env } : {}), ...(c.o.secretsPath ? { secretsPath: c.o.secretsPath } : {}), check: c.check, now: c.now };
   const viaWriter = async (driver: InstanceDriver, extra: Partial<T3InstanceOptions> = {}): Promise<SyncItem> => {
     const r = await applyT3Instance({ id: p.id, driver, app: p.app, gatewayUrl: url, name: displayName(p), binary: c.bin(driver === "claude" ? "claude" : driver), ...base, ...extra });
     return { id: p.id, status: r.status === "absent" ? "current" : r.status, ...(r.warnings?.length ? { detail: r.warnings.join("; ") } : {}) };

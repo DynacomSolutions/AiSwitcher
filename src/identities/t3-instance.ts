@@ -41,6 +41,8 @@ export interface T3InstanceOptions {
   caPath?: string;
   home?: string;
   env?: Record<string, string | undefined>;
+  /** Folder that holds one home folder per instance. Default: `<T3 home>/gateway`. */
+  gatewayDir?: string;
   secretsPath?: string;
   /** The app token, when the caller has it (a pod reads it from a mounted file). Without it the secrets file is read. */
   token?: string;
@@ -243,7 +245,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
   const t3Home = t3Paths({ home, ...(opts.env ? { env: opts.env } : {}) }).t3Home;
   const settingsPath = join(t3Home, "userdata", "settings.json");
   const backupsDir = join(t3Home, "backups");
-  const folder = join(t3Home, "gateway", opts.id);
+  const folder = join(opts.gatewayDir ?? join(t3Home, "gateway"), opts.id);
   const check = opts.check === true;
   const now = (opts.now ?? Date.now)();
 
