@@ -69,11 +69,23 @@ describe("failureName", () => {
 test("redactText removes id.secret keys and the value after a secret-looking name, and keeps the name", () => {
   const idKey = `${"0123456789abcdef".repeat(2)}.${"AbCdEfGh".repeat(2)}`; // built here, not written out: no key-shaped literal
   expect(redactText(`auth failed for ${idKey} today`)).toBe("auth failed for [redacted] today");
-  expect(redactText("api_key=short1 and apikey: v2 and API-KEY = v3")).toBe("api_key=[redacted] and apikey: [redacted] and API-KEY = [redacted]");
-  expect(redactText("password: hunter2 secret=abc token:xyz")).toBe("password: [redacted] secret=[redacted] token:[redacted]");
-  expect(redactText("x-api-key: abc123 client_secret=abc")).toBe("x-api-key: [redacted] client_secret=[redacted]");
-  expect(redactText('{"token":"abc","n":1}')).toBe('{"token":[redacted]');
+  expect(redactText("api_key=short1 and apikey: v2 and API-KEY = v3")).toBe("api_key=[redacted] and apikey: v2 and API-KEY = v3"); // `v2`, `v3` are too short to be secrets
+  expect(redactText("password: hunter2 secret=abc token:xyz")).toBe("password: [redacted] secret=abc token:xyz");
+  expect(redactText("x-api-key: abc123def client_secret=abcdefghijkl")).toBe("x-api-key: [redacted] client_secret=[redacted]");
   expect(redactText("authorization: Bearer abc_SYNTHETIC_FIXTURE_123")).not.toContain("SYNTHETIC_FIXTURE");
+  // JSON: the value goes, the quotes and the rest stay
+  expect(redactText('{"token":"abc12345","n":1}')).toBe('{"token":"[redacted]","n":1}');
+  expect(redactText('{"apiKey":"abc123","model":"glm-4.6"}')).toBe('{"apiKey":"[redacted]","model":"glm-4.6"}');
+  expect(redactText('{"authorization":"Zq7xK9mLp2Rt"} tail')).toBe('{"authorization":"[redacted]"} tail');
+  expect(redactText('{\\"apiKey\\":\\"abc123\\",\\"model\\":\\"glm\\"}')).toBe('{\\"apiKey\\":\\"[redacted]\\",\\"model\\":\\"glm\\"}');
+  expect(redactText("secret=hunter2; next=1")).toBe("secret=[redacted]; next=1");
+  // the reason stays: words and numbers after a secret-looking name are not secrets
+  expect(redactText("Invalid token: expired, please sign in again")).toBe("Invalid token: expired, please sign in again");
+  expect(redactText("token: counting failed")).toBe("token: counting failed");
+  expect(redactText("prompt token=12345 over limit")).toBe("prompt token=12345 over limit");
+  expect(redactText("max_tokens: 4096 exceeded")).toBe("max_tokens: 4096 exceeded");
+  expect(redactText("password reset required")).toBe("password reset required");
+  expect(redactText('{"error":{"message":"bad token:x","type":"auth_error","code":401}}')).toBe('{"error":{"message":"bad token:x","type":"auth_error","code":401}}');
   // plain words are not changed
   expect(redactText("max_tokens exceeded, token limit reached")).toBe("max_tokens exceeded, token limit reached");
 });
