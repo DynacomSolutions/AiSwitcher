@@ -19,14 +19,27 @@ const REDACTIONS: Array<[RegExp, string]> = [
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g, "[redacted]"], // JWT
   [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, "$1 [redacted]"],
   [/\b(?:aisg|sk|pk|rk|xai|gsk|ghp|gho|ghs|key)[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]"], // prefixed API keys and gateway tokens
+  [/\b[0-9a-f]{32}\.[A-Za-z0-9]{16}\b/g, "[redacted]"], // id.secret API keys
   [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[email]"],
   [/[A-Za-z0-9+/_=-]{40,}/g, "[redacted]"], // long opaque runs: tokens, base64 data
 ];
+
+/**
+ * `name: value`, `name=value` and JSON `"name":"value"` (also with escaped quotes). The name, the quotes and the text after the value stay.
+ * The value ends at a quote, comma, semicolon, closing brace or space, and goes only when it looks like a secret.
+ */
+const NAMED_SECRET = /(\b[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|authorization)\\?["']?\s*[:=]\s*\\?["']?)([^\s"',;}\\]+)/gi;
+
+/** A value that looks like a secret: 12 or more characters, or letters mixed with digits (5 or more). Words such as `expired` and numbers such as `4096` are not. */
+function looksSecret(value: string): boolean {
+  return value.length >= 12 || (value.length >= 5 && /[A-Za-z]/.test(value) && /\d/.test(value));
+}
 
 /** `s` with credential-shaped text removed, control characters and runs of spaces collapsed, cut to `max` characters. */
 export function redactText(s: string, max = ERROR_MESSAGE_MAX): string {
   let out = s.replace(/[\u0000-\u001f\u007f]+/g, " ");
   for (const [re, to] of REDACTIONS) out = out.replace(re, to);
+  out = out.replace(NAMED_SECRET, (all, name: string, value: string) => (looksSecret(value) ? `${name}[redacted]` : all));
   out = out.replace(/\s+/g, " ").trim();
   return out.length > max ? `${out.slice(0, max - 1)}…` : out;
 }

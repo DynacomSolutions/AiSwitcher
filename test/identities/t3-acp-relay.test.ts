@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayCliDeps } from "../../src/cli/gateway/apps.ts";
 import { runAcpRelayProcess, runT3AcpCommand } from "../../src/cli/gateway/t3-acp.ts";
-import { acpRelayPaths, aisHasRelay, checkAcpRelay, compareVersions, installAcpRelay, launcherSource, removeAcpRelay, resolveAgentInstall } from "../../src/identities/t3-acp-relay.ts";
+import { syncT3GatewayModels, zcodeConfigPathFromCommand, zcodeLauncherOriginal } from "../../src/identities/t3-gateway-models.ts";
+import { acpRelayPaths, aisHasRelay, checkAcpRelay, compareVersions, installAcpRelay, launcherSource, removeAcpRelay, resolveAgentInstall, zcodeLauncherPath, zcodeLauncherSource } from "../../src/identities/t3-acp-relay.ts";
 
 const root = await mkdtemp(join(tmpdir(), "ais-t3acp-"));
 afterAll(() => rm(root, { recursive: true, force: true }));
@@ -240,7 +241,7 @@ test("the command reports each instance, and --check fails when something is mis
   expect((await cli(h, { remove: true })).at(-1)).toContain("t3-acp: removed");
   expect(await cli(h, { remove: true })).toEqual(["t3-acp: nothing to remove"]);
   const none = await host({ c: { driver: "claudeAgent", config: {} } });
-  expect(await cli(none)).toEqual(["t3-acp: no T3 Code provider instance of kimi-code, grok-build or glm-acp-agent"]);
+  expect(await cli(none)).toEqual(["t3-acp: no T3 Code provider instance of kimi-code, grok-build, glm-acp-agent or ZCode"]);
   await chmod(h.settings, 0o644);
 });
 
@@ -274,4 +275,191 @@ test("the relay command: --supported, and no agent to run", async () => {
   } finally {
     process.stderr.write = err;
   }
+});
+
+// ZCode: a local-source instance whose commandPath is the ZCode launcher script.
+const ZCODE_LAUNCHER_TEXT = '#!/bin/sh\nexport ZCODE_HOME="$HOME/.zcode"\nexport ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.zcode/v2/provider_config.json"\nexec /usr/bin/node server.js "$@"\n';
+
+const zl = (h: Host & { original: string }): string => zcodeLauncherPath(acpRelayPaths(h.opts).launchers, h.original);
+
+async function zcodeHost(withAis = true): Promise<Host & { original: string }> {
+  const h = await host({}, withAis);
+  const original = join(h.home, ".local", "share", "zcode", "zcode-acp-launch");
+  await mkdir(join(h.home, ".local", "share", "zcode"), { recursive: true });
+  await writeFile(original, ZCODE_LAUNCHER_TEXT, { mode: 0o755 });
+  await writeFile(h.settings, `${JSON.stringify({ theme: "dark", providerInstances: { zc: { driver: "acpRegistry", enabled: true, config: { source: "local", commandPath: original, commandArgs: [] } }, mine: { driver: "acpRegistry", config: { source: "local", commandPath: "/opt/other-agent" } } } }, null, 2)}\n`);
+  return { ...h, original };
+}
+
+test("zcode: the instance's launcher moves behind the relay, a re-run changes nothing, --check passes", async () => {
+  const h = await zcodeHost();
+  const r = await installAcpRelay(h.opts);
+  expect(r.instances).toEqual([{ instance: "zc", agentId: "zcode", status: "set" }]);
+  const launcher = zcodeLauncherPath(acpRelayPaths(h.opts).launchers, h.original);
+  expect(launcher).toMatch(/\/zcode-[0-9a-f]{8}$/);
+  expect((await h.read()).providerInstances.zc.config).toEqual({ source: "local", commandPath: launcher, commandArgs: [] });
+  expect((await h.read()).providerInstances.mine.config.commandPath).toBe("/opt/other-agent"); // not a ZCode launcher: left alone
+  const text = await readFile(launcher, "utf8");
+  expect(text).toBe(zcodeLauncherSource(join(h.home, ".local", "bin", "ais"), h.original));
+  expect(zcodeLauncherOriginal(text)).toBe(h.original);
+  expect(text).toContain('__acp_relay --supported=binary');
+  expect(text).toContain('__acp_relay zcode "--binary=$ORIGINAL"');
+  expect(text).not.toContain("--fallback");
+  expect((await stat(launcher)).mode & 0o777).toBe(0o755);
+  // idempotent: the settings file and the launcher stay as they are
+  const settingsAfter = await readFile(h.settings, "utf8");
+  const again = await installAcpRelay(h.opts);
+  expect(again.changed).toBe(false);
+  expect(again.instances).toEqual([{ instance: "zc", agentId: "zcode", status: "current" }]);
+  expect(await readFile(h.settings, "utf8")).toBe(settingsAfter);
+  expect(await readFile(launcher, "utf8")).toBe(text);
+  expect(await checkAcpRelay(h.opts)).toEqual([]);
+  // the original launcher is never changed
+  expect(await readFile(h.original, "utf8")).toBe(ZCODE_LAUNCHER_TEXT);
+});
+
+test("zcode: --check says what is wrong", async () => {
+  const h = await zcodeHost();
+  expect(await checkAcpRelay(h.opts)).toEqual(["zc (zcode): the relay is not set"]);
+  await installAcpRelay(h.opts);
+  await rm(join(h.home, ".local", "bin", "ais"));
+  expect(await checkAcpRelay(h.opts)).toEqual([`zcode: ${join(h.home, ".local", "bin", "ais")} is missing, so the agent starts without the relay`]);
+  await writeFile(join(h.home, ".local", "bin", "ais"), "#!/bin/sh\n", { mode: 0o755 });
+  await writeFile(zl(h), "#!/bin/sh\n# edited\n");
+  expect(await checkAcpRelay(h.opts)).toEqual([`zcode: the launcher ${zl(h)} does not record its original launcher`]);
+  await installAcpRelay(h.opts); // an edited generated launcher is not repaired by a re-run: it no longer names the original
+  expect((await readFile(zl(h), "utf8")).includes("edited")).toBe(true);
+});
+
+test("zcode: --remove puts the original launcher back and deletes the generated one", async () => {
+  const h = await zcodeHost();
+  await installAcpRelay(h.opts);
+  const r = await removeAcpRelay(h.opts);
+  expect(r.instances).toEqual([{ instance: "zc", agentId: "zcode", status: "removed" }]);
+  expect((await h.read()).providerInstances.zc.config).toEqual({ source: "local", commandPath: h.original, commandArgs: [] });
+  expect(await stat(zl(h)).catch(() => undefined)).toBeUndefined();
+  expect((await removeAcpRelay(h.opts)).changed).toBe(false);
+  // after a remove, a new install works again
+  expect((await installAcpRelay(h.opts)).changed).toBe(true);
+});
+
+test("zcode: the generated launcher starts the relay, or the original directly when ais is missing", async () => {
+  const h = await zcodeHost(false);
+  await writeFile(h.original, '#!/bin/sh\nexport ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=/x/c.json\nprintf "orig:%s|" "$@"\n', { mode: 0o755 });
+  await installAcpRelay(h.opts);
+  expect(Bun.spawnSync([zl(h), "a b", "c"]).stdout.toString()).toBe("orig:a b|orig:c|");
+  await mkdir(join(h.home, ".local", "bin"), { recursive: true });
+  await writeFile(join(h.home, ".local", "bin", "ais"), '#!/bin/sh\nprintf "ais:%s|" "$@"\n', { mode: 0o755 });
+  expect(Bun.spawnSync([zl(h), "a b"]).stdout.toString()).toBe(`ais:__acp_relay|ais:zcode|ais:--binary=${h.original}|ais:a b|`);
+  await writeFile(join(h.home, ".local", "bin", "ais"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  expect(Bun.spawnSync([zl(h), "x"]).stdout.toString()).toBe("orig:x|");
+});
+
+test("zcode: the model-list sync still finds the config through the generated launcher", async () => {
+  const h = await zcodeHost();
+  await installAcpRelay(h.opts);
+  expect(zcodeLauncherSource("/x/ais", h.original)).not.toContain("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE");
+  expect(await zcodeConfigPathFromCommand(zl(h), h.home)).toBe(join(h.home, ".zcode", "v2", "provider_config.json"));
+  expect(await zcodeConfigPathFromCommand(h.original, h.home)).toBe(join(h.home, ".zcode", "v2", "provider_config.json"));
+  expect(await zcodeConfigPathFromCommand("/no/such/launcher", h.home)).toBeUndefined();
+  // end to end: sync reads the provider config named by the original launcher and updates it
+  const configDir = join(h.home, ".zcode", "v2");
+  await mkdir(configDir, { recursive: true });
+  const configFile = join(configDir, "provider_config.json");
+  const rule = { providerId: "ais-gateway", config: { personalModelIds: ["glm-old"], modelOrder: ["glm-old"], access: { type: "api-key", apiKey: "aisg_SYNTHETIC_FIXTURE_zcode" }, api: { type: "openai-chat-completions", baseUrl: "https://gw.example.test/gateway/t3-zai/v1" } } };
+  await writeFile(configFile, JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [rule] }, modelConfigRules: { providerModelRules: [], manualProviderModelRules: [] }, defaultModelSelection: { providerId: "ais-gateway", modelId: "glm-old" } } }));
+  const fetchStub = (async () => new Response(JSON.stringify({ data: [{ id: "glm-5.3" }] }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+  const results = await syncT3GatewayModels({ home: h.home, env: {}, fetch: fetchStub });
+  expect(results.map((x) => [x.provider, x.status])).toEqual([["ais-gateway", "updated"]]);
+  expect(JSON.parse(await readFile(configFile, "utf8")).config.providerConfigRules.providerRules[0].config.personalModelIds).toEqual(["glm-5.3"]);
+});
+
+test("zcode: the command reports the instance", async () => {
+  const h = await zcodeHost();
+  const out = await cli(h);
+  expect(out[0]).toBe("t3-acp: zc (zcode): relay set");
+  expect((await cli(h, { check: true }))).toEqual(["t3-acp: in place"]);
+  expect((await cli(h, { remove: true })).at(-1)).toContain("t3-acp: removed");
+});
+
+test("zcode: an instance moved off a legacy or old-hash launcher gets the new one, and the old file is deleted", async () => {
+  const h = await zcodeHost();
+  const launchers = acpRelayPaths(h.opts).launchers;
+  await mkdir(launchers, { recursive: true });
+  const legacy = join(launchers, "zcode"); // the plain launcher of an early build
+  const oldHash = join(launchers, "zcode-00000000"); // a launcher from an older hash scheme
+  await writeFile(legacy, zcodeLauncherSource(join(h.home, ".local", "bin", "ais"), h.original), { mode: 0o755 });
+  await writeFile(oldHash, zcodeLauncherSource(join(h.home, ".local", "bin", "ais"), h.original), { mode: 0o755 });
+  const settings = await h.read();
+  settings.providerInstances.zc.config.commandPath = legacy;
+  settings.providerInstances.old = { driver: "acpRegistry", enabled: true, config: { source: "local", commandPath: oldHash, commandArgs: [] } };
+  await writeFile(h.settings, `${JSON.stringify(settings, null, 2)}\n`);
+
+  const r = await installAcpRelay(h.opts);
+  expect(r.instances.map((x) => x.status)).toEqual(["set", "set"]);
+  const now = await h.read();
+  expect(now.providerInstances.zc.config.commandPath).toBe(zl(h));
+  expect(now.providerInstances.old.config.commandPath).toBe(zl(h));
+  expect(await stat(zl(h))).toBeDefined();
+  expect(await stat(legacy).catch(() => undefined)).toBeUndefined();
+  expect(await stat(oldHash).catch(() => undefined)).toBeUndefined();
+  expect((await installAcpRelay(h.opts)).changed).toBe(false);
+});
+
+test("zcode: two instances with different launchers each keep their own generated launcher and original", async () => {
+  const h = await zcodeHost();
+  const second = join(h.home, ".local", "share", "zcode-b", "zcode-acp-launch");
+  await mkdir(join(h.home, ".local", "share", "zcode-b"), { recursive: true });
+  const textB = ZCODE_LAUNCHER_TEXT.replace("$HOME/.zcode/v2", "$HOME/.zcode-b/v2");
+  await writeFile(second, textB, { mode: 0o755 });
+  const settings = await h.read();
+  settings.providerInstances.zb = { driver: "acpRegistry", enabled: true, config: { source: "local", commandPath: second, commandArgs: [] } };
+  await writeFile(h.settings, `${JSON.stringify(settings, null, 2)}\n`);
+  const launchers = acpRelayPaths(h.opts).launchers;
+  const lA = zcodeLauncherPath(launchers, h.original);
+  const lB = zcodeLauncherPath(launchers, second);
+  expect(lA).not.toBe(lB);
+
+  const r = await installAcpRelay(h.opts);
+  expect(r.instances).toEqual([
+    { instance: "zc", agentId: "zcode", status: "set" },
+    { instance: "zb", agentId: "zcode", status: "set" },
+  ]);
+  let now = await h.read();
+  expect(now.providerInstances.zc.config.commandPath).toBe(lA);
+  expect(now.providerInstances.zb.config.commandPath).toBe(lB);
+  expect(zcodeLauncherOriginal(await readFile(lA, "utf8"))).toBe(h.original);
+  expect(zcodeLauncherOriginal(await readFile(lB, "utf8"))).toBe(second);
+
+  // idempotent: nothing changes, the launchers keep their own original
+  const settingsAfter = await readFile(h.settings, "utf8");
+  const again = await installAcpRelay(h.opts);
+  expect(again.changed).toBe(false);
+  expect(again.instances.map((x) => x.status)).toEqual(["current", "current"]);
+  expect(await readFile(h.settings, "utf8")).toBe(settingsAfter);
+  expect(zcodeLauncherOriginal(await readFile(lA, "utf8"))).toBe(h.original);
+  expect(zcodeLauncherOriginal(await readFile(lB, "utf8"))).toBe(second);
+  expect(await checkAcpRelay(h.opts)).toEqual([]);
+
+  // the model sync follows each launcher to its own provider config
+  expect(await zcodeConfigPathFromCommand(lA, h.home)).toBe(join(h.home, ".zcode", "v2", "provider_config.json"));
+  expect(await zcodeConfigPathFromCommand(lB, h.home)).toBe(join(h.home, ".zcode-b", "v2", "provider_config.json"));
+
+  // --check names the instance whose launcher is gone
+  await rm(lB);
+  expect(await checkAcpRelay(h.opts)).toEqual([`zcode: the launcher ${lB} does not record its original launcher`]);
+  await writeFile(lB, zcodeLauncherSource(join(h.home, ".local", "bin", "ais"), second), { mode: 0o755 });
+
+  // --remove restores each exact original
+  const removed = await removeAcpRelay(h.opts);
+  expect(removed.instances).toEqual([
+    { instance: "zc", agentId: "zcode", status: "removed" },
+    { instance: "zb", agentId: "zcode", status: "removed" },
+  ]);
+  now = await h.read();
+  expect(now.providerInstances.zc.config.commandPath).toBe(h.original);
+  expect(now.providerInstances.zb.config.commandPath).toBe(second);
+  expect(await stat(lA).catch(() => undefined)).toBeUndefined();
+  expect(await readFile(h.original, "utf8")).toBe(ZCODE_LAUNCHER_TEXT);
+  expect(await readFile(second, "utf8")).toBe(textB);
 });

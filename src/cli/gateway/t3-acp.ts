@@ -1,5 +1,5 @@
 import { adapterFor, runAcpRelay } from "../../acp/relay-process.ts";
-import { checkAcpRelay, installAcpRelay, removeAcpRelay, resolveAgentInstall, type AcpRelayOptions, type AcpRelayResult } from "../../identities/t3-acp-relay.ts";
+import { checkAcpRelay, installAcpRelay, removeAcpRelay, resolveAgentInstall, ZCODE_AGENT_ID, type AcpRelayOptions, type AcpRelayResult } from "../../identities/t3-acp-relay.ts";
 import { boolFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import type { GatewayCliDeps } from "./apps.ts";
@@ -16,7 +16,7 @@ function report(r: AcpRelayResult, out: (line: string) => void): void {
 
 /**
  * `ais gateway t3-acp [--check] [--remove]`: starts T3 Code's ACP registry agents (kimi-code, grok-build, glm-acp-agent)
- * behind the AIS relay, so a failed turn shows its reason in the thread (src/identities/t3-acp-relay.ts). `--check`
+ * and the ZCode ACP launcher behind the AIS relay, so a failed turn shows its reason in the thread (src/identities/t3-acp-relay.ts). `--check`
  * writes nothing and fails when something is not in place; `--remove` undoes it. T3 Code is never restarted here: it
  * reads its settings file again by itself, and sessions started after that use the relay.
  */
@@ -39,7 +39,7 @@ export async function runT3AcpCommand(args: string[], flags: ParsedArgs["flags"]
   }
   const r = await installAcpRelay(opts);
   if (r.instances.length === 0) {
-    deps.out("t3-acp: no T3 Code provider instance of kimi-code, grok-build or glm-acp-agent");
+    deps.out("t3-acp: no T3 Code provider instance of kimi-code, grok-build, glm-acp-agent or ZCode");
     return;
   }
   report(r, deps.out);
@@ -47,9 +47,10 @@ export async function runT3AcpCommand(args: string[], flags: ParsedArgs["flags"]
 }
 
 /**
- * `ais __acp_relay <agentId> [--fallback=<executable>] [agent arguments]`: what a launcher starts. Takes the agent's
- * place on stdin and stdout and runs the agent T3 Code installed behind the relay; with no install record it runs the
- * fallback executable. Prints nothing to stdout itself. `ais __acp_relay --supported` only exits 0: a launcher asks it
+ * `ais __acp_relay <agentId> [--binary=<executable> | --fallback=<executable>] [agent arguments]`: what a launcher starts.
+ * Takes the agent's place on stdin and stdout and runs the agent T3 Code installed behind the relay; with no install
+ * record it runs the fallback executable. `--binary=` runs exactly that executable (the ZCode and grok launchers use it,
+ * so a T3 install record never wins over the launcher that exports the ZCode config). Prints nothing to stdout itself. `ais __acp_relay --supported` only exits 0: a launcher asks it
  * before it hands the agent over, because an ais without the relay fails on this command.
  */
 export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions = {}): Promise<number> {
@@ -75,5 +76,6 @@ export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions =
   if (install.binDirectory) env.PATH = `${install.binDirectory}${process.platform === "win32" ? ";" : ":"}${env.PATH ?? ""}`;
   const adapter = adapterFor(agentId, env);
   // The idle-permission answer was measured with kimi-code only; other agents keep their own wake turns and approval mode.
-  return runAcpRelay({ command: install.executable, args: agentArgs, env, ...(adapter ? { adapter } : {}), ...(agentId === "kimi-code" ? {} : { answerIdlePermissions: false }) });
+  // zcode: plain pass-through plus the error for a prompt left open when the agent ends (no adapter, no limit snooze).
+  return runAcpRelay({ command: install.executable, args: agentArgs, env, agentName: agentId, ...(adapter ? { adapter } : {}), ...(agentId === "kimi-code" ? {} : { answerIdlePermissions: false }), ...(agentId === ZCODE_AGENT_ID ? { limit: false as const } : {}) });
 }

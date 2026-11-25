@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { kimiAdapter } from "../../src/acp/kimi-turn.ts";
-import { adapterFor, runAcpRelay } from "../../src/acp/relay-process.ts";
+import { adapterFor, agentEndMessage, END_MESSAGE_MAX, runAcpRelay, type RelayProcessOptions } from "../../src/acp/relay-process.ts";
 import { EMPTY_TURN_NOTICE, TURN_FAILED_CODE } from "../../src/acp/relay.ts";
 import { LimitSnoozer, type McpCaller, type McpEndpoint } from "../../src/acp/limit-snooze.ts";
 
@@ -47,6 +47,11 @@ process.stdin.on("data", (d) => {
       else if (text === "burst") { openPrompt = m.id; retrying(process.env.FAKE_BURST_RESET); } // short reset, no snooze
       else if (text === "rpc") send({ jsonrpc: "2.0", id: m.id, error: { code: -32603, message: "Internal error", data: { details: "API error (status 500): upstream down" } } });
       else if (text === "exit") process.exit(7);
+      else if (text === "die") { process.stderr.write("boom: out of memory SYNTHETIC_FIXTURE\\n"); process.kill(process.pid, "SIGKILL"); }
+      else if (text === "fail7") { process.stderr.write("fatal: cannot read config key=sk-SYNTHETIC_FIXTURE_abcdefgh1234\\n"); process.exit(1); }
+      else if (text === "hang") { openPrompt = m.id; fs.writeFileSync(process.env.FAKE_SEEN + ".ready", "1"); }
+      else if (text === "stubborn") { openPrompt = m.id; process.on("SIGTERM", () => {}); fs.writeFileSync(process.env.FAKE_SEEN + ".ready", "1"); }
+      else if (text === "answer-then-exit") { send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } }); setTimeout(() => process.exit(3), 20); }
       else if (text === "wake") { send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } }); setTimeout(() => send({ jsonrpc: "2.0", id: "perm-1", method: "session/request_permission", params: { sessionId: "session_fake", options: [{ optionId: "approve", name: "Approve once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }], toolCall: { toolCallId: "t1", title: "Bash" } } }), 50); }
     } else if (m.method === "session/cancel") {
       ended("cancelled");
@@ -60,7 +65,7 @@ process.stdin.on("data", (d) => {
 process.stdin.on("end", () => process.exit(0));
 `;
 
-async function start(name: string, opts: { limit?: LimitSnoozer; inTurnWatchMs?: number } = {}) {
+async function start(name: string, opts: { limit?: LimitSnoozer; inTurnWatchMs?: number; extra?: Partial<RelayProcessOptions> } = {}) {
   const reset = new Date(Date.now() + 3 * 3600_000).toISOString(); // a long reset, over the two-minute horizon
   const burstReset = new Date(Date.now() + 30_000).toISOString(); // a short burst reset, under the horizon
   const dir = join(root, name);
@@ -86,6 +91,9 @@ async function start(name: string, opts: { limit?: LimitSnoozer; inTurnWatchMs?:
     wake?.();
   });
   const notes: string[] = [];
+  const stderr = new PassThrough();
+  let errText = "";
+  stderr.on("data", (d: Buffer) => (errText += d.toString("utf8")));
   const exit = runAcpRelay({
     command: process.execPath,
     args: [script, "acp", "--flag=value with space"],
@@ -94,6 +102,9 @@ async function start(name: string, opts: { limit?: LimitSnoozer; inTurnWatchMs?:
     stdin,
     stdout,
     log: (l) => notes.push(l),
+    stderr,
+    agentName: "zcode",
+    ...(opts.extra ?? {}),
     ...(opts.limit ? { limit: opts.limit } : {}),
     ...(opts.inTurnWatchMs !== undefined ? { inTurnWatchMs: opts.inTurnWatchMs } : {}),
   });
@@ -114,7 +125,7 @@ async function start(name: string, opts: { limit?: LimitSnoozer; inTurnWatchMs?:
   };
   const send = (o: unknown) => stdin.write(`${JSON.stringify(o)}\n`);
   const prompt = (id: number, text: string) => send({ jsonrpc: "2.0", id, method: "session/prompt", params: { sessionId: "session_fake", prompt: [{ type: "text", text }] } });
-  return { stdin, send, prompt, next, exit, notes, seen, lines, reset, burstReset };
+  return { stdin, send, prompt, next, exit, notes, seen, lines, reset, burstReset, stderrText: () => errText };
 }
 
 test("a client talks to the agent through the relay: failed, good, empty and error turns", async () => {
@@ -185,6 +196,277 @@ test("the relay ends with the agent's exit code", async () => {
   a.prompt(1, "exit");
   expect(await a.exit).toBe(7);
 }, 30_000);
+
+/** Waits until the stand-in agent has the open prompt (a loaded host can start it late). */
+async function ready(a: { seen: string }): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (!(await Bun.file(`${a.seen}.ready`).exists())) {
+    if (Date.now() > deadline) throw new Error("the agent never got the prompt");
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+describe("an agent that ends with a prompt open", () => {
+  test("it exits with a code: each open prompt gets one error with the reason, and stderr still reaches the client", async () => {
+    const a = await start("end-code");
+    a.prompt(1, "hang");
+    a.prompt(2, "fail7"); // the agent exits at this prompt; prompt 1 is open too
+    expect(await a.exit).toBe(1);
+    const answers = a.lines.map((l) => JSON.parse(l));
+    expect(answers.map((x) => x.id).sort()).toEqual([1, 2]);
+    for (const x of answers) {
+      expect(x.error.code).toBe(TURN_FAILED_CODE);
+      expect(x.error.message).toContain("The ACP agent zcode stopped during the turn: it exited with code 1.");
+      expect(x.error.message).toContain("Last agent output: fatal: cannot read config key=");
+      expect(x.error.message).not.toContain("SYNTHETIC_FIXTURE_abcdefgh1234"); // redacted
+      expect(x.error.message.length).toBeLessThan(END_MESSAGE_MAX);
+      expect(x.error.data).toMatchObject({ source: "ais-acp-relay", reason: "agent_ended", exitCode: 1 });
+    }
+    expect(a.stderrText()).toContain("fatal: cannot read config key="); // the client still gets the agent's stderr, unchanged
+    expect(a.stderrText()).toContain("sk-SYNTHETIC_FIXTURE_abcdefgh1234");
+  }, 30_000);
+
+  test("it is ended by a signal the relay never saw: the message says only the agent was stopped", async () => {
+    const a = await start("end-signal");
+    a.prompt(1, "die");
+    expect(await a.exit).toBe(137);
+    const [err] = await a.next(1);
+    expect(err!.id).toBe(1);
+    expect(err!.error.message).toContain("it was ended by SIGKILL.");
+    expect(err!.error.message).toContain("The relay received no signal");
+    expect(err!.error.message).toContain("boom: out of memory");
+    expect(err!.error.data).toMatchObject({ signal: "SIGKILL" });
+    expect(a.lines.length).toBe(1);
+  }, 30_000);
+
+  test("the relay gets SIGTERM first: the signal is forwarded, and the error names the outside stop", async () => {
+    const a = await start("relay-sigterm");
+    a.prompt(1, "hang");
+    await ready(a); // the agent has the prompt
+    process.emit("SIGTERM");
+    expect(await a.exit).toBe(143);
+    const [err] = await a.next(1);
+    expect(err!.id).toBe(1);
+    expect(err!.error.message).toContain("it was ended by SIGTERM.");
+    expect(err!.error.message).toContain("The relay received SIGTERM first, so something outside the agent stopped its process group or systemd scope.");
+    expect(err!.error.data).toMatchObject({ signal: "SIGTERM", relaySignal: "SIGTERM" });
+    expect(a.lines.length).toBe(1);
+  }, 30_000);
+
+  test("an agent that ignores the signal is stopped after the grace time, and the prompt is still answered", async () => {
+    const a = await start("relay-stubborn", { extra: { signalGraceMs: 300 } });
+    a.prompt(1, "stubborn");
+    await ready(a);
+    process.emit("SIGTERM");
+    expect(await a.exit).toBe(143);
+    const [err] = await a.next(1);
+    expect(err!.error.message).toContain("it did not end within 0.3 seconds after the relay received SIGTERM, so the relay stopped it.");
+    expect(a.lines.length).toBe(1);
+  }, 30_000);
+
+  test("a prompt the agent already answered is not answered a second time", async () => {
+    const a = await start("no-double");
+    a.prompt(1, "answer-then-exit");
+    a.prompt(2, "hang");
+    expect(await a.exit).toBe(3);
+    const answers = a.lines.map((l) => JSON.parse(l)).filter((x) => x.id !== undefined); // the empty-turn notice has no id
+    expect(answers.map((x) => x.id)).toEqual([1, 2]);
+    expect(answers[0]).toEqual({ jsonrpc: "2.0", id: 1, result: { stopReason: "end_turn" } });
+    expect(answers[1].error.message).toContain("it exited with code 3.");
+  }, 30_000);
+
+  test("no prompt open: the stream ends with no extra line", async () => {
+    const a = await start("no-open");
+    a.send({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: 1 } });
+    await a.next(1);
+    a.prompt(1, "ok");
+    await a.next(2);
+    a.prompt(2, "exit");
+    a.stdin.end();
+    // prompt 2 is open, so it gets one; the answered prompt 1 does not
+    expect(await a.exit).toBe(7);
+    expect(a.lines.map((l) => JSON.parse(l).id).filter((id) => id !== undefined)).toEqual([0, 1, 2]);
+  }, 30_000);
+
+  test("lines pass byte for byte: odd spacing, key order and unicode stay as the agent wrote them", async () => {
+    const dir = join(root, "bytes");
+    await mkdir(dir, { recursive: true });
+    const script = join(dir, "echo.cjs");
+    const payload = '{ "jsonrpc":"2.0",  "method":"session/update","params":{"z":1,"a":"é\u00e9 ✓"} }';
+    await writeFile(script, `process.stdout.write(${JSON.stringify(`${payload}
+`)}); process.stdin.on("data", (d) => process.stdout.write(d)); process.stdin.on("end", () => process.exit(0));`);
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let got = "";
+    stdout.on("data", (d: Buffer) => (got += d.toString("utf8")));
+    const done = runAcpRelay({ command: process.execPath, args: [script], stdin, stdout, stderr: new PassThrough(), log: () => {} });
+    stdin.write("client  line  one\n");
+    await new Promise((r) => setTimeout(r, 300));
+    stdin.end();
+    expect(await done).toBe(0);
+    expect(got.startsWith(`${payload}\n`)).toBe(true);
+    expect(got).toContain("client  line  one");
+  }, 30_000);
+
+  test("agentEndMessage: a start error, and a long stderr tail stays under the limit with its last lines", () => {
+    expect(agentEndMessage({ agent: "zcode", code: null, signal: null, startError: "spawn ENOENT" })).toBe("The ACP agent zcode could not start: spawn ENOENT");
+    const tail = Array.from({ length: 200 }, (_, i) => `line ${i} ${"x".repeat(100)}`).join("\n");
+    const m = agentEndMessage({ agent: "zcode", code: 2, signal: null, stderrTail: tail });
+    expect(m.length).toBeLessThanOrEqual(END_MESSAGE_MAX);
+    expect(m).toContain("line 199");
+    expect(m).not.toContain("line 100 ");
+  });
+});
+
+describe("an agent whose helper process keeps its output open", () => {
+  const PROMPT = '{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s1"}}\n';
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  async function waitFor(file: string): Promise<string> {
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      const f = Bun.file(file);
+      if (await f.exists()) {
+        const t = (await f.text()).trim();
+        if (t !== "") return t;
+      }
+      if (Date.now() > deadline) throw new Error(`${file} never appeared`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  test("a helper that inherits stderr does not keep the relay waiting: the prompt gets its error within a second", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let out = "";
+    stdout.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    const t0 = Date.now();
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", "read l; sleep 3 >/dev/null </dev/null & exit 1"], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false });
+    stdin.write(PROMPT);
+    expect(await done).toBe(1);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    const answers = out.trim().split("\n").map((l) => JSON.parse(l));
+    expect(answers.length).toBe(1);
+    expect(answers[0].id).toBe(7);
+    expect(answers[0].error.message).toContain("it exited with code 1.");
+  }, 30_000);
+
+  test("a line a helper writes to stdout after the error answer is not passed on", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let out = "";
+    stdout.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    const late = '{"jsonrpc":"2.0","method":"session/update","params":{"late":true}}';
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `read l; (sleep 1.2; echo '${late}') >&1 2>/dev/null & exit 1`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false });
+    stdin.write(PROMPT);
+    expect(await done).toBe(1);
+    await new Promise((r) => setTimeout(r, 1800)); // the helper writes now
+    const lines = out.trim().split("\n");
+    expect(lines.length).toBe(1);
+    expect(JSON.parse(lines[0]!).error.message).toContain("it exited with code 1.");
+    expect(out).not.toContain("late");
+  }, 30_000);
+
+  test("a helper that holds stdout after the agent exits is stopped, and the message says the agent exited", async () => {
+    const dir = join(root, "orphan-stdout");
+    await mkdir(dir, { recursive: true });
+    const pidFile = join(dir, "helper.pid");
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let out = "";
+    stdout.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `read l; (sleep 31 & echo $! > ${pidFile}; wait) & while [ ! -s ${pidFile} ]; do sleep 0.05; done; exit 3`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false });
+    stdin.write(PROMPT);
+    const pid = Number(await waitFor(pidFile));
+    expect(await done).toBe(3);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(alive(pid)).toBe(false);
+    const err = JSON.parse(out.trim().split("\n")[0]!);
+    expect(err.error.message).toContain("it exited with code 3. Its output stayed open for 500 ms after that, so the relay stopped waiting for it.");
+    expect(err.error.message).not.toContain("more than");
+  }, 30_000);
+
+  test("a helper that closed its output is stopped too after a normal exit", async () => {
+    const dir = join(root, "orphan-normal");
+    await mkdir(dir, { recursive: true });
+    const pidFile = join(dir, "helper.pid");
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `read l; sleep 31 >/dev/null 2>&1 </dev/null & echo $! > ${pidFile}; exit 0`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false });
+    stdin.write(PROMPT);
+    const pid = Number(await waitFor(pidFile));
+    expect(await done).toBe(0);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(alive(pid)).toBe(false);
+  }, 30_000);
+
+  test("a signal reaches the agent's helper too: nothing is left running after the relay ends", async () => {
+    const dir = join(root, "orphan");
+    await mkdir(dir, { recursive: true });
+    const pidFile = join(dir, "helper.pid");
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `read l; sleep 31 & echo $! > ${pidFile}; wait`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false, signalGraceMs: 2000 });
+    stdin.write(PROMPT);
+    const pid = Number(await waitFor(pidFile));
+    expect(alive(pid)).toBe(true);
+    process.emit("SIGTERM");
+    expect(await done).toBe(143);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(alive(pid)).toBe(false);
+  }, 30_000);
+
+  test("an agent that ignores the signal: the group is killed after the grace time, helper included", async () => {
+    const dir = join(root, "orphan-stubborn");
+    await mkdir(dir, { recursive: true });
+    const pidFile = join(dir, "helper.pid");
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let out = "";
+    stdout.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `trap "" TERM; read l; sleep 31 & echo $! > ${pidFile}; wait`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false, signalGraceMs: 1000 });
+    stdin.write(PROMPT);
+    const pid = Number(await waitFor(pidFile));
+    process.emit("SIGTERM");
+    expect(await done).toBe(143);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(alive(pid)).toBe(false);
+    const err = JSON.parse(out.trim().split("\n")[0]!);
+    expect(err.error.message).toContain("it did not end within 1 second after the relay received SIGTERM, so the relay stopped it.");
+  }, 30_000);
+});
+
+test("the end message separates an agent that did not end from one whose output stayed open, with singular and plural seconds", () => {
+  const base = { agent: "zcode", code: null, signal: null, relaySignal: "SIGTERM" as const };
+  expect(agentEndMessage({ ...base, timedOut: { graceMs: 1000 } })).toContain("it did not end within 1 second after the relay received SIGTERM, so the relay stopped it.");
+  expect(agentEndMessage({ ...base, timedOut: { graceMs: 3000 } })).toContain("it did not end within 3 seconds after");
+  // the agent ended and its output stayed open: the message says the agent ended, never "more than N seconds"
+  const open = agentEndMessage({ agent: "zcode", code: 3, signal: null, outputOpen: { drainMs: 500 } });
+  expect(open).toContain("it exited with code 3. Its output stayed open for 500 ms after that, so the relay stopped waiting for it.");
+  expect(open).not.toContain("more than");
+  expect(agentEndMessage({ agent: "zcode", code: null, signal: "SIGKILL", outputOpen: { drainMs: 500 } })).toContain("it was ended by SIGKILL. Its output stayed open for 500 ms after that");
+  expect(agentEndMessage({ agent: "zcode", code: 0, signal: null })).not.toContain("output stayed open");
+});
+
+test("a stderr tail that was cut loses its partial first line, and secrets in it are redacted", () => {
+  const idKey = `${"0123456789abcdef".repeat(2)}.${"AbCdEfGh".repeat(2)}`; // built here, not written out: no key-shaped literal
+  const tail = ["ial first line", "fatal: password=hunter2extra", "token: SYNTHETIC_FIXTURE_tok", `x-api-key: ${idKey}`].join("\n");
+  const cut = agentEndMessage({ agent: "zcode", code: 1, signal: null, stderrTail: tail, stderrCut: true });
+  expect(cut).not.toContain("ial first line");
+  expect(cut).toContain("fatal: password=[redacted]");
+  expect(cut).toContain("token: [redacted]");
+  expect(cut).not.toContain("hunter2extra");
+  expect(cut).not.toContain("AbCdEfGh");
+  expect(agentEndMessage({ agent: "zcode", code: 1, signal: null, stderrTail: tail })).toContain("ial first line"); // not cut: kept
+});
 
 test("an agent that cannot start gives 127 and a note", async () => {
   const notes: string[] = [];
