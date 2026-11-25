@@ -6,11 +6,13 @@ import { registerStoreAdmin, type StoreAdminDeps } from "./admin-store.ts";
 import { registerFavouritesAdmin } from "./admin-favourites.ts";
 import { registerSessionsAdmin, type SessionsAdminDeps } from "./admin-sessions.ts";
 import { favouritesToken } from "./favourites-token.ts";
+import { instanceAppToken, instanceTokenExpiry, instanceTokenWindow, instancesToken } from "./instances-token.ts";
+import { instanceIdsForApp } from "../t3/instances/plan.ts";
 import type { FavouritesService } from "./chat/favourites.ts";
 import type { GatewayMetrics } from "./metrics.ts";
 import type { LoginRenewal } from "./renewal.ts";
 import { adapterFor } from "./providers/index.ts";
-import { generateToken } from "./tokens.ts";
+import { generateToken, INSTANCE_PREFIX_MARK, isInstancePrefix } from "./tokens.ts";
 import { foldSessionUsage } from "./session-usage.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord, UsageHistoryRow } from "./types.ts";
@@ -55,6 +57,11 @@ export interface AdminDeps {
   /** The starred models behind GET and POST /favourites (admin-favourites.ts). Read at each call: it is undefined until the chat stack is up. */
   favourites?(): FavouritesService | undefined;
   metrics?: Pick<GatewayMetrics, "favourite" | "sessionsError">;
+  /**
+   * The t3-instances scope (instances-token.ts): a derived read-only token that lists apps in a reduced view and hands out one
+   * derived app token per active app. `namespaces` limits which apps get a token. Absent: the scope is off. `log` gets one JSON line per token read.
+   */
+  instances?: { namespaces: readonly string[]; log(line: string): void };
   /**
    * The session ingest routes (admin-sessions.ts, `/sessions/v1/*`). Absent: the feature is off and the routes answer 404.
    * `token` is the ingest token (AIS_GATEWAY_SESSIONS_TOKEN). It opens these routes and no other.
@@ -251,15 +258,26 @@ export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
   const read = deps.readStore ?? store;
   const hono = new Hono();
-  const err = (status: 400 | 401 | 404 | 409 | 429 | 500 | 503, message: string): Response => Response.json({ error: message }, { status, ...(status === 429 ? { headers: { "retry-after": "5" } } : {}) });
+  const err = (status: 400 | 401 | 404 | 409 | 422 | 429 | 500 | 503, message: string): Response => Response.json({ error: message }, { status, ...(status === 429 ? { headers: { "retry-after": "5" } } : {}) });
 
   // The favourites token (derived from the admin token) opens GET and POST /favourites and nothing else.
   const favouritesBearer = deps.adminToken ? favouritesToken(deps.adminToken) : undefined;
   // The ingest token opens `/sessions/v1/*` and nothing else, and only while the feature is on.
   const sessionsBearer = deps.sessions?.token || undefined;
+  // The t3-instances token opens GET /apps (reduced view) and POST /apps/:name/instance-token and nothing else.
+  const instancesBearer = deps.instances && deps.adminToken ? instancesToken(deps.adminToken) : undefined;
+  const instancesRoute = (c: { req: { path: string; method: string } }): "list" | "token" | undefined => {
+    if (c.req.path === "/apps" && c.req.method === "GET") return "list";
+    if (c.req.method === "POST" && /^\/apps\/[^/]+\/instance-token$/.test(c.req.path)) return "token";
+    return undefined;
+  };
   hono.use("*", async (c, next) => {
     const given = bearer(c.req.raw);
     if (deps.adminToken && sameSecret(given, deps.adminToken)) return next();
+    if (instancesBearer && instancesRoute(c) && sameSecret(given, instancesBearer)) {
+      c.set("scope" as never, "instances" as never);
+      return next();
+    }
     if (favouritesBearer && c.req.path === "/favourites" && (c.req.method === "GET" || c.req.method === "POST") && sameSecret(given, favouritesBearer)) return next();
     if (sessionsBearer && c.req.path.startsWith("/sessions/v1/") && sameSecret(given, sessionsBearer)) return next();
     if (c.req.path.startsWith("/sessions/v1/")) deps.metrics?.sessionsError?.("auth");
@@ -315,7 +333,58 @@ export function createAdminApp(deps: AdminDeps): Hono {
 
   hono.get("/apps", async (c) => {
     const apps = await read.listApps();
+    // The t3-instances scope sees names, provider, mode, target and namespace only: no owner, models, limits or token data.
+    if (c.get("scope" as never) === ("instances" as never)) {
+      const allowed = new Set(deps.instances?.namespaces ?? []);
+      return c.json({ apps: apps.filter((a) => a.state === "active" && allowed.has(a.namespace)).map((a) => ({ name: a.name, namespace: a.namespace, provider: a.provider, style: a.style, state: a.state, target: a.target.kind === "pool" ? { kind: "pool" as const } : a.target })) });
+    }
     return c.json({ apps: await Promise.all(apps.map((a) => appView(read, a))) });
+  });
+
+  // Hands a T3 instance the token it uses for one app. The gateway keeps only hashes, so it cannot return an existing token:
+  // the token is derived (instances-token.ts), added once, and returned again on every later call. Other tokens are not touched.
+  hono.post("/apps/:name/instance-token", async (c) => {
+    const cfg = deps.instances;
+    const name = c.req.param("name");
+    const log = (outcome: "minted" | "served" | "refused", extra: Record<string, unknown> = {}) => cfg?.log(JSON.stringify({ event: "instance-token", app: name, outcome, at: deps.now().toISOString(), ...extra }));
+    if (!cfg) return err(404, "no such app");
+    const app = await read.getApp(name);
+    if (!app || app.state !== "active") {
+      log("refused", { reason: "no active app" });
+      return err(404, "no such app");
+    }
+    if (!cfg.namespaces.includes(app.namespace)) {
+      log("refused", { reason: "namespace" });
+      return Response.json({ error: "the app is outside the namespaces of this credential" }, { status: 403 });
+    }
+    // Only an app that one of the T3 instance shapes uses gets a token: an app that no instance maps to has no use for one.
+    if (instanceIdsForApp({ name: app.name, provider: app.provider, state: app.state, target: app.target }).length === 0) {
+      log("refused", { reason: "no instance uses this app" });
+      return Response.json({ error: "no T3 instance uses this app" }, { status: 403 });
+    }
+    const nowMs = deps.now().getTime();
+    const window = instanceTokenWindow(nowMs);
+    const expiresAt = instanceTokenExpiry(window);
+    // Expired minted records go first, so the store does not grow by one record per window.
+    await store.pruneMarkedTokens(name, INSTANCE_PREFIX_MARK, deps.now().toISOString());
+    const records = await read.tokensFor(name);
+    // One token per app, rotation generation and window. An app rotation changes the generation (the number of the app's own tokens) and caps the minted tokens at its overlap.
+    const generation = records.filter((r) => !isInstancePrefix(r.prefix)).length;
+    const t = instanceAppToken(deps.adminToken, name, generation, window);
+    const found = records.some((r) => r.prefix === t.prefix && r.hash === t.hash);
+    if (!found) {
+      try {
+        await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: deps.now().toISOString(), expiresAt });
+      } catch (e) {
+        if (e instanceof AppRevokedError) {
+          log("refused", { reason: "revoked" });
+          return err(404, "no such app");
+        }
+        throw e;
+      }
+    }
+    log(found ? "served" : "minted", { prefix: t.prefix, expiresAt });
+    return c.json({ app: name, token: t.token, prefix: t.prefix, expiresAt });
   });
 
   hono.get("/apps/:name", async (c) => {
@@ -387,6 +456,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
     // Safe in any order against a racing revoke: a revoke gives every token an expiry, and this only sets one where none exists.
     // The store refuses the new token for a revoked app.
     await store.expireTokens(name, previousExpiresAt);
+    await store.capMarkedTokens(name, INSTANCE_PREFIX_MARK, previousExpiresAt);
     const t = generateToken();
     try {
       await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: now.toISOString() });

@@ -17,8 +17,13 @@ export function sameHash(storedHex: string, secret: string): boolean {
   return stored.length === given.length && timingSafeEqual(stored, given);
 }
 
+/** The first letter of the prefix of every scope-minted instance token. Tokens from generateToken never start with it. */
+export const INSTANCE_PREFIX_MARK = "z";
+export const isInstancePrefix = (prefix: string): boolean => prefix.startsWith(INSTANCE_PREFIX_MARK);
+
 export function generateToken(): { token: string; prefix: string; hash: string } {
   const p = crypto.getRandomValues(new Uint8Array(PREFIX_LEN));
+  while (BASE32[p[0]! % 32] === INSTANCE_PREFIX_MARK) p[0] = crypto.getRandomValues(new Uint8Array(1))[0]!;
   const prefix = Array.from(p, (b) => BASE32[b % 32]).join("");
   const secret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
   return { token: `${TOKEN_HEAD}${prefix}_${secret}`, prefix, hash: hashSecret(secret) };
@@ -58,4 +63,11 @@ export async function verifyToken(
     ok = true;
   }
   return ok;
+}
+
+/** A token built from fixed bytes: 5 bytes give the prefix, 32 bytes the secret. Used for tokens that must be the same on every call. */
+export function tokenFromBytes(prefixBytes: Uint8Array, secretBytes: Uint8Array, mark = ""): { token: string; prefix: string; hash: string } {
+  const prefix = (mark + Array.from(prefixBytes.subarray(0, PREFIX_LEN), (b) => BASE32[b % 32]).join("")).slice(0, PREFIX_LEN);
+  const secret = Buffer.from(secretBytes.subarray(0, 32)).toString("base64url");
+  return { token: `${TOKEN_HEAD}${prefix}_${secret}`, prefix, hash: hashSecret(secret) };
 }

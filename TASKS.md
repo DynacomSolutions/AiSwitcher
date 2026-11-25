@@ -184,7 +184,7 @@ ETA: 2026-11-28 18:00 ICT
 | 245 | T3 gateway homes get agent-guard when AIS creates or updates them | done | claude | t3-home-agent-guard | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/650 (ee78d3b).<br>Ships in v0.5.80. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-26 00:25 ICT
+ETA: 2026-11-26 00:30 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -233,8 +233,8 @@ ETA: 2026-11-26 00:25 ICT
 | 319 | Limits page shows the plan label per account | done | agent | limits-plan-label | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/787. |
 | 320 | T3 model lists auto-enumerate for every gateway provider (zai, grok) | done | agent | t3-models-all-providers | | | ZCode: merged https://github.com/DynacomSolutions/AiSwitcher/pull/792.<br>Live 25 Nov on v0.5.121: `ais gateway t3-models --check` reports current for kimi (6), opencode (37) and ZCode (13 models).<br>Grok lists its own models. T3 shows the same 4 models as the gateway. |
 | 323 | Console limits: countdown beside each reset time | done | claude | identities-reset-countdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/797.<br>Live on v0.5.115 limits page (screenshot checked). |
-| 336 | Limits page: keep the reset countdown fully visible on each card | in_progress | agent | limits-countdown-clip | | 2026-11-26 00:25 ICT | On v0.5.121 the reset line clips at 1280 px: 23 of 23 lines on one tab.<br>Follow-up to 5.323.<br>Four commits made 22:55 to 23:10 ICT (15:55 to 16:10 GMT).<br>The end-to-end test passes on the fixed page; the worker proves that it fails on the unfixed page.<br>Pull request follows. |
-| 337 | Limits page: Codex accounts show their plan badge | done | agent | codex-plan-label | | | `codexPlanLabel` knew six plan types only. Live accounts send `promax` and `self_serve_business_prolite`.<br>Follow-up to 5.319.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/826 (6ff55b2) at 22:55 ICT (15:55 GMT).<br>Live after release v0.5.122 and the console image roll-out. |
+| 336 | Limits page: keep the reset countdown fully visible on each card | in_progress | agent | limits-countdown-clip | | 2026-11-26 00:30 ICT | On v0.5.121 the reset line clips at 1280 px: 23 of 23 lines on one tab.<br>Follow-up to 5.323.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/831 (370bb0f) at 00:06 ICT (17:06 GMT).<br>CI green. The console image builds now.<br>Live check expected 00:30 ICT. |
+| 337 | Limits page: Codex accounts show their plan badge | done | agent | codex-plan-label | | | `codexPlanLabel` knew six plan types only. Live accounts send `promax` and `self_serve_business_prolite`.<br>Follow-up to 5.319.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/826 (6ff55b2) at 22:55 ICT (15:55 GMT).<br>Release v0.5.122 published 23:39 ICT (16:39 GMT).<br>Live at 00:04 ICT (17:04 GMT): 3 Codex cards show Promax and Self Serve Business Prolite. |
 ## 6. Browser control extension
 ETA: 2026-11-23 16:30 ICT
 
@@ -275,7 +275,7 @@ ETA: 2026-11-23 16:30 ICT
 | 289 | AIS Browser: a later session of the same chat regains its saved group | done | claude | browser-saved-reclaim | 6.288 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/731, released v0.5.101.<br>Saved entries now store label and owned/approved flags.<br>Live: ContractFinder re-saved, 34 expired tabs closed, 66 tabs in 33 splits. |
 | 325 | Same chat keeps its tabs and groups after compaction | done | claude | browser-group-after-compaction | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/808 and https://github.com/DynacomSolutions/AiSwitcher/pull/811 after two Opus reviews.<br>T3 thread id is the chat id. Long child ids become a fixed hash.<br>Live in v0.5.119: a child thread sends the chat id, tab test passed. |
 | 326 | `ais browser headers` masks secret headers | done | claude | browser-headers-mask | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/813, live in v0.5.120.<br>Plain output masks the token. `--tool` and `--reveal` print it for the helpers. |
-| 327 | Rotate the browser agent token that a worker printed | todo | claude | | 6.326 | 2026-11-25 23:00 ICT | Owner chose: rotate at a quiet time.<br>The token is per identity and shared by its live sessions. |
+| 327 | Rotate the browser agent token that a worker printed | done | claude | | 6.326 | | Rotated 25 Nov 23:03 ICT (16:03 GMT) after a quiet check.<br>Old token gives 401, new token lists browsers.<br>Pool sessions started before the rotation must relaunch for browser calls. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-15 23:00 ICT

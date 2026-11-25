@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { readOpencodeV2Credentials } from "../cli/limits/opencode-limits.ts";
 import { heartbeatPath } from "../identities/gateway-heartbeat.ts";
@@ -12,9 +12,9 @@ import { loadIdentitiesFile } from "../identities/store.ts";
 import type { Identity } from "../identities/types.ts";
 import { loadGatewayGuard } from "../sync/gateway-guard.ts";
 import { storeMayHoldLogin } from "./host-login-gate.ts";
-import { isFresher, isReplacedLogin, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
+import { isFresher, isPlaceholderLogin, isRefreshableLogin, isReplacedLogin, losesLogin, mergeByKey, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
 import { sha256Hex, type HomeFileKind, type HomeStoreClient } from "./home-store.ts";
-import { mergeRegistries, readRegistryBase } from "./registry-sync.ts";
+import { droppedIdentities, mergeRegistries, readRegistryBase } from "./registry-sync.ts";
 import type { RefreshGuardBackend } from "./refresh-guard.ts";
 
 /**
@@ -38,6 +38,9 @@ import type { RefreshGuardBackend } from "./refresh-guard.ts";
 export const STORE_META_PATH = ".ais/gateway-store-meta.json";
 /** Opencode's credential when only its SQLite database holds it: a small file the gateway reads on scratch replicas. */
 export const OPENCODE_GATEWAY_KEY_FILE = join("data", "opencode", "ais-gateway-key.json");
+
+/** The login files that hold a refresh token: claude `.credentials.json`, codex and pi `auth.json`. */
+const MAIN_LOGIN_FILES = new Set([".credentials.json", "auth.json"]);
 
 const OAUTH_TOOLS: readonly RefreshableTool[] = ["claude", "codex", "grok", "kimi"];
 
@@ -128,6 +131,24 @@ export async function collectImportEntries(home: string = homedir()): Promise<Im
   return out;
 }
 
+/** True for a JSON object with more than one top-level entry (a shared pi auth.json, claude with mcpOAuth). */
+const isMultiEntry = (text: string): boolean => {
+  try {
+    const v = JSON.parse(text) as unknown;
+    return typeof v === "object" && v !== null && !Array.isArray(v) && Object.keys(v).length > 1;
+  } catch {
+    return false;
+  }
+};
+
+const sameJsonText = (a: string, b: string): boolean => {
+  try {
+    return JSON.stringify(JSON.parse(a)) === JSON.stringify(JSON.parse(b));
+  } catch {
+    return false;
+  }
+};
+
 const relOf = (home: string, abs: string): string | undefined => {
   const r = relative(home, abs);
   return r === "" || r.startsWith("..") || r.startsWith(sep) ? undefined : r.split(sep).join("/");
@@ -139,14 +160,27 @@ export async function importHome(
 ): Promise<ImportReport> {
   const home = opts.home ?? homedir();
   const report: ImportReport = { added: [], updated: [], unchanged: [], skipped: [] };
-  for (const e of opts.entries ?? (await collectImportEntries(home))) {
+  const handle = async (e: ImportEntry): Promise<void> => {
     const rel = relOf(home, e.abs);
     if (!rel) {
       report.skipped.push({ path: e.abs, why: "outside HOME" });
-      continue;
+      return;
     }
     const content = e.content ?? (await readFile(e.abs).catch(() => undefined));
-    if (!content) continue;
+    if (!content) return;
+    // A placeholder or a file without a refresh token is no login: it never reaches the store, whatever the row holds.
+    // Only a tool's main login file is checked: the member account record (.claude.json) holds no refresh token and travels as is.
+    if (e.kind === "login" && MAIN_LOGIN_FILES.has(basename(rel))) {
+      const text = content.toString("utf8");
+      if (isPlaceholderLogin(text)) {
+        report.skipped.push({ path: rel, why: "it holds a gateway placeholder, not a login" });
+        return;
+      }
+      if (!isRefreshableLogin(text)) {
+        report.skipped.push({ path: rel, why: "it holds no refresh token" });
+        return;
+      }
+    }
     const once = async (): Promise<void> => {
       if (e.kind === "login" && (await isReplacedLogin(store, rel, content.toString("utf8")))) {
         report.skipped.push({ path: rel, why: "it holds a login the owner replaced with another account's" });
@@ -169,21 +203,46 @@ export async function importHome(
         report.skipped.push({ path: rel, why: "the store already has a heartbeat" });
         return;
       }
-      if (e.kind === "login") {
+      const multi = e.kind === "login" && isMultiEntry(content.toString("utf8")) && mergeByKey(content.toString("utf8"), row.content.toString("utf8")) !== undefined;
+      if (e.kind === "login" && !multi) {
         if (!isFresher(content.toString("utf8"), row.content.toString("utf8"))) {
           report.skipped.push({ path: rel, why: "the store's grant is as fresh or fresher" });
           return;
         }
       }
       let body = content;
+      if (e.kind === "login") {
+        // A multi-entry login (pi auth.json, claude with mcpOAuth) is merged per entry: the older token of one entry never replaces a newer one,
+        // and a gateway entry never replaces a real one. It is pushed only when the merge loses nothing and differs from the row.
+        const merged = multi ? mergeByKey(content.toString("utf8"), row.content.toString("utf8")) : undefined;
+        if (merged) {
+          if (losesLogin(merged.toString("utf8"), row.content.toString("utf8"))) {
+            report.skipped.push({ path: rel, why: "it would replace a login the gateway can renew with one it cannot" });
+            return;
+          }
+          if (sameJsonText(merged.toString("utf8"), row.content.toString("utf8"))) {
+            report.skipped.push({ path: rel, why: "the store's grant is as fresh or fresher" });
+            return;
+          }
+          body = merged;
+        } else if (losesLogin(content.toString("utf8"), row.content.toString("utf8"))) {
+          report.skipped.push({ path: rel, why: "it would replace a login the gateway can renew with one it cannot" });
+          return;
+        }
+      }
       if (e.kind === "registry") {
         const last = await readRegistryBase(home, rel);
         if (last && last.sha === sha256Hex(content)) {
           report.skipped.push({ path: rel, why: "the store's registry is newer and the host copy did not change" });
           return;
         }
-        if (!last || last.sha !== row.sha256) {
-          const merged = mergeRegistries(content.toString("utf8"), row.content.toString("utf8"));
+        // A host copy that drops an identity the store holds is merged, never pushed as is: removal goes through retire.
+        if (!last || last.sha !== row.sha256 || droppedIdentities(content.toString("utf8"), row.content.toString("utf8")).length > 0) {
+          const merged = mergeRegistries(content.toString("utf8"), row.content.toString("utf8"), last?.names ? { baseNames: last.names } : {});
+          if (!merged && droppedIdentities(content.toString("utf8"), row.content.toString("utf8")).length > 0) {
+            report.skipped.push({ path: rel, why: "the host copy is no registry and would drop identities the store holds" });
+            return;
+          }
           if (merged) {
             if (sha256Hex(merged) === row.sha256) {
               report.skipped.push({ path: rel, why: "the store's registry already holds every host identity" });
@@ -215,6 +274,14 @@ export async function importHome(
         await lock.release();
       }
     } else await once();
+    };
+  for (const e of opts.entries ?? (await collectImportEntries(home))) {
+    // One refused or broken file never stops the import, nor the host sync pass around it.
+    try {
+      await handle(e);
+    } catch (err) {
+      report.skipped.push({ path: relOf(home, e.abs) ?? e.abs, why: `import failed (${(err as Error).message})` });
+    }
   }
   return report;
 }

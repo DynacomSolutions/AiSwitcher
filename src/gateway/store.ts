@@ -31,6 +31,10 @@ export interface GatewayStore {
   addToken(rec: TokenRecord): Promise<void>;
   tokensFor(app: string): Promise<TokenRecord[]>;
   expireTokens(app: string, at: string): Promise<void>;
+  /** Caps the expiry of every token of the app whose prefix starts with `mark` (no expiry, or one after `at`) to `at`. */
+  capMarkedTokens(app: string, mark: string, at: string): Promise<void>;
+  /** Deletes the tokens of the app whose prefix starts with `mark` and whose expiry is before `before`. */
+  pruneMarkedTokens(app: string, mark: string, before: string): Promise<void>;
   /** Marks the app revoked and stops every token of it now (expiresAt set to the revoke time). */
   revokeApp(name: string): Promise<void>;
   /** Calls `onApp` with the app name whenever any replica changes an app or its tokens. Returns an unlisten function. Optional: a store without it relies on the periodic refresh. */
@@ -154,6 +158,21 @@ export class MemoryGatewayStore implements GatewayStore {
     for (const t of this.tokens) {
       if (t.app === app && t.expiresAt === undefined) t.expiresAt = at;
     }
+    this.changed(app);
+  }
+
+  async capMarkedTokens(app: string, mark: string, at: string): Promise<void> {
+    for (const t of this.tokens) {
+      if (t.app === app && t.prefix.startsWith(mark) && (t.expiresAt === undefined || Date.parse(t.expiresAt) > Date.parse(at))) t.expiresAt = at;
+    }
+    this.changed(app);
+  }
+
+  async pruneMarkedTokens(app: string, mark: string, before: string): Promise<void> {
+    const keep = this.tokens.filter((t) => !(t.app === app && t.prefix.startsWith(mark) && t.expiresAt !== undefined && Date.parse(t.expiresAt) < Date.parse(before)));
+    if (keep.length === this.tokens.length) return;
+    this.tokens.length = 0;
+    this.tokens.push(...keep);
     this.changed(app);
   }
 

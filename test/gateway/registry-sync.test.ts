@@ -6,7 +6,7 @@ import { importHome } from "../../src/gateway/home-import.ts";
 import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type PgHomeStore, type PutResult } from "../../src/gateway/home-store.ts";
 import { hostSyncOnce, startHostSync } from "../../src/gateway/host-sync.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
-import { mergeRegistries, readRegistryBase } from "../../src/gateway/registry-sync.ts";
+import { droppedIdentities, mergeRegistries, readRegistryBase } from "../../src/gateway/registry-sync.ts";
 
 // A registry change made in the store (a console add) must reach the host file and never be reverted by the host sync or by the
 // periodic import, also after a restart. A host-side change still reaches the store; when both sides moved, neither loses an
@@ -152,13 +152,54 @@ describe("a registry file that moved on the host", () => {
     expect(await read(home, REG)).toBe(hostNew);
   });
 
-  test("a host deletion reaches the store when only the host changed", async () => {
+  test("a host file that drops an identity is merged, never pushed: the store keeps the identity", async () => {
     const { home, store } = await inStep();
-    const smaller = registry([], ["alpha"]);
-    await put(home, REG, smaller);
+    await put(home, REG, registry([], ["alpha"]));
+    await sync(home, store);
+    expect(namesOf(store.text(REG))).toEqual(["pool-main", "alpha"]);
+    expect(namesOf(await read(home, REG))).toEqual(["pool-main", "alpha"]);
+  });
+
+  test("a host deletion with a tombstone reaches the store, and a tombstoned store entry is dropped in a merge", async () => {
+    const { home, store } = await inStep();
+    const gone = `${JSON.stringify({ version: 1, identities: [ident("pool-main", { swapPool: { accounts: ["alpha"], active: "alpha" } })], deleted: [{ name: "alpha", at: 1 }] }, null, 2)}\n`;
+    await put(home, REG, gone);
     await sync(home, store);
     expect(namesOf(store.text(REG))).toEqual(["pool-main"]);
-    expect(namesOf(await read(home, REG))).toEqual(["pool-main"]);
+    const merged = JSON.parse(mergeRegistries(gone, registry(["alpha", "extra"]))!.toString()) as { identities: Array<{ name: string }>; deleted: Array<{ name: string; at: number }> };
+    expect(merged.identities.map((i) => i.name)).toEqual(["pool-main", "extra"]);
+    expect(merged.deleted).toEqual([{ name: "alpha", at: 1 }]);
+  });
+
+  test("droppedIdentities: a non-registry text over a populated registry counts as dropping every name", () => {
+    expect(droppedIdentities("{}", registry(["alpha"]))).toEqual(["pool-main", "alpha"]);
+    expect(droppedIdentities("", registry(["alpha"]))).toEqual(["pool-main", "alpha"]);
+    expect(droppedIdentities("{}", "{}")).toEqual([]);
+  });
+
+  test("a host file that is not a registry is never pushed over the store row", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    store.seed(REG, registry(["alpha"]), null, "registry");
+    await put(home, REG, "{}");
+    await sync(home, store);
+    expect(store.puts).toEqual([]);
+    expect(namesOf(store.text(REG))).toEqual(["pool-main", "alpha"]);
+  });
+
+  test("an empty host registry never empties the store registry", async () => {
+    const { home, store } = await inStep();
+    await put(home, REG, `${JSON.stringify({ version: 1, identities: [] })}\n`);
+    await sync(home, store);
+    expect(namesOf(store.text(REG))).toEqual(["pool-main", "alpha"]);
+  });
+
+  test("retiring an identity on the host still reaches the store", async () => {
+    const { home, store } = await inStep();
+    const retired = `${JSON.stringify({ version: 1, identities: [ident("pool-main", { swapPool: { accounts: ["alpha"], active: "alpha" } }), ident("alpha", { retired: true })] }, null, 2)}\n`;
+    await put(home, REG, retired);
+    await sync(home, store);
+    expect(store.text(REG)).toBe(retired);
   });
 });
 
@@ -206,12 +247,12 @@ describe("both sides moved", () => {
     expect(store.puts).toEqual([]);
   });
 
-  test("a host registry that is not JSON is still pushed as the host's copy", async () => {
+  test("a host registry that is not JSON is never pushed over a populated store registry", async () => {
     const { home, store } = await inStep();
     store.seed(REG, registry(["alpha", "consoled"]), null, "registry");
     await put(home, REG, "not json");
     await sync(home, store);
-    expect(store.text(REG)).toBe("not json");
+    expect(namesOf(store.text(REG))).toEqual(["pool-main", "alpha", "consoled"]);
   });
 });
 
@@ -230,5 +271,122 @@ describe("mergeRegistries", () => {
   test("a side that is not a registry gives no merge", () => {
     expect(mergeRegistries("nope", "{}")).toBeUndefined();
     expect(mergeRegistries("{}", JSON.stringify({ identities: [] }))).toBeUndefined();
+  });
+});
+
+describe("ais identities delete", () => {
+  test("deleteIdentity leaves a tombstone, and retire keeps the entry", async () => {
+    const { deleteIdentity, retireIdentity } = await import("../../src/cli/identities/actions.ts");
+    const file = JSON.parse(registry(["alpha", "beta"]));
+    deleteIdentity(file, "alpha");
+    expect(file.deleted?.map((t: { name: string }) => t.name)).toEqual(["alpha"]);
+    expect(file.identities.map((i: { name: string }) => i.name)).toEqual(["pool-main", "beta"]);
+    retireIdentity(file, "beta", new Date("2026-11-25T00:00:00Z"));
+    expect(file.identities.some((i: { name: string }) => i.name === "beta")).toBe(true);
+    expect(file.deleted?.map((t: { name: string }) => t.name)).toEqual(["alpha"]);
+  });
+});
+
+describe("tombstones with times", () => {
+  const dated = (name: string, addedAt?: number, extra: Record<string, unknown> = {}) => ({ ...ident(name, extra), ...(addedAt !== undefined ? { addedAt } : {}) });
+  const regOf = (ids: unknown[], deleted?: unknown[]) => `${JSON.stringify({ version: 1, identities: ids, ...(deleted ? { deleted } : {}) }, null, 2)}\n`;
+  const merge = (host: string, store: string) => JSON.parse(mergeRegistries(host, store)!.toString()) as { identities: Array<{ name: string; label: string }>; deleted?: Array<{ name: string; at: number }> };
+
+  test("createIdentity stamps addedAt and clears the name's tombstone", async () => {
+    const { createIdentity } = await import("../../src/cli/identities/actions.ts");
+    const file = { version: 1 as const, identities: [], deleted: [{ name: "alpha", at: 5 }, { name: "other", at: 5 }] };
+    const id = createIdentity(file, { name: "alpha", label: "alpha", configDir: "~/x/alpha" });
+    expect(typeof id.addedAt).toBe("number");
+    expect(file.deleted).toEqual([{ name: "other", at: 5 }]);
+  });
+
+  test("an add newer than the delete beats it, in the merge and in droppedIdentities", () => {
+    const store = regOf([dated("a", 10), dated("b", 20)]);
+    const host = regOf([dated("a", 10)], [{ name: "b", at: 15 }]);
+    expect(merge(host, store).identities.map((i) => i.name)).toEqual(["a", "b"]);
+    expect(droppedIdentities(host, store)).toEqual(["b"]);
+    const older = regOf([dated("a", 10)], [{ name: "b", at: 25 }]);
+    expect(merge(older, store).identities.map((i) => i.name)).toEqual(["a"]);
+    expect(droppedIdentities(older, store)).toEqual([]);
+  });
+
+  test("the old name-only form still reads as a tombstone for an entry without addedAt", () => {
+    const store = regOf([dated("a"), dated("b")]);
+    const host = regOf([dated("a")], ["b"]);
+    expect(merge(host, store).identities.map((i) => i.name)).toEqual(["a"]);
+    expect(droppedIdentities(host, store)).toEqual([]);
+  });
+
+  test("a tombstone goes once the store no longer lists the name", () => {
+    expect(merge(regOf([dated("a")], [{ name: "b", at: 9 }]), regOf([dated("a")])).deleted).toBeUndefined();
+    expect(merge(regOf([dated("a")], [{ name: "b", at: 9 }]), regOf([dated("a"), dated("b")])).deleted).toEqual([{ name: "b", at: 9 }]);
+  });
+
+  test("a console delete beats a host with local changes, and a host re-add after it survives", () => {
+    const store = regOf([dated("a"), dated("b")], [{ name: "b", at: 100 }].slice(0, 0));
+    const consoleDeleted = regOf([dated("a")], [{ name: "b", at: 100 }]);
+    const hostEdited = regOf([dated("a"), dated("b", undefined, { label: "edited" })]);
+    expect(merge(hostEdited, consoleDeleted).identities.map((i) => i.name)).toEqual(["a"]);
+    const hostReadded = regOf([dated("a"), dated("b", 200)]);
+    expect(merge(hostReadded, consoleDeleted).identities.map((i) => i.name)).toEqual(["a", "b"]);
+    expect(store).toContain("b");
+  });
+
+  test("a host-only tombstone applies only to names the host's base listed; any other name is a re-add", () => {
+    const store = regOf([dated("a"), dated("b", 900)]);
+    const host = regOf([dated("a")], [{ name: "b", at: 1000 }]);
+    const out = JSON.parse(mergeRegistries(host, store, { baseNames: ["a"] })!.toString()) as { identities: Array<{ name: string }>; deleted?: unknown[] };
+    expect(out.identities.map((i) => i.name)).toEqual(["a", "b"]);
+    expect(out.deleted).toBeUndefined();
+    const listed = JSON.parse(mergeRegistries(host, store, { baseNames: ["a", "b"] })!.toString()) as { identities: Array<{ name: string }> };
+    expect(listed.identities.map((i) => i.name)).toEqual(["a"]);
+  });
+
+  test("a tombstone is kept for 90 days even when the store no longer lists the name", () => {
+    const day = 86_400_000;
+    const recent = merge(regOf([dated("a")], [{ name: "b", at: Date.now() - 2 * day }]), regOf([dated("a")]));
+    expect(recent.deleted?.map((t) => t.name)).toEqual(["b"]);
+    const old = merge(regOf([dated("a")], [{ name: "b", at: Date.now() - 100 * day }]), regOf([dated("a")]));
+    expect(old.deleted).toBeUndefined();
+  });
+
+  test("mergeIdentity keeps the larger addedAt whichever side wins", async () => {
+    const { mergeIdentity } = await import("../../src/sync/registry.ts");
+    const a = { name: "x", label: "x", configDir: "~/x", addedAt: 10 } as never;
+    const b = { name: "x", label: "x", configDir: "~/x", addedAt: 20 } as never;
+    expect((mergeIdentity(a, b) as { addedAt?: number }).addedAt).toBe(20);
+    expect((mergeIdentity(b, a) as { addedAt?: number }).addedAt).toBe(20);
+  });
+
+  test("an entry without addedAt that the host's base did not list is a re-add; one the base listed stays covered", () => {
+    const store = regOf([dated("a")], [{ name: "b", at: 1000 }]);
+    const host = regOf([dated("a"), dated("b")]);
+    expect(JSON.parse(mergeRegistries(host, store, { baseNames: ["a"] })!.toString()).identities.map((i: { name: string }) => i.name)).toEqual(["a", "b"]);
+    expect(JSON.parse(mergeRegistries(host, store, { baseNames: ["a", "b"] })!.toString()).identities.map((i: { name: string }) => i.name)).toEqual(["a"]);
+  });
+
+  test("markAdded stamps the time and clears the tombstone", async () => {
+    const { markAdded } = await import("../../src/identities/tombstones.ts");
+    const file = { identities: [{ name: "x" }], deleted: [{ name: "x", at: 1 }, { name: "y", at: 1 }] } as { identities: Array<{ name: string; addedAt?: number }>; deleted?: Array<{ name: string; at: number }> };
+    markAdded(file, file.identities[0]!);
+    expect(typeof file.identities[0]!.addedAt).toBe("number");
+    expect(file.deleted).toEqual([{ name: "y", at: 1 }]);
+  });
+
+  test("portableIdentitiesFile and mergeRegistryConflict keep the tombstones", async () => {
+    const { portableIdentitiesFile, mergeRegistryConflict } = await import("../../src/sync/registry.ts");
+    const { CLAUDE_CONFIG } = await import("../../src/identities/tool-configs.ts");
+    const dir0 = await tmp();
+    const file = { version: 1 as const, identities: [], deleted: [{ name: "b", at: 3 }] };
+    expect(portableIdentitiesFile(file, { ...CLAUDE_CONFIG, identitiesJsonPath: join(dir0, ".claude", "identities.json") }, dir0).deleted).toEqual([{ name: "b", at: 3 }]);
+    const dir = await tmp();
+    const live = join(dir, "live.json");
+    const prev = join(dir, "prev.json");
+    await writeFile(live, regOf([dated("a")], [{ name: "b", at: 3 }]));
+    await writeFile(prev, regOf([dated("a"), dated("b")]));
+    expect(await mergeRegistryConflict(live, prev)).toBe(true);
+    const out = JSON.parse(await readFile(live, "utf8")) as { identities: Array<{ name: string }>; deleted: unknown[] };
+    expect(out.identities.map((i) => i.name)).toEqual(["a"]);
+    expect(out.deleted).toEqual([{ name: "b", at: 3 }]);
   });
 });

@@ -67,17 +67,30 @@ function WindowRow({ window }: { window: LimitWindow }) {
         <span className="shrink-0 font-medium tabular-nums">{pct.toFixed(1)}%</span>
       </div>
       <Progress value={pct} indicatorClassName={windowTone(pct)} />
+      {/* The times wrap inside the card. The separator stays on the times. The countdown is one piece that wraps alone. */}
       {(window.resetsAt || window.resetsAtMs !== undefined || window.note) && (
-        <div className="flex items-baseline justify-between gap-3 text-xs text-muted-foreground">
-          <span className="min-w-0 truncate" title={window.resetsAtMs !== undefined ? formatResetTimes(window.resetsAtMs) : undefined}>
+        <div
+          data-slot="reset-line"
+          className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-xs text-muted-foreground"
+        >
+          <span
+            data-slot="reset-times"
+            className="min-w-0 break-words"
+            title={window.resetsAtMs !== undefined ? formatResetTimes(window.resetsAtMs) : undefined}
+          >
             {window.resetsAtMs !== undefined ? (
               <>
-                {formatResetTimes(window.resetsAtMs)} · <ResetCountdown ms={window.resetsAtMs} />
+                {formatResetTimes(window.resetsAtMs)}
+                {/* A non-breaking space binds the separator to the times, so a wrapped line never starts with it. */}
+                {"\u00a0· "}
+                <ResetCountdown ms={window.resetsAtMs} />
               </>
             ) : (window.resetsAt ?? "")}
           </span>
           {window.note ? (
-            <span className="shrink-0 text-amber-600 dark:text-amber-400">{window.note}</span>
+            <span data-slot="window-note" className="ml-auto min-w-0 break-words text-amber-600 dark:text-amber-400">
+              {window.note}
+            </span>
           ) : null}
         </div>
       )}
@@ -282,12 +295,15 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
   return (
     <Card className="gap-4">
       <CardHeader className="space-y-0">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="truncate font-medium" title={result.identity.name}>
-              {result.identity.name}
-            </span>
-            <ToolBadge tool={result.toolName} />
+        {/* A plan badge that leaves less than 4rem for the name goes onto a second line, under the name. */}
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex min-w-0 grow flex-wrap items-center gap-2">
+            <div className="flex min-w-0 grow items-center gap-2">
+              <span className="w-0 min-w-16 grow truncate font-medium" title={result.identity.name}>
+                {result.identity.name}
+              </span>
+              <ToolBadge tool={result.toolName} />
+            </div>
             {result.plan ? (
               <Badge variant="secondary" title="Account plan">
                 {result.plan}

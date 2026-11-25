@@ -14,6 +14,7 @@ import { createStoreSyncSupervisor, type StoreSyncSupervisor } from "./store-syn
 import { createT3ClaudeTicker, type T3ClaudeTicker } from "./t3-claude-ticker.ts";
 import { createT3TelemetryTicker, type T3TelemetryTicker } from "./t3-telemetry-ticker.ts";
 import { createT3FavouritesTicker, type T3FavouritesTicker } from "./t3-favourites-ticker.ts";
+import { createT3InstancesTicker, type T3InstancesTicker } from "./t3-instances-ticker.ts";
 import { createT3ModelsTicker, type T3ModelsTicker } from "./t3-models-ticker.ts";
 import { createT3UsageTicker, type T3UsageTicker } from "./t3-usage-ticker.ts";
 import { POLL_MS, scanTree, snapshotsDiffer, type Snapshot } from "./watch.ts";
@@ -289,6 +290,8 @@ export interface RunDaemonOptions {
   t3Telemetry?: T3TelemetryTicker | false;
   /** T3 favourites sync with the gateway list (t3-favourites-ticker.ts). Default: one is created when no `deps` are given. */
   t3Favourites?: T3FavouritesTicker | false;
+  /** T3 provider instances from the live gateway app list (t3-instances-ticker.ts). Default: one is created when no `deps` are given. */
+  t3Instances?: T3InstancesTicker | false;
 }
 
 /**
@@ -311,6 +314,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
   const t3Claude = options.t3Claude === false ? undefined : (options.t3Claude ?? (options.deps ? undefined : createT3ClaudeTicker()));
   const t3Telemetry = options.t3Telemetry === false ? undefined : (options.t3Telemetry ?? (options.deps ? undefined : createT3TelemetryTicker()));
   const t3Favourites = options.t3Favourites === false ? undefined : (options.t3Favourites ?? (options.deps ? undefined : createT3FavouritesTicker()));
+  const t3Instances = options.t3Instances === false ? undefined : (options.t3Instances ?? (options.deps ? undefined : createT3InstancesTicker()));
   let stopped = false;
   let wake: (() => void) | undefined;
   const onSignal = () => {
@@ -343,6 +347,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
       try { await t3Claude?.tick(); } catch { /* retried next interval */ }
       try { await t3Telemetry?.tick(); } catch { /* retried next interval */ }
       try { await t3Favourites?.tick(); } catch { /* retried next interval */ }
+      try { await t3Instances?.tick(); } catch { /* retried next interval */ }
       if (stopped) break;
       await new Promise<void>((resolve) => {
         wake = resolve;

@@ -68,6 +68,14 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     const { runT3InstanceCommand } = await import("./t3-instance.ts");
     return runT3InstanceCommand(rest, flags, merged);
   }
+  if (sub === "t3-instances") {
+    const { runT3InstancesCommand } = await import("./t3-instances.ts");
+    return runT3InstancesCommand(rest, flags, merged);
+  }
+  if (sub === "instances-token") {
+    const { runInstancesTokenCommand } = await import("./instances-token.ts");
+    return runInstancesTokenCommand(rest, merged);
+  }
   if (sub === "favourites-token") {
     const { runFavouritesTokenCommand } = await import("./favourites-token.ts");
     return runFavouritesTokenCommand(rest, merged);
@@ -78,7 +86,7 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     const { runCodexHomeCommand } = await import("./codex-home.ts");
     return runCodexHomeCommand(rest, flags, merged);
   }
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-telemetry|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|codex-home|favourites-token ...  (ais gateway --help)");
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-telemetry|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|t3-instances|codex-home|favourites-token|instances-token ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");
@@ -94,13 +102,14 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   const replicaUrl = replicaUrlFromEnv(process.env, adminPort);
   if (credentialStore) console.info(`gateway: logins from the PostgreSQL credential store${credentialStore.fileStore ? " (this replica's HOME is the host file store: write-back on)" : ""}`);
   const sessions = sessionsFromEnv(process.env);
+  const instances = instancesFromEnv(process.env);
   if (sessions) {
     console.info(`gateway: session ingest routes on (flush gap ${sessions.flushGapSeconds ?? SESSIONS_DEFAULT_FLUSH_GAP_SECONDS} s)`);
     // No object store client with a read key exists in the gateway config yet (board row 20.306), so the hook that checks a
     // part object before its row is committed (spec 4.2) is not wired. The shipper's upload-first order is the only guard.
     console.warn("gateway: session ingest does not check part objects in the object store (no read-capable client is configured; board row 20.306)");
   }
-  const gateway = await startGateway({ port, adminPort, databaseUrl, adminToken, handleSignals: true, ...(connect ? { connect } : {}), ...(credentialStore ? { credentialStore } : {}), ...(replicaUrl ? { replicaUrl } : {}), ...(sessions ? { sessions } : {}) });
+  const gateway = await startGateway({ port, adminPort, databaseUrl, adminToken, handleSignals: true, ...(connect ? { connect } : {}), ...(credentialStore ? { credentialStore } : {}), ...(replicaUrl ? { replicaUrl } : {}), ...(sessions ? { sessions } : {}), ...(instances ? { instances } : {}) });
   console.info(`gateway: proxy on :${gateway.port}, admin on :${gateway.adminPort}; warming up`);
   // Runs until SIGTERM or SIGINT, whose handler drains and exits the process.
   await new Promise<void>(() => {});
@@ -195,6 +204,16 @@ export function sessionsFromEnv(env: Record<string, string | undefined>): { toke
   const gap = Number(gapRaw);
   if (!Number.isInteger(gap) || gap < 1 || gap > 3600) throw new CliUsageError(`${SESSIONS_FLUSH_GAP_ENV} must be a whole number of seconds from 1 to 3600`);
   return { token, flushGapSeconds: gap };
+}
+
+export const INSTANCES_NAMESPACES_ENV = "AIS_GATEWAY_INSTANCES_NAMESPACES";
+
+/** The namespaces for the t3-instances scope: a comma list, default `dev`. An empty value turns the scope off. */
+export function instancesFromEnv(env: Record<string, string | undefined>): { namespaces: string[] } | undefined {
+  const raw = env[INSTANCES_NAMESPACES_ENV];
+  if (raw === undefined) return { namespaces: ["dev"] };
+  const namespaces = raw.split(",").map((n) => n.trim()).filter(Boolean);
+  return namespaces.length > 0 ? { namespaces } : undefined;
 }
 
 /** This replica's admin address for the others: AIS_GATEWAY_REPLICA_URL, else http://$POD_IP:<admin port>; none on a single host. */

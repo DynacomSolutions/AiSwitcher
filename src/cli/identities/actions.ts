@@ -1,3 +1,4 @@
+import { markAdded } from "../../identities/tombstones.ts";
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "../../identities/types.ts";
 import { isCodexLoginMethod } from "../../identities/types.ts";
 import { normaliseIdentityColour } from "../../identities/colour.ts";
@@ -72,6 +73,7 @@ export function createIdentity(file: IdentitiesFile, input: CreateIdentityInput)
     ...(input.directories?.length ? { directories: input.directories } : {}),
     ...(input.aliases?.length ? { aliases: input.aliases } : {}),
   };
+  markAdded(file, identity);
   file.identities.push(identity);
   return identity;
 }
@@ -127,6 +129,8 @@ export function updateIdentity(file: IdentitiesFile, name: string, input: Update
 export function deleteIdentity(file: IdentitiesFile, name: string): Identity {
   const identity = requireIdentity(file, name);
   file.identities = file.identities.filter((i) => i !== identity);
+  // The tombstone tells the gateway store this removal is on purpose, so its merge does not bring the identity back.
+  file.deleted = [...(file.deleted ?? []).filter((t) => t.name !== identity.name), { name: identity.name, at: Date.now() }];
   return identity;
 }
 

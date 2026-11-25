@@ -1,5 +1,6 @@
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { addedAtOf, mergeTombstones, parseTombstones, tombstoneCovers } from "../identities/tombstones.ts";
 import { aisStateDir } from "../shared/ais-home.ts";
 
 /**
@@ -18,7 +19,12 @@ import { aisStateDir } from "../shared/ais-home.ts";
 export interface RegistryBase {
   version: number;
   sha: string;
+  /** Identity names the registry listed at this base: a host tombstone applies only to these, any other name is a re-add. */
+  names?: string[];
 }
+
+/** How long a tombstone stays in the registry after its delete, even when the store no longer lists the name. */
+export const TOMBSTONE_KEEP_MS = 90 * 86_400_000;
 
 export const registryBasesPath = (home: string): string => join(aisStateDir(home), "gateway-registry-bases.json");
 
@@ -36,7 +42,9 @@ async function readAll(home: string): Promise<Record<string, RegistryBase>> {
     const out: Record<string, RegistryBase> = {};
     for (const [path, b] of Object.entries(raw.bases ?? {})) {
       const rec = b as Partial<RegistryBase> | null;
-      if (rec && typeof rec.sha === "string" && typeof rec.version === "number") out[path] = { sha: rec.sha, version: rec.version };
+      if (rec && typeof rec.sha === "string" && typeof rec.version === "number") {
+        out[path] = { sha: rec.sha, version: rec.version, ...(Array.isArray(rec.names) ? { names: rec.names.filter((n): n is string => typeof n === "string") } : {}) };
+      }
     }
     return out;
   } catch {
@@ -52,7 +60,7 @@ export const readRegistryBase = async (home: string, rel: string): Promise<Regis
 export const writeRegistryBase = (home: string, rel: string, base: RegistryBase): Promise<void> =>
   serial(async () => {
     const all = await readAll(home);
-    if (all[rel]?.sha === base.sha && all[rel]?.version === base.version) return;
+    if (all[rel]?.sha === base.sha && all[rel]?.version === base.version && JSON.stringify(all[rel]?.names) === JSON.stringify(base.names)) return;
     all[rel] = base;
     const file = registryBasesPath(home);
     await mkdir(dirname(file), { recursive: true, mode: 0o700 });
@@ -67,9 +75,11 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 /**
  * Merges a host registry and a store registry per identity name. An identity on one side only is kept. An identity on both
  * sides takes the host entry, with the union of the two swapPool `accounts` lists (host order first). Other top-level keys
- * take the host value. Undefined when either text is not a registry object with an `identities` array.
+ * take the host value. Tombstones (`deleted`, identities/tombstones.ts) of both sides apply: an identity a tombstone covers is
+ * dropped from the result, whichever side lists it, unless the entry was added after the delete. A tombstone stays for 90 days, and as long as
+ * the store registry lists its name. Undefined when either text is not a registry object with an `identities` array.
  */
-export function mergeRegistries(host: string, store: string): Buffer | undefined {
+export function mergeRegistries(host: string, store: string, opts: { baseNames?: readonly string[]; now?: number } = {}): Buffer | undefined {
   let h: unknown;
   let s: unknown;
   try {
@@ -85,6 +95,12 @@ export function mergeRegistries(host: string, store: string): Buffer | undefined
     return m;
   };
   const theirs = named(s.identities);
+  // A tombstone only the host holds applies to names the host's base listed. Any other name was added since: a re-add, whatever the clocks say.
+  const storeTombs = new Set(parseTombstones(s.deleted).map((t) => t.name));
+  const baseNames = opts.baseNames ? new Set(opts.baseNames) : undefined;
+  const ignored = new Set(parseTombstones(h.deleted).filter((t) => baseNames && !storeTombs.has(t.name) && !baseNames.has(t.name)).map((t) => t.name));
+  const tombs = new Map(mergeTombstones(parseTombstones(h.deleted).filter((t) => !ignored.has(t.name)), parseTombstones(s.deleted)).map((t) => [t.name, t]));
+  const covered = (i: Record<string, unknown>): boolean => tombstoneCovers(tombs.get(i.name as string), i);
   const identities: unknown[] = [];
   const seen = new Set<string>();
   for (const i of h.identities) {
@@ -94,13 +110,52 @@ export function mergeRegistries(host: string, store: string): Buffer | undefined
     }
     seen.add(i.name);
     const other = theirs.get(i.name);
-    const pool = i.swapPool;
-    const otherPool = other?.swapPool;
+    // The newer add wins when the two sides hold different creations of one name.
+    const entry = other && (addedAtOf(other) ?? 0) > (addedAtOf(i) ?? 0) ? other : i;
+    // An older host (no addedAt) that re-added a name its base did not list made a new entry: the tombstone does not cover it.
+    const readded = entry === i && addedAtOf(i) === undefined && baseNames !== undefined && !baseNames.has(i.name);
+    if (!readded && covered(entry)) continue;
+    const pool = entry.swapPool;
+    const otherPool = (entry === i ? other : i)?.swapPool;
     if (isObject(pool) && Array.isArray(pool.accounts) && isObject(otherPool) && Array.isArray(otherPool.accounts)) {
       const accounts = [...new Set([...(pool.accounts as unknown[]), ...(otherPool.accounts as unknown[])])];
-      identities.push({ ...i, swapPool: { ...pool, accounts } });
-    } else identities.push(i);
+      identities.push({ ...entry, swapPool: { ...pool, accounts } });
+    } else identities.push(entry);
   }
-  for (const i of s.identities) if (!(isObject(i) && typeof i.name === "string" && seen.has(i.name))) identities.push(i);
-  return Buffer.from(`${JSON.stringify({ ...s, ...h, identities }, null, 2)}\n`);
+  for (const i of s.identities) if (!(isObject(i) && typeof i.name === "string" && (seen.has(i.name) || covered(i)))) identities.push(i);
+  const { deleted: _hd, ...hostRest } = h;
+  const { deleted: _sd, ...storeRest } = s;
+  const now = opts.now ?? Date.now();
+  const keep = [...tombs.values()].filter((t) => theirs.has(t.name) || (t.at > 0 && now - t.at < TOMBSTONE_KEEP_MS));
+  return Buffer.from(`${JSON.stringify({ ...storeRest, ...hostRest, identities, ...(keep.length > 0 ? { deleted: keep } : {}) }, null, 2)}\n`);
+}
+
+const namesOf = (list: unknown[]): Set<string> => new Set(list.flatMap((i) => (isObject(i) && typeof i.name === "string" ? [i.name] : [])));
+
+/**
+ * Names of the identities that `current` (the store registry) holds and `next` (a pushed registry) lacks. Removal goes through
+ * `retire` (the entry stays, flagged) or a tombstone (`deleted`, written by `ais identities delete`) that covers the store's entry,
+ * so a push that drops any other name is a mistake: a host file rewritten empty must not take the gateway's identities and their
+ * logins with it. Text that is not a registry counts as dropping every name of a populated registry.
+ */
+export function droppedIdentities(next: string, current: string): string[] {
+  let c: unknown;
+  try {
+    c = JSON.parse(current);
+  } catch {
+    return [];
+  }
+  if (!isObject(c) || !Array.isArray(c.identities)) return [];
+  const held = c.identities.filter((i): i is Record<string, unknown> => isObject(i) && typeof i.name === "string");
+  if (held.length === 0) return [];
+  let n: unknown;
+  try {
+    n = JSON.parse(next);
+  } catch {
+    return held.map((i) => i.name as string);
+  }
+  if (!isObject(n) || !Array.isArray(n.identities)) return held.map((i) => i.name as string);
+  const kept = namesOf(n.identities);
+  const tombs = new Map(parseTombstones(n.deleted).map((t) => [t.name, t]));
+  return held.filter((i) => !kept.has(i.name as string) && !tombstoneCovers(tombs.get(i.name as string), i)).map((i) => i.name as string);
 }
