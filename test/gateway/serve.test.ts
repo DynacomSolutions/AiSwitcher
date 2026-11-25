@@ -175,6 +175,109 @@ describe("serve lifecycle", () => {
     await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
   });
 
+  describe("CONNECT listener readiness", () => {
+    const fakeProxy = { port: 4321, stop: async () => {} };
+    const metricsOf = async (g: { port: number }): Promise<string> => (await fetch(`${base(g)}/metrics`)).text();
+    const text = (url: string) => fetch(url).then(async (r) => ({ status: r.status, body: await r.text() }));
+    async function bootConnect(over: Partial<GatewayHooks>) {
+      const g = await startGateway({ port: 0, adminPort: 0, databaseUrl: "postgres://unused", adminToken: ADMIN, connect: { port: 0, tlsDir: "/unused" } }, hooks({ noHeartbeat: true, connectRetry: { initialMs: 5, maxMs: 20 }, ...over }));
+      started.push(g);
+      return g;
+    }
+
+    test("a failed start is retried and logged, /readyz is 503 until it listens, and the metrics follow", async () => {
+      const errors: string[] = [];
+      console.error = (...a: unknown[]) => void errors.push(a.join(" "));
+      let calls = 0;
+      let succeed = false;
+      const g = await bootConnect({
+        startConnectProxy: async () => {
+          calls += 1;
+          if (!succeed) throw Object.assign(new Error("address already in use"), { code: "EADDRINUSE" });
+          return fakeProxy;
+        },
+      });
+      expect(g.connectPort).toBeUndefined();
+      await waitFor(() => calls >= 3);
+      expect(await text(`${base(g)}/readyz`)).toEqual({ status: 503, body: "connect proxy not listening\n" });
+      expect(await status(`${base(g)}/healthz`)).toBe(200); // far inside the 5 minute limit
+      const down = await metricsOf(g);
+      expect(down).toContain("ais_gateway_connect_proxy_up 0\n");
+      expect(down).toMatch(/ais_gateway_connect_proxy_start_failures_total [3-9]\d*\n/);
+      expect(errors.filter((e) => e.includes("connect proxy not started (Error EADDRINUSE)")).length).toBeGreaterThanOrEqual(3);
+      succeed = true;
+      await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+      const up = await metricsOf(g);
+      expect(up).toContain("ais_gateway_connect_proxy_up 1\n");
+      expect(up).toContain("ais_gateway_connect_proxy_down_seconds 0\n");
+      expect(up).toContain("ais_gateway_ready 1\n");
+      const settled = calls;
+      await Bun.sleep(60);
+      expect(calls).toBe(settled); // no further attempt once it listens
+    });
+
+    test("a start that works first time keeps /readyz 200 and the gauge at 1", async () => {
+      const g = await bootConnect({ startConnectProxy: async () => fakeProxy });
+      await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+      expect(g.connectPort).toBe(4321);
+      expect(await metricsOf(g)).toContain("ais_gateway_connect_proxy_up 1\n");
+    });
+
+    test("/healthz answers 503 only after the CONNECT proxy was down for the limit, and recovers when it listens", async () => {
+      let clock = Date.parse("2026-11-26T00:00:00.000Z");
+      let succeed = false;
+      const g = await bootConnect({
+        now: () => new Date(clock),
+        startConnectProxy: async () => {
+          if (!succeed) throw new Error("no certificate");
+          return fakeProxy;
+        },
+        connectRetry: { initialMs: 5, maxMs: 20 },
+      });
+      expect(await status(`${base(g)}/healthz`)).toBe(200);
+      clock += 299_000;
+      expect(await status(`${base(g)}/healthz`)).toBe(200);
+      clock += 1_000;
+      expect(await text(`${base(g)}/healthz`)).toEqual({ status: 503, body: "connect proxy not listening for 300 s\n" });
+      expect(await metricsOf(g)).toContain("ais_gateway_connect_proxy_down_seconds 300\n");
+      succeed = true;
+      await waitFor(async () => (await status(`${base(g)}/healthz`)) === 200);
+    });
+
+    test("stop ends the retries, and a start that finishes while stopping is closed", async () => {
+      let calls = 0;
+      let stopped = 0;
+      let finish!: () => void;
+      const slow = new Promise<void>((r) => (finish = r));
+      const g = await bootConnect({
+        startConnectProxy: async () => {
+          calls += 1;
+          if (calls < 2) throw new Error("not yet");
+          await slow;
+          return { port: 4322, stop: async () => void (stopped += 1) };
+        },
+      });
+      await waitFor(() => calls === 2);
+      const stopping = g.stop();
+      finish();
+      await stopping;
+      expect(stopped).toBe(1);
+      const settled = calls;
+      await Bun.sleep(60);
+      expect(calls).toBe(settled);
+    });
+
+    test("without a CONNECT proxy configured nothing changes: /readyz and /healthz answer 200 and the gauge is absent", async () => {
+      const g = await boot();
+      await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+      expect(await text(`${base(g)}/readyz`)).toMatchObject({ status: 200 });
+      expect(await status(`${base(g)}/healthz`)).toBe(200);
+      const m = await metricsOf(g);
+      expect(m).not.toContain("ais_gateway_connect_proxy_up ");
+      expect(m).toContain("ais_gateway_connect_proxy_start_failures_total 0\n");
+    });
+  });
+
   test("the CONNECT proxy forwards a reset-credit view and redeem with the member's login, and refuses an unknown gateway token", async () => {
     const token = await seed();
     const tlsDir = await mkdtemp(join(tmpdir(), "gw-connect-tls-"));

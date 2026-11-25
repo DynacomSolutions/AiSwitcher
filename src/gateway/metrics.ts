@@ -216,6 +216,8 @@ export class PrometheusMetrics implements GatewayMetrics {
   appNoticesUp: () => number = () => 0;
   /** Readiness and usage warm-up state, set in serve.ts. */
   readiness: () => { ready: boolean; state: string } = () => ({ ready: false, state: "cold" });
+  /** The CONNECT proxy listener, set in serve.ts. `configured` false means this replica runs no CONNECT proxy. */
+  connectProxy: () => { configured: boolean; up: boolean; downSeconds: number; failures: number } = () => ({ configured: false, up: false, downSeconds: 0, failures: 0 });
   usageWarmup: () => { seconds: number; timeouts: number; cold: number } = () => ({ seconds: 0, timeouts: 0, cold: 0 });
   /** Extra text sections of other components (the session enrichment). Each returns finished exposition lines. */
   readonly sections: Array<() => string[]> = [];
@@ -459,6 +461,13 @@ export class PrometheusMetrics implements GatewayMetrics {
     out.push("# HELP ais_gateway_ready 1 while /readyz answers 200, else 0.", "# TYPE ais_gateway_ready gauge", `ais_gateway_ready ${rd.ready ? 1 : 0}`);
     out.push("# HELP ais_gateway_readiness_state 1 for the current readiness state (cold, warm, timeout, draining), 0 for the others.", "# TYPE ais_gateway_readiness_state gauge");
     for (const st of ["cold", "warm", "timeout", "draining"]) out.push(`ais_gateway_readiness_state{state="${st}"} ${rd.state === st ? 1 : 0}`);
+    const cp = this.connectProxy();
+    // Absent when this replica has no CONNECT proxy configured, so the series never reads as a healthy listener that does not exist.
+    if (cp.configured) {
+      out.push("# HELP ais_gateway_connect_proxy_up 1 while the CONNECT proxy listens, 0 while it is configured but not listening (absent when not configured).", "# TYPE ais_gateway_connect_proxy_up gauge", `ais_gateway_connect_proxy_up ${cp.up ? 1 : 0}`);
+      out.push("# HELP ais_gateway_connect_proxy_down_seconds Seconds the configured CONNECT proxy has not been listening (0 while it listens).", "# TYPE ais_gateway_connect_proxy_down_seconds gauge", `ais_gateway_connect_proxy_down_seconds ${cp.downSeconds}`);
+    }
+    out.push("# HELP ais_gateway_connect_proxy_start_failures_total Failed attempts to start the CONNECT proxy listener.", "# TYPE ais_gateway_connect_proxy_start_failures_total counter", `ais_gateway_connect_proxy_start_failures_total ${cp.failures}`);
     const uw = this.usageWarmup();
     out.push("# HELP ais_gateway_usage_warmup_seconds Duration of the usage cache warm-up (0 until it ends).", "# TYPE ais_gateway_usage_warmup_seconds gauge", `ais_gateway_usage_warmup_seconds ${uw.seconds}`);
     out.push("# HELP ais_gateway_usage_warmup_timeouts_total Usage warm-ups that hit the timeout with identities still cold.", "# TYPE ais_gateway_usage_warmup_timeouts_total counter", `ais_gateway_usage_warmup_timeouts_total ${uw.timeouts}`);

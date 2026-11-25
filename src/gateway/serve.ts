@@ -130,6 +130,13 @@ export interface GatewayHooks {
   browserIdentityExists?: NonNullable<GatewayDeps["browserIdentityExists"]>;
   notify?: Notifier;
   warmBackoff?: { initialMs: number; maxMs: number };
+  /** Tests: replaces the start of the CONNECT proxy listener (default startUsageProxy). */
+  startConnectProxy?: typeof startUsageProxy;
+  /**
+   * The CONNECT proxy start retries (default 1 s doubling to 30 s) and how long it may stay down before /healthz answers 503
+   * so the kubelet restarts the container (default 5 minutes). The clock is `now`.
+   */
+  connectRetry?: { initialMs?: number; maxMs?: number; healthzLimitMs?: number };
   ledger?: { max: number; flushMs: number };
   /** How often the app and token cache is re-read for changes made by other instances. */
   refreshIntervalMs?: number;
@@ -195,6 +202,8 @@ export interface GatewayHooks {
 /** What `AIS_GATEWAY_CHAT_*` configures. */
 export interface ChatEnvConfig { kube: KubeConfigEnv; mcpUrl: string; maxLive: number; startTimeoutMs: number }
 
+/** A configured CONNECT proxy that has not listened for this long makes /healthz answer 503, so the kubelet restarts the container. */
+const CONNECT_HEALTHZ_LIMIT_MS = 5 * 60_000;
 const CHAT_MAX_DEFAULT = 12;
 /** The broker refuses to start a chat older than this (its default maxAgeMs). */
 const CHAT_MAX_AGE_MS = 7 * 86_400_000;
@@ -942,6 +951,16 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   let usageWarmupTimeouts = 0;
   let usageWarmupCold = 0;
   const isReady = (): boolean => warmed && !draining && usageGate.isReady();
+  // The CONNECT proxy listener. Configured but not listening makes /readyz 503, and after a long outage /healthz 503 too.
+  const connectConfigured = opts.connect !== undefined;
+  const connectHealthzLimitMs = hooks.connectRetry?.healthzLimitMs ?? CONNECT_HEALTHZ_LIMIT_MS;
+  let connectProxy: RunningUsageProxy | undefined;
+  let connectDownSince = now().getTime();
+  let connectFailures = 0;
+  let connectTimer: ReturnType<typeof setTimeout> | undefined;
+  let connectAttempt: Promise<void> | undefined;
+  const connectDownMs = (): number => (connectConfigured && !connectProxy ? Math.max(0, now().getTime() - connectDownSince) : 0);
+  metrics.connectProxy = () => ({ configured: connectConfigured, up: connectProxy !== undefined, downSeconds: Math.floor(connectDownMs() / 1000), failures: connectFailures });
   metrics.readiness = () => ({ ready: isReady(), state: usageGate.state() });
   metrics.usageWarmup = () => ({ seconds: (usageGate.result()?.durationMs ?? 0) / 1000, timeouts: usageWarmupTimeouts, cold: usageWarmupCold });
   let storeSynced = false;
@@ -1150,11 +1169,16 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     const path = new URL(req.url).pathname;
     // Operational endpoints answer only inside the cluster (vmagent and probes use the pod address): on a public host they do not exist.
     if (isOperationalPath(path) && viaPublicHost(req.headers, req.url, publicHosts)) return markGatewayResponse(new Response("AIS gateway: not found on a public host\n", { status: 404, headers: { [GATEWAY_ERROR_HEADER]: "operational_path" } }));
-    if (path === "/healthz") return new Response("ok\n");
+    if (path === "/healthz") {
+      // Liveness also covers the listener clients use: a CONNECT proxy that stays down is only cured by a restart.
+      if (!draining && connectDownMs() >= connectHealthzLimitMs) return new Response(`connect proxy not listening for ${Math.floor(connectDownMs() / 1000)} s\n`, { status: 503 });
+      return new Response("ok\n");
+    }
     if (path === "/readyz") {
       if (draining) return new Response("draining\n", { status: 503 });
       if (!warmed) return new Response("warming\n", { status: 503 });
       if (!usageGate.isReady()) return new Response("warming usage cache\n", { status: 503 });
+      if (connectConfigured && !connectProxy) return new Response("connect proxy not listening\n", { status: 503 });
       // A warm replica serves from its loaded logins; ledger rows queue and the store sync retries until the database is back.
       // Taking it out of the rotation would leave no gateway at all while the database primary is down.
       return new Response(dbOk() ? "ready\n" : "ready, database unreachable\n");
@@ -1508,6 +1532,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       clearInterval(gaugeTimer);
       clearInterval(pruneTimer);
       clearInterval(pingTimer);
+      clearTimeout(connectTimer);
+      await connectAttempt?.catch(() => undefined);
       if (importTimer) clearInterval(importTimer);
       store.stop();
       // Bun's stop(false) refuses new connections and resolves once active requests are done.
@@ -1542,27 +1568,55 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     return stopping;
   };
 
-  let connectProxy: RunningUsageProxy | undefined;
   if (opts.connect) {
-    try {
-      connectProxy = await startUsageProxy({
-        port: opts.connect.port,
-        ...(hooks.host ? { host: hooks.host } : {}),
-        tlsDir: opts.connect.tlsDir,
-        ...(opts.connect.publishCaTo ? { publishCaTo: opts.connect.publishCaTo } : {}),
-        appForToken,
-        // The gateway's own route for the app, with the client's method, headers (same token) and body.
-        serve: async (app, path, req) => {
-          const hasBody = req.body !== null && req.method !== "GET" && req.method !== "HEAD";
-          return proxy.fetch(new Request(`http://gateway.internal/${encodeURIComponent(app)}${path}${new URL(req.url).search}`, { method: req.method, headers: req.headers, ...(hasBody ? { body: req.body, duplex: "half" } : {}) } as RequestInit), { ip: "127.0.0.1" });
-        },
-        ...(hooks.fetch ? { fetch: hooks.fetch } : {}),
-      });
-      console.info(`gateway: connect proxy on :${connectProxy.port}`);
-    } catch (err) {
-      // A missing certificate never takes the gateway down; only the proxy is off.
-      console.warn(`gateway: connect proxy not started (${describe(err)})`);
-    }
+    const connect = opts.connect;
+    const startProxy = hooks.startConnectProxy ?? startUsageProxy;
+    const initialMs = hooks.connectRetry?.initialMs ?? 1_000;
+    const maxMs = hooks.connectRetry?.maxMs ?? 30_000;
+    let delayMs = initialMs;
+    /** One start attempt. A failure is logged with its reason and counted; the caller schedules the next one. Never throws. */
+    const tryStart = async (): Promise<boolean> => {
+      try {
+        const started = await startProxy({
+          port: connect.port,
+          ...(hooks.host ? { host: hooks.host } : {}),
+          tlsDir: connect.tlsDir,
+          ...(connect.publishCaTo ? { publishCaTo: connect.publishCaTo } : {}),
+          appForToken,
+          // The gateway's own route for the app, with the client's method, headers (same token) and body.
+          serve: async (app, path, req) => {
+            const hasBody = req.body !== null && req.method !== "GET" && req.method !== "HEAD";
+            return proxy.fetch(new Request(`http://gateway.internal/${encodeURIComponent(app)}${path}${new URL(req.url).search}`, { method: req.method, headers: req.headers, ...(hasBody ? { body: req.body, duplex: "half" } : {}) } as RequestInit), { ip: "127.0.0.1" });
+          },
+          ...(hooks.fetch ? { fetch: hooks.fetch } : {}),
+        });
+        if (draining) {
+          // The gateway began to stop while this attempt ran: do not keep a listener that nobody will close.
+          await started.stop(true).catch(() => undefined);
+          return true;
+        }
+        connectProxy = started;
+        console.info(`gateway: connect proxy on :${started.port}`);
+        return true;
+      } catch (err) {
+        connectFailures += 1;
+        // A missing certificate or a held port never takes the gateway down; the proxy retries, and /readyz stays 503 until it listens.
+        console.error(`gateway: connect proxy not started (${describe(err)}); it will retry`);
+        return false;
+      }
+    };
+    const scheduleRetry = (): void => {
+      if (draining) return;
+      const wait = delayMs;
+      delayMs = Math.min(maxMs, delayMs * 2);
+      connectTimer = setTimeout(() => {
+        connectAttempt = tryStart().then((ok) => {
+          if (!ok) scheduleRetry();
+        });
+      }, wait);
+      connectTimer.unref?.();
+    };
+    if (!(await tryStart())) scheduleRetry();
   }
 
   const onSignal = (): void => {

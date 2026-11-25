@@ -959,12 +959,23 @@ Replicas:
   2026) stayed held for days on every replica that had seen the 429.
 - Browser relay: see `docs/agents/browser.md` (sockets stay on their replica; calls are forwarded).
 
-Health: `/healthz` is liveness (always `ok` while the process serves). `/readyz` is readiness: 503 while warming (with the
+Health: `/healthz` is liveness (`ok` while the process serves, unless the CONNECT listener stays down; see below). `/readyz` is readiness: 503 while warming (with the
 store: until the first full pull finished) or draining. Once warm, a replica stays ready while the database is down: it
 serves from the logins it loaded, ledger rows queue in memory (oldest dropped past 50,000) and the store sync retries
 on its poll. Taking it out of rotation would leave no gateway at all while the PostgreSQL primary is down. The body
 says `ready, database unreachable` when the database has not answered a ping (every 5 s, 2 s timeout) for 15 s, and
 the log has one `database unreachable` line per outage. A replica that never warmed stays unready.
+
+CONNECT listener (TCP 47132, only when the replica is configured with a CONNECT proxy): a failed start never stops the
+gateway, but the replica is not ready without it. The gateway retries the start with a backoff (1 s, doubling to 30 s) and
+logs each failure with its reason at error level, and logs once when the listener is up. Until it listens, `/readyz`
+answers `503 connect proxy not listening` (checked after the other readiness answers). If the listener stays down for 5
+minutes, `/healthz` answers `503 connect proxy not listening for <n> s`, so the kubelet restarts the container. A replica
+with no CONNECT proxy configured is unchanged. Metrics: `ais_gateway_connect_proxy_up` (1 listening, 0 configured but not
+listening; the series is absent when no CONNECT proxy is configured), `ais_gateway_connect_proxy_down_seconds` (same
+rule) and `ais_gateway_connect_proxy_start_failures_total` (always present). Cluster liveness should also open a TCP
+connection to the CONNECT port, so a listener that dies after start is caught too. A failed start releases its loopback
+TLS listener and renewal timer, so retries leak nothing.
 
 The console stands down for every store-owned login (`docs/agents/console-web.md`, `AIS_GATEWAY_STORE_DATABASE_URL`).
 
