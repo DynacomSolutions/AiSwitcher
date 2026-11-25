@@ -271,13 +271,22 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
     client.on("error", () => client.destroy());
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen({ host: opts.host ?? "0.0.0.0", port: opts.port }, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen({ host: opts.host ?? "0.0.0.0", port: opts.port }, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (err) {
+    // The port is held or refused: release the loopback TLS listener and the renewal timer, so a retry starts clean and leaks nothing.
+    clearInterval(recheck);
+    await tlsServer.stop(true).catch(() => undefined);
+    throw err;
+  }
+  // An error after the listener is up must be logged, never thrown as an unhandled event that ends the process.
+  server.on("error", (err: Error) => log(`gateway: connect-proxy listener error (${err.message})`));
   return {
     port: (server.address() as net.AddressInfo).port,
     stop: async (force = true) => {

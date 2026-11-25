@@ -392,6 +392,20 @@ describe("usage proxy: opencode and grok hosts", () => {
     expect(res.status).toBe(200);
     expect(targets).toEqual(["opencode.ai:443"]);
   });
+
+  test("a start refused by a held port rejects, leaks no timer, and succeeds once the port is free", async () => {
+    const holder = net.createServer();
+    await new Promise<void>((r) => holder.listen({ host: "127.0.0.1", port: 0 }, () => r()));
+    const heldPort = (holder.address() as net.AddressInfo).port;
+    await expect(proxy([], { port: heldPort })).rejects.toThrow();
+    await new Promise<void>((r) => holder.close(() => r()));
+    const p = await proxy([], { port: heldPort });
+    expect(p.port).toBe(heldPort);
+  });
+
+  test("a missing certificate rejects the start", async () => {
+    await expect(proxy([], { tlsDir: join(dir, "missing") })).rejects.toThrow();
+  });
 });
 
 afterAll(() => rm(dir, { recursive: true, force: true }));
