@@ -7,12 +7,18 @@
 // Asserts, for every route of apps/web/src/App.tsx at 360x740 and 390x844:
 //   document.documentElement.scrollWidth <= clientWidth (no horizontal page overflow);
 // and that on a narrow screen the menu button opens the navigation, Escape closes it, and following a link closes it.
+// With a stubbed limits answer it also asserts on /limits at each width and at 1280x900: no reset line or badge clips
+// text, no box cuts a countdown off, each countdown is in one piece inside its card, no line starts with the separator,
+// and the plan badge stays clear of the status badge. The reset lines are found by their text, not by the markup.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cdp, type Session } from "../../chrome-extension/test/e2e/cdp.ts";
+import { countdownUntil } from "../src/lib/format.ts";
+import { formatResetTimes } from "../src/lib/reset-time.ts";
+import type { LimitsResponse, PoolsUsageResponse } from "../src/types/api.ts";
 
 const repoRoot = join(import.meta.dir, "../../..");
 const distDir = process.env.AIS_WEB_DIST ?? join(repoRoot, "apps/web/dist");
@@ -26,6 +32,232 @@ const ROUTES = [
 ];
 const VIEWPORTS = [{ width: 360, height: 740 }, { width: 390, height: 844 }];
 const LONG = "VeryLongUnbrokenTokenVeryLongUnbrokenTokenVeryLongUnbrokenTokenVeryLong";
+// The e2e identities have no credentials, so the daemon never reports reset times. This synthetic answer does.
+// 12 days and 17 hours give a long countdown text, so a reset line wraps at 360 px and on the desktop grid.
+const RESET_AT = Date.now() + 12 * 86_400_000 + 17 * 3_600_000 + 23 * 60_000;
+const SYNTHETIC_IDENTITY = { label: "Synthetic identity", configDir: "synthetic" };
+const SYNTHETIC_LIMITS: LimitsResponse = {
+  cached: false,
+  fetchedAt: new Date().toISOString(),
+  results: [
+    {
+      toolName: "claude",
+      provider: "anthropic",
+      identity: { name: "SYNTHETIC_FIXTURE-long-plan", ...SYNTHETIC_IDENTITY },
+      status: "live",
+      plan: "Self Serve Business Prolite",
+      windows: [
+        { label: "Session", category: "session", usedPercent: 40, resetsAtMs: RESET_AT },
+        { label: "Week", category: "week", usedPercent: 95, resetsAtMs: RESET_AT + 86_400_000, note: "over budget: $1234.56 of $1000.00" },
+        { label: "Month", category: "month", usedPercent: 100, resetsAtMs: RESET_AT - 60_000 }, // a reset in the past shows "now"
+      ],
+    },
+    {
+      toolName: "claude",
+      provider: "anthropic",
+      identity: { name: "SYNTHETIC_FIXTURE-short-plan", ...SYNTHETIC_IDENTITY },
+      status: "live",
+      plan: "Go",
+      windows: [{ label: "Session", category: "session", usedPercent: 10, resetsAtMs: RESET_AT }],
+    },
+  ],
+};
+// One pool with both identities. A pool card shows the reset of the window with the highest use of each member.
+const SYNTHETIC_POOLS: PoolsUsageResponse = {
+  todayKey: "2026-11-25",
+  weekStartKey: "2026-11-19",
+  pools: [{ tool: "claude", name: "SYNTHETIC_FIXTURE-pool", active: "SYNTHETIC_FIXTURE-long-plan", members: SYNTHETIC_LIMITS.results.map((r) => ({ name: r.identity.name, allowed: true })) }],
+  gateway: { today: { configured: false, rows: [] }, week: { configured: false, rows: [] } },
+};
+const POOL_RESETS = SYNTHETIC_LIMITS.results.map((r) => r.windows.reduce((worst, w) => (w.usedPercent > worst.usedPercent ? w : worst)).resetsAtMs!);
+
+/** What the page reports about the Limits cards. */
+type LimitsCheck = { lines: number; wrapped: number; notes: number; poolLines: number; poolWrapped: number; plans: number; problems: string[] };
+
+/** The left and the right edge of a box in the page, in px. */
+type Box = { left: number; right: number };
+
+/** One character of the rendered text of an element: its box and the character. */
+type Char = { top: number; left: number; right: number; ch: string };
+
+const LIMITS_ANSWERS: Record<string, unknown> = { "/api/limits": SYNTHETIC_LIMITS, "/api/pools/usage": SYNTHETIC_POOLS };
+
+/**
+ * Runs in the page before each document: it answers the limits routes with the synthetic data. The real fetch serves
+ * each other path. The test sends the source of each page function with its `toString()`.
+ */
+function limitsStub(answers: Record<string, unknown>): void {
+  const real = window.fetch.bind(window);
+  const stub = (input: RequestInfo | URL, init?: RequestInit) => {
+    const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const u = new URL(raw, location.href);
+    const answer = u.origin === location.origin && Object.hasOwn(answers, u.pathname) ? answers[u.pathname] : undefined;
+    return answer === undefined
+      ? real(input, init)
+      : Promise.resolve(new Response(JSON.stringify(answer), { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  // The type of fetch has a preconnect member. The stub keeps the member of the page.
+  window.fetch = Object.assign(stub, { preconnect: window.fetch.preconnect });
+}
+
+/** Runs in the page: the innermost elements that show one of the given texts. The markup of the page does not matter. */
+function withText(wanted: string[]): Element[] {
+  const text = (el: Element) => (el.textContent ?? "").replace(/[\s\u00a0]+/g, " ").trim();
+  const found = [...document.querySelectorAll("main *")].filter((el) => wanted.includes(text(el)));
+  return found.filter((el) => !found.some((o) => o !== el && el.contains(o)));
+}
+
+/**
+ * Runs in the page. Finds the reset lines, the notes and the plan badges by their text, so the markup of the page is
+ * free, and names each rule of the Limits cards that is broken.
+ */
+function limitCheck(
+  args: { expected: string[]; times: string[]; notes: string[]; plans: string[] },
+  withText: (wanted: string[]) => Element[],
+): LimitsCheck {
+  const R = (el: Element) => el.getBoundingClientRect();
+  const text = (el: Element) => (el.textContent ?? "").replace(/[\s\u00a0]+/g, " ").trim();
+  const inside = (r: Box, box: Box) => r.left >= box.left - 1 && r.right <= box.right + 1;
+  // True when the element can hide part of its content.
+  const guarded = (el: Element) => {
+    const cs = getComputedStyle(el);
+    return cs.overflowX !== "visible" || cs.overflowY !== "visible" || el.classList.contains("truncate");
+  };
+  const clips = (el: Element) => guarded(el) && el.scrollWidth > el.clientWidth + 1;
+  // The content box of the card part an element is in. The header and the content of a card have the same box.
+  const cardBox = (el: Element): Box => {
+    const part = el.closest("[data-slot=card-content], [data-slot=card-header]") ?? el;
+    const r = R(part);
+    const cs = getComputedStyle(part);
+    return {
+      left: r.left + parseFloat(cs.paddingLeft) + parseFloat(cs.borderLeftWidth),
+      right: r.right - parseFloat(cs.paddingRight) - parseFloat(cs.borderRightWidth),
+    };
+  };
+  // One box for each character that has one, in the order of the text.
+  const chars = (root: Element): Char[] => {
+    const out: Char[] = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const value = node.nodeValue ?? "";
+      for (let i = 0; i < value.length; i++) {
+        const range = document.createRange();
+        range.setStart(node, i);
+        range.setEnd(node, i + 1);
+        // A character in a span can give two rects. Their union is the box of the character.
+        const r = range.getBoundingClientRect();
+        if (r.width > 0) out.push({ top: r.top, left: r.left, right: r.right, ch: value[i]! });
+      }
+    }
+    return out;
+  };
+  // The text of each line box, from the top line down. Characters whose tops are less than 4 px apart are on one line.
+  const lineTexts = (cs: Char[]) => {
+    const lines: Char[][] = [];
+    for (const c of [...cs].sort((a, b) => a.top - b.top || a.left - b.left)) {
+      const last = lines[lines.length - 1];
+      if (last && c.top - last[0]!.top < 4) last.push(c);
+      else lines.push([c]);
+    }
+    return lines.map((l) => [...l].sort((a, b) => a.left - b.left).map((c) => c.ch).join(""));
+  };
+  const boxOf = (cs: Char[]): Box => ({ left: Math.min(...cs.map((c) => c.left)), right: Math.max(...cs.map((c) => c.right)) });
+  // A box up to the card that hides its overflow and holds part of a box outside its edge.
+  const cutBy = (el: Element, box: Box): string | undefined => {
+    const card = el.closest("[data-slot=card]");
+    for (let a: Element | null = el; a; a = a.parentElement) {
+      const cs = getComputedStyle(a);
+      const hidden = ["hidden", "clip"].includes(cs.overflowX) || ["hidden", "clip"].includes(cs.overflowY);
+      if (hidden && !inside(box, R(a))) return a.tagName.toLowerCase() + "." + String(a.className).slice(0, 60);
+      if (a === card) break;
+    }
+    return undefined;
+  };
+
+  const problems: string[] = [];
+  const root = document.documentElement;
+  if (root.scrollWidth > root.clientWidth) problems.push(`page overflow: ${root.scrollWidth} > ${root.clientWidth}`);
+  // One reset line: "<times> · <countdown>" on an identity card, "Resets <times> · <countdown>" on a pool card.
+  const check = (el: Element) => {
+    const full = text(el);
+    const pool = full.startsWith("Resets ");
+    const box = cardBox(el);
+    const cs = chars(el);
+    // The countdown is the end of the line.
+    const countdown = full.slice(full.lastIndexOf(" · ") + 3);
+    if (cs.length < countdown.length) {
+      problems.push(`the line has no rendered text: "${full}"`);
+      return { pool, wrapped: false };
+    }
+    const tail = cs.slice(-countdown.length);
+    const tailBox = boxOf(tail);
+    if (tail.map((c) => c.ch).join("") !== countdown) problems.push(`the countdown is not one run of characters: "${full}"`);
+    if (clips(el) || [...el.querySelectorAll("*")].some(clips)) problems.push(`clipped text: "${full}"`);
+    if (el.scrollWidth > el.clientWidth + 1) problems.push(`text wider than its box: "${full}"`);
+    const cut = cutBy(el, tailBox);
+    if (cut) problems.push(`the countdown is cut off by ${cut}: "${full}"`);
+    if (lineTexts(tail).length !== 1) problems.push(`countdown over two lines: "${full}"`);
+    if (!inside(tailBox, box)) problems.push(`countdown outside the card: "${full}"`);
+    const lines = lineTexts(cs);
+    // The separator can be a non-breaking space and a dot: both must stay off the start of a line.
+    if (lines.some((l) => /^\s*\u00b7/.test(l))) problems.push(`a line starts with the separator: "${full}"`);
+    if (!pool) {
+      // The tooltip of the line shows the reset times.
+      const title = el instanceof HTMLElement ? el.title : "";
+      if (!args.times.includes(title)) problems.push(`the tooltip with the reset times is missing: "${full}"`);
+      // A bound separator ends a line, so the line after it holds the countdown alone.
+      const first = lines[lines.length - 2];
+      const second = lines[lines.length - 1];
+      if (lines.length > 1 && (!first?.endsWith("\u00b7") || !/^(in .+|now)$/.test(second ?? ""))) {
+        problems.push(`a wrapped line does not end with the separator, or the line after it is not the countdown alone: ${JSON.stringify(lines)}`);
+      }
+    }
+    return { pool, wrapped: lines.length > 1 };
+  };
+  let lines = 0;
+  let wrapped = 0;
+  let poolLines = 0;
+  let poolWrapped = 0;
+  for (const el of withText(args.expected)) {
+    const r = check(el);
+    if (r.pool) poolLines++;
+    else lines++;
+    if (r.wrapped) {
+      if (r.pool) poolWrapped++;
+      else wrapped++;
+    }
+  }
+  const notes = withText(args.notes);
+  for (const note of notes) {
+    const box = cardBox(note);
+    const r = R(note);
+    if (clips(note) || !inside(r, box)) problems.push(`note clipped or outside the card: "${note.textContent}"`);
+    if (r.right < box.right - 1) problems.push(`note is not at the right edge of the card: "${note.textContent}"`);
+  }
+  // The badge that shows a plan text, and the other badge of the same header: the status badge.
+  let plans = 0;
+  const badges = [...document.querySelectorAll("main [data-slot=badge]")];
+  for (const plan of badges.filter((b) => args.plans.includes(text(b)))) {
+    plans++;
+    const box = cardBox(plan);
+    const header = plan.closest("[data-slot=card-header]");
+    const status = header ? [...header.querySelectorAll("[data-slot=badge]")].find((b) => b !== plan) : undefined;
+    if (!status) {
+      problems.push(`plan badge without a status badge: "${plan.textContent}"`);
+      continue;
+    }
+    if (clips(plan)) problems.push(`clipped plan badge: "${plan.textContent}"`);
+    if (clips(status)) problems.push(`clipped status badge: "${status.textContent}"`);
+    const p = R(plan);
+    const s = R(status);
+    if (!inside(p, box)) problems.push(`plan badge outside the card: "${plan.textContent}"`);
+    if (!inside(s, box)) problems.push(`status badge outside the card: "${status.textContent}"`);
+    if (p.left < s.right - 1 && s.left < p.right - 1 && p.top < s.bottom - 1 && s.top < p.bottom - 1) {
+      problems.push(`plan badge covers the status badge: "${plan.textContent}"`);
+    }
+  }
+  return { lines, wrapped, notes: notes.length, poolLines, poolWrapped, plans, problems };
+}
 
 let runDir = "";
 let daemon: ReturnType<typeof Bun.spawn> | undefined;
@@ -67,6 +299,59 @@ async function open(route: string): Promise<void> {
   await waitFor(`${route} to render`, 20_000, () => page.eval<boolean>("main_has_text()"));
   // Give data a bounded time to replace skeletons; a route that stays loading is still measured, in its loading state.
   await waitFor(`${route} data`, 8_000, () => page.eval<boolean>("main_ready()")).catch(() => undefined);
+}
+
+// The countdown text can change while the page renders. Each accepted instant gives one accepted text.
+const COUNTDOWN_INSTANTS = [0, -20_000, -40_000, 5_000];
+
+/** Opens a limits route with the synthetic data and asserts the rules of the Limits cards at one viewport. */
+async function checkLimitsCards(
+  width: number,
+  height: number,
+  route: string,
+  counts: { lines: number; notes: number; plans: number; poolLines: number; wrappedAtLeast: number },
+): Promise<void> {
+  await setViewport(width, height);
+  const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+    source: `(${limitsStub.toString()})(${JSON.stringify(LIMITS_ANSWERS)})`,
+  });
+  try {
+    await open(route);
+    const texts = (ms: number) =>
+      COUNTDOWN_INSTANTS.map((dt) => {
+        const countdown = countdownUntil(ms, Date.now() + dt);
+        return countdown === "now" ? "now" : `in ${countdown}`;
+      });
+    const expected = [
+      ...SYNTHETIC_LIMITS.results.flatMap((r) => r.windows.flatMap((w) => texts(w.resetsAtMs!).map((c) => `${formatResetTimes(w.resetsAtMs!)} · ${c}`))),
+      ...POOL_RESETS.flatMap((ms) => texts(ms).map((c) => `Resets ${formatResetTimes(ms)} · ${c}`)),
+    ];
+    // Wait until each reset line of the route is on the page. A line is found by its text, so the page markup is free.
+    await waitFor("limits rows", 10_000, async () =>
+      (await page.eval<number>(`(${withText.toString()})(${JSON.stringify(expected)}).length`)) >= counts.lines + counts.poolLines);
+    await sleep(300);
+    const resets = [...SYNTHETIC_LIMITS.results.flatMap((r) => r.windows.map((w) => w.resetsAtMs!)), ...POOL_RESETS];
+    const times = [...new Set(resets.map((ms) => formatResetTimes(ms)))];
+    const notes = [...new Set(SYNTHETIC_LIMITS.results.flatMap((r) => r.windows.flatMap((w) => (w.note ? [w.note] : []))))];
+    const plans = [...new Set(SYNTHETIC_LIMITS.results.flatMap((r) => (r.plan ? [r.plan] : [])))];
+    const checkArgs = JSON.stringify({ expected, times, notes, plans });
+    const m = await page.eval<LimitsCheck>(`(${limitCheck.toString()})(${checkArgs}, ${withText.toString()})`);
+    const detail = JSON.stringify(m);
+    console.log(`limits cards at ${width}px ${route}: ${detail}`);
+    expect(m.problems, detail).toEqual([]);
+    expect(m.lines, detail).toBe(counts.lines);
+    expect(m.wrapped, detail).toBeGreaterThanOrEqual(counts.wrappedAtLeast);
+    expect(m.notes, detail).toBe(counts.notes);
+    expect(m.plans, detail).toBe(counts.plans);
+    expect(m.poolLines, detail).toBe(counts.poolLines);
+    if (evidence) {
+      await mkdir(evidence, { recursive: true });
+      const name = route === "/limits" ? "overview" : route.slice("/limits/".length);
+      await writeFile(join(evidence, `${width}-limits-${name}.png`), await page.screenshot());
+    }
+  } finally {
+    await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+  }
 }
 
 /** Overflow report: page scroll width, and the widest offenders when it overflows. */
@@ -178,6 +463,17 @@ for (const vp of VIEWPORTS) {
       }, 40_000);
     }
 
+    // Identity cards: three lines on the card with the long plan, one line on the card with the short plan.
+    // The rule of the separator needs a line that wraps. At 360 px a reset line is too long for the card.
+    test("/limits/anthropic keeps each reset countdown in full", async () => {
+      await checkLimitsCards(vp.width, vp.height, "/limits/anthropic", { lines: 4, notes: 1, plans: 2, poolLines: 0, wrappedAtLeast: vp.width === 360 ? 1 : 0 });
+    }, 40_000);
+
+    // Pool cards: one reset line for each member of the pool.
+    test("/limits keeps each pool reset countdown in full", async () => {
+      await checkLimitsCards(vp.width, vp.height, "/limits", { lines: 0, notes: 0, plans: 0, poolLines: 2, wrappedAtLeast: 0 });
+    }, 40_000);
+
     test("the New identity dialog fits the viewport", async () => {
       await setViewport(vp.width, vp.height);
       await open("/identities");
@@ -226,3 +522,15 @@ for (const vp of VIEWPORTS) {
     }, 40_000);
   });
 }
+
+// The desktop grid. The countdown was cut off here, and a long plan badge covered the status badge.
+describe("1280x900", () => {
+  // Each card of the grid is narrow, so every reset line wraps here.
+  test("/limits/anthropic keeps each reset countdown in full", async () => {
+    await checkLimitsCards(1280, 900, "/limits/anthropic", { lines: 4, notes: 1, plans: 2, poolLines: 0, wrappedAtLeast: 1 });
+  }, 40_000);
+
+  test("/limits keeps each pool reset countdown in full", async () => {
+    await checkLimitsCards(1280, 900, "/limits", { lines: 0, notes: 0, plans: 0, poolLines: 2, wrappedAtLeast: 0 });
+  }, 40_000);
+});
