@@ -5,6 +5,7 @@ import type { SwapReason, SwapResult } from "../../identities/pool/adapter.ts";
 import { isGatewayRoutedPool } from "../../identities/pool/gateway-pool.ts";
 import { eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
 import { poolStatus, swapIfLimited, swapToNext, type MemberRow, type PoolOpsDeps } from "../../identities/pool/ops.ts";
+import { recordAdapterFor } from "../../identities/pool/record-adapter.ts";
 import { adapterFor } from "../../identities/pool/registry.ts";
 import { performPoolSwap } from "../../identities/pool/swap.ts";
 import { parseHookInput, runContinuation, type ContinueRequest } from "../../identities/claude-swap-continue.ts";
@@ -165,8 +166,8 @@ async function mutatePool(
 /** `ais swap <tool> ...` (and the `ais claude-swap ...` alias): one command
  * set over the generic pool core, driven by the tool's adapter. */
 export async function runSwapCommand(tool: string, positionals: string[], flags: ParsedArgs["flags"], deps: SwapDeps = {}): Promise<void> {
-  const adapter = adapterFor(tool as ToolConfig["toolName"]);
-  if (!adapter) throw new CliUsageError(`No swap pool support for "${tool}". Supported: claude, codex, kimi, pi.`);
+  const adapter = adapterFor(tool as ToolConfig["toolName"]) ?? recordAdapterFor(tool);
+  if (!adapter) throw new CliUsageError(`No swap pool support for "${tool}". Supported: claude, codex, kimi, pi, grok, opencode, zai.`);
   const config = adapter.config;
   const cmd = swapCommandName(tool);
   const USAGE = usageText(cmd);

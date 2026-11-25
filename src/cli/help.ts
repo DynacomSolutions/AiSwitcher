@@ -179,7 +179,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   swap: {
-    usage: "ais swap <claude|codex|kimi|pi> [subcommand]",
+    usage: "ais swap <claude|codex|kimi|pi|grok|opencode|zai> [subcommand]",
     desc: "Swap pools: switch a login between member accounts",
     examples: ["ais swap claude status", "ais swap claude next --if-limited"],
     subs: {
