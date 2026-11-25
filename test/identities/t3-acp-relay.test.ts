@@ -382,6 +382,30 @@ test("zcode: the command reports the instance", async () => {
   expect((await cli(h, { remove: true })).at(-1)).toContain("t3-acp: removed");
 });
 
+test("zcode: an instance moved off a legacy or old-hash launcher gets the new one, and the old file is deleted", async () => {
+  const h = await zcodeHost();
+  const launchers = acpRelayPaths(h.opts).launchers;
+  await mkdir(launchers, { recursive: true });
+  const legacy = join(launchers, "zcode"); // the plain launcher of an early build
+  const oldHash = join(launchers, "zcode-00000000"); // a launcher from an older hash scheme
+  await writeFile(legacy, zcodeLauncherSource(join(h.home, ".local", "bin", "ais"), h.original), { mode: 0o755 });
+  await writeFile(oldHash, zcodeLauncherSource(join(h.home, ".local", "bin", "ais"), h.original), { mode: 0o755 });
+  const settings = await h.read();
+  settings.providerInstances.zc.config.commandPath = legacy;
+  settings.providerInstances.old = { driver: "acpRegistry", enabled: true, config: { source: "local", commandPath: oldHash, commandArgs: [] } };
+  await writeFile(h.settings, `${JSON.stringify(settings, null, 2)}\n`);
+
+  const r = await installAcpRelay(h.opts);
+  expect(r.instances.map((x) => x.status)).toEqual(["set", "set"]);
+  const now = await h.read();
+  expect(now.providerInstances.zc.config.commandPath).toBe(zl(h));
+  expect(now.providerInstances.old.config.commandPath).toBe(zl(h));
+  expect(await stat(zl(h))).toBeDefined();
+  expect(await stat(legacy).catch(() => undefined)).toBeUndefined();
+  expect(await stat(oldHash).catch(() => undefined)).toBeUndefined();
+  expect((await installAcpRelay(h.opts)).changed).toBe(false);
+});
+
 test("zcode: two instances with different launchers each keep their own generated launcher and original", async () => {
   const h = await zcodeHost();
   const second = join(h.home, ".local", "share", "zcode-b", "zcode-acp-launch");

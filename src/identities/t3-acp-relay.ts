@@ -376,6 +376,7 @@ async function installOnce(opts: AcpRelayOptions): Promise<AcpRelayResult> {
     results.push({ instance: inst.id, agentId: inst.agentId, status: "set" });
   }
   // ZCode: each instance's own launcher moves behind the relay, through one generated launcher per original launcher.
+  const replaced = new Set<string>(); // generated launchers an instance moved away from (the plain `zcode` of an early build, or another hash)
   for (const inst of await zcodeInstances(read.settings, paths, paths.home)) {
     if (!inst.original) {
       results.push({ instance: inst.id, agentId: ZCODE_AGENT_ID, status: "kept", detail: `${inst.commandPath} does not record its original launcher; run ais gateway t3-acp --remove, then ais gateway t3-acp` });
@@ -388,11 +389,19 @@ async function installOnce(opts: AcpRelayOptions): Promise<AcpRelayResult> {
       results.push({ instance: inst.id, agentId: ZCODE_AGENT_ID, status: "current" });
       continue;
     }
+    if (isGeneratedZcode(inst.commandPath, paths.launchers)) replaced.add(inst.commandPath);
     inst.config.commandPath = zcodeLauncher;
     changed = true;
     results.push({ instance: inst.id, agentId: ZCODE_AGENT_ID, status: "set" });
   }
   const backup = changed ? await writeSettings(paths, read.text, read.settings, (opts.now ?? Date.now)()) : undefined;
+  // An old launcher goes only after the settings no longer name it, and only when no instance still points at it.
+  const inUse = new Set<string>();
+  for (const raw of Object.values(obj(read.settings.providerInstances) ?? {})) {
+    const path = str(obj(obj(raw)?.config)?.commandPath);
+    if (path) inUse.add(path);
+  }
+  for (const old of replaced) if (!inUse.has(old)) await rm(old, { force: true });
   return { instances: results, changed, ...(backup ? { backup } : {}) };
 }
 
