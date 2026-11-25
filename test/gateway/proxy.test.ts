@@ -1713,7 +1713,7 @@ describe("native limit answers", () => {
     expect(res.headers.get("anthropic-ratelimit-unified-status")).toBe("rejected");
     expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe("1793622600");
     expect(res.headers.get("anthropic-ratelimit-unified-representative-claim")).toBe("five_hour");
-    expect(res.headers.get("retry-after")).toBe("9000");
+    expect(res.headers.get("retry-after")).toBe("55"); // capped for the client; the reset headers and the text keep the real reset
     expect(((await res.clone().json()) as { error: { message: string } }).error.message).toMatch(/Resets at 2026-11-02T12:30:00\.000Z\.$/);
     expect(((await res.json()) as { error: { type: string } }).error.type).toBe("rate_limit_error");
     expect(seen.length).toBe(0);

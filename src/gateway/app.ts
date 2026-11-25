@@ -10,6 +10,7 @@ import { createCallRoutes, type CallHub } from "./browser/routing.ts";
 import { checkCaps, dayStartIct } from "./caps.ts";
 import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
 import { providerError } from "./errors.ts";
+import { CLIENT_RETRY_AFTER_CAP_SECONDS, PoolHoldGate, fullPoolAnswers, heldReplays, heldStreamResponse, poolHoldFromEnv, wantsStream } from "./pool-hold.ts";
 import type { LedgerBuffer } from "./ledger-buffer.ts";
 import { clientFamily, sessionKeyFromBodyTail, sessionKeyFromHeaders } from "./session-key.ts";
 import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadRequest, KnownBadFiles, MAX_FILE_CHECKS, MEDIA_REMOVED_HEADER, mediaAware, mentionedFileIds, rejectedUpload, withoutFiles, type FileVerdict } from "./media-recovery.ts";
@@ -65,6 +66,10 @@ export interface GatewayDeps {
   sideCountHealth?(ok: boolean): void;
   /** Waits `ms` or until `signal` aborts; tests inject a fake clock. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** Aborts when the gateway stops: a request held for a full pool ends at once with a retryable error (pool-hold.ts). */
+  drainSignal?: AbortSignal;
+  /** Limits of the full-pool hold (pool-hold.ts). Defaults come from AIS_GATEWAY_POOL_HOLD_* variables. */
+  poolHold?: Partial<import("./pool-hold.ts").PoolHoldLimits>;
 }
 
 /** Side-count database calls in flight at once for the whole gateway process (all apps share one gate); the rest queue for a slot. */
@@ -456,8 +461,10 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   /** Quota holds (proven exhaustion, model-scoped): the time from which one request may probe the member again, by hold key. */
   const probes = new Map<string, number>();
   const knownBad = new KnownBadFiles();
+  const holdGate = new PoolHoldGate({ ...poolHoldFromEnv(), ...deps.poolHold });
+  const hold: HoldCtl = { gate: holdGate, replay: (r) => handle(r) };
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   const chatDeps = deps.chat ? { chat: deps.chat } : {};
@@ -471,7 +478,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -934,6 +941,36 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     const reason = pick.reject === "no-headroom" && app.target.kind === "pool" && (await exhaustedNames()).size > 0 ? "no-headroom:exhausted" : pick.reject;
     // Out of capacity (or at the reserve): answer in the provider's own limit shape so its CLI shows its built-in limit handling.
     const out = await outOfCapacity(pick.reject, reason, why);
+    if (out && app.target.kind === "pool" && app.provider === "claude" && out.status === 429 && pick.reject !== "no-identities") {
+      // A full pool is not a hard stop for a worker: Claude Code ends a request on a retry-after over 60 s. A streamed request
+      // that can be replayed is held open (pool-hold.ts); any other answer keeps a retry-after the client accepts.
+      fullPoolAnswers.add(out);
+      const waitSec = Number(out.headers.get("retry-after"));
+      // Only a wait the client would refuse is held: a short burst answer already works with the client's own retry.
+      if (waitSec > CLIENT_RETRY_AFTER_CAP_SECONDS && !heldReplays.has(req) && body.kind === "buffered" && !req.signal.aborted && !deps.drainSignal?.aborted && wantsStream(body.bytes) && hold.gate.tryEnter(body.bytes.length)) {
+        const bytes = body.bytes;
+        const limitText = await out.clone().text().then((t) => { try { return (JSON.parse(t) as { error?: { message?: string } }).error?.message ?? why; } catch { return why; } }).catch(() => why);
+        req.signal.removeEventListener("abort", onAbort);
+        log(JSON.stringify({ event: "pool_hold", app: app.name, provider: app.provider, ...(model !== undefined ? { model } : {}) }));
+        return heldStreamResponse({
+          limits: hold.gate.limits,
+          gate: hold.gate,
+          bytes: bytes.length,
+          now: deps.now,
+          sleep: deps.sleep ?? defaultSleep,
+          drain: deps.drainSignal,
+          limitMessage: limitText,
+          onEvent: (e) => deps.metrics.poolHold?.(app.name, e),
+          replay: (signal) => {
+            const again = new Request(req.url, { method: req.method, headers: req.headers, body: bytes, signal });
+            heldReplays.add(again);
+            return hold.replay(again);
+          },
+        });
+      }
+      const ra = Number(out.headers.get("retry-after"));
+      if (Number.isFinite(ra) && ra > CLIENT_RETRY_AFTER_CAP_SECONDS) out.headers.set("retry-after", String(CLIENT_RETRY_AFTER_CAP_SECONDS));
+    }
     if (out) return out;
     return reject(429, why, identityForRow, model, reason);
   }
@@ -1305,6 +1342,12 @@ const BURST_HOLD_DEFAULT_MS = 15_000;
 /** How often (per member, per replica) one request may probe a member held for quota while the pool has no headroom. */
 const QUOTA_PROBE_INTERVAL_MS = 5 * 60_000;
 /** Longest a request waits in total for short member holds to end before the client gets the 429. */
+/** The full-pool hold of one replica, and the way it sends a buffered request through the proxy again. */
+interface HoldCtl {
+  gate: PoolHoldGate;
+  replay(req: Request): Promise<Response>;
+}
+
 const SHORT_HOLD_WAIT_BUDGET_MS = 90_000;
 const SHORT_HOLD_MAX_WAITS = 8;
 const SHORT_HOLD_MIN_SLEEP_MS = 250;
