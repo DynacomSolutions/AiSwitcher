@@ -456,3 +456,14 @@ ETA: 2026-12-12 18:00 ICT
 | 312 | Cut over Claude and Codex to the database | todo | | | 20.309, 20.310 | | |
 | 313 | Pi, Grok and Kimi sessions in the database | todo | | | 20.312 | | |
 | 314 | Crush normalised session export | todo | | | 20.313 | | |
+
+## 21. Gateway identities and agent pools
+ETA: 2026-11-26 18:00 ICT
+- Clean up gateway identities, give each provider an agent pool and make T3 read pools live from the gateway.
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 328 | Keep only the Go subscription OpenCode identity in the gateway | in_progress | claude | gateway-identities-cleanup | | 2026-11-26 12:00 ICT | Record removed identities and pools in scratch first. |
+| 329 | Agent pools for Grok, OpenCode and Z.ai with the org identity | in_progress | claude | gateway-identities-cleanup | | 2026-11-26 14:00 ICT | Same pattern as the Claude and Codex pools. |
+| 330 | Give the Kimi pool its correct name, with every reference updated | in_progress | claude | gateway-identities-cleanup | | 2026-11-26 14:00 ICT | Pool now named like the Claude pool. |
+| 331 | T3 on the host and in pods reads every identity and pool live from the gateway | in_progress | claude | gateway-identities-cleanup | 21.329, 21.330 | 2026-11-26 18:00 ICT | No static or cached pool lists in code, T3 config or cluster values. |
