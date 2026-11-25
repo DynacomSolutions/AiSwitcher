@@ -244,6 +244,24 @@ export class CachedGatewayStore implements GatewayStore {
     );
   }
 
+  async capMarkedTokens(app: string, mark: string, at: string): Promise<void> {
+    await this.inner.capMarkedTokens(app, mark, at);
+    this.bump(app);
+    this.tokens.set(
+      app,
+      (this.tokens.get(app) ?? []).map((t) => (t.prefix.startsWith(mark) && (t.expiresAt === undefined || Date.parse(t.expiresAt) > Date.parse(at)) ? { ...t, expiresAt: at } : t)),
+    );
+  }
+
+  async pruneMarkedTokens(app: string, mark: string, before: string): Promise<void> {
+    await this.inner.pruneMarkedTokens(app, mark, before);
+    this.bump(app);
+    this.tokens.set(
+      app,
+      (this.tokens.get(app) ?? []).filter((t) => !(t.prefix.startsWith(mark) && t.expiresAt !== undefined && Date.parse(t.expiresAt) < Date.parse(before))),
+    );
+  }
+
   async revokeApp(name: string): Promise<void> {
     await this.inner.revokeApp(name);
     this.bump(name);

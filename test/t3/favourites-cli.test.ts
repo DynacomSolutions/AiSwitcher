@@ -83,7 +83,9 @@ describe("ais t3 favourites sync", () => {
     const gw = fakeGateway();
     const ctl = new AbortController();
     const out: string[] = [];
-    const port = 20000 + Math.floor(Math.random() * 20000);
+    const probe = Bun.serve({ port: 0, fetch: () => new Response("") }); // the system picks a free port, so parallel runs never meet
+    const port = probe.port;
+    await probe.stop(true);
     const run = runT3Command(["favourites", "sync"], { "t3-home": h.home, "metrics-listen": `127.0.0.1:${port}` }, { out: (l) => out.push(l), client: gw.api, names: async () => names(), stateDir: h.stateDir, env: {}, signal: ctl.signal });
     try {
       await until(() => gw.calls.gets > 0);
