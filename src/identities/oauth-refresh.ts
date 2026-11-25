@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   grantFingerprint,
@@ -22,6 +22,7 @@ import { isSwapPool, poolsHoldingMember } from "./pool/swap-pool.ts";
 import { codexAccountIdOfDir } from "./codex-auth.ts";
 import { SwapLockError, withOauthRefreshLock, withOauthRefreshLocks } from "./claude-swap-lock.ts";
 import { isGatewayManagedHere } from "./gateway-managed.ts";
+import { hasMemberCopy, isMemberStoreTool, isUnderMemberStore, memberDir, memberStoreEnabled } from "./gateway-members.ts";
 import { isGatewayAccessToken, isGatewayRoutedDir } from "./claude-gateway-entry.ts";
 import type { Identity } from "./types.ts";
 import { kimiCredentialStores, persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
@@ -394,6 +395,18 @@ export async function writeGrantThroughStores(
       } catch (err) {
         failed.push({ path: `pool:${poolDir}`, error: err instanceof Error ? err.message : String(err) });
       }
+    }
+  }
+  // Self-heal for the gateway: an identity without a member-store copy (its folder holds a gateway placeholder, or it was routed
+  // with no copy made) gets the new grant in the member store, so it never depends on the routed folder or the pi registry.
+  if (memberStoreEnabled() && isMemberStoreTool(tool) && !isSwapPool(identity) && !isUnderMemberStore(identity.configDir) && !hasMemberCopy(tool, identity.name)) {
+    const dir = memberDir(tool, identity.name);
+    try {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await writeProviderGrantCopy(tool, dir, grant, { backups });
+      written.push(`member:${dir}`);
+    } catch (err) {
+      failed.push({ path: `member:${dir}`, error: err instanceof Error ? err.message : String(err) });
     }
   }
   const piDir = options.piDir ?? (await piIdentityFor(identity.name))?.configDir;
