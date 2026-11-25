@@ -72,3 +72,19 @@ describe("managed ids", () => {
     expect(instanceIdsForApp(app("t3-grok-org", "grok", pin("org"))).sort()).toEqual(["t3-grok-org", "t3-grok-org-acp"]);
   });
 });
+
+describe("collision-free ids", () => {
+  test("a pin named pool, or ending in -acp or -usage, is skipped so it cannot take the id of another instance", () => {
+    const plan = planT3Instances([
+      app("t3-grok-pool", "grok", pool),
+      app("t3-grok-x", "grok", pin("x")),
+      app("t3-grok-pool-pin", "grok", pin("pool")),
+      app("t3-grok-x-acp", "grok", pin("x-acp")),
+      app("t3-opencode-x", "opencode", pin("x")),
+      app("t3-opencode-x-usage", "opencode", pin("x-usage")),
+    ]);
+    expect(plan.map((p) => p.id)).toEqual(["t3-grok-pool", "t3-grok-pool-acp", "t3-grok-x", "t3-grok-x-acp", "t3-opencode-x"]);
+    expect(plan.find((p) => p.id === "t3-grok-x-acp")?.app).toBe("t3-grok-x");
+    expect(plan.find((p) => p.id === "t3-grok-pool")?.app).toBe("t3-grok-pool");
+  });
+});

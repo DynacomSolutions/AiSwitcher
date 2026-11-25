@@ -49,6 +49,8 @@ function appWho(app: GatewayApp): string | undefined {
   if (!shape || app.state !== "active") return undefined;
   const who = app.target.kind === "pool" ? "pool" : app.target.identity;
   if (!who || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(who)) return undefined;
+  // These pin names would take the id of another instance (the pool, an ACP twin, a usage twin): no instance is made for them.
+  if (app.target.kind === "pin" && (who === "pool" || /-(?:acp|usage)$/.test(who))) return undefined;
   if (app.target.kind === "pool") return app.name === `agents-${app.provider}` || app.name === `t3-${app.provider}-pool` ? who : undefined;
   return app.name.startsWith(`t3-${app.provider}-`) ? who : undefined;
 }
@@ -104,7 +106,9 @@ export function instanceIdsFor(provider: string, who: string): string[] {
  * are retired and map to nothing.
  */
 export function parseInstanceId(id: string): { provider: string; who: string } | undefined {
-  if (!isManagedInstanceId(id) || /^t3-claude-(?:kimi|zai)(?:-|$)/.test(id)) return undefined;
+  // Lenient on the identity part (T3 and the favourites accept `+`, `:` and `@`): only the sync's removal rule is strict (`isManagedInstanceId`).
+  const known = /^(?:(?:claude|codex)-pool|t3-(?:claude|codex|opencode|grok|kimi|zai)-.+)$/.test(id) && !id.endsWith("-usage") && !(/^t3-(?:kimi|zai)-/.test(id) && !id.endsWith("-acp"));
+  if (!known || /^t3-claude-(?:kimi|zai)(?:-|$)/.test(id)) return undefined;
   for (const [provider, shape] of Object.entries(PROVIDERS)) {
     // Longest suffix first, so `t3-grok-x-acp` is the ACP twin of `t3-grok-x`.
     for (const k of [...shape.kinds].sort((a, b) => b.suffix.length - a.suffix.length)) {

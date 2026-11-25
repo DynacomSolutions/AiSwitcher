@@ -128,3 +128,10 @@ describe("every instance form of all six providers", () => {
     expect(mappedKeys([{ provider: "t3-grok-pool", model: "g" }, { provider: "t3-grok-pool-acp", model: "g" }])).toEqual([poolKey("g", "grok")]);
   });
 });
+
+import { instanceToAis as _toAis, keyToFav as _toFav } from "../../src/t3/favourites/mapping.ts";
+test("an identity with characters beyond letters, digits, dot, dash and underscore still maps both ways", () => {
+  expect(_toAis("t3-claude-a+b")).toEqual({ provider: "claude", identity: "a+b" });
+  expect(_toAis("t3-kimi-team:eu-acp")).toEqual({ provider: "kimi", identity: "team:eu" });
+  expect(_toFav({ provider: "claude", identity: "a+b", model: "m" }, { instances: new Set(["t3-claude-a+b"]) })).toEqual({ provider: "t3-claude-a+b", model: "m" });
+});
