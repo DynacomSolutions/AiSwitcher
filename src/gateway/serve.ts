@@ -5,6 +5,7 @@ import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { DEAD_REFRESH_CODES, DEFAULT_ACCESS_TOKEN_LIFETIME_S, effectiveGrantPaths, GATEWAY_RENEW_FRACTION, KIMI_RENEW_BELOW_S, OAuthRefreshError, type IdentityGrantRefresh, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ClusterBrowserHub, RELAY_PATH } from "./browser/cluster.ts";
 import { HomeMirror } from "./home-mirror.ts";
 import { importHome, STORE_META_PATH } from "./home-import.ts";
@@ -61,7 +62,7 @@ import { createUsageSource, fetchPoolUsage, withOpencodeUsage, type FetchUsage }
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
-import { enableMemberStore, memberStoreEnabled, setLocalWriteHook } from "../identities/gateway-members.ts";
+import { enableMemberStore, hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreEnabled, setLocalWriteHook } from "../identities/gateway-members.ts";
 import { clearLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
@@ -596,6 +597,15 @@ export async function keepAliveOnce(deps: {
   return { retryTools: [...retryTools] };
 }
 
+/**
+ * Files to push after a refresh: the grant paths, the labels the write-through lists, and the member store login when the
+ * account has one (a refresh of an identity with no member copy makes it, and the grant paths name the identity's own folder).
+ */
+export async function refreshPushPaths(tool: RefreshableTool, identity: Identity, written: string[], grantPaths: (tool: RefreshableTool, identity: Identity) => Promise<string[]>): Promise<string[]> {
+  const member = isMemberStoreTool(tool) && hasMemberCopy(tool, identity.name) ? [join(memberDir(tool, identity.name), memberLoginFile(tool))] : [];
+  return [...new Set([...(await grantPaths(tool, identity)), ...written, ...member])];
+}
+
 export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {}): Promise<RunningGateway> {
   if (opts.adminToken.length < MIN_ADMIN_TOKEN_LENGTH) throw new Error(`gateway: the admin token (AIS_GATEWAY_ADMIN_TOKEN) must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters`);
   if (opts.sessions) {
@@ -682,7 +692,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
               const account = `${tool}/${identity.name}`;
               let first: unknown;
               try {
-                await mirror.push([...new Set([...(await grantPaths(tool, identity)), ...written])], account, "login");
+                await mirror.push(await refreshPushPaths(tool, identity, written, grantPaths), account, "login");
               } catch (err) {
                 first = err;
               }

@@ -127,6 +127,8 @@ export function updateIdentity(file: IdentitiesFile, name: string, input: Update
 export function deleteIdentity(file: IdentitiesFile, name: string): Identity {
   const identity = requireIdentity(file, name);
   file.identities = file.identities.filter((i) => i !== identity);
+  // The tombstone tells the gateway store this removal is on purpose, so its merge does not bring the identity back.
+  file.deleted = [...new Set([...(file.deleted ?? []), identity.name])];
   return identity;
 }
 

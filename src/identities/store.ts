@@ -182,6 +182,7 @@ export function parseIdentitiesFile(raw: unknown): IdentitiesFile {
     version: 1,
     identities: rec.identities as Identity[],
     chromeProfileOverrides: rec.chromeProfileOverrides as ChromeProfileOverride[] | undefined,
+    ...(Array.isArray(rec.deleted) ? { deleted: rec.deleted.filter((n): n is string => typeof n === "string") } : {}),
   };
 }
 

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { gatewayEntryText } from "../../src/identities/claude-gateway-entry.ts";
-import { grantFreshness, HomeMirror, isFresher, mergeByKey } from "../../src/gateway/home-mirror.ts";
+import { grantFreshness, HomeMirror, isFresher, isPlaceholderLogin, isRefreshableLogin, mergeByKey } from "../../src/gateway/home-mirror.ts";
 import { importHome } from "../../src/gateway/home-import.ts";
 import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type PgHomeStore, type PutResult } from "../../src/gateway/home-store.ts";
 
@@ -74,6 +74,43 @@ describe("freshness", () => {
     const realPi = JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE-a", refresh: "SYNTHETIC_FIXTURE-r", expires: 1_795_635_411_000 } });
     const merged = JSON.parse(mergeByKey(placeholderPi, realPi)!.toString()) as { anthropic: { refresh: string } };
     expect(merged.anthropic.refresh).toBe("SYNTHETIC_FIXTURE-r");
+  });
+});
+
+describe("per entry placeholder check", () => {
+  const piMixed = JSON.stringify({
+    anthropic: { type: "oauth", access: "aisg_SYNTHETIC_FIXTURE_token", refresh: "", expires: 4_102_444_800_000 },
+    "openai-codex": { type: "oauth", access: "SYNTHETIC_FIXTURE-a", refresh: "SYNTHETIC_FIXTURE-r", expires: 1_795_635_411_000 },
+  });
+  test("one gateway entry in a pi auth.json does not mark the whole file, and its real entry still counts", () => {
+    expect(isPlaceholderLogin(piMixed)).toBe(false);
+    expect(isRefreshableLogin(piMixed)).toBe(true);
+    expect(grantFreshness(piMixed)).toBe(1_795_635_411);
+  });
+  test("codex's literal none refresh token is no refresh token", () => {
+    const codexPlaceholder = JSON.stringify({ OPENAI_API_KEY: "aisg_SYNTHETIC_FIXTURE_token", tokens: { access_token: "aisg_SYNTHETIC_FIXTURE_token", refresh_token: "none" } });
+    expect(isRefreshableLogin(codexPlaceholder)).toBe(false);
+    expect(isPlaceholderLogin(codexPlaceholder)).toBe(true);
+  });
+  test("a previous row with any real refresh token is protected", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    store.seed(".pi/identities/alpha/auth.json", piMixed);
+    await put(home, ".pi/identities/alpha/auth.json", PLACEHOLDER);
+    const report = await importHome(asStore(store), { home, entries: [{ abs: join(home, ".pi/identities/alpha/auth.json"), account: "pi/alpha", kind: "login" }] });
+    expect(store.puts).toEqual([]);
+    expect(report.skipped.length).toBe(1);
+  });
+});
+
+describe("member account record", () => {
+  test("a .claude.json beside a login is uploaded although it holds no refresh token", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    const rel = ".ais/gateway-members/claude/alpha/.claude.json";
+    await put(home, rel, JSON.stringify({ oauthAccount: { accountUuid: "uuid-1" } }));
+    const report = await importHome(asStore(store), { home, entries: [{ abs: join(home, rel), account: "claude/alpha", kind: "login" }] });
+    expect(report.added).toEqual([rel]);
   });
 });
 

@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { readOpencodeV2Credentials } from "../cli/limits/opencode-limits.ts";
 import { heartbeatPath } from "../identities/gateway-heartbeat.ts";
@@ -38,6 +38,9 @@ import type { RefreshGuardBackend } from "./refresh-guard.ts";
 export const STORE_META_PATH = ".ais/gateway-store-meta.json";
 /** Opencode's credential when only its SQLite database holds it: a small file the gateway reads on scratch replicas. */
 export const OPENCODE_GATEWAY_KEY_FILE = join("data", "opencode", "ais-gateway-key.json");
+
+/** The login files that hold a refresh token: claude `.credentials.json`, codex and pi `auth.json`. */
+const MAIN_LOGIN_FILES = new Set([".credentials.json", "auth.json"]);
 
 const OAUTH_TOOLS: readonly RefreshableTool[] = ["claude", "codex", "grok", "kimi"];
 
@@ -148,7 +151,8 @@ export async function importHome(
     const content = e.content ?? (await readFile(e.abs).catch(() => undefined));
     if (!content) continue;
     // A placeholder or a file without a refresh token is no login: it never reaches the store, whatever the row holds.
-    if (e.kind === "login") {
+    // Only a tool's main login file is checked: the member account record (.claude.json) holds no refresh token and travels as is.
+    if (e.kind === "login" && MAIN_LOGIN_FILES.has(basename(rel))) {
       const text = content.toString("utf8");
       if (isPlaceholderLogin(text)) {
         report.skipped.push({ path: rel, why: "it holds a gateway placeholder, not a login" });
@@ -197,6 +201,10 @@ export async function importHome(
         // A host copy that drops an identity the store holds is merged, never pushed as is: removal goes through retire.
         if (!last || last.sha !== row.sha256 || droppedIdentities(content.toString("utf8"), row.content.toString("utf8")).length > 0) {
           const merged = mergeRegistries(content.toString("utf8"), row.content.toString("utf8"));
+          if (!merged && droppedIdentities(content.toString("utf8"), row.content.toString("utf8")).length > 0) {
+            report.skipped.push({ path: rel, why: "the host copy is no registry and would drop identities the store holds" });
+            return;
+          }
           if (merged) {
             if (sha256Hex(merged) === row.sha256) {
               report.skipped.push({ path: rel, why: "the store's registry already holds every host identity" });

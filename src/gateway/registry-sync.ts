@@ -85,6 +85,10 @@ export function mergeRegistries(host: string, store: string): Buffer | undefined
     return m;
   };
   const theirs = named(s.identities);
+  const deleted = new Set([...tombstones(h), ...tombstones(s)]);
+  const hostNames = new Set(h.identities.flatMap((i) => (isObject(i) && typeof i.name === "string" ? [i.name] : [])));
+  // A name the host tombstoned and no longer lists is gone for good; a name listed again (re-added) is not.
+  const dead = (name: string): boolean => tombstones(h).has(name) && !hostNames.has(name);
   const identities: unknown[] = [];
   const seen = new Set<string>();
   for (const i of h.identities) {
@@ -101,26 +105,37 @@ export function mergeRegistries(host: string, store: string): Buffer | undefined
       identities.push({ ...i, swapPool: { ...pool, accounts } });
     } else identities.push(i);
   }
-  for (const i of s.identities) if (!(isObject(i) && typeof i.name === "string" && seen.has(i.name))) identities.push(i);
-  return Buffer.from(`${JSON.stringify({ ...s, ...h, identities }, null, 2)}\n`);
+  for (const i of s.identities) if (!(isObject(i) && typeof i.name === "string" && (seen.has(i.name) || dead(i.name)))) identities.push(i);
+  return Buffer.from(`${JSON.stringify({ ...s, ...h, identities, ...(deleted.size > 0 ? { deleted: [...deleted] } : {}) }, null, 2)}\n`);
 }
 
+const namesOf = (list: unknown[]): Set<string> => new Set(list.flatMap((i) => (isObject(i) && typeof i.name === "string" ? [i.name] : [])));
+const tombstones = (reg: Record<string, unknown>): Set<string> => new Set(Array.isArray(reg.deleted) ? reg.deleted.filter((n): n is string => typeof n === "string") : []);
+
 /**
- * Names of the identities that `current` (the store registry) holds and `next` (a pushed registry) lacks. Empty when either text
- * is not a registry. Removal goes through `retire` (the entry stays, flagged), never through deletion of the entry, so a push
- * that drops a name is a mistake: a host file rewritten empty must not take the gateway's identities and their logins with it.
+ * Names of the identities that `current` (the store registry) holds and `next` (a pushed registry) lacks. Removal goes through
+ * `retire` (the entry stays, flagged) or a tombstone (`deleted: [names]`, written by `ais identities delete`), so a push that
+ * drops any other name is a mistake: a host file rewritten empty must not take the gateway's identities and their logins with it.
+ * Text that is not a registry counts as dropping every name of a populated registry. Empty when `current` holds no identities.
  */
 export function droppedIdentities(next: string, current: string): string[] {
-  let n: unknown;
   let c: unknown;
   try {
-    n = JSON.parse(next);
     c = JSON.parse(current);
   } catch {
     return [];
   }
-  if (!isObject(n) || !isObject(c) || !Array.isArray(n.identities) || !Array.isArray(c.identities)) return [];
-  const names = (list: unknown[]): Set<string> => new Set(list.flatMap((i) => (isObject(i) && typeof i.name === "string" ? [i.name] : [])));
-  const kept = names(n.identities);
-  return [...names(c.identities)].filter((name) => !kept.has(name));
+  if (!isObject(c) || !Array.isArray(c.identities)) return [];
+  const held = [...namesOf(c.identities)];
+  if (held.length === 0) return [];
+  let n: unknown;
+  try {
+    n = JSON.parse(next);
+  } catch {
+    return held;
+  }
+  if (!isObject(n) || !Array.isArray(n.identities)) return held;
+  const kept = namesOf(n.identities);
+  const gone = tombstones(n);
+  return held.filter((name) => !kept.has(name) && !gone.has(name));
 }

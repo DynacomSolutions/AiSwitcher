@@ -165,14 +165,48 @@ describe("admin store routes: rotated refresh tokens and the real server", () =>
     const before = server.rows.get(path)!;
     const placeholder = JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_token", refreshToken: null, expiresAt: 4_102_444_800_000 } });
     const r = await fetchPut(app, path, placeholder, "claude/alpha", "login", before.version);
-    expect(r.status).toBe(409);
+    // 422, not 409: an old host client reads 409 as a lost race and retries the same write for ever; it throws on 422.
+    expect(r.status).toBe(422);
     expect(await r.json()).toEqual({ error: "placeholder" });
     expect(server.rows.get(path)).toBe(before);
     // A login without a refresh token is refused the same way; a placeholder for a new row, or a real login, passes.
     const blank = JSON.stringify({ claudeAiOauth: { accessToken: "SYNTHETIC_FIXTURE-a", expiresAt: 1 } });
-    expect((await fetchPut(app, path, blank, "claude/alpha", "login", before.version)).status).toBe(409);
+    expect((await fetchPut(app, path, blank, "claude/alpha", "login", before.version)).status).toBe(422);
     expect((await fetchPut(app, "y/.credentials.json", placeholder, "claude/beta", "login")).status).toBe(200);
     expect((await fetchPut(app, path, grant("r-next", 1_795_999_999_000), "claude/alpha", "login", before.version)).status).toBe(200);
+  });
+
+  test("the refusal status is one an old host client throws on, and the new client throws too", async () => {
+    const { app, opts, server } = setup();
+    const path = "x/.credentials.json";
+    await fetchPut(app, path, grant("r-live", 1_795_635_411_000), "claude/alpha", "login");
+    const placeholder = JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_token", refreshToken: null, expiresAt: 4_102_444_800_000 } });
+    const r = await fetchPut(app, path, placeholder, "claude/alpha", "login", server.rows.get(path)!.version);
+    // Old client: api.ok("PUT", ..., [200, 409]) throws on any other status.
+    expect([200, 409].includes(r.status)).toBe(false);
+    await expect(new HttpHomeStore({ ...opts, warn: () => undefined }).put(path, Buffer.from(placeholder), { account: "claude/alpha", kind: "login", expectedVersion: server.rows.get(path)!.version })).rejects.toThrow(/placeholder/);
+  });
+
+  test("a stale expectedVersion gets the normal compare-and-swap conflict before any guard", async () => {
+    const { app, server } = setup();
+    const path = "x/.credentials.json";
+    await fetchPut(app, path, grant("r-live", 1_795_635_411_000), "claude/alpha", "login");
+    const placeholder = JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_token", refreshToken: null, expiresAt: 4_102_444_800_000 } });
+    const r = await fetchPut(app, path, placeholder, "claude/alpha", "login", server.rows.get(path)!.version + 5);
+    expect(r.status).toBe(409);
+    expect(((await r.json()) as { error: string }).error).toBe("the row changed");
+  });
+
+  test("a registry push that is not a registry, or drops names, is refused; a tombstoned name may go", async () => {
+    const { app, server } = setup();
+    const path = ".claude/identities.json";
+    const reg = (names: string[], deleted?: string[]): string => JSON.stringify({ version: 1, identities: names.map((name) => ({ name })), ...(deleted ? { deleted } : {}) });
+    await fetchPut(app, path, reg(["a", "b"]), null, "registry");
+    const v = server.rows.get(path)!.version;
+    expect((await fetchPut(app, path, "{}", null, "registry", v)).status).toBe(422);
+    expect((await fetchPut(app, path, "[]", null, "registry", v)).status).toBe(422);
+    expect((await fetchPut(app, path, reg(["a"]), null, "registry", v)).status).toBe(422);
+    expect((await fetchPut(app, path, reg(["a"], ["b"]), null, "registry", v)).status).toBe(200);
   });
 
   test("a registry push that drops an identity the store registry holds is refused with 409 drops-identities; retire and adds pass", async () => {
@@ -184,7 +218,7 @@ describe("admin store routes: rotated refresh tokens and the real server", () =>
     const v = server.rows.get(path)!.version;
     const before = server.rows.get(path)!;
     const r = await fetchPut(app, path, reg("a"), null, "registry", v);
-    expect(r.status).toBe(409);
+    expect(r.status).toBe(422);
     expect(await r.json()).toEqual({ error: "drops-identities" });
     expect(server.rows.get(path)).toBe(before);
     expect((await fetchPut(app, path, reg("a", ["b", true]), null, "registry", v)).status).toBe(200);

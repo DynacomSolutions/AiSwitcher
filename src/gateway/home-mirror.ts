@@ -57,24 +57,34 @@ interface Base {
   sha: string;
 }
 
-/** True when any string value in the parsed credential file is a gateway app token (the placeholder login of a routed folder). */
-function holdsGatewayToken(v: unknown, depth: number): boolean {
-  if (depth > 6 || typeof v !== "object" || v === null) return false;
-  return Object.values(v as Record<string, unknown>).some((x) => (typeof x === "string" ? isGatewayAccessToken(x) : holdsGatewayToken(x, depth + 1)));
+const ACCESS_FIELDS = /^(access_token|accessToken|access|OPENAI_API_KEY)$/;
+
+/** True for an object (one provider entry, or the file itself) whose access-token field is a gateway app token. */
+function isGatewayEntry(v: unknown): boolean {
+  return isPlainObject(v) && Object.entries(v).some(([k, x]) => ACCESS_FIELDS.test(k) && isGatewayAccessToken(x));
 }
 
-/** True when the text is a gateway placeholder login: it holds a gateway app token. */
+/** True when any entry of the parsed credential file is a gateway entry (an app token in an access-token field). */
+function holdsGatewayEntry(v: unknown, depth: number): boolean {
+  if (depth > 6 || typeof v !== "object" || v === null) return false;
+  return isGatewayEntry(v) || Object.values(v as Record<string, unknown>).some((x) => holdsGatewayEntry(x, depth + 1));
+}
+
+/**
+ * True when the text is a gateway placeholder login: it holds a gateway entry and no real refresh token anywhere. One gateway
+ * entry beside real entries (a pi auth.json) does not make the whole file a placeholder.
+ */
 export function isPlaceholderLogin(text: string): boolean {
   try {
-    return holdsGatewayToken(JSON.parse(text), 0);
+    return holdsGatewayEntry(JSON.parse(text), 0) && refreshFingerprints(text).length === 0;
   } catch {
     return false;
   }
 }
 
-/** True when the text is a login the gateway can keep renewing: it is no placeholder and holds a refresh token. */
+/** True when the text holds a real refresh token (codex's literal "none" is not one): the gateway can keep renewing it. */
 export function isRefreshableLogin(text: string): boolean {
-  return !isPlaceholderLogin(text) && refreshFingerprints(text).length > 0;
+  return refreshFingerprints(text).length > 0;
 }
 
 /**
@@ -89,8 +99,6 @@ export function grantFreshness(text: string): number | undefined {
   } catch {
     return undefined;
   }
-  // A gateway placeholder carries a fixed far-future expiry: it is never a grant, so it has no age and never wins.
-  if (holdsGatewayToken(json, 0)) return undefined;
   let best: number | undefined;
   const take = (s: number | undefined): void => {
     if (s !== undefined && Number.isFinite(s) && s > 0 && (best === undefined || s > best)) best = s;
@@ -108,6 +116,8 @@ export function grantFreshness(text: string): number | undefined {
   };
   const walk = (v: unknown, depth: number): void => {
     if (depth > 6 || typeof v !== "object" || v === null) return;
+    // A gateway entry carries a fixed far-future expiry: it is never a grant, so it has no age and never wins.
+    if (isGatewayEntry(v)) return;
     for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
       if (/expir/i.test(k) && /refresh/i.test(k)) continue;
       if (/expir/i.test(k)) {
@@ -128,7 +138,7 @@ export function refreshFingerprints(text: string): string[] {
   const walk = (v: unknown, depth: number): void => {
     if (depth > 6 || typeof v !== "object" || v === null) return;
     for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
-      if (/^refresh_?token$|^refresh$/i.test(k) && typeof x === "string" && x.trim()) out.push(grantFingerprint({ refresh_token: x, access_token: "" }));
+      if (/^refresh_?token$|^refresh$/i.test(k) && typeof x === "string" && x.trim() && x !== "none") out.push(grantFingerprint({ refresh_token: x, access_token: "" }));
       else walk(x, depth + 1);
     }
   };
@@ -349,9 +359,11 @@ export class HomeMirror {
     };
     if (last && last.sha === localSha) return write();
     // A host file that drops an identity the store holds is merged, never pushed as is: removal goes through retire.
-    if (last && last.sha === row.sha256 && droppedIdentities(local.toString("utf8"), row.content.toString("utf8")).length === 0) return put(local);
+    const drops = droppedIdentities(local.toString("utf8"), row.content.toString("utf8")).length > 0;
+    if (last && last.sha === row.sha256 && !drops) return put(local);
     const merged = mergeRegistries(local.toString("utf8"), row.content.toString("utf8"));
-    if (!merged) return put(local);
+    // No merge is possible (the host file is no registry): never push it over identities the store holds.
+    if (!merged) return drops ? write() : put(local);
     if (sha256Hex(merged) === row.sha256) return write();
     await writeAtomic(abs, merged);
     return put(merged);

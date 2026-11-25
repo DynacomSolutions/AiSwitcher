@@ -6,7 +6,7 @@ import { importHome } from "../../src/gateway/home-import.ts";
 import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type PgHomeStore, type PutResult } from "../../src/gateway/home-store.ts";
 import { hostSyncOnce, startHostSync } from "../../src/gateway/host-sync.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
-import { mergeRegistries, readRegistryBase } from "../../src/gateway/registry-sync.ts";
+import { droppedIdentities, mergeRegistries, readRegistryBase } from "../../src/gateway/registry-sync.ts";
 
 // A registry change made in the store (a console add) must reach the host file and never be reverted by the host sync or by the
 // periodic import, also after a restart. A host-side change still reaches the store; when both sides moved, neither loses an
@@ -160,6 +160,33 @@ describe("a registry file that moved on the host", () => {
     expect(namesOf(await read(home, REG))).toEqual(["pool-main", "alpha"]);
   });
 
+  test("a host deletion with a tombstone reaches the store, and a tombstoned store entry is dropped in a merge", async () => {
+    const { home, store } = await inStep();
+    const gone = `${JSON.stringify({ version: 1, identities: [ident("pool-main", { swapPool: { accounts: ["alpha"], active: "alpha" } })], deleted: ["alpha"] }, null, 2)}\n`;
+    await put(home, REG, gone);
+    await sync(home, store);
+    expect(namesOf(store.text(REG))).toEqual(["pool-main"]);
+    const merged = JSON.parse(mergeRegistries(gone, registry(["alpha", "extra"]))!.toString()) as { identities: Array<{ name: string }>; deleted: string[] };
+    expect(merged.identities.map((i) => i.name)).toEqual(["pool-main", "extra"]);
+    expect(merged.deleted).toEqual(["alpha"]);
+  });
+
+  test("droppedIdentities: a non-registry text over a populated registry counts as dropping every name", () => {
+    expect(droppedIdentities("{}", registry(["alpha"]))).toEqual(["pool-main", "alpha"]);
+    expect(droppedIdentities("", registry(["alpha"]))).toEqual(["pool-main", "alpha"]);
+    expect(droppedIdentities("{}", "{}")).toEqual([]);
+  });
+
+  test("a host file that is not a registry is never pushed over the store row", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    store.seed(REG, registry(["alpha"]), null, "registry");
+    await put(home, REG, "{}");
+    await sync(home, store);
+    expect(store.puts).toEqual([]);
+    expect(namesOf(store.text(REG))).toEqual(["pool-main", "alpha"]);
+  });
+
   test("an empty host registry never empties the store registry", async () => {
     const { home, store } = await inStep();
     await put(home, REG, `${JSON.stringify({ version: 1, identities: [] })}\n`);
@@ -220,12 +247,12 @@ describe("both sides moved", () => {
     expect(store.puts).toEqual([]);
   });
 
-  test("a host registry that is not JSON is still pushed as the host's copy", async () => {
+  test("a host registry that is not JSON is never pushed over a populated store registry", async () => {
     const { home, store } = await inStep();
     store.seed(REG, registry(["alpha", "consoled"]), null, "registry");
     await put(home, REG, "not json");
     await sync(home, store);
-    expect(store.text(REG)).toBe("not json");
+    expect(namesOf(store.text(REG))).toEqual(["pool-main", "alpha", "consoled"]);
   });
 });
 
@@ -244,5 +271,18 @@ describe("mergeRegistries", () => {
   test("a side that is not a registry gives no merge", () => {
     expect(mergeRegistries("nope", "{}")).toBeUndefined();
     expect(mergeRegistries("{}", JSON.stringify({ identities: [] }))).toBeUndefined();
+  });
+});
+
+describe("ais identities delete", () => {
+  test("deleteIdentity leaves a tombstone, and retire keeps the entry", async () => {
+    const { deleteIdentity, retireIdentity } = await import("../../src/cli/identities/actions.ts");
+    const file = JSON.parse(registry(["alpha", "beta"]));
+    deleteIdentity(file, "alpha");
+    expect(file.deleted).toEqual(["alpha"]);
+    expect(file.identities.map((i: { name: string }) => i.name)).toEqual(["pool-main", "beta"]);
+    retireIdentity(file, "beta", new Date("2026-11-25T00:00:00Z"));
+    expect(file.identities.some((i: { name: string }) => i.name === "beta")).toBe(true);
+    expect(file.deleted).toEqual(["alpha"]);
   });
 });

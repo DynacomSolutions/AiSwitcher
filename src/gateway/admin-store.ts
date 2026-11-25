@@ -16,7 +16,7 @@ import { droppedIdentities } from "./registry-sync.ts";
  * - POST /store/files/read             encrypted rows: {paths} or {account, extraPaths}
  * - PUT  /store/files                  compare-and-swap write of one encrypted row: `expectedVersion` is required (null creates).
  *                                       200 {version}; 409 {current} when the row moved; 409 "rotated" for a login whose refresh token the journal shows rotated out;
- *                                       409 "placeholder" for a login that is not refreshable over one that is; 409 "drops-identities" for a registry that drops an identity
+ *                                       422 "placeholder" for a login that is not refreshable over one that is; 422 "drops-identities" for a registry that drops an identity (422, not 409: an old host client reads 409 as a lost race and retries for ever)
  * - GET  /store/wait?since=N&ms=M      long poll: answers at once when a row is past version N, else when a change arrives or after M ms
  * - GET  /store/journal?provider&identity&oldFp   refresh journal entries for one refresh-token fingerprint
  */
@@ -37,7 +37,7 @@ const MAX_CIPHER_BYTES = 8 * 1024 * 1024;
 
 const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string" && s.length > 0);
 
-type Fail = (status: 400 | 404 | 409 | 503, message: string, extra?: object) => Response;
+type Fail = (status: 400 | 404 | 409 | 422 | 503, message: string, extra?: object) => Response;
 
 function b64(raw: unknown): Buffer | undefined {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > MAX_CIPHER_BYTES * 2 || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) return undefined;
@@ -121,11 +121,12 @@ export function registerStoreAdmin(hono: Hono, deps: StoreAdminDeps | undefined,
       const guarded = kind === "login" || (kind === "registry" && path.endsWith("identities.json"));
       if (guarded && typeof expectedVersion === "number") {
         const [cur] = await deps.homeStore.getCipher({ paths: [path] });
-        if (cur) {
+        // Only a write that would land is judged: a stale version gets the normal compare-and-swap conflict below.
+        if (cur && cur.version === expectedVersion) {
           const next = deps.homeStore.decrypt(path, cipher).toString("utf8");
           const prev = deps.homeStore.decrypt(path, cur.cipher).toString("utf8");
-          if (kind === "login" && !isRefreshableLogin(next) && isRefreshableLogin(prev)) return err(409, "placeholder");
-          if (kind === "registry" && droppedIdentities(next, prev).length > 0) return err(409, "drops-identities");
+          if (kind === "login" && !isRefreshableLogin(next) && isRefreshableLogin(prev)) return err(422, "placeholder");
+          if (kind === "registry" && droppedIdentities(next, prev).length > 0) return err(422, "drops-identities");
         }
       }
       result = await deps.homeStore.putCipher(path, cipher, sha256, { account, kind: kind as HomeFileKind, expectedVersion: expectedVersion as number | null });

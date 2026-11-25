@@ -89,6 +89,8 @@ export interface IdentitiesFile {
   version: 1;
   identities: Identity[];
   chromeProfileOverrides?: ChromeProfileOverride[];
+  /** Names removed on purpose (`ais identities delete`). The gateway store registry drops them; any other missing name is kept. */
+  deleted?: string[];
 }
 
 export interface ToolConfig {
