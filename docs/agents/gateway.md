@@ -125,6 +125,46 @@ a provider passes the last upstream 429 through.
 Claude Code in API-key mode (the gateway token via `apiKeyHelper`) retries a 429 only when `retry-after` is
 60 s or less; a longer wait ends the request with `Request rejected (429)`.
 
+### Full pool hold (pool apps, claude)
+
+Facts from the Claude Code 2.1.159 bundle (read only): the client retries a failed request at most 10 times
+(`CLAUDE_CODE_MAX_RETRIES`). It waits the `retry-after` value, and when that value is over 60 s it throws
+`retry_after_too_long` and ends the request. Its persistent retry mode (`CLAUDE_CODE_RETRY_WATCHDOG`) is off by default.
+So a plain 429 cannot keep a worker alive through a pool that stays full for hours (the stops of 24 Nov 2026).
+
+Design: the gateway holds the request, it does not answer 429. A pool app (never a pinned app) whose claude request wants
+a stream, has a buffered body (up to the 32 MiB replay cap) and meets a full pool with a wait over 55 s gets
+`200 text/event-stream` at once. That ends the client's 10 minute header timeout. The gateway sends an SSE `ping` every
+15 s, so the client's stream idle watchdog stays quiet. Every 30 s it sends the buffered request through the proxy again
+(same app, same token, same selection and failover). When a member has room, the answer of that replay is the rest of the
+stream. A replay that meets a full pool again waits. A replay that fails for another reason ends the stream with an SSE
+`error` event in the provider's shape, which the client reads as a normal API error.
+
+- Time limit: 6 h (`AIS_GATEWAY_POOL_HOLD_MAX_S`). After it the stream ends with the `rate_limit_error` event that carries
+  the reset text, so T3 Code can still snooze the thread until the reset.
+- Limits per replica: 200 held requests (`AIS_GATEWAY_POOL_HOLD_MAX_REQUESTS`) and 256 MiB of held bodies
+  (`AIS_GATEWAY_POOL_HOLD_MAX_BODY_MB`). A request over a limit gets the plain 429. Check and ping steps:
+  `AIS_GATEWAY_POOL_HOLD_CHECK_S`, `AIS_GATEWAY_POOL_HOLD_PING_S`.
+- Other full-pool answers (not streamed, over the replay cap, or a hold over its limit) keep the native 429 shape, but
+  `retry-after` is capped at 55 s, so the client retries (up to 10 times) instead of ending the request.
+- Unknown reset (the 300 s default) is held the same way: the hold looks at the pool, not at the reset text.
+- Pod drain: a held request is not an in-flight upstream call. On SIGTERM the process aborts one drain signal. Every hold
+  ends at once with an SSE `overloaded_error` event, which the client retries (and the router sends to a pod that is
+  ready). The old pod stops accepting and has nothing held, so the drain waits only for real streams. A request already
+  served after its wait is a normal stream and finishes.
+- A client that leaves ends its hold and frees its slot and its bytes. The held request holds no upstream connection and
+  no body budget, only its buffered body.
+- Metrics: `ais_gateway_pool_holds_total{app,event}` with events `held`, `served`, `failed`, `timeout`, `drained`,
+  `cancelled`. Code: `src/gateway/pool-hold.ts`; tests: `test/gateway/pool-hold.test.ts`.
+
+### Pool headroom metric
+
+`ais_gateway_pool_members_with_headroom{provider,threshold="0.9"}` counts pool members whose weekly use is below 90%
+(the fullest weekly window that applies to every model). `ais_gateway_pool_members_with_reading{provider}` counts the
+members that have a weekly figure, so a missing reading never counts as headroom. Neither carries a member name. Each
+replica sets them every 60 s from the shared usage readings, with the other gateway gauges, and the cluster's scrape of
+`/metrics` takes them into VictoriaMetrics. The .cluster alert fires when the claude figure is under 2 for 15 minutes.
+
 ## Add, update, rotate and revoke
 
 What each command does to tokens:
