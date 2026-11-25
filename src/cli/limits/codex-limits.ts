@@ -147,26 +147,37 @@ function labelAndCategoryFor(mins: number | undefined): { label: string; categor
   return { label: `~${Math.round(mins / 60)}h`, category };
 }
 
+/** The short label of each plan name that the wire sends as one known word.
+ * The key is the lower-cased wire value. */
+const KNOWN_PLAN_LABELS: ReadonlyMap<string, string> = new Map([
+  ["free", "Free"],
+  ["go", "Go"],
+  ["plus", "Plus"],
+  ["pro", "Pro"],
+  ["team", "Team"],
+  ["enterprise", "Enterprise"],
+]);
+
+/** Wire values that say that the plan is not known. They name no plan, so
+ * they show no label. Compared in lower case, after the outer spaces are
+ * removed. */
+const PLAN_PLACEHOLDERS: ReadonlySet<string> = new Set(["unknown", "none", "null", "n/a", "-"]);
+
 /** Short display label for the wire's planType (app-server snapshot or
- * wham/usage plan_type). Known ChatGPT plan names only: an unknown value
- * yields undefined, never a guessed label. */
+ * wham/usage plan_type). A known plan name keeps its short label. Any other
+ * value shows the words of the wire in title case, split on `_` and on
+ * whitespace, as `kimiPlanLabel` and `zaiPlanLabel` do. An absent, empty or
+ * placeholder value yields undefined. The label is real wire data only: no
+ * plan name is invented here. */
 export function codexPlanLabel(planType: string | null | undefined): string | undefined {
-  switch ((planType ?? "").toLowerCase()) {
-    case "free":
-      return "Free";
-    case "go":
-      return "Go";
-    case "plus":
-      return "Plus";
-    case "pro":
-      return "Pro";
-    case "team":
-      return "Team";
-    case "enterprise":
-      return "Enterprise";
-    default:
-      return undefined;
-  }
+  const value = (planType ?? "").trim();
+  const key = value.toLowerCase();
+  if (key === "" || PLAN_PLACEHOLDERS.has(key)) return undefined;
+  const known = KNOWN_PLAN_LABELS.get(key);
+  if (known !== undefined) return known;
+  const words = value.split(/[\s_]+/).filter(Boolean);
+  if (words.length === 0) return undefined;
+  return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
 }
 
 /** rateLimitReachedType/spendControlReached live at the snapshot level (they

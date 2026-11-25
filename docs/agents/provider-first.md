@@ -204,21 +204,29 @@ What the rule means in practice, now enforced in both pipelines:
   REAL $ column reads the same `realCost` payload field).
 
 - **The account plan label is real wire data only (`ToolLimitResult.plan`).**
-  Each fetcher maps its own wire's plan name to a short display label:
+  Each fetcher builds the label from the words that its own wire sends:
   claude's profile plan (`claudePlanLabel`, type plus rate-limit tier, e.g.
-  "Max 20x"), codex's `planType` ("Plus", "Pro", "Team", "Enterprise"),
-  kimi's `user.membership.level` (LEVEL_ prefix stripped, title-cased),
-  zai's quota `data.level` (title-cased), and an active OpenCode Go quota
-  read ("Go": that endpoint serves the Go plan only). Grok's billing config
-  and ali's gateway usage carry no plan name, so those fetchers never set
-  the field. An unknown plan value yields undefined, never a guess. Absent
-  renders nothing in every view (web badge, CLI identity branch). The
-  gateway rows carry the same label: claude's `plan` object is mapped in
-  `mapGatewayLimitRow`, the other providers ride `PoolUsage.planLabel`.
-  Aggregation inherits a duplicate source's label when the winner has none
-  (same account). Claude's limits fetch reuses the shared plan reader
-  (`claudePlanLabelFor` over `currentPlan`): its hourly profile cache and
-  failure backoff apply, and no new endpoint is polled.
+  "Max 20x"), codex's `planType` (`codexPlanLabel`, rule below), kimi's
+  `user.membership.level` (LEVEL_ prefix stripped, title-cased), zai's quota
+  `data.level` (title-cased), and an active OpenCode Go quota read ("Go":
+  that endpoint serves the Go plan only). Codex maps its `planType` in three
+  steps. A known name (`free`, `go`, `plus`, `pro`, `team`, `enterprise`)
+  keeps its short label ("Plus", "Pro", "Team", "Enterprise"). Any other
+  non-empty value shows the words of the wire in title case, split on `_`
+  and on whitespace: `promax` gives "Promax" and
+  `self_serve_business_prolite` gives "Self Serve Business Prolite". A
+  placeholder value (`unknown`, `none`, `null`, `n/a` and `-`, in any case,
+  with the outer spaces removed) yields undefined. No label is ever
+  invented: a value that names no plan yields undefined, never a guess.
+  Grok's billing config and ali's gateway usage carry no plan name, so
+  those fetchers never set the field. Absent renders nothing in every view
+  (web badge, CLI identity branch). The gateway rows carry the same label:
+  claude's `plan` object is mapped in `mapGatewayLimitRow`, the other
+  providers ride `PoolUsage.planLabel`. Aggregation inherits a duplicate
+  source's label when the winner has none (same account). Claude's limits
+  fetch reuses the shared plan reader (`claudePlanLabelFor` over
+  `currentPlan`): its hourly profile cache and failure backoff apply, and
+  no new endpoint is polled.
 
 Verification should cover aggregation when native and multi-provider clients
 share a credential, fallback to an available result when one source fails,

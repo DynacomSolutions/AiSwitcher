@@ -1,6 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  CODEX_WHAM_USAGE_URL,
   codexPlanLabel,
+  fetchCodexLimits,
+  fetchCodexLimitsViaStore,
   isCodexAuthRejectionError,
   extraUsageFromCredits,
   isTransientCodexLimitsError,
@@ -21,11 +27,115 @@ describe("codexPlanLabel", () => {
     expect(codexPlanLabel("PRO")).toBe("Pro");
   });
 
-  test("absent or unknown plan types yield undefined, never a guess", () => {
+  test("any other plan type shows the words of the wire in title case", () => {
+    // Plan types that the live accounts send (seen 2026-11-25).
+    expect(codexPlanLabel("promax")).toBe("Promax");
+    expect(codexPlanLabel("self_serve_business_prolite")).toBe("Self Serve Business Prolite");
+    // The case of the wire and the outer spaces change nothing.
+    expect(codexPlanLabel("PROMAX")).toBe("Promax");
+    expect(codexPlanLabel(" Self_Serve_Business_Prolite ")).toBe("Self Serve Business Prolite");
+    // A space splits words in the same way as an underscore.
+    expect(codexPlanLabel("business pro lite")).toBe("Business Pro Lite");
+    expect(codexPlanLabel("future_tier")).toBe("Future Tier");
+  });
+
+  test("an absent, empty or placeholder plan type yields undefined, so no label is shown", () => {
     expect(codexPlanLabel(undefined)).toBeUndefined();
     expect(codexPlanLabel(null)).toBeUndefined();
     expect(codexPlanLabel("")).toBeUndefined();
-    expect(codexPlanLabel("future_tier")).toBeUndefined();
+    expect(codexPlanLabel("   ")).toBeUndefined();
+    // A value with no word.
+    expect(codexPlanLabel("_")).toBeUndefined();
+    expect(codexPlanLabel(" _ ")).toBeUndefined();
+    // Each placeholder word.
+    expect(codexPlanLabel("unknown")).toBeUndefined();
+    expect(codexPlanLabel("none")).toBeUndefined();
+    expect(codexPlanLabel("null")).toBeUndefined();
+    expect(codexPlanLabel("n/a")).toBeUndefined();
+    expect(codexPlanLabel("-")).toBeUndefined();
+    // The same words in any case and with outer spaces.
+    expect(codexPlanLabel("UNKNOWN")).toBeUndefined();
+    expect(codexPlanLabel(" None ")).toBeUndefined();
+    expect(codexPlanLabel("Null")).toBeUndefined();
+    expect(codexPlanLabel("N/A")).toBeUndefined();
+    expect(codexPlanLabel(" - ")).toBeUndefined();
+  });
+});
+
+/** A stand-in for `codex app-server --stdio`. It answers `initialize` with an
+ * empty result and `account/rateLimits/read` with a snapshot that carries the
+ * given plan type. */
+const appServerStandIn = (planType: string) => `
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let end;
+  while ((end = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, end);
+    buffer = buffer.slice(end + 1);
+    if (!line.trim()) continue;
+    const request = JSON.parse(line);
+    const result =
+      request.method === "initialize"
+        ? {}
+        : { rateLimits: { primary: { usedPercent: 10, windowDurationMins: 300 }, secondary: { usedPercent: 20, windowDurationMins: 10080 }, planType: ${JSON.stringify(planType)} } };
+    process.stdout.write(JSON.stringify({ id: request.id, result }) + "\\n");
+  }
+});
+`;
+
+describe("the plan on each limits path", () => {
+  let scratch: string;
+  let savedPath: string | undefined;
+  const member = () => ({ name: "member", label: "member", configDir: join(scratch, "identity") });
+  const memberRoot = () => join(scratch, "members");
+  beforeEach(async () => {
+    scratch = await mkdtemp(join(tmpdir(), "ais-codex-limits-"));
+    savedPath = process.env.PATH;
+  });
+  afterEach(async () => {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    await rm(scratch, { recursive: true, force: true });
+  });
+
+  test("the app-server snapshot puts the plan type of the wire on the row", async () => {
+    // PATH holds only the stand-in folder, and the scratch home holds no managed binary.
+    // Thus the limits read starts no real codex binary.
+    const bin = join(scratch, "bin");
+    await mkdir(bin);
+    await writeFile(join(scratch, "stand-in.js"), appServerStandIn("promax"));
+    await writeFile(join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${join(scratch, "stand-in.js")}"\n`, { mode: 0o755 });
+    process.env.PATH = bin;
+    const r = await fetchCodexLimits(member(), { memberRoot: memberRoot() });
+    expect(r.status).toBe("live");
+    expect(r.plan).toBe("Promax");
+  }, 20_000);
+
+  test("the wham usage read puts the plan type of the wire on the row, and a placeholder puts none", async () => {
+    await mkdir(join(memberRoot(), "codex", "member"), { recursive: true });
+    await writeFile(
+      join(memberRoot(), "codex", "member", "auth.json"),
+      JSON.stringify({ tokens: { access_token: "SYNTHETIC_FIXTURE-codex-store-access" } }),
+    );
+    const primaryWindow = { used_percent: 42, limit_window_seconds: 18_000, reset_at: 1_789_200_600 };
+    const read = async (planType: string) => {
+      const calls: string[] = [];
+      const fetchImpl = (async (url: string) => {
+        calls.push(url);
+        return new Response(JSON.stringify({ plan_type: planType, rate_limit: { primary_window: primaryWindow } }), { status: 200 });
+      }) as unknown as typeof fetch;
+      const result = await fetchCodexLimitsViaStore(member(), { fetchImpl, memberRoot: memberRoot() });
+      return { calls, result };
+    };
+    const live = await read("self_serve_business_prolite");
+    expect(live.result.status).toBe("live");
+    expect(live.result.plan).toBe("Self Serve Business Prolite");
+    expect(live.calls).toEqual([CODEX_WHAM_USAGE_URL]);
+    const placeholder = await read("unknown");
+    expect(placeholder.result.status).toBe("live");
+    expect("plan" in placeholder.result).toBe(false);
   });
 });
 
