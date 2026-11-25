@@ -331,7 +331,9 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     }
     const likeConfig = obj(like?.config);
     const binaryPath = opts.binary ?? (typeof likeConfig?.binaryPath === "string" && likeConfig.binaryPath !== "" ? likeConfig.binaryPath : join(home, ".local", "bin", "claude"));
-    const config: Json = { ...obj(existing?.config), binaryPath, homePath: folder };
+    // keepExisting: a home path that is already set stays (the pool instance of a pod keeps its identity folder).
+    const keptHome = opts.keepExisting && typeof obj(existing?.config)?.homePath === "string" && obj(existing?.config)!.homePath !== "" ? (obj(existing?.config)!.homePath as string) : folder;
+    const config: Json = { ...obj(existing?.config), binaryPath, homePath: keptHome };
     if (models.length > 0) config.customModels = models;
     else delete config.customModels;
     entry = { ...existing, driver: "claudeAgent", displayName, enabled, config };

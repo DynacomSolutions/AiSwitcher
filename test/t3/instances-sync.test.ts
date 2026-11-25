@@ -276,4 +276,14 @@ describe("hardening", () => {
     expect(items.find((i) => i.id === "codex-pool")?.status).toBe("updated");
     expect(await readFile(auth, "utf8")).toBe("{}\n");
   });
+
+  test("an existing Claude home path (a pool kept on an identity folder) is not moved back to the gateway folder", async () => {
+    await run(APPS);
+    const s = await settings();
+    s.providerInstances[POOL_CLAUDE].config.homePath = "/identities/pool";
+    await writeFile(settingsPath, JSON.stringify(s, null, 2) + "\n");
+    const items = await run(APPS);
+    expect(items.find((i) => i.id === POOL_CLAUDE)?.status).toBe("current");
+    expect((await settings()).providerInstances[POOL_CLAUDE].config.homePath).toBe("/identities/pool");
+  });
 });
