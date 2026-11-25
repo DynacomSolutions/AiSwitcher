@@ -80,6 +80,19 @@ const KEY_PROXY = "AIS_T3_ANTHROPIC_PROXY";
 const KEY_CA = "NODE_EXTRA_CA_CERTS";
 const KEY_OPTIONS = "NODE_OPTIONS";
 
+/**
+ * Telemetry opt-outs for the T3 server and every child it starts (owner order, 25 Nov 2026). T3 0.1.7 reads
+ * T3CODE_TELEMETRY_ENABLED (product analytics and relay traces). Claude Code reads DISABLE_TELEMETRY and DISABLE_ERROR_REPORTING.
+ * OpenCode reads DO_NOT_TRACK and DISABLE_TELEMETRY. Grok reads DISABLE_TELEMETRY and DISABLE_ERROR_REPORTING. Kimi reads KIMI_DISABLE_TELEMETRY. CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is not set: it also stops model listing and auth.
+ */
+export const T3_TELEMETRY_ENV: Readonly<Record<string, string>> = {
+  T3CODE_TELEMETRY_ENABLED: "false",
+  DISABLE_TELEMETRY: "1",
+  DISABLE_ERROR_REPORTING: "1",
+  DO_NOT_TRACK: "1",
+  KIMI_DISABLE_TELEMETRY: "1",
+};
+
 export interface T3Paths {
   t3Home: string;
   serviceEnv: string;
@@ -185,6 +198,24 @@ const toLines = (text: string): string[] => {
 };
 const fromLines = (lines: string[]): string => (lines.length === 0 ? "" : `${lines.join("\n")}\n`);
 
+/** Pure: the service.env text with the telemetry opt-out keys set; every other line and the order is kept. Throws on HTTPS_PROXY & co. */
+export function upsertTelemetryOff(text: string): string {
+  assertNoForbidden(text);
+  let lines = toLines(text);
+  for (const [k, v] of Object.entries(T3_TELEMETRY_ENV)) lines = setKey(lines, k, (old) => render(k, v, old?.quote ?? ""));
+  return fromLines(lines);
+}
+
+/** Telemetry opt-out keys of a service.env that are missing or hold another value. Empty when all are right. */
+export function missingTelemetryKeys(text: string): string[] {
+  const values = new Map<string, string>();
+  for (const line of toLines(text)) {
+    const kv = parseLine(line);
+    if (kv) values.set(kv.key, kv.value); // the last copy wins
+  }
+  return Object.entries(T3_TELEMETRY_ENV).filter(([k, v]) => values.get(k) !== v).map(([k, v]) => `${k}=${v}`);
+}
+
 export interface UpsertInput {
   preloadPath: string;
   proxyUrl: string;
@@ -205,7 +236,7 @@ export function upsertServiceEnv(text: string, input: UpsertInput): string {
   });
   lines = setKey(lines, KEY_PROXY, () => render(KEY_PROXY, input.proxyUrl));
   lines = setKey(lines, KEY_CA, () => render(KEY_CA, input.caPath));
-  return fromLines(lines);
+  return upsertTelemetryOff(fromLines(lines));
 }
 
 /** Pure: drops the three keys, and from NODE_OPTIONS only our --require (the line goes when nothing else is left). */
@@ -227,7 +258,7 @@ export function missingKeys(text: string, preloadPath: string): string[] {
   const values = new Map<string, string>();
   for (const line of toLines(text)) {
     const kv = parseLine(line);
-    if (kv && !values.has(kv.key)) values.set(kv.key, kv.value);
+    if (kv) values.set(kv.key, kv.value); // the last copy wins
   }
   const missing: string[] = [];
   if (!hasRequire(optionTokens(values.get(KEY_OPTIONS) ?? ""), preloadPath)) missing.push(`${KEY_OPTIONS} (--require ${preloadPath})`);
@@ -306,6 +337,24 @@ export async function removeT3Proxy(opts: T3Options = {}): Promise<InstallResult
   return { preload: paths.preload, serviceEnv: paths.serviceEnv, backup: saved, changed: saved !== undefined || hadPreload };
 }
 
+/** Sets the telemetry opt-out keys in service.env (created when missing). Does not touch the proxy keys or the preload. */
+export async function installT3Telemetry(opts: T3Options = {}): Promise<InstallResult> {
+  const paths = t3Paths(opts);
+  const before = await readOptional(paths.serviceEnv);
+  const after = upsertTelemetryOff(before ?? "");
+  const saved = await writeServiceEnv(paths, before, after, (opts.now ?? Date.now)());
+  return { preload: paths.preload, serviceEnv: paths.serviceEnv, backup: saved, changed: before !== after };
+}
+
+/** Read-only: telemetry problems of service.env (a missing file counts). Empty when telemetry is off. */
+export async function checkT3Telemetry(opts: T3Options = {}): Promise<string[]> {
+  const paths = t3Paths(opts);
+  const text = await readOptional(paths.serviceEnv);
+  if (text === undefined) return [`${paths.serviceEnv} is missing (telemetry is not off)`];
+  const missing = missingTelemetryKeys(text);
+  return missing.length > 0 ? [`telemetry is not off in ${paths.serviceEnv}: ${missing.join(", ")}`] : [];
+}
+
 /** Read-only: what is wrong with the install (empty when installed and current). */
 export async function checkT3Proxy(opts: T3Options = {}): Promise<string[]> {
   const paths = t3Paths(opts);
@@ -317,6 +366,8 @@ export async function checkT3Proxy(opts: T3Options = {}): Promise<string[]> {
     if (bad.length > 0) problems.push(`forbidden proxy variable(s) in ${paths.serviceEnv}: ${bad.join(", ")} (breaks every T3 child)`);
     const missing = missingKeys(text, paths.preload);
     if (missing.length > 0) problems.push(`missing keys: ${missing.join(", ")}`);
+    const telemetry = missingTelemetryKeys(text);
+    if (telemetry.length > 0) problems.push(`telemetry is not off in ${paths.serviceEnv}: ${telemetry.join(", ")} (run ais gateway t3-telemetry)`);
   }
   const preload = await readOptional(paths.preload);
   if (preload === undefined) problems.push(`preload missing: ${paths.preload}`);
@@ -335,6 +386,10 @@ export async function t3ProxyDoctorProblems(opts: T3Options = {}): Promise<strin
   if (text !== undefined) {
     const bad = forbiddenProxyVars(text);
     if (bad.length > 0) problems.push(`${paths.serviceEnv} sets ${bad.join(", ")}: this breaks git, gh, npm and codex in every T3 thread (the gateway proxy intercepts only api.anthropic.com, opencode.ai and cli-chat-proxy.grok.com; every other host is a plain tunnel); remove it, use ais gateway t3-proxy`);
+  }
+  if (text !== undefined) {
+    const telemetry = missingTelemetryKeys(text);
+    if (telemetry.length > 0) problems.push(`${paths.serviceEnv} does not turn telemetry off (${telemetry.join(", ")}); run ais gateway t3-telemetry, then restart T3`);
   }
   const preload = await readOptional(paths.preload).catch(() => undefined);
   if (preload !== undefined && preload !== PRELOAD_SOURCE) problems.push(`T3 preload ${paths.preload} is out of date; run ais gateway t3-proxy, then restart T3`);

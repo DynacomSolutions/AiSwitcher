@@ -80,7 +80,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|t3-instances|codex-home|favourites-token|instances-token ...",
+    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-telemetry|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|t3-instances|codex-home|favourites-token|instances-token ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -105,6 +105,10 @@ export const HELP: Record<string, HelpNode> = {
       "t3-proxy": sub(
         "ais gateway t3-proxy [--proxy=<url>] [--ca=<path>] [--check] [--remove]",
         "Route api.anthropic.com (all paths), opencode.ai /zen/go/v1/usage and cli-chat-proxy.grok.com /v1/billing for the T3 Code server only (not its children) through the gateway CONNECT proxy so T3's account usage, reset credits, OpenCode Go usage and Grok billing come from the gateway (every other host is a plain tunnel): installs ~/.ais/t3/anthropic-proxy.cjs and sets NODE_OPTIONS (--require), AIS_T3_ANTHROPIC_PROXY and NODE_EXTRA_CA_CERTS in ~/.t3/service.env (T3CODE_HOME honoured; never HTTPS_PROXY); --check only reports, --remove undoes it; restart T3 to apply (never done here)",
+      ),
+      "t3-telemetry": sub(
+        "ais gateway t3-telemetry [--check]",
+        "Turn telemetry off for T3 Code and its agents: sets T3CODE_TELEMETRY_ENABLED=false, DISABLE_TELEMETRY=1, DISABLE_ERROR_REPORTING=1, DO_NOT_TRACK=1 and KIMI_DISABLE_TELEMETRY=1 in ~/.t3/service.env (T3 passes them to every child), and [analytics], [feedback] and [otel] opt-outs in the config.toml of every Codex home; T3 Claude homes get theirs from t3-claude-sync; the profile-sync daemon repairs the Codex keys and reports service.env drift every 10 minutes; --check writes nothing and fails on drift; restart T3 to apply (never done here)",
       ),
       "t3-models": sub(
         "ais gateway t3-models [--check]",

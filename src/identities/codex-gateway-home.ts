@@ -1,6 +1,7 @@
 import { chmod, mkdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { parse as parseToml } from "smol-toml";
+import { applyCodexTelemetryOff, codexTelemetryProblems } from "./codex-telemetry.ts";
 import { aisHome } from "../shared/ais-home.ts";
 import { LOCAL_GATEWAY_ROUTES } from "../gateway/local-routes.ts";
 import { LOCAL_GATEWAY_HTTP_PORT, localGatewayTlsPort, localTlsBundlePath } from "../gateway/local-tls.ts";
@@ -218,6 +219,8 @@ export async function codexGatewayHomeProblem(dir: string): Promise<string | und
     return e instanceof Error ? e.message : String(e);
   }
   if (transformCodexGatewayConfig(text, target.base, target.app, target.route) !== text) return "config.toml needs chatgpt_base_url / requires_openai_auth";
+  const telemetry = codexTelemetryProblems(text);
+  if (telemetry.length > 0) return `config.toml does not turn telemetry off (${telemetry.join(", ")})`;
   try {
     const auth = JSON.parse(await readFile(join(dir, "auth.json"), "utf8")) as { tokens?: { account_id?: unknown; access_token?: unknown; id_token?: unknown } };
     if (auth.tokens?.account_id !== `ais-${target.app}` || typeof auth.tokens.access_token !== "string" || auth.tokens.access_token === "") return "auth.json is not the gateway placeholder login";
@@ -244,7 +247,13 @@ export async function configureCodexGatewayHome(dir: string, token: string): Pro
   const { base, route } = localText === text ? read : parseGatewayProvider(localText);
   await mkdir(dir, { recursive: true });
   await writeFileAtomic(join(dir, "auth.json"), buildCodexGatewayAuth(app, token));
-  const next = transformCodexGatewayConfig(localText, base, app, route);
+  const transformed = transformCodexGatewayConfig(localText, base, app, route);
+  let next = transformed;
+  try {
+    next = applyCodexTelemetryOff(transformed);
+  } catch (e) {
+    console.error(`ais: warning: telemetry not turned off in ${join(dir, "config.toml")}: ${e instanceof Error ? e.message : String(e)}`);
+  }
   if (next !== text) {
     const path = join(dir, "config.toml");
     const mode = (await stat(path)).mode & 0o777;

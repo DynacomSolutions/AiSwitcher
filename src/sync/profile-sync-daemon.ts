@@ -12,6 +12,7 @@ import { listLiveSessions, sessionRegistryDir, type IsRunning, type RegisteredSe
 import type { SyncRunOptions } from "./types.ts";
 import { createStoreSyncSupervisor, type StoreSyncSupervisor } from "./store-sync-supervisor.ts";
 import { createT3ClaudeTicker, type T3ClaudeTicker } from "./t3-claude-ticker.ts";
+import { createT3TelemetryTicker, type T3TelemetryTicker } from "./t3-telemetry-ticker.ts";
 import { createT3FavouritesTicker, type T3FavouritesTicker } from "./t3-favourites-ticker.ts";
 import { createT3InstancesTicker, type T3InstancesTicker } from "./t3-instances-ticker.ts";
 import { createT3ModelsTicker, type T3ModelsTicker } from "./t3-models-ticker.ts";
@@ -285,6 +286,8 @@ export interface RunDaemonOptions {
   t3Usage?: T3UsageTicker | false;
   /** T3 Claude home drift check against the source identities (t3-claude-ticker.ts). Default: one is created when no `deps` are given. */
   t3Claude?: T3ClaudeTicker | false;
+  /** Telemetry opt-out guard for Codex homes and service.env (t3-telemetry-ticker.ts). Default: one is created when no `deps` are given. */
+  t3Telemetry?: T3TelemetryTicker | false;
   /** T3 favourites sync with the gateway list (t3-favourites-ticker.ts). Default: one is created when no `deps` are given. */
   t3Favourites?: T3FavouritesTicker | false;
   /** T3 provider instances from the live gateway app list (t3-instances-ticker.ts). Default: one is created when no `deps` are given. */
@@ -309,6 +312,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
   const t3Models = options.t3Models === false ? undefined : (options.t3Models ?? (options.deps ? undefined : createT3ModelsTicker()));
   const t3Usage = options.t3Usage === false ? undefined : (options.t3Usage ?? (options.deps ? undefined : createT3UsageTicker()));
   const t3Claude = options.t3Claude === false ? undefined : (options.t3Claude ?? (options.deps ? undefined : createT3ClaudeTicker()));
+  const t3Telemetry = options.t3Telemetry === false ? undefined : (options.t3Telemetry ?? (options.deps ? undefined : createT3TelemetryTicker()));
   const t3Favourites = options.t3Favourites === false ? undefined : (options.t3Favourites ?? (options.deps ? undefined : createT3FavouritesTicker()));
   const t3Instances = options.t3Instances === false ? undefined : (options.t3Instances ?? (options.deps ? undefined : createT3InstancesTicker()));
   let stopped = false;
@@ -341,6 +345,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
       try { await t3Models?.tick(); } catch { /* retried next interval */ }
       try { await t3Usage?.tick(); } catch { /* retried next interval */ }
       try { await t3Claude?.tick(); } catch { /* retried next interval */ }
+      try { await t3Telemetry?.tick(); } catch { /* retried next interval */ }
       try { await t3Favourites?.tick(); } catch { /* retried next interval */ }
       try { await t3Instances?.tick(); } catch { /* retried next interval */ }
       if (stopped) break;
