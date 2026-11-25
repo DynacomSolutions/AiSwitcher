@@ -1,12 +1,14 @@
+import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { appTokenKey, readSecretsKey } from "../../cli/gateway/secrets-file.ts";
 import { GATEWAY_TOKEN_PREFIX } from "../../identities/claude-gateway-entry.ts";
-import { configureCodexGatewayHome } from "../../identities/codex-gateway-home.ts";
+import { buildCodexGatewayAuth, configureCodexGatewayHome, readCodexGatewayHomeApp } from "../../identities/codex-gateway-home.ts";
 import { writeFileAtomic } from "../../identities/pool/fs.ts";
 import { t3Paths } from "../../identities/t3-anthropic-proxy.ts";
-import { applyT3Instance, stable, writeSettings, type InstanceDriver, type T3InstanceOptions } from "../../identities/t3-instance.ts";
+import { applyT3Instance, flushSettingsBatch, loadSettingsBatch, stable, type InstanceDriver, type SettingsBatch, type T3InstanceOptions } from "../../identities/t3-instance.ts";
+import { syncT3UsageCredentials } from "../../identities/t3-usage-credentials.ts";
 import { loadClaudeIdentities, noThirdPartyNames, t3ClaudeSource } from "../../shared/t3-claude-source.ts";
 import { isManagedInstanceId, planT3Instances, type GatewayApp, type PlannedInstance } from "./plan.ts";
 
@@ -86,6 +88,8 @@ interface Ctx {
   home: string;
   t3Home: string;
   settingsPath: string;
+  /** The whole run works on this in-memory copy of settings.json and writes it once at the end. */
+  batch: SettingsBatch;
   flavour: "host" | "pod";
   bin: (name: string) => string;
   check: boolean;
@@ -94,25 +98,32 @@ interface Ctx {
 
 const folderOf = (c: Ctx, id: string): string => join(c.o.gatewayDir ?? join(c.t3Home, "gateway"), id);
 
-/** Writes one entry into settings.json (backup kept). Returns whether it differs from the current one. */
+const instancesOf = (c: Ctx): Json => obj(c.batch.settings.providerInstances) ?? {};
+
+/** Puts one entry into the in-memory settings (the run writes the file once). Returns whether it differs from the current one. */
 async function putEntry(c: Ctx, id: string, build: (existing: Json | undefined) => Json): Promise<boolean> {
-  const before = await fileText(c.settingsPath);
-  const settings: Json = before === undefined ? {} : (obj(JSON.parse(before)) ?? {});
-  const instances = obj(settings.providerInstances) ?? {};
+  const instances = instancesOf(c);
   const existing = obj(instances[id]);
   const entry = build(existing);
   if (stable(existing) === stable(entry)) return false;
   if (!c.check) {
-    settings.providerInstances = { ...instances, [id]: entry };
-    await writeSettings(c.settingsPath, before, settings, join(c.t3Home, "backups"), c.now());
+    c.batch.settings.providerInstances = { ...instances, [id]: entry };
+    c.batch.dirty.add(id);
   }
   return true;
 }
 
 async function hasInstance(c: Ctx, id: string): Promise<boolean> {
-  const text = await fileText(c.settingsPath);
-  return text !== undefined && obj(obj(JSON.parse(text))?.providerInstances)?.[id] !== undefined;
+  return instancesOf(c)[id] !== undefined;
 }
+
+/** Display name and enabled flag: set on create only. An existing instance keeps what the user (or T3) has set. */
+const lead = (existing: Json | undefined, p: PlannedInstance, suffix = ""): Json => ({
+  displayName: typeof existing?.displayName === "string" ? existing.displayName : `${displayName(p)}${suffix}`,
+  enabled: typeof existing?.enabled === "boolean" ? existing.enabled : true,
+});
+
+const tokenStamp = (token: string): string => createHash("sha256").update(token).digest("hex").slice(0, 16);
 
 async function claudeSource(c: Ctx, id: string): Promise<T3InstanceOptions["source"]> {
   try {
@@ -129,13 +140,13 @@ async function claudeSource(c: Ctx, id: string): Promise<T3InstanceOptions["sour
 const POOL_ACCENT = "#c62d2d";
 const PIN_ACCENT: Record<string, string> = { claude: "#df25eb", codex: "#c355c6" };
 
-/** Gives an instance its provider accent colour when it has none. A colour set by hand stays. */
+/** Gives a new instance the accent colour of its provider. */
 async function putAccent(c: Ctx, p: PlannedInstance, item: SyncItem): Promise<SyncItem> {
   const colour = p.who === "pool" ? POOL_ACCENT : PIN_ACCENT[p.provider];
-  if (!colour || item.status === "skipped" || item.status === "failed") return item;
-  if (c.check && item.status === "created") return item;
-  const changed = await putEntry(c, p.id, (existing) => (existing && typeof existing.accentColor !== "string" ? { ...existing, accentColor: colour } : (existing ?? {})));
-  return changed && item.status === "current" ? { ...item, status: "updated" } : item;
+  // On create only: a colour (or the lack of one) on an existing instance is the user's.
+  if (!colour || item.status !== "created" || c.check) return item;
+  await putEntry(c, p.id, (existing) => (existing && typeof existing.accentColor !== "string" ? { ...existing, accentColor: colour } : (existing ?? {})));
+  return item;
 }
 
 async function applyOne(c: Ctx, p: PlannedInstance): Promise<SyncItem> {
@@ -149,7 +160,7 @@ async function applyInstance(c: Ctx, p: PlannedInstance): Promise<SyncItem> {
   if (!token || !token.startsWith(GATEWAY_TOKEN_PREFIX)) return { id: p.id, status: "skipped", detail: `no gateway token for app ${p.app}` };
   const base = { token, home: c.home, ...(c.o.gatewayDir ? { gatewayDir: c.o.gatewayDir } : {}), ...(c.o.env ? { env: c.o.env } : {}), ...(c.o.secretsPath ? { secretsPath: c.o.secretsPath } : {}), check: c.check, now: c.now };
   const viaWriter = async (driver: InstanceDriver, extra: Partial<T3InstanceOptions> = {}): Promise<SyncItem> => {
-    const r = await applyT3Instance({ id: p.id, driver, app: p.app, gatewayUrl: url, name: displayName(p), binary: c.bin(driver === "claude" ? "claude" : driver), ...base, ...extra });
+    const r = await applyT3Instance({ id: p.id, driver, app: p.app, gatewayUrl: url, name: displayName(p), binary: c.bin(driver === "claude" ? "claude" : driver), keepExisting: true, batch: c.batch, ...base, ...extra });
     return { id: p.id, status: r.status === "absent" ? "current" : r.status, ...(r.warnings?.length ? { detail: r.warnings.join("; ") } : {}) };
   };
   switch (p.kind) {
@@ -175,9 +186,17 @@ async function applyCodex(c: Ctx, p: PlannedInstance, url: string, token: string
     const cfg = obj(existing?.config);
     // An existing home path is kept (the pool home may be an identity folder).
     if (typeof cfg?.homePath === "string" && cfg.homePath !== "") home = cfg.homePath;
-    return { ...existing, driver: "codex", displayName: displayName(p), enabled: true, config: { ...cfg, binaryPath: c.bin("codex"), homePath: home } };
+    return { ...existing, driver: "codex", ...lead(existing, p), config: { ...cfg, binaryPath: c.bin("codex"), homePath: home } };
   });
-  if (!c.check) {
+  if (c.check) {
+    // A dry run still reports a changed login: auth.json must hold the placeholder login of the current token.
+    try {
+      const have = await readCodexGatewayHomeApp(home);
+      if ((await fileText(join(home, "auth.json"))) !== buildCodexGatewayAuth(have.app, token)) changed = true;
+    } catch {
+      changed = true;
+    }
+  } else {
     const cfgPath = join(home, "config.toml");
     if ((await fileText(cfgPath)) === undefined) {
       await mkdir(home, { recursive: true });
@@ -231,11 +250,22 @@ async function applyAcp(c: Ctx, p: PlannedInstance, url: string, token: string):
     environment.push(env("ACP_GLM_SESSION_DIR", join(folder, "sessions")));
   }
   const commandPath = host ? join(c.home, ".ais", "t3", "acp", agent.agentId) : c.bin(agent.binary);
+  // T3 redacts a sensitive env value after it reads it (`value: ""`, `valueRedacted: true`). A redacted entry of the same name counts
+  // as equal until the token changes; a short hash of the token in the folder tells that. The plaintext is written only on a change.
+  const stampPath = join(folder, ".gateway-token-sha");
+  const tokenChanged = (await fileText(stampPath))?.trim() !== tokenStamp(token);
   let existed = false;
   let changed = await putEntry(c, p.id, (existing) => {
     existed = existing !== undefined;
-    return { ...existing, driver: "acpRegistry", displayName: displayName(p), enabled: true, config: { ...obj(existing?.config), source: "registry", agentId: agent.agentId, commandPath }, environment };
+    const have = (existing?.environment as Json[] | undefined) ?? [];
+    const env2 = environment.map((e) => {
+      if (e.sensitive !== true || tokenChanged) return e;
+      const kept = have.find((h) => obj(h)?.name === e.name && obj(h)?.valueRedacted === true);
+      return kept ?? e;
+    });
+    return { ...existing, driver: "acpRegistry", ...lead(existing, p), config: { ...obj(existing?.config), source: "registry", agentId: agent.agentId, commandPath }, environment: env2 };
   });
+  if (host && environment.some((e) => e.sensitive === true)) await putFile(stampPath, `${tokenStamp(token)}\n`, 0o600, c.check);
   if (p.kind === "acp-kimi") {
     // The folder config.toml names the gateway provider and holds the app token. Only base_url and api_key of [providers.gateway] follow
     // the gateway; every other line (the model lists of `ais gateway t3-models`) stays.
@@ -256,9 +286,9 @@ async function applyOpencodePod(c: Ctx, p: PlannedInstance): Promise<SyncItem> {
   let existed = false;
   const a = await putEntry(c, p.id, (existing) => {
     existed = existing !== undefined;
-    return { ...existing, driver: "acpRegistry", displayName: `${displayName(p)} chat`, enabled: true, config: { ...obj(existing?.config), source: "registry", agentId: "opencode", commandPath: c.bin("opencode") }, environment: [env("OPENCODE_CONFIG_DIR", folder), env("XDG_DATA_HOME", join(folder, "data"))] };
+    return { ...existing, driver: "acpRegistry", ...lead(existing, p, " chat"), config: { ...obj(existing?.config), source: "registry", agentId: "opencode", commandPath: c.bin("opencode") }, environment: [env("OPENCODE_CONFIG_DIR", folder), env("XDG_DATA_HOME", join(folder, "data"))] };
   });
-  const b = await putEntry(c, usageId, (existing) => ({ ...existing, driver: "opencode", displayName: displayName(p), enabled: true, config: { ...obj(existing?.config), binaryPath: c.bin("opencode") }, environment: [env("OPENCODE_CONFIG_DIR", usageFolder), env("XDG_DATA_HOME", usageFolder)] }));
+  const b = await putEntry(c, usageId, (existing) => ({ ...existing, driver: "opencode", ...lead(existing, p), config: { ...obj(existing?.config), binaryPath: c.bin("opencode") }, environment: [env("OPENCODE_CONFIG_DIR", usageFolder), env("XDG_DATA_HOME", usageFolder)] }));
   return { id: p.id, status: a || b ? (existed ? "updated" : "created") : "current" };
 }
 
@@ -269,11 +299,13 @@ export async function syncT3Instances(o: SyncT3InstancesOptions): Promise<SyncIt
   const t3Home = t3Paths({ home, ...(o.env ? { env: o.env } : {}) }).t3Home;
   const flavour = o.flavour ?? "host";
   const binaryDir = o.binaryDir ?? "/opt/t3-agents/default";
+  const settingsPath = join(t3Home, "userdata", "settings.json");
   const c: Ctx = {
     o,
     home,
     t3Home,
-    settingsPath: join(t3Home, "userdata", "settings.json"),
+    settingsPath,
+    batch: await loadSettingsBatch(settingsPath),
     flavour,
     bin: (name) => (flavour === "pod" ? join(binaryDir, name) : join(home, ".local", "bin", name)),
     check: o.check === true,
@@ -291,16 +323,35 @@ export async function syncT3Instances(o: SyncT3InstancesOptions): Promise<SyncIt
   // Remove what the app list no longer asks for. An app that is planned but skipped or failed keeps its instance.
   const keep = new Set(plan.map((p) => p.id));
   if (flavour === "pod") for (const p of plan) if (p.kind === "opencode") keep.add(`${p.id}-usage`);
-  const text = await fileText(c.settingsPath);
-  const instances = obj(obj(text ? JSON.parse(text) : {})?.providerInstances) ?? {};
   const managed = (id: string): boolean => isManagedInstanceId(id) || (flavour === "pod" && /^t3-opencode-.+-usage$/.test(id));
-  for (const id of Object.keys(instances)) {
-    if (keep.has(id) || !managed(id)) continue;
+  const managedIds = Object.keys(instancesOf(c)).filter(managed);
+  const stale = managedIds.filter((id) => !keep.has(id));
+  // A short or wrong app list must not wipe the instances: no removal when the plan holds no T3 app, or when it would remove more than half.
+  const refuse = stale.length > 0 && (plan.length === 0 || (stale.length >= 2 && stale.length > managedIds.length / 2));
+  for (const id of stale) {
+    if (refuse) {
+      out.push({ id, status: "skipped", detail: plan.length === 0 ? "removal refused: the app list holds no T3 app" : "removal refused: it would remove more than half of the gateway instances" });
+      continue;
+    }
     try {
-      const r = await applyT3Instance({ id, driver: "claude", app: "", gatewayUrl: "", home, ...(o.env ? { env: o.env } : {}), check: c.check, remove: true, now: c.now });
+      const r = await applyT3Instance({ id, driver: "claude", app: "", gatewayUrl: "", home, ...(o.env ? { env: o.env } : {}), check: c.check, remove: true, now: c.now, batch: c.batch });
       out.push({ id, status: r.status === "removed" ? "removed" : "current" });
     } catch (e) {
       out.push({ id, status: "failed", detail: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  if (!c.check) {
+    // One write for the whole run: the file is read again here and only the instances this run touched are merged in.
+    await flushSettingsBatch(settingsPath, c.batch, join(t3Home, "backups"), c.now());
+    // The usage logins (grok, opencode) read the instances from the file, so they run after it is written.
+    try {
+      const usage = await syncT3UsageCredentials({ home, ...(o.env ? { env: o.env } : {}), ...(o.secretsPath ? { secretsPath: o.secretsPath } : {}) });
+      for (const r of usage) {
+        const item = out.find((i) => i.id === r.id);
+        if (item && r.status === "updated" && item.status === "current") item.status = "updated";
+      }
+    } catch (e) {
+      out.push({ id: "usage-credentials", status: "failed", detail: e instanceof Error ? e.message : String(e) });
     }
   }
   return out;

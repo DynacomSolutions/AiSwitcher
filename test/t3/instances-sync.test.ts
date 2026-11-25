@@ -193,3 +193,87 @@ test("accent colour follows the provider and the pool, and a colour set by hand 
   expect((await settings()).providerInstances["t3-codex-org"].accentColor).toBe("#111111");
   expect((await run(apps, { tokenFor })).every((i) => i.status === "current")).toBe(true);
 });
+
+describe("hardening", () => {
+  const zai = [app("t3-zai-pool", "zai", pool)];
+  const redact = async () => {
+    const s = await settings();
+    for (const inst of Object.values(s.providerInstances) as { environment?: { sensitive?: boolean; value: string; valueRedacted?: boolean }[] }[])
+      for (const e of inst.environment ?? []) if (e.sensitive) { e.value = ""; e.valueRedacted = true; }
+    await writeFile(settingsPath, JSON.stringify(s, null, 2) + "\n");
+  };
+
+  test("a value that T3 redacted is equal until the token changes; the plaintext is not written back", async () => {
+    await run(zai);
+    await redact();
+    const before = await backups();
+    const items = await run(zai);
+    expect(items.every((i) => i.status === "current")).toBe(true);
+    expect(await backups()).toBe(before);
+    expect(JSON.stringify(await settings())).not.toContain(TOKEN);
+    await writeFile(secrets, (await readFile(secrets, "utf8")).replaceAll(TOKEN, ROTATED));
+    expect((await run(zai)).find((i) => i.id === "t3-zai-pool-acp")?.status).toBe("updated");
+    expect(JSON.stringify(await settings())).toContain(ROTATED);
+  });
+
+  test("an existing instance keeps its display name, enabled flag and colour", async () => {
+    await run(APPS);
+    const s = await settings();
+    s.providerInstances["t3-kimi-pool-acp"].displayName = "Mine";
+    s.providerInstances["t3-kimi-pool-acp"].enabled = false;
+    s.providerInstances["t3-grok-pool"].enabled = false;
+    delete s.providerInstances[POOL_CLAUDE].accentColor;
+    await writeFile(settingsPath, JSON.stringify(s, null, 2) + "\n");
+    const items = await run(APPS);
+    expect(items.every((i) => i.status === "current")).toBe(true);
+    const after = (await settings()).providerInstances;
+    expect(after["t3-kimi-pool-acp"]).toMatchObject({ displayName: "Mine", enabled: false });
+    expect(after["t3-grok-pool"].enabled).toBe(false);
+    expect(after[POOL_CLAUDE].accentColor).toBeUndefined();
+  });
+
+  test("one run makes one backup and keeps what changed in the file meanwhile", async () => {
+    const before = await backups();
+    await run(APPS, {
+      tokenFor: async (name) => {
+        // T3 (or another tool) edits settings.json while the sync runs.
+        const s = await settings();
+        s.providerInstances["added-by-t3"] = { driver: "codex", enabled: true };
+        await writeFile(settingsPath, JSON.stringify(s, null, 2) + "\n");
+        return name ? LIVE : undefined;
+      },
+    });
+    expect(await backups()).toBe(before + 1);
+    const after = (await settings()).providerInstances;
+    expect(after["added-by-t3"]).toBeDefined();
+    expect(after["t3-kimi-pool-acp"]).toBeDefined();
+  });
+
+  test("only the newest 10 backups stay", async () => {
+    for (let i = 0; i < 14; i++) {
+      await writeFile(secrets, (await readFile(secrets, "utf8")).replaceAll(i === 0 ? TOKEN : `aisg_r${i - 1}`, `aisg_r${i}`));
+      await run(zai);
+    }
+    expect(await backups()).toBeLessThanOrEqual(10);
+  });
+
+  test("no removal when the list holds no T3 app, and none when it would remove more than half", async () => {
+    await run(APPS);
+    const none = await run([app("other", "claude", { kind: "pin", identity: "x" }, "revoked")]);
+    expect(none.filter((i) => i.status === "removed")).toEqual([]);
+    expect(none.some((i) => /refused/.test(i.detail ?? ""))).toBe(true);
+    const half = await run([app("agents-claude", "claude", pool)]);
+    expect(half.filter((i) => i.status === "removed")).toEqual([]);
+    expect(Object.keys((await settings()).providerInstances)).toContain("t3-kimi-pool-acp");
+    expect((await run(APPS.slice(0, 5))).filter((i) => i.status === "removed").map((i) => i.id)).toEqual(["t3-zai-pool-acp"]);
+  });
+
+  test("check reports a codex login that differs from the token", async () => {
+    await run(APPS);
+    const auth = join(home, ".t3", "gateway", "codex-pool", "auth.json");
+    await writeFile(auth, "{}\n");
+    const items = await run(APPS, { check: true });
+    expect(items.find((i) => i.id === "codex-pool")?.status).toBe("updated");
+    expect(await readFile(auth, "utf8")).toBe("{}\n");
+  });
+});

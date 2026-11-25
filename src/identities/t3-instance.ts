@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { appTokenKey, readSecretsKey } from "../cli/gateway/secrets-file.ts";
@@ -51,6 +51,43 @@ export interface T3InstanceOptions {
   fetch?: (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
   check?: boolean;
   remove?: boolean;
+  /** An existing instance keeps its own display name and enabled flag (the sync sets them on create only). */
+  keepExisting?: boolean;
+  /** Changes go into this in-memory copy of settings.json; the caller writes it once with `flushSettingsBatch`. */
+  batch?: SettingsBatch;
+}
+
+/** An in-memory copy of settings.json shared by many instance writes, so one run makes one write and one backup. */
+export interface SettingsBatch {
+  text: string | undefined;
+  settings: Json;
+  /** Instance ids this run set or removed. Only these are merged into the file when it is flushed. */
+  dirty: Set<string>;
+}
+
+export async function loadSettingsBatch(settingsPath: string): Promise<SettingsBatch> {
+  const text = await readText(settingsPath);
+  const settings: Json = text === undefined ? {} : (obj(JSON.parse(text)) ?? (() => { throw new Error(`${settingsPath} is not a JSON object`); })());
+  return { text, settings, dirty: new Set() };
+}
+
+/**
+ * Writes the batch: re-reads settings.json now, applies only the instances this run touched, and writes once (atomic, one backup)
+ * when the result differs. Anything T3 or another tool changed since the batch was loaded stays. Returns the backup path.
+ */
+export async function flushSettingsBatch(settingsPath: string, batch: SettingsBatch, backupsDir: string, now: number): Promise<string | undefined> {
+  if (batch.dirty.size === 0) return undefined;
+  const text = await readText(settingsPath);
+  const fresh: Json = text === undefined ? {} : (obj(JSON.parse(text)) ?? (() => { throw new Error(`${settingsPath} is not a JSON object`); })());
+  const instances = { ...obj(fresh.providerInstances) };
+  const mine = obj(batch.settings.providerInstances) ?? {};
+  for (const id of batch.dirty) {
+    if (mine[id] === undefined) delete instances[id];
+    else instances[id] = mine[id];
+  }
+  if (stable(instances) === stable(obj(fresh.providerInstances) ?? {})) return undefined;
+  fresh.providerInstances = instances;
+  return writeSettings(settingsPath, text, fresh, backupsDir, now);
 }
 
 export interface T3InstanceResult {
@@ -185,6 +222,14 @@ interface Plan {
   onlyIfMissing?: boolean;
 }
 
+/** Keeps the newest `keep` settings backups of this tool and removes the older ones. */
+async function pruneBackups(dir: string, keep: number): Promise<void> {
+  const names = (await readdir(dir)).filter((n) => n.startsWith("settings.json.pre-t3-instance."));
+  const dated = await Promise.all(names.map(async (n) => ({ n, t: (await stat(join(dir, n))).mtimeMs })));
+  dated.sort((a, b) => b.t - a.t || (a.n < b.n ? 1 : -1));
+  for (const d of dated.slice(keep)) await rm(join(dir, d.n), { force: true });
+}
+
 async function backupSettings(backupsDir: string, before: string, now: number): Promise<string> {
   await mkdir(backupsDir, { recursive: true });
   const stem = join(backupsDir, `settings.json.pre-t3-instance.${Math.floor(now / 1000)}`);
@@ -192,6 +237,7 @@ async function backupSettings(backupsDir: string, before: string, now: number): 
   for (let n = 1; ; n++) {
     try {
       await writeFile(saved, before, { mode: 0o600, flag: "wx" });
+      await pruneBackups(backupsDir, 10);
       return saved;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST" || n > 100) throw err;
@@ -249,8 +295,9 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
   const check = opts.check === true;
   const now = (opts.now ?? Date.now)();
 
-  const beforeText = await readText(settingsPath);
-  const settings: Json = beforeText === undefined ? {} : (obj(JSON.parse(beforeText)) ?? (() => { throw new Error(`${settingsPath} is not a JSON object`); })());
+  const loaded = opts.batch ?? (await loadSettingsBatch(settingsPath));
+  const beforeText = loaded.text;
+  const settings: Json = loaded.settings;
   const instances = obj(settings.providerInstances) ?? {};
   const existing = obj(instances[opts.id]);
 
@@ -260,13 +307,18 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     if (check) return { status: "removed", changes, folder };
     delete instances[opts.id];
     settings.providerInstances = instances;
+    if (opts.batch) {
+      opts.batch.dirty.add(opts.id);
+      return { status: "removed", changes, folder };
+    }
     const backup = await writeSettings(settingsPath, beforeText, settings, backupsDir, now);
     return { status: "removed", changes, ...(backup ? { backup } : {}), folder };
   }
 
   const token = opts.token ?? (await readSecretsKey(appTokenKey(opts.app), opts.secretsPath));
   if (!token || !token.startsWith(GATEWAY_TOKEN_PREFIX)) throw new Error(`No gateway token (${GATEWAY_TOKEN_PREFIX}...) for app ${opts.app} in the secrets file`);
-  const displayName = opts.name ?? opts.id;
+  const displayName = opts.keepExisting && typeof existing?.displayName === "string" ? existing.displayName : (opts.name ?? opts.id);
+  const enabled = opts.keepExisting && existing && typeof existing.enabled === "boolean" ? existing.enabled : true;
   const models = opts.models ?? [];
   const plans: Plan[] = [{ path: join(folder, "token"), content: `${token}\n`, mode: 0o600, label: "token" }];
   let entry: Json;
@@ -282,7 +334,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     const config: Json = { ...obj(existing?.config), binaryPath, homePath: folder };
     if (models.length > 0) config.customModels = models;
     else delete config.customModels;
-    entry = { ...existing, driver: "claudeAgent", displayName, enabled: true, config };
+    entry = { ...existing, driver: "claudeAgent", displayName, enabled, config };
 
     const own = (await readJsonObject(join(folder, "settings.json"))) ?? {};
     const env = withDirectGateway(own, opts.gatewayUrl).env as Json;
@@ -318,7 +370,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
       ...existing,
       driver: "pi",
       displayName,
-      enabled: true,
+      enabled,
       environment: [{ name: "PI_CODING_AGENT_DIR", value: folder, sensitive: false }],
       config,
     };
@@ -351,7 +403,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
       ...existing,
       driver: "opencode",
       displayName,
-      enabled: true,
+      enabled,
       environment: [
         { name: "OPENCODE_CONFIG_DIR", value: folder, sensitive: false },
         { name: "XDG_DATA_HOME", value: folder, sensitive: false },
@@ -377,7 +429,7 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
       ...existing,
       driver: "grok",
       displayName,
-      enabled: true,
+      enabled,
       environment: [
         { name: "GROK_HOME", value: folder, sensitive: false },
         { name: "GROK_AUTH_PATH", value: join(folder, "cli-auth.json"), sensitive: false },
@@ -433,14 +485,15 @@ export async function applyT3Instance(opts: T3InstanceOptions): Promise<T3Instan
     }
     if (entryChanged) {
       settings.providerInstances = { ...instances, [opts.id]: entry };
-      backup = await writeSettings(settingsPath, beforeText, settings, backupsDir, now);
+      if (opts.batch) opts.batch.dirty.add(opts.id);
+      else backup = await writeSettings(settingsPath, beforeText, settings, backupsDir, now);
     }
   }
 
   let usage: UsageResult[] | undefined;
   // opencode: the usage writer reads the instance from settings.json and the folder opencode.json, so a check with
   // either still to be written has nothing to read yet; the changes list already reports it.
-  const usageReady = opts.driver === "grok" || (opts.driver === "opencode" && (!check || (toWrite.length === 0 && !entryChanged)));
+  const usageReady = !opts.batch && opts.driver === "grok" || (opts.driver === "opencode" && (!check || (toWrite.length === 0 && !entryChanged)));
   if (usageReady) {
     usage = (await syncT3UsageCredentials({ home, ...(opts.env ? { env: opts.env } : {}), ...(opts.secretsPath ? { secretsPath: opts.secretsPath } : {}), check })).filter((r) => r.id === opts.id);
     for (const r of usage) if (r.status === "updated") changes.push(`usage credential ${r.file}`);
