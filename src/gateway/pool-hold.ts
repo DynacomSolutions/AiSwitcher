@@ -62,7 +62,14 @@ export class PoolHoldGate {
     return true;
   }
   leave(bytes: number): void {
+    this.leaveHeld();
+    this.releaseBytes(bytes);
+  }
+  /** The request is no longer a hold (a replay serves it), but its body may still be in memory. */
+  leaveHeld(): void {
     this.held = Math.max(0, this.held - 1);
+  }
+  releaseBytes(bytes: number): void {
     this.bytes = Math.max(0, this.bytes - bytes);
   }
 }
@@ -185,9 +192,19 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
     if (done) return;
     done = true;
     input.drain?.removeEventListener("abort", onDrain);
-    input.gate.leave(input.bytes);
+    // A served hold stops counting as held at once, but its body stays in the byte count until the stream ends: the
+    // request closure keeps the body alive while the served stream runs, so the cap on held bytes stays true.
+    if (event === "served") input.gate.leaveHeld();
+    else input.gate.leave(input.bytes);
     input.onEvent?.(event);
   };
+  let bytesReleased = false;
+  const releaseServedBytes = (): void => {
+    if (bytesReleased || !served) return;
+    bytesReleased = true;
+    input.gate.releaseBytes(input.bytes);
+  };
+  let served = false;
   /** Ends the wait: the client went away or the gateway stops. A stream that is already served ends only when the client goes. */
   const waitSignal = input.drain ? AbortSignal.any([ctrl.signal, input.drain]) : ctrl.signal;
   /** Ends a replay that has not answered yet when the gateway stops. After the answer the served stream runs on. */
@@ -251,6 +268,12 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
             sinceCheck = 0;
             let res: Response;
             replaying = true;
+            // The pings go on while the replay is in flight: a replay may wait long for a member, and the client's idle
+            // watchdog must see data. This timer is real time, apart from the injected `sleep` that paces the hold loop.
+            let replayDone = false;
+            const pingTimer = setInterval(() => {
+              if (replayDone || waitSignal.aborted || !send(sse("ping", { type: "ping" }))) clearInterval(pingTimer);
+            }, input.limits.pingMs);
             try {
               res = await input.replay(AbortSignal.any([ctrl.signal, replayCtrl.signal]));
             } catch {
@@ -260,6 +283,8 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
               return end();
             } finally {
               replaying = false;
+              replayDone = true;
+              clearInterval(pingTimer);
             }
             if (input.drain?.aborted && !res.ok) {
               // The shutdown aborted the replay: the proxy turns that into an error answer. The loop top resets the stream.
@@ -273,23 +298,32 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
             }
             if (res.ok && res.body) {
               // The replay is the real answer: its body is the rest of the stream. Its end ends the hold.
+              served = true;
               finish("served");
               const note = replayNote(res.headers);
               if (note) send(note);
               const reader = res.body.getReader();
+              let gotChunk = false;
               ctrl.signal.addEventListener("abort", () => void reader.cancel().catch(() => undefined), { once: true });
               try {
                 for (;;) {
                   const r = await reader.read();
                   if (r.done) break;
+                  gotChunk = true;
                   if (!send(r.value)) {
                     await reader.cancel().catch(() => undefined);
                     break;
                   }
                 }
               } catch {
+                // No answer byte went out yet, or the gateway is stopping: a reset, which Claude Code retries as a stream.
+                if (!gotChunk || input.drain?.aborted) {
+                  releaseServedBytes();
+                  return reset();
+                }
                 send(sse("error", { type: "error", error: { type: "api_error", message: "upstream stream failed" } }));
               }
+              releaseServedBytes();
               return end();
             }
             send(sse("error", await errorEvent(res)));
@@ -298,6 +332,7 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
           }
         } catch {
           finish("failed");
+          releaseServedBytes();
           end();
         }
       })();
@@ -305,6 +340,7 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
     cancel() {
       ctrl.abort();
       finish("cancelled");
+      releaseServedBytes();
     },
   });
   return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" } });

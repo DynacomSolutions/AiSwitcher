@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { wantsStream } from "../../src/gateway/pool-hold.ts";
+import { PoolHoldGate, heldStreamResponse, wantsStream, type PoolHoldLimits } from "../../src/gateway/pool-hold.ts";
 import { createGatewayApp, type GatewayDeps } from "../../src/gateway/app.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { PrometheusMetrics, noopMetrics } from "../../src/gateway/metrics.ts";
@@ -354,6 +354,135 @@ describe("a full pool holds a streamed request until a member has room", () => {
     const res = await post(createGatewayApp(deps), "pool", token);
     expect(res.status).toBe(429);
     expect(Number(res.headers.get("retry-after"))).toBe(55);
+  });
+
+  test("a chunked original request: the replay reserves its real size from the body budget, not the 32 MiB cap", async () => {
+    const waiting: number[] = [];
+    deps.bodyBudgetBytes = 40 * 1024 * 1024;
+    deps.metrics = { ...deps.metrics, bodyBudgetWaiting: (n: number) => { waiting.push(n); } };
+    let open!: () => void;
+    const gate = new Promise<void>((r) => { open = r; });
+    deps.sleep = async (ms) => { await gate; sleeps.push(ms); clock += ms; };
+    const token = await add(mk("pool", { kind: "pool" }));
+    const gw = createGatewayApp(deps);
+    const chunked = (): Promise<Response> => {
+      const payload = new TextEncoder().encode(JSON.stringify({ model: "claude-opus-4", stream: true, messages: [] }));
+      const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(payload); c.close(); } });
+      return Promise.resolve(gw.request(new Request("http://gw.test/pool/v1/messages", {
+        method: "POST", body, duplex: "half",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "transfer-encoding": "chunked" },
+      } as RequestInit)));
+    };
+    const a = await chunked();
+    const b = await chunked();
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    waiting.length = 0; // only the replays count from here
+    open();
+    await Promise.all([a.text(), b.text()]);
+    // Two replays of 32 MiB would not fit in 40 MiB at once: one would queue. Real sizes (a few bytes) never queue.
+    expect(waiting.filter((n) => n > 0)).toEqual([]);
+  });
+});
+
+describe("a served hold, an unserved stream and the pings (unit)", () => {
+  const limits: PoolHoldLimits = { maxMs: 60_000, checkMs: 1, pingMs: 1, maxHeld: 10, maxBytes: 10_000 };
+  const input = (gate: PoolHoldGate, replay: () => Promise<Response>, drain?: AbortSignal) => ({
+    limits, gate, bytes: 1000, now: () => new Date(), sleep: async () => { await new Promise((r) => setTimeout(r, 1)); }, drain, replay, limitMessage: "limit",
+  });
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  /** A served answer that the test opens, feeds and closes by hand. */
+  const manual = () => {
+    let ctl!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({ start(c) { ctl = c; } });
+    return { res: new Response(body, { headers: { "content-type": "text/event-stream" } }), ctl };
+  };
+  const readUntil = async (r: { read(): Promise<{ done: boolean; value?: Uint8Array }> }, needle: string): Promise<string> => {
+    let text = "";
+    while (!text.includes(needle)) {
+      const x = await r.read();
+      if (x.done) break;
+      text += dec.decode(x.value);
+    }
+    return text;
+  };
+
+  test("F1: a served hold leaves the hold count at once, but its body stays in the byte count until the stream ends", async () => {
+    const gate = new PoolHoldGate(limits);
+    expect(gate.tryEnter(1000)).toBe(true);
+    const m = manual();
+    const res = heldStreamResponse(input(gate, async () => m.res));
+    const reader = res.body!.getReader();
+    m.ctl.enqueue(enc.encode("event: message_start\ndata: {}\n\n"));
+    await readUntil(reader, "message_start");
+    expect(gate.held).toBe(0);
+    expect(gate.bytes).toBe(1000); // old code: 0 here, while the body is still in memory
+    m.ctl.close();
+    while (!(await reader.read()).done);
+    expect(gate.bytes).toBe(0);
+  });
+
+  test("F1: a client that leaves a served stream frees its bytes", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    const m = manual();
+    const res = heldStreamResponse(input(gate, async () => m.res));
+    const reader = res.body!.getReader();
+    m.ctl.enqueue(enc.encode("event: message_start\ndata: {}\n\n"));
+    await readUntil(reader, "message_start");
+    expect(gate.bytes).toBe(1000);
+    await reader.cancel();
+    expect(gate.bytes).toBe(0);
+  });
+
+  test("F4: a served answer that fails before its first event resets the stream, no SSE error event", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    const failing = new Response(new ReadableStream<Uint8Array>({ pull() { throw new Error("upstream gone"); } }), { headers: { "content-type": "text/event-stream" } });
+    const reader = heldStreamResponse(input(gate, async () => failing)).body!.getReader();
+    let text = "";
+    let err: unknown;
+    try {
+      text = await readUntil(reader, "never");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(text).not.toContain("event: error");
+    expect(gate.bytes).toBe(0);
+  });
+
+  test("F4: a served answer that fails after an event still ends with the SSE error event", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    const m = manual();
+    const reader = heldStreamResponse(input(gate, async () => m.res)).body!.getReader();
+    m.ctl.enqueue(enc.encode("event: message_start\ndata: {}\n\n"));
+    await readUntil(reader, "message_start");
+    m.ctl.error(new Error("cut"));
+    expect(await readUntil(reader, "event: error")).toContain("upstream stream failed");
+  });
+
+  test("F5: pings continue while a replay is in flight", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    let finish!: () => void;
+    const slow = new Promise<Response>((resolve) => {
+      finish = () => resolve(new Response('event: message_start\ndata: {}\n\n', { headers: { "content-type": "text/event-stream" } }));
+    });
+    const reader = heldStreamResponse(input(gate, () => slow)).body!.getReader();
+    // The replay waits (a scaled stand-in for 60 s: 60 ping steps of 1 ms); pings must keep coming meanwhile.
+    let pings = 0;
+    const started = Date.now();
+    while (pings < 15 && Date.now() - started < 5000) {
+      const x = await reader.read();
+      if (x.done) break;
+      pings += (dec.decode(x.value).match(/event: ping/g) ?? []).length;
+    }
+    expect(pings).toBeGreaterThanOrEqual(15);
+    finish();
+    expect(await readUntil(reader, "message_start")).toContain("message_start");
   });
 });
 
