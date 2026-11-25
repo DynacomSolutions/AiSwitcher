@@ -500,16 +500,22 @@ received SIGTERM first, so something outside the agent stopped its process group
 got a signal first, and `Last agent output: <last five stderr lines>` (redacted) when the agent wrote to stderr. The
 message stays under 4096 characters. The agent's stderr still goes to the client's stderr unchanged. A prompt the agent
 already answered is never answered again. When the relay gets SIGTERM, SIGINT or SIGHUP it forwards the signal to the
-agent and waits up to 3 seconds (`SIGNAL_GRACE_MS`) for it to end. An agent that does not end is killed, and the open
-prompts are answered the same way.
+agent's process group (the agent runs in its own group, so what it started gets the signal too) and waits up to 3 seconds
+(`SIGNAL_GRACE_MS`) for it to end. An agent that does not end is killed with its group, and the open prompts are answered
+the same way. The relay acts on the agent's exit, not on the close of its streams: after the exit it waits at most 500 ms
+(`STDOUT_DRAIN_MS`) for the rest of stdout and never for stderr, so a helper process that holds a pipe cannot keep it
+waiting. No agent line follows the error answer. If the relay itself is killed without a chance to forward, the agent sees
+its stdin close, and a stop of the relay's systemd scope still kills the whole group.
 
 ZCode is not a registry agent. Its provider instance has `source: "local"` and a `commandPath` that names a launcher
 script (it exports `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` and starts the ZCode ACP server). `ais gateway t3-acp` moves that
-instance behind the relay too: it writes `~/.ais/t3/acp/zcode`, which records the original launcher (`ORIGINAL=`) and
-starts `ais __acp_relay zcode --fallback=<original launcher>`, or the original launcher directly when `ais` is missing or
-has no relay. `__acp_relay zcode` has no agent adapter: it passes every line through and adds only the error above. The
+instance behind the relay too: it writes `~/.ais/t3/acp/zcode-<hash of the original path>`, one launcher per original
+launcher (two ZCode instances with different launchers never share one). It records the original launcher (`ORIGINAL=`)
+and starts `ais __acp_relay zcode --binary=<original launcher>` (probed with `--supported=binary`, so a T3 install record
+never wins over the launcher that exports the config), or the original launcher directly when `ais` is missing or has no
+relay. `__acp_relay zcode` has no agent adapter: it passes every line through and adds only the error above. The
 model-list sync (`src/identities/t3-gateway-models.ts`) follows the recorded original launcher to find
-`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, so it keeps working. `--remove` puts the original launcher back as `commandPath`.
+`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, so it keeps working. `--remove` puts each original launcher back as `commandPath`.
 A re-run changes nothing.
 
 How it is installed: one launcher per agent in `~/.ais/t3/acp/<agentId>`, set as the "Executable override"
