@@ -458,7 +458,7 @@ ETA: 2026-12-12 18:00 ICT
 | 307 | Cluster: watchdog rules, metrics, Headlamp row | done | claude | | 20.303, 20.299 | | .cluster PR 3306 merged.<br>Alerts gated on the shipper flag, plus a restart-loop rule. |
 | 308 | Console reader from the database | done | claude | sessions-console-reader | 20.301, 20.302, 20.306 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/785 (9e06016).<br>AIS_SESSIONS_SOURCE switch, default files.<br>Two Opus reviews, all faults fixed.<br>Identity resolution still open: rows show as (unassigned). |
 | 309 | Equivalence test and performance proof | done | claude | sessions-equivalence-perf | 20.308 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/800 (8b49f78), Opus review passed.<br>CI tree p95 177 ms, tail warm 54 ms, cold 131 ms.<br>Shipped sessions equal to the host files. |
-| 310 | Backfill per node with verification | in_progress | claude | sessions-backfill | 20.305, 20.307 | 2026-11-26 12:00 ICT | Four smaller nodes shipped and verified.<br>The two largest nodes wait for the object store gate: 24 h stable, peak under 60%.<br>Gate re-check 2026-11-26 01:06 ICT. |
+| 310 | Backfill per node with verification | blocked | claude | sessions-backfill | 20.305, 20.307 | | Four smaller nodes shipped and verified.<br>Gate check 26 Nov 01:10 ICT failed: object store OOM kill on 25 Nov 23:14 ICT, peak 2.0 of 2 GiB.<br>Store memory grows about 0.1 GiB per hour; owner decides the fix.<br>Next check 26 Nov 23:30 ICT. |
 | 311 | Reconcile drill and verify-host command | todo | | | 20.310 | | |
 | 312 | Cut over Claude and Codex to the database | todo | | | 20.309, 20.310 | | |
 | 313 | Pi, Grok and Kimi sessions in the database | todo | | | 20.312 | | |
