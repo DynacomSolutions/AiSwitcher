@@ -15,8 +15,10 @@ import { resolveHerdrBinary } from "../../shared/herdr-bin.ts";
 import { installSwapHook, removeSwapHook } from "../../identities/claude-swap-hook.ts";
 import { ensureClaudeTranscriptRetention } from "../../identities/claude-settings.ts";
 import { expandPath, isValidIdentityKey, translateHostPath } from "../../identities/match.ts";
-import { loadIdentitiesFile, saveIdentitiesFile } from "../../identities/store.ts";
+import { findIdentityByNameOrAlias, loadIdentitiesFile, saveIdentitiesFile } from "../../identities/store.ts";
+import { isRetired } from "../../identities/retired.ts";
 import {
+  allowedAccounts,
   DEFAULT_SWAP_THRESHOLD_PERCENT,
   memberIdentity,
   poolsOf,
@@ -278,9 +280,16 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
           else delete pool.swapPool.disallowed;
           // A record-only pool must never keep a disallowed member as active: move it to the first allowed one.
           if (isRecordOnlyTool(tool) && pool.swapPool.active !== undefined && set.has(pool.swapPool.active)) {
-            const next = pool.swapPool.accounts.find((n) => !set.has(n));
+            const next = pool.swapPool.accounts.find((n) => {
+              if (set.has(n)) return false;
+              const m = findIdentityByNameOrAlias(file.identities, n);
+              return m !== undefined && !isRetired(m);
+            });
             if (next) pool.swapPool.active = next;
             else delete pool.swapPool.active;
+          }
+          if (isRecordOnlyTool(tool) && allowedAccounts(pool).filter((n) => { const m = findIdentityByNameOrAlias(file.identities, n); return m !== undefined && !isRetired(m); }).length === 0) {
+            log(yellow(`  pool ${pool.name} now has no allowed member: the gateway ${tool} pool is empty until you run "${cmd} allow <account>"`));
           }
           return `${member.name} is ${sub === "allow" ? "allowed" : "not allowed"} in pool ${pool.name}`;
         });
@@ -295,6 +304,7 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
         if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 1 || threshold > 100)) {
           throw new CliUsageError("--threshold must be a number from 1 to 100");
         }
+        if (isRecordOnlyTool(tool) && mode === "on") throw new CliUsageError(`${tool} pools are record-only: there is no credential to swap, so auto swap is not available.`);
         const msg = await mutatePool(config, deps, poolFlag, (_file, pool) => {
           pool.swapPool.auto = mode === "on";
           if (threshold !== undefined) pool.swapPool.thresholdPercent = threshold;

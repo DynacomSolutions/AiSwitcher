@@ -5,6 +5,11 @@ import { join } from "node:path";
 import { runSwapCommand } from "../../src/cli/swap/dispatch.ts";
 import { adapterFor } from "../../src/identities/pool/registry.ts";
 import { appPoolMemberNames } from "../../src/gateway/serve.ts";
+import { collectLimitTargets } from "../../src/cli/limits/collect.ts";
+import { UnknownPoolError } from "../../src/identities/errors.ts";
+import { resolveIdentity } from "../../src/identities/resolve.ts";
+import { GROK_CONFIG } from "../../src/identities/tool-configs.ts";
+import { deleteIdentity } from "../../src/cli/identities/actions.ts";
 import { requirePool } from "../../src/identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../../src/identities/store.ts";
 
@@ -63,6 +68,44 @@ for (const tool of ["grok", "opencode", "zai"] as const) {
       expect(requirePool(file, undefined, tool).swapPool.active).toBeUndefined();
       expect(appPoolMemberNames(file)).toEqual([]);
       await expect(swap(["to", "a"], { force: true })).rejects.toThrow(/not allowed/);
+    });
+
+    test("disallow skips a retired or missing member when it moves active; clears active when none is left", async () => {
+      await writeFile(registry, JSON.stringify({ version: 1, identities: [
+        { name: "a", label: "a", configDir: join(root, "a") },
+        { name: "b", label: "b", configDir: join(root, "b"), retired: true },
+        { name: "c", label: "c", configDir: join(root, "c") },
+      ] }));
+      await swap(["pool", "create", "tri"], { accounts: "a,c", "config-dir": join(root, "tri") });
+      const file = await loadIdentitiesFile(registry);
+      file.identities.find((i) => i.name === "tri")!.swapPool!.accounts = ["a", "b", "ghost", "c"];
+      await writeFile(registry, JSON.stringify(file));
+      await swap(["disallow", "a"]);
+      expect(requirePool(await loadIdentitiesFile(registry), undefined, tool).swapPool.active).toBe("c");
+      out = [];
+      await swap(["disallow", "c"]);
+      expect(requirePool(await loadIdentitiesFile(registry), undefined, tool).swapPool.active).toBeUndefined();
+      expect(out.join("\n")).toMatch(/no allowed member/);
+    });
+
+    test("deleting the pool record (the documented undo) gives the gateway every login again", async () => {
+      await swap(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") });
+      const file = await loadIdentitiesFile(registry);
+      expect(appPoolMemberNames(file)).toEqual(["a", "b"]);
+      deleteIdentity(file, "shared");
+      expect(appPoolMemberNames(file)).toEqual(["a", "b", "c"]);
+    });
+
+    test("auto on is refused for a record-only pool", async () => {
+      await swap(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") });
+      await expect(swap(["auto", "on"])).rejects.toThrow(/record-only/);
+    });
+
+    test("a record pool is skipped by limits targets and refused by --pool", async () => {
+      await swap(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") });
+      const cfg = { ...GROK_CONFIG, toolName: tool, identitiesJsonPath: registry };
+      expect((await collectLimitTargets(undefined, {}, [cfg])).map((t) => t.identity.name)).toEqual(["a", "b", "c"]);
+      await expect(resolveIdentity(cfg, { explicitPoolFlag: "shared", cwd: root, env: {} } as never)).rejects.toBeInstanceOf(UnknownPoolError);
     });
 
     test("disallowing the active member moves active to the first allowed member", async () => {

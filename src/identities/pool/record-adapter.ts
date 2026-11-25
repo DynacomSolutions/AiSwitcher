@@ -9,8 +9,8 @@ import type { PoolAdapter, PoolUsage } from "./adapter.ts";
  * These tools keep a static key or login per identity and have no OAuth refresh, so there is no credential file to move
  * into a pool folder. A pool of such a tool is a registry record only: its members, `active` marker and `disallowed`
  * list. The gateway reads that record to choose which logins a pool app may use (`appPoolMemberNames`); without a record
- * it uses every login that is not retired. `active` is the recorded member and the first one the gateway tries. A swap
- * only changes the record and the ledger.
+ * it uses every login that is not retired. The gateway does not read `active` for these tools: every allowed member is equal. `active` is a recorded marker only (shown by status),
+ * kept on an allowed, existing, non-retired member. A swap only changes the record and the ledger.
  *
  * They are deliberately NOT in the generic adapter registry (registry.ts): the launch picker, the `--pool` flag and the
  * auto-swap scheduler treat a registered tool as one that has a real pool folder, and these have none.

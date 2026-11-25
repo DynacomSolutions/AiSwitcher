@@ -188,7 +188,7 @@ export const HELP: Record<string, HelpNode> = {
       next: sub("ais swap <tool> next [--if-limited] [--pool=]", "Swap to the member with most headroom"),
       "allow|disallow": sub("ais swap <tool> allow|disallow <account>", "Edit the allowed accounts"),
       auto: sub("ais swap <tool> auto on|off [--threshold=95]", "Automatic swap near the limit"),
-      pool: sub("ais swap <tool> pool create <name> --accounts=a,b [--config-dir=]", "Create a pool identity"),
+      pool: sub("ais swap <tool> pool create <name> --accounts=a,b [--config-dir=]", "Create a pool identity (grok, opencode, zai: a record only, one account is enough; undo it with: ais identities delete <pool-name> --tool=<tool> --yes, then the gateway uses every login again; never retire it, that leaves no member)"),
       hook: sub("ais swap claude hook on|off [--pool=]", "Optional StopFailure rate-limit hook (claude only)"),
       usage: sub("ais swap <tool> usage [--json] [--scan]", "Per-member usage split (claude, codex); claude --json reads the collector snapshot, --scan forces a live scan"),
     },
