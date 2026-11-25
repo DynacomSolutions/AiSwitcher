@@ -108,7 +108,10 @@ function PoolCard({ pool }: { pool: PoolSummary }) {
                 <div className="col-span-3 space-y-0.5 text-xs text-muted-foreground">
                   {m.worstResetsAtMs !== undefined ? (
                     <div>
-                      Resets {formatResetTimes(m.worstResetsAtMs)} · <ResetCountdown ms={m.worstResetsAtMs} />
+                      {/* A non-breaking space binds the separator to the times, so a wrapped line never starts with it. */}
+                      Resets {formatResetTimes(m.worstResetsAtMs)}
+                      {"\u00a0· "}
+                      <ResetCountdown ms={m.worstResetsAtMs} />
                     </div>
                   ) : null}
                   {m.extraUsage ? <div>{creditsNote(m.extraUsage)}</div> : null}
