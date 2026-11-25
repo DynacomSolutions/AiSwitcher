@@ -397,13 +397,21 @@ min 5) controls staleness tolerance. Concurrent identical requests share one
 upstream fetch.
 
 A row carries `plan` (short display label, e.g. `"Max 20x"`, `"Pro"`,
-`"Team"`, `"Plus"`, `"Standard"`, `"Max"`, `"Go"`) only when real wire data
-names the account plan: claude's profile plan (type and rate-limit tier),
-codex's `planType`, kimi's `user.membership.level`, zai's quota `data.level`,
-or an active OpenCode Go quota read. Grok and ali expose no plan on their
-wires, so their rows never carry one. An absent `plan` means the provider
-exposes no plan or it could not be read; clients render nothing then, never
-a guessed label.
+`"Team"`, `"Plus"`, `"Standard"`, `"Max"`, `"Go"`, `"Promax"`) only when
+real wire data names the account plan: claude's profile plan (type and
+rate-limit tier), codex's `planType`, kimi's `user.membership.level`, zai's
+quota `data.level`, or an active OpenCode Go quota read. Grok and ali expose
+no plan on their wires, so their rows never carry one.
+
+Codex maps its `planType` in three steps. A known name keeps its short
+label (`"Plus"`, `"Pro"`, `"Team"`, `"Enterprise"`, `"Free"`, `"Go"`). Any
+other non-empty value shows the words of the wire in title case, split on
+`_` and on whitespace: `promax` gives `"Promax"` and
+`self_serve_business_prolite` gives `"Self Serve Business Prolite"`. A
+placeholder value (`unknown`, `none`, `null`, `n/a` and `-`, in any case,
+with the outer spaces removed) gives no `plan`. No label is ever invented.
+An absent `plan` means that the provider exposes no plan, or that the plan
+could not be read. Clients render nothing then, never a guessed label.
 
 When the gateway admin API is configured (`AIS_GATEWAY_ADMIN_URL` and
 `AIS_GATEWAY_ADMIN_TOKEN`), the cluster gateway is the source of truth for
