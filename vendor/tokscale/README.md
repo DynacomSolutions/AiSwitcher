@@ -157,9 +157,12 @@ The patches add these AIS-only surfaces:
   old. A truncated, rotated or replaced log, new subagent evidence, a
   referenced session that changed or appeared, or any mismatch with the cached
   entry falls back to the full parse. A complete row without a timestamp takes
-  the log's mtime, which changes with every append, and a log with no
-  messages leaves no cache entry to resume from. Such a log is parsed in full
-  on every scan.
+  the log's mtime, which changes with every append, so a log with such a
+  message row is parsed in full. Rows that are not messages (startup, auth,
+  billing) never take the mtime and never block the resume. A log with no
+  messages caches an empty entry (message count 0) next to its checkpoint,
+  so it resumes like any other log and reads only its new bytes. An unchanged
+  log of this kind is served from the entry and is not read.
   The prefix digest is sampled: a rewrite of the bytes between the two 64 KiB
   windows that keeps the length is not detected. Grok only appends to this log,
   so a scan accepts that risk, as the Claude and Codex sections do for their

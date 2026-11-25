@@ -1,8 +1,60 @@
 diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
-index f976489..4bd8499 100644
+index f976489..0d72f16 100644
 --- a/crates/tokscale-core/src/lib.rs
 +++ b/crates/tokscale-core/src/lib.rs
-@@ -3477,13 +3477,41 @@ fn parse_all_messages_streaming<S: MessageSink>(
+@@ -1884,6 +1884,11 @@ fn parse_all_messages_streaming<S: MessageSink>(
+         ) -> Option<message_cache::FingerprintStatus>,
+     {
+         let mut cached = source_cache.take(identity, path);
++        // AIS: a Grok unified log with no message rows still caches an empty
++        // entry, so a grown log resumes from its checkpoint (message count 0)
++        // and an unchanged one is served from the entry without a read.
++        let keep_empty = resume.is_some()
++            && identity == message_cache::CacheIdentity::for_client(ClientId::Grok);
+         // An entry written before retention provenance existed cannot say
+         // which of its rows the live transcript already dropped, so serving it
+         // warm presents a retained copy of a response as a live one — and the
+@@ -1933,12 +1938,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
+             };
+         };
+ 
++        let fingerprint_unchanged = matches!(
++            fingerprint_status,
++            message_cache::FingerprintStatus::Unchanged
++        );
+         let fingerprint = match fingerprint_status {
+             message_cache::FingerprintStatus::Unchanged => {
+                 let Some(entry) = cached.take() else {
+                     unreachable!("an uncached source always builds a complete fingerprint")
+                 };
+-                if !rebuild_retention_provenance && !entry.messages.is_empty() {
++                if !rebuild_retention_provenance && (!entry.messages.is_empty() || keep_empty) {
+                     let retained_message_keys = entry.retained_message_keys();
+                     return CachedParseOutcome {
+                         messages: cached_messages(entry, pricing),
+@@ -1957,7 +1966,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
+         if let Some(entry) = cached.take() {
+             if !rebuild_retention_provenance
+                 && entry.fingerprint == fingerprint
+-                && !entry.messages.is_empty()
++                && (!entry.messages.is_empty() || keep_empty)
+             {
+                 let retained_message_keys = entry.retained_message_keys();
+                 return CachedParseOutcome {
+@@ -2032,7 +2041,11 @@ fn parse_all_messages_streaming<S: MessageSink>(
+                 }
+             }
+         }
+-        let cache_entry = if messages.is_empty() || !cacheable {
++        // An empty result that resumed an unchanged empty entry has nothing to
++        // write back.
++        let empty_entry_kept = keep_empty && messages.is_empty() && fingerprint_unchanged;
++        let cache_entry = if (messages.is_empty() && !keep_empty) || empty_entry_kept || !cacheable
++        {
+             None
+         } else {
+             Some(match history {
+@@ -3477,13 +3490,41 @@ fn parse_all_messages_streaming<S: MessageSink>(
              // Use a Grok-aware fingerprint: legacy output depends on session
              // sidecars, while unified output reads metadata across the complete
              // sessions tree; all of those inputs must invalidate cached output.
@@ -46,7 +98,7 @@ index f976489..4bd8499 100644
              )
          })
          .collect();
-@@ -15294,8 +15322,8 @@ mod tests {
+@@ -15294,8 +15335,8 @@ mod tests {
              assert!(parsed(), "{label}: grown log must re-parse");
              assert_eq!(
                  metadata_reads(),
@@ -57,7 +109,7 @@ index f976489..4bd8499 100644
              );
              drop(env);
              assert_eq!(after_append, cold(home.path()), "{label}: append");
-@@ -15347,6 +15375,263 @@ mod tests {
+@@ -15347,6 +15388,427 @@ mod tests {
          }
      }
  
@@ -316,6 +368,170 @@ index f976489..4bd8499 100644
 +            read * 3 < full_read,
 +            "read {read} bytes, a full read is {full_read}"
 +        );
++    }
++
++    /// Startup, auth and billing rows: no message, and some without a timestamp.
++    fn ais_grok_quiet_row(index: u32) -> String {
++        match index % 4 {
++            0 => format!("{{\"ts\":\"2026-11-01T00:00:00Z\",\"pid\":11,\"msg\":\"startup\",\"ctx\":{{\"n\":{index}}}}}\n"),
++            1 => format!("{{\"pid\":11,\"msg\":\"auth token refreshed\",\"ctx\":{{\"n\":{index}}}}}\n"),
++            2 => format!("{{\"ts\":\"2026-11-01T00:00:01Z\",\"pid\":11,\"msg\":\"billing balance\",\"ctx\":{{\"n\":{index}}}}}\n"),
++            _ => format!("not json {index}\n"),
++        }
++    }
++
++    /// A log with no message rows resumes from its checkpoint like any other:
++    /// it reads only the appended bytes, an unchanged log reads none, a first
++    /// message row gives the totals of a cold read, and a truncated log falls
++    /// back to the full parse.
++    #[test]
++    #[serial_test::serial]
++    fn ais_grok_incremental_log_without_messages_reads_only_new_bytes() {
++        use sessions::grok::GROK_UNIFIED_BYTES_READ as GROK_BYTES;
++        use std::sync::atomic::Ordering;
++        let cache_home = tempfile::TempDir::new().unwrap();
++        let home = tempfile::TempDir::new().unwrap();
++        let sessions = home.path().join(".grok/sessions/%2Ftmp%2Fa");
++        ais_grok_session(&sessions.join("s1"), "grok-code", None);
++        ais_grok_session(&sessions.join("s2"), "grok-4", None);
++        let logs = home.path().join(".grok/logs");
++        std::fs::create_dir_all(&logs).unwrap();
++        let unified = logs.join("unified.jsonl");
++        let scan = |home: &std::path::Path| {
++            ais_grok_rows(&parse_all_messages_with_pricing_with_env_strategy(
++                home.to_str().unwrap(),
++                &["grok".to_string()],
++                None,
++                false,
++                &scanner::ScannerSettings::default(),
++            ))
++        };
++        let cold = |home: &std::path::Path| {
++            let fresh_cache = tempfile::TempDir::new().unwrap();
++            let _env = redirect_cache_home(fresh_cache.path());
++            scan(home)
++        };
++        let tick = || std::thread::sleep(std::time::Duration::from_millis(30));
++        let mut next = 0u32;
++        let mut quiet = |rows: u32| {
++            (0..rows)
++                .map(|_| {
++                    next += 1;
++                    ais_grok_quiet_row(next)
++                })
++                .collect::<String>()
++        };
++        std::fs::write(&unified, quiet(80000)).unwrap();
++
++        let env = redirect_cache_home(cache_home.path());
++        let before = GROK_BYTES.load(Ordering::Relaxed);
++        assert!(scan(home.path()).is_empty());
++        let full_read = GROK_BYTES.load(Ordering::Relaxed) - before;
++        assert!(full_read > 0);
++        drop(env);
++
++        // Nothing changed: the log is not read again.
++        tick();
++        let env = redirect_cache_home(cache_home.path());
++        let before = GROK_BYTES.load(Ordering::Relaxed);
++        assert!(scan(home.path()).is_empty());
++        let unchanged_read = GROK_BYTES.load(Ordering::Relaxed) - before;
++        drop(env);
++        assert_eq!(unchanged_read, 0, "an unchanged log is not read again");
++
++        // Appended chunks of rows with no message: only the new bytes.
++        for round in 0..3 {
++            tick();
++            ais_incremental_append(&unified, &quiet(5));
++            let env = redirect_cache_home(cache_home.path());
++            let before = GROK_BYTES.load(Ordering::Relaxed);
++            let warm = scan(home.path());
++            let read = GROK_BYTES.load(Ordering::Relaxed) - before;
++            drop(env);
++            assert!(warm.is_empty());
++            assert!(
++                read * 8 < full_read,
++                "round {round}: read {read} bytes, a full read is {full_read}"
++            );
++            eprintln!("AIS_GROK_EMPTY full_read={full_read} incremental_read={read}");
++        }
++
++        // The first message row: the totals of a cold read.
++        tick();
++        ais_incremental_append(&unified, &quiet(3));
++        ais_incremental_append(&unified, &ais_grok_row(0));
++        let env = redirect_cache_home(cache_home.path());
++        let first_message = scan(home.path());
++        drop(env);
++        assert_eq!(first_message.len(), 1);
++        assert_eq!(first_message, cold(home.path()), "first message row");
++        tick();
++        ais_incremental_append(&unified, &quiet(4));
++        ais_incremental_append(&unified, &ais_grok_row(1));
++        let env = redirect_cache_home(cache_home.path());
++        let before = GROK_BYTES.load(Ordering::Relaxed);
++        let after_message = scan(home.path());
++        let read = GROK_BYTES.load(Ordering::Relaxed) - before;
++        drop(env);
++        assert_eq!(after_message.len(), 2);
++        assert_eq!(after_message, cold(home.path()), "after the first message");
++        assert!(
++            read * 8 < full_read,
++            "read {read} bytes, a full read is {full_read}"
++        );
++
++        // A truncated log falls back to the full parse and is empty again.
++        tick();
++        std::fs::write(&unified, quiet(50)).unwrap();
++        let env = redirect_cache_home(cache_home.path());
++        let truncated = scan(home.path());
++        drop(env);
++        assert!(truncated.is_empty());
++        assert_eq!(truncated, cold(home.path()), "truncated");
++    }
++
++    /// A truncated or replaced log that held no messages is read in full.
++    #[test]
++    #[serial_test::serial]
++    fn ais_grok_incremental_empty_log_truncated_falls_back_to_full_read() {
++        use sessions::grok::GROK_UNIFIED_BYTES_READ as GROK_BYTES;
++        use std::sync::atomic::Ordering;
++        let cache_home = tempfile::TempDir::new().unwrap();
++        let home = tempfile::TempDir::new().unwrap();
++        let logs = home.path().join(".grok/logs");
++        std::fs::create_dir_all(&logs).unwrap();
++        let unified = logs.join("unified.jsonl");
++        let scan = |home: &std::path::Path| {
++            ais_grok_rows(&parse_all_messages_with_pricing_with_env_strategy(
++                home.to_str().unwrap(),
++                &["grok".to_string()],
++                None,
++                false,
++                &scanner::ScannerSettings::default(),
++            ))
++        };
++        let text = |from: u32, to: u32| (from..to).map(ais_grok_quiet_row).collect::<String>();
++        std::fs::write(&unified, text(0, 4000)).unwrap();
++        let env = redirect_cache_home(cache_home.path());
++        scan(home.path());
++        drop(env);
++        for (label, contents) in [
++            ("truncated", text(0, 300)),
++            ("replaced", text(10000, 14500)),
++        ] {
++            std::thread::sleep(std::time::Duration::from_millis(30));
++            std::fs::write(&unified, &contents).unwrap();
++            let env = redirect_cache_home(cache_home.path());
++            let before = GROK_BYTES.load(Ordering::Relaxed);
++            assert!(scan(home.path()).is_empty());
++            let read = GROK_BYTES.load(Ordering::Relaxed) - before;
++            drop(env);
++            assert!(
++                read >= contents.len() as u64,
++                "{label}: read {read} bytes of {}",
++                contents.len()
++            );
++        }
 +    }
 +
      #[test]
