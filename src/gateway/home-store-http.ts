@@ -63,7 +63,7 @@ export class StoreApi {
     try {
       res = await this.doFetch(`${this.base}${path}`, {
         method,
-        headers: { authorization: `Bearer ${this.opts.token}`, "content-type": "application/json" },
+        headers: { authorization: `Bearer ${this.opts.token}`, "content-type": "application/json", "x-ais-store-refusals": "1" },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       });

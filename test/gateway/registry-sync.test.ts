@@ -162,13 +162,13 @@ describe("a registry file that moved on the host", () => {
 
   test("a host deletion with a tombstone reaches the store, and a tombstoned store entry is dropped in a merge", async () => {
     const { home, store } = await inStep();
-    const gone = `${JSON.stringify({ version: 1, identities: [ident("pool-main", { swapPool: { accounts: ["alpha"], active: "alpha" } })], deleted: ["alpha"] }, null, 2)}\n`;
+    const gone = `${JSON.stringify({ version: 1, identities: [ident("pool-main", { swapPool: { accounts: ["alpha"], active: "alpha" } })], deleted: [{ name: "alpha", at: 1 }] }, null, 2)}\n`;
     await put(home, REG, gone);
     await sync(home, store);
     expect(namesOf(store.text(REG))).toEqual(["pool-main"]);
-    const merged = JSON.parse(mergeRegistries(gone, registry(["alpha", "extra"]))!.toString()) as { identities: Array<{ name: string }>; deleted: string[] };
+    const merged = JSON.parse(mergeRegistries(gone, registry(["alpha", "extra"]))!.toString()) as { identities: Array<{ name: string }>; deleted: Array<{ name: string; at: number }> };
     expect(merged.identities.map((i) => i.name)).toEqual(["pool-main", "extra"]);
-    expect(merged.deleted).toEqual(["alpha"]);
+    expect(merged.deleted).toEqual([{ name: "alpha", at: 1 }]);
   });
 
   test("droppedIdentities: a non-registry text over a populated registry counts as dropping every name", () => {
@@ -279,10 +279,73 @@ describe("ais identities delete", () => {
     const { deleteIdentity, retireIdentity } = await import("../../src/cli/identities/actions.ts");
     const file = JSON.parse(registry(["alpha", "beta"]));
     deleteIdentity(file, "alpha");
-    expect(file.deleted).toEqual(["alpha"]);
+    expect(file.deleted?.map((t: { name: string }) => t.name)).toEqual(["alpha"]);
     expect(file.identities.map((i: { name: string }) => i.name)).toEqual(["pool-main", "beta"]);
     retireIdentity(file, "beta", new Date("2026-11-25T00:00:00Z"));
     expect(file.identities.some((i: { name: string }) => i.name === "beta")).toBe(true);
-    expect(file.deleted).toEqual(["alpha"]);
+    expect(file.deleted?.map((t: { name: string }) => t.name)).toEqual(["alpha"]);
+  });
+});
+
+describe("tombstones with times", () => {
+  const dated = (name: string, addedAt?: number, extra: Record<string, unknown> = {}) => ({ ...ident(name, extra), ...(addedAt !== undefined ? { addedAt } : {}) });
+  const regOf = (ids: unknown[], deleted?: unknown[]) => `${JSON.stringify({ version: 1, identities: ids, ...(deleted ? { deleted } : {}) }, null, 2)}\n`;
+  const merge = (host: string, store: string) => JSON.parse(mergeRegistries(host, store)!.toString()) as { identities: Array<{ name: string; label: string }>; deleted?: Array<{ name: string; at: number }> };
+
+  test("createIdentity stamps addedAt and clears the name's tombstone", async () => {
+    const { createIdentity } = await import("../../src/cli/identities/actions.ts");
+    const file = { version: 1 as const, identities: [], deleted: [{ name: "alpha", at: 5 }, { name: "other", at: 5 }] };
+    const id = createIdentity(file, { name: "alpha", label: "alpha", configDir: "~/x/alpha" });
+    expect(typeof id.addedAt).toBe("number");
+    expect(file.deleted).toEqual([{ name: "other", at: 5 }]);
+  });
+
+  test("an add newer than the delete beats it, in the merge and in droppedIdentities", () => {
+    const store = regOf([dated("a", 10), dated("b", 20)]);
+    const host = regOf([dated("a", 10)], [{ name: "b", at: 15 }]);
+    expect(merge(host, store).identities.map((i) => i.name)).toEqual(["a", "b"]);
+    expect(droppedIdentities(host, store)).toEqual(["b"]);
+    const older = regOf([dated("a", 10)], [{ name: "b", at: 25 }]);
+    expect(merge(older, store).identities.map((i) => i.name)).toEqual(["a"]);
+    expect(droppedIdentities(older, store)).toEqual([]);
+  });
+
+  test("the old name-only form still reads as a tombstone for an entry without addedAt", () => {
+    const store = regOf([dated("a"), dated("b")]);
+    const host = regOf([dated("a")], ["b"]);
+    expect(merge(host, store).identities.map((i) => i.name)).toEqual(["a"]);
+    expect(droppedIdentities(host, store)).toEqual([]);
+  });
+
+  test("a tombstone goes once the store no longer lists the name", () => {
+    expect(merge(regOf([dated("a")], [{ name: "b", at: 9 }]), regOf([dated("a")])).deleted).toBeUndefined();
+    expect(merge(regOf([dated("a")], [{ name: "b", at: 9 }]), regOf([dated("a"), dated("b")])).deleted).toEqual([{ name: "b", at: 9 }]);
+  });
+
+  test("a console delete beats a host with local changes, and a host re-add after it survives", () => {
+    const store = regOf([dated("a"), dated("b")], [{ name: "b", at: 100 }].slice(0, 0));
+    const consoleDeleted = regOf([dated("a")], [{ name: "b", at: 100 }]);
+    const hostEdited = regOf([dated("a"), dated("b", undefined, { label: "edited" })]);
+    expect(merge(hostEdited, consoleDeleted).identities.map((i) => i.name)).toEqual(["a"]);
+    const hostReadded = regOf([dated("a"), dated("b", 200)]);
+    expect(merge(hostReadded, consoleDeleted).identities.map((i) => i.name)).toEqual(["a", "b"]);
+    expect(store).toContain("b");
+  });
+
+  test("portableIdentitiesFile and mergeRegistryConflict keep the tombstones", async () => {
+    const { portableIdentitiesFile, mergeRegistryConflict } = await import("../../src/sync/registry.ts");
+    const { CLAUDE_CONFIG } = await import("../../src/identities/tool-configs.ts");
+    const dir0 = await tmp();
+    const file = { version: 1 as const, identities: [], deleted: [{ name: "b", at: 3 }] };
+    expect(portableIdentitiesFile(file, { ...CLAUDE_CONFIG, identitiesJsonPath: join(dir0, ".claude", "identities.json") }, dir0).deleted).toEqual([{ name: "b", at: 3 }]);
+    const dir = await tmp();
+    const live = join(dir, "live.json");
+    const prev = join(dir, "prev.json");
+    await writeFile(live, regOf([dated("a")], [{ name: "b", at: 3 }]));
+    await writeFile(prev, regOf([dated("a"), dated("b")]));
+    expect(await mergeRegistryConflict(live, prev)).toBe(true);
+    const out = JSON.parse(await readFile(live, "utf8")) as { identities: Array<{ name: string }>; deleted: unknown[] };
+    expect(out.identities.map((i) => i.name)).toEqual(["a"]);
+    expect(out.deleted).toEqual([{ name: "b", at: 3 }]);
   });
 });

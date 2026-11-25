@@ -1,7 +1,7 @@
 import type { Hono } from "hono";
 import type { JournalEntry } from "./refresh-guard.ts";
 import { assertRelPath, type HomeFileKind, type HomeStoreServer } from "./home-store.ts";
-import { isRefreshableLogin, refreshFingerprints } from "./home-mirror.ts";
+import { losesLogin, refreshFingerprints } from "./home-mirror.ts";
 import { droppedIdentities } from "./registry-sync.ts";
 
 /**
@@ -29,6 +29,8 @@ export interface StoreAdminDeps {
 }
 
 /** Longest a long poll may wait. The client asks for less. */
+/** Request header of a host client that understands the 422 refusals of `PUT /store/files`. */
+export const STORE_REFUSALS_HEADER = "x-ais-store-refusals";
 export const STORE_WAIT_MAX_MS = 30_000;
 const KINDS: readonly HomeFileKind[] = ["registry", "login", "hostfile", "heartbeat", "marker", "meta", "derived"];
 /** Rows one read may name. The host mirror asks for the changed paths of one account at a time. */
@@ -125,8 +127,13 @@ export function registerStoreAdmin(hono: Hono, deps: StoreAdminDeps | undefined,
         if (cur && cur.version === expectedVersion) {
           const next = deps.homeStore.decrypt(path, cipher).toString("utf8");
           const prev = deps.homeStore.decrypt(path, cur.cipher).toString("utf8");
-          if (kind === "login" && !isRefreshableLogin(next) && isRefreshableLogin(prev)) return err(422, "placeholder");
-          if (kind === "registry" && droppedIdentities(next, prev).length > 0) return err(422, "drops-identities");
+          const refusal = kind === "login" ? (losesLogin(next, prev) ? "placeholder" : undefined) : droppedIdentities(next, prev).length > 0 ? "drops-identities" : undefined;
+          if (refusal) {
+            // A host that sends the capability header throws on the refusal (422). An older host reads any status but 200 and 409 as a
+            // failure that stops its whole sync pass, so it gets 200 with the row's own version and nothing is written.
+            if (c.req.header(STORE_REFUSALS_HEADER) === "1") return err(422, refusal);
+            return c.json({ version: cur.version });
+          }
         }
       }
       result = await deps.homeStore.putCipher(path, cipher, sha256, { account, kind: kind as HomeFileKind, expectedVersion: expectedVersion as number | null });

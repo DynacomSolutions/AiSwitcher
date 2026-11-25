@@ -1,3 +1,4 @@
+import { mergeTombstones, tombstoneCovers } from "../identities/tombstones.ts";
 import { homedir } from "node:os";
 import { dirname, relative, sep } from "node:path";
 import { copyFile } from "node:fs/promises";
@@ -73,6 +74,7 @@ export function portableIdentitiesFile(
     ...(file.chromeProfileOverrides
       ? { chromeProfileOverrides: file.chromeProfileOverrides.map((override) => portableOverride(override, homes)) }
       : {}),
+    ...(file.deleted?.length ? { deleted: file.deleted } : {}),
   };
 }
 
@@ -211,6 +213,9 @@ export async function mergeRegistryConflict(
     return other ? mergeIdentity(identity, other) : identity;
   });
   identities.push(...byName.values());
+  // Tombstones of both sides apply, and the identities they cover (added no later than the delete) go.
+  const tombs = new Map(mergeTombstones(primary.deleted ?? [], secondary.deleted ?? []).map((t) => [t.name, t]));
+  const survivors = identities.filter((identity) => !tombstoneCovers(tombs.get(identity.name), identity));
 
   const overrideKeys = new Set<string>();
   const chromeProfileOverrides = [...(primary.chromeProfileOverrides ?? []), ...(secondary.chromeProfileOverrides ?? [])].filter(
@@ -223,8 +228,9 @@ export async function mergeRegistryConflict(
   );
   await saveIdentitiesFile(livePath, {
     version: 1,
-    identities: identities.filter((identity) => !isSyntheticLegacySessionContainer(identity)),
+    identities: survivors.filter((identity) => !isSyntheticLegacySessionContainer(identity)),
     ...(chromeProfileOverrides.length > 0 ? { chromeProfileOverrides } : {}),
+    ...(tombs.size > 0 ? { deleted: [...tombs.values()] } : {}),
   });
   return true;
 }

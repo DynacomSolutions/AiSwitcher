@@ -187,6 +187,36 @@ describe("admin store routes: rotated refresh tokens and the real server", () =>
     await expect(new HttpHomeStore({ ...opts, warn: () => undefined }).put(path, Buffer.from(placeholder), { account: "claude/alpha", kind: "login", expectedVersion: server.rows.get(path)!.version })).rejects.toThrow(/placeholder/);
   });
 
+  test("a host without the capability header gets 200 with the row's own version and nothing is written", async () => {
+    const { app, server } = setup();
+    const path = "x/.credentials.json";
+    await fetchPut(app, path, grant("r-live", 1_795_635_411_000), "claude/alpha", "login");
+    const before = server.rows.get(path)!;
+    const placeholder = JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_token", refreshToken: null, expiresAt: 4_102_444_800_000 } });
+    const r = await fetchPut(app, path, placeholder, "claude/alpha", "login", before.version, false);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ version: before.version });
+    expect(server.rows.get(path)).toBe(before);
+    const reg = ".claude/identities.json";
+    await fetchPut(app, reg, JSON.stringify({ version: 1, identities: [{ name: "a" }, { name: "b" }] }), null, "registry");
+    const rv = server.rows.get(reg)!;
+    const r2 = await fetchPut(app, reg, JSON.stringify({ version: 1, identities: [{ name: "a" }] }), null, "registry", rv.version, false);
+    expect(r2.status).toBe(200);
+    expect(server.rows.get(reg)).toBe(rv);
+  });
+
+  test("a mixed login file whose real entry becomes a gateway entry is refused, and a rotated entry beside it passes", async () => {
+    const { app, server } = setup();
+    const path = ".pi/identities/alpha/auth.json";
+    const real = (tag: string, exp: number) => ({ type: "oauth", access: `SYNTHETIC_FIXTURE-a-${tag}`, refresh: `SYNTHETIC_FIXTURE-r-${tag}`, expires: exp });
+    const gw = { type: "oauth", access: "aisg_SYNTHETIC_FIXTURE_token", refresh: "", expires: 4_102_444_800_000 };
+    await fetchPut(app, path, JSON.stringify({ anthropic: real("a", 1_795_000_000_000), "openai-codex": real("c", 1_795_000_000_000) }), "pi/alpha", "login");
+    const v = server.rows.get(path)!.version;
+    const bad = await fetchPut(app, path, JSON.stringify({ anthropic: gw, "openai-codex": real("c2", 1_796_000_000_000) }), "pi/alpha", "login", v);
+    expect(bad.status).toBe(422);
+    expect((await fetchPut(app, path, JSON.stringify({ anthropic: real("a2", 1_796_000_000_000), "openai-codex": real("c2", 1_796_000_000_000) }), "pi/alpha", "login", v)).status).toBe(200);
+  });
+
   test("a stale expectedVersion gets the normal compare-and-swap conflict before any guard", async () => {
     const { app, server } = setup();
     const path = "x/.credentials.json";
@@ -268,10 +298,10 @@ describe("admin store routes: rotated refresh tokens and the real server", () =>
 });
 
 /** A raw, correctly encrypted PUT with an expected version of null, to see the gateway's answer. */
-async function fetchPut(app: ReturnType<typeof createAdminApp>, path: string, text: string, account: string | null, kind: string, expectedVersion: number | null = null): Promise<Response> {
+async function fetchPut(app: ReturnType<typeof createAdminApp>, path: string, text: string, account: string | null, kind: string, expectedVersion: number | null = null, capable = true): Promise<Response> {
   return app.request("http://admin.test/store/files", {
     method: "PUT",
-    headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" },
+    headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json", ...(capable ? { "x-ais-store-refusals": "1" } : {}) },
     body: JSON.stringify({ path, account, kind, cipher: encryptFile(KEY, path, Buffer.from(text)).toString("base64"), sha256: sha256Hex(text), expectedVersion }),
   });
 }

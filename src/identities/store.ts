@@ -1,3 +1,4 @@
+import { parseTombstones } from "./tombstones.ts";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "./types.ts";
@@ -182,7 +183,7 @@ export function parseIdentitiesFile(raw: unknown): IdentitiesFile {
     version: 1,
     identities: rec.identities as Identity[],
     chromeProfileOverrides: rec.chromeProfileOverrides as ChromeProfileOverride[] | undefined,
-    ...(Array.isArray(rec.deleted) ? { deleted: rec.deleted.filter((n): n is string => typeof n === "string") } : {}),
+    ...(Array.isArray(rec.deleted) ? { deleted: parseTombstones(rec.deleted) } : {}),
   };
 }
 

@@ -180,3 +180,66 @@ describe("HomeMirror", () => {
     expect(await readFile(join(home, LOGIN), "utf8")).toBe(real("store"));
   });
 });
+
+const realEntry = (tag: string, exp: number) => ({ type: "oauth", access: `SYNTHETIC_FIXTURE-a-${tag}`, refresh: `SYNTHETIC_FIXTURE-r-${tag}`, expires: exp });
+const gwEntry = { type: "oauth", access: "aisg_SYNTHETIC_FIXTURE_token", refresh: "", expires: 4_102_444_800_000 };
+const PI = ".pi/identities/alpha/auth.json";
+
+describe("a mixed pi auth.json (real entry beside a gateway entry)", () => {
+  async function inStep() {
+    const home = await tmp();
+    const store = new FakeStore();
+    const rowText = JSON.stringify({ anthropic: realEntry("a", 1_795_000_000_000), "openai-codex": realEntry("c", 1_795_000_000_000) });
+    store.seed(PI, rowText);
+    store.rows.get(PI)!.account = "pi/alpha";
+    await put(home, PI, rowText);
+    const mirror = new HomeMirror(asStore(store), { home, fileStore: true, warn: () => {} });
+    await mirror.pullAll();
+    return { home, store, mirror };
+  }
+
+  test("only local changed: the rotated entry is pushed, the gateway entry never is", async () => {
+    const { home, store, mirror } = await inStep();
+    await put(home, PI, JSON.stringify({ anthropic: gwEntry, "openai-codex": realEntry("c2", 1_796_000_000_000) }));
+    await mirror.pushDirty();
+    const row = JSON.parse(store.text(PI)!) as { anthropic: { refresh: string }; "openai-codex": { refresh: string } };
+    expect(row.anthropic.refresh).toBe("SYNTHETIC_FIXTURE-r-a");
+    expect(row["openai-codex"].refresh).toBe("SYNTHETIC_FIXTURE-r-c2");
+    expect(JSON.parse(await readFile(join(home, PI), "utf8")).anthropic.refresh).toBe("SYNTHETIC_FIXTURE-r-a");
+  });
+
+  test("push() reconciles the same file instead of pushing it as is", async () => {
+    const { home, store, mirror } = await inStep();
+    await put(home, PI, JSON.stringify({ anthropic: gwEntry, "openai-codex": realEntry("c2", 1_796_000_000_000) }));
+    await mirror.push([join(home, PI)], "pi/alpha", "login");
+    expect(JSON.parse(store.text(PI)!).anthropic.refresh).toBe("SYNTHETIC_FIXTURE-r-a");
+  });
+});
+
+describe("one refused file never starves the later ones", () => {
+  test("pushDirty and pushAccountDirty push every other dirty file when one push throws", async () => {
+    const home = await tmp();
+    const store = new FakeStore();
+    const a = ".claude/identities/a/.credentials.json";
+    const b = ".claude/identities/b/.credentials.json";
+    store.seed(a, real("ra"));
+    store.seed(b, real("rb"));
+    store.rows.get(b)!.account = "claude/a";
+    await put(home, a, real("ra"));
+    await put(home, b, real("rb"));
+    const mirror = new HomeMirror(asStore(store), { home, fileStore: true, warn: () => {} });
+    await mirror.pullAll();
+    await put(home, a, real("ra2", 1_796_000_000_000));
+    await put(home, b, real("rb2", 1_796_000_000_000));
+    const put0 = store.put.bind(store);
+    store.put = async (path, content, o) => {
+      if (path === a) throw new Error("refused");
+      return put0(path, content, o);
+    };
+    await expect(mirror.pushDirty()).rejects.toThrow("refused");
+    expect(store.text(b)).toBe(real("rb2", 1_796_000_000_000));
+    await put(home, b, real("rb3", 1_797_000_000_000));
+    await expect(mirror.pushAccountDirty("claude/a")).resolves.toBeUndefined();
+    expect(store.text(b)).toBe(real("rb3", 1_797_000_000_000));
+  });
+});

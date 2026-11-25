@@ -1,5 +1,6 @@
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { addedAtOf, mergeTombstones, parseTombstones, tombstoneCovers } from "../identities/tombstones.ts";
 import { aisStateDir } from "../shared/ais-home.ts";
 
 /**
@@ -67,7 +68,9 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 /**
  * Merges a host registry and a store registry per identity name. An identity on one side only is kept. An identity on both
  * sides takes the host entry, with the union of the two swapPool `accounts` lists (host order first). Other top-level keys
- * take the host value. Undefined when either text is not a registry object with an `identities` array.
+ * take the host value. Tombstones (`deleted`, identities/tombstones.ts) of both sides apply: an identity a tombstone covers is
+ * dropped from the result, whichever side lists it, unless the entry was added after the delete. A tombstone stays only while the
+ * store registry still lists its name. Undefined when either text is not a registry object with an `identities` array.
  */
 export function mergeRegistries(host: string, store: string): Buffer | undefined {
   let h: unknown;
@@ -85,10 +88,8 @@ export function mergeRegistries(host: string, store: string): Buffer | undefined
     return m;
   };
   const theirs = named(s.identities);
-  const deleted = new Set([...tombstones(h), ...tombstones(s)]);
-  const hostNames = new Set(h.identities.flatMap((i) => (isObject(i) && typeof i.name === "string" ? [i.name] : [])));
-  // A name the host tombstoned and no longer lists is gone for good; a name listed again (re-added) is not.
-  const dead = (name: string): boolean => tombstones(h).has(name) && !hostNames.has(name);
+  const tombs = new Map(mergeTombstones(parseTombstones(h.deleted), parseTombstones(s.deleted)).map((t) => [t.name, t]));
+  const covered = (i: Record<string, unknown>): boolean => tombstoneCovers(tombs.get(i.name as string), i);
   const identities: unknown[] = [];
   const seen = new Set<string>();
   for (const i of h.identities) {
@@ -98,25 +99,30 @@ export function mergeRegistries(host: string, store: string): Buffer | undefined
     }
     seen.add(i.name);
     const other = theirs.get(i.name);
-    const pool = i.swapPool;
-    const otherPool = other?.swapPool;
+    // The newer add wins when the two sides hold different creations of one name.
+    const entry = other && (addedAtOf(other) ?? 0) > (addedAtOf(i) ?? 0) ? other : i;
+    if (covered(entry)) continue;
+    const pool = entry.swapPool;
+    const otherPool = (entry === i ? other : i)?.swapPool;
     if (isObject(pool) && Array.isArray(pool.accounts) && isObject(otherPool) && Array.isArray(otherPool.accounts)) {
       const accounts = [...new Set([...(pool.accounts as unknown[]), ...(otherPool.accounts as unknown[])])];
-      identities.push({ ...i, swapPool: { ...pool, accounts } });
-    } else identities.push(i);
+      identities.push({ ...entry, swapPool: { ...pool, accounts } });
+    } else identities.push(entry);
   }
-  for (const i of s.identities) if (!(isObject(i) && typeof i.name === "string" && (seen.has(i.name) || dead(i.name)))) identities.push(i);
-  return Buffer.from(`${JSON.stringify({ ...s, ...h, identities, ...(deleted.size > 0 ? { deleted: [...deleted] } : {}) }, null, 2)}\n`);
+  for (const i of s.identities) if (!(isObject(i) && typeof i.name === "string" && (seen.has(i.name) || covered(i)))) identities.push(i);
+  const { deleted: _hd, ...hostRest } = h;
+  const { deleted: _sd, ...storeRest } = s;
+  const keep = [...tombs.values()].filter((t) => theirs.has(t.name));
+  return Buffer.from(`${JSON.stringify({ ...storeRest, ...hostRest, identities, ...(keep.length > 0 ? { deleted: keep } : {}) }, null, 2)}\n`);
 }
 
 const namesOf = (list: unknown[]): Set<string> => new Set(list.flatMap((i) => (isObject(i) && typeof i.name === "string" ? [i.name] : [])));
-const tombstones = (reg: Record<string, unknown>): Set<string> => new Set(Array.isArray(reg.deleted) ? reg.deleted.filter((n): n is string => typeof n === "string") : []);
 
 /**
  * Names of the identities that `current` (the store registry) holds and `next` (a pushed registry) lacks. Removal goes through
- * `retire` (the entry stays, flagged) or a tombstone (`deleted: [names]`, written by `ais identities delete`), so a push that
- * drops any other name is a mistake: a host file rewritten empty must not take the gateway's identities and their logins with it.
- * Text that is not a registry counts as dropping every name of a populated registry. Empty when `current` holds no identities.
+ * `retire` (the entry stays, flagged) or a tombstone (`deleted`, written by `ais identities delete`) that covers the store's entry,
+ * so a push that drops any other name is a mistake: a host file rewritten empty must not take the gateway's identities and their
+ * logins with it. Text that is not a registry counts as dropping every name of a populated registry.
  */
 export function droppedIdentities(next: string, current: string): string[] {
   let c: unknown;
@@ -126,16 +132,16 @@ export function droppedIdentities(next: string, current: string): string[] {
     return [];
   }
   if (!isObject(c) || !Array.isArray(c.identities)) return [];
-  const held = [...namesOf(c.identities)];
+  const held = c.identities.filter((i): i is Record<string, unknown> => isObject(i) && typeof i.name === "string");
   if (held.length === 0) return [];
   let n: unknown;
   try {
     n = JSON.parse(next);
   } catch {
-    return held;
+    return held.map((i) => i.name as string);
   }
-  if (!isObject(n) || !Array.isArray(n.identities)) return held;
+  if (!isObject(n) || !Array.isArray(n.identities)) return held.map((i) => i.name as string);
   const kept = namesOf(n.identities);
-  const gone = tombstones(n);
-  return held.filter((name) => !kept.has(name) && !gone.has(name));
+  const tombs = new Map(parseTombstones(n.deleted).map((t) => [t.name, t]));
+  return held.filter((i) => !kept.has(i.name as string) && !tombstoneCovers(tombs.get(i.name as string), i)).map((i) => i.name as string);
 }

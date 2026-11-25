@@ -66,6 +66,7 @@ export function createIdentity(file: IdentitiesFile, input: CreateIdentityInput)
 
   const identity: Identity = {
     name: input.name,
+    addedAt: Date.now(),
     label: input.label,
     ...(input.description ? { description: input.description } : {}),
     configDir: input.configDir,
@@ -73,6 +74,8 @@ export function createIdentity(file: IdentitiesFile, input: CreateIdentityInput)
     ...(input.aliases?.length ? { aliases: input.aliases } : {}),
   };
   file.identities.push(identity);
+  // A name created again is no longer deleted.
+  if (file.deleted) file.deleted = file.deleted.filter((t) => t.name !== input.name);
   return identity;
 }
 
@@ -128,7 +131,7 @@ export function deleteIdentity(file: IdentitiesFile, name: string): Identity {
   const identity = requireIdentity(file, name);
   file.identities = file.identities.filter((i) => i !== identity);
   // The tombstone tells the gateway store this removal is on purpose, so its merge does not bring the identity back.
-  file.deleted = [...new Set([...(file.deleted ?? []), identity.name])];
+  file.deleted = [...(file.deleted ?? []).filter((t) => t.name !== identity.name), { name: identity.name, at: Date.now() }];
   return identity;
 }
 

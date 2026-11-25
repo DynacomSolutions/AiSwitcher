@@ -82,6 +82,24 @@ export function isPlaceholderLogin(text: string): boolean {
   }
 }
 
+/**
+ * True when writing `next` over `prev` would lose a login the gateway can renew: the file stops being refreshable, or one of its
+ * entries (a top-level key: a pi provider, claude's `claudeAiOauth`, codex's `tokens`) that was refreshable is still there but is
+ * not any more (a gateway entry put in its place). An entry that is missing is no loss here (a provider removed on purpose).
+ */
+export function losesLogin(next: string, prev: string): boolean {
+  if (!isRefreshableLogin(prev)) return false;
+  if (!isRefreshableLogin(next)) return true;
+  try {
+    const n = JSON.parse(next) as unknown;
+    const p = JSON.parse(prev) as unknown;
+    if (!isPlainObject(n) || !isPlainObject(p)) return false;
+    return Object.entries(p).some(([k, v]) => k in n && isPlainObject(v) && refreshFingerprints(JSON.stringify(v)).length > 0 && refreshFingerprints(JSON.stringify(n[k])).length === 0);
+  } catch {
+    return false;
+  }
+}
+
 /** True when the text holds a real refresh token (codex's literal "none" is not one): the gateway can keep renewing it. */
 export function isRefreshableLogin(text: string): boolean {
   return refreshFingerprints(text).length > 0;
@@ -223,6 +241,14 @@ async function writeAtomic(path: string, data: Buffer): Promise<void> {
   await rename(tmp, path);
 }
 
+const sameJson = (a: Buffer, b: Buffer): boolean => {
+  try {
+    return JSON.stringify(JSON.parse(a.toString("utf8"))) === JSON.stringify(JSON.parse(b.toString("utf8")));
+  } catch {
+    return false;
+  }
+};
+
 const readLocal = async (abs: string): Promise<Buffer | undefined> => readFile(abs).catch(() => undefined);
 
 export class HomeMirror {
@@ -324,23 +350,43 @@ export class HomeMirror {
       // Only the local file changed.
       if (row.kind === "registry" || row.kind === "hostfile") return hostTruth ? push(row.version) : write();
       if (row.kind === "meta" || row.kind === "derived") return write();
-      if (this.mustNotPush(row, local)) return write();
-      return push(row.version);
+      return row.kind === "login" ? this.pushLogin(row, local, push, write) : push(row.version);
     }
     // Both changed, or first sight.
     if (hostTruth) return push(row.version);
     if (row.kind === "login" && (row.account ?? "").startsWith("pi/") && mergeByKey(local.toString("utf8"), row.content.toString("utf8"))) return this.mergeAndPush(row, local);
     if (row.kind === "login") {
       const l = local.toString("utf8");
-      if (isFresher(l, row.content.toString("utf8")) && !this.mustNotPush(row, local)) return push(row.version);
+      if (isFresher(l, row.content.toString("utf8"))) return this.pushLogin(row, local, push, write);
     }
     if (this.fileStore && row.kind === "hostfile") return "kept";
     return write();
   }
 
-  /** True for a login file that is no refreshable login while the row is one: a placeholder or blanked file never replaces a real login. */
+  /** True for a login file that would lose a login the row holds: a placeholder or blanked file, or a gateway entry put over a real entry. */
   private mustNotPush(row: HomeFileRow, local: Buffer): boolean {
-    return row.kind === "login" && !isRefreshableLogin(local.toString("utf8")) && isRefreshableLogin(row.content.toString("utf8"));
+    return row.kind === "login" && losesLogin(local.toString("utf8"), row.content.toString("utf8"));
+  }
+
+  /**
+   * Pushes a changed login file. A file that would lose a real entry is merged per entry instead (mergeByKey: a gateway entry
+   * never beats a real one), so the real entries that changed still reach the store and the gateway entry never does; when the
+   * merge is the row itself the row is written back to the file.
+   */
+  private async pushLogin(
+    row: HomeFileRow,
+    local: Buffer,
+    push: (expected: number) => Promise<"pushed" | "conflict">,
+    write: () => Promise<"wrote" | "kept">,
+  ): Promise<ReconcileOutcome> {
+    if (!this.mustNotPush(row, local)) return push(row.version);
+    const merged = mergeByKey(local.toString("utf8"), row.content.toString("utf8"));
+    if (!merged || losesLogin(merged.toString("utf8"), row.content.toString("utf8")) || sameJson(merged, row.content)) return write();
+    const r = await this.store.put(row.path, merged, { account: row.account, kind: row.kind, expectedVersion: row.version });
+    if (!r.ok) return "conflict";
+    await writeAtomic(this.abs(row.path), merged);
+    await this.setBase(row.path, r.version, sha256Hex(merged));
+    return "pushed";
   }
 
   /**
@@ -458,8 +504,15 @@ export class HomeMirror {
       const base = this.bases.get(rel);
       if (base && base.sha === sha) continue;
       const known = this.kinds.get(rel);
-      // A placeholder login is never pushed: the store row holds the real grant (or none), never the app token.
-      if ((known?.kind ?? kind) === "login" && isPlaceholderLogin(local.toString("utf8"))) continue;
+      // A login that would lose what the row holds (a placeholder, or a gateway entry over a real entry) is reconciled, never pushed as is.
+      if ((known?.kind ?? kind) === "login") {
+        const text = local.toString("utf8");
+        const [cur] = await this.store.get([rel]);
+        if (cur ? losesLogin(text, cur.content.toString("utf8")) : isPlaceholderLogin(text)) {
+          if (cur) await this.reconcile(cur);
+          continue;
+        }
+      }
       const r = await this.store.put(rel, local, { account: known?.account ?? account, kind: known?.kind ?? kind, expectedVersion: base ? base.version : null });
       if (r.ok) {
         this.kinds.set(rel, { kind: known?.kind ?? kind, account: known?.account ?? account });
@@ -475,17 +528,25 @@ export class HomeMirror {
 
   /** Pushes the account's tracked files whose local copy differs from their base (a push that missed them). No account lock: call it inside one. */
   async pushAccountDirty(account: string): Promise<void> {
+    let first: unknown;
+    // One refused or failed file never stops the others: later rotated logins still reach the store.
     for (const [rel, base] of [...this.bases]) {
       const k = this.kinds.get(rel);
       if (!k || k.account !== account) continue;
       const local = await readLocal(this.abs(rel));
       if (!local || sha256Hex(local) === base.sha) continue;
-      await this.push([this.abs(rel)], account, k.kind);
+      try {
+        await this.push([this.abs(rel)], account, k.kind);
+      } catch (err) {
+        first ??= err;
+      }
     }
+    if (first !== undefined) throw first;
   }
 
   /** Pushes every tracked file whose local copy changed (file-store import of host edits, a push that failed earlier). */
   async pushDirty(): Promise<void> {
+    let first: unknown;
     for (const [rel, base] of [...this.bases]) {
       const local = await readLocal(this.abs(rel));
       const k = this.kinds.get(rel);
@@ -498,9 +559,15 @@ export class HomeMirror {
         const [row] = await this.store.get([rel]);
         if (row) await this.reconcile(row);
       };
-      if (k.account) await this.withAccount(k.account, run);
-      else await run();
+      // One refused or failed file never stops the others: later rotated logins still reach the store.
+      try {
+        if (k.account) await this.withAccount(k.account, run);
+        else await run();
+      } catch (err) {
+        first ??= err;
+      }
     }
+    if (first !== undefined) throw first;
   }
 
   /** Starts following changes: NOTIFY for speed, a poll for anything missed. */

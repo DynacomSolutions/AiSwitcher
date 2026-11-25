@@ -1,5 +1,7 @@
 export interface Identity {
   name: string;
+  /** When the identity was created (ms since the epoch). A newer add beats an older registry tombstone (identities/tombstones.ts). */
+  addedAt?: number;
   label: string;
   description?: string;
   configDir: string;
@@ -90,7 +92,7 @@ export interface IdentitiesFile {
   identities: Identity[];
   chromeProfileOverrides?: ChromeProfileOverride[];
   /** Names removed on purpose (`ais identities delete`). The gateway store registry drops them; any other missing name is kept. */
-  deleted?: string[];
+  deleted?: Array<{ name: string; at: number }>;
 }
 
 export interface ToolConfig {
