@@ -907,7 +907,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         else if (e === "drained") record(identityForRow, "rejected", 503, undefined, true, undefined, model, "hold_drained");
       },
       replay: (signal) => {
-        const again = new Request(req.url, { method: req.method, headers: req.headers, body: bytes, signal });
+        // The replay body is the buffered bytes: its own length is the truth, whatever framing the original request had.
+        const headers = new Headers(req.headers);
+        headers.set("content-length", String(bytes.length));
+        headers.delete("transfer-encoding");
+        const again = new Request(req.url, { method: req.method, headers, body: bytes, signal });
         heldReplays.add(again);
         return hold.replay(again);
       },
