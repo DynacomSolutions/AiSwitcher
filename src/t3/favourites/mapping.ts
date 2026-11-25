@@ -1,5 +1,6 @@
 // T3 Code names a model favourite by provider instance id and model slug. AIS names it by provider, identity (or pool) and model.
 // This file maps one to the other. It is pure and needs no configuration: a pool instance maps to the reserved identity POOL_IDENTITY.
+import { instanceIdsFor, parseInstanceId } from "../instances/plan.ts";
 import { CHAT_PROVIDERS, favId, POOL_IDENTITY, selectable, type ChatProvider, type FavKey } from "../../browser/chat-protocol.ts";
 
 /** One entry of `favorites` in T3 Code's settings.json. */
@@ -13,43 +14,22 @@ export interface MapContext {
 }
 
 /**
- * The T3 provider instance ids AIS makes (`ais gateway t3-instance` and the T3 setup), by provider:
- *
- * | instance id                                  | AIS provider | identity     |
- * | -------------------------------------------- | ------------ | ------------ |
- * | <claude\|codex>-pool                          | claude, codex | the pool (POOL_IDENTITY) |
- * | t3-claude-<identity>                         | claude       | <identity>   |
- * | t3-codex-<identity>                          | codex        | <identity>   |
- * | t3-kimi-<identity>-acp, t3-kimi-pool-acp     | kimi         | <identity>, the pool |
- * | t3-grok-<identity>, t3-grok-<identity>-acp   | grok         | <identity>   |
- * | t3-grok-pool                                 | grok         | the pool     |
- * | t3-zai-<identity>-acp                        | zai          | <identity>   |
- * | t3-opencode-<identity>, t3-opencode-pool     | opencode     | <identity>, the pool |
+ * The T3 provider instance ids AIS makes follow one pattern, defined in `src/t3/instances/plan.ts` (no id is listed here):
+ * `<claude|codex>-pool` and `t3-<claude|codex>-<identity>`, `t3-<opencode>-<pool|identity>`, `t3-grok-<pool|identity>` with the ACP
+ * twin `-acp`, `t3-<kimi|zai>-<pool|identity>-acp`.
  *
  * A pool instance maps to the same AIS identity on every host and pod, `POOL_IDENTITY`, whatever the pool is called. No pool name is read.
  *
  * Everything else has no AIS identity and is never mapped: T3's own `claudeAgent` and `codex` instances, the Claude homes that
  * route to Kimi or Z.ai models (`t3-claude-kimi-*`, `t3-claude-zai-*`), `t3-zcode-*`, and every usage-only instance (an id that ends in `-usage`).
  */
-/** The Claude and Codex pool instances are named `<provider>-pool`. */
-const poolId = (p: "claude" | "codex"): string => `${p}-pool`;
-const POOL_IDS: Record<string, ChatProvider> = { [poolId("claude")]: "claude", [poolId("codex")]: "codex" };
-
 interface Parsed { provider: ChatProvider; name: string; pool: boolean }
 
+// The id pattern lives in src/t3/instances/plan.ts, the one place that also makes the instances from the live gateway app list.
 function parseInstance(id: string): Parsed | undefined {
-  // A usage-only instance (`t3-opencode-<identity>-usage`) reads limits and has no AIS identity of its own.
-  if (id.endsWith("-usage")) return undefined;
-  const pool = POOL_IDS[id];
-  if (pool) return { provider: pool, name: "", pool: true };
-  if (/^t3-claude-(?:kimi|zai)(?:-|$)/.test(id)) return undefined;
-  let m = /^t3-(claude|codex|opencode)-(.+)$/.exec(id);
-  if (m) return m[2] === "pool" ? { provider: m[1] as ChatProvider, name: "", pool: true } : { provider: m[1] as ChatProvider, name: m[2]!, pool: false };
-  m = /^t3-(kimi|zai)-(.+)-acp$/.exec(id);
-  if (m) return m[2] === "pool" ? { provider: m[1] as ChatProvider, name: "", pool: true } : { provider: m[1] as ChatProvider, name: m[2]!, pool: false };
-  m = /^t3-grok-(.+?)(-acp)?$/.exec(id);
-  if (m) return m[1] === "pool" ? { provider: "grok", name: "", pool: true } : { provider: "grok", name: m[1]!, pool: false };
-  return undefined;
+  const p = parseInstanceId(id);
+  if (!p) return undefined;
+  return { provider: p.provider as ChatProvider, name: p.who === "pool" ? "" : p.who, pool: p.who === "pool" };
 }
 
 /** The AIS provider and identity of a T3 instance id, or undefined when the instance is not one AIS manages. */
@@ -70,15 +50,7 @@ export function favToKey(f: T3Fav, ctx: Pick<MapContext, "canonical"> = {}): Fav
 
 /** The instance ids that can hold a favourite of this provider and identity, best first. */
 export function instanceCandidates(provider: ChatProvider, identity: string): string[] {
-  const pool = identity === POOL_IDENTITY;
-  switch (provider) {
-    case "claude": return pool ? [poolId("claude")] : [`t3-claude-${identity}`];
-    case "codex": return pool ? [poolId("codex")] : [`t3-codex-${identity}`];
-    case "kimi": return [`t3-kimi-${pool ? "pool" : identity}-acp`];
-    case "zai": return [`t3-zai-${pool ? "pool" : identity}-acp`];
-    case "grok": return pool ? ["t3-grok-pool", "t3-grok-pool-acp"] : [`t3-grok-${identity}`, `t3-grok-${identity}-acp`];
-    case "opencode": return [`t3-opencode-${pool ? "pool" : identity}`];
-  }
+  return instanceIdsFor(provider, identity === POOL_IDENTITY ? "pool" : identity);
 }
 
 /** The T3 favourite for an AIS key: the first candidate instance that exists. Undefined when this T3 home has no such instance. */
