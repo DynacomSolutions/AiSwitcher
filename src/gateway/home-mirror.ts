@@ -2,8 +2,9 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
+import { isGatewayAccessToken } from "../identities/claude-gateway-entry.ts";
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
-import { mergeRegistries, readRegistryBase, writeRegistryBase } from "./registry-sync.ts";
+import { droppedIdentities, mergeRegistries, readRegistryBase, writeRegistryBase } from "./registry-sync.ts";
 import { sha256Hex, type HomeFileKind, type HomeFileMeta, type HomeFileRow, type HomeStoreClient } from "./home-store.ts";
 
 /**
@@ -56,6 +57,26 @@ interface Base {
   sha: string;
 }
 
+/** True when any string value in the parsed credential file is a gateway app token (the placeholder login of a routed folder). */
+function holdsGatewayToken(v: unknown, depth: number): boolean {
+  if (depth > 6 || typeof v !== "object" || v === null) return false;
+  return Object.values(v as Record<string, unknown>).some((x) => (typeof x === "string" ? isGatewayAccessToken(x) : holdsGatewayToken(x, depth + 1)));
+}
+
+/** True when the text is a gateway placeholder login: it holds a gateway app token. */
+export function isPlaceholderLogin(text: string): boolean {
+  try {
+    return holdsGatewayToken(JSON.parse(text), 0);
+  } catch {
+    return false;
+  }
+}
+
+/** True when the text is a login the gateway can keep renewing: it is no placeholder and holds a refresh token. */
+export function isRefreshableLogin(text: string): boolean {
+  return !isPlaceholderLogin(text) && refreshFingerprints(text).length > 0;
+}
+
 /**
  * Seconds of the latest expiry-like value in a credential file (any `*expir*`, `last_refresh`, a JWT's `exp`), or undefined.
  * A refresh token's own expiry (`refreshTokenExpiresAt`, `refresh_token_expires_*`) is not the grant's age: Claude Code keeps
@@ -68,6 +89,8 @@ export function grantFreshness(text: string): number | undefined {
   } catch {
     return undefined;
   }
+  // A gateway placeholder carries a fixed far-future expiry: it is never a grant, so it has no age and never wins.
+  if (holdsGatewayToken(json, 0)) return undefined;
   let best: number | undefined;
   const take = (s: number | undefined): void => {
     if (s !== undefined && Number.isFinite(s) && s > 0 && (best === undefined || s > best)) best = s;
@@ -291,6 +314,7 @@ export class HomeMirror {
       // Only the local file changed.
       if (row.kind === "registry" || row.kind === "hostfile") return hostTruth ? push(row.version) : write();
       if (row.kind === "meta" || row.kind === "derived") return write();
+      if (this.mustNotPush(row, local)) return write();
       return push(row.version);
     }
     // Both changed, or first sight.
@@ -298,10 +322,15 @@ export class HomeMirror {
     if (row.kind === "login" && (row.account ?? "").startsWith("pi/") && mergeByKey(local.toString("utf8"), row.content.toString("utf8"))) return this.mergeAndPush(row, local);
     if (row.kind === "login") {
       const l = local.toString("utf8");
-      if (isFresher(l, row.content.toString("utf8"))) return push(row.version);
+      if (isFresher(l, row.content.toString("utf8")) && !this.mustNotPush(row, local)) return push(row.version);
     }
     if (this.fileStore && row.kind === "hostfile") return "kept";
     return write();
+  }
+
+  /** True for a login file that is no refreshable login while the row is one: a placeholder or blanked file never replaces a real login. */
+  private mustNotPush(row: HomeFileRow, local: Buffer): boolean {
+    return row.kind === "login" && !isRefreshableLogin(local.toString("utf8")) && isRefreshableLogin(row.content.toString("utf8"));
   }
 
   /**
@@ -319,7 +348,8 @@ export class HomeMirror {
       return "pushed";
     };
     if (last && last.sha === localSha) return write();
-    if (last && last.sha === row.sha256) return put(local);
+    // A host file that drops an identity the store holds is merged, never pushed as is: removal goes through retire.
+    if (last && last.sha === row.sha256 && droppedIdentities(local.toString("utf8"), row.content.toString("utf8")).length === 0) return put(local);
     const merged = mergeRegistries(local.toString("utf8"), row.content.toString("utf8"));
     if (!merged) return put(local);
     if (sha256Hex(merged) === row.sha256) return write();
@@ -416,6 +446,8 @@ export class HomeMirror {
       const base = this.bases.get(rel);
       if (base && base.sha === sha) continue;
       const known = this.kinds.get(rel);
+      // A placeholder login is never pushed: the store row holds the real grant (or none), never the app token.
+      if ((known?.kind ?? kind) === "login" && isPlaceholderLogin(local.toString("utf8"))) continue;
       const r = await this.store.put(rel, local, { account: known?.account ?? account, kind: known?.kind ?? kind, expectedVersion: base ? base.version : null });
       if (r.ok) {
         this.kinds.set(rel, { kind: known?.kind ?? kind, account: known?.account ?? account });

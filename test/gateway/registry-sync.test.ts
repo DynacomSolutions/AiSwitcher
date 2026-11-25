@@ -152,13 +152,27 @@ describe("a registry file that moved on the host", () => {
     expect(await read(home, REG)).toBe(hostNew);
   });
 
-  test("a host deletion reaches the store when only the host changed", async () => {
+  test("a host file that drops an identity is merged, never pushed: the store keeps the identity", async () => {
     const { home, store } = await inStep();
-    const smaller = registry([], ["alpha"]);
-    await put(home, REG, smaller);
+    await put(home, REG, registry([], ["alpha"]));
     await sync(home, store);
-    expect(namesOf(store.text(REG))).toEqual(["pool-main"]);
-    expect(namesOf(await read(home, REG))).toEqual(["pool-main"]);
+    expect(namesOf(store.text(REG))).toEqual(["pool-main", "alpha"]);
+    expect(namesOf(await read(home, REG))).toEqual(["pool-main", "alpha"]);
+  });
+
+  test("an empty host registry never empties the store registry", async () => {
+    const { home, store } = await inStep();
+    await put(home, REG, `${JSON.stringify({ version: 1, identities: [] })}\n`);
+    await sync(home, store);
+    expect(namesOf(store.text(REG))).toEqual(["pool-main", "alpha"]);
+  });
+
+  test("retiring an identity on the host still reaches the store", async () => {
+    const { home, store } = await inStep();
+    const retired = `${JSON.stringify({ version: 1, identities: [ident("pool-main", { swapPool: { accounts: ["alpha"], active: "alpha" } }), ident("alpha", { retired: true })] }, null, 2)}\n`;
+    await put(home, REG, retired);
+    await sync(home, store);
+    expect(store.text(REG)).toBe(retired);
   });
 });
 

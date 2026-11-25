@@ -104,3 +104,23 @@ export function mergeRegistries(host: string, store: string): Buffer | undefined
   for (const i of s.identities) if (!(isObject(i) && typeof i.name === "string" && seen.has(i.name))) identities.push(i);
   return Buffer.from(`${JSON.stringify({ ...s, ...h, identities }, null, 2)}\n`);
 }
+
+/**
+ * Names of the identities that `current` (the store registry) holds and `next` (a pushed registry) lacks. Empty when either text
+ * is not a registry. Removal goes through `retire` (the entry stays, flagged), never through deletion of the entry, so a push
+ * that drops a name is a mistake: a host file rewritten empty must not take the gateway's identities and their logins with it.
+ */
+export function droppedIdentities(next: string, current: string): string[] {
+  let n: unknown;
+  let c: unknown;
+  try {
+    n = JSON.parse(next);
+    c = JSON.parse(current);
+  } catch {
+    return [];
+  }
+  if (!isObject(n) || !isObject(c) || !Array.isArray(n.identities) || !Array.isArray(c.identities)) return [];
+  const names = (list: unknown[]): Set<string> => new Set(list.flatMap((i) => (isObject(i) && typeof i.name === "string" ? [i.name] : [])));
+  const kept = names(n.identities);
+  return [...names(c.identities)].filter((name) => !kept.has(name));
+}

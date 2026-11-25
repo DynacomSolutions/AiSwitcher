@@ -12,9 +12,9 @@ import { loadIdentitiesFile } from "../identities/store.ts";
 import type { Identity } from "../identities/types.ts";
 import { loadGatewayGuard } from "../sync/gateway-guard.ts";
 import { storeMayHoldLogin } from "./host-login-gate.ts";
-import { isFresher, isReplacedLogin, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
+import { isFresher, isPlaceholderLogin, isRefreshableLogin, isReplacedLogin, refreshFingerprints, REPLACED_MARKER_FILE } from "./home-mirror.ts";
 import { sha256Hex, type HomeFileKind, type HomeStoreClient } from "./home-store.ts";
-import { mergeRegistries, readRegistryBase } from "./registry-sync.ts";
+import { droppedIdentities, mergeRegistries, readRegistryBase } from "./registry-sync.ts";
 import type { RefreshGuardBackend } from "./refresh-guard.ts";
 
 /**
@@ -147,6 +147,18 @@ export async function importHome(
     }
     const content = e.content ?? (await readFile(e.abs).catch(() => undefined));
     if (!content) continue;
+    // A placeholder or a file without a refresh token is no login: it never reaches the store, whatever the row holds.
+    if (e.kind === "login") {
+      const text = content.toString("utf8");
+      if (isPlaceholderLogin(text)) {
+        report.skipped.push({ path: rel, why: "it holds a gateway placeholder, not a login" });
+        continue;
+      }
+      if (!isRefreshableLogin(text)) {
+        report.skipped.push({ path: rel, why: "it holds no refresh token" });
+        continue;
+      }
+    }
     const once = async (): Promise<void> => {
       if (e.kind === "login" && (await isReplacedLogin(store, rel, content.toString("utf8")))) {
         report.skipped.push({ path: rel, why: "it holds a login the owner replaced with another account's" });
@@ -182,7 +194,8 @@ export async function importHome(
           report.skipped.push({ path: rel, why: "the store's registry is newer and the host copy did not change" });
           return;
         }
-        if (!last || last.sha !== row.sha256) {
+        // A host copy that drops an identity the store holds is merged, never pushed as is: removal goes through retire.
+        if (!last || last.sha !== row.sha256 || droppedIdentities(content.toString("utf8"), row.content.toString("utf8")).length > 0) {
           const merged = mergeRegistries(content.toString("utf8"), row.content.toString("utf8"));
           if (merged) {
             if (sha256Hex(merged) === row.sha256) {

@@ -149,6 +149,8 @@ export class HttpHomeStore {
     if (opts.expectedVersion === undefined) throw new Error("gateway store API: a write needs an expected version (null to create)");
     const body = { path, account: opts.account, kind: opts.kind, cipher: encryptFile(this.key, path, content).toString("base64"), sha256: sha256Hex(content), expectedVersion: opts.expectedVersion };
     const { status, json } = await this.api.ok("PUT", "/store/files", body, [200, 409]);
+    // A refusal (placeholder login, registry that drops identities) is no lost race: retrying the same write never helps.
+    if (status === 409 && (json.error === "placeholder" || json.error === "drops-identities")) throw new Error(`gateway store API: the gateway refused the write of ${path} (${json.error})`);
     if (status === 409) return { ok: false, ...(json.current ? { current: toMeta(json.current) } : {}) };
     return { ok: true, version: Number(json.version) };
   }
