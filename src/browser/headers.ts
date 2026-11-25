@@ -96,3 +96,18 @@ async function registryAuth(i: HeadersInput, tool: BrowserTool, configDir: strin
   const token = await (i.readToken ?? readTokenFile)(expandPath(identity.configDir));
   return token ? { token } : {};
 }
+
+/** Header names whose value is a secret. Compared in lower case. */
+const SECRET_HEADERS = new Set(["authorization", "proxy-authorization", "cookie", "x-api-key"]);
+
+const maskValue = (v: string): string => {
+  const m = /^(Bearer\s+)(.*)$/i.exec(v);
+  const scheme = m?.[1] ?? "";
+  const secret = m?.[2] ?? v;
+  return `${scheme}${secret.slice(0, 4)}\u2026`;
+};
+
+/** A copy of `headers` with every secret value cut to its first 4 characters and an ellipsis. Other headers stay as they are. */
+export function maskHeaders(headers: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(headers).map(([k, v]) => [k, SECRET_HEADERS.has(k.toLowerCase()) ? maskValue(v) : v]));
+}

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { browserHeaders, isOtherProviderName, readTrimmed } from "../../src/browser/headers.ts";
+import { browserHeaders, isOtherProviderName, maskHeaders, readTrimmed } from "../../src/browser/headers.ts";
 
 const TOKEN = "aisg_SYNTHETIC_FIXTURE_tok_abc";
 const id = (name: string, extra: object = {}) => ({ name, label: name, configDir: `/ids/${name}`, ...extra });
@@ -147,6 +147,47 @@ test("token file reader: trims whitespace, refuses empty, missing and directory"
     expect((await browserHeaders({ ...noRegistry, env: env(join(dir, "padded")) })).Authorization).toBe(`Bearer ${TOKEN}`);
     for (const f of ["empty", "blank", "missing", "folder"]) expect(await browserHeaders({ ...noRegistry, env: env(join(dir, f)) })).toEqual({});
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("maskHeaders: bearer token cut to 4 characters, other headers readable", async () => {
+  const h = await browserHeaders({ ...base, env: { CLAUDE_CONFIG_DIR: "/ids/pool", T3CODE_THREAD_ID: "thread-abc" } });
+  const m = maskHeaders(h);
+  expect(m.Authorization).toBe("Bearer aisg\u2026");
+  expect(JSON.stringify(m)).not.toContain(TOKEN);
+  expect(m["X-AIS-Chat-Id"]).toBe("thread-abc");
+  expect(m["X-AIS-Pool"]).toBe("team-pool");
+  expect(m["X-AIS-Session-Label"]).toBe(h["X-AIS-Session-Label"]);
+  expect(maskHeaders({ Cookie: "sessionsecret" }).Cookie).toBe("sess\u2026");
+});
+
+test("ais browser headers: plain masks, --tool and --reveal print the token", async () => {
+  const { runBrowserCommand } = await import("../../src/cli/browser/dispatch.ts");
+  const dir = mkdtempSync(join(tmpdir(), "ais-hdr-"));
+  const tokenFile = join(dir, "tok");
+  writeFileSync(tokenFile, `${TOKEN}\n`, { mode: 0o600 });
+  const saved = { ...process.env };
+  process.env.CLAUDE_CONFIG_DIR = join(dir, "no-such-identity");
+  process.env.AIS_BROWSER_AGENT_TOKEN_FILE = tokenFile;
+  process.env.T3CODE_THREAD_ID = "thread-xyz";
+  try {
+    const run = async (flags: Record<string, string | true>) => {
+      const lines: string[] = [];
+      await runBrowserCommand(["headers"], { ...flags }, { out: (l: string) => lines.push(l) });
+      return lines.join("\n");
+    };
+    const masked = await run({});
+    expect(masked).not.toContain(TOKEN);
+    expect(masked).toContain("Bearer aisg");
+    expect(masked).toContain("thread-xyz");
+    expect(JSON.parse(await run({ reveal: true })).Authorization).toBe(`Bearer ${TOKEN}`);
+    expect(JSON.parse(await run({ tool: "claude" })).Authorization).toBe(`Bearer ${TOKEN}`);
+  } finally {
+    for (const k of ["CLAUDE_CONFIG_DIR", "AIS_BROWSER_AGENT_TOKEN_FILE", "T3CODE_THREAD_ID"]) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k]!;
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });
