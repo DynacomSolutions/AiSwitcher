@@ -455,6 +455,30 @@ describe("usage proxy: opencode and grok hosts", () => {
     }
   });
 
+  test("a certificate reload that finishes after stop starts no loopback TLS server", async () => {
+    const reloadDir = join(dir, "reload-tls");
+    await mkdir(reloadDir);
+    makeTls(reloadDir);
+    const keyPem = join(dir, "reload-key.pem");
+    Bun.spawnSync(["cp", join(reloadDir, "tls.key"), keyPem]);
+    const p = await proxy([], { tlsDir: reloadDir, tlsRecheckMs: 20 });
+    // The key becomes a named pipe, so the reload read blocks until a writer opens it; the certificate gets a new mtime.
+    Bun.spawnSync(["sh", "-c", "rm tls.key && mkfifo tls.key && touch tls.crt"], { cwd: reloadDir });
+    await Bun.sleep(100); // the reload has started and waits on the key
+    const realServe = Bun.serve;
+    let started = 0;
+    const spy = spyOn(Bun, "serve").mockImplementation(((o: Parameters<typeof Bun.serve>[0]) => ((started += 1), realServe(o))) as unknown as typeof Bun.serve);
+    try {
+      await p.stop(true);
+      // Let the blocked read finish after stop (a bounded writer, so no process is left waiting).
+      Bun.spawnSync(["timeout", "2", "sh", "-c", `for i in 1 2 3 4 5 6; do cat ${keyPem} > tls.key; done`], { cwd: reloadDir });
+      await Bun.sleep(100);
+      expect(started).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   test("a missing certificate rejects the start", async () => {
     await expect(proxy([], { tlsDir: join(dir, "missing") })).rejects.toThrow();
   });

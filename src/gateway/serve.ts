@@ -1620,7 +1620,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
             timer.unref?.();
           }),
         ]);
-        if (draining) return true; // closed above; the gateway is stopping.
+        if (draining) {
+          // stop() ran between the check above and here: close this proxy too (a second stop is safe).
+          await started.stop(true).catch(() => undefined);
+          return true;
+        }
         mine = started;
         connectProxy = started;
         console.info(`gateway: connect proxy on :${started.port}`);

@@ -207,11 +207,14 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
   let covered = coveredHosts(tls.cert);
   const logCovered = (): void => log(`gateway: connect-proxy intercepts ${[...covered].join(", ") || "no host"} (certificate names)`);
   logCovered();
+  /** Set by stop(): nothing may start after it (a certificate reload that finishes late starts no loopback TLS server). */
+  let stopped = false;
   const recheck = setInterval(() => {
     void (async () => {
       const st = await stat(join(opts.tlsDir, "tls.crt")).catch(() => undefined);
       if (!st || st.mtimeMs === tls.mtime) return;
       const next = await readTls(opts.tlsDir);
+      if (stopped) return;
       const old = tlsServer;
       tlsServer = startTls(next);
       tls = next;
@@ -291,7 +294,6 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
     throw err;
   }
   // An error or an unexpected close after the listener is up is logged and reported once, never thrown as an unhandled event that ends the process.
-  let stopped = false;
   let reportedDown = false;
   const down = (reason: string): void => {
     if (stopped || reportedDown) return;

@@ -977,8 +977,8 @@ rule) and `ais_gateway_connect_proxy_start_failures_total` (always present). `ai
 `/readyz`, so they are 0 while a configured CONNECT proxy is not listening. A listener that dies after it started (a server
 error or an unexpected close) is closed, reported as not listening, and started again with the same backoff; the 5 minute
 `/healthz` limit counts from that moment. Each start attempt is given up after 10 s, and a start that finishes late is
-closed. The cluster liveness probe opens a TCP connection to the CONNECT port, so a listener that dies after start is
-caught there too. A failed start releases its loopback TLS listener and renewal timer, so retries leak nothing.
+closed. The cluster liveness probe also opens a TCP connection to the CONNECT port, so it can restart the container after
+about 3 minutes of a dead listener, before the 5 minute `/healthz` limit, and it catches a listener that dies after start. A failed start releases its loopback TLS listener and renewal timer, so retries leak nothing.
 
 The console stands down for every store-owned login (`docs/agents/console-web.md`, `AIS_GATEWAY_STORE_DATABASE_URL`).
 

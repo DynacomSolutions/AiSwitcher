@@ -265,7 +265,9 @@ describe("serve lifecycle", () => {
       const stopping = g.stop();
       finish();
       await stopping;
-      expect(stopped).toEqual([true]);
+      // Closed at least once, always with force (a second stop of the same proxy is safe).
+      expect(stopped.length).toBeGreaterThanOrEqual(1);
+      expect(stopped.every((f) => f === true)).toBe(true);
       const settled = calls;
       await Bun.sleep(60);
       expect(calls).toBe(settled);
