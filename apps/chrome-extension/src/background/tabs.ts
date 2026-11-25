@@ -26,6 +26,8 @@ const RELINK_DEBOUNCE_MS = 400;
  * (for example after context compaction) gives a new session id within minutes, long before SESSION_END_MS.
  */
 export const HOLDER_LIVE_MS = 10 * 60_000;
+/** The call time of a session is written to the session storage at most this often. */
+const CALL_STORE_MS = 30_000;
 /** Tab changes in a saved group are written to its snapshot after this quiet time, so closing a whole group never shrinks the snapshot tab by tab. */
 const SAVED_REFRESH_MS = 1500;
 /** A snapshot only shrinks when the group is still alive this long after the first refresh that saw the shrink. */
@@ -57,7 +59,7 @@ export interface SavedTab { url: string; title: string; split?: number }
  */
 export interface SavedFlag { owned: boolean; approved: boolean }
 /** A named tab group that outlives the agent session. `groupId` is -1 while the group is closed. `tabIds` are the live tab ids, used to check that a group id still means this group. */
-export interface SavedGroup { name: string; title: string; color: GroupColor; groupId: number; identity: string; tabIds: number[]; tabs: SavedTab[]; /** One entry per `tabIds` entry, same order, so it survives a relink. Absent in older entries: nothing is known to be owned and every tab counts as approved. */ flags?: SavedFlag[]; /** The session that last held the group: it regains the grant after idling out. */ holder?: string; /** The chat (session label) that saved the group. A later session of the same identity and chat regains the group. Absent in entries from older versions. */ label?: string }
+export interface SavedGroup { name: string; title: string; color: GroupColor; groupId: number; identity: string; tabIds: number[]; tabs: SavedTab[]; /** One entry per `tabIds` entry, same order, so it survives a relink. Absent in older entries: nothing is known to be owned and every tab counts as approved. */ flags?: SavedFlag[]; /** The session that last held the group: it regains the grant after idling out. */ holder?: string; /** The chat (session label) that saved the group. A later session of the same identity and chat regains the group. Absent in entries from older versions. */ label?: string; /** Stable chat id of the saving chat. When the entry and the caller both have one, they must match. Absent in older entries: the label rule alone applies. */ chatId?: string }
 /** One tab of an agent group record. `owned` is false for a tab that sits in the group but never belonged to the session (a tab the user added). */
 export interface AgentTab { id: number; url: string; adopted: boolean; owned: boolean; /** A tab of a group the user approved with request_group: no session of the chat closes or ungroups it. */ approved?: true }
 /** A group that an agent session created. It outlives the session and the browser run, and stays with the chat (identity plus label). */
@@ -107,6 +109,8 @@ export class TabManager {
   }
   /** Saved groups by name, shared by every session of this browser. Persisted in chrome.storage.local. */
   private readonly saved = new Map<string, SavedGroup>();
+  /** When the call time of each session was last written to the session storage. */
+  private readonly callStored = new Map<string, number>();
   private readonly opening = new Set<string>();
   private readonly shrinkSince = new Map<string, number>();
   private savedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -385,6 +389,7 @@ export class TabManager {
       entry.groupId = gid;
       entry.holder = ref.id;
       if (ref.label !== "" && ref.chat !== true) entry.label = ref.label;
+      if (ref.chatId !== undefined) entry.chatId = ref.chatId;
       await this.snapshotOf(entry, members, s);
       this.saved.set(name, entry);
       this.grants.set(gid, ref.id);
@@ -467,6 +472,7 @@ export class TabManager {
     if (ref.label === "" || ref.chat === true || g.identity !== ref.identity || g.groupId === -1) return false;
     const records = this.chatRecords(ref.identity, ref.label).filter(r => r.groupId === g.groupId);
     if (g.label !== undefined ? g.label !== ref.label : records.length === 0) return false;
+    if (g.chatId !== undefined && ref.chatId !== undefined && g.chatId !== ref.chatId) return false; // another chat with the same label
     const s = this.session(ref);
     if (s.groupId !== -1 && s.tabIds.size > 0 && await this.api.tabGroups.get(s.groupId)) return false;
     let rec: AgentGroup | undefined;
@@ -522,7 +528,7 @@ export class TabManager {
   /** The first call of a session: regains an open saved group of its own chat. */
   private async reclaimSaved(ref: SessionRef): Promise<boolean> {
     for (const g of [...this.saved.values()]) {
-      if (g.identity !== ref.identity || g.groupId === -1 || (g.label !== undefined && g.label !== ref.label)) continue;
+      if (g.identity !== ref.identity || g.groupId === -1 || (g.label !== undefined && g.label !== ref.label) || (g.chatId !== undefined && ref.chatId !== undefined && g.chatId !== ref.chatId)) continue;
       if (g.label === undefined && this.chatRecords(ref.identity, ref.label).every(r => r.groupId !== g.groupId)) continue; // an older entry: only the chat's own record links it
       const s = this.sessions.get(ref.id);
       if (s && this.grants.get(g.groupId) === ref.id && g.tabIds.every((id, i) => g.flags?.[i]?.owned !== true || s.tabIds.has(id))) continue; // already holds every tab it owns
@@ -749,9 +755,12 @@ export class TabManager {
 
   /** A call happened: the session is live and is not idle. */
   private markCall(id: string): void {
-    this.lastCall.set(id, this.now());
-    this.lastSeen.set(id, this.now());
-    this.persist();
+    const now = this.now();
+    const stored = this.callStored.get(id);
+    this.lastCall.set(id, now);
+    this.lastSeen.set(id, now);
+    // The stored call time only has to be fresh within HOLDER_LIVE_MS: write it at most once per CALL_STORE_MS.
+    if (stored === undefined || now - stored >= CALL_STORE_MS) { this.callStored.set(id, now); this.persist(); }
   }
 
   /**
@@ -1038,8 +1047,9 @@ export class TabManager {
 
   /** Revokes grants whose group is gone (closed by the user). */
   async pruneGrants(): Promise<void> {
-    for (const gid of [...this.grants.keys()]) if (!(await this.api.tabGroups.get(gid))) this.grants.delete(gid);
-    this.persist();
+    let dropped = false;
+    for (const gid of [...this.grants.keys()]) if (!(await this.api.tabGroups.get(gid))) { this.grants.delete(gid); dropped = true; }
+    if (dropped) this.persist();
   }
 
   /** The session ended: its grants go and it is dropped when it holds no tabs. */
@@ -1053,7 +1063,7 @@ export class TabManager {
     }
     if (this.sessions.get(id)?.tabIds.size === 0) this.sessions.delete(id);
     this.lastSeen.delete(id);
-    this.lastCall.delete(id);
+    this.lastCall.delete(id); this.callStored.delete(id);
     this.persist();
   }
 
@@ -1276,7 +1286,7 @@ export class TabManager {
     const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, ...(s.chatId !== undefined ? { chatId: s.chatId } : {}), tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted], ...(s.approved && s.approved.size > 0 ? { approvedTabIds: [...s.approved] } : {}), ...(s.chat ? { chat: true } : {}), ...(s.color !== undefined ? { color: s.color } : {}) }));
     const grants = [...this.grants].map(([groupId, sessionId]) => ({ groupId, sessionId }));
     const chatLinks = [...this.links].map(([sessionId, tabIds]) => ({ sessionId, tabIds: [...tabIds] }));
-    return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants, [CHAT_LINKS_KEY]: chatLinks, [LAST_CALLS_KEY]: Object.fromEntries(this.lastCall) };
+    return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants, [CHAT_LINKS_KEY]: chatLinks, [LAST_CALLS_KEY]: Object.fromEntries([...this.lastCall].filter(([, at]) => this.now() - at <= HOLDER_LIVE_MS)) };
   }
 
   private persist(): void {
@@ -1288,7 +1298,8 @@ export class TabManager {
    * and grants are handed to the next instance through chrome.storage.local. Tab and group ids stay valid.
    */
   async handover(): Promise<void> {
-    await this.api.storage.set({ [HANDOVER_KEY]: { at: this.now(), ...this.snapshot() } });
+    const started = (await this.api.sessionStorage.get([RUN_STARTED_KEY]))[RUN_STARTED_KEY];
+    await this.api.storage.set({ [HANDOVER_KEY]: { at: this.now(), ...this.snapshot(), ...(typeof started === "number" ? { [RUN_STARTED_KEY]: started } : {}) } });
   }
 
   /** Rebuild ownership and grants after a service-worker restart or a self-update reload; tabs and groups that no longer exist are dropped. */
@@ -1323,13 +1334,13 @@ export class TabManager {
       await this.api.storage.remove([HANDOVER_KEY]);
       if (!Array.isArray(stored[SESSIONS_KEY]) && typeof handed.at === "number" && this.now() - handed.at < HANDOVER_MAX_AGE_MS) {
         stored = handed;
-        await this.api.sessionStorage.set({ [SESSIONS_KEY]: handed[SESSIONS_KEY], [GRANTS_KEY]: handed[GRANTS_KEY], [CHAT_LINKS_KEY]: handed[CHAT_LINKS_KEY] ?? [], [LAST_CALLS_KEY]: handed[LAST_CALLS_KEY] ?? {} });
+        await this.api.sessionStorage.set({ [SESSIONS_KEY]: handed[SESSIONS_KEY], [GRANTS_KEY]: handed[GRANTS_KEY], [CHAT_LINKS_KEY]: handed[CHAT_LINKS_KEY] ?? [], [LAST_CALLS_KEY]: handed[LAST_CALLS_KEY] ?? {}, ...(typeof handed[RUN_STARTED_KEY] === "number" ? { [RUN_STARTED_KEY]: handed[RUN_STARTED_KEY] } : {}) });
       }
     }
     const raw = stored[SESSIONS_KEY];
     if (!Array.isArray(raw)) return;
     const calls = stored[LAST_CALLS_KEY];
-    if (typeof calls === "object" && calls !== null) for (const [id, at] of Object.entries(calls)) if (typeof at === "number") this.lastCall.set(id, at);
+    if (typeof calls === "object" && calls !== null) for (const [id, at] of Object.entries(calls)) if (typeof at === "number" && this.now() - at <= HOLDER_LIVE_MS) { this.lastCall.set(id, at); this.callStored.set(id, at); }
     const live = new Set((await this.queryTabs()).map(t => t.id));
     const storedLinks = stored[CHAT_LINKS_KEY];
     if (Array.isArray(storedLinks)) {

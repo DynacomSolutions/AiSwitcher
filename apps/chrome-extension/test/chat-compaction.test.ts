@@ -142,15 +142,14 @@ describe("the stable chat id decides who takes tabs from a dead session", () => 
   });
 
   test("an older shim with an own group takes nothing from a dead session", async () => {
-    const { t, a1 } = await compacted();
-    // The older shim made its own group while the holder was still live (before the quiet time of `compacted`).
+    // The older shim made its own group while the holder was still live.
     const t2 = setup();
     const x1 = await t2.create(S1, "https://mail.example.com/1");
     await t2.call("tabs_context", {}, S1);
     await t2.create(OLD_SHIM, "https://old.example.com/1");
     clock += HOLDER_LIVE_MS + 1000;
     expect(await t2.call("close_tab", { tabId: x1 }, OLD_SHIM)).toMatchObject({ ok: false, error: "forbidden_tab" });
-    expect(t.api.tabList.has(a1)).toBe(true);
+    expect(t2.api.tabList.has(x1)).toBe(true);
   });
 
   test("a service worker restart keeps live sessions live", async () => {
@@ -171,6 +170,63 @@ describe("the stable chat id decides who takes tabs from a dead session", () => 
     const g = ctx.groups.find((x: { groupId: number }) => x.groupId === gidA);
     expect(g).toMatchObject({ scope: "other", holderLabel: "Mail chat", holderLive: true });
     expect(t.api.tabList.has(a1)).toBe(true);
+  });
+});
+
+describe("a saved group follows the chat id", () => {
+  async function savedByMail() {
+    const t = setup();
+    const a1 = await t.create(S1, "https://mail.example.com/1");
+    await t.tabs.refreshAgents();
+    const gid = t.api.tabList.get(a1)!.groupId;
+    expect(await t.call("save_group", { name: "Mail saved" }, S1)).toMatchObject({ ok: true });
+    clock += HOLDER_LIVE_MS + 1000; // S1 is quiet for good
+    return { t, a1, gid };
+  }
+
+  test("a chat with the same label and another chat id neither regains nor closes the saved group", async () => {
+    const { t, a1, gid } = await savedByMail();
+    await t.call("tabs_context", {}, SAME_LABEL);
+    expect(await t.call("close_tab", { tabId: a1 }, SAME_LABEL)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(await t.call("close_group", { groupId: gid }, SAME_LABEL)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.api.tabList.has(a1)).toBe(true);
+  });
+
+  test("a later session of the same chat id regains the saved group", async () => {
+    const { t, a1 } = await savedByMail();
+    expect(await t.call("close_tab", { tabId: a1 }, S2)).toMatchObject({ ok: true });
+    expect(t.api.tabList.has(a1)).toBe(false);
+  });
+
+  test("a saved group stored before the chat id existed keeps the label rule", async () => {
+    const { t, a1 } = await savedByMail();
+    for (const g of t.api.store.savedGroups as Array<{ chatId?: string }>) delete g.chatId;
+    const later = setup(t.api);
+    await later.tabs.load();
+    expect(await later.call("close_tab", { tabId: a1 }, SAME_LABEL)).toMatchObject({ ok: true });
+  });
+});
+
+describe("the call time is stored rarely", () => {
+  test("one tabs_context call writes the call time at most once", async () => {
+    const t = setup();
+    await t.create(S1, "https://mail.example.com/1");
+    clock += 60_000;
+    let writes = 0;
+    const set = t.api.sessionStorage.set;
+    t.api.sessionStorage.set = async (v: Record<string, unknown>) => { if ("lastCalls" in v) writes++; return set(v); };
+    await t.call("tabs_context", {}, S1);
+    expect(writes).toBeLessThanOrEqual(1);
+  });
+
+  test("a call time older than the live window is not stored", async () => {
+    const t = setup();
+    await t.create(S1, "https://mail.example.com/1");
+    clock += HOLDER_LIVE_MS + 1000;
+    await t.create(S2, "https://docs.example.com/1");
+    const calls = t.api.session.lastCalls as Record<string, number>;
+    expect(calls[S1.id]).toBeUndefined();
+    expect(calls[S2.id]).toBeDefined();
   });
 });
 
