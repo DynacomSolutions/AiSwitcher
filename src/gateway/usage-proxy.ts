@@ -81,6 +81,11 @@ export interface UsageProxyOptions {
   connectTarget?(host: string, port: number): { host: string; port: number };
   log?(line: string): void;
   tlsRecheckMs?: number;
+  /**
+   * Called once when the listener is gone without a call to `stop`: a server error or an unexpected close. The caller
+   * closes this proxy and starts a new one. Never called after `stop`.
+   */
+  onDown?(reason: string): void;
 }
 
 export interface RunningUsageProxy {
@@ -202,11 +207,14 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
   let covered = coveredHosts(tls.cert);
   const logCovered = (): void => log(`gateway: connect-proxy intercepts ${[...covered].join(", ") || "no host"} (certificate names)`);
   logCovered();
+  /** Set by stop(): nothing may start after it (a certificate reload that finishes late starts no loopback TLS server). */
+  let stopped = false;
   const recheck = setInterval(() => {
     void (async () => {
       const st = await stat(join(opts.tlsDir, "tls.crt")).catch(() => undefined);
       if (!st || st.mtimeMs === tls.mtime) return;
       const next = await readTls(opts.tlsDir);
+      if (stopped) return;
       const old = tlsServer;
       tlsServer = startTls(next);
       tls = next;
@@ -271,18 +279,40 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
     client.on("error", () => client.destroy());
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen({ host: opts.host ?? "0.0.0.0", port: opts.port }, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen({ host: opts.host ?? "0.0.0.0", port: opts.port }, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (err) {
+    // The port is held or refused: release the loopback TLS listener and the renewal timer, so a retry starts clean and leaks nothing.
+    clearInterval(recheck);
+    await tlsServer.stop(true).catch(() => undefined);
+    throw err;
+  }
+  // An error or an unexpected close after the listener is up is logged and reported once, never thrown as an unhandled event that ends the process.
+  let reportedDown = false;
+  const down = (reason: string): void => {
+    if (stopped || reportedDown) return;
+    reportedDown = true;
+    log(`gateway: connect-proxy listener down (${reason})`);
+    opts.onDown?.(reason);
+  };
+  server.on("error", (err: Error) => down(err.message));
+  server.on("close", () => down("closed"));
   return {
     port: (server.address() as net.AddressInfo).port,
     stop: async (force = true) => {
+      stopped = true;
       clearInterval(recheck);
-      server.close();
+      try {
+        server.close();
+      } catch {
+        // Already closed.
+      }
       await tlsServer.stop(force);
     },
   };

@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -391,6 +391,96 @@ describe("usage proxy: opencode and grok hosts", () => {
     const res = await viaProxy(p.port, { ca: await readFile(join(narrowTlsDir, "ca.crt"), "utf8"), path: "/api/oauth/usage", headers: { authorization: `Bearer ${APP_TOKEN}` } });
     expect(res.status).toBe(200);
     expect(targets).toEqual(["opencode.ai:443"]);
+  });
+
+  test("a start refused by a held port rejects, stops its loopback TLS server and its timer, and succeeds once the port is free", async () => {
+    const holder = net.createServer();
+    await new Promise<void>((r) => holder.listen({ host: "127.0.0.1", port: 0 }, () => r()));
+    const heldPort = (holder.address() as net.AddressInfo).port;
+    const servers: Array<{ stops: number }> = [];
+    const realServe = Bun.serve;
+    const serveSpy = spyOn(Bun, "serve").mockImplementation(((o: Parameters<typeof Bun.serve>[0]) => {
+      const srv = realServe(o);
+      const rec = { stops: 0 };
+      servers.push(rec);
+      const realStop = srv.stop.bind(srv);
+      srv.stop = ((force?: boolean) => ((rec.stops += 1), realStop(force))) as typeof srv.stop;
+      return srv;
+    }) as unknown as typeof Bun.serve);
+    const timers = new Set<unknown>();
+    const realSet = globalThis.setInterval;
+    const realClear = globalThis.clearInterval;
+    const setSpy = spyOn(globalThis, "setInterval").mockImplementation(((...a: Parameters<typeof setInterval>) => {
+      const h = realSet(...a);
+      timers.add(h);
+      return h;
+    }) as typeof setInterval);
+    const clearSpy = spyOn(globalThis, "clearInterval").mockImplementation(((h: Parameters<typeof clearInterval>[0]) => (timers.delete(h), realClear(h))) as typeof clearInterval);
+    try {
+      await expect(proxy([], { port: heldPort })).rejects.toThrow();
+      expect(servers).toEqual([{ stops: 1 }]); // the loopback TLS server was stopped
+      expect(timers.size).toBe(0); // the certificate renewal timer was cleared
+    } finally {
+      serveSpy.mockRestore();
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+    await new Promise<void>((r) => holder.close(() => r()));
+    const p = await proxy([], { port: heldPort });
+    expect(p.port).toBe(heldPort);
+  });
+
+  test("onDown fires once when the listener closes without stop, and never after stop", async () => {
+    const created: net.Server[] = [];
+    const realCreate = net.createServer;
+    const spy = spyOn(net, "createServer").mockImplementation(((...a: Parameters<typeof net.createServer>) => {
+      const srv = realCreate(...a);
+      created.push(srv);
+      return srv;
+    }) as typeof net.createServer);
+    try {
+      const reasons: string[] = [];
+      const p = await proxy([], { onDown: (r) => void reasons.push(r) });
+      created[0]!.close();
+      await Bun.sleep(20);
+      expect(reasons).toEqual(["closed"]);
+      await p.stop(true);
+      expect(reasons).toHaveLength(1);
+      const q = await proxy([], { onDown: (r) => void reasons.push(r) });
+      await q.stop(true);
+      await Bun.sleep(20);
+      expect(reasons).toHaveLength(1); // a stop the caller asked for is not "down"
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("a certificate reload that finishes after stop starts no loopback TLS server", async () => {
+    const reloadDir = join(dir, "reload-tls");
+    await mkdir(reloadDir);
+    makeTls(reloadDir);
+    const keyPem = join(dir, "reload-key.pem");
+    Bun.spawnSync(["cp", join(reloadDir, "tls.key"), keyPem]);
+    const p = await proxy([], { tlsDir: reloadDir, tlsRecheckMs: 20 });
+    // The key becomes a named pipe, so the reload read blocks until a writer opens it; the certificate gets a new mtime.
+    Bun.spawnSync(["sh", "-c", "rm tls.key && mkfifo tls.key && touch tls.crt"], { cwd: reloadDir });
+    await Bun.sleep(100); // the reload has started and waits on the key
+    const realServe = Bun.serve;
+    let started = 0;
+    const spy = spyOn(Bun, "serve").mockImplementation(((o: Parameters<typeof Bun.serve>[0]) => ((started += 1), realServe(o))) as unknown as typeof Bun.serve);
+    try {
+      await p.stop(true);
+      // Let the blocked read finish after stop (a bounded writer, so no process is left waiting).
+      Bun.spawnSync(["timeout", "2", "sh", "-c", `for i in 1 2 3 4 5 6; do cat ${keyPem} > tls.key; done`], { cwd: reloadDir });
+      await Bun.sleep(100);
+      expect(started).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("a missing certificate rejects the start", async () => {
+    await expect(proxy([], { tlsDir: join(dir, "missing") })).rejects.toThrow();
   });
 });
 
