@@ -162,7 +162,7 @@ test("maskHeaders: bearer token cut to 4 characters, other headers readable", as
   expect(maskHeaders({ Cookie: "sessionsecret" }).Cookie).toBe("sess\u2026");
 });
 
-test("ais browser headers: masked by default, --reveal prints the token", async () => {
+test("ais browser headers: plain masks, --tool and --reveal print the token", async () => {
   const { runBrowserCommand } = await import("../../src/cli/browser/dispatch.ts");
   const dir = mkdtempSync(join(tmpdir(), "ais-hdr-"));
   const tokenFile = join(dir, "tok");
@@ -174,7 +174,7 @@ test("ais browser headers: masked by default, --reveal prints the token", async 
   try {
     const run = async (flags: Record<string, string | true>) => {
       const lines: string[] = [];
-      await runBrowserCommand(["headers"], { tool: "claude", ...flags }, { out: (l: string) => lines.push(l) });
+      await runBrowserCommand(["headers"], { ...flags }, { out: (l: string) => lines.push(l) });
       return lines.join("\n");
     };
     const masked = await run({});
@@ -182,6 +182,7 @@ test("ais browser headers: masked by default, --reveal prints the token", async 
     expect(masked).toContain("Bearer aisg");
     expect(masked).toContain("thread-xyz");
     expect(JSON.parse(await run({ reveal: true })).Authorization).toBe(`Bearer ${TOKEN}`);
+    expect(JSON.parse(await run({ tool: "claude" })).Authorization).toBe(`Bearer ${TOKEN}`);
   } finally {
     for (const k of ["CLAUDE_CONFIG_DIR", "AIS_BROWSER_AGENT_TOKEN_FILE", "T3CODE_THREAD_ID"]) {
       if (saved[k] === undefined) delete process.env[k];

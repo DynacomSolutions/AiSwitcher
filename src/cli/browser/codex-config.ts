@@ -34,7 +34,7 @@ export function codexBlock(gateway: string, ais: string, home: string): string {
     BEGIN,
     "[mcp_servers.ais-browser]",
     `url = ${toml(url)}`,
-    `http_headers_helper = ${toml(`${shq(ais)} browser headers --tool=codex --reveal --config-dir=${shq(home)}`)}`,
+    `http_headers_helper = ${toml(`${shq(ais)} browser headers --tool=codex --config-dir=${shq(home)}`)}`,
     `tool_timeout_sec = ${TOOL_TIMEOUT_SEC}`,
     END,
     "",

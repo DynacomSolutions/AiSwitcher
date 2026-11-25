@@ -22,9 +22,9 @@ export async function runBrowserCommand(positionals: string[], flags: ParsedArgs
     const { browserHeaders, maskHeaders } = await import("../../browser/headers.ts");
     const tool = flags.tool === "claude" || flags.tool === "codex" ? flags.tool : undefined;
     const configDir = typeof flags["config-dir"] === "string" ? flags["config-dir"] : undefined;
-    // Secret values are masked unless --reveal is set. Claude and Codex run the helper with --reveal: they read stdout as JSON headers.
+    // Helper form (--tool=<name>) and --reveal print real values: Claude and Codex read stdout as JSON headers. Plain output masks secrets.
     const headers = await browserHeaders({ env: process.env, cwd: process.cwd(), tool, configDir });
-    (deps.out ?? ((l: string) => process.stdout.write(`${l}\n`)))(JSON.stringify(flags.reveal === true ? headers : maskHeaders(headers)));
+    (deps.out ?? ((l: string) => process.stdout.write(`${l}\n`)))(JSON.stringify(flags.reveal === true || tool !== undefined ? headers : maskHeaders(headers)));
     return;
   }
   if (sub === "codex-config") {
