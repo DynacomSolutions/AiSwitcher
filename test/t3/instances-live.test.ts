@@ -46,9 +46,15 @@ test("check writes no token file", async () => {
   await expect(stat(join(tokenDir, "t3-kimi-pool"))).rejects.toThrow();
 });
 
-test("the scoped token is preferred to the admin token, and the admin token alone still works without token reads", async () => {
+test("the admin token wins when both are set (a host keeps both in ~/.secrets), and the admin token alone makes no token reads", async () => {
   await writeFile(secrets, `AIS_GATEWAY_ADMIN_URL=https://admin.example\nAIS_GATEWAY_ADMIN_TOKEN=adm\nAIS_GATEWAY_PROXY_URL=https://gw.example/gateway\nAIS_GATEWAY_APP_T3_KIMI_POOL_TOKEN=aisg_local1\n`);
   await syncT3InstancesLive(deps(), { home, env: {} });
   expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(["GET /apps"]);
   expect(calls[0]!.auth).toBe("Bearer adm");
+});
+
+test("a host with both tokens uses the admin path only", async () => {
+  await writeFile(secrets, `AIS_GATEWAY_ADMIN_URL=https://admin.example\nAIS_GATEWAY_ADMIN_TOKEN=adm\nAIS_GATEWAY_INSTANCES_TOKEN=${SCOPE}\nAIS_GATEWAY_PROXY_URL=https://gw.example/gateway\nAIS_GATEWAY_APP_T3_KIMI_POOL_TOKEN=aisg_local1\n`);
+  await syncT3InstancesLive(deps(), { home, env: {} });
+  expect(calls.map((c) => `${c.method} ${c.path} ${c.auth}`)).toEqual(["GET /apps Bearer adm"]);
 });

@@ -34,12 +34,13 @@ async function setting(deps: GatewayCliDeps, key: string): Promise<string | unde
 
 /**
  * Reads the app list and the proxy base from the gateway and applies the difference to T3's settings.
- * With AIS_GATEWAY_INSTANCES_TOKEN set (a pod, or a host without the admin token) the list comes from the scoped credential and each
+ * With AIS_GATEWAY_INSTANCES_TOKEN set and no admin token (a pod) the list comes from the scoped credential and each
  * app token is read from the gateway now (POST /apps/<app>/instance-token); with `tokenDir` the tokens are also written there, one
  * file per app (mode 0600). Without it the admin token reads the list and the app tokens come from the token folder or ~/.secrets.
  */
 export async function syncT3InstancesLive(deps: GatewayCliDeps, opts: LiveSyncOptions = {}): Promise<SyncItem[]> {
-  const scoped = await setting(deps, INSTANCES_TOKEN_KEY);
+  // The scoped credential is for a pod, which has no admin token. A host that has the admin token uses it (and its own app tokens).
+  const scoped = (await setting(deps, "AIS_GATEWAY_ADMIN_TOKEN")) ? undefined : await setting(deps, INSTANCES_TOKEN_KEY);
   const url = scoped ? await setting(deps, "AIS_GATEWAY_ADMIN_URL") : undefined;
   const admin = scoped && url ? new Admin(url.replace(/\/+$/, ""), scoped, deps.fetch) : (await connect(deps)).admin;
   const root = opts.gatewayRoot ?? (await setting(deps, "AIS_GATEWAY_PROXY_URL"));
