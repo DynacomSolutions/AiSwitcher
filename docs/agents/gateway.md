@@ -973,9 +973,12 @@ answers `503 connect proxy not listening` (checked after the other readiness ans
 minutes, `/healthz` answers `503 connect proxy not listening for <n> s`, so the kubelet restarts the container. A replica
 with no CONNECT proxy configured is unchanged. Metrics: `ais_gateway_connect_proxy_up` (1 listening, 0 configured but not
 listening; the series is absent when no CONNECT proxy is configured), `ais_gateway_connect_proxy_down_seconds` (same
-rule) and `ais_gateway_connect_proxy_start_failures_total` (always present). Cluster liveness should also open a TCP
-connection to the CONNECT port, so a listener that dies after start is caught too. A failed start releases its loopback
-TLS listener and renewal timer, so retries leak nothing.
+rule) and `ais_gateway_connect_proxy_start_failures_total` (always present). `ais_gateway_ready` and `ready()` follow
+`/readyz`, so they are 0 while a configured CONNECT proxy is not listening. A listener that dies after it started (a server
+error or an unexpected close) is closed, reported as not listening, and started again with the same backoff; the 5 minute
+`/healthz` limit counts from that moment. Each start attempt is given up after 10 s, and a start that finishes late is
+closed. The cluster liveness probe opens a TCP connection to the CONNECT port, so a listener that dies after start is
+caught there too. A failed start releases its loopback TLS listener and renewal timer, so retries leak nothing.
 
 The console stands down for every store-owned login (`docs/agents/console-web.md`, `AIS_GATEWAY_STORE_DATABASE_URL`).
 
