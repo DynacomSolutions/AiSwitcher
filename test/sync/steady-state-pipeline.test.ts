@@ -389,8 +389,11 @@ test.skipIf(process.platform !== "linux" || !rsync)("appends to large histories 
   const cold = await round(10_000, true);
   const warm = await round(20_000, true);
 
-  // Runtime start-up and the ssh/lsof children are the fixed part; the history reads must not scale with 64 MB.
-  const budget = appended * 10 + 20_000_000;
+  // The fixed part is the start-up of the ais processes and their ssh and lsof children. Every ais process reads
+  // its own source at start, so that baseline grows with the code base (about 21.8 MB on 25 Nov 2026). The budget
+  // leaves room for it and stays below half of the 65 MB history. It also sits far below the 86.6 MB that a cold
+  // phase reads, which is the regression that this test guards against.
+  const budget = appended * 10 + 28_000_000;
   const phases = ["local pull-tails", "local push-tails", "local pull-merge", "remote fake-host:tail-plan", "remote fake-host:profile-merge"];
   const measured = Object.fromEntries(phases.map((p) => [p, phaseIo(warm.text, p)?.rchar]));
   console.log(`reads: history ${whole} appended ${appended} budget ${budget}; cold ${JSON.stringify(Object.fromEntries(phases.map((p) => [p, phaseIo(cold.text, p)?.rchar])))}; warm ${JSON.stringify(measured)}`);
