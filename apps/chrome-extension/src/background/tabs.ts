@@ -755,15 +755,34 @@ export class TabManager {
    */
   private async reclaimSession(ref: SessionRef): Promise<boolean> {
     const s = this.session(ref);
-    if (s.groupId !== -1 && s.tabIds.size > 0 && await this.api.tabGroups.get(s.groupId)) return false;
+    // A session that already has a live own group (made after a compaction) still takes the tabs of an earlier dead session of its chat: they join its tab set, the group id stays.
+    const hasGroup = s.groupId !== -1 && s.tabIds.size > 0 && await this.api.tabGroups.get(s.groupId) !== undefined;
     for (const [oid, o] of [...this.sessions]) {
       if (oid === ref.id || o.chat || o.identity !== ref.identity || o.label !== ref.label || o.groupId === -1 || o.tabIds.size === 0) continue;
+      if (hasGroup && o.groupId === s.groupId) continue;
       if (this.holderLive(oid) || this.queues.has(oid) || this.grantedGroups(oid).length > 0) continue;
       if (this.grants.has(o.groupId) || this.savedClaims(o.groupId)) continue;
       if (!(await this.api.tabGroups.get(o.groupId))) continue;
-      const members = new Set((await this.queryTabs()).filter(t => t.groupId === o.groupId).map(t => t.id));
-      const ids = [...o.tabIds].filter(id => members.has(id));
-      if (ids.length === 0) continue;
+      const all = await this.queryTabs();
+      const members = new Set(all.filter(t => t.groupId === o.groupId).map(t => t.id));
+      if (![...o.tabIds].some(id => members.has(id))) continue;
+      // The tabs of the earlier group that joined the old session from other groups (an earlier compaction) stay with the chat.
+      const alive = new Set(all.map(t => t.id));
+      const ids = [...o.tabIds].filter(id => alive.has(id));
+      if (hasGroup) {
+        for (const id of ids) {
+          s.tabIds.add(id);
+          if (o.adopted.has(id)) s.adopted.add(id);
+          if (o.approved?.has(id)) { s.approved ??= new Set(); s.approved.add(id); }
+        }
+        for (const r of this.agents.values()) if (r.groupId === o.groupId && r.holder === oid) r.holder = ref.id;
+        this.sessions.delete(oid);
+        this.lastSeen.delete(oid);
+        this.lastCall.delete(oid);
+        this.persist();
+        await this.persistAgents();
+        return true;
+      }
       s.groupId = o.groupId;
       s.tabIds = new Set(ids);
       s.adopted = new Set(ids.filter(id => o.adopted.has(id)));
@@ -838,7 +857,7 @@ export class TabManager {
     for (const [groupId, tabCount] of ids) {
       const info = await this.api.tabGroups.get(groupId);
       const members = all.filter(t => t.groupId === groupId);
-      const scope = groupId === mine ? "own" : this.grants.get(groupId) === sessionId ? "granted" : [...this.saved.values()].some(g => g.groupId === groupId && members.some(t => g.tabIds.includes(t.id))) ? "saved" : "other";
+      const scope = groupId === mine || (me !== undefined && members.length > 0 && members.every(t => me.tabIds.has(t.id)) && !this.grants.has(groupId)) ? "own" : this.grants.get(groupId) === sessionId ? "granted" : [...this.saved.values()].some(g => g.groupId === groupId && members.some(t => g.tabIds.includes(t.id))) ? "saved" : "other";
       let holder: { label: string; live: boolean } | undefined;
       if (me && groupId !== mine) for (const [oid, o] of this.sessions) if (oid !== sessionId && o.groupId === groupId && o.identity === me.identity && !o.chat) { holder = { label: o.label, live: this.holderLive(oid) }; break; }
       const hiddenTabCount = grantedMine.has(groupId) ? 0 : members.filter(t => { const o = this.ownerOf(t.id); return o !== undefined && o !== sessionId; }).length;
@@ -861,13 +880,15 @@ export class TabManager {
    * Group-level rule of close_group. Only the own group of the session can be closed: never a granted group, a saved group or the group of another session.
    * The per-tab rule (owns, not approved) is checked by the caller with the same predicate as close_tab.
    */
-  checkClose(ref: SessionRef, groupId: number): { ok: true } | { ok: false; code: "forbidden_tab"; message: string } {
+  checkClose(ref: SessionRef, groupId: number, memberIds: number[] = []): { ok: true } | { ok: false; code: "forbidden_tab"; message: string } {
     const refuse = (message: string) => ({ ok: false as const, code: "forbidden_tab" as const, message });
     if (groupId < 0) return refuse(`Group ${groupId} is not a tab group.`);
     if (this.grants.has(groupId)) return refuse(`Group ${groupId} is granted to a session. A granted group belongs to the user and is never closed.`);
     if (this.savedClaims(groupId)) return refuse(`Group ${groupId} is a saved group. It belongs to the user and is never closed.`);
     const s = this.sessions.get(ref.id);
-    if (!s || s.identity !== ref.identity || s.groupId !== groupId) return refuse(`Group ${groupId} is not the own group of this session, so it cannot be closed.`);
+    // A group that an earlier session of this chat made is own too, once its tabs joined this session (see reclaimSession).
+    const ownTabs = memberIds.length > 0 && s !== undefined && memberIds.every(id => s.tabIds.has(id));
+    if (!s || s.identity !== ref.identity || (s.groupId !== groupId && !ownTabs)) return refuse(`Group ${groupId} is not the own group of this session, so it cannot be closed.`);
     return { ok: true };
   }
 
@@ -903,7 +924,9 @@ export class TabManager {
       for (const r of this.agents.values()) {
         if (r.identity !== ref.identity || r.title !== info.title || r.groupId === groupId) continue;
         const live = r.groupId !== -1 && (await this.api.tabGroups.get(r.groupId))?.title === r.title && await this.liveAgent(r);
-        if (!live) return { ok: false, code: "forbidden_tab", message: "This group may hold tabs that an earlier approval protects. Wait until its tabs finish loading, then ask again." };
+        // An unlinked record can still link while its tabs load. That wait ends with the relink window: after it, a tab that never loads (for example one stuck on a "Leave site?" dialog) no longer blocks.
+        const waiting = this.startedAt === undefined || this.now() - this.startedAt <= RELINK_WINDOW_MS;
+        if (!live && waiting) return { ok: false, code: "forbidden_tab", message: "This group may hold tabs that an earlier approval protects. Wait until its tabs finish loading, then ask again." };
       }
     }
     const tabIds = (await this.queryTabs()).filter(t => t.groupId === groupId).map(t => t.id);
