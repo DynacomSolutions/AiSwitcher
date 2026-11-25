@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { tokenFromBytes } from "./tokens.ts";
+import { INSTANCE_PREFIX_MARK, tokenFromBytes } from "./tokens.ts";
 
 /** What the t3-instances scope token is derived from. A new version string makes every old one invalid. */
 const SCOPE_CONTEXT = "ais-t3-instances-v1";
@@ -26,9 +26,10 @@ export const instanceTokenExpiry = (window: number): string => new Date((window 
 /**
  * The app token that the scope hands to a T3 instance. It is derived from the admin token, the app, a generation (app rotations)
  * and a time window, so the same call in the same window gives the same token and the store holds one record per window, not one
- * per call. The gateway stores only the hash. After a leak, rotate the admin token: every derived token then stops matching.
+ * per call. The gateway stores only the hash. The generation is the number of the app's own tokens: an app rotation adds one, so the
+ * next mint gives a new token, and the rotation ends the older minted tokens at its overlap. After a leak, rotate the app (or the admin token).
  */
 export function instanceAppToken(adminToken: string, app: string, generation: number, window: number): { token: string; prefix: string; hash: string } {
   const part = (label: string): Buffer => createHmac("sha256", adminToken).update(`${APP_CONTEXT}\n${app}\n${generation}\n${window}\n${label}`).digest();
-  return tokenFromBytes(part("prefix"), part("secret"));
+  return tokenFromBytes(part("prefix"), part("secret"), INSTANCE_PREFIX_MARK);
 }

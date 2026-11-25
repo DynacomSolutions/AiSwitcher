@@ -76,6 +76,20 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect((await s.tokensFor("b"))[0]?.expiresAt).toBeUndefined();
   });
 
+  test("capMarkedTokens and pruneMarkedTokens touch only marked tokens of the app", async () => {
+    const s = await makeStore();
+    await s.putApp(base);
+    const at = "2026-11-02T00:00:00.000Z";
+    await s.addToken({ app: "a", prefix: "zaaaaaaa", hash: "h1", createdAt: "2026-11-01T00:00:00.000Z" });
+    await s.addToken({ app: "a", prefix: "zbbbbbbb", hash: "h2", createdAt: "2026-11-01T00:00:00.000Z", expiresAt: "2026-12-01T00:00:00.000Z" });
+    await s.addToken({ app: "a", prefix: "zccccccc", hash: "h3", createdAt: "2026-11-01T00:00:00.000Z", expiresAt: "2026-11-01T12:00:00.000Z" });
+    await s.addToken({ app: "a", prefix: "kddddddd", hash: "h4", createdAt: "2026-11-01T00:00:00.000Z" });
+    await s.capMarkedTokens("a", "z", at);
+    await s.pruneMarkedTokens("a", "z", at);
+    const left = Object.fromEntries((await s.tokensFor("a")).map((t) => [t.prefix, t.expiresAt]));
+    expect(left).toEqual({ zaaaaaaa: at, zbbbbbbb: at, kddddddd: undefined });
+  });
+
   test("a revoked app is final: putApp and addToken throw and change nothing", async () => {
     const s = await makeStore();
     await s.putApp(base);

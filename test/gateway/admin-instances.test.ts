@@ -80,11 +80,28 @@ describe("t3-instances scope", () => {
     expect(await verifyToken(store, "agents-claude", own, now)).toBe(true);
   });
 
-  test("rotating the app's own token leaves the instance token working", async () => {
+  test("rotating the app ends the minted token at the overlap and the next mint is a new token", async () => {
     const first = (await (await mint("agents-claude")).json()) as { token: string };
+    const rot = (await (await call("/apps/agents-claude/tokens", ADMIN, { method: "POST", body: JSON.stringify({ overlapHours: 1 }) })).json()) as { previousTokensExpireAt: string };
+    const next = (await (await mint("agents-claude")).json()) as { token: string };
+    expect(next.token).not.toBe(first.token);
+    expect(await verifyToken(store, "agents-claude", first.token, now)).toBe(true); // overlap
+    expect(await verifyToken(store, "agents-claude", next.token, now)).toBe(true);
+    now = new Date(Date.parse(rot.previousTokensExpireAt) + 1000);
+    expect(await verifyToken(store, "agents-claude", first.token, now)).toBe(false);
+    expect(await verifyToken(store, "agents-claude", next.token, now)).toBe(true);
+  });
+
+  test("a mint removes expired minted records of the app and keeps live and own tokens", async () => {
+    const WEEK = 7 * 24 * 3600 * 1000;
+    now = new Date(Math.floor(now.getTime() / WEEK) * WEEK + 3600 * 1000);
     await call("/apps/agents-claude/tokens", ADMIN, { method: "POST" });
-    expect(((await (await mint("agents-claude")).json()) as any).token).toBe(first.token);
-    expect(await verifyToken(store, "agents-claude", first.token, now)).toBe(true);
+    await mint("agents-claude");
+    now = new Date(now.getTime() + 20 * 24 * 3600 * 1000);
+    await mint("agents-claude");
+    const records = await store.tokensFor("agents-claude");
+    expect(records.length).toBe(2); // the app's own token and the live minted one
+    expect(records.filter((r) => r.expiresAt === undefined).length).toBe(1);
   });
 
   test("a minted token is re-minted in the next window and the old one works until its overlap ends", async () => {

@@ -324,6 +324,20 @@ export class PgGatewayStore implements GatewayStore {
     await this.notifyApp(app);
   }
 
+  async capMarkedTokens(app: string, mark: string, at: string): Promise<void> {
+    await this.sql`
+      UPDATE gateway_tokens SET expires_at = ${at}::timestamptz
+      WHERE app = ${app} AND starts_with(prefix, ${mark}::text) AND (expires_at IS NULL OR expires_at > ${at}::timestamptz)`;
+    await this.notifyApp(app);
+  }
+
+  async pruneMarkedTokens(app: string, mark: string, before: string): Promise<void> {
+    await this.sql`
+      DELETE FROM gateway_tokens
+      WHERE app = ${app} AND starts_with(prefix, ${mark}::text) AND expires_at IS NOT NULL AND expires_at < ${before}::timestamptz`;
+    await this.notifyApp(app);
+  }
+
   async revokeApp(name: string): Promise<void> {
     await this.sql.begin(async (tx) => {
       await tx`UPDATE gateway_apps SET state = 'revoked' WHERE name = ${name}`;

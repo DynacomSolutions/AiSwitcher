@@ -12,7 +12,7 @@ import type { FavouritesService } from "./chat/favourites.ts";
 import type { GatewayMetrics } from "./metrics.ts";
 import type { LoginRenewal } from "./renewal.ts";
 import { adapterFor } from "./providers/index.ts";
-import { generateToken } from "./tokens.ts";
+import { generateToken, INSTANCE_PREFIX_MARK, isInstancePrefix } from "./tokens.ts";
 import { foldSessionUsage } from "./session-usage.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord, UsageHistoryRow } from "./types.ts";
@@ -365,9 +365,12 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const nowMs = deps.now().getTime();
     const window = instanceTokenWindow(nowMs);
     const expiresAt = instanceTokenExpiry(window);
+    // Expired minted records go first, so the store does not grow by one record per window.
+    await store.pruneMarkedTokens(name, INSTANCE_PREFIX_MARK, deps.now().toISOString());
     const records = await read.tokensFor(name);
-    // One token per app and window. Rotating the app's own token does not touch it (it already has an expiry); a leak is closed by rotating the admin token.
-    const t = instanceAppToken(deps.adminToken, name, 0, window);
+    // One token per app, rotation generation and window. An app rotation changes the generation (the number of the app's own tokens) and caps the minted tokens at its overlap.
+    const generation = records.filter((r) => !isInstancePrefix(r.prefix)).length;
+    const t = instanceAppToken(deps.adminToken, name, generation, window);
     const found = records.some((r) => r.prefix === t.prefix && r.hash === t.hash);
     if (!found) {
       try {
@@ -453,6 +456,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
     // Safe in any order against a racing revoke: a revoke gives every token an expiry, and this only sets one where none exists.
     // The store refuses the new token for a revoked app.
     await store.expireTokens(name, previousExpiresAt);
+    await store.capMarkedTokens(name, INSTANCE_PREFIX_MARK, previousExpiresAt);
     const t = generateToken();
     try {
       await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: now.toISOString() });
