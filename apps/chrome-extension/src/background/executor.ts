@@ -482,7 +482,7 @@ export class Executor {
         const closable = meta!.closable;
         const done = await this.tabs.takeGroup(session, groupId, meta!.tabIds, closable);
         if (!done.ok) throw new ToolError(done.code, done.message);
-        return text(JSON.stringify({ groupId, approved: true, tabCount: done.tabCount, note: closable ? "The group is now your own group. You can close its tabs with close_tab, and the session end closes them. A tab that an earlier approval protected stays protected." : "The group is now your own group and every tab is adopted. The session end closes and ungroups none of them." }));
+        return text(JSON.stringify({ groupId, approved: true, tabCount: done.tabCount, ...(done.allowCloseSkipped ? { allowCloseSkipped: true } : {}), note: closable && done.allowCloseSkipped ? "The group is now your own group and every tab is adopted. allowClose was not applied: an earlier approval may protect some tabs and they could not be told apart, so the session end closes none of them." : closable ? "The group is now your own group. You can close its tabs with close_tab, and the session end closes them. A tab that an earlier approval protected stays protected." : "The group is now your own group and every tab is adopted. The session end closes and ungroups none of them." }));
       }
       case "adopt_tab": {
         const { tabId } = a("adopt_tab");

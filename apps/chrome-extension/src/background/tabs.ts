@@ -4,10 +4,13 @@ import { UnsupportedApiError } from "./chrome-api.ts";
 import type { ChromeApi, GroupColor, TabInfo } from "./chrome-api.ts";
 
 /** `adopted` is the subset of `tabIds` the session did not create itself (adopt_tab, or tabs opened inside a user-granted group): they outlive it. */
-export interface SessionTabs { groupId: number; tabIds: Set<number>; adopted: Set<number>; identity: string; label: string; chat?: true; color?: string; /** Tabs of a group the user approved with request_group: never closed and never ungrouped by the session. */ approved?: Set<number> }
-export interface SessionRef { id: string; identity: string; label: string; chat?: true; color?: string }
+export interface SessionTabs { groupId: number; tabIds: Set<number>; adopted: Set<number>; identity: string; label: string; /** Stable chat id from the shim (T3 thread id), the same across compaction. Absent for an older shim. */ chatId?: string; chat?: true; color?: string; /** Tabs of a group the user approved with request_group: never closed and never ungrouped by the session. */ approved?: Set<number> }
+export interface SessionRef { id: string; identity: string; label: string; chatId?: string; chat?: true; color?: string }
 
 const SESSIONS_KEY = "sessions";
+const LAST_CALLS_KEY = "lastCalls";
+/** First start of this browser run, in chrome.storage.session: a service worker restart reuses it, so the relink window never restarts. */
+const RUN_STARTED_KEY = "runStartedAt";
 const GRANTS_KEY = "grants";
 const HANDOVER_KEY = "handover";
 const CHAT_LINKS_KEY = "chatLinks";
@@ -43,7 +46,7 @@ export function colorForIdentity(identity: string): GroupColor {
   return COLORS[h % COLORS.length]!;
 }
 
-export type RequestCheck = { ok: true; already: boolean; title: string; tabCount: number; tabIds: number[]; /** Another session made or holds this group. */ shared: boolean } | { ok: false; code: "forbidden_tab" | "bad_args"; message: string };
+export type RequestCheck = { ok: true; already: boolean; title: string; tabCount: number; tabIds: number[]; /** Another session made or holds this group. */ shared: boolean; /** allowClose was asked, but a tab may hold an earlier approval that could not be matched: every tab stays approved. */ allowCloseSkipped?: true } | { ok: false; code: "forbidden_tab" | "bad_args"; message: string };
 export type GrantResult = "ok" | "no_session" | "no_group" | "in_use";
 
 /** One tab of a saved group. `split` is a pair label (1, 2, ...) shared by the two tabs of a split view; absent when the tab is not in one. */
@@ -58,7 +61,7 @@ export interface SavedGroup { name: string; title: string; color: GroupColor; gr
 /** One tab of an agent group record. `owned` is false for a tab that sits in the group but never belonged to the session (a tab the user added). */
 export interface AgentTab { id: number; url: string; adopted: boolean; owned: boolean; /** A tab of a group the user approved with request_group: no session of the chat closes or ungroups it. */ approved?: true }
 /** A group that an agent session created. It outlives the session and the browser run, and stays with the chat (identity plus label). */
-export interface AgentGroup { identity: string; label: string; title: string; color: GroupColor; groupId: number; tabs: AgentTab[]; /** The session that last held the group. */ holder: string; updatedAt: number }
+export interface AgentGroup { identity: string; label: string; title: string; color: GroupColor; groupId: number; tabs: AgentTab[]; /** The session that last held the group. */ holder: string; /** Stable chat id of the holder (T3 thread id). Two chats with one label never share a record when both have an id. */ chatId?: string; updatedAt: number }
 export interface GroupOverview { groupId: number; title: string; tabCount: number; scope: "own" | "granted" | "saved" | "other"; /** Only for the own group of another session with the same identity. */ holderLabel?: string; holderLive?: boolean; /** Tabs of the group that no list in the response shows, because another session owns them. */ hiddenTabCount: number }
 export type SaveResult = { ok: true; groupId: number; tabCount: number } | { ok: false; code: "bad_args" | "forbidden_tab" | "internal"; message: string };
 export type OpenResult =
@@ -624,6 +627,7 @@ export class TabManager {
   private holderLive(sessionId: string): boolean {
     if ((this.busy.get(sessionId) ?? 0) > 0) return true;
     const seen = this.lastCall.get(sessionId);
+    // The call times live in chrome.storage.session, so a service worker restart keeps them. A browser restart clears them: every session of the earlier run is dead then.
     return seen !== undefined && this.now() - seen <= HOLDER_LIVE_MS;
   }
 
@@ -691,11 +695,12 @@ export class TabManager {
         for (const [k, o] of [...this.agents]) if (o.groupId === s.groupId) this.agents.delete(k); // the chat was renamed
         const members = all.filter(t => t.groupId === s.groupId).sort((x, y) => x.windowId - y.windowId || x.index - y.index);
         if (members.length === 0) continue;
-        r = { identity: s.identity, label: s.label, title: info.title, color: info.color ?? colorForIdentity(s.identity), groupId: s.groupId, tabs: members.map(t => TabManager.agentTab(t, s.tabIds.has(t.id), s.adopted.has(t.id), s.approved?.has(t.id) === true)), holder: sid, updatedAt: this.now() };
+        r = { identity: s.identity, label: s.label, title: info.title, color: info.color ?? colorForIdentity(s.identity), groupId: s.groupId, tabs: members.map(t => TabManager.agentTab(t, s.tabIds.has(t.id), s.adopted.has(t.id), s.approved?.has(t.id) === true)), holder: sid, ...(s.chatId !== undefined ? { chatId: s.chatId } : {}), updatedAt: this.now() };
         this.agents.set(this.freeKey(r), r);
         changed = true;
       }
       r.holder = sid;
+      if (s.chatId !== undefined) r.chatId = s.chatId;
     }
     for (const [key, r] of this.agents) {
       const live = await this.liveAgent(r, all);
@@ -746,6 +751,7 @@ export class TabManager {
   private markCall(id: string): void {
     this.lastCall.set(id, this.now());
     this.lastSeen.set(id, this.now());
+    this.persist();
   }
 
   /**
@@ -759,6 +765,9 @@ export class TabManager {
     const hasGroup = s.groupId !== -1 && s.tabIds.size > 0 && await this.api.tabGroups.get(s.groupId) !== undefined;
     for (const [oid, o] of [...this.sessions]) {
       if (oid === ref.id || o.chat || o.identity !== ref.identity || o.label !== ref.label || o.groupId === -1 || o.tabIds.size === 0) continue;
+      // Two chats can share a label. Two different chat ids never hand over. Only the same chat id moves tabs into an own group; without ids (an older shim) the label alone keeps its earlier rule.
+      if (o.chatId !== undefined && ref.chatId !== undefined && o.chatId !== ref.chatId) continue;
+      if (hasGroup && (o.chatId === undefined || o.chatId !== ref.chatId)) continue;
       if (hasGroup && o.groupId === s.groupId) continue;
       if (this.holderLive(oid) || this.queues.has(oid) || this.grantedGroups(oid).length > 0) continue;
       if (this.grants.has(o.groupId) || this.savedClaims(o.groupId)) continue;
@@ -801,6 +810,7 @@ export class TabManager {
   private async reclaimRecord(ref: SessionRef, r: AgentGroup): Promise<boolean> {
     {
       if (r.holder !== ref.id && this.holderLive(r.holder)) return false;
+      if (r.chatId !== undefined && ref.chatId !== undefined && r.chatId !== ref.chatId) return false; // another chat with the same label
       let live = await this.liveAgent(r);
       if (!live && (await this.relinkPool()).has(r)) live = await this.liveAgent(r);
       if (!live) return false;
@@ -823,6 +833,7 @@ export class TabManager {
       const approved = owned.filter(x => x.approved).map(x => x.id);
       if (approved.length > 0) s.approved = new Set(approved); else delete s.approved;
       r.holder = ref.id;
+      if (ref.chatId !== undefined) r.chatId = ref.chatId;
       r.tabs = live.map(t => TabManager.agentTab(t, s.tabIds.has(t.id), s.adopted.has(t.id), s.approved?.has(t.id) === true));
       r.updatedAt = this.now();
       this.persist();
@@ -859,7 +870,7 @@ export class TabManager {
       const members = all.filter(t => t.groupId === groupId);
       const scope = groupId === mine || (me !== undefined && members.length > 0 && members.every(t => me.tabIds.has(t.id)) && !this.grants.has(groupId)) ? "own" : this.grants.get(groupId) === sessionId ? "granted" : [...this.saved.values()].some(g => g.groupId === groupId && members.some(t => g.tabIds.includes(t.id))) ? "saved" : "other";
       let holder: { label: string; live: boolean } | undefined;
-      if (me && groupId !== mine) for (const [oid, o] of this.sessions) if (oid !== sessionId && o.groupId === groupId && o.identity === me.identity && !o.chat) { holder = { label: o.label, live: this.holderLive(oid) }; break; }
+      if (me && groupId !== mine) for (const [oid, o] of this.sessions) if (oid !== sessionId && (o.groupId === groupId || (members.length > 0 && members.every(t => o.tabIds.has(t.id)))) && o.identity === me.identity && !o.chat) { holder = { label: o.label, live: this.holderLive(oid) }; break; }
       const hiddenTabCount = grantedMine.has(groupId) ? 0 : members.filter(t => { const o = this.ownerOf(t.id); return o !== undefined && o !== sessionId; }).length;
       out.push({ groupId, title: info?.title ?? "", tabCount, scope, ...(holder ? { holderLabel: holder.label, holderLive: holder.live } : {}), hiddenTabCount });
     }
@@ -957,6 +968,24 @@ export class TabManager {
       if (id !== ref.id) for (const t of members) if (o.approved?.has(t.id)) protectedTabs.add(t.id);
     }
     for (const r of this.agents.values()) for (const t of r.tabs) if (t.approved === true && members.some(m => m.id === t.id)) protectedTabs.add(t.id);
+    // After the relink window an unlinked record of the same identity and title can still hold approved tabs (old tab ids after a browser restart, or a tab that never loaded).
+    // They match by URL. allowClose never removes an earlier approval: when an approved tab of such a record has no match, every tab stays approved.
+    let allowCloseSkipped = false;
+    if (allowClose) {
+      const title = (await this.api.tabGroups.get(groupId))?.title;
+      const matched = new Set<number>();
+      for (const r of this.agents.values()) {
+        if (r.identity !== ref.identity || r.title !== title || r.groupId === groupId) continue;
+        if (r.groupId !== -1 && await this.liveAgent(r)) continue; // linked: protected by tab id above
+        const free = new Map<number, string>(members.map(m => [m.id, m.url]));
+        for (const t of r.tabs) {
+          if (t.approved !== true) continue;
+          const hit = [...free].find(([, url]) => url === t.url);
+          if (hit) { free.delete(hit[0]); matched.add(hit[0]); } else allowCloseSkipped = true;
+        }
+      }
+      for (const id of matched) protectedTabs.add(id);
+    }
     for (const [id, o] of [...this.sessions]) {
       if (id === ref.id) continue;
       if (o.groupId === groupId && o.identity === ref.identity) for (const t of members) if (o.tabIds.has(t.id) && !o.adopted.has(t.id)) created.add(t.id);
@@ -968,13 +997,13 @@ export class TabManager {
     s.groupId = groupId;
     for (const t of members) {
       s.tabIds.add(t.id);
-      const keep = !allowClose || protectedTabs.has(t.id) || s.approved?.has(t.id) === true;
+      const keep = !allowClose || allowCloseSkipped || protectedTabs.has(t.id) || s.approved?.has(t.id) === true;
       // allowClose: the tab is owned like a created tab (close_tab works, the session end closes it), unless an earlier approval protected it.
       if (keep) { s.approved ??= new Set(); s.approved.add(t.id); if (!created.has(t.id)) s.adopted.add(t.id); }
     }
     this.persist();
     await this.refreshAgents();
-    return c;
+    return allowCloseSkipped ? { ...c, allowCloseSkipped: true } : c;
   }
 
   // ---- grants ------------------------------------------------------------
@@ -1244,10 +1273,10 @@ export class TabManager {
   }
 
   private snapshot(): Record<string, unknown> {
-    const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted], ...(s.approved && s.approved.size > 0 ? { approvedTabIds: [...s.approved] } : {}), ...(s.chat ? { chat: true } : {}), ...(s.color !== undefined ? { color: s.color } : {}) }));
+    const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, ...(s.chatId !== undefined ? { chatId: s.chatId } : {}), tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted], ...(s.approved && s.approved.size > 0 ? { approvedTabIds: [...s.approved] } : {}), ...(s.chat ? { chat: true } : {}), ...(s.color !== undefined ? { color: s.color } : {}) }));
     const grants = [...this.grants].map(([groupId, sessionId]) => ({ groupId, sessionId }));
     const chatLinks = [...this.links].map(([sessionId, tabIds]) => ({ sessionId, tabIds: [...tabIds] }));
-    return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants, [CHAT_LINKS_KEY]: chatLinks };
+    return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants, [CHAT_LINKS_KEY]: chatLinks, [LAST_CALLS_KEY]: Object.fromEntries(this.lastCall) };
   }
 
   private persist(): void {
@@ -1271,25 +1300,36 @@ export class TabManager {
       await this.loadSaved(); // after the sessions, so a session's own group is never linked to a saved group
       await this.loadAgents(); // after the saved groups: an explicit save wins
       await this.relinkPool();
-      this.startedAt = this.now();
+      this.startedAt = await this.runStart();
     } finally {
       this.loadingAgents = undefined;
       done();
     }
   }
 
+  /** First start of this browser run. chrome.storage.session survives a service worker restart, so a restart reuses it. */
+  private async runStart(): Promise<number> {
+    const at = (await this.api.sessionStorage.get([RUN_STARTED_KEY]))[RUN_STARTED_KEY];
+    if (typeof at === "number" && at <= this.now()) return at;
+    const now = this.now();
+    await this.api.sessionStorage.set({ [RUN_STARTED_KEY]: now }).catch(() => {});
+    return now;
+  }
+
   private async loadSessions(): Promise<void> {
-    let stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY, CHAT_LINKS_KEY]);
+    let stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY, CHAT_LINKS_KEY, LAST_CALLS_KEY]);
     const handed = (await this.api.storage.get([HANDOVER_KEY]))[HANDOVER_KEY] as ({ at?: number } & Record<string, unknown>) | undefined;
     if (handed) {
       await this.api.storage.remove([HANDOVER_KEY]);
       if (!Array.isArray(stored[SESSIONS_KEY]) && typeof handed.at === "number" && this.now() - handed.at < HANDOVER_MAX_AGE_MS) {
         stored = handed;
-        await this.api.sessionStorage.set({ [SESSIONS_KEY]: handed[SESSIONS_KEY], [GRANTS_KEY]: handed[GRANTS_KEY], [CHAT_LINKS_KEY]: handed[CHAT_LINKS_KEY] ?? [] });
+        await this.api.sessionStorage.set({ [SESSIONS_KEY]: handed[SESSIONS_KEY], [GRANTS_KEY]: handed[GRANTS_KEY], [CHAT_LINKS_KEY]: handed[CHAT_LINKS_KEY] ?? [], [LAST_CALLS_KEY]: handed[LAST_CALLS_KEY] ?? {} });
       }
     }
     const raw = stored[SESSIONS_KEY];
     if (!Array.isArray(raw)) return;
+    const calls = stored[LAST_CALLS_KEY];
+    if (typeof calls === "object" && calls !== null) for (const [id, at] of Object.entries(calls)) if (typeof at === "number") this.lastCall.set(id, at);
     const live = new Set((await this.queryTabs()).map(t => t.id));
     const storedLinks = stored[CHAT_LINKS_KEY];
     if (Array.isArray(storedLinks)) {
@@ -1301,10 +1341,10 @@ export class TabManager {
       }
     }
     const grants = Array.isArray(stored[GRANTS_KEY]) ? stored[GRANTS_KEY] as Array<{ groupId: number; sessionId: string }> : [];
-    for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; tabIds: number[]; adoptedTabIds?: number[]; approvedTabIds?: number[]; chat?: boolean; color?: string }>) {
+    for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; chatId?: string; tabIds: number[]; adoptedTabIds?: number[]; approvedTabIds?: number[]; chat?: boolean; color?: string }>) {
       const tabIds = new Set(e.tabIds.filter(id => live.has(id)));
       const adopted = new Set((e.adoptedTabIds ?? []).filter(id => tabIds.has(id))); // older data has no split: every tab counts as created
-      if (tabIds.size > 0 || grants.some(g => g.sessionId === e.id)) this.sessions.set(e.id, { groupId: e.groupId, tabIds, adopted, ...(e.approvedTabIds?.some(id => tabIds.has(id)) ? { approved: new Set(e.approvedTabIds.filter(id => tabIds.has(id))) } : {}), identity: e.identity, label: e.label, ...(e.chat ? { chat: true as const } : {}), ...(typeof e.color === "string" ? { color: e.color } : {}) });
+      if (tabIds.size > 0 || grants.some(g => g.sessionId === e.id)) this.sessions.set(e.id, { groupId: e.groupId, tabIds, adopted, ...(e.approvedTabIds?.some(id => tabIds.has(id)) ? { approved: new Set(e.approvedTabIds.filter(id => tabIds.has(id))) } : {}), identity: e.identity, label: e.label, ...(typeof e.chatId === "string" ? { chatId: e.chatId } : {}), ...(e.chat ? { chat: true as const } : {}), ...(typeof e.color === "string" ? { color: e.color } : {}) });
     }
     for (const g of grants) if (this.sessions.has(g.sessionId)) this.grants.set(g.groupId, g.sessionId);
     await this.pruneGrants();
@@ -1317,6 +1357,7 @@ export class TabManager {
       this.sessions.set(ref.id, s);
     }
     if (ref.label !== "") s.label = ref.label;
+    if (ref.chatId !== undefined) s.chatId = ref.chatId;
     if (ref.chat === true) s.chat = true;
     if (ref.color !== undefined) s.color = ref.color;
     return s;

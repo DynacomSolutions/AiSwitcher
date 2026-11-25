@@ -152,10 +152,11 @@ describe("tabs.onReplaced", () => {
     const t = setup();
     const a = await t.tabs.create(AG, "https://a.example.com/");
     const stray = t.api.addTab(80);
-    const before = JSON.stringify(t.api.session);
+    const owned = () => JSON.stringify({ sessions: t.api.session.sessions, grants: t.api.session.grants, chatLinks: t.api.session.chatLinks }); // the call times change with every call
+    const before = owned();
     t.api.replaceTab(stray.id);
     expect(await sessionTabIds(t)).toEqual([a.id]);
-    expect(JSON.stringify(t.api.session)).toBe(before);
+    expect(owned()).toBe(before);
     expect(t.tabs.ownerOf(80)).toBeUndefined();
   });
 

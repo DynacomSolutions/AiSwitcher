@@ -6,16 +6,21 @@ import { HOLDER_LIVE_MS, TabManager } from "../src/background/tabs.ts";
 import { FakeChrome } from "./fakes.ts";
 
 // One chat, several sessions: the agent session id changes when Claude Code compacts the context.
-const S1 = { id: "sess-1", identity: "alice", label: "Mail chat" };
-const S2 = { id: "sess-2", identity: "alice", label: "Mail chat" };
-const S3 = { id: "sess-3", identity: "alice", label: "Mail chat" };
-const OTHER_CHAT = { id: "sess-x", identity: "alice", label: "Another chat" };
+// The stable chat id (the T3 thread id) is the same across the sessions of one chat.
+const S1 = { id: "sess-1", identity: "alice", label: "Mail chat", chatId: "thread-mail" };
+const S2 = { id: "sess-2", identity: "alice", label: "Mail chat", chatId: "thread-mail" };
+const S3 = { id: "sess-3", identity: "alice", label: "Mail chat", chatId: "thread-mail" };
+const OTHER_CHAT = { id: "sess-x", identity: "alice", label: "Another chat", chatId: "thread-other" };
+/** A different chat that has the same label (two T3 threads with one title). */
+const SAME_LABEL = { id: "sess-y", identity: "alice", label: "Mail chat", chatId: "thread-twin" };
+/** An older shim: no chat id, only the label. */
+const OLD_SHIM = { id: "sess-old", identity: "alice", label: "Mail chat" };
 let n = 0;
 let clock = 7_000_000;
 
 function setup(api = new FakeChrome()) {
   const tabs = new TabManager(api, () => clock);
-  const executor = new Executor({ api, tabs, state: new State(api.storage) });
+  const executor = new Executor({ api, tabs, state: new State(api.storage), sleep: async () => {} });
   const call = (tool: BrowserTool | "session_end", args: Record<string, unknown> = {}, s: Record<string, unknown> = S1) => executor.run({ id: `c${++n}`, session: s, tool, args } as CallRequest);
   const json = (r: Awaited<ReturnType<typeof call>>) => JSON.parse(r.ok && r.content[0]?.type === "text" ? r.content[0].text : "{}");
   const create = async (s: Record<string, unknown>, url: string): Promise<number> => json(await call("tabs_create", { url }, s)).tabId;
@@ -72,12 +77,16 @@ describe("a later session of the same chat regains its earlier group", () => {
     expect(await t.call("close_tab", { tabId: b1 }, S3)).toMatchObject({ ok: true });
   });
 
-  test("a tab that waits on a beforeunload dialog stays with the chat", async () => {
-    const { t, a2, gidA } = await compacted();
-    // a1 stays open and owned after a "Leave site?" dialog kept it: the group still closes as a whole later.
-    await t.call("tabs_context", {}, S2);
-    expect(await t.call("close_group", { groupId: gidA }, S2)).toMatchObject({ ok: true });
+  test("a tab that holds a beforeunload prompt stays open and owned by the chat", async () => {
+    const { t, a1, a2, gidA } = await compacted();
+    t.api.keepOpen.add(a1); // "Leave site?": the page refuses to close
+    const first = await t.call("close_group", { groupId: gidA }, S2);
     expect(t.api.tabList.has(a2)).toBe(false);
+    expect(t.api.tabList.has(a1)).toBe(true);
+    expect(JSON.stringify(first)).toContain(String(a1));
+    // The tab still belongs to the chat that regained it, and the group stays its own.
+    expect(t.tabs.sessions.get(S2.id)!.tabIds.has(a1)).toBe(true);
+    expect(t.tabs.owns(S2.id, a1, "alice")).toBe(true);
   });
 
   test("a live holder of the same chat keeps its tabs", async () => {
@@ -103,21 +112,118 @@ describe("a later session of the same chat regains its earlier group", () => {
   });
 });
 
-describe("request_group allowClose and a tab that never loads", () => {
-  test("an unlinked old record of the identity stops blocking after the relink window", async () => {
+describe("the stable chat id decides who takes tabs from a dead session", () => {
+  test("the same label with a different chat id never takes the tabs (no own group)", async () => {
+    const { t, a1, gidA } = await compacted();
+    expect(await t.call("close_tab", { tabId: a1 }, SAME_LABEL)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(await t.call("adopt_tab", { tabId: a1 }, SAME_LABEL)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(await t.call("close_group", { groupId: gidA }, SAME_LABEL)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.api.tabList.has(a1)).toBe(true);
+  });
+
+  test("the same label with a different chat id never takes the tabs (own group)", async () => {
+    const { t, a1, gidA } = await compacted();
+    await t.create(SAME_LABEL, "https://twin.example.com/1");
+    clock += HOLDER_LIVE_MS + 1000;
+    expect(await t.call("close_tab", { tabId: a1 }, SAME_LABEL)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(await t.call("close_group", { groupId: gidA }, SAME_LABEL)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.api.tabList.has(a1)).toBe(true);
+  });
+
+  test("the same chat id takes the tabs after a compaction", async () => {
+    const { t, a1, gidA } = await compacted();
+    expect(await t.call("close_group", { groupId: gidA }, S2)).toMatchObject({ ok: true });
+    expect(t.api.tabList.has(a1)).toBe(false);
+  });
+
+  test("an older shim without a chat id keeps the label rule: it takes the tabs of a dead session when it has no own group", async () => {
+    const { t, a1 } = await compacted();
+    expect(await t.call("close_tab", { tabId: a1 }, OLD_SHIM)).toMatchObject({ ok: true });
+  });
+
+  test("an older shim with an own group takes nothing from a dead session", async () => {
+    const { t, a1 } = await compacted();
+    // The older shim made its own group while the holder was still live (before the quiet time of `compacted`).
+    const t2 = setup();
+    const x1 = await t2.create(S1, "https://mail.example.com/1");
+    await t2.call("tabs_context", {}, S1);
+    await t2.create(OLD_SHIM, "https://old.example.com/1");
+    clock += HOLDER_LIVE_MS + 1000;
+    expect(await t2.call("close_tab", { tabId: x1 }, OLD_SHIM)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.api.tabList.has(a1)).toBe(true);
+  });
+
+  test("a service worker restart keeps live sessions live", async () => {
     const t = setup();
+    const a1 = await t.create(S1, "https://mail.example.com/1");
+    await t.tabs.refreshAgents();
+    clock += 2 * 60_000; // quiet for 2 minutes only: still live
+    const later = setup(t.api); // a new service worker: same chrome, no memory
+    await later.tabs.load();
+    expect(await later.call("close_tab", { tabId: a1 }, OLD_SHIM)).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(t.api.tabList.has(a1)).toBe(true);
+  });
+
+  test("a returning old session sees the group that its chat moved as held by the new session", async () => {
+    const { t, a1, gidA } = await compacted();
+    await t.call("tabs_context", {}, S2); // S2 takes group A and is live now
+    const ctx = t.json(await t.call("tabs_context", {}, { ...S1, id: "sess-1b", chatId: "thread-elsewhere", label: "Mail chat" }));
+    const g = ctx.groups.find((x: { groupId: number }) => x.groupId === gidA);
+    expect(g).toMatchObject({ scope: "other", holderLabel: "Mail chat", holderLive: true });
+    expect(t.api.tabList.has(a1)).toBe(true);
+  });
+});
+
+describe("request_group allowClose and a tab that never loads", () => {
+  /** A user group of 2 tabs, and an unlinked record of the same identity and title that holds approved tabs under old tab ids (a browser restart). */
+  async function withUnlinkedRecord(t: ReturnType<typeof setup>, recordUrls: string[]) {
     const ids: number[] = [];
     for (let i = 0; i < 2; i++) ids.push(t.api.addTab(1 + i, `https://u.example.com/${i}`).id);
     const gid = await t.api.tabs.group(ids);
     t.api.groups.set(gid, { title: "Mail chat", color: "blue" });
-    const records = (t.tabs as unknown as { agents: Map<string, Record<string, unknown>> }).agents;
-    records.set("k", { identity: "alice", label: "Old chat", title: "Mail chat", color: "blue", groupId: -1, tabs: [{ id: 99, url: "x", owned: true, adopted: false }], holder: "gone", updatedAt: clock });
+    t.api.store.agentGroups = [{ identity: "alice", label: "Old chat", title: "Mail chat", color: "blue", groupId: -1, tabs: recordUrls.map((url, i) => ({ id: 900 + i, url, owned: true, adopted: true, approved: true })), holder: "gone", updatedAt: clock }];
     await t.tabs.load();
-    const r = await t.call("request_group", { groupId: gid, allowClose: true }, S1);
-    expect(JSON.stringify(r)).toContain("earlier approval protects"); // inside the window: still protected
+    return { ids, gid };
+  }
+  const approve = async (t: ReturnType<typeof setup>, gid: number, s: Record<string, unknown> = S1) => {
+    const pending = t.call("request_group", { groupId: gid, allowClose: true }, s);
+    for (let i = 0; i < 400 && t.api.shown.size === 0; i++) await Bun.sleep(5);
+    if (t.api.shown.size === 0) return pending; // refused before any prompt: the caller reads the error
+    t.api.clickNotification(0);
+    return pending;
+  };
+
+  test("inside the relink window an unlinked record still blocks", async () => {
+    const t = setup();
+    const { gid } = await withUnlinkedRecord(t, ["https://u.example.com/0"]);
+    expect(JSON.stringify(await t.call("request_group", { groupId: gid, allowClose: true }))).toContain("earlier approval protects");
+  });
+
+  test("after the window allowClose keeps the protection of the tab that an unlinked record approved, and other tabs are closable", async () => {
+    const t = setup();
+    const { ids, gid } = await withUnlinkedRecord(t, ["https://u.example.com/0"]);
     clock += 11 * 60_000;
-    const later = t.call("request_group", { groupId: gid, allowClose: true }, S1);
-    await Bun.sleep(50);
-    expect(JSON.stringify(await Promise.race([later, Bun.sleep(100).then(() => "prompt")]))).not.toContain("earlier approval protects");
+    expect(t.json(await approve(t, gid))).toMatchObject({ approved: true });
+    expect(await t.call("close_tab", { tabId: ids[0]! })).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(await t.call("close_tab", { tabId: ids[1]! })).toMatchObject({ ok: true });
+  });
+
+  test("an approved tab with no match keeps every tab approved and reports that allowClose was not applied", async () => {
+    const t = setup();
+    const { ids, gid } = await withUnlinkedRecord(t, ["https://u.example.com/0", "https://stuck.example.com/never-loaded"]);
+    clock += 11 * 60_000;
+    expect(t.json(await approve(t, gid))).toMatchObject({ approved: true, allowCloseSkipped: true });
+    expect(await t.call("close_tab", { tabId: ids[0]! })).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(await t.call("close_tab", { tabId: ids[1]! })).toMatchObject({ ok: false, error: "forbidden_tab" });
+  });
+
+  test("the relink window does not start again when the service worker restarts", async () => {
+    const t = setup();
+    const { gid } = await withUnlinkedRecord(t, ["https://u.example.com/0"]);
+    clock += 6 * 60_000;
+    const later = setup(t.api);
+    await later.tabs.load(); // the keepalive alarm woke a stopped worker
+    clock += 6 * 60_000; // 12 minutes since the run started
+    expect(t.json(await approve(later, gid))).toMatchObject({ approved: true });
   });
 });
