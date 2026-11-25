@@ -275,7 +275,7 @@ ETA: 2026-11-23 16:30 ICT
 | 289 | AIS Browser: a later session of the same chat regains its saved group | done | claude | browser-saved-reclaim | 6.288 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/731, released v0.5.101.<br>Saved entries now store label and owned/approved flags.<br>Live: ContractFinder re-saved, 34 expired tabs closed, 66 tabs in 33 splits. |
 | 325 | Same chat keeps its tabs and groups after compaction | done | claude | browser-group-after-compaction | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/808 and https://github.com/DynacomSolutions/AiSwitcher/pull/811 after two Opus reviews.<br>T3 thread id is the chat id. Long child ids become a fixed hash.<br>Live in v0.5.119: a child thread sends the chat id, tab test passed. |
 | 326 | `ais browser headers` masks secret headers | done | claude | browser-headers-mask | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/813, live in v0.5.120.<br>Plain output masks the token. `--tool` and `--reveal` print it for the helpers. |
-| 327 | Rotate the browser agent token that a worker printed | todo | claude | | 6.326 | 2026-11-25 23:00 ICT | Owner chose: rotate at a quiet time.<br>The token is per identity and shared by its live sessions. |
+| 327 | Rotate the browser agent token that a worker printed | done | claude | | 6.326 | | Rotated 25 Nov 23:03 ICT (16:03 GMT) after a quiet check.<br>Old token gives 401, new token lists browsers.<br>Pool sessions started before the rotation must relaunch for browser calls. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-15 23:00 ICT
