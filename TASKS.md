@@ -184,7 +184,7 @@ ETA: 2026-11-28 18:00 ICT
 | 245 | T3 gateway homes get agent-guard when AIS creates or updates them | done | claude | t3-home-agent-guard | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/650 (ee78d3b).<br>Ships in v0.5.80. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-25 23:30 ICT
+ETA: 2026-11-25 23:50 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -233,8 +233,8 @@ ETA: 2026-11-25 23:30 ICT
 | 319 | Limits page shows the plan label per account | done | agent | limits-plan-label | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/787. |
 | 320 | T3 model lists auto-enumerate for every gateway provider (zai, grok) | done | agent | t3-models-all-providers | | | ZCode: merged https://github.com/DynacomSolutions/AiSwitcher/pull/792.<br>Live 25 Nov on v0.5.121: `ais gateway t3-models --check` reports current for kimi (6), opencode (37) and ZCode (13 models).<br>Grok lists its own models. T3 shows the same 4 models as the gateway. |
 | 323 | Console limits: countdown beside each reset time | done | claude | identities-reset-countdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/797.<br>Live on v0.5.115 limits page (screenshot checked). |
-| 336 | Limits page: keep the reset countdown fully visible on each card | in_progress | agent | limits-countdown-clip | | 2026-11-25 23:30 ICT | On v0.5.121 the reset line clips at 1280 px: 23 of 23 lines on one tab.<br>Follow-up to 5.323.<br>Worker runs since 22:07 ICT (15:07 GMT).<br>Pull request follows. |
-| 337 | Limits page: Codex accounts show their plan badge | in_progress | agent | codex-plan-label | | 2026-11-25 23:15 ICT | `codexPlanLabel` knew six plan types only. Live accounts send `promax` and `self_serve_business_prolite`.<br>Follow-up to 5.319.<br>Commit made 22:22 ICT (15:22 GMT).<br>Pull request follows. |
+| 336 | Limits page: keep the reset countdown fully visible on each card | in_progress | agent | limits-countdown-clip | | 2026-11-25 23:50 ICT | On v0.5.121 the reset line clips at 1280 px: 23 of 23 lines on one tab.<br>Follow-up to 5.323.<br>Four commits made 22:55 to 23:10 ICT (15:55 to 16:10 GMT); the worker adds the end-to-end test.<br>Pull request follows. |
+| 337 | Limits page: Codex accounts show their plan badge | done | agent | codex-plan-label | | | `codexPlanLabel` knew six plan types only. Live accounts send `promax` and `self_serve_business_prolite`.<br>Follow-up to 5.319.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/826 (6ff55b2) at 22:55 ICT (15:55 GMT).<br>Live after release v0.5.122 and the console image roll-out. |
 ## 6. Browser control extension
 ETA: 2026-11-23 16:30 ICT
 
