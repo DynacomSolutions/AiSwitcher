@@ -344,7 +344,7 @@ Keep new codex releases working against the AIS gateway placeholder login.
 | 295 | Sessions in the AIS database (HoardDB) | in_progress | claude | | | 2026-12-12 18:00 ICT | Owner decision: session index in Postgres, transcripts in HoardDB object storage.<br>Console Sessions page reads from there, not host folders.<br>Design done, build in epic 20. |
 
 ## 14. Gateway survives any node loss
-ETA: 2026-11-15 23:00 ICT
+ETA: 2026-11-26 02:00 ICT
 AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gateway replicas.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -353,6 +353,9 @@ AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gat
 | 196 | Host login files follow the PostgreSQL credential store without a hostPath replica | done | claude | ais-host-store-sync | 14.195 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/530 (addec72), released v0.5.51.<br>`ais gateway store sync` runs under the profile-sync daemon when AIS_GATEWAY_STORE_DATABASE_URL is set (`ais gateway store setup`).<br>Host configured; first pass converged 43 rows. grantFreshness ignores refreshTokenExpiresAt. |
 | 198 | Gateway stays Ready while PostgreSQL is unreachable once logins are loaded | done | claude | gateway-node-loss | 14.195 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/536 (23af228), released v0.5.53; live on the gateway image.<br>Live proof: PostgreSQL blackholed in one replica for 75 s, `/readyz` stayed 200 (`ready, database unreachable`), kubelet Ready stayed True, back to `ready` after. |
 | 199 | Host clients reach the gateway without the local ClusterIP (node failover) | done | claude | gateway-node-loss | 14.195 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/536, released v0.5.53; host relay on, Claude folders and T3 env point at it.<br>Live proof: client with the cluster service range dropped, real `claude -p` answered through a replica on another node; relay also failed over by itself during a real host reboot. |
+| 333 | Fail over Anthropic overloads before content to another pool member, truthful gateway errors | in_progress | claude | gateway-529-truthful | | 2026-11-26 01:30 ICT | Incident 25 Nov 14:02 GMT: 4 real Anthropic overloaded_error answers with request ids, pool had headroom.<br>Gateway passed them through unchanged, no failover tried. |
+| 334 | One gateway pod on every Linux node (DaemonSet), alert when a node has none | in_progress | claude | gateway-every-node | 14.195 | 2026-11-26 01:00 ICT | Preferred anti-affinity put 2 pods on two nodes and none on two others.<br>Cluster GitOps PR. |
+| 335 | Live proof: evict one gateway pod during a test turn, the turn continues | todo | claude | | 14.333, 14.334 | 2026-11-26 02:00 ICT | Eviction API only, test thread only. |
 
 ## 15. Gateway logins never revoked by AIS
 ETA: 2026-11-24 08:00 ICT
