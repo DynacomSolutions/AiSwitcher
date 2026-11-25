@@ -67,17 +67,29 @@ function WindowRow({ window }: { window: LimitWindow }) {
         <span className="shrink-0 font-medium tabular-nums">{pct.toFixed(1)}%</span>
       </div>
       <Progress value={pct} indicatorClassName={windowTone(pct)} />
+      {/* The times wrap inside the card. The countdown is one piece that moves down with the separator. */}
       {(window.resetsAt || window.resetsAtMs !== undefined || window.note) && (
-        <div className="flex items-baseline justify-between gap-3 text-xs text-muted-foreground">
-          <span className="min-w-0 truncate" title={window.resetsAtMs !== undefined ? formatResetTimes(window.resetsAtMs) : undefined}>
+        <div
+          data-slot="reset-line"
+          className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-xs text-muted-foreground"
+        >
+          <span
+            data-slot="reset-times"
+            className="min-w-0 break-words"
+            title={window.resetsAtMs !== undefined ? formatResetTimes(window.resetsAtMs) : undefined}
+          >
             {window.resetsAtMs !== undefined ? (
               <>
-                {formatResetTimes(window.resetsAtMs)} · <ResetCountdown ms={window.resetsAtMs} />
+                {formatResetTimes(window.resetsAtMs)}
+                {" ·\u00a0"}
+                <ResetCountdown ms={window.resetsAtMs} />
               </>
             ) : (window.resetsAt ?? "")}
           </span>
           {window.note ? (
-            <span className="shrink-0 text-amber-600 dark:text-amber-400">{window.note}</span>
+            <span data-slot="window-note" className="ml-auto min-w-0 break-words text-amber-600 dark:text-amber-400">
+              {window.note}
+            </span>
           ) : null}
         </div>
       )}
