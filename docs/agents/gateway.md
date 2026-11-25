@@ -126,7 +126,8 @@ A pool also fails over, before any content, on an upstream overload or server er
 Anthropic event stream whose first event is an `overloaded_error` or `api_error` (sent inside a 200). Only a bounded
 prefix of a stream is read, and a normal stream flows on at once. Each other member gets the replayed body once. An
 overload is not quota, so no member is held back. When every member fails, the last upstream answer returns unchanged
-with its request id. Pinned apps and bodies that cannot be replayed pass the answer through. Each retry counts in
+with its request id. Only model-call routes (messages, chat completions, responses, completions) fail over this way: file uploads, message
+batches and other create calls never do. Pinned apps and bodies that cannot be replayed pass the answer through. Each retry counts in
 `ais_gateway_failovers_total{reason}` and writes one `failover` log line.
 
 Answers the gateway builds itself carry `x-ais-gateway-error: <reason>`, and their message starts with `AIS gateway: `

@@ -18,7 +18,7 @@ export interface RetryInfo {
  * True for a call that asks a model for an answer (messages, chat completions, responses, completions). Only these may
  * fail over on an overload: a create call such as a file upload or a message batch may have taken effect already.
  */
-export const isModelCall = (method: string, rest: string): boolean => method.toUpperCase() === "POST" && /(?:^|\/)(?:messages|chat\/completions|responses|completions)\/?$/.test(rest);
+export const isModelCall = (method: string, rest: string): boolean => method.toUpperCase() === "POST" && /^\/(?:v1|backend-api\/codex)\/(?:messages|chat\/completions|responses(?:\/compact)?|completions)\/?$/.test(rest);
 
 /** HTTP statuses that fail over: 529 is Anthropic's overload, the others are server errors. */
 const RETRY_STATUSES = new Set([500, 502, 503, 504, 529]);

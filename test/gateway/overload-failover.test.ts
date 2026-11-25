@@ -5,7 +5,7 @@ import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { createGatewayApp, peekFirstEvent, type GatewayDeps } from "../../src/gateway/app.ts";
 import { GatewayCredentialError } from "../../src/gateway/credentials.ts";
 import { GATEWAY_ERROR_HEADER, GATEWAY_UPSTREAM_HEADER } from "../../src/gateway/errors.ts";
-import { firstEventOf } from "../../src/gateway/overload.ts";
+import { firstEventOf, isModelCall } from "../../src/gateway/overload.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { noopMetrics } from "../../src/gateway/metrics.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
@@ -340,6 +340,34 @@ describe("pool failover on overload and server errors before content", () => {
     expect(await res.text()).toBe(OVERLOAD_BODY("req_a"));
     expect(res.headers.get("request-id")).toBe("req_a");
     expect(who).toEqual(["a", "b"]);
+  });
+
+  test("a second member whose 403 body breaks in the quota check leaves the first member's overload answer standing", async () => {
+    const real = deps.fetch;
+    deps.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const auth = new Headers(init?.headers).get("authorization");
+      if (auth === "Bearer tok-b") {
+        who.push("b");
+        return Promise.resolve(new Response(new ReadableStream<Uint8Array>({ pull(c) { c.error(new Error("connection reset")); } }), { status: 403, headers: { "content-type": "application/json" } }));
+      }
+      return real(input, init);
+    }) as typeof fetch;
+    handler = () => overloaded(529, "req_a");
+    const res = await post(createGatewayApp(deps));
+    expect(res.status).toBe(529);
+    expect(await res.text()).toBe(OVERLOAD_BODY("req_a"));
+    expect(res.headers.get("request-id")).toBe("req_a");
+    expect(who).toEqual(["a", "b"]);
+  });
+
+  test("isModelCall matches model-call routes only", () => {
+    for (const p of ["/v1/messages", "/v1/messages/", "/v1/chat/completions", "/v1/responses", "/v1/completions", "/backend-api/codex/responses", "/backend-api/codex/responses/compact"]) {
+      expect(isModelCall("POST", p)).toBe(true);
+    }
+    for (const p of ["/v1/threads/t1/messages", "/v1/messages/count_tokens", "/v1/messages/batches", "/v1/files", "/x/v1/messages", "/v1/responses/resp_1/cancel"]) {
+      expect(isModelCall("POST", p)).toBe(false);
+    }
+    expect(isModelCall("GET", "/v1/messages")).toBe(false);
   });
 
   test("a short-hold wait never sends the request back to a member that overloaded", async () => {

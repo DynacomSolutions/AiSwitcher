@@ -1162,6 +1162,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       return await retryable(res);
     } catch (err) {
       if (req.signal.aborted || ctrl.signal.aborted) throw err;
+      // A no-op when the peek already locked the body; it frees the connection when the failure came earlier.
       await discard(res);
       return { retry: { reason: "server_error", http: res.status, errorType: "read_failed" } };
     }
@@ -1274,9 +1275,21 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
           tried.add(name);
           continue;
         }
-        const sq = await isQuota(second);
-        // The new answer is read before the old one goes: a body that breaks leaves the old answer standing.
-        const o = sq.quota ? { res: sq.res, retry: undefined as RetryInfo | undefined } : await classify(sq.res);
+        // The new answer is read before the old one goes: a body that breaks (in `isQuota` or `classify`) leaves the old answer standing.
+        let sq: { quota: boolean; res: Response };
+        let o: { retry?: RetryInfo; res?: Response };
+        try {
+          sq = await isQuota(second);
+          o = sq.quota ? { res: sq.res, retry: undefined } : await classify(sq.res);
+        } catch (err) {
+          if (req.signal.aborted || ctrl.signal.aborted) {
+            if (cur) await discard(cur);
+            throw err;
+          }
+          await discard(second);
+          sq = { quota: false, res: second };
+          o = { retry: { reason: "server_error", http: second.status, errorType: "read_failed" } };
+        }
         if (!o.res) {
           overloaded.add(name);
           credErr = credErr ?? new Error("upstream answer unreadable");
