@@ -100,6 +100,8 @@ const obj = (v: unknown): Json | undefined => (typeof v === "object" && v !== nu
 const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() !== "" ? v.trim() : undefined);
 
 interface Prompt {
+  /** The JSON-RPC id of the request, as the client sent it. */
+  id: string | number;
   sessionId: string;
   /** What the adapter returned before the prompt went to the agent. */
   mark: unknown;
@@ -207,7 +209,7 @@ export class AcpRelay {
     } catch {
       mark = undefined;
     }
-    this.prompts.set(key, { sessionId, mark, outputAtStart: this.output.get(sessionId) ?? 0 });
+    this.prompts.set(key, { id: msg.id as string | number, sessionId, mark, outputAtStart: this.output.get(sessionId) ?? 0 });
   }
 
   /** The T3 MCP server of a session setup request, kept in memory for the limit snooze. */
@@ -252,6 +254,11 @@ export class AcpRelay {
   /** A failed prompt: a usage limit with a reset time snoozes the thread. Fire and forget. */
   private limitFailure(sessionId: string, text: string, status?: number, code?: string): void {
     this.opts.limit?.onFailure(sessionId, { text, ...(status !== undefined ? { status } : {}), ...(code !== undefined ? { code } : {}) });
+  }
+
+  /** The JSON-RPC ids of the prompts the agent has not answered. The process answers them itself when the agent ends. */
+  openPromptIds(): Array<string | number> {
+    return [...this.prompts.values()].map((p) => p.id);
   }
 
   /** Whether any prompt is open. The process runs the in-turn limit watch only while one is. */

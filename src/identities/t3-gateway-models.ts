@@ -464,6 +464,33 @@ export function zcodeConfigPathFromLauncher(launcherText: string, home: string):
   return isAbsolute(p) ? p : undefined;
 }
 
+const shUnquote = (s: string): string => s.slice(1, -1).replace(/'\\''/g, "'");
+
+/** The original launcher a generated ZCode launcher records, or undefined when the text is not one. */
+export function zcodeLauncherOriginal(text: string): string | undefined {
+  if (!text.includes("Written by `ais gateway t3-acp`")) return undefined;
+  const m = /^ORIGINAL=('(?:[^']|'\\'')*')\s*$/m.exec(text);
+  return m ? shUnquote(m[1]!) : undefined;
+}
+
+/**
+ * The ZCode personal provider config path the launcher at `commandPath` names. A launcher written by this module names
+ * none itself: the path comes from the original launcher it records.
+ */
+export async function zcodeConfigPathFromCommand(commandPath: string, home: string): Promise<string | undefined> {
+  let path = commandPath;
+  for (let hop = 0; hop < 2; hop++) {
+    const text = await readFile(path, "utf8").catch(() => undefined);
+    if (text === undefined) return undefined;
+    const found = zcodeConfigPathFromLauncher(text, home);
+    if (found) return found;
+    const original = zcodeLauncherOriginal(text);
+    if (!original) return undefined;
+    path = original;
+  }
+  return undefined;
+}
+
 async function syncZcodeConfigFile(file: string, opts: SyncOptions): Promise<FolderResult[]> {
   const dir = dirname(file);
   let text: string;
@@ -524,13 +551,7 @@ async function syncZcodeAcpInstances(opts: SyncOptions): Promise<FolderResult[]>
     if (!isObj(inst) || inst.driver !== "acpRegistry") continue;
     const commandPath = str(isObj(inst.config) ? inst.config.commandPath : undefined);
     if (!commandPath) continue;
-    let launcher: string;
-    try {
-      launcher = await readFile(commandPath, "utf8");
-    } catch {
-      continue;
-    }
-    const file = zcodeConfigPathFromLauncher(launcher, home);
+    const file = await zcodeConfigPathFromCommand(commandPath, home);
     if (!file || seen.has(file)) continue;
     seen.add(file);
     results.push(...(await syncZcodeConfigFile(file, opts)));

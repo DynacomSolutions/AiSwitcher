@@ -6,12 +6,18 @@
  *   last bytes are passed, so the relay can note where the agent's records stand before the agent sees the prompt.
  * - Agent to client: one line at a time, in order. An unchanged line keeps its bytes. Each write is waited for, so
  *   nothing is still pending when this process ends (Bun drops pending stdout at `process.exit`).
- * - stderr is the agent's own. Signals go to the agent; this process ends with the agent's exit code.
+ * - stderr is the agent's own: it goes on to this process's stderr unchanged, and a short tail is kept. Signals go to the
+ *   agent; this process ends with the agent's exit code.
+ * - When the agent ends (an exit code, a signal, or no end after a signal sent to this process) while a `session/prompt`
+ *   is still open, each open request gets one JSON-RPC error that says why. Without it the client sees only a closed
+ *   stream and shows its default text ("Provider turn failed."). A prompt the agent answered is never answered twice.
  */
 import { spawn } from "node:child_process";
+import { basename } from "node:path";
+import { redactText } from "../gateway/upstream-error.ts";
 import { kimiAdapter, kimiHome } from "./kimi-turn.ts";
 import { LimitSnoozer } from "./limit-snooze.ts";
-import { AcpRelay, type RelayAdapter } from "./relay.ts";
+import { AcpRelay, TURN_FAILED_CODE, type RelayAdapter } from "./relay.ts";
 
 /** How often the in-turn limit watch reads the agent's log while a prompt is open. */
 export const IN_TURN_WATCH_MS = 3000;
@@ -49,6 +55,48 @@ export function adapterFor(agentId: string, env: Record<string, string | undefin
   return agentId === "kimi-code" ? kimiAdapter(kimiHome(env)) : undefined;
 }
 
+/** The longest message the relay puts in an error it sends for an open prompt. */
+export const END_MESSAGE_MAX = 4096;
+/** How long the agent gets to end after a signal reached this process, before it is stopped and the prompts get their answer. */
+export const SIGNAL_GRACE_MS = 3000;
+/** How much of the agent's last stderr output is kept for the error message. */
+const STDERR_KEEP = 4000;
+
+export interface AgentEnd {
+  agent: string;
+  /** The exit code, when the agent ended by itself. */
+  code: number | null;
+  /** The signal that ended the agent, when it ended by one. */
+  signal: NodeJS.Signals | null;
+  /** The first signal this process received, when it did. */
+  relaySignal?: NodeJS.Signals;
+  /** The agent did not end in `graceMs` after that signal and was stopped by the relay. */
+  timedOut?: { graceMs: number };
+  /** The agent could not start. */
+  startError?: string;
+  /** The last agent stderr text (raw; redacted here). */
+  stderrTail?: string;
+}
+
+/** The text a client shows for a turn that ended because the agent process ended. Under END_MESSAGE_MAX characters. */
+export function agentEndMessage(e: AgentEnd): string {
+  if (e.startError !== undefined) return redactText(`The ACP agent ${e.agent} could not start: ${e.startError}`, END_MESSAGE_MAX);
+  const parts = [`The ACP agent ${e.agent} stopped during the turn:`];
+  if (e.timedOut) parts.push(`it did not end within ${Number((e.timedOut.graceMs / 1000).toFixed(1))} seconds after the relay received ${e.relaySignal ?? "a signal"}, so the relay stopped it.`);
+  else if (e.signal) parts.push(`it was ended by ${e.signal}.`);
+  else parts.push(e.code === 0 ? "it exited with code 0 before it answered." : `it exited with code ${e.code ?? "unknown"}.`);
+  if (e.relaySignal) parts.push(`The relay received ${e.relaySignal} first, so something outside the agent stopped its process group or systemd scope.`);
+  else if (e.signal) parts.push("The relay received no signal, so only the agent process was stopped.");
+  const tail = (e.stderrTail ?? "")
+    .split(/\r?\n/)
+    .map((l) => redactText(l, 300))
+    .filter((l) => l !== "")
+    .slice(-5)
+    .join(" | ");
+  if (tail !== "") parts.push(`Last agent output: ${tail}`);
+  return redactText(parts.join(" "), END_MESSAGE_MAX);
+}
+
 export interface RelayProcessOptions {
   command: string;
   args: string[];
@@ -64,6 +112,12 @@ export interface RelayProcessOptions {
   answerIdlePermissions?: boolean;
   /** The in-turn limit watch interval. Default IN_TURN_WATCH_MS. Only used when the adapter has inTurnLimit. */
   inTurnWatchMs?: number;
+  /** The agent's name in error messages. Default: the executable's file name. */
+  agentName?: string;
+  /** Where the agent's stderr goes. Default process.stderr. */
+  stderr?: NodeJS.WritableStream;
+  /** See SIGNAL_GRACE_MS. */
+  signalGraceMs?: number;
 }
 
 /** Starts the agent and relays until it exits. Resolves with the exit code this process should end with. */
@@ -71,7 +125,17 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
   const stdin: NodeJS.ReadableStream = opts.stdin ?? process.stdin;
   const stdout: NodeJS.WritableStream = opts.stdout ?? process.stdout;
   const log = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const child = spawn(opts.command, opts.args, { stdio: ["pipe", "pipe", "inherit"], env: opts.env ?? process.env });
+  const stderr: NodeJS.WritableStream = opts.stderr ?? process.stderr;
+  const agentName = opts.agentName ?? basename(opts.command);
+  const graceMs = opts.signalGraceMs ?? SIGNAL_GRACE_MS;
+  const child = spawn(opts.command, opts.args, { stdio: ["pipe", "pipe", "pipe"], env: opts.env ?? process.env });
+  // The agent's stderr goes on unchanged (the client logs it); a short tail is kept for the error message.
+  let stderrTail = "";
+  stderr.on("error", () => {});
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderrTail = (stderrTail + chunk.toString("utf8")).slice(-STDERR_KEEP);
+    stderr.write(chunk);
+  });
   // The relay's own lines to the agent go between the client's lines, never inside one.
   const fromClient = new LineSplitter();
   let held: string[] = [];
@@ -92,14 +156,25 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     let watchTimer: ReturnType<typeof setTimeout> | undefined;
     let watchBusy = false;
     const signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT", "SIGHUP"];
+    let relaySignal: NodeJS.Signals | undefined;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let ending = false;
+    let sealed = false; // the open prompts were answered: nothing more goes to the client
     const forward = (signal: NodeJS.Signals) => {
+      relaySignal ??= signal;
       child.kill(signal);
+      // The agent gets a short moment to end. If it does not, it is stopped and its open prompts are answered here.
+      graceTimer ??= setTimeout(() => {
+        child.kill("SIGKILL");
+        void end({ agent: agentName, code: null, signal: null, ...(relaySignal ? { relaySignal } : {}), timedOut: { graceMs }, stderrTail }, 128 + (signalNumber(relaySignal ?? "SIGTERM") ?? 15));
+      }, graceMs);
     };
     const handlers = signals.map((s) => [s, () => forward(s)] as const);
     for (const [s, h] of handlers) process.on(s, h);
     const finish = (code: number) => {
       if (done) return;
       done = true;
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
       stopWatch();
       for (const [s, h] of handlers) process.off(s, h);
       resolve(code);
@@ -129,7 +204,7 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     /** Resolves when the bytes are written (or the client is gone). */
     const write = (bytes: Buffer): Promise<void> =>
       new Promise<void>((done) => {
-        if (clientGone) return done();
+        if (clientGone || sealed) return done();
         stdout.write(bytes, () => done());
       });
     const NEWLINE = Buffer.from("\n");
@@ -183,15 +258,33 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
       scheduleWatch();
     }
 
+    /**
+     * The agent is gone. Each prompt it did not answer gets one error that says why, written and flushed before this
+     * process ends. Runs once. A prompt the agent answered is not open any more, so it is never answered twice.
+     */
+    async function end(why: AgentEnd, code: number): Promise<void> {
+      if (ending) return;
+      ending = true;
+      await chain;
+      const ids = relay.openPromptIds();
+      if (ids.length > 0) {
+        const message = agentEndMessage(why);
+        const data = { source: "ais-acp-relay", reason: "agent_ended", ...(why.code !== null ? { exitCode: why.code } : {}), ...(why.signal ? { signal: why.signal } : {}), ...(why.relaySignal ? { relaySignal: why.relaySignal } : {}) };
+        log(`acp-relay: the agent ended with ${ids.length} prompt(s) open; each was answered with an error`);
+        await write(Buffer.from(ids.map((id) => `${JSON.stringify({ jsonrpc: "2.0", id, error: { code: TURN_FAILED_CODE, message, data } })}\n`).join(""), "utf8"));
+      }
+      sealed = true;
+      finish(code);
+    }
+
     child.on("error", (err) => {
       log(`acp-relay: cannot start ${opts.command}: ${err.message}`);
-      finish(127);
+      void end({ agent: agentName, code: null, signal: null, startError: err.message }, 127);
     });
     child.on("close", (code, signal) => {
       const rest = fromAgent.rest();
-      void chain
-        .then(() => (rest.length > 0 ? write(rest) : undefined))
-        .then(() => finish(code ?? (signal ? 128 + (signalNumber(signal) ?? 15) : 1)));
+      chain = chain.then(() => (rest.length > 0 ? write(rest) : undefined));
+      void end({ agent: agentName, code, signal, ...(relaySignal ? { relaySignal } : {}), stderrTail }, code ?? (signal ? 128 + (signalNumber(signal) ?? 15) : 1));
     });
   });
 }
