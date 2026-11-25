@@ -278,7 +278,7 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
               res = await input.replay(AbortSignal.any([ctrl.signal, replayCtrl.signal]));
             } catch {
               if (waitSignal.aborted) continue;
-              send(sse("error", { type: "error", error: { type: "api_error", message: "gateway error" } }));
+              send(sse("error", { type: "error", error: { type: "api_error", message: "AIS gateway: the held request could not be sent again" } }));
               finish("failed");
               return end();
             } finally {
@@ -321,7 +321,7 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
                   releaseServedBytes();
                   return reset();
                 }
-                send(sse("error", { type: "error", error: { type: "api_error", message: "upstream stream failed" } }));
+                send(sse("error", { type: "error", error: { type: "api_error", message: "AIS gateway: the upstream stream broke after the answer began" } }));
               }
               releaseServedBytes();
               return end();
@@ -358,7 +358,7 @@ function replayNote(h: Headers): Uint8Array | undefined {
 
 /** The SSE error event for a replay answer that is not a stream: the provider's own error object when it has one. */
 async function errorEvent(res: Response): Promise<unknown> {
-  let message = "gateway error";
+  let message = `AIS gateway: the held request got an answer with status ${res.status} that is not a provider error`;
   try {
     const text = (await res.text()).slice(0, 64 * 1024);
     const j = JSON.parse(text) as { error?: { type?: unknown; message?: unknown } };

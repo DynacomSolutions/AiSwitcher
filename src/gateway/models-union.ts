@@ -1,7 +1,7 @@
 import type { GatewayDeps } from "./app.ts";
 import { stripHopByHop, upstreamHeaders } from "./app.ts";
 import { GatewayCredentialError } from "./credentials.ts";
-import { providerError } from "./errors.ts";
+import { GATEWAY_UPSTREAM_HEADER, providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
 import { routeFor } from "./routes.ts";
 import { allowedMembers } from "./select.ts";
@@ -49,7 +49,7 @@ interface MemberAnswer {
 function credentialFailure(style: ApiStyle, answers: MemberAnswer[]): Response | undefined {
   if (answers.length === 0 || !answers.every((a) => a.credErr !== undefined)) return undefined;
   const err = answers.find((a) => a.credErr?.loggedOut)?.credErr ?? answers[0]!.credErr!;
-  return providerError(style, err.loggedOut ? 401 : 502, err.clientMessage);
+  return providerError(style, err.loggedOut ? 401 : 502, err.clientMessage, err.loggedOut ? "login_dead" : "credential_unavailable");
 }
 
 export async function poolModels(input: PoolModelsInput): Promise<Response> {
@@ -58,9 +58,9 @@ export async function poolModels(input: PoolModelsInput): Promise<Response> {
   try {
     names = await allowedMembers(app, deps);
   } catch {
-    return providerError(style, 502, "model list unavailable");
+    return providerError(style, 502, "the model list could not be read from any pool member", "models_unavailable");
   }
-  if (names.length === 0) return providerError(style, 502, "model list unavailable");
+  if (names.length === 0) return providerError(style, 502, "the model list could not be read from any pool member", "models_unavailable");
   // Leave out logged-out logins, as the pick does, but keep one name so that an answer (the login error) still comes back.
   const loggedOut = deps.creds?.loggedOut;
   if (loggedOut) {
@@ -98,12 +98,12 @@ export async function poolModels(input: PoolModelsInput): Promise<Response> {
       failed.push(a);
       if (a.res?.ok) {
         if (first) await first.body?.cancel().catch(() => undefined);
-        return passThrough(a.res);
+        return passThrough(a.res, app.provider);
       }
       if (!first && a.res) first = a.res;
       else await a.res?.body?.cancel().catch(() => undefined);
     }
-    return first ? passThrough(first) : (credentialFailure(style, failed) ?? providerError(style, 502, "upstream request failed"));
+    return first ? passThrough(first, app.provider) : (credentialFailure(style, failed) ?? providerError(style, 502, "no pool member answered the model list request", "upstream_unreachable"));
   }
 
   const answers = await Promise.all(names.map(ask));
@@ -111,7 +111,7 @@ export async function poolModels(input: PoolModelsInput): Promise<Response> {
   if (lists.length === 0) {
     const first = answers.find((a) => a.res !== undefined)?.res;
     for (const a of answers) if (a.res && a.res !== first) await a.res.body?.cancel().catch(() => undefined);
-    return first ? passThrough(first) : (credentialFailure(style, answers) ?? providerError(style, 502, "upstream request failed"));
+    return first ? passThrough(first, app.provider) : (credentialFailure(style, answers) ?? providerError(style, 502, "no pool member answered the model list request", "upstream_unreachable"));
   }
   for (const a of answers) if (!lists.includes(a)) await a.res?.body?.cancel().catch(() => undefined);
   const merged = mergeModelLists(lists.map((a) => a.json));
@@ -154,8 +154,9 @@ export async function listAppModels(app: GatewayApp, deps: GatewayDeps, signal: 
   return out;
 }
 
-function passThrough(res: Response): Response {
+function passThrough(res: Response, provider: string): Response {
   const headers = new Headers(res.headers);
+  headers.set(GATEWAY_UPSTREAM_HEADER, provider);
   stripHopByHop(headers);
   if (headers.has("content-encoding")) {
     headers.delete("content-encoding");

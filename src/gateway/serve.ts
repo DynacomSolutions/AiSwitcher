@@ -51,7 +51,7 @@ import type { ChatStore } from "./chat/types.ts";
 import { listAppModels } from "./models-union.ts";
 import { CachedGatewayStore } from "./cache-store.ts";
 import { CredentialCache, GatewayCredentialError, loginCommand, type RefreshFn } from "./credentials.ts";
-import { providerError } from "./errors.ts";
+import { GATEWAY_ERROR_HEADER, providerError } from "./errors.ts";
 import { errorTag, LedgerBuffer } from "./ledger-buffer.ts";
 import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
@@ -1099,7 +1099,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       if (!draining && warmed && req.method === "GET" && new URL(req.url).pathname === "/browser/connect") {
         // Authentication is the first `hello` message; the token is never in the URL.
         if (srv.upgrade(req)) return undefined as unknown as Response;
-        return markGatewayResponse(new Response("websocket upgrade required\n", { status: 426 }));
+        return markGatewayResponse(new Response("AIS gateway: websocket upgrade required\n", { status: 426, headers: { [GATEWAY_ERROR_HEADER]: "upgrade_required" } }));
       }
       const res = markGatewayResponse(await route(req, srv));
       if (draining) {
@@ -1116,7 +1116,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   async function route(req: Request, srv: { timeout(r: Request, s: number): void; requestIP(r: Request): { address: string } | null }): Promise<Response> {
     const path = new URL(req.url).pathname;
     // Operational endpoints answer only inside the cluster (vmagent and probes use the pod address): on a public host they do not exist.
-    if (isOperationalPath(path) && viaPublicHost(req.headers, req.url, publicHosts)) return markGatewayResponse(new Response("not found\n", { status: 404 }));
+    if (isOperationalPath(path) && viaPublicHost(req.headers, req.url, publicHosts)) return markGatewayResponse(new Response("AIS gateway: not found on a public host\n", { status: 404, headers: { [GATEWAY_ERROR_HEADER]: "operational_path" } }));
     if (path === "/healthz") return new Response("ok\n");
     if (path === "/readyz") {
       if (draining) return new Response("draining\n", { status: 503 });
@@ -1127,7 +1127,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       return new Response(dbOk() ? "ready\n" : "ready, database unreachable\n");
     }
     if (path === "/metrics") return new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } });
-    if (!warmed) return providerError(await styleForPath({ store }, path), 503, "gateway is starting");
+    if (!warmed) return providerError(await styleForPath({ store }, path), 503, "the gateway is starting and is not ready yet", "starting");
     srv.timeout(req, 0); // A long generation is not idle.
     return proxy.fetch(req, { ip: srv.requestIP(req)?.address });
   }

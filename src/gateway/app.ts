@@ -9,7 +9,7 @@ import { createMcpRoutes } from "./browser/mcp.ts";
 import { createCallRoutes, type CallHub } from "./browser/routing.ts";
 import { checkCaps, dayStartIct } from "./caps.ts";
 import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
-import { providerError } from "./errors.ts";
+import { GATEWAY_ERROR_HEADER, GATEWAY_UPSTREAM_HEADER, limitError, markGatewayError, providerError } from "./errors.ts";
 import { CLIENT_RETRY_AFTER_CAP_SECONDS, PoolHoldGate, fullPoolAnswers, heldReplays, heldStreamResponse, poolHoldFromEnv, wantsStream } from "./pool-hold.ts";
 import type { LedgerBuffer } from "./ledger-buffer.ts";
 import { clientFamily, sessionKeyFromBodyTail, sessionKeyFromHeaders } from "./session-key.ts";
@@ -22,6 +22,7 @@ import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
 import { poolModels } from "./models-union.ts";
+import { errorTypeOfBody, firstEventOf, isModelCall, retryReasonForStatus, retryReasonForStreamError, type FirstEvent, type RetryInfo } from "./overload.ts";
 import { collapseSlashes, PIN_FORWARD, routeFor, serveRoute, sideDailyLimitFromEnv, type AccountOp, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity, usageForModel, utilisationOf } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
@@ -248,6 +249,34 @@ export async function peek(res: Response, cap: number): Promise<{ bytes: Uint8Ar
   return { bytes, whole: whole && size <= cap, res: out };
 }
 
+/**
+ * Reads the start of an event-stream answer until its first event is known, at most `cap` bytes. A normal stream is
+ * decided on its first `event:` line, so it flows on without delay. The response is re-created with every byte read
+ * put back in front of the rest of the body.
+ */
+export async function peekFirstEvent(res: Response, cap: number): Promise<{ first: FirstEvent; res: Response }> {
+  if (!res.body) return { first: { state: "pass" }, res };
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let first: FirstEvent = { state: "pending" };
+  while (first.state === "pending" && size <= cap) {
+    const r = await reader.read();
+    if (r.done) break;
+    chunks.push(r.value);
+    size += r.value.length;
+    const all = new Uint8Array(size);
+    let at = 0;
+    for (const c of chunks) {
+      all.set(c, at);
+      at += c.length;
+    }
+    first = firstEventOf(all);
+  }
+  if (first.state === "pending") first = { state: "pass" }; // no whole first event within the cap: the stream passes through
+  return { first, res: new Response(chainStream(chunks, reader), { status: res.status, statusText: res.statusText, headers: res.headers }) };
+}
+
 export function isQuotaBody(bytes: Uint8Array): boolean {
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
@@ -464,7 +493,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const holdGate = new PoolHoldGate({ ...poolHoldFromEnv(), ...deps.poolHold });
   const hold: HoldCtl = { gate: holdGate, replay: (r) => handle(r) };
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "internal error while handling the request", "internal_error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   const chatDeps = deps.chat ? { chat: deps.chat } : {};
@@ -491,11 +520,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     found = appName ? await deps.store.getApp(appName) : undefined;
   } catch {
     deps.metrics.authFailure("auth-error");
-    return providerError(guessStyle(url.pathname), 502, "gateway store unavailable");
+    return providerError(guessStyle(url.pathname), 502, "gateway store unavailable", "store_unavailable");
   }
   if (!found) {
     deps.metrics.authFailure("unknown-app");
-    return providerError(guessStyle(url.pathname), 404, "not found");
+    return providerError(guessStyle(url.pathname), 404, "no app of this name", "unknown_app");
   }
   const app: GatewayApp = found;
   const style = app.style;
@@ -508,12 +537,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       valid = await verifyToken(deps.store, app.name, token, deps.now());
     } catch {
       deps.metrics.authFailure("auth-error", app.name);
-      return providerError(style, 502, "gateway store unavailable");
+      return providerError(style, 502, "gateway store unavailable", "store_unavailable");
     }
   }
   if (!valid) {
     deps.metrics.authFailure("bad-token", app.name);
-    return providerError(style, 401, "invalid or missing gateway token");
+    return providerError(style, 401, "invalid or missing gateway token", "bad_token");
   }
 
   const canon = async (name: string): Promise<string> => {
@@ -564,9 +593,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       // Observation must never affect the response.
     }
   };
-  const reject = (status: number, message: string, identity = identityForRow, model?: string, reason?: string): Response => {
+  const reject = (status: number, message: string, identity = identityForRow, model?: string, reason?: string, slug?: string): Response => {
     record(identity, "rejected", status, undefined, false, undefined, model, reason);
-    return providerError(style, status, message);
+    return providerError(style, status, message, slug ?? (reason ?? "rejected").replace(/[^a-z0-9_-]+/gi, "_"));
   };
 
   let identity = identityForRow;
@@ -586,16 +615,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       return new Response(null, { status: 499 });
     }
     record(identity, "error", 500, undefined, false, undefined, model);
-    return providerError(style, 500, "gateway error");
+    return providerError(style, 500, "internal error while handling the request", "internal_error");
   } finally {
     releaseBody?.();
   }
 
   async function run(): Promise<Response> {
-  if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
+  if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path", identityForRow, undefined, undefined, "path_not_allowed");
   let route = routeFor(app.provider, style, req.method, rest);
   // ChatGPT account paths a codex client asks for under /backend-api (plugins and the like): never forwarded with a login.
-  if (route?.kind === "deny") return reject(route.status, "this path is not available through the gateway");
+  if (route?.kind === "deny") return reject(route.status, "this path is not available through the gateway", identityForRow, undefined, undefined, "path_denied");
   // A pinned app has one identity, so a pool-served answer (usage, reset credits) is replaced by the provider's own for that identity.
   if (route?.kind === "serve" && app.target.kind === "pin" && PIN_FORWARD[route.name]) route = { kind: "account", op: "forward", url: PIN_FORWARD[route.name] as string };
   /** A list, search or speech call is not a model call: no model allowlist, and its upstream errors never touch logins or the pool. */
@@ -663,10 +692,10 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       if (req.body) {
         // Bounded: a declared length over the limit is refused unread; otherwise the body is read in chunks inside the body budget and cut off at the limit.
         const declared = declaredLength(req);
-        if (Number.isFinite(declared) && declared > ACCOUNT_BODY_LIMIT) return reject(413, "request body too large for an account call");
+        if (Number.isFinite(declared) && declared > ACCOUNT_BODY_LIMIT) return reject(413, "request body too large for an account call", identityForRow, undefined, undefined, "body_too_large");
         releaseBody = await budget.reserve(Number.isFinite(declared) ? declared : ACCOUNT_BODY_LIMIT, ctrl.signal);
         bytes = await readCapped(req.body, ACCOUNT_BODY_LIMIT);
-        if (!bytes) return reject(413, "request body too large for an account call");
+        if (!bytes) return reject(413, "request body too large for an account call", identityForRow, undefined, undefined, "body_too_large");
       }
       const out = await forwardAccount({ app, deps, state: accountState, op: route.op as AccountOp, method: req.method, url: route.url, search: url.search, headers: req.headers, body: bytes, style, signal: ctrl.signal });
       req.signal.removeEventListener("abort", onAbort);
@@ -711,13 +740,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       record(identity, "client_aborted", 499, undefined, false, undefined, undefined);
       return new Response(null, { status: 499 });
     }
-    return reject(400, "request body could not be read");
+    return reject(400, "request body could not be read", identityForRow, undefined, undefined, "body_unreadable");
   }
   model = requestModel(body);
   if (!sessionKey && body.kind === "buffered") sessionKey = sessionKeyFromBodyTail(body.bytes);
   if (!side && app.models && app.models.length > 0 && body.kind === "stream") {
     deps.metrics.rejection(app.name, "model");
-    return reject(413, "request too large to verify the model allowlist", identityForRow, model);
+    return reject(413, "request too large to verify the model allowlist", identityForRow, model, undefined, "body_too_large");
   }
   let used = 0;
   if (app.dailyTokens !== undefined) {
@@ -962,20 +991,20 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       if (h?.kind === "burst" && "identity" in free && trueReset === undefined) {
         const secs = Math.min(60, Math.max(1, Math.ceil(((exhausted.get(exKey(free.identity)) ?? 0) - deps.now().getTime()) / 1000)));
         record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
-        const res = providerError(style, 429, limitMessage("rate", Math.floor(deps.now().getTime() / 1000) + secs, "upstream rate limit, retry shortly"));
+        const res = limitError(style, limitMessage("rate", Math.floor(deps.now().getTime() / 1000) + secs, "AIS gateway: every pool member is briefly held after a provider rate limit, retry shortly"), "pool_members_held");
         res.headers.set("retry-after", String(secs));
         return res;
       }
       if (h?.kind === "cred") {
         record(identityForRow, "credential_error", 502, undefined, false, undefined, model, reason);
-        return providerError(style, 502, h.message ?? "upstream credential unavailable");
+        return providerError(style, 502, h.message ?? "upstream credential unavailable", "credential_unavailable");
       }
     }
     if (rejectKind !== "no-identities") {
       const usages = await memberUsages(app, deps, model);
       const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
       const now = deps.now();
-      const answer = nativeLimitResponse(app.provider, usages, reserve, now, limitResets) ?? (why === undefined ? undefined : genericLimitResponse(style, summariseLimit(usages, reserve, now, limitResets).resetAtSec, now, why));
+      const answer = nativeLimitResponse(app.provider, usages, reserve, now, limitResets) ?? (why === undefined ? undefined : genericLimitResponse(style, summariseLimit(usages, reserve, now, limitResets).resetAtSec, now, `AIS gateway: ${why}`));
       if (answer) {
         record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
         return answer;
@@ -1097,6 +1126,48 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return { quota: p.whole && isQuotaBody(p.bytes), res: p.res };
   };
 
+
+  /**
+   * An overload or server error before any content: 529, 500, 502, 503, 504, or an event-stream answer whose first event
+   * is an overloaded or api error (Anthropic sends these inside a 200). Only a bounded prefix is read; a normal stream
+   * is decided on its first event line and flows on unchanged. The response returned carries every byte read.
+   */
+  const retryable = async (res: Response): Promise<{ retry?: RetryInfo; res: Response }> => {
+    if (side || !isModelCall(req.method, rest)) return { res };
+    const requestId = upstreamRequestId(res.headers);
+    if (retryReasonForStatus(res.status) !== undefined) {
+      const p = await peek(res, ERROR_PEEK_BYTES);
+      const errorType = errorTypeOfBody(p.bytes);
+      const reason = retryReasonForStatus(res.status, errorType);
+      if (reason === undefined) return { res: p.res };
+      return { retry: { reason, http: res.status, ...(errorType ? { errorType } : {}), ...(requestId ? { requestId } : {}) }, res: p.res };
+    }
+    if (res.status === 200 && style === "anthropic" && (res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+      const p = await peekFirstEvent(res, ERROR_PEEK_BYTES);
+      if (p.first.state !== "error") return { res: p.res };
+      const reason = retryReasonForStreamError(p.first.errorType);
+      if (reason === undefined) return { res: p.res };
+      const id = requestId ?? p.first.requestId;
+      return { retry: { reason, http: res.status, ...(p.first.errorType ? { errorType: p.first.errorType } : {}), ...(id ? { requestId: id } : {}) }, res: p.res };
+    }
+    return { res };
+  };
+
+  /**
+   * `retryable`, but a body that breaks while it is read gives a failed result (no `res`, a `server_error` retry) and
+   * not an exception, so the next member still gets the request. A client that is gone still throws.
+   */
+  const classify = async (res: Response): Promise<{ retry?: RetryInfo; res?: Response }> => {
+    try {
+      return await retryable(res);
+    } catch (err) {
+      if (req.signal.aborted || ctrl.signal.aborted) throw err;
+      // A no-op when the peek already locked the body; it frees the connection when the failure came earlier.
+      await discard(res);
+      return { retry: { reason: "server_error", http: res.status, errorType: "read_failed" } };
+    }
+  };
+
   identity = await canon(pick.identity);
   /** The pool member (as named in the pool) whose answer the client gets. */
   let servedBy = pick.identity;
@@ -1153,20 +1224,31 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     if (poolReplay) {
       let quota = false;
+      /** Set while the answer in `cur` is an overload or server error: the next member gets the request. It is not quota, so no member is held back for it. */
+      let retry: RetryInfo | undefined;
+      /** Members that answered an overload or server error: not asked again for this request, whatever a short-hold wait clears. */
+      const overloaded = new Set<string>();
       if (cur) {
         const q = await isQuota(cur);
         cur = q.res;
         quota = q.quota;
         if (quota) holdQuota(pick.identity, cur);
+        else {
+          const o = await classify(cur);
+          cur = o.res;
+          retry = o.retry;
+          if (retry) overloaded.add(pick.identity);
+          if (!cur) credErr = credErr ?? new Error("upstream answer unreadable");
+        }
       }
       // Every quota answer before the first byte marks that member exhausted until its reset (or briefly for a burst
       // 429), and a credential failure holds the member back; then the next eligible member gets the replayed body,
       // until one answers or none is left (the last answer then stands, or the credential error if there was none).
       const tried = new Set<string>();
       let name = pick.identity;
-      while (quota || !cur) {
+      while (quota || !cur || retry) {
         tried.add(name);
-        const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried]), model);
+        const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried, ...overloaded]), model);
         if (!("identity" in next)) {
           // Everyone left is only briefly held: wait for the first to free, then try the pool again from the top.
           if (quota && cur && (await waitForShortHold())) {
@@ -1193,14 +1275,44 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
           tried.add(name);
           continue;
         }
-        const sq = await isQuota(second);
+        // The new answer is read before the old one goes: a body that breaks (in `isQuota` or `classify`) leaves the old answer standing.
+        let sq: { quota: boolean; res: Response };
+        let o: { retry?: RetryInfo; res?: Response };
+        try {
+          sq = await isQuota(second);
+          o = sq.quota ? { res: sq.res, retry: undefined } : await classify(sq.res);
+        } catch (err) {
+          if (req.signal.aborted || ctrl.signal.aborted) {
+            if (cur) await discard(cur);
+            throw err;
+          }
+          await discard(second);
+          sq = { quota: false, res: second };
+          o = { retry: { reason: "server_error", http: second.status, errorType: "read_failed" } };
+        }
+        if (!o.res) {
+          overloaded.add(name);
+          credErr = credErr ?? new Error("upstream answer unreadable");
+          if (!cur) retry = o.retry;
+          continue;
+        }
+        const left = quota ? "quota" : retry ? retry.reason : "credential";
+        const from = identity;
+        const to = await canon(next.identity);
         if (cur) await discard(cur);
-        deps.metrics.failover(app.name);
-        cur = sq.res;
-        identity = await canon(next.identity);
+        deps.metrics.failover(app.name, left);
+        try {
+          log(JSON.stringify({ event: "failover", app: app.name, reason: left, from, to, ...(retry ? { http: retry.http, ...(retry.errorType ? { errorType: retry.errorType } : {}), ...(retry.requestId ? { requestId: retry.requestId } : {}) } : {}) }));
+        } catch {
+          // Observation must never affect the response.
+        }
+        cur = o.res;
+        identity = to;
         servedBy = next.identity;
         quota = sq.quota;
+        retry = o.retry;
         if (quota) holdQuota(name, cur);
+        else if (retry) overloaded.add(name);
       }
       if (!cur) throw credErr;
       if (quota) {
@@ -1238,12 +1350,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     if (err instanceof GatewayCredentialError) {
       record(identity, "credential_error", 502, undefined, false, undefined, model);
-      return providerError(style, 502, err.clientMessage);
+      return providerError(style, 502, err.clientMessage, "credential_unavailable");
     }
     // Never echo the error: it may carry paths or provider text.
     const credential = err instanceof RefreshCooldownError || err instanceof NotRefreshableError || (err as { name?: string } | null)?.name === "SwapLockError";
     record(identity, credential ? "credential_error" : "upstream_error", 502, undefined, false, undefined, model, credential ? undefined : failureName(err));
-    return providerError(style, 502, credential ? "upstream credential unavailable" : "upstream request failed");
+    return providerError(style, 502, credential ? "upstream credential unavailable" : "could not reach the upstream provider or the connection broke before an answer", credential ? "credential_unavailable" : "upstream_unreachable");
   }
 
   if (!side && route === undefined && mediaAware(app.provider) && isUploadRequest(req.method, rest) && up.status >= 200 && up.status < 300) {
@@ -1258,7 +1370,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       if (rejected.id) knownBad.add(app.provider, rejected.id, deps.now().getTime());
       const details = redactText(rejected.details, 200);
       record(identity, "upstream_error", 422, undefined, false, undefined, model, "upload_rejected", { type: "file_status_error", message: details });
-      return providerError("openai", 422, `upload rejected by provider: ${details}`);
+      return providerError("openai", 422, `upload rejected by provider: ${details}`, "upload_rejected");
     }
   }
   if (mediaRemoved > 0) {
@@ -1289,7 +1401,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       const resetAtSec = (servedBlocked || !anyFree ? fullWindowReset(usages, reserve, nowDate) : undefined)
         ?? (heldUntil !== undefined && heldUntil > nowDate.getTime() ? Math.ceil(heldUntil / 1000) : summariseLimit(usages, reserve, nowDate, limitResets).resetAtSec);
       await discard(up);
-      up = genericLimitResponse(style, resetAtSec, nowDate, redactText(upstreamMessage ?? "upstream rate limit", 120));
+      up = genericLimitResponse(style, resetAtSec, nowDate, `AIS gateway: provider said ${redactText(upstreamMessage ?? "rate limit", 120)}`);
     }
   }
 
@@ -1305,7 +1417,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       up = p.res;
       const message = (p.whole ? summariseUpstreamError(p.bytes)?.message : undefined) ?? "upstream rate limit";
       quietRefusals = false;
-      const held = startHold(redactText(message, 200), "upstream-429");
+      const held = startHold(`AIS gateway: provider said ${redactText(message, 200)}`, "upstream-429");
       if (held) {
         await discard(up);
         return held;
@@ -1318,6 +1430,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   releaseBody?.();
   const headers = new Headers(up.headers);
   headers.delete(SUBSCRIPTION_EXHAUSTED_HEADER);
+  // A provider's answer passes through unchanged: this header only says whose answer it is. A limit answer the gateway made itself has its own header.
+  if (!headers.has(GATEWAY_ERROR_HEADER)) headers.set(GATEWAY_UPSTREAM_HEADER, app.provider);
   if (mediaRemoved > 0) headers.set(MEDIA_REMOVED_HEADER, String(mediaRemoved));
   stripHopByHop(headers);
   if (up.status === 429 && claudePool) {

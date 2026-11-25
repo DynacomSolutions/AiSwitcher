@@ -1,6 +1,6 @@
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import { formatLimitTimes } from "../shared/limit-times.ts";
-import { providerError } from "./errors.ts";
+import { GATEWAY_ERROR_HEADER, GATEWAY_MESSAGE_PREFIX, limitError } from "./errors.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 
 /**
@@ -118,7 +118,9 @@ export function summariseLimit(usages: Array<PoolUsage | undefined>, reservePerc
  */
 export function limitMessage(kind: string, resetAtSec: number, reason?: string, zones?: string[]): string {
   const local = `resets ${formatLimitTimes(resetAtSec * 1000, zones)}`;
-  return `You've hit your ${kind} limit (${reason ? `${reason}; ` : ""}${local}). Resets at ${new Date(resetAtSec * 1000).toISOString()}.`;
+  // The opening stays as clients read it. The reason inside the bracket names the gateway as the maker of this answer.
+  const why = reason ?? `${GATEWAY_MESSAGE_PREFIX}all pool members are at their limit`;
+  return `You've hit your ${kind} limit (${why}; ${local}). Resets at ${new Date(resetAtSec * 1000).toISOString()}.`;
 }
 
 /**
@@ -126,7 +128,7 @@ export function limitMessage(kind: string, resetAtSec: number, reason?: string, 
  * `kind` defaults to "usage".
  */
 export function genericLimitResponse(style: ApiStyle, resetAtSec: number, now: Date, reason: string, kind = "usage"): Response {
-  const res = providerError(style, 429, limitMessage(kind, resetAtSec, reason));
+  const res = limitError(style, limitMessage(kind, resetAtSec, reason), "provider_limit");
   res.headers.set("retry-after", String(Math.max(1, resetAtSec - Math.floor(now.getTime() / 1000))));
   return res;
 }
@@ -152,6 +154,7 @@ export function anthropicLimitResponse(info: LimitInfo, now: Date): Response {
   const headers = new Headers({
     "content-type": "application/json",
     "retry-after": String(retryAfter),
+    [GATEWAY_ERROR_HEADER]: "provider_limit",
     "anthropic-ratelimit-unified-status": "rejected",
     "anthropic-ratelimit-unified-reset": String(info.resetAtSec),
     "anthropic-ratelimit-unified-representative-claim": info.claim === "short" ? "five_hour" : "seven_day",
@@ -175,7 +178,7 @@ export function anthropicLimitResponse(info: LimitInfo, now: Date): Response {
  */
 export function codexLimitResponse(info: LimitInfo, now: Date): Response {
   const nowSec = Math.floor(now.getTime() / 1000);
-  const headers = new Headers({ "content-type": "application/json" });
+  const headers = new Headers({ "content-type": "application/json", [GATEWAY_ERROR_HEADER]: "provider_limit" });
   const short = slotFor(info, "short");
   const long = slotFor(info, "long");
   const primary = info.claim === "short" ? { ...short, utilization: 100, resetsAtSec: info.resetAtSec } : short;
