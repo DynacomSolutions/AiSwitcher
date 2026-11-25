@@ -16,9 +16,11 @@
  *
  * ZCode is not a registry agent: its instance (`acpRegistry` driver, `source: "local"`) names a launcher script of its own
  * as `commandPath`, a script that exports `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` and starts the ZCode ACP server. That
- * launcher is moved behind the relay too: `~/.ais/t3/acp/zcode` records the original launcher, starts it behind
- * `ais __acp_relay zcode` (plain pass-through plus an error for each prompt left open when the agent ends), and starts it
- * directly when `ais` is missing. `--remove` puts the original launcher back as `commandPath`.
+ * launcher is moved behind the relay too: `~/.ais/t3/acp/zcode-<hash of the original path>` records the original launcher,
+ * starts it behind `ais __acp_relay zcode` (plain pass-through plus an error for each prompt left open when the agent
+ * ends), and starts it directly when `ais` is missing. Each ZCode instance with its own original launcher gets its own
+ * generated launcher, so two instances never run each other's provider config. `--remove` puts each original launcher
+ * back as `commandPath`.
  *
  * Only instances whose `commandPath` is empty or already this launcher are changed. T3 Code itself is never changed.
  * While the override is set T3 Code does not install a newer version of the agent; `--check` says when the registry
@@ -28,7 +30,7 @@ import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { t3Paths } from "./t3-anthropic-proxy.ts";
 import { zcodeConfigPathFromLauncher, zcodeLauncherOriginal } from "./t3-gateway-models.ts";
 
@@ -37,8 +39,18 @@ export const RELAY_AGENTS = ["kimi-code", "grok-build", "glm-acp-agent"] as cons
 export type RelayAgentId = (typeof RELAY_AGENTS)[number];
 export const isRelayAgent = (id: string): id is RelayAgentId => (RELAY_AGENTS as readonly string[]).includes(id);
 
-/** The id the ZCode launcher goes by: `~/.ais/t3/acp/zcode` and `ais __acp_relay zcode`. */
+/** The id the ZCode launchers go by: `~/.ais/t3/acp/zcode-<hash>` and `ais __acp_relay zcode`. */
 export const ZCODE_AGENT_ID = "zcode";
+
+/** The generated launcher for the ZCode launcher at `original`: one file per original, so instances never share one. */
+export function zcodeLauncherPath(launchers: string, original: string): string {
+  return join(launchers, `${ZCODE_AGENT_ID}-${createHash("sha256").update(original).digest("hex").slice(0, 8)}`);
+}
+
+/** True when `commandPath` is a launcher this module generated for ZCode (one per original, or the plain `zcode` of an early build). */
+function isGeneratedZcode(commandPath: string, launchers: string): boolean {
+  return dirname(commandPath) === launchers && /^zcode(-[0-9a-f]{8})?$/.test(basename(commandPath));
+}
 
 export interface AcpRelayOptions {
   home?: string;
@@ -194,7 +206,7 @@ export function zcodeLauncherSource(aisPath: string, originalLauncher: string): 
     "# Without ais, or with an ais that has no relay, ORIGINAL starts directly.",
     `AIS=${shQuote(aisPath)}`,
     `ORIGINAL=${shQuote(originalLauncher)}`,
-    `if [ -x "$AIS" ] && "$AIS" __acp_relay --supported >/dev/null 2>&1; then exec "$AIS" __acp_relay ${ZCODE_AGENT_ID} "--fallback=$ORIGINAL" "$@"; fi`,
+    `if [ -x "$AIS" ] && "$AIS" __acp_relay --supported=binary >/dev/null 2>&1; then exec "$AIS" __acp_relay ${ZCODE_AGENT_ID} "--binary=$ORIGINAL" "$@"; fi`,
     `exec "$ORIGINAL" "$@"`,
     "",
   ].join("\n");
@@ -239,7 +251,6 @@ interface ZcodeInstance {
 
 /** The ZCode instances: `acpRegistry` instances whose `commandPath` is a ZCode launcher, or the relay launcher for one. */
 async function zcodeInstances(settings: Json, paths: AcpRelayPaths, home: string): Promise<ZcodeInstance[]> {
-  const launcher = join(paths.launchers, ZCODE_AGENT_ID);
   const out: ZcodeInstance[] = [];
   for (const [id, raw] of Object.entries(obj(settings.providerInstances) ?? {})) {
     const inst = obj(raw);
@@ -247,8 +258,8 @@ async function zcodeInstances(settings: Json, paths: AcpRelayPaths, home: string
     if (!inst || !config || inst.driver !== "acpRegistry") continue;
     const commandPath = str(config.commandPath);
     if (!commandPath) continue;
-    if (commandPath === launcher) {
-      const text = await readFile(launcher, "utf8").catch(() => undefined);
+    if (isGeneratedZcode(commandPath, paths.launchers)) {
+      const text = await readFile(commandPath, "utf8").catch(() => undefined);
       out.push({ id, commandPath, config, original: text === undefined ? undefined : zcodeLauncherOriginal(text) });
       continue;
     }
@@ -364,19 +375,13 @@ async function installOnce(opts: AcpRelayOptions): Promise<AcpRelayResult> {
     changed = true;
     results.push({ instance: inst.id, agentId: inst.agentId, status: "set" });
   }
-  // ZCode: its own launcher moves behind the relay. One generated launcher serves every ZCode instance with that original.
-  const zcodeLauncher = join(paths.launchers, ZCODE_AGENT_ID);
-  let zcodeOriginal: string | undefined;
+  // ZCode: each instance's own launcher moves behind the relay, through one generated launcher per original launcher.
   for (const inst of await zcodeInstances(read.settings, paths, paths.home)) {
     if (!inst.original) {
-      results.push({ instance: inst.id, agentId: ZCODE_AGENT_ID, status: "kept", detail: `${zcodeLauncher} does not record its original launcher; run ais gateway t3-acp --remove, then ais gateway t3-acp` });
+      results.push({ instance: inst.id, agentId: ZCODE_AGENT_ID, status: "kept", detail: `${inst.commandPath} does not record its original launcher; run ais gateway t3-acp --remove, then ais gateway t3-acp` });
       continue;
     }
-    if (zcodeOriginal !== undefined && inst.original !== zcodeOriginal) {
-      results.push({ instance: inst.id, agentId: ZCODE_AGENT_ID, status: "kept", detail: `uses another launcher (${inst.original}) than the first ZCode instance` });
-      continue;
-    }
-    zcodeOriginal = inst.original;
+    const zcodeLauncher = zcodeLauncherPath(paths.launchers, inst.original);
     const source = zcodeLauncherSource(paths.ais, inst.original);
     if ((await readFile(zcodeLauncher, "utf8").catch(() => undefined)) !== source) await writeAtomic(zcodeLauncher, source, 0o755);
     if (inst.commandPath === zcodeLauncher) {
@@ -410,11 +415,10 @@ async function removeOnce(opts: AcpRelayOptions): Promise<AcpRelayResult> {
       results.push({ instance: inst.id, agentId: inst.agentId, status: "removed" });
     }
     // ZCode: the original launcher goes back as the instance's executable.
-    const zcodeLauncher = join(paths.launchers, ZCODE_AGENT_ID);
     for (const inst of await zcodeInstances(read.settings, paths, paths.home)) {
-      if (inst.commandPath !== zcodeLauncher) continue;
+      if (!isGeneratedZcode(inst.commandPath, paths.launchers)) continue;
       if (!inst.original) {
-        results.push({ instance: inst.id, agentId: ZCODE_AGENT_ID, status: "kept", detail: `${zcodeLauncher} does not record its original launcher, so it stays` });
+        results.push({ instance: inst.id, agentId: ZCODE_AGENT_ID, status: "kept", detail: `${inst.commandPath} does not record its original launcher, so it stays` });
         keep = true;
         continue;
       }
@@ -467,19 +471,21 @@ export async function checkAcpRelay(opts: AcpRelayOptions = {}): Promise<string[
 
 async function checkZcode(settings: Json, paths: AcpRelayPaths, opts: AcpRelayOptions): Promise<string[]> {
   const problems: string[] = [];
-  const launcher = join(paths.launchers, ZCODE_AGENT_ID);
-  let checked = false;
+  const checked = new Set<string>();
   for (const inst of await zcodeInstances(settings, paths, paths.home)) {
-    if (inst.commandPath !== launcher) {
+    if (!isGeneratedZcode(inst.commandPath, paths.launchers)) {
       problems.push(`${inst.id} (${ZCODE_AGENT_ID}): the relay is not set`);
       continue;
     }
-    if (checked) continue;
-    checked = true;
+    const launcher = inst.commandPath;
     if (!inst.original) {
       problems.push(`${ZCODE_AGENT_ID}: the launcher ${launcher} does not record its original launcher`);
       continue;
     }
+    const expected = zcodeLauncherPath(paths.launchers, inst.original);
+    if (launcher !== expected) problems.push(`${inst.id} (${ZCODE_AGENT_ID}): the launcher ${launcher} is out of date (run ais gateway t3-acp)`);
+    if (checked.has(launcher)) continue;
+    checked.add(launcher);
     const source = await readFile(launcher, "utf8").catch(() => undefined);
     if (source !== zcodeLauncherSource(paths.ais, inst.original)) problems.push(`${ZCODE_AGENT_ID}: the launcher ${launcher} is missing or out of date`);
     let originalThere = false;

@@ -65,3 +65,15 @@ describe("failureName", () => {
     expect(failureName(undefined)).toBeUndefined();
   });
 });
+
+test("redactText removes id.secret keys and the value after a secret-looking name, and keeps the name", () => {
+  const idKey = `${"0123456789abcdef".repeat(2)}.${"AbCdEfGh".repeat(2)}`; // built here, not written out: no key-shaped literal
+  expect(redactText(`auth failed for ${idKey} today`)).toBe("auth failed for [redacted] today");
+  expect(redactText("api_key=short1 and apikey: v2 and API-KEY = v3")).toBe("api_key=[redacted] and apikey: [redacted] and API-KEY = [redacted]");
+  expect(redactText("password: hunter2 secret=abc token:xyz")).toBe("password: [redacted] secret=[redacted] token:[redacted]");
+  expect(redactText("x-api-key: abc123 client_secret=abc")).toBe("x-api-key: [redacted] client_secret=[redacted]");
+  expect(redactText('{"token":"abc","n":1}')).toBe('{"token":[redacted]');
+  expect(redactText("authorization: Bearer abc_SYNTHETIC_FIXTURE_123")).not.toContain("SYNTHETIC_FIXTURE");
+  // plain words are not changed
+  expect(redactText("max_tokens exceeded, token limit reached")).toBe("max_tokens exceeded, token limit reached");
+});

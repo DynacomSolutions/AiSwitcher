@@ -47,9 +47,10 @@ export async function runT3AcpCommand(args: string[], flags: ParsedArgs["flags"]
 }
 
 /**
- * `ais __acp_relay <agentId> [--fallback=<executable>] [agent arguments]`: what a launcher starts. Takes the agent's
- * place on stdin and stdout and runs the agent T3 Code installed behind the relay; with no install record it runs the
- * fallback executable. Prints nothing to stdout itself. `ais __acp_relay --supported` only exits 0: a launcher asks it
+ * `ais __acp_relay <agentId> [--binary=<executable> | --fallback=<executable>] [agent arguments]`: what a launcher starts.
+ * Takes the agent's place on stdin and stdout and runs the agent T3 Code installed behind the relay; with no install
+ * record it runs the fallback executable. `--binary=` runs exactly that executable (the ZCode and grok launchers use it,
+ * so a T3 install record never wins over the launcher that exports the ZCode config). Prints nothing to stdout itself. `ais __acp_relay --supported` only exits 0: a launcher asks it
  * before it hands the agent over, because an ais without the relay fails on this command.
  */
 export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions = {}): Promise<number> {

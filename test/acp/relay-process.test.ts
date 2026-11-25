@@ -318,6 +318,117 @@ describe("an agent that ends with a prompt open", () => {
   });
 });
 
+describe("an agent whose helper process keeps its output open", () => {
+  const PROMPT = '{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s1"}}\n';
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  async function waitFor(file: string): Promise<string> {
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      const f = Bun.file(file);
+      if (await f.exists()) {
+        const t = (await f.text()).trim();
+        if (t !== "") return t;
+      }
+      if (Date.now() > deadline) throw new Error(`${file} never appeared`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  test("a helper that inherits stderr does not keep the relay waiting: the prompt gets its error within a second", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let out = "";
+    stdout.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    const t0 = Date.now();
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", "read l; sleep 3 >/dev/null </dev/null & exit 1"], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false });
+    stdin.write(PROMPT);
+    expect(await done).toBe(1);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    const answers = out.trim().split("\n").map((l) => JSON.parse(l));
+    expect(answers.length).toBe(1);
+    expect(answers[0].id).toBe(7);
+    expect(answers[0].error.message).toContain("it exited with code 1.");
+  }, 30_000);
+
+  test("a line a helper writes to stdout after the error answer is not passed on", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let out = "";
+    stdout.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    const late = '{"jsonrpc":"2.0","method":"session/update","params":{"late":true}}';
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `read l; (sleep 1.2; echo '${late}') >&1 2>/dev/null & exit 1`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false });
+    stdin.write(PROMPT);
+    expect(await done).toBe(1);
+    await new Promise((r) => setTimeout(r, 1800)); // the helper writes now
+    const lines = out.trim().split("\n");
+    expect(lines.length).toBe(1);
+    expect(JSON.parse(lines[0]!).error.message).toContain("it exited with code 1.");
+    expect(out).not.toContain("late");
+  }, 30_000);
+
+  test("a signal reaches the agent's helper too: nothing is left running after the relay ends", async () => {
+    const dir = join(root, "orphan");
+    await mkdir(dir, { recursive: true });
+    const pidFile = join(dir, "helper.pid");
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `read l; sleep 31 & echo $! > ${pidFile}; wait`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false, signalGraceMs: 2000 });
+    stdin.write(PROMPT);
+    const pid = Number(await waitFor(pidFile));
+    expect(alive(pid)).toBe(true);
+    process.emit("SIGTERM");
+    expect(await done).toBe(143);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(alive(pid)).toBe(false);
+  }, 30_000);
+
+  test("an agent that ignores the signal: the group is killed after the grace time, helper included", async () => {
+    const dir = join(root, "orphan-stubborn");
+    await mkdir(dir, { recursive: true });
+    const pidFile = join(dir, "helper.pid");
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let out = "";
+    stdout.on("data", (c: Buffer) => (out += c.toString("utf8")));
+    const done = runAcpRelay({ command: "/bin/sh", args: ["-c", `trap "" TERM; read l; sleep 31 & echo $! > ${pidFile}; wait`], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false, signalGraceMs: 1000 });
+    stdin.write(PROMPT);
+    const pid = Number(await waitFor(pidFile));
+    process.emit("SIGTERM");
+    expect(await done).toBe(143);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(alive(pid)).toBe(false);
+    const err = JSON.parse(out.trim().split("\n")[0]!);
+    expect(err.error.message).toContain("it did not end within 1 second after the relay received SIGTERM, so the relay stopped it.");
+  }, 30_000);
+});
+
+test("the end message separates an agent that did not end from one whose output stayed open, with singular and plural seconds", () => {
+  const base = { agent: "zcode", code: null, signal: null, relaySignal: "SIGTERM" as const };
+  expect(agentEndMessage({ ...base, timedOut: { graceMs: 1000 } })).toContain("it did not end within 1 second after the relay received SIGTERM, so the relay stopped it.");
+  expect(agentEndMessage({ ...base, timedOut: { graceMs: 3000 } })).toContain("it did not end within 3 seconds after");
+  expect(agentEndMessage({ ...base, timedOut: { graceMs: 1000, agentEnded: true } })).toContain("its process ended, but its output stayed open for more than 1 second after the relay received SIGTERM");
+});
+
+test("a stderr tail that was cut loses its partial first line, and secrets in it are redacted", () => {
+  const idKey = `${"0123456789abcdef".repeat(2)}.${"AbCdEfGh".repeat(2)}`; // built here, not written out: no key-shaped literal
+  const tail = ["ial first line", "fatal: password=hunter2extra", "token: abcdef", `x-api-key: ${idKey}`].join("\n");
+  const cut = agentEndMessage({ agent: "zcode", code: 1, signal: null, stderrTail: tail, stderrCut: true });
+  expect(cut).not.toContain("ial first line");
+  expect(cut).toContain("fatal: password=[redacted]");
+  expect(cut).toContain("token: [redacted]");
+  expect(cut).not.toContain("hunter2extra");
+  expect(cut).not.toContain("AbCdEfGh");
+  expect(agentEndMessage({ agent: "zcode", code: 1, signal: null, stderrTail: tail })).toContain("ial first line"); // not cut: kept
+});
+
 test("an agent that cannot start gives 127 and a note", async () => {
   const notes: string[] = [];
   const code = await runAcpRelay({ command: join(root, "no-such-agent"), args: [], stdin: new PassThrough(), stdout: new PassThrough(), log: (l) => notes.push(l) });
