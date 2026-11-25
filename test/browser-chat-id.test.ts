@@ -8,7 +8,20 @@ describe("stable chat id", () => {
   test("only the T3 thread id counts; no session id of the agent does", () => {
     expect(stableChatId({ T3CODE_THREAD_ID: "thread-1" })).toBe("thread-1");
     expect(stableChatId({ CLAUDE_CODE_SESSION_ID: "abc", CODEX_SESSION_ID: "def" })).toBeUndefined();
-    expect(stableChatId({ T3CODE_THREAD_ID: "bad id!" })).toBeUndefined();
+    expect(stableChatId({ T3CODE_THREAD_ID: "" })).toBeUndefined();
+    expect(stableChatId({ T3CODE_THREAD_ID: "  " })).toBeUndefined();
+  });
+
+  test("a long or odd thread id becomes a stable digest that the gateway accepts", () => {
+    const raw = `thread:delegated-task:command%3Amcp%3A${"a".repeat(36)}%3Adelegate-task%3A${"b".repeat(36)}`;
+    expect(raw.length).toBeGreaterThan(128);
+    const id = stableChatId({ T3CODE_THREAD_ID: raw });
+    expect(id).toMatch(/^t3h:[0-9a-f]{32}$/);
+    expect(stableChatId({ T3CODE_THREAD_ID: raw })).toBe(id);
+    expect(stableChatId({ T3CODE_THREAD_ID: `${raw}x` })).not.toBe(id);
+    expect(stableChatId({ T3CODE_THREAD_ID: "bad id!" })).toMatch(/^t3h:/);
+    const parsed = parseMcpHeaders((n) => (n === "x-ais-chat-id" ? launchHeaders({ label: "L", chatId: id })["X-AIS-Chat-Id"]! : null));
+    expect(parsed).toMatchObject({ ok: true, value: { chatId: id } });
   });
 
   test("the launch header carries it and the gateway reads it", () => {
