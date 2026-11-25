@@ -137,8 +137,13 @@ a stream, has a buffered body (up to the 32 MiB replay cap) and meets a full poo
 `200 text/event-stream` at once. That ends the client's 10 minute header timeout. The gateway sends an SSE `ping` every
 15 s, so the client's stream idle watchdog stays quiet. Every 30 s it sends the buffered request through the proxy again
 (same app, same token, same selection and failover). When a member has room, the answer of that replay is the rest of the
-stream. A replay that meets a full pool again waits. A replay that fails for another reason ends the stream with an SSE
-`error` event in the provider's shape, which the client reads as a normal API error.
+stream. Every 429 that the gateway would return to a streamed claude pool request counts as a full pool: the
+out-of-capacity answer, a provider 429 passed through, and a replay that meets a provider 429. A replay that meets such a
+429 waits. A replay that fails for another reason ends the stream with an SSE `error` event in the provider's shape,
+which the client reads as a normal API error. Upstream calls stay bounded: a member that quota held is probed at most
+once per 5 min per replica, so the calls do not grow with the number of held requests.
+The served answer sends its `request-id` and `anthropic-ratelimit-unified-*` values as one SSE comment line
+(`: ais-replay ...`), because the 200 headers went out when the hold began. The client does not see them as headers.
 
 - Time limit: 6 h (`AIS_GATEWAY_POOL_HOLD_MAX_S`). After it the stream ends with the `rate_limit_error` event that carries
   the reset text, so T3 Code can still snooze the thread until the reset.
@@ -149,9 +154,17 @@ stream. A replay that meets a full pool again waits. A replay that fails for ano
   `retry-after` is capped at 55 s, so the client retries (up to 10 times) instead of ending the request.
 - Unknown reset (the 300 s default) is held the same way: the hold looks at the pool, not at the reset text.
 - Pod drain: a held request is not an in-flight upstream call. On SIGTERM the process aborts one drain signal. Every hold
-  ends at once with an SSE `overloaded_error` event, which the client retries (and the router sends to a pod that is
-  ready). The old pod stops accepting and has nothing held, so the drain waits only for real streams. A request already
-  served after its wait is a normal stream and finishes.
+  ends at once with a socket reset before any message event (`controller.error()`, `ECONNRESET` in a Bun client), and it
+  aborts a replay that has not answered yet. Claude Code retries a reset as a stream, up to 2 times. An SSE `error` event
+  before `message_start` is wrong here: the client then resends the request without streaming, and a request that is not
+  streamed is never held. The router sends the retry to a pod that is ready. The old pod stops accepting and has nothing
+  held, so the drain waits only for real streams. A request already served after its wait is a normal stream and finishes.
+  Check the reset live through Envoy after the first release.
+- Client setting: `CLAUDE_ENABLE_STREAM_WATCHDOG` must stay off (unset) for apps that use held requests. The watchdog
+  counts only message events, not `ping`, so it would abort a healthy hold.
+- Ledger: a held request writes no row while it waits and no rejection metric. It writes one row when the hold ends:
+  the real final status when served, `rejected` 429 on timeout, `client_aborted` 499 when the client leaves, `rejected`
+  503 on drain.
 - A client that leaves ends its hold and frees its slot and its bytes. The held request holds no upstream connection and
   no body budget, only its buffered body.
 - Metrics: `ais_gateway_pool_holds_total{app,event}` with events `held`, `served`, `failed`, `timeout`, `drained`,
