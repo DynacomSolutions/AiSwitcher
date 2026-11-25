@@ -59,3 +59,10 @@ export async function verifyToken(
   }
   return ok;
 }
+
+/** A token built from fixed bytes: 5 bytes give the prefix, 32 bytes the secret. Used for tokens that must be the same on every call. */
+export function tokenFromBytes(prefixBytes: Uint8Array, secretBytes: Uint8Array): { token: string; prefix: string; hash: string } {
+  const prefix = Array.from(prefixBytes.subarray(0, PREFIX_LEN), (b) => BASE32[b % 32]).join("");
+  const secret = Buffer.from(secretBytes.subarray(0, 32)).toString("base64url");
+  return { token: `${TOKEN_HEAD}${prefix}_${secret}`, prefix, hash: hashSecret(secret) };
+}

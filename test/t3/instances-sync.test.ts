@@ -10,6 +10,8 @@ let home: string;
 let secrets: string;
 let settingsPath: string;
 const TOKEN = "aisg_testtoken123";
+const ROTATED = ["aisg", "rotated"].join("_");
+const LIVE = ["aisg", "live"].join("_");
 const app = (name: string, provider: string, target: GatewayApp["target"], state = "active"): GatewayApp => ({ name, provider, target, state });
 const pool = { kind: "pool" } as const;
 const APPS: GatewayApp[] = [
@@ -130,4 +132,36 @@ test("only-missing keeps an existing instance and still adds and removes", async
   expect(after["t3-opencode-pool"].displayName).toBe("seeded");
   expect(after["t3-zai-pool-acp"]).toBeDefined();
   expect(after["t3-grok-old"]).toBeUndefined();
+});
+
+test("the Kimi config.toml follows a changed token and is left alone when the token is the same", async () => {
+  await run(APPS);
+  const cfg = join(home, ".t3", "gateway", "t3-kimi-pool-acp", "config.toml");
+  expect(await readFile(cfg, "utf8")).toContain(TOKEN);
+  await writeFile(secrets, (await readFile(secrets, "utf8")).replaceAll(TOKEN, ROTATED));
+  const items = await run(APPS);
+  expect(items.find((i) => i.id === "t3-kimi-pool-acp")?.status).toBe("updated");
+  expect(await readFile(cfg, "utf8")).toContain(ROTATED);
+  expect(await readFile(cfg, "utf8")).not.toContain(TOKEN);
+  expect((await run(APPS)).find((i) => i.id === "t3-kimi-pool-acp")?.status).toBe("current");
+});
+
+test("tokenFor gives the app token live and wins over the token folder and the secrets file", async () => {
+  const asked: string[] = [];
+  const items = await run(APPS, { tokenFor: async (name) => (asked.push(name), name === "t3-zai-pool" ? undefined : LIVE) });
+  expect([...new Set(asked)].sort()).toEqual(["agents-claude", "agents-codex", "t3-grok-pool", "t3-kimi-pool", "t3-opencode-pool", "t3-zai-pool"]);
+  expect(items.find((i) => i.id === "t3-zai-pool-acp")?.status).toBe("skipped");
+  expect(await readFile(join(home, ".t3", "gateway", "t3-kimi-pool-acp", "config.toml"), "utf8")).toContain(LIVE);
+});
+
+test("a rotated Kimi token keeps the model lines of the config.toml", async () => {
+  await run(APPS);
+  const cfg = join(home, ".t3", "gateway", "t3-kimi-pool-acp", "config.toml");
+  await writeFile(cfg, `${await readFile(cfg, "utf8")}\n[models."gateway/x"]\nprovider = "gateway"\nmodel = "x"\n`, { mode: 0o600 });
+  await writeFile(secrets, (await readFile(secrets, "utf8")).replaceAll(TOKEN, ROTATED));
+  await run(APPS);
+  const text = await readFile(cfg, "utf8");
+  expect(text).toContain(`api_key = "${ROTATED}"`);
+  expect(text).toContain('[models."gateway/x"]');
+  expect(text.match(/api_key/g)).toHaveLength(1);
 });

@@ -80,7 +80,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|t3-instances|codex-home|favourites-token ...",
+    usage: "ais gateway serve|local|app|usage|usage-history|store|release|claude-proxy|claude-preload|t3-proxy|t3-models|t3-claude-sync|t3-usage|t3-acp|t3-instance|t3-instances|codex-home|favourites-token|instances-token ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -133,6 +133,10 @@ export const HELP: Record<string, HelpNode> = {
       "favourites-token": sub(
         "ais gateway favourites-token",
         "Print the favourites-only token that is derived from the gateway admin token (env or ~/.secrets AIS_GATEWAY_ADMIN_TOKEN): HMAC-SHA256 of the admin token with the text ais-favourites-v1, as hex. The gateway accepts it on GET and POST /favourites only, so a T3 pod sidecar can run `ais t3 favourites sync` without the admin token (set it there as AIS_GATEWAY_FAVOURITES_TOKEN). It changes when the admin token changes. Seal the output into a Secret; the command prints nothing else",
+      ),
+      "instances-token": sub(
+        "ais gateway instances-token",
+        "Print the t3-instances token that is derived from the gateway admin token (env or ~/.secrets AIS_GATEWAY_ADMIN_TOKEN): HMAC-SHA256 of the admin token with a fixed text, as hex. Seal it into the Secret of a T3 pod as AIS_GATEWAY_INSTANCES_TOKEN. The gateway accepts it on GET /apps (names, namespace, provider, mode and target only) and on POST /apps/<app>/instance-token (the token that the instance uses for that app, same on every call, only for an active app in a namespace of AIS_GATEWAY_INSTANCES_NAMESPACES, default dev; every read is logged). It cannot change an app, rotate or read other tokens, touch the credential store or favourites. It changes when the admin token changes. With it set, `ais gateway t3-instances sync` reads the list and every app token from the gateway, so no per-app token list is kept",
       ),
       "codex-home": sub(
         "ais gateway codex-home <codex home dir>... [--check]",

@@ -33,6 +33,8 @@ export interface SyncT3InstancesOptions {
   secretsPath?: string;
   /** A folder that holds one token file per app (`<dir>/<app>`), as in a pod. Without it the secrets file is read. */
   tokenDir?: string;
+  /** Gives the token of one app, read live from the gateway by the caller. Wins over `tokenDir` and the secrets file. Undefined: skip the app. */
+  tokenFor?: (app: string) => Promise<string | undefined>;
   /** Leave an instance that already exists exactly as it is (a pod: the chart seeds its own entries). Only missing ones are made. */
   onlyMissing?: boolean;
   check?: boolean;
@@ -125,7 +127,7 @@ async function claudeSource(c: Ctx, id: string): Promise<T3InstanceOptions["sour
 async function applyOne(c: Ctx, p: PlannedInstance): Promise<SyncItem> {
   if (c.o.onlyMissing && (await hasInstance(c, p.id))) return { id: p.id, status: "current" };
   const url = `${c.o.gatewayRoot.replace(/\/+$/, "")}/${p.app}`;
-  const token = c.o.tokenDir ? (await fileText(join(c.o.tokenDir, p.app)))?.trim() : await readSecretsKey(appTokenKey(p.app), c.o.secretsPath);
+  const token = c.o.tokenFor ? (await c.o.tokenFor(p.app))?.trim() : c.o.tokenDir ? (await fileText(join(c.o.tokenDir, p.app)))?.trim() : await readSecretsKey(appTokenKey(p.app), c.o.secretsPath);
   if (!token || !token.startsWith(GATEWAY_TOKEN_PREFIX)) return { id: p.id, status: "skipped", detail: `no gateway token for app ${p.app}` };
   const base = { token, home: c.home, ...(c.o.env ? { env: c.o.env } : {}), ...(c.o.secretsPath ? { secretsPath: c.o.secretsPath } : {}), check: c.check, now: c.now };
   const viaWriter = async (driver: InstanceDriver, extra: Partial<T3InstanceOptions> = {}): Promise<SyncItem> => {
@@ -174,6 +176,27 @@ async function applyCodex(c: Ctx, p: PlannedInstance, url: string, token: string
   return { id: p.id, status: changed ? (existed ? "updated" : "created") : "current" };
 }
 
+/** Sets base_url and api_key inside [providers.gateway] of a Kimi config.toml; other tables and lines are kept. Adds a missing key. */
+export function setGatewayKeys(text: string, baseUrl: string, token: string): string {
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => l.trim() === "[providers.gateway]");
+  if (start < 0) return `${text}${text.endsWith("\n") || text === "" ? "" : "\n"}[providers.gateway]\ntype = "kimi"\nbase_url = ${JSON.stringify(baseUrl)}\napi_key = ${JSON.stringify(token)}\n`;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) if (/^\s*\[/.test(lines[i]!)) { end = i; break; }
+  const want: Record<string, string> = { base_url: JSON.stringify(baseUrl), api_key: JSON.stringify(token) };
+  const seen = new Set<string>();
+  for (let i = start + 1; i < end; i++) {
+    const key = /^\s*(base_url|api_key)\s*=/.exec(lines[i]!)?.[1];
+    if (key) {
+      lines[i] = `${key} = ${want[key]}`;
+      seen.add(key);
+    }
+  }
+  const add = Object.keys(want).filter((k) => !seen.has(k)).map((k) => `${k} = ${want[k]}`);
+  lines.splice(start + 1, 0, ...add);
+  return lines.join("\n");
+}
+
 async function applyAcp(c: Ctx, p: PlannedInstance, url: string, token: string): Promise<SyncItem> {
   const agent = ACP_AGENT[p.kind]!;
   const folder = folderOf(c, p.id);
@@ -196,11 +219,12 @@ async function applyAcp(c: Ctx, p: PlannedInstance, url: string, token: string):
     return { ...existing, driver: "acpRegistry", displayName: displayName(p), enabled: true, config: { ...obj(existing?.config), source: "registry", agentId: agent.agentId, commandPath }, environment };
   });
   if (p.kind === "acp-kimi") {
-    // The folder config.toml names the gateway provider. Model lists come from `ais gateway t3-models`; an existing file is kept as it is.
+    // The folder config.toml names the gateway provider and holds the app token. Only base_url and api_key of [providers.gateway] follow
+    // the gateway; every other line (the model lists of `ais gateway t3-models`) stays.
     const cfgPath = join(folder, "config.toml");
-    if ((await fileText(cfgPath)) === undefined) {
-      changed = (await putFile(cfgPath, `[providers.gateway]\ntype = "kimi"\nbase_url = ${JSON.stringify(`${url}/v1`)}\napi_key = ${JSON.stringify(token)}\n`, 0o600, c.check)) || changed;
-    }
+    const fresh = `[providers.gateway]\ntype = "kimi"\nbase_url = ${JSON.stringify(`${url}/v1`)}\napi_key = ${JSON.stringify(token)}\n`;
+    const have = await fileText(cfgPath);
+    changed = (await putFile(cfgPath, have === undefined ? fresh : setGatewayKeys(have, `${url}/v1`, token), 0o600, c.check)) || changed;
   }
   return { id: p.id, status: changed ? (existed ? "updated" : "created") : "current" };
 }

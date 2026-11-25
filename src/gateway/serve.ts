@@ -95,6 +95,11 @@ export interface GatewayOptions {
    * `token`: the ingest token, AIS_GATEWAY_SESSIONS_TOKEN. `flushGapSeconds`: AIS_GATEWAY_SESSIONS_FLUSH_GAP_SECONDS (default 120).
    */
   sessions?: { token: string; flushGapSeconds?: number };
+  /**
+   * The t3-instances scope (instances-token.ts): the namespaces whose apps may hand a token to a T3 instance.
+   * Off when absent. AIS_GATEWAY_INSTANCES_NAMESPACES sets it in the CLI (default `dev`).
+   */
+  instances?: { namespaces: readonly string[] };
 }
 
 /** Everything a test (or another host) may replace. Production uses the defaults. */
@@ -851,6 +856,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     readStore: inner,
     adminToken: opts.adminToken,
     now,
+    ...(opts.instances ? { instances: { namespaces: opts.instances.namespaces, log: (line: string) => console.info(line) } } : {}),
     renewal: () => buildRenewalReport({ tools: GATEWAY_REFRESH_TOOLS, accounts: renewalAccounts, summary: () => refreshBackend.summary?.() ?? Promise.resolve([]), isRevoked: (tool, name, fingerprint) => fingerprint !== undefined && deadLogins.get(`${tool}/${name}`)?.fingerprint === fingerprint, now }),
     ...(homeStore
       ? {

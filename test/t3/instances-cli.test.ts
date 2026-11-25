@@ -50,3 +50,19 @@ test("the ticker asks again each run and logs a change once", async () => {
   expect(calls).toBe(2);
   expect(log).toHaveLength(1);
 });
+
+test("instances-token prints the derived scope token and refuses extra words", async () => {
+  const { runInstancesTokenCommand } = await import("../../src/cli/gateway/instances-token.ts");
+  const { instancesToken } = await import("../../src/gateway/instances-token.ts");
+  const lines: string[] = [];
+  await runInstancesTokenCommand([], { ...deps(apps, lines) }, { AIS_GATEWAY_ADMIN_TOKEN: "admin-secret-value" });
+  expect(lines).toEqual([instancesToken("admin-secret-value")]);
+  await expect(runInstancesTokenCommand(["x"], deps(apps, []), {})).rejects.toThrow(/Usage/);
+});
+
+test("the gateway namespaces come from the environment: default dev, empty turns the scope off", async () => {
+  const { instancesFromEnv } = await import("../../src/cli/gateway/dispatch.ts");
+  expect(instancesFromEnv({})).toEqual({ namespaces: ["dev"] });
+  expect(instancesFromEnv({ AIS_GATEWAY_INSTANCES_NAMESPACES: "dev, stage" })).toEqual({ namespaces: ["dev", "stage"] });
+  expect(instancesFromEnv({ AIS_GATEWAY_INSTANCES_NAMESPACES: "" })).toBeUndefined();
+});
