@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   grantFingerprint,
@@ -22,6 +23,9 @@ import { isSwapPool, poolsHoldingMember } from "./pool/swap-pool.ts";
 import { codexAccountIdOfDir } from "./codex-auth.ts";
 import { SwapLockError, withOauthRefreshLock, withOauthRefreshLocks } from "./claude-swap-lock.ts";
 import { isGatewayManagedHere } from "./gateway-managed.ts";
+import { isGatewayOwnerProcess } from "./gateway-managed.ts";
+import { folderHoldsGatewayEntry } from "./gateway-routed.ts";
+import { hasMemberCopy, isRefreshableLoginText, isMemberStoreTool, isUnderMemberStore, memberDir, memberLoginFile, memberStoreEnabled } from "./gateway-members.ts";
 import { isGatewayAccessToken, isGatewayRoutedDir } from "./claude-gateway-entry.ts";
 import type { Identity } from "./types.ts";
 import { kimiCredentialStores, persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
@@ -374,6 +378,19 @@ export async function writeGrantThroughStores(
   }
 
   const backups = new Set<string>();
+  // Self-heal for the gateway needs to know BEFORE the native write whether the gateway holds this identity: only the gateway owner
+  // process does it, and only when the folder holds the gateway entry or no refreshable login (the grant lives in pi). A refreshable
+  // folder login belongs to the host (`ais gateway local` never takes it).
+  const healMember = await (async (): Promise<boolean> => {
+    if (!memberStoreEnabled() || !isGatewayOwnerProcess() || !isMemberStoreTool(tool) || isSwapPool(identity) || isUnderMemberStore(identity.configDir) || hasMemberCopy(tool, identity.name)) return false;
+    if (folderHoldsGatewayEntry(tool, identity)) return true;
+    try {
+      if (isRefreshableLoginText(tool, readFileSync(join(expandPath(identity.configDir), memberLoginFile(tool)), "utf8"))) return false;
+    } catch {
+      // no folder login at all: held only through pi
+    }
+    return (options.piDir ?? (await piIdentityFor(identity.name))?.configDir) !== undefined;
+  })();
   // A store whose read failed is never written over: a torn file would lose its other entries.
   const skip = (path: string): boolean => options.skipPaths?.has(path) === true;
   try {
@@ -394,6 +411,17 @@ export async function writeGrantThroughStores(
       } catch (err) {
         failed.push({ path: `pool:${poolDir}`, error: err instanceof Error ? err.message : String(err) });
       }
+    }
+  }
+  // The new grant also goes to the member store, so the identity never depends on the routed folder or the pi registry.
+  if (healMember && isMemberStoreTool(tool)) {
+    const dir = memberDir(tool, identity.name);
+    try {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await writeProviderGrantCopy(tool, dir, grant, { backups });
+      written.push(`member:${dir}`);
+    } catch (err) {
+      failed.push({ path: `member:${dir}`, error: err instanceof Error ? err.message : String(err) });
     }
   }
   const piDir = options.piDir ?? (await piIdentityFor(identity.name))?.configDir;

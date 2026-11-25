@@ -63,7 +63,7 @@ export class StoreApi {
     try {
       res = await this.doFetch(`${this.base}${path}`, {
         method,
-        headers: { authorization: `Bearer ${this.opts.token}`, "content-type": "application/json" },
+        headers: { authorization: `Bearer ${this.opts.token}`, "content-type": "application/json", "x-ais-store-refusals": "1" },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       });
@@ -148,7 +148,9 @@ export class HttpHomeStore {
   async put(path: string, content: Buffer, opts: { account: string | null; kind: HomeFileKind; expectedVersion?: number | null }): Promise<PutResult> {
     if (opts.expectedVersion === undefined) throw new Error("gateway store API: a write needs an expected version (null to create)");
     const body = { path, account: opts.account, kind: opts.kind, cipher: encryptFile(this.key, path, content).toString("base64"), sha256: sha256Hex(content), expectedVersion: opts.expectedVersion };
-    const { status, json } = await this.api.ok("PUT", "/store/files", body, [200, 409]);
+    const { status, json } = await this.api.ok("PUT", "/store/files", body, [200, 409, 422]);
+    // A refusal (placeholder login, registry that drops identities) is no lost race: retrying the same write never helps.
+    if (status === 422 || (status === 409 && (json.error === "placeholder" || json.error === "drops-identities"))) throw new Error(`gateway store API: the gateway refused the write of ${path} (${json.error})`);
     if (status === 409) return { ok: false, ...(json.current ? { current: toMeta(json.current) } : {}) };
     return { ok: true, version: Number(json.version) };
   }

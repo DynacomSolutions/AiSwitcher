@@ -5,6 +5,7 @@ import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { DEAD_REFRESH_CODES, DEFAULT_ACCESS_TOKEN_LIFETIME_S, effectiveGrantPaths, GATEWAY_RENEW_FRACTION, KIMI_RENEW_BELOW_S, OAuthRefreshError, type IdentityGrantRefresh, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ClusterBrowserHub, RELAY_PATH } from "./browser/cluster.ts";
 import { HomeMirror } from "./home-mirror.ts";
 import { importHome, STORE_META_PATH } from "./home-import.ts";
@@ -61,7 +62,7 @@ import { createUsageSource, fetchPoolUsage, withOpencodeUsage, type FetchUsage }
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
-import { enableMemberStore, memberStoreEnabled, setLocalWriteHook } from "../identities/gateway-members.ts";
+import { enableMemberStore, hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreEnabled, setLocalWriteHook } from "../identities/gateway-members.ts";
 import { clearLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
@@ -596,6 +597,42 @@ export async function keepAliveOnce(deps: {
   return { retryTools: [...retryTools] };
 }
 
+/**
+ * Files to push after a refresh: the grant paths, the labels the write-through lists, and the member store login when the
+ * account has one (a refresh of an identity with no member copy makes it, and the grant paths name the identity's own folder).
+ */
+export async function refreshPushPaths(tool: RefreshableTool, identity: Identity, written: string[], grantPaths: (tool: RefreshableTool, identity: Identity) => Promise<string[]>): Promise<string[]> {
+  const member = isMemberStoreTool(tool) && hasMemberCopy(tool, identity.name) ? [join(memberDir(tool, identity.name), memberLoginFile(tool))] : [];
+  return [...new Set([...(await grantPaths(tool, identity)), ...written, ...member])];
+}
+
+/**
+ * Pushes the files of a refreshed account, then every other tracked file of it that changed. It throws only for a file that really
+ * failed: a listed file whose push failed but that is tracked is retried by the dirty pass, and that pass's own error counts.
+ */
+export async function pushRefreshed(
+  mirror: Pick<HomeMirror, "push" | "pushAccountDirty" | "tracks">,
+  tool: RefreshableTool,
+  identity: Identity,
+  written: string[],
+  grantPaths: (tool: RefreshableTool, identity: Identity) => Promise<string[]>,
+): Promise<void> {
+  const account = `${tool}/${identity.name}`;
+  const paths = await refreshPushPaths(tool, identity, written, grantPaths);
+  const failed: Array<{ path: string; err: unknown }> = [];
+  for (const path of paths) {
+    try {
+      await mirror.push([path], account, "login");
+    } catch (err) {
+      failed.push({ path, err });
+    }
+  }
+  // Whatever the listed paths missed (or a failed push left behind) goes too: every tracked file of the account that changed.
+  await mirror.pushAccountDirty(account);
+  const lost = failed.find((f) => !mirror.tracks(f.path, account));
+  if (lost) throw lost.err;
+}
+
 export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {}): Promise<RunningGateway> {
   if (opts.adminToken.length < MIN_ADMIN_TOKEN_LENGTH) throw new Error(`gateway: the admin token (AIS_GATEWAY_ADMIN_TOKEN) must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters`);
   if (opts.sessions) {
@@ -679,18 +716,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
             run: (account, fn) => mirror.withAccount(`${account.provider}/${account.identity}`, fn),
             pull: async (tool, identity) => mirror.pullAccount(`${tool}/${identity.name}`, await grantPaths(tool, identity)),
             push: async (tool, identity, written) => {
-              const account = `${tool}/${identity.name}`;
-              let first: unknown;
-              try {
-                await mirror.push([...new Set([...(await grantPaths(tool, identity)), ...written])], account, "login");
-              } catch (err) {
-                first = err;
-              }
-              // Whatever the listed paths missed (or a failed push left behind) goes too: every tracked file of the account that changed.
-              await mirror.pushAccountDirty(account).catch((err) => {
-                throw first ?? err;
-              });
-              alerter.recover("credential-store-write-failed", account);
+              await pushRefreshed(mirror, tool, identity, written, grantPaths);
+              alerter.recover("credential-store-write-failed", `${tool}/${identity.name}`);
             },
           },
           onStoreWriteFailed: (account) => alerter.raise("credential-store-write-failed", `${account.provider}/${account.identity}`, `the gateway could not write the ${account.provider} login "${account.identity}" to the credential store after a refresh; the new token only exists on this replica until it can (check the database)`),

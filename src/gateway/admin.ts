@@ -251,7 +251,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
   const read = deps.readStore ?? store;
   const hono = new Hono();
-  const err = (status: 400 | 401 | 404 | 409 | 429 | 500 | 503, message: string): Response => Response.json({ error: message }, { status, ...(status === 429 ? { headers: { "retry-after": "5" } } : {}) });
+  const err = (status: 400 | 401 | 404 | 409 | 422 | 429 | 500 | 503, message: string): Response => Response.json({ error: message }, { status, ...(status === 429 ? { headers: { "retry-after": "5" } } : {}) });
 
   // The favourites token (derived from the admin token) opens GET and POST /favourites and nothing else.
   const favouritesBearer = deps.adminToken ? favouritesToken(deps.adminToken) : undefined;

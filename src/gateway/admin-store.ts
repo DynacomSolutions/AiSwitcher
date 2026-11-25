@@ -1,7 +1,8 @@
 import type { Hono } from "hono";
 import type { JournalEntry } from "./refresh-guard.ts";
 import { assertRelPath, type HomeFileKind, type HomeStoreServer } from "./home-store.ts";
-import { refreshFingerprints } from "./home-mirror.ts";
+import { losesLogin, refreshFingerprints } from "./home-mirror.ts";
+import { droppedIdentities } from "./registry-sync.ts";
 
 /**
  * Admin routes of the host credential sync: a host reads and writes the gateway's file store through these instead of
@@ -14,7 +15,8 @@ import { refreshFingerprints } from "./home-mirror.ts";
  * - GET  /store/files?since=N          metadata of the rows past version N (all rows when N is 0)
  * - POST /store/files/read             encrypted rows: {paths} or {account, extraPaths}
  * - PUT  /store/files                  compare-and-swap write of one encrypted row: `expectedVersion` is required (null creates).
- *                                       200 {version}; 409 {current} when the row moved; 409 "rotated" for a login whose refresh token the journal shows rotated out
+ *                                       200 {version}; 409 {current} when the row moved; 409 "rotated" for a login whose refresh token the journal shows rotated out;
+ *                                       422 "placeholder" for a login that is not refreshable over one that is; 422 "drops-identities" for a registry that drops an identity (422, not 409: an old host client reads 409 as a lost race and retries for ever)
  * - GET  /store/wait?since=N&ms=M      long poll: answers at once when a row is past version N, else when a change arrives or after M ms
  * - GET  /store/journal?provider&identity&oldFp   refresh journal entries for one refresh-token fingerprint
  */
@@ -27,6 +29,8 @@ export interface StoreAdminDeps {
 }
 
 /** Longest a long poll may wait. The client asks for less. */
+/** Request header of a host client that understands the 422 refusals of `PUT /store/files`. */
+export const STORE_REFUSALS_HEADER = "x-ais-store-refusals";
 export const STORE_WAIT_MAX_MS = 30_000;
 const KINDS: readonly HomeFileKind[] = ["registry", "login", "hostfile", "heartbeat", "marker", "meta", "derived"];
 /** Rows one read may name. The host mirror asks for the changed paths of one account at a time. */
@@ -35,7 +39,7 @@ const MAX_CIPHER_BYTES = 8 * 1024 * 1024;
 
 const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string" && s.length > 0);
 
-type Fail = (status: 400 | 404 | 409 | 503, message: string, extra?: object) => Response;
+type Fail = (status: 400 | 404 | 409 | 422 | 503, message: string, extra?: object) => Response;
 
 function b64(raw: unknown): Buffer | undefined {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > MAX_CIPHER_BYTES * 2 || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) return undefined;
@@ -112,6 +116,24 @@ export function registerStoreAdmin(hono: Hono, deps: StoreAdminDeps | undefined,
         for (const fp of refreshFingerprints(text)) {
           const entries = await deps.journal(provider!, rest.join("/"), fp);
           if (entries.some((e) => e.outcome === "refreshed" && e.newFp !== undefined && e.newFp !== e.oldFp)) return err(409, "rotated");
+        }
+      }
+      // A login that is no refreshable login (a gateway placeholder, a blanked file) never replaces a refreshable one, and a registry push
+      // never drops an identity the store registry holds (removal is `retire`, which keeps the entry). Both are host bugs, whatever the host version.
+      const guarded = kind === "login" || (kind === "registry" && path.endsWith("identities.json"));
+      if (guarded && typeof expectedVersion === "number") {
+        const [cur] = await deps.homeStore.getCipher({ paths: [path] });
+        // Only a write that would land is judged: a stale version gets the normal compare-and-swap conflict below.
+        if (cur && cur.version === expectedVersion) {
+          const next = deps.homeStore.decrypt(path, cipher).toString("utf8");
+          const prev = deps.homeStore.decrypt(path, cur.cipher).toString("utf8");
+          const refusal = kind === "login" ? (losesLogin(next, prev) ? "placeholder" : undefined) : droppedIdentities(next, prev).length > 0 ? "drops-identities" : undefined;
+          if (refusal) {
+            // A host that sends the capability header throws on the refusal (422). An older host reads any status but 200 and 409 as a
+            // failure that stops its whole sync pass, so it gets 200 with the row's own version and nothing is written.
+            if (c.req.header(STORE_REFUSALS_HEADER) === "1") return err(422, refusal);
+            return c.json({ version: cur.version });
+          }
         }
       }
       result = await deps.homeStore.putCipher(path, cipher, sha256, { account, kind: kind as HomeFileKind, expectedVersion: expectedVersion as number | null });

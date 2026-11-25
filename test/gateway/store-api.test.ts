@@ -157,6 +157,104 @@ describe("admin store routes: rotated refresh tokens and the real server", () =>
     expect(asked.every(([p, i, fp]) => p === "claude" && i === "alpha" && !fp!.includes("SYNTHETIC_FIXTURE"))).toBe(true);
   });
 
+  test("a placeholder login over a refreshable login row is refused with 422 placeholder and the row is unchanged", async () => {
+    const { app, server } = setup();
+    const path = "x/.credentials.json";
+    const real = grant("r-live", 1_795_635_411_000);
+    expect((await fetchPut(app, path, real, "claude/alpha", "login")).status).toBe(200);
+    const before = server.rows.get(path)!;
+    const placeholder = JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_token", refreshToken: null, expiresAt: 4_102_444_800_000 } });
+    const r = await fetchPut(app, path, placeholder, "claude/alpha", "login", before.version);
+    // 422, not 409: an old host client reads 409 as a lost race and retries the same write for ever; it throws on 422.
+    expect(r.status).toBe(422);
+    expect(await r.json()).toEqual({ error: "placeholder" });
+    expect(server.rows.get(path)).toBe(before);
+    // A login without a refresh token is refused the same way; a placeholder for a new row, or a real login, passes.
+    const blank = JSON.stringify({ claudeAiOauth: { accessToken: "SYNTHETIC_FIXTURE-a", expiresAt: 1 } });
+    expect((await fetchPut(app, path, blank, "claude/alpha", "login", before.version)).status).toBe(422);
+    expect((await fetchPut(app, "y/.credentials.json", placeholder, "claude/beta", "login")).status).toBe(200);
+    expect((await fetchPut(app, path, grant("r-next", 1_795_999_999_000), "claude/alpha", "login", before.version)).status).toBe(200);
+  });
+
+  test("the refusal status is one an old host client throws on, and the new client throws too", async () => {
+    const { app, opts, server } = setup();
+    const path = "x/.credentials.json";
+    await fetchPut(app, path, grant("r-live", 1_795_635_411_000), "claude/alpha", "login");
+    const placeholder = JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_token", refreshToken: null, expiresAt: 4_102_444_800_000 } });
+    const r = await fetchPut(app, path, placeholder, "claude/alpha", "login", server.rows.get(path)!.version);
+    // Old client: api.ok("PUT", ..., [200, 409]) throws on any other status.
+    expect([200, 409].includes(r.status)).toBe(false);
+    await expect(new HttpHomeStore({ ...opts, warn: () => undefined }).put(path, Buffer.from(placeholder), { account: "claude/alpha", kind: "login", expectedVersion: server.rows.get(path)!.version })).rejects.toThrow(/placeholder/);
+  });
+
+  test("a host without the capability header gets 200 with the row's own version and nothing is written", async () => {
+    const { app, server } = setup();
+    const path = "x/.credentials.json";
+    await fetchPut(app, path, grant("r-live", 1_795_635_411_000), "claude/alpha", "login");
+    const before = server.rows.get(path)!;
+    const placeholder = JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_token", refreshToken: null, expiresAt: 4_102_444_800_000 } });
+    const r = await fetchPut(app, path, placeholder, "claude/alpha", "login", before.version, false);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ version: before.version });
+    expect(server.rows.get(path)).toBe(before);
+    const reg = ".claude/identities.json";
+    await fetchPut(app, reg, JSON.stringify({ version: 1, identities: [{ name: "a" }, { name: "b" }] }), null, "registry");
+    const rv = server.rows.get(reg)!;
+    const r2 = await fetchPut(app, reg, JSON.stringify({ version: 1, identities: [{ name: "a" }] }), null, "registry", rv.version, false);
+    expect(r2.status).toBe(200);
+    expect(server.rows.get(reg)).toBe(rv);
+  });
+
+  test("a mixed login file whose real entry becomes a gateway entry is refused, and a rotated entry beside it passes", async () => {
+    const { app, server } = setup();
+    const path = ".pi/identities/alpha/auth.json";
+    const real = (tag: string, exp: number) => ({ type: "oauth", access: `SYNTHETIC_FIXTURE-a-${tag}`, refresh: `SYNTHETIC_FIXTURE-r-${tag}`, expires: exp });
+    const gw = { type: "oauth", access: "aisg_SYNTHETIC_FIXTURE_token", refresh: "", expires: 4_102_444_800_000 };
+    await fetchPut(app, path, JSON.stringify({ anthropic: real("a", 1_795_000_000_000), "openai-codex": real("c", 1_795_000_000_000) }), "pi/alpha", "login");
+    const v = server.rows.get(path)!.version;
+    const bad = await fetchPut(app, path, JSON.stringify({ anthropic: gw, "openai-codex": real("c2", 1_796_000_000_000) }), "pi/alpha", "login", v);
+    expect(bad.status).toBe(422);
+    expect((await fetchPut(app, path, JSON.stringify({ anthropic: real("a2", 1_796_000_000_000), "openai-codex": real("c2", 1_796_000_000_000) }), "pi/alpha", "login", v)).status).toBe(200);
+  });
+
+  test("a stale expectedVersion gets the normal compare-and-swap conflict before any guard", async () => {
+    const { app, server } = setup();
+    const path = "x/.credentials.json";
+    await fetchPut(app, path, grant("r-live", 1_795_635_411_000), "claude/alpha", "login");
+    const placeholder = JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_token", refreshToken: null, expiresAt: 4_102_444_800_000 } });
+    const r = await fetchPut(app, path, placeholder, "claude/alpha", "login", server.rows.get(path)!.version + 5);
+    expect(r.status).toBe(409);
+    expect(((await r.json()) as { error: string }).error).toBe("the row changed");
+  });
+
+  test("a registry push that is not a registry, or drops names, is refused; a tombstoned name may go", async () => {
+    const { app, server } = setup();
+    const path = ".claude/identities.json";
+    const reg = (names: string[], deleted?: string[]): string => JSON.stringify({ version: 1, identities: names.map((name) => ({ name })), ...(deleted ? { deleted } : {}) });
+    await fetchPut(app, path, reg(["a", "b"]), null, "registry");
+    const v = server.rows.get(path)!.version;
+    expect((await fetchPut(app, path, "{}", null, "registry", v)).status).toBe(422);
+    expect((await fetchPut(app, path, "[]", null, "registry", v)).status).toBe(422);
+    expect((await fetchPut(app, path, reg(["a"]), null, "registry", v)).status).toBe(422);
+    expect((await fetchPut(app, path, reg(["a"], ["b"]), null, "registry", v)).status).toBe(200);
+  });
+
+  test("a registry push that drops an identity the store registry holds is refused with 422 drops-identities; retire and adds pass", async () => {
+    const { app, server } = setup();
+    const path = ".claude/identities.json";
+    const reg = (...names: Array<string | [string, boolean]>): string =>
+      JSON.stringify({ version: 1, identities: names.map((n) => (Array.isArray(n) ? { name: n[0], retired: n[1] } : { name: n })) });
+    expect((await fetchPut(app, path, reg("a", "b"), null, "registry")).status).toBe(200);
+    const v = server.rows.get(path)!.version;
+    const before = server.rows.get(path)!;
+    const r = await fetchPut(app, path, reg("a"), null, "registry", v);
+    expect(r.status).toBe(422);
+    expect(await r.json()).toEqual({ error: "drops-identities" });
+    expect(server.rows.get(path)).toBe(before);
+    expect((await fetchPut(app, path, reg("a", ["b", true]), null, "registry", v)).status).toBe(200);
+    expect((await fetchPut(app, path, reg("a", ["b", true], "c"), null, "registry", v + 1)).status).toBe(200);
+  });
+
   test("a real admin server holds /store/wait past Bun's 10 s idle timeout without a reset", async () => {
     const { app, server } = setup();
     const srv = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: withStoreWaitTimeout((req) => app.fetch(req)) });
@@ -200,11 +298,11 @@ describe("admin store routes: rotated refresh tokens and the real server", () =>
 });
 
 /** A raw, correctly encrypted PUT with an expected version of null, to see the gateway's answer. */
-async function fetchPut(app: ReturnType<typeof createAdminApp>, path: string, text: string, account: string | null, kind: string): Promise<Response> {
+async function fetchPut(app: ReturnType<typeof createAdminApp>, path: string, text: string, account: string | null, kind: string, expectedVersion: number | null = null, capable = true): Promise<Response> {
   return app.request("http://admin.test/store/files", {
     method: "PUT",
-    headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" },
-    body: JSON.stringify({ path, account, kind, cipher: encryptFile(KEY, path, Buffer.from(text)).toString("base64"), sha256: sha256Hex(text), expectedVersion: null }),
+    headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json", ...(capable ? { "x-ais-store-refusals": "1" } : {}) },
+    body: JSON.stringify({ path, account, kind, cipher: encryptFile(KEY, path, Buffer.from(text)).toString("base64"), sha256: sha256Hex(text), expectedVersion }),
   });
 }
 

@@ -156,8 +156,12 @@ export interface HostSync {
 const runImport = async (store: HomeStoreClient, lock: RefreshGuardBackend, home: string, opts: HostSyncOptions): Promise<ImportReport> =>
   importHome(store, { home, lock, ...(opts.importEntries ? { entries: await opts.importEntries() } : {}) });
 
-async function pass(mirror: CountingMirror, store: HomeStoreClient, lock: RefreshGuardBackend, home: string, opts: HostSyncOptions): Promise<HostSyncResult> {
-  const imported = await runImport(store, lock, home, opts);
+async function pass(mirror: CountingMirror, store: HomeStoreClient, lock: RefreshGuardBackend, home: string, opts: HostSyncOptions, warn?: (m: string) => void): Promise<HostSyncResult> {
+  // A failed import never stops the pull and push, nor the mirror that follows the store afterwards.
+  const imported = await runImport(store, lock, home, opts).catch((err: unknown): ImportReport => {
+    (warn ?? opts.warn ?? ((m: string) => console.warn(`ais gateway store sync: ${m}`)))(`import failed (${(err as Error).name})`);
+    return { added: [], updated: [], unchanged: [], skipped: [] };
+  });
   mirror.wrote = 0;
   mirror.pushed = 0;
   await mirror.pullAll();
@@ -206,7 +210,7 @@ export function startHostSync(cfg: HostStoreConfig | undefined, opts: HostSyncOp
   let stopped = false;
   const ready = (async () => {
     const { store, lock, mirror } = await opened;
-    const r = await pass(mirror, store, lock, home, opts);
+    const r = await pass(mirror, store, lock, home, opts, warn);
     if (stopped) return r;
     await mirror.start(opts.pollMs ?? HOST_SYNC_POLL_MS);
     timer = setInterval(() => {

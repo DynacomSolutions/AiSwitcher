@@ -55,13 +55,24 @@ const failure = async (p: Promise<unknown>): Promise<HttpError> => {
   throw new Error("expected a rejection");
 };
 
+describe("a re-add through the console", () => {
+  test("stamps addedAt and clears the name's tombstone, so the next merge keeps the identity", async () => {
+    const reg = { ...claudeRegistry(), deleted: [{ name: "again", at: Date.now() - 3_600_000 }, { name: "other", at: 5 }] };
+    const { store, puts } = fakeStore({ [CLAUDE_PATH]: { content: reg, version: 7 } });
+    await addGatewayIdentity("claude", { name: "again", label: "Again" }, { store });
+    const written = puts[0]!.json as unknown as { identities: Array<{ name: string; addedAt?: number }>; deleted?: Array<{ name: string }> };
+    expect(typeof written.identities.find((i) => i.name === "again")?.addedAt).toBe("number");
+    expect(written.deleted?.map((t) => t.name)).toEqual(["other"]);
+  });
+});
+
 describe("addGatewayIdentity", () => {
   test("adds to a pool: copies the member folder shape, joins the members, writes with the version check", async () => {
     const { store, puts } = fakeStore({ [CLAUDE_PATH]: { content: claudeRegistry(), version: 7 } });
     const result = await add(store, "claude", { name: "new-one", label: "New One", description: "alice@example.test", pool: "pool-a" });
     expect(result).toEqual({
       tool: "claude",
-      identity: { name: "new-one", label: "New One", description: "alice@example.test", configDir: "/profiles/u/.claude/identities/new-one" },
+      identity: { name: "new-one", addedAt: expect.any(Number), label: "New One", description: "alice@example.test", configDir: "/profiles/u/.claude/identities/new-one" },
       pool: "pool-a",
       registryVersion: 8,
     });
@@ -86,7 +97,7 @@ describe("addGatewayIdentity", () => {
   test("codex copies the sign-in method of the donor", async () => {
     const { store } = fakeStore({ [CODEX_PATH]: { content: codexRegistry(), version: 1 } });
     const result = await add(store, "codex", { name: "cx-b", label: "Codex B" });
-    expect(result.identity).toEqual({ name: "cx-b", label: "Codex B", configDir: "/profiles/u/.codex/identities/cx-b", codexLoginMethod: "browser" });
+    expect(result.identity).toEqual({ name: "cx-b", addedAt: expect.any(Number), label: "Codex B", configDir: "/profiles/u/.codex/identities/cx-b", codexLoginMethod: "browser" });
   });
 
   test("a version conflict is a 409 and nothing is reported as added", async () => {
