@@ -1,5 +1,6 @@
 import { GROK_CONFIG, OPENCODE_CONFIG, ZAI_CONFIG } from "../tool-configs.ts";
 import type { ToolConfig } from "../types.ts";
+import { isAllowed, SwapPoolError } from "./swap-pool.ts";
 import type { PoolAdapter, PoolUsage } from "./adapter.ts";
 
 /**
@@ -21,6 +22,8 @@ const recordAdapter = (tool: ToolConfig["toolName"], config: ToolConfig): PoolAd
   liveSwap: true,
   hasCredentials: () => true,
   swapCredentials: async ({ pool, target }) => {
+    // The record's active member must stay a usable one: never a member the pool disallows (force included).
+    if (!isAllowed(pool, target.name)) throw new SwapPoolError(`Account "${target.name}" is not allowed in pool "${pool.name}"; allow it first.`);
     const from = pool.swapPool.active ?? null;
     return {
       pool: pool.name,
@@ -41,3 +44,6 @@ const adapters = new Map<string, PoolAdapter>([
 ]);
 
 export const recordAdapterFor = (tool: string): PoolAdapter | undefined => adapters.get(tool);
+
+/** Tools whose pool is a record only; their pool may hold one member (the gateway then routes every request to it). */
+export const isRecordOnlyTool = (tool: string): boolean => adapters.has(tool);

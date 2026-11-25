@@ -5,7 +5,7 @@ import type { SwapReason, SwapResult } from "../../identities/pool/adapter.ts";
 import { isGatewayRoutedPool } from "../../identities/pool/gateway-pool.ts";
 import { eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
 import { poolStatus, swapIfLimited, swapToNext, type MemberRow, type PoolOpsDeps } from "../../identities/pool/ops.ts";
-import { recordAdapterFor } from "../../identities/pool/record-adapter.ts";
+import { isRecordOnlyTool, recordAdapterFor } from "../../identities/pool/record-adapter.ts";
 import { adapterFor } from "../../identities/pool/registry.ts";
 import { performPoolSwap } from "../../identities/pool/swap.ts";
 import { parseHookInput, runContinuation, type ContinueRequest } from "../../identities/claude-swap-continue.ts";
@@ -276,6 +276,12 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
           else set.add(member.name);
           if (set.size > 0) pool.swapPool.disallowed = pool.swapPool.accounts.filter((n) => set.has(n));
           else delete pool.swapPool.disallowed;
+          // A record-only pool must never keep a disallowed member as active: move it to the first allowed one.
+          if (isRecordOnlyTool(tool) && pool.swapPool.active !== undefined && set.has(pool.swapPool.active)) {
+            const next = pool.swapPool.accounts.find((n) => !set.has(n));
+            if (next) pool.swapPool.active = next;
+            else delete pool.swapPool.active;
+          }
           return `${member.name} is ${sub === "allow" ? "allowed" : "not allowed"} in pool ${pool.name}`;
         });
         return log(`${green("✔")} ${msg}`);
@@ -304,7 +310,7 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
         const requested = listFlag(flags, "accounts");
         if (!requested) throw new CliUsageError("Missing required --accounts=a,b[,c]");
         const file = await loadIdentitiesFile(registryPath);
-        const accounts = validateMembers(file, name, requested, tool, adapter.memberProblem);
+        const accounts = validateMembers(file, name, requested, tool, adapter.memberProblem, isRecordOnlyTool(tool) ? 1 : 2);
         const configDir = stringFlag(flags, "config-dir") ?? join(config.identitiesRootDir, name);
         const dir = translateHostPath(expandPath(configDir)); // fs form; the registry keeps the host form
         // Two pools sharing one folder would fight over its credentials.

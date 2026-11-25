@@ -127,8 +127,8 @@ export function memberProblem(file: IdentitiesFile, poolName: string, name: stri
 /** Validates the whole member list against the tool's registry, returning
  * the canonical member names (aliases resolved) or throwing one error that
  * lists every problem. */
-export function validateMembers(file: IdentitiesFile, poolName: string, requested: string[], tool: string = "claude", extra?: (member: Identity) => string | undefined): string[] {
-  if (requested.length < 2) throw new SwapPoolError("A swap pool needs at least two accounts.");
+export function validateMembers(file: IdentitiesFile, poolName: string, requested: string[], tool: string = "claude", extra?: (member: Identity) => string | undefined, minAccounts: number = 2): string[] {
+  if (requested.length < minAccounts) throw new SwapPoolError(minAccounts === 1 ? "A swap pool needs at least one account." : "A swap pool needs at least two accounts.");
   const names: string[] = [];
   const problems: string[] = [];
   for (const key of requested) {

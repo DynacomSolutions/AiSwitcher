@@ -51,5 +51,31 @@ for (const tool of ["grok", "opencode", "zai"] as const) {
       await swap(["status"], { "no-usage": true });
       expect(out.join("\n")).toContain("shared");
     });
+  
+    test("a one-member pool routes every gateway request to that member; active never points to a disallowed or retired one", async () => {
+      await swap(["pool", "create", "solo"], { accounts: "a", "config-dir": join(root, "solo") });
+      let file = await loadIdentitiesFile(registry);
+      expect(requirePool(file, undefined, tool).swapPool).toEqual({ accounts: ["a"], active: "a" });
+      expect(appPoolMemberNames(file)).toEqual(["a"]);
+      await expect(swap(["to", "a"], { force: true })).resolves.toBeUndefined();
+      await swap(["disallow", "a"]);
+      file = await loadIdentitiesFile(registry);
+      expect(requirePool(file, undefined, tool).swapPool.active).toBeUndefined();
+      expect(appPoolMemberNames(file)).toEqual([]);
+      await expect(swap(["to", "a"], { force: true })).rejects.toThrow(/not allowed/);
+    });
+
+    test("disallowing the active member moves active to the first allowed member", async () => {
+      await swap(["pool", "create", "pair"], { accounts: "a,b", "config-dir": join(root, "pair") });
+      await swap(["disallow", "a"]);
+      expect(requirePool(await loadIdentitiesFile(registry), undefined, tool).swapPool.active).toBe("b");
+    });
   });
 }
+
+test("claude, codex, kimi and pi still need two accounts", async () => {
+  await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "a", label: "a", configDir: join(root, "a") }] }));
+  for (const tool of ["claude", "codex", "kimi", "pi"]) {
+    await expect(runSwapCommand(tool, ["pool", "create", "solo"], { accounts: "a" }, deps())).rejects.toThrow(/at least two accounts/);
+  }
+});
