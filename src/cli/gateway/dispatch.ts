@@ -372,11 +372,18 @@ async function runStorePruneRetired(tool: string, dryRun: boolean, deps: Gateway
     const r = await pruneRetiredIdentities(store, {
       tool,
       dryRun,
-      // Any active pin of the name keeps it, whatever its provider: the app list names providers differently from store folders.
+      // Per name, the providers of its active pin apps: the prune keeps a name only for a pin of the tool's own provider.
       activePins: async () => {
         try {
           const apps = await fetchGatewayApps((await connect(deps)).admin);
-          return new Set(apps.filter((a) => a.state === "active" && a.target.kind === "pin" && a.target.identity).map((a) => a.target.identity as string));
+          const pins = new Map<string, Set<string>>();
+          for (const a of apps) {
+            if (a.state !== "active" || a.target.kind !== "pin" || !a.target.identity) continue;
+            const set = pins.get(a.target.identity) ?? new Set<string>();
+            set.add(a.provider || a.target.provider || "");
+            pins.set(a.target.identity, set);
+          }
+          return pins;
         } catch {
           return undefined;
         }
