@@ -261,13 +261,14 @@ describe("a full pool holds a streamed request until a member has room", () => {
     const refreshes: string[] = [];
     deps.refreshUsage = async (_provider, identity) => {
       refreshes.push(identity);
-      readings[identity] = weekly(100, T0.getTime() + 4 * HOURS);
+      readings[identity] = weekly(100, T0.getTime() + 2 * HOURS);
     };
     const token = await add(mk("pool", { kind: "pool" }));
     const started = performance.now();
     const res = await post(createGatewayApp(deps), "pool", token, false);
     expect(res.status).toBe(429);
-    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(60);
+    expect(Number(res.headers.get("retry-after"))).toBe(7200);
+    expect((await res.json() as { error: { message: string } }).error.message).toContain("(reset after 2h 0s)");
     expect(performance.now() - started).toBeLessThan(1_000);
     expect(clock).toBe(T0.getTime());
     expect(sleeps).toEqual([]);

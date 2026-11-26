@@ -100,18 +100,8 @@ const MARGINAL_QUOTA_REFRESH_COOLDOWN_MS = 30_000;
 /** Waits for the real usage source, then reads its updated cache within a fixed request budget. */
 async function refreshMarginalUsage(deps: GatewayDeps, provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined> {
   if (!deps.refreshUsage) return undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("marginal usage refresh timed out")), MARGINAL_QUOTA_REFRESH_BUDGET_MS);
-    });
-    await Promise.race([deps.refreshUsage(provider, identity), timeout]);
-    return await deps.usageFor(provider, identity).catch(() => undefined);
-  } catch {
-    return undefined;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+  const read = deps.refreshUsage(provider, identity).then(() => deps.usageFor(provider, identity));
+  return bounded(read, MARGINAL_QUOTA_REFRESH_BUDGET_MS, "pool quota refresh").catch(() => undefined);
 }
 
 /** Returns quota use from windows that have not reset. Expired windows never prove a current quota limit. */
@@ -1050,7 +1040,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       if (ageMs > 90_000 || !reading.windows?.some((window) =>
         window.model === undefined && window.utilization >= 100 && Date.parse(window.resetsAt ?? "") > nowMs,
       )) return { proven: false, available: false };
-      const refreshKey = `${app.provider}/${exKey(name)}`;
+      const refreshKey = exKey(name);
       const prior = marginalQuotaRefreshes.get(refreshKey);
       let refreshed: PoolUsage | undefined;
       if (prior && !prior.settled) {
@@ -1066,11 +1056,17 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       }
       const refreshedAt = Date.parse(refreshed?.capturedAt ?? "");
       if (!refreshed || refreshed.stale || refreshed.noPlan || (refreshed.status !== "live" && refreshed.status !== "rate-limited") || !Number.isFinite(refreshedAt) || nowMs - refreshedAt > 45_000) return { proven: false, available: false };
-      const util = quotaProofUtilisation(refreshed, model, nowMs);
-      return { proven: util !== undefined && util >= 100, available: util !== undefined && util < (app.reservePercent ?? DEFAULT_RESERVE_PERCENT) };
+      const util = quotaProofUtilisation(refreshed, model, deps.now().getTime());
+      return { proven: util !== undefined && util >= 100, available: util !== undefined && util < (app.reservePercent ?? DEFAULT_RESERVE_PERCENT), refreshed };
     })) : [];
     const allProven = outcomes.length > 0 && outcomes.every((outcome) => outcome.proven);
     if (allProven) {
+      if (outcomes.some((outcome) => outcome.refreshed)) {
+        // The confirming read can report a different reset from the reading that first blocked this request.
+        const usages = await memberUsages(app, deps, model);
+        out = nativeLimitResponse(app.provider, usages, app.reservePercent ?? DEFAULT_RESERVE_PERCENT, deps.now(), limitResets, true) ?? out;
+        fullPoolAnswers.add(out);
+      }
       confirmedPoolAnswers.add(out);
       return out;
     }
@@ -1178,7 +1174,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     // Out of capacity (or at the reserve): answer in the provider's own limit shape so its CLI shows its built-in limit handling.
     let out = await outOfCapacity(pick.reject, reason, why);
     if (out && claudePool && out.status === 429 && pick.reject !== "no-identities") out = await holdOrCap(out, why);
-    if (!replaying && mayHold && !(out && heldMarks.has(out))) {
+    if (!replaying && mayHold && out?.status === 429 && !heldMarks.has(out)) {
       // Not held (the replica is at its cap): the refusal is counted and written as for any other.
       quietRefusals = false;
       deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : "no_headroom");
