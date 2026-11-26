@@ -926,6 +926,11 @@ counting it made a blanked file look fresher than the live grant.
   version. The old direct path runs only with `AIS_GATEWAY_STORE_DIRECT=1` and `AIS_GATEWAY_STORE_DATABASE_URL` (kept for one
   release; `store prune` still needs it). `AIS_GATEWAY_STORE_DATABASE_URL` also makes the console stand down. Restarted
   with a backoff (10 s to 5 minutes); it exits when the daemon goes. One per host (lock `~/.ais/state/gateway-store-sync.lock`).
+- `ais gateway store prune --retired --tool=<tool> [--dry-run]` (owner command, direct database path) deletes the rows below
+  `.<tool>/identities/<name>/` for a name that the tool's store registry (`.<tool>/identities.json`) tombstones or no longer
+  lists. It keeps a swap pool record, a pool account, and any name that an active gateway app pins. Each delete is
+  compare-and-swap on the listed version. It refuses the whole run when the registry row is missing, unreadable or lists no
+  identity, or when `GET /apps` fails (`src/gateway/store-prune.ts`).
 - `ais gateway store setup --key-file=<path>` reads the database URL from stdin (never argv), proves the database answers
   and the key decrypts a row, writes both into `~/.secrets` (backup first, mode 0600) and restarts the daemon.
   The URL must reach the database from the host: the pooler's service address, not an in-cluster DNS name the host
