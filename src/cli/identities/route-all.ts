@@ -77,13 +77,9 @@ export { backupUnique, classifyLogin, loginFreshness };
 export const ROUTE_TOOLS = ["claude", "codex", "grok", "kimi", "pi"] as const;
 export type RouteTool = (typeof ROUTE_TOOLS)[number];
 
-const REGISTRY_OF: Record<RouteTool, string> = {
-  claude: CLAUDE_CONFIG.identitiesJsonPath,
-  codex: CODEX_CONFIG.identitiesJsonPath,
-  grok: GROK_CONFIG.identitiesJsonPath,
-  kimi: KIMI_CONFIG.identitiesJsonPath,
-  pi: PI_CONFIG.identitiesJsonPath,
-};
+/** Read at call time, never copied at import: a module that first loads while a config path is overridden would keep the override for good. */
+export const registryOf = (tool: RouteTool): string =>
+  ({ claude: CLAUDE_CONFIG, codex: CODEX_CONFIG, grok: GROK_CONFIG, kimi: KIMI_CONFIG, pi: PI_CONFIG })[tool].identitiesJsonPath;
 
 const LOCAL_PORT_DEFAULT = 47140;
 const CODEX_PROVIDER = "ais-gateway";
@@ -647,7 +643,7 @@ async function isRoutedAlready(tool: MemberStoreTool, dir: string, token: string
 /* ------------------------------------------------------------------ the command */
 
 async function accountsOf(tool: RouteTool, opts: RouteAllOptions): Promise<Identity[]> {
-  const file = await loadIdentitiesFile(opts.registries?.[tool] ?? REGISTRY_OF[tool]);
+  const file = await loadIdentitiesFile(opts.registries?.[tool] ?? registryOf(tool));
   return file.identities.filter((i) => !isRetired(i));
 }
 

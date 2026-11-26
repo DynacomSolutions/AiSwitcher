@@ -191,3 +191,21 @@ describe("an account moved into the gateway member store is the gateway's", () =
     expect(posts).toBe(0);
   });
 });
+
+describe("gateway-managed registry path", () => {
+  test("the registry is read at the config path in force when it runs, never a path copied at module load", async () => {
+    const { CODEX_CONFIG } = await import("../../src/identities/tool-configs.ts");
+    const saved = CODEX_CONFIG.identitiesJsonPath;
+    const dir = await mkdtemp(join(tmpdir(), "ais-gw-registry-"));
+    const file = join(dir, "codex-identities.json");
+    await writeFile(file, JSON.stringify({ version: 1, identities: [{ name: "late", label: "late", configDir: join(dir, "late") }] }));
+    try {
+      (CODEX_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = file;
+      expect((await listGatewayManagedAccounts(undefined, "codex")).map((i) => i.name)).toEqual(["late"]);
+    } finally {
+      (CODEX_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved;
+      await rm(dir, { recursive: true, force: true });
+    }
+    expect((await listGatewayManagedAccounts(undefined, "codex")).map((i) => i.name)).not.toEqual(["late"]);
+  });
+});

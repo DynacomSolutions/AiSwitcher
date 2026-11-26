@@ -1085,3 +1085,18 @@ describe("member store in the gateway process", () => {
     expect((await loadIdentitiesFile(opts.registries!.claude!)).identities.find((i) => i.name === "alpha")?.configDir).toBe(dirOf(".claude", "alpha"));
   });
 });
+
+describe("route-all registry path", () => {
+  test("registryOf follows the config path in force at call time, never a path copied at module load", async () => {
+    const { registryOf } = await import("../../../src/cli/identities/route-all.ts");
+    const { CLAUDE_CONFIG } = await import("../../../src/identities/tool-configs.ts");
+    const saved = CLAUDE_CONFIG.identitiesJsonPath;
+    try {
+      (CLAUDE_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = "/elsewhere/claude-identities.json";
+      expect(registryOf("claude")).toBe("/elsewhere/claude-identities.json");
+    } finally {
+      (CLAUDE_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved;
+    }
+    expect(registryOf("claude")).toBe(saved);
+  });
+});
