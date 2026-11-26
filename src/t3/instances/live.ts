@@ -13,12 +13,12 @@ export async function fetchGatewayApps(admin: Admin): Promise<GatewayApp[]> {
   const { json } = await admin.call("GET", "/apps");
   const list = Array.isArray(json.apps) ? (json.apps as Record<string, unknown>[]) : [];
   return list.map((a) => {
-    const t = (a.target ?? {}) as { kind?: unknown; identity?: unknown };
+    const t = (a.target ?? {}) as { kind?: unknown; identity?: unknown; provider?: unknown };
     return {
       name: str(a.name),
       provider: str(a.provider),
       state: str(a.state),
-      target: { kind: t.kind === "pin" ? "pin" : "pool", ...(typeof t.identity === "string" ? { identity: t.identity } : {}) },
+      target: { kind: t.kind === "pin" ? "pin" : "pool", ...(typeof t.identity === "string" ? { identity: t.identity } : {}), ...(typeof t.provider === "string" ? { provider: t.provider } : {}) },
     } as GatewayApp;
   });
 }

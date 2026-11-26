@@ -33,7 +33,9 @@ const asStore = (s: FakeStore) => s as unknown as PgHomeStore;
 const REG = ".opencode/identities.json";
 const F = (n: string, f = "auth.json"): string => `.opencode/identities/${n}/${f}`;
 const registry = (ids: unknown[], deleted?: unknown[]): string => JSON.stringify({ version: 1, identities: ids, ...(deleted ? { deleted } : {}) });
-const noPins = async (): Promise<Set<string>> => new Set();
+const noPins = async (): Promise<Map<string, ReadonlySet<string>>> => new Map();
+/** Active pins: name -> providers of the apps that pin it. */
+const pins = (o: Record<string, string[]>) => async (): Promise<Map<string, ReadonlySet<string>>> => new Map(Object.entries(o).map(([k, v]) => [k, new Set(v)]));
 
 function fixture(ids: unknown[], deleted?: unknown[]): FakeStore {
   const s = new FakeStore();
@@ -75,9 +77,54 @@ describe("store prune --retired", () => {
     const s = fixture([{ name: "live" }], ["pinned", "free"]);
     s.seed(F("pinned"), "x");
     s.seed(F("free"), "x");
-    const r = await pruneRetiredIdentities(asStore(s), { tool: "opencode", activePins: async () => new Set(["pinned"]) });
+    const r = await pruneRetiredIdentities(asStore(s), { tool: "opencode", activePins: pins({ pinned: ["opencode"] }) });
     expect(r.removed).toEqual([F("free")]);
-    expect(r.kept).toEqual([{ path: F("pinned"), why: "an active gateway app pins it" }]);
+    expect(r.kept).toEqual([{ path: F("pinned"), why: "an active opencode gateway app pins it" }]);
+  });
+
+  test("a name pinned only by an active app of another provider is removed", async () => {
+    const s = fixture([{ name: "live" }], ["other"]);
+    s.seed(F("other"), "x");
+    const r = await pruneRetiredIdentities(asStore(s), { tool: "opencode", activePins: pins({ other: ["claude", "codex"] }) });
+    expect(r.removed).toEqual([F("other")]);
+    expect(s.rows.has(F("other"))).toBe(false);
+  });
+
+  test("a name pinned by apps of several providers is kept when one has the tool's provider", async () => {
+    const s = fixture([{ name: "live" }], ["both"]);
+    s.seed(F("both"), "x");
+    const r = await pruneRetiredIdentities(asStore(s), { tool: "opencode", activePins: pins({ both: ["claude", "opencode"] }) });
+    expect(r.removed).toEqual([]);
+    expect(r.kept).toEqual([{ path: F("both"), why: "an active opencode gateway app pins it" }]);
+  });
+
+  test("the kimi-code tool is kept by a kimi pin and not by a claude pin", async () => {
+    const s = new FakeStore();
+    s.seed(".kimi-code/identities.json", registry([{ name: "live" }], ["a", "b"]), "registry" as HomeFileKind);
+    s.seed(".kimi-code/identities/a/auth.json", "x");
+    s.seed(".kimi-code/identities/b/auth.json", "x");
+    const r = await pruneRetiredIdentities(asStore(s), { tool: "kimi-code", activePins: pins({ a: ["kimi"], b: ["claude"] }) });
+    expect(r.removed).toEqual([".kimi-code/identities/b/auth.json"]);
+    expect(r.kept).toEqual([{ path: ".kimi-code/identities/a/auth.json", why: "an active kimi gateway app pins it" }]);
+  });
+
+  test("an unmapped tool keeps a name with any active pin, and says so", async () => {
+    const s = new FakeStore();
+    s.seed(".newtool/identities.json", registry([{ name: "live" }], ["a", "free"]), "registry" as HomeFileKind);
+    s.seed(".newtool/identities/a/auth.json", "x");
+    s.seed(".newtool/identities/free/auth.json", "x");
+    const r = await pruneRetiredIdentities(asStore(s), { tool: "newtool", activePins: pins({ a: ["claude"] }) });
+    expect(r.removed).toEqual([".newtool/identities/free/auth.json"]);
+    expect(r.kept).toHaveLength(1);
+    expect(r.kept[0]?.why).toContain("no known provider");
+  });
+
+  test("a prototype key is not read as a known tool", async () => {
+    const s = new FakeStore();
+    s.seed(".constructor/identities.json", registry([{ name: "live" }], ["a"]), "registry" as HomeFileKind);
+    s.seed(".constructor/identities/a/auth.json", "x");
+    const r = await pruneRetiredIdentities(asStore(s), { tool: "constructor", activePins: pins({ a: ["claude"] }) });
+    expect(r.kept[0]?.why).toContain("no known provider");
   });
 
   test("a pool record name and a pool account are kept", async () => {

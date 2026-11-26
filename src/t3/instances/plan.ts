@@ -10,7 +10,7 @@
 export interface GatewayApp {
   name: string;
   provider: string;
-  target: { kind: "pool" | "pin"; identity?: string };
+  target: { kind: "pool" | "pin"; identity?: string; provider?: string };
   state: string;
 }
 
