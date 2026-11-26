@@ -56,7 +56,7 @@ export type Route =
  * - `forward` of `GET /api/oauth/profile` on a claude pool app is not forwarded: the gateway answers with a profile made up from the app name (no upstream call, no member login), so each pool is its own account in a client such as T3 Code.
  * - `claude-usage`: pin forwards; pool serves the windows and merges the chosen member's `cedar_ember` when asked for.
  * - `claude-org`: `/api/organizations/<org>/...`; the org is rewritten to the member's, and a reset redeem goes to the member owning the grant.
- * - `codex-consume`: spending a codex reset credit, sent to a member that has one.
+ * - `codex-consume`: spending a Codex reset credit through the app's authenticated member; admin spending pins a stored identity directly.
  */
 export type AccountOp = "forward" | "claude-usage" | "claude-org" | "codex-consume";
 

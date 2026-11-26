@@ -14,6 +14,11 @@ import type { SharedReading, UsageReadings } from "./usage-readings.ts";
 
 export const USAGE_TTL_MS = 45_000;
 
+export interface CodexResetSource {
+  (identity: string): Promise<ManualResetInfo | undefined>;
+  invalidate(identity: string): Promise<void>;
+}
+
 /** Reads the provider's manual reset inventory with the same account-scoped headers as Codex traffic. */
 export async function fetchCodexResetCredits(
   credential: ProviderCredential,
@@ -49,30 +54,43 @@ export async function fetchCodexResetCredits(
 /** Cache Codex reset credits per identity so repeated Console polls do not hit the provider. */
 export function createCodexResetSource(opts: {
   fetchCredits(identity: string): Promise<ManualResetInfo | undefined>;
+  invalidations?: import("./reset-credit-cache.ts").ResetCreditInvalidations;
   ttlMs?: number;
   now?: () => number;
-}) {
+}): CodexResetSource {
   const ttl = opts.ttlMs ?? USAGE_TTL_MS;
   const now = opts.now ?? Date.now;
-  const entries = new Map<string, { value: ManualResetInfo; at: number }>();
+  const entries = new Map<string, { value: ManualResetInfo; at: number; version: string }>();
   const inflight = new Map<string, Promise<ManualResetInfo | undefined>>();
-  return async (identity: string): Promise<ManualResetInfo | undefined> => {
-    const entry = entries.get(identity);
+  const source = async (identity: string): Promise<ManualResetInfo | undefined> => {
+    let version: string | undefined = opts.invalidations ? undefined : "unshared";
+    try { if (opts.invalidations) version = await opts.invalidations.version(identity); } catch { /* The cache cannot be trusted when shared state is unavailable. */ }
+    let entry = entries.get(identity);
+    if (entry && (version === undefined || entry.version !== version)) {
+      entries.delete(identity);
+      entry = undefined;
+    }
     if (entry && now() - entry.at < ttl) return entry.value;
     let running = inflight.get(identity);
     if (!running) {
       running = opts.fetchCredits(identity).then((value) => {
-        if (value) entries.set(identity, { value, at: now() });
-        else if (entry) entries.set(identity, { value: { ...entry.value, stale: true }, at: now() });
+        if (value) entries.set(identity, { value, at: now(), version: version ?? "unshared" });
+        else if (entry) entries.set(identity, { value: { ...entry.value, stale: true }, at: now(), version: entry.version });
         return value ?? (entry ? { ...entry.value, stale: true } : undefined);
       }).catch(() => {
-        if (entry) entries.set(identity, { value: { ...entry.value, stale: true }, at: now() });
+        if (entry) entries.set(identity, { value: { ...entry.value, stale: true }, at: now(), version: entry.version });
         return entry ? { ...entry.value, stale: true } : undefined;
       }).finally(() => inflight.delete(identity));
       inflight.set(identity, running);
     }
     return running;
   };
+  return Object.assign(source, {
+    async invalidate(identity: string): Promise<void> {
+      entries.delete(identity);
+      await opts.invalidations?.invalidate(identity);
+    },
+  });
 }
 
 /** The providers with a usage reader: `fetchPoolUsage` (claude, codex, kimi, zai) and the OpenCode Go read. Others (grok, ali) have no source. */

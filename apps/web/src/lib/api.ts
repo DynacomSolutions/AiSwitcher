@@ -183,6 +183,9 @@ export const api = {
   useClaudeReset: (identity: string, grantId: string) =>
     request<UseResetResult>(`/api/limits/claude/${encodeURIComponent(identity)}/resets/${encodeURIComponent(grantId)}`, { method: "POST" }),
 
+  useCodexReset: (identity: string) =>
+    request<{ identity: string }>(`/api/limits/codex/${encodeURIComponent(identity)}/resets/use`, { method: "POST" }),
+
   getPush: () => request<PushStatusResponse>("/api/push"),
   subscribePush: (subscription: PushSubscriptionJSON) =>
     request<{ ok: true; subscriptions: number }>("/api/push/subscribe", { method: "POST", body: { subscription } }),

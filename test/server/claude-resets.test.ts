@@ -165,6 +165,22 @@ describe("useClaudeReset", () => {
     expect(refused.status).toBe(409);
     expect(invalidated).toBe(1);
   });
+  test("Codex route uses only the Gateway spend seam for the selected account", async () => {
+    const seen: string[] = [];
+    let invalidated = 0;
+    const app = createApp({
+      token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1", peerPort: 50000, peerUid: () => process.getuid?.(),
+      codexUseReset: async (identity) => { seen.push(identity); return { identity }; },
+      invalidateLimits: () => void invalidated++,
+    });
+    const path = "/api/limits/codex/codex-SYNTHETIC_FIXTURE-member/resets/use";
+    expect((await app.request(path, { method: "POST", headers: { Host: "127.0.0.1:47129" } })).status).toBe(403);
+    const ok = await app.request(path, { method: "POST", headers: { Host: "127.0.0.1:47129", "X-AIS-Console": "1" } });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ identity: "codex-SYNTHETIC_FIXTURE-member" });
+    expect(seen).toEqual(["codex-SYNTHETIC_FIXTURE-member"]);
+    expect(invalidated).toBe(1);
+  });
   test("with a gateway admin configured the route delegates to the gateway and reads no host token", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ais-route-gw-"));
     const secrets = join(dir, "secrets");

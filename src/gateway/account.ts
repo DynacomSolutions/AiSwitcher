@@ -70,6 +70,55 @@ export interface AccountResult {
   cls: string;
 }
 
+/** Spends one Codex reset on this exact stored member. The consume request is sent once. */
+export async function consumeCodexResetForIdentity(
+  identity: string,
+  deps: Pick<GatewayDeps, "creds" | "fetch"> & { credential?: import("./providers/shared.ts").ProviderCredential },
+): Promise<{ identity: string }> {
+  const adapter = adapterFor("codex");
+  const credential = deps.credential ?? await deps.creds.get("codex", identity);
+  if (credential.identity !== identity) throw Object.assign(new Error("Codex credential identity did not match the requested account"), { status: 409 });
+  let credits: Response;
+  try {
+    credits = await deps.fetch(CODEX_CREDITS_URL, {
+      method: "GET",
+      headers: upstreamHeaders(adapter, credential, new Headers({ accept: "application/json" })),
+      signal: AbortSignal.timeout(10_000),
+      redirect: "manual",
+    });
+  } catch {
+    throw Object.assign(new Error("Codex reset credits could not be checked"), { status: 502 });
+  }
+  if (!credits.ok) {
+    await discard(credits);
+    throw Object.assign(new Error(`Codex reset credits answered HTTP ${credits.status}`), { status: 502 });
+  }
+  const inventory = await credits.json().catch(() => undefined);
+  if ((availableCount(inventory) ?? 0) <= 0) {
+    throw Object.assign(new Error("This Codex account has no available reset credits"), { status: 409 });
+  }
+
+  // Codex consumes the next available credit for this authenticated account. Do not retry this POST.
+  let spent: Response;
+  try {
+    spent = await deps.fetch(`${CODEX_CREDITS_URL}/consume`, {
+      method: "POST",
+      headers: upstreamHeaders(adapter, credential, new Headers({ accept: "application/json", "content-type": "application/json" })),
+      body: "{}",
+      signal: AbortSignal.timeout(10_000),
+      redirect: "manual",
+    });
+  } catch {
+    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
+  }
+  if (!spent.ok) {
+    await discard(spent);
+    throw Object.assign(new Error(`Codex refused the reset (HTTP ${spent.status})`), { status: [400, 403, 404, 409, 429].includes(spent.status) ? spent.status : 502 });
+  }
+  await spent.body?.cancel().catch(() => undefined);
+  return { identity };
+}
+
 async function discard(res: Response): Promise<void> {
   try {
     await res.body?.cancel();

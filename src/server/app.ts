@@ -27,7 +27,7 @@ import * as authApi from "./auth.ts";
 import { accountKey, collectAccounts } from "../identities/account-info.ts";
 import { invalidateLimitsCache, runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayModelUsage, loadGatewayUsage, loadGatewayUsageHistory, type GatewayModelUsageView, type GatewayUsageHistoryView, type GatewayUsageView } from "../gateway/usage-view.ts";
-import { loadGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, type GatewayLimitsView } from "./gateway-limits.ts";
+import { loadGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, useCodexResetViaGateway, type GatewayLimitsView } from "./gateway-limits.ts";
 import { GATEWAY_USAGE_WINDOW_DAYS, mergeGatewayUsageWithHistory, usageBucketZone } from "./gateway-usage.ts";
 import * as gatewayApps from "./gateway-apps.ts";
 import { addGatewayIdentity, type GatewayIdentityAddResult } from "./gateway-identities.ts";
@@ -112,6 +112,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   poolKeys?: () => Promise<Set<string>>;
   /** Test seam for POST /api/limits/claude/:identity/resets/:grant; defaults to Anthropic's reset endpoint. */
   claudeUseReset?: (identity: string, grantId: string) => Promise<claudeResets.UseResetResult>;
+  /** Test seam for POST /api/limits/codex/:identity/resets/use; defaults to the authenticated Gateway store. */
+  codexUseReset?: (identity: string) => Promise<{ identity: string }>;
   /** Test seam: drops the cached /api/limits reads after a spent reset; defaults to the scan daemon's cache. */
   invalidateLimits?: () => void;
   /** Test seam for GET /api/usage/projects; defaults to reading the collector's projects.json. */
@@ -385,6 +387,14 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     // Through the gateway when this console has an admin URL and token (the gateway holds the logins); else the host's own login.
     const spend = deps.claudeUseReset ?? (async (i, g) => ((await gatewayApps.gatewayAdminConfig({})) ? ((await useClaudeResetViaGateway(i, g)) as claudeResets.UseResetResult) : claudeResets.useClaudeReset(i, g)));
     const result = await spend(decodeSegment(c.req.param("identity")), decodeSegment(c.req.param("grant")));
+    (deps.invalidateLimits ?? invalidateLimitsCache)();
+    return c.json(result);
+  });
+  // A confirmed Codex consume has no provider grant id. It is pinned to the named identity in the Gateway store.
+  app.post("/api/limits/codex/:identity/resets/use", async (c) => {
+    const identity = decodeSegment(c.req.param("identity"));
+    const spend = deps.codexUseReset ?? ((name) => useCodexResetViaGateway(name));
+    const result = await spend(identity);
     (deps.invalidateLimits ?? invalidateLimitsCache)();
     return c.json(result);
   });

@@ -97,3 +97,29 @@ export async function useClaudeResetViaGateway(
   }
   return body;
 }
+
+/** Spends one Codex reset through the gateway admin API on the named stored identity. */
+export async function useCodexResetViaGateway(
+  identity: string,
+  deps: { fetch?: typeof fetch; secretsPath?: string; timeoutMs?: number } = {},
+): Promise<{ identity: string }> {
+  const cfg = await gatewayAdminConfig({ ...(deps.secretsPath ? { secretsPath: deps.secretsPath } : {}) });
+  if (!cfg) throw new HttpError(503, "gateway admin is not configured on this console");
+  let res: Response;
+  try {
+    res = await (deps.fetch ?? fetch)(`${cfg.url}/limits/codex/${encodeURIComponent(identity)}/resets/use`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${cfg.token}` },
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 30_000),
+    });
+  } catch {
+    throw new HttpError(502, "gateway admin unreachable. The reset outcome may be unknown; refresh limits before another attempt.");
+  }
+  const body = (await res.json().catch(() => undefined)) as { identity?: unknown; error?: unknown } | undefined;
+  if (!res.ok) {
+    const status = [400, 404, 409, 429, 503].includes(res.status) ? res.status : 502;
+    throw new HttpError(status, typeof body?.error === "string" ? body.error.slice(0, 300) : `gateway admin answered ${res.status}`);
+  }
+  if (body?.identity !== identity) throw new HttpError(502, "gateway confirmed a reset for a different identity");
+  return { identity };
+}

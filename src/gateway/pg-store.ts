@@ -21,6 +21,7 @@ import chat0012 from "./migrations/0012_chat.sql" with { type: "text" };
 import favourites0013 from "./migrations/0013_favourites.sql" with { type: "text" };
 import sessions0014 from "./migrations/0014_sessions.sql" with { type: "text" };
 import sessionsOneCopy0015 from "./migrations/0015_sessions_one_copy.sql" with { type: "text" };
+import resetCreditInvalidations0016 from "./migrations/0016_reset_credit_invalidations.sql" with { type: "text" };
 import type { PgListener } from "./pg-listen.ts";
 import { pgPoolOptions } from "./pg-pool.ts";
 
@@ -42,6 +43,7 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0013_favourites", sql: favourites0013 },
   { version: "0014_sessions", sql: sessions0014 },
   { version: "0015_sessions_one_copy", sql: sessionsOneCopy0015 },
+  { version: "0016_reset_credit_invalidations", sql: resetCreditInvalidations0016 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */

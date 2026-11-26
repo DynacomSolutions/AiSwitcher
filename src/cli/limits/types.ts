@@ -150,6 +150,8 @@ export interface ToolLimitResult {
   /** See ManualResetInfo. Present only when the provider reports at least
    * one usable manual reset right now. */
   manualReset?: ManualResetInfo;
+  /** True when the Gateway credential store owns this provider identity. */
+  gatewayManaged?: boolean;
   /** See ExtraUsageInfo. Present only on a live fetch that reported it. */
   extraUsage?: ExtraUsageInfo;
   /** Short human-readable account plan label, e.g. "Max 20x", "Pro", "Team",

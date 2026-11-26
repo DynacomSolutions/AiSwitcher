@@ -3,6 +3,7 @@ import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { pickIdentity } from "../../src/gateway/select.ts";
 import { createCodexResetSource, fetchCodexResetCredits, createUsageSource as createUsageSourceRaw, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
 import { MemoryUsageReadings, type UsageReadings } from "../../src/gateway/usage-readings.ts";
+import { MemoryResetCreditInvalidations } from "../../src/gateway/reset-credit-cache.ts";
 
 /** The source with a silent log by default, so the tests print no `usage-read` lines. A test that reads the log passes its own. */
 const createUsageSource = (o: Parameters<typeof createUsageSourceRaw>[0]): ReturnType<typeof createUsageSourceRaw> => createUsageSourceRaw({ log: () => {}, ...o });
@@ -77,6 +78,20 @@ describe("Codex reset source", () => {
     expect(await source("codex-a")).toEqual({ availableCount: 0, stale: true });
     expect(calls).toBe(2);
     expect(await source("codex-b")).toBeUndefined();
+    expect(calls).toBe(3);
+  });
+
+  test("a spend invalidation clears reset counts on every replica", async () => {
+    const invalidations = new MemoryResetCreditInvalidations();
+    let count = 2;
+    let calls = 0;
+    const sourceA = createCodexResetSource({ invalidations, fetchCredits: async () => { calls++; return { availableCount: count }; } });
+    const sourceB = createCodexResetSource({ invalidations, fetchCredits: async () => { calls++; return { availableCount: count }; } });
+    expect(await sourceA("codex-SYNTHETIC_FIXTURE")).toEqual({ availableCount: 2 });
+    expect(await sourceB("codex-SYNTHETIC_FIXTURE")).toEqual({ availableCount: 2 });
+    count = 1;
+    await sourceA.invalidate("codex-SYNTHETIC_FIXTURE");
+    expect(await sourceB("codex-SYNTHETIC_FIXTURE")).toEqual({ availableCount: 1 });
     expect(calls).toBe(3);
   });
 });

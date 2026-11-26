@@ -38,6 +38,18 @@ describe("admin api", () => {
     expect((await call("/apps")).status).toBe(200);
   });
 
+  test("Codex reset admin route pins the requested identity and requires admin auth", async () => {
+    const identities: string[] = [];
+    app = createAdminApp({ store, adminToken: ADMIN, now: () => now, canonical: async (provider, identity) => {
+      expect(provider).toBe("codex");
+      return identity === "codex-alias" ? "codex-member" : identity;
+    }, spendCodexReset: async (identity) => { identities.push(identity); return { identity }; } });
+    const path = "/limits/codex/codex-alias/resets/use";
+    expect((await call(path, { method: "POST", token: null })).status).toBe(401);
+    expect((await call(path, { method: "POST" })).status).toBe(200);
+    expect(identities).toEqual(["codex-member"]);
+  });
+
   test("put creates an app, get returns it, bad input is 400", async () => {
     expect((await put("web")).status).toBe(201);
     const got = (await (await call("/apps/web")).json()) as any;
