@@ -513,6 +513,8 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const exhausted = new Map<string, number>();
   /** Provider-confirmed subscription exhaustion, keyed by member and (when needed) requested model scope. */
   const provenQuota = new Map<string, number>();
+  /** Limits background confirmation of marginal full-pool readings to one request per member per minute. */
+  const marginalQuotaRefreshAt = new Map<string, number>();
   const resetCredits: ResetCreditsCache = {};
   const accountState = newAccountState();
   const sideGate = new Gate(SIDE_COUNT_MAX_INFLIGHT);
@@ -525,7 +527,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const holdGate = new PoolHoldGate({ ...poolHoldFromEnv(), ...deps.poolHold });
   const hold: HoldCtl = { gate: holdGate, replay: (r) => handle(r) };
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, provenQuota, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "internal error while handling the request", "internal_error"));
+    proxy(req, deps, log, budget, exhausted, provenQuota, marginalQuotaRefreshAt, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "internal error while handling the request", "internal_error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   const chatDeps = deps.chat ? { chat: deps.chat } : {};
@@ -539,7 +541,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, provenQuota: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, provenQuota: Map<string, number>, marginalQuotaRefreshAt: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -997,6 +999,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     // A burst 429, credential hold, or overload never enters this proof set, so those requests still wait and fail over.
     const members = app.target.kind === "pool" ? await eligibleMembers(app, deps).catch(() => []) : [];
     const nowMs = deps.now().getTime();
+    for (const [key, until] of marginalQuotaRefreshAt) if (until <= nowMs) marginalQuotaRefreshAt.delete(key);
     const allProven = members.length > 0 && (await Promise.all(members.map(async (name) => {
       const account = provenQuota.get(exKey(name));
       const scoped = model === undefined ? undefined : provenQuota.get(`${exKey(name)}${MODEL_HOLD_SEP}${model}`);
@@ -1004,8 +1007,20 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       // A still-current provider usage reading at 100% is definitive for that scope. Reserve and stale readings do not prove exhaustion.
       const reading = await deps.usageFor(app.provider, name).catch(() => undefined);
       const capturedAt = Date.parse(reading?.capturedAt ?? "");
-      if (!reading || reading.stale || reading.noPlan || (reading.status !== "live" && reading.status !== "rate-limited") || !Number.isFinite(capturedAt) || nowMs - capturedAt > 45_000) return false;
-      return (utilisationOf(usageForModel(reading, model)) ?? 0) >= 100;
+      if (!reading || reading.stale || reading.noPlan || reading.status !== "live" || !Number.isFinite(capturedAt)) return false;
+      const ageMs = nowMs - capturedAt;
+      if (ageMs <= 45_000) return (utilisationOf(usageForModel(reading, model)) ?? 0) >= 100;
+      // A bounded inference is safe only for an unscoped full window whose reset is still ahead.
+      // This confirms staggered production snapshots without trusting quota across a reset.
+      if (ageMs > 90_000 || !reading.windows?.some((window) =>
+        window.model === undefined && window.utilization >= 100 && Date.parse(window.resetsAt ?? "") > nowMs,
+      )) return false;
+      const refreshKey = exKey(name);
+      if (deps.refreshUsage && (marginalQuotaRefreshAt.get(refreshKey) ?? 0) <= nowMs) {
+        marginalQuotaRefreshAt.set(refreshKey, nowMs + 60_000);
+        void deps.refreshUsage(app.provider, name).catch(() => undefined);
+      }
+      return true;
     }))).every(Boolean);
     if (allProven) {
       confirmedPoolAnswers.add(out);

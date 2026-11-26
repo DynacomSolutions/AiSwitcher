@@ -250,6 +250,46 @@ describe("a full pool holds a streamed request until a member has room", () => {
     expect(clock - T0.getTime()).toBeLessThan(60_000);
   });
 
+  test("P1 regression: staggered full usage snapshots refuse promptly and refresh marginal readings out of band", async () => {
+    const names = Array.from({ length: 10 }, (_, i) => `account-${i}`);
+    const ages = [25, 29, 33, 37, 41, 45, 49, 53, 57, 61];
+    readings = Object.fromEntries(names.map((name, i) => [name, {
+      ...weekly(100, T0.getTime() + 4 * HOURS),
+      capturedAt: new Date(T0.getTime() - ages[i]! * 1_000).toISOString(),
+    }]));
+    deps.poolMembers = async () => names;
+    const refreshes: string[] = [];
+    deps.refreshUsage = async (_provider, identity) => { refreshes.push(identity); };
+    const token = await add(mk("pool", { kind: "pool" }));
+    const gw = createGatewayApp(deps);
+    const started = performance.now();
+    const res = await post(gw, "pool", token);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(60);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(clock).toBe(T0.getTime());
+    expect(sleeps).toEqual([]);
+    expect(events).toEqual([]);
+    expect(seen).toEqual([]);
+    expect(refreshes).toEqual(names.slice(6));
+    const repeated = await post(gw, "pool", token);
+    expect(repeated.status).toBe(429);
+    expect(refreshes).toEqual(names.slice(6));
+  });
+
+  test("a marginal full reading cannot prove quota after its unscoped window resets", async () => {
+    readings = {
+      a: { ...weekly(100, T0.getTime() - 1), capturedAt: new Date(T0.getTime() - 61_000).toISOString() },
+      b: { ...weekly(100, T0.getTime() - 1), capturedAt: new Date(T0.getTime() - 49_000).toISOString() },
+    };
+    const token = await add(mk("pool", { kind: "pool" }));
+    const res = await post(createGatewayApp(deps), "pool", token);
+    expect(res.status).toBe(200);
+    expect((await res.text())).toContain("message_start");
+    expect(seen).toHaveLength(1);
+    expect(events).toEqual([]);
+  });
+
   test("P2: a transient provider throttle during replay surfaces its status and detail", async () => {
     readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
     const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
