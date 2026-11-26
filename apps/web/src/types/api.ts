@@ -335,7 +335,6 @@ export interface ToolLimitResult {
   plan?: string;
   /** Local query state. A Codex reset rechecks this account until this deadline. */
   resetPendingUntil?: number;
-  resetBaselineWindows?: Array<{ label: string; model?: string; usedPercent: number }>;
 }
 
 export interface LimitsResponse {

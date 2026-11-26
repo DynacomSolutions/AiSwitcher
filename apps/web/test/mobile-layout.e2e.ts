@@ -748,16 +748,18 @@ for (const vp of VIEWPORTS) {
         await open("/limits/openai");
         const resetButton = 'main button[aria-label="Use reset on SYNTHETIC_FIXTURE-codex-credit"]';
         await waitFor("Codex reset button", 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(resetButton)})`));
-        const stale = { ...SYNTHETIC_LIMITS, results: SYNTHETIC_LIMITS.results.map((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit" ? { ...row, capturedAt: "2026-11-26T09:00:00.000Z", manualReset: { ...row.manualReset, availableCount: 1 } } : row) };
-        const fresh = { ...SYNTHETIC_LIMITS, results: SYNTHETIC_LIMITS.results.map((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit" ? { ...row, capturedAt: "2026-11-26T10:00:03.000Z", windows: [{ label: "Week", category: "week", usedPercent: 0 }], manualReset: { ...row.manualReset, availableCount: 1 } } : row) };
+        const stale = { ...SYNTHETIC_LIMITS, results: [SYNTHETIC_LIMITS.results.find((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit")!].map((row) => ({ ...row, capturedAt: "2026-11-26T09:00:00.000Z", manualReset: { ...row.manualReset, availableCount: 1 } })) };
+        const fresh = { ...SYNTHETIC_LIMITS, results: [SYNTHETIC_LIMITS.results.find((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit")!].map((row) => ({ ...row, capturedAt: "2026-11-26T10:00:03.000Z", windows: [{ label: "Week", category: "week", usedPercent: 0 }], manualReset: { ...row.manualReset, availableCount: 1 } })) };
         await page.eval(`window.__aisCodexResetResult = 'reset'; window.__aisCodexReconciliation = { status: 'pending' };
           window.__aisLimitsQueue = [${JSON.stringify(stale)}, ${JSON.stringify(fresh)}]; document.querySelector(${JSON.stringify(resetButton)}).click()`);
         await waitFor("Codex reset prompt", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
         await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset').click()`);
-        await waitFor("read-only Codex reconciliation", 8_000, () => page.eval<boolean>(`document.querySelector('main').innerText.includes('0.0%')`));
+        await waitFor("read-only Codex reconciliation", 8_000, () => page.eval<boolean>(`document.querySelector('main').innerText.includes('1 available') && document.querySelector('main').innerText.includes('0.0%')`));
         expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(1);
         expect(await page.eval<boolean>(`window.__aisLimitsCalls.some(q => q.includes('freshCodex=SYNTHETIC_FIXTURE-codex-credit'))`)).toBe(true);
+        expect(await page.eval<boolean>(`window.__aisLimitsCalls.some(q => q.includes('tool=codex') && q.includes('identity=SYNTHETIC_FIXTURE-codex-credit'))`)).toBe(true);
         expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('1 available')`)).toBe(true);
+        expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('SYNTHETIC_FIXTURE-codex-other-credit')`)).toBe(true);
       } finally {
         await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
       }

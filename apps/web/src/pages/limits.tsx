@@ -267,7 +267,7 @@ function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: 
           const pending = result.reconciliation?.status === "pending";
           return {
             ...row,
-            ...(usage ? { ...usage, identity: row.identity } : pending ? { status: "cached" as LimitFetchStatus, error: "OpenAI usage refresh is pending. Showing last-known data.", resetPendingUntil: Date.now() + 30_000, resetBaselineWindows: row.windows.map(({ label, model, usedPercent }) => ({ label, ...(model ? { model } : {}), usedPercent })) } : {}),
+            ...(usage ? { ...usage, identity: row.identity } : pending ? { status: "cached" as LimitFetchStatus, error: "OpenAI usage refresh is pending. Showing last-known data.", resetPendingUntil: Date.now() + 30_000 } : {}),
             ...(manualReset ? { manualReset } : {}),
           };
         }),
