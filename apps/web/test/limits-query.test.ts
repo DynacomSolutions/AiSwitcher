@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { limitsRefetchInterval, POLL, reconcileLimits } from "../src/hooks/queries.ts";
+import { limitsRefetchInterval, POLL, reconcileLimits } from "../src/lib/limits-reconciliation.ts";
 import type { LimitsResponse, ToolLimitResult } from "../src/types/api.ts";
 
 const capturedAt = (seconds: number) => new Date(seconds * 1_000).toISOString();
