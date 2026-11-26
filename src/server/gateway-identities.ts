@@ -8,6 +8,7 @@ import { markAdded } from "../identities/tombstones.ts";
 import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias, parseIdentitiesFile } from "../identities/store.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
+import { isBedrockIdentity } from "../identities/aws-profile.ts";
 import type { Identity } from "../identities/types.ts";
 import { gatewayAdminConfig, type GatewayAppsDeps } from "./gateway-apps.ts";
 import { HttpError } from "./types.ts";
@@ -105,6 +106,59 @@ async function openStore(tool: GatewayIdentityTool, deps: GatewayIdentitiesDeps)
   return { store: new HttpHomeStore({ url: admin.url, token: admin.token, key, ...(deps.fetch ? { fetch: deps.fetch } : {}), warn: () => {} }), own: true };
 }
 
+async function editRegistry<Result>(tool: GatewayIdentityTool, deps: GatewayIdentitiesDeps, edit: (file: Record<string, unknown>) => { changed: boolean; result: Result }): Promise<Result & { registryVersion: number }> {
+  const { store, own } = await openStore(tool, deps);
+  try {
+    let metas: HomeFileMeta[];
+    let rows: Awaited<ReturnType<typeof store.get>>;
+    const pattern = registryRowPattern(tool);
+    try {
+      metas = (await store.list(0)).filter((m) => m.kind === "registry" && pattern.test(m.path));
+      if (metas.length === 0) throw new HttpError(404, `the gateway store holds no ${tool} registry`);
+      if (metas.length !== 1) throw new HttpError(409, `ambiguous ${tool} registry`);
+      rows = await store.get([metas[0]!.path]);
+    } catch (e) {
+      throw storeFailure(e);
+    }
+    const row = rows[0];
+    if (!row) throw new HttpError(502, `the gateway store could not read the ${tool} registry`);
+    let file: Record<string, unknown>;
+    try {
+      file = JSON.parse(row.content.toString("utf8")) as Record<string, unknown>;
+      parseIdentitiesFile(file);
+    } catch {
+      throw new HttpError(502, `the ${tool} registry in the gateway store is not valid`);
+    }
+    const { changed, result } = edit(file);
+    if (!changed) return { ...result, registryVersion: row.version };
+    let put: Awaited<ReturnType<typeof store.put>>;
+    try {
+      put = await store.put(row.path, Buffer.from(`${JSON.stringify(file, null, 2)}\n`), { account: row.account ?? null, kind: "registry", expectedVersion: row.version });
+    } catch (e) {
+      throw storeFailure(e);
+    }
+    if (!put.ok) throw new HttpError(409, "the registry changed during the write; try again");
+    return { ...result, registryVersion: put.version };
+  } finally {
+    if (own) await store.close().catch(() => undefined);
+  }
+}
+
+export async function addGatewayPoolMember(tool: string, poolName: string, identityName: string, deps: GatewayIdentitiesDeps = {}) {
+  if (!isTool(tool) || !isValidIdentityKey(poolName) || !isValidIdentityKey(identityName)) throw new HttpError(400, "invalid tool, pool or identity");
+  return editRegistry(tool, deps, (file) => {
+    const identities = file.identities as Identity[];
+    const pool = identities.find((entry) => entry.name === poolName);
+    const member = identities.find((entry) => entry.name === identityName);
+    if (!pool || !isSwapPool(pool) || !member) throw new HttpError(404, "pool or identity not found");
+    if (isRetired(pool) || isRetired(member) || isSwapPool(member) || isBedrockIdentity(member)) throw new HttpError(409, "identity or pool is ineligible");
+    if (pool.swapPool.disallowed?.includes(identityName)) throw new HttpError(409, "member is explicitly disallowed");
+    const changed = !pool.swapPool.accounts.includes(identityName);
+    if (changed) pool.swapPool.accounts.push(identityName);
+    return { changed, result: { tool, pool: poolName, member: identityName, changed } };
+  });
+}
+
 /**
  * Adds an identity to the gateway store's registry of `tool`. With `pool` it copies the shape of that pool's existing
  * members (config folder pattern, Codex sign-in method) and joins the pool's member list; without it, it copies the
@@ -115,28 +169,7 @@ export async function addGatewayIdentity(toolRaw: string, raw: unknown, deps: Ga
   if (!isTool(toolRaw)) throw new HttpError(400, `identities can be added for ${GATEWAY_IDENTITY_TOOLS.join(" and ")} only`);
   const tool = toolRaw;
   const input = parseGatewayIdentityInput(raw);
-  const { store, own } = await openStore(tool, deps);
-  try {
-    let metas: HomeFileMeta[];
-    let rows: Awaited<ReturnType<typeof store.get>>;
-    const pattern = registryRowPattern(tool);
-    try {
-      metas = (await store.list(0)).filter((m) => m.kind === "registry" && pattern.test(m.path));
-      if (metas.length === 0) throw new HttpError(404, `the gateway store holds no ${tool} registry`);
-      rows = await store.get([metas[0]!.path]);
-    } catch (e) {
-      throw storeFailure(e);
-    }
-    const meta = metas[0]!;
-    const row = rows[0];
-    if (!row) throw new HttpError(502, `the gateway store could not read the ${tool} registry`);
-    let file: Record<string, unknown>;
-    try {
-      file = JSON.parse(row.content.toString("utf8")) as Record<string, unknown>;
-      parseIdentitiesFile(file);
-    } catch {
-      throw new HttpError(502, `the ${tool} registry in the gateway store is not valid`);
-    }
+  return editRegistry(tool, deps, (file) => {
     const identities = file.identities as Identity[];
     if (findIdentityByNameOrAlias(identities, input.name)) throw new HttpError(409, `"${input.name}" is already an identity name or alias`);
 
@@ -165,17 +198,8 @@ export async function addGatewayIdentity(toolRaw: string, raw: unknown, deps: Ga
     identities.push(entry);
     if (pool && !pool.swapPool!.accounts.includes(input.name)) pool.swapPool!.accounts.push(input.name);
 
-    let put: Awaited<ReturnType<typeof store.put>>;
-    try {
-      put = await store.put(meta.path, Buffer.from(`${JSON.stringify(file, null, 2)}\n`), { account: meta.account ?? null, kind: "registry", expectedVersion: meta.version });
-    } catch (e) {
-      throw storeFailure(e);
-    }
-    if (!put.ok) throw new HttpError(409, "the registry changed while the identity was added; try again");
-    return { tool, identity: entry, ...(pool ? { pool: pool.name } : {}), registryVersion: put.version };
-  } finally {
-    if (own) await store.close().catch(() => undefined);
-  }
+    return { changed: true, result: { tool, identity: entry, ...(pool ? { pool: pool.name } : {}) } };
+  });
 }
 
 /** Maps a store failure to a console error without leaking the address or a token. */

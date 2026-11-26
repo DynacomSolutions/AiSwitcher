@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createApp, type ConsoleAppDeps } from "../../src/server/app.ts";
-import { addGatewayIdentity, parseGatewayIdentityInput, type GatewayIdentitiesDeps } from "../../src/server/gateway-identities.ts";
+import { addGatewayIdentity, addGatewayPoolMember, parseGatewayIdentityInput, type GatewayIdentitiesDeps } from "../../src/server/gateway-identities.ts";
 import { StoreApiError } from "../../src/gateway/home-store-http.ts";
 import type { HomeFileMeta, PutResult } from "../../src/gateway/home-store.ts";
 import { HttpError } from "../../src/server/types.ts";
@@ -63,6 +63,45 @@ describe("a re-add through the console", () => {
     const written = puts[0]!.json as unknown as { identities: Array<{ name: string; addedAt?: number }>; deleted?: Array<{ name: string }> };
     expect(typeof written.identities.find((i) => i.name === "again")?.addedAt).toBe("number");
     expect(written.deleted?.map((t) => t.name)).toEqual(["other"]);
+  });
+});
+
+describe("addGatewayPoolMember", () => {
+  for (const [tool, path] of [["claude", CLAUDE_PATH], ["codex", CODEX_PATH]] as const) {
+    test(`${tool}: adds only the member and a replay writes nothing`, async () => {
+      const registry = claudeRegistry();
+      const first = fakeStore({ [path]: { content: registry, version: 7 } });
+      expect(await addGatewayPoolMember(tool, "pool-a", "solo", first)).toMatchObject({ changed: true, registryVersion: 8 });
+      registry.identities[0]!.swapPool!.accounts.push("solo");
+      expect(first.puts[0]!.json).toEqual(registry);
+      expect(first.puts[0]!.opts.expectedVersion).toBe(7);
+      const replay = fakeStore({ [path]: { content: registry, version: 8 } });
+      expect(await addGatewayPoolMember(tool, "pool-a", "solo", replay)).toMatchObject({ changed: false, registryVersion: 8 });
+      expect(replay.puts).toHaveLength(0);
+    });
+  }
+
+  test("refuses unsuitable inputs and concurrent changes", async () => {
+    const registry = claudeRegistry();
+    Object.assign(registry.identities[0]!.swapPool!, { disallowed: ["member-b"] });
+    Object.assign(registry.identities[1]!, { retired: true });
+    const deps = fakeStore({ [CLAUDE_PATH]: { content: registry, version: 3 } }, { put: () => ({ ok: false }) });
+    for (const [member, status] of [["pool-a", 409], ["unknown", 404], ["member-a", 409], ["member-b", 409], ["../bad", 400]] as const) {
+      expect((await failure(addGatewayPoolMember("claude", "pool-a", member, deps))).status).toBe(status);
+    }
+    expect(deps.puts).toHaveLength(0);
+    expect((await failure(addGatewayPoolMember("claude", "pool-a", "solo", deps))).status).toBe(409);
+  });
+
+  test("the console guard applies before the write", async () => {
+    const deps = fakeStore({ [CLAUDE_PATH]: { content: claudeRegistry(), version: 4 } });
+    const app = createApp({ token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1", peerPort: 50000, peerUid: () => process.getuid?.(), gatewayPoolMemberAdd: (tool, pool, member) => addGatewayPoolMember(tool, pool, member, deps) });
+    const path = "/api/gateway/pools/claude/pool-a/members/solo";
+    const headers = { Host: "127.0.0.1:47129" };
+    expect((await app.request(path, { method: "PUT", headers })).status).toBe(403);
+    expect(deps.puts).toHaveLength(0);
+    expect((await app.request(path, { method: "PUT", headers: { ...headers, "X-AIS-Console": "1" } })).status).toBe(200);
+    expect(deps.puts).toHaveLength(1);
   });
 });
 

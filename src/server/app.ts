@@ -30,7 +30,7 @@ import { loadGatewayModelUsage, loadGatewayUsage, loadGatewayUsageHistory, type 
 import { loadGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, useCodexResetViaGateway, type GatewayLimitsView } from "./gateway-limits.ts";
 import { GATEWAY_USAGE_WINDOW_DAYS, mergeGatewayUsageWithHistory, usageBucketZone } from "./gateway-usage.ts";
 import * as gatewayApps from "./gateway-apps.ts";
-import { addGatewayIdentity, type GatewayIdentityAddResult } from "./gateway-identities.ts";
+import { addGatewayIdentity, addGatewayPoolMember, type GatewayIdentityAddResult } from "./gateway-identities.ts";
 import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import * as claudeResets from "./claude-resets.ts";
@@ -106,6 +106,7 @@ export interface ConsoleAppDeps extends GuardDeps {
   }>;
   /** Test seam for POST /api/gateway/identities/:tool; defaults to the gateway credential store over the admin API. */
   gatewayIdentityAdd?: (tool: string, body: unknown) => Promise<GatewayIdentityAddResult>;
+  gatewayPoolMemberAdd?: typeof addGatewayPoolMember;
   /** Test seam for the gateway renewal state on GET /api/auth/refresh; defaults to the gateway admin API. */
   gatewayRenewal?: () => Promise<GatewayRenewalView>;
   /** Test seam: "tool/identity" keys of pools (they hold no login); defaults to the registries. */
@@ -300,6 +301,9 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   // Adds a login slot through the gateway store (never a host file); the Auth page's Login button signs it in.
   app.post("/api/gateway/identities/:tool", async (c) =>
     c.json(await (deps.gatewayIdentityAdd ?? ((t, b) => addGatewayIdentity(t, b)))(decodeSegment(c.req.param("tool")), await c.req.json().catch(() => undefined)), 201),
+  );
+  app.put("/api/gateway/pools/:tool/:pool/members/:member", async (c) =>
+    c.json(await (deps.gatewayPoolMemberAdd ?? addGatewayPoolMember)(decodeSegment(c.req.param("tool")), decodeSegment(c.req.param("pool")), decodeSegment(c.req.param("member")))),
   );
   app.post("/api/identities/:tool", async (c) => c.json(await createIdentityInRegistry(c.req.param("tool"), await c.req.json())));
   app.patch("/api/identities/:tool/:name", async (c) =>
