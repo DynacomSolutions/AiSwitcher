@@ -1,6 +1,6 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import type { LoginFlowStatus } from "@/types/api";
+import type { LimitsResponse, LoginFlowStatus, ToolLimitResult } from "@/types/api";
 
 /** Polling intervals from docs/API.md. Files endpoints are on demand. */
 export const POLL = {
@@ -109,11 +109,60 @@ export function useLocalModelsQuery() {
   });
 }
 
+function limitWindowKey(window: { label: string; model?: string }): string {
+  return `${window.label.trim().toLowerCase()}\u0000${window.model?.trim().toLowerCase() ?? ""}`;
+}
+
+function resetRelief(previous: ToolLimitResult, next: ToolLimitResult): boolean {
+  if (next.status !== "live" || !next.capturedAt || !previous.capturedAt || Date.parse(next.capturedAt) <= Date.parse(previous.capturedAt)) return false;
+  const baseline = new Map((previous.resetBaselineWindows ?? []).map((window) => [limitWindowKey(window), window.usedPercent]));
+  return next.windows.some((window) => {
+    const used = baseline.get(limitWindowKey(window));
+    return typeof used === "number" && window.usedPercent < used;
+  });
+}
+
+function reconcileLimits(current: LimitsResponse | undefined, incoming: LimitsResponse): LimitsResponse {
+  if (!current) return incoming;
+  const previousByKey = new Map(current.results.map((row) => [`${row.toolName}\u0000${row.identity.name}`, row]));
+  const seen = new Set<string>();
+  const results = incoming.results.map((row) => {
+    const key = `${row.toolName}\u0000${row.identity.name}`;
+    seen.add(key);
+    const previous = previousByKey.get(key);
+    if (!previous) return row;
+    if (previous.resetPendingUntil) {
+      if (resetRelief(previous, row)) return row;
+      const manualReset = row.manualReset && !row.manualReset.stale ? row.manualReset : previous.manualReset;
+      return { ...previous, ...(manualReset ? { manualReset } : {}) };
+    }
+    const oldCaptured = previous.capturedAt ? Date.parse(previous.capturedAt) : Number.NaN;
+    const newCaptured = row.capturedAt ? Date.parse(row.capturedAt) : Number.NaN;
+    if (Number.isFinite(oldCaptured) && (!Number.isFinite(newCaptured) || newCaptured < oldCaptured)) return previous;
+    return row;
+  });
+  for (const previous of current.results) {
+    const key = `${previous.toolName}\u0000${previous.identity.name}`;
+    if (!seen.has(key) && previous.resetPendingUntil) results.push(previous);
+  }
+  return { ...incoming, results };
+}
+
 export function useLimitsQuery() {
+  const client = useQueryClient();
   return useQuery({
     queryKey: qk.limits,
-    queryFn: api.getLimits,
-    refetchInterval: POLL.slow,
+    queryFn: async () => {
+      const current = client.getQueryData<LimitsResponse>(qk.limits);
+      const pending = current?.results.find((row) => row.toolName === "codex" && row.resetPendingUntil && row.resetPendingUntil > Date.now());
+      const incoming = await api.getLimits(pending?.identity.name);
+      return reconcileLimits(client.getQueryData<LimitsResponse>(qk.limits), incoming);
+    },
+    refetchInterval: (query) => {
+      const pending = query.state.data?.results.find((row) => row.toolName === "codex" && row.resetPendingUntil);
+      if (!pending) return POLL.slow;
+      return pending.resetPendingUntil! > Date.now() ? 2_000 : false;
+    },
   });
 }
 

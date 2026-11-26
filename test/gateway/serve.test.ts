@@ -1638,7 +1638,7 @@ describe("Codex reset credits", () => {
         if (!opts?.fresh) return { status: "live", maxUtilization: 90, windows: [{ label: "~7d", utilization: 90 }], capturedAt: now };
         freshReads++;
         await Bun.sleep(40);
-        const used = freshReads === 1 ? 90 : 0;
+        const used = freshReads === 1 ? 90 : 42;
         return { status: "live", maxUtilization: used, windows: [{ label: "~7d", utilization: used }], capturedAt: new Date().toISOString() };
       },
       fetch: (async (_input, init) => {
@@ -1658,10 +1658,64 @@ describe("Codex reset credits", () => {
     expect(await response.json()).toMatchObject({
       identity: "codex-member",
       result: "reset",
-      reconciliation: { status: "confirmed", usage: { maxUtilization: 0, windows: [{ utilization: 0 }] } },
+      reconciliation: { status: "confirmed", usage: { maxUtilization: 42, windows: [{ utilization: 42 }] } },
     });
     expect(freshReads).toBe(2);
     expect(consumes).toBe(1);
+  });
+
+  test("does not confirm timestamp or order drift in unchanged full windows", async () => {
+    const baseAt = new Date(Date.now() - 1_000).toISOString();
+    const shared = new MemoryUsageReadings();
+    await shared.save("codex", "codex-member", { status: "live", maxUtilization: 100, windows: [
+      { label: "~7d", utilization: 100, resetsAt: "2026-11-27T10:00:00.000Z" },
+      { label: "~5h", utilization: 100, resetsAt: "2026-11-26T15:00:00.000Z" },
+    ], capturedAt: baseAt }, 3_600_000);
+    await store.putApp({ ...app, name: "codex-reset", provider: "codex", style: "openai", target: { kind: "pin", identity: "codex-member" } });
+    let freshReads = 0;
+    const g = await boot({
+      usageFor: undefined,
+      usageReadings: shared,
+      poolMembers: async (provider) => provider === "codex" ? ["codex-member"] : [],
+      canonical: async (_provider, identity) => identity,
+      fetchUsage: async (_provider, _identity, opts) => {
+        if (!opts?.fresh) return undefined;
+        freshReads++;
+        return { status: "live", maxUtilization: 100, windows: [
+          { label: "~5h", utilization: 100, resetsAt: "2026-11-26T16:00:00.000Z" },
+          { label: "~7d", utilization: 100, resetsAt: "2026-11-27T11:00:00.000Z" },
+        ], capturedAt: new Date(Date.parse(baseAt) + freshReads * 1_000).toISOString() };
+      },
+      fetch: (async (_input, init) => init?.method === "POST" ? Response.json({ code: "reset" }) : Response.json({ available_count: 1 })) as typeof fetch,
+    });
+    const response = await fetch(`http://127.0.0.1:${g.adminPort}/limits/codex/codex-member/resets/use`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" },
+      body: JSON.stringify({ redeemRequestId: crypto.randomUUID() }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ result: "reset", reconciliation: { status: "pending", usage: { maxUtilization: 100, stale: true } } });
+    expect(freshReads).toBe(3);
+  });
+
+  test("does not confirm a fresh figure when the baseline is missing", async () => {
+    await store.putApp({ ...app, name: "codex-reset", provider: "codex", style: "openai", target: { kind: "pin", identity: "codex-member" } });
+    const g = await boot({
+      usageFor: undefined,
+      poolMembers: async (provider) => provider === "codex" ? ["codex-member"] : [],
+      canonical: async (_provider, identity) => identity,
+      fetchUsage: async (_provider, _identity, opts) => opts?.fresh
+        ? { status: "live", maxUtilization: 0, windows: [{ label: "~7d", utilization: 0 }], capturedAt: new Date(Date.now() + 1_000).toISOString() }
+        : undefined,
+      fetch: (async (_input, init) => init?.method === "POST" ? Response.json({ code: "reset" }) : Response.json({ available_count: 1 })) as typeof fetch,
+    });
+    const response = await fetch(`http://127.0.0.1:${g.adminPort}/limits/codex/codex-member/resets/use`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" },
+      body: JSON.stringify({ redeemRequestId: crypto.randomUUID() }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ result: "reset", reconciliation: { status: "pending" } });
   });
 
   test("reports pending and retains last-known usage when OpenAI reads fail", async () => {

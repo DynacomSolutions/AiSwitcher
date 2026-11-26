@@ -162,7 +162,7 @@ export const api = {
       body: { alias },
     }),
 
-  getLimits: () => request<LimitsResponse>("/api/limits?maxAge=45"),
+  getLimits: (freshCodexIdentity?: string) => request<LimitsResponse>(`/api/limits?maxAge=${freshCodexIdentity ? 5 : 45}${freshCodexIdentity ? `&freshCodex=${encodeURIComponent(freshCodexIdentity)}` : ""}`),
 
   getUsage: () => request<UsageResponse>("/api/usage"),
 

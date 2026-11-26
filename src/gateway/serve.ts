@@ -927,6 +927,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     identityState: hooks.identityState ?? defaultIdentityState,
     // The same cached usage reads the proxy selects on: the console Limits page shows them through GET /limits.
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
+    refreshUsageFor: async (provider, identity) => usage.refreshNow(provider, await canonical(provider, identity)),
     resetCreditsFor: resetCredits,
 
     poolMembers,
@@ -939,6 +940,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     }),
     spendCodexReset: hooks.spendCodexReset ?? (async (identity, redeemRequestId) => {
       const before = await usage.get("codex", identity).catch(() => undefined);
+      const beforeAt = before ? Date.parse(before.capturedAt) : Number.NaN;
+      const baseline = before && !before.stale && before.status !== "unavailable" && Number.isFinite(beforeAt) ? before : undefined;
       // Resolve or refresh the login before taking the spend lock. Credential refresh uses the same distributed account lock.
       const credential = await creds.get("codex", identity);
       const lock = await refreshBackend.acquire({ provider: "codex", identity }, 15_000);
@@ -957,7 +960,19 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       if (result.result !== "reset" && result.result !== "already_redeemed") return { ...result, reconciliation: { status: "not_needed" as const } };
 
       // Read only this account from OpenAI. A different replica may still have the pre-reset shared cache.
-      let latest = before;
+      let latest: typeof before = before;
+      const consumedAt = Date.now();
+      const relieved = (candidate: typeof before): boolean => {
+        if (!baseline || !candidate || candidate.stale || candidate.status === "unavailable") return false;
+        const capturedAt = Date.parse(candidate.capturedAt);
+        if (!Number.isFinite(capturedAt) || capturedAt <= consumedAt || !(candidate.windows?.length)) return false;
+        const key = (window: NonNullable<typeof candidate.windows>[number]) => `${window.label.trim().toLowerCase()}\u0000${window.model?.trim().toLowerCase() ?? ""}`;
+        const previous = new Map((baseline.windows ?? []).map((window) => [key(window), window.utilization]));
+        return candidate.windows.some((window) => {
+          const used = previous.get(key(window));
+          return typeof used === "number" && window.utilization < used;
+        });
+      };
       // Keep the fresh reads inside the console's 30-second Gateway request timeout.
       const deadline = Date.now() + 6_000;
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -966,14 +981,13 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         if (remaining <= 0) break;
         let timer: ReturnType<typeof setTimeout> | undefined;
         const finished = await Promise.race([
-          usage.refreshNow("codex", identity).then(() => true, () => true),
+          (attempt === 0 ? usage.refreshNowAfterInflight("codex", identity) : usage.refreshNow("codex", identity)).then(() => true, () => true),
           new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
         ]);
         if (timer) clearTimeout(timer);
         if (!finished) break;
         latest = await usage.get("codex", identity).catch(() => latest);
-        const changed = JSON.stringify(latest?.windows ?? []) !== JSON.stringify(before?.windows ?? []);
-        if (latest && !latest.stale && (changed || !before)) {
+        if (relieved(latest)) {
           return { ...result, reconciliation: { status: "confirmed" as const, usage: latest } };
         }
       }

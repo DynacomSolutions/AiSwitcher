@@ -156,12 +156,16 @@ async function registryPoolKeys(): Promise<Set<string>> {
 }
 
 /** The `/api/limits` answer: the host scan merged with the gateway limits, with accounts per row. */
-async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string; identity?: string }, maxAgeS: number, onGateway?: (view: GatewayLimitsView | undefined) => void): Promise<unknown> {
+async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string; identity?: string }, maxAgeS: number, onGateway?: (view: GatewayLimitsView | undefined) => void, freshCodexIdentity?: string): Promise<unknown> {
   // The cluster gateway is the source of truth for the limits of the identities it manages; the host scan covers the rest.
   // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
   const [result, gateway] = await Promise.all([
     runScanIsolated("limits", { ...filters, maxAgeS }, 45_000),
-    (deps.gatewayLimits ?? loadGatewayLimits)().catch(() => undefined),
+    (deps.gatewayLimits
+      ? deps.gatewayLimits()
+      : freshCodexIdentity
+        ? loadGatewayLimits({ provider: "codex", identity: freshCodexIdentity, fresh: true })
+        : loadGatewayLimits()).catch(() => undefined),
   ]);
   onGateway?.(gateway);
   if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "limits scan failed");
@@ -344,7 +348,8 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
     };
-    return c.json(await loadLimitsPayload(deps, filters, numberQuery(c, "maxAge", 45)));
+    const freshCodexIdentity = queryValue(c, "freshCodex");
+    return c.json(await loadLimitsPayload(deps, filters, numberQuery(c, "maxAge", 45), undefined, freshCodexIdentity));
   });
   app.get("/api/usage", async (c) => {
     const filters = {

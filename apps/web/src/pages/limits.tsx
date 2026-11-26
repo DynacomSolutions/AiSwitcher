@@ -261,22 +261,19 @@ function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: 
         results: prev.results.map((row) => {
           if (row.toolName !== "codex" || row.identity.name !== result.identity) return row;
           const reset = row.manualReset;
-          const manualReset = reset
-            ? {
-                ...reset,
-                ...(result.result === "reset" ? { availableCount: Math.max(0, reset.availableCount - 1) } : {}),
-                stale: true,
-              }
-            : undefined;
+          const spent = result.result === "reset" || result.result === "already_redeemed";
+          const manualReset = reset && spent ? { ...reset, stale: true } : reset;
           const usage = result.reconciliation?.status === "confirmed" ? result.reconciliation.usage : undefined;
+          const pending = result.reconciliation?.status === "pending";
           return {
             ...row,
-            ...(usage ? { ...usage, identity: row.identity } : result.reconciliation?.status === "pending" ? { status: "cached" as const, error: "OpenAI usage refresh is pending. Showing last-known data." } : {}),
+            ...(usage ? { ...usage, identity: row.identity } : pending ? { status: "cached" as LimitFetchStatus, error: "OpenAI usage refresh is pending. Showing last-known data.", resetPendingUntil: Date.now() + 30_000, resetBaselineWindows: row.windows.map(({ label, model, usedPercent }) => ({ label, ...(model ? { model } : {}), usedPercent })) } : {}),
             ...(manualReset ? { manualReset } : {}),
           };
         }),
       }));
       void qc.invalidateQueries({ queryKey: qk.poolsUsage });
+      if (result.result === "reset" || result.result === "already_redeemed") void qc.invalidateQueries({ queryKey: qk.limits });
       if (result.result === "reset") {
         if (result.reconciliation?.status === "confirmed") {
           toast.success("Reset used", { description: `OpenAI confirmed the reset for ${result.identity}. Fresh usage read for this account.` });
@@ -304,7 +301,7 @@ function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: 
           <AlertDialogTitle>Use a reset on {identity}?</AlertDialogTitle>
           <AlertDialogDescription>
             This spends one of {availableCount} available reset credits on this Codex account. The reset cannot be returned.
-            After OpenAI accepts the request, Console makes up to three fresh usage reads for this account. If OpenAI is slow, Limits keeps the last-known reading and reports pending.
+            After OpenAI accepts the request, Console checks usage for this account. If OpenAI is slow, Limits keeps the last-known reading and reports pending.
           </AlertDialogDescription>
         </AlertDialogHeader>
         {mutation.error ? <p role="alert" className="text-sm text-destructive">{mutation.error.message}</p> : null}

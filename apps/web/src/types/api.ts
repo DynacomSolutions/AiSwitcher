@@ -333,6 +333,9 @@ export interface ToolLimitResult {
   /** Short account plan label from real wire data, e.g. "Max 20x", "Plus", "Go".
    * Absent when the provider exposes no plan or it could not be read: render nothing then. */
   plan?: string;
+  /** Local query state. A Codex reset rechecks this account until this deadline. */
+  resetPendingUntil?: number;
+  resetBaselineWindows?: Array<{ label: string; model?: string; usedPercent: number }>;
 }
 
 export interface LimitsResponse {

@@ -342,6 +342,11 @@ export function createUsageSource(opts: {
     prefill: (provider: GatewayProvider, identity: string): Promise<void> => refresh(provider, identity),
     /** Reads the source now (past any shared short-lived cache) and waits; single-flight per member. Used after a quota answer. */
     refreshNow: (provider: GatewayProvider, identity: string): Promise<void> => refresh(provider, identity, true),
+    /** Waits for an older fresh read, then starts a distinct read for a post-action reconciliation. */
+    refreshNowAfterInflight: (provider: GatewayProvider, identity: string): Promise<void> => {
+      const running = freshInflight.get(keyOf(provider, identity));
+      return running ? running.then(() => refresh(provider, identity, true)) : refresh(provider, identity, true);
+    },
     /** Waits for fetches in flight (tests). */
     async idle(): Promise<void> {
       while (inflight.size > 0 || freshInflight.size > 0) await Promise.all([...inflight.values(), ...freshInflight.values()]);
