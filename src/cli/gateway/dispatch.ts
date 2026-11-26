@@ -250,12 +250,13 @@ export async function runReleaseCommand(args: string[], force: boolean, deps: Ga
   deps.out(`gateway release: ${target} released; host refreshers may renew it again`);
 }
 
-const STORE_USAGE = "Usage: ais gateway store import [--dry-run] | sync [--once] | prune [--dry-run] | setup --key-file=<path>  (database URL on stdin)";
+const STORE_USAGE = "Usage: ais gateway store import [--dry-run] | sync [--once] | prune [--dry-run] | prune --retired --tool=<tool> [--dry-run] | setup --key-file=<path>  (database URL on stdin)";
 
 /**
  * `ais gateway store import [--dry-run]`: copies this host's gateway login files into the PostgreSQL store (idempotent).
  * `ais gateway store sync [--once]`: keeps this host's login files in step with the store (host-sync.ts).
  * `ais gateway store prune [--dry-run]`: removes the stale store copy of a login the host owns and the gateway does not manage (store-prune.ts).
+ * `ais gateway store prune --retired --tool=<tool> [--dry-run]`: removes the rows of identities that the tool's store registry no longer holds.
  * `ais gateway store setup --key-file=<path>`: records the store's database URL (stdin) and key in ~/.secrets for the sync.
  */
 async function runStoreCommand(args: string[], flags: ParsedArgs["flags"], deps: GatewayCliDeps): Promise<void> {
@@ -263,6 +264,12 @@ async function runStoreCommand(args: string[], flags: ParsedArgs["flags"], deps:
   if (extra.length > 0) throw new CliUsageError(STORE_USAGE);
   if (action === "sync") return runStoreSync(boolFlag(flags, "once"), deps);
   if (action === "setup") return runStoreSetup(stringFlag(flags, "key-file"), deps);
+  if (action === "prune" && boolFlag(flags, "retired")) {
+    const tool = stringFlag(flags, "tool");
+    if (!tool) throw new CliUsageError("Usage: ais gateway store prune --retired --tool=<tool> [--dry-run]  (--tool is required)");
+    return runStorePruneRetired(tool, boolFlag(flags, "dry-run"), deps);
+  }
+  if (action === "prune" && stringFlag(flags, "tool")) throw new CliUsageError("--tool only goes with --retired");
   if (action === "prune") return runStorePrune(boolFlag(flags, "dry-run"), deps);
   if (action !== "import") throw new CliUsageError(STORE_USAGE);
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
@@ -346,6 +353,41 @@ async function runStorePrune(dryRun: boolean, deps: GatewayCliDeps): Promise<voi
     deps.out(`gateway store prune: ${r.removed.length} ${dryRun ? "would be removed" : "removed"}, ${r.kept.length} kept`);
     for (const p of r.removed) deps.out(`  - ${p}`);
     for (const k of r.kept) deps.out(`  = ${k.path} (${k.why})`);
+  } finally {
+    await store.close().catch(() => undefined);
+  }
+}
+
+async function runStorePruneRetired(tool: string, dryRun: boolean, deps: GatewayCliDeps): Promise<void> {
+  const { hostStoreConfig } = await import("../../gateway/host-sync.ts");
+  const cfg = await hostStoreConfig();
+  if (!cfg) throw new CliUsageError("No credential store configured on this host: run `ais gateway store setup --key-file=<path>` first");
+  if (!cfg.databaseUrl) throw new CliUsageError("`ais gateway store prune` needs direct database access: set AIS_GATEWAY_STORE_DIRECT=1 and AIS_GATEWAY_STORE_DATABASE_URL for this one command");
+  const { PgHomeStore } = await import("../../gateway/home-store.ts");
+  const { pruneRetiredIdentities, PruneRefused } = await import("../../gateway/store-prune.ts");
+  const { connect } = await import("./apps.ts");
+  const { fetchGatewayApps } = await import("../../t3/instances/live.ts");
+  const store = new PgHomeStore(cfg.databaseUrl, cfg.key, `prune:${process.env.HOSTNAME ?? "host"}:${process.pid}`);
+  try {
+    const r = await pruneRetiredIdentities(store, {
+      tool,
+      dryRun,
+      // Any active pin of the name keeps it, whatever its provider: the app list names providers differently from store folders.
+      activePins: async () => {
+        try {
+          const apps = await fetchGatewayApps((await connect(deps)).admin);
+          return new Set(apps.filter((a) => a.state === "active" && a.target.kind === "pin" && a.target.identity).map((a) => a.target.identity as string));
+        } catch {
+          return undefined;
+        }
+      },
+    });
+    deps.out(`gateway store prune --retired --tool=${tool}: ${r.removed.length} ${dryRun ? "would be removed" : "removed"}, ${r.kept.length} kept`);
+    for (const p of r.removed) deps.out(`  - ${p}`);
+    for (const k of r.kept) deps.out(`  = ${k.path} (${k.why})`);
+  } catch (err) {
+    if (err instanceof PruneRefused) throw new CliUsageError(`gateway store prune --retired refused, nothing removed: ${err.message}`);
+    throw err;
   } finally {
     await store.close().catch(() => undefined);
   }

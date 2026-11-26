@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { parseTombstones, tombstoneCovers } from "../identities/tombstones.ts";
 import { loadGatewayGuard } from "../sync/gateway-guard.ts";
 import { gatewayManagesLogin, piCopyOf } from "./host-login-gate.ts";
 import type { PgHomeStore } from "./home-store.ts";
@@ -52,6 +53,78 @@ export async function pruneUnmanagedLogins(store: Pick<PgHomeStore, "list" | "de
     }
     if (await gatewayManagesLogin(guard, login, home)) {
       report.kept.push({ path: meta.path, why: "this host sees the gateway manage this login" });
+      continue;
+    }
+    if (opts.dryRun || (await store.delete(meta.path, meta.version))) report.removed.push(meta.path);
+    else report.kept.push({ path: meta.path, why: "the row changed while it was checked" });
+  }
+  return report;
+}
+
+export interface RetiredOptions {
+  tool: string;
+  dryRun?: boolean;
+  /** Names that an active gateway app pins, or undefined when the app list could not be read. */
+  activePins: () => Promise<Set<string> | undefined>;
+}
+
+/** Thrown when a retired-identity run must stop before it removes anything. */
+export class PruneRefused extends Error {}
+
+const TOOL_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * Removes the store rows of identities that a tool's store registry (`.<tool>/identities.json`) no longer holds: every row below
+ * `.<tool>/identities/<name>/` whose name is tombstoned (and the tombstone covers the entry) or not listed. A name is kept when it is
+ * a pool record, a pool account, or pinned by an active gateway app. Each delete is compare-and-swap on the version listed.
+ * Refuses the whole run (throws PruneRefused, removes nothing) when the registry row is missing, does not decrypt, lists no
+ * identity (an empty registry must never read as "all retired"), or the app list cannot be read.
+ */
+export async function pruneRetiredIdentities(store: Pick<PgHomeStore, "list" | "get" | "delete">, opts: RetiredOptions): Promise<PruneReport> {
+  if (!TOOL_RE.test(opts.tool)) throw new PruneRefused(`"${opts.tool}" is not a tool name`);
+  const registryPath = `.${opts.tool}/identities.json`;
+  const [row] = await store.get([registryPath]);
+  if (!row) throw new PruneRefused(`the registry row ${registryPath} is missing or does not decrypt`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.content.toString("utf8"));
+  } catch {
+    throw new PruneRefused(`the registry row ${registryPath} is not valid JSON`);
+  }
+  const reg = (typeof parsed === "object" && parsed !== null ? parsed : {}) as { identities?: unknown; deleted?: unknown };
+  const listed = new Map<string, unknown>();
+  const poolNames = new Set<string>();
+  const poolAccounts = new Set<string>();
+  if (Array.isArray(reg.identities)) {
+    for (const i of reg.identities) {
+      const rec = (typeof i === "object" && i !== null ? i : {}) as { name?: unknown; swapPool?: { accounts?: unknown } };
+      if (typeof rec.name !== "string" || !rec.name) continue;
+      listed.set(rec.name, i);
+      if (rec.swapPool) {
+        poolNames.add(rec.name);
+        if (Array.isArray(rec.swapPool.accounts)) for (const a of rec.swapPool.accounts) if (typeof a === "string") poolAccounts.add(a);
+      }
+    }
+  }
+  if (listed.size === 0) throw new PruneRefused(`the registry row ${registryPath} lists no identity, so it is not read as "all retired"`);
+  const tombs = new Map(parseTombstones(reg.deleted).map((t) => [t.name, t]));
+  const pinned = await opts.activePins();
+  if (!pinned) throw new PruneRefused("the gateway app list could not be read");
+
+  const prefix = `.${opts.tool}/identities/`;
+  const report: PruneReport = { removed: [], kept: [] };
+  for (const meta of await store.list(0)) {
+    if (!meta.path.startsWith(prefix)) continue;
+    const name = meta.path.slice(prefix.length).split("/")[0] ?? "";
+    if (!name || !meta.path.slice(prefix.length + name.length).startsWith("/")) continue;
+    const entry = listed.get(name);
+    let why: string | undefined;
+    if (entry !== undefined && !tombstoneCovers(tombs.get(name), entry)) why = "the registry still lists this identity";
+    else if (poolNames.has(name)) why = "a swap pool record";
+    else if (poolAccounts.has(name)) why = "an account of a swap pool";
+    else if (pinned.has(name)) why = "an active gateway app pins it";
+    if (why) {
+      report.kept.push({ path: meta.path, why });
       continue;
     }
     if (opts.dryRun || (await store.delete(meta.path, meta.version))) report.removed.push(meta.path);
