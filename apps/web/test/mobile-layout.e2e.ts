@@ -13,6 +13,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cdp, type Session } from "../../chrome-extension/test/e2e/cdp.ts";
 import { countdownUntil } from "../src/lib/format.ts";
@@ -24,7 +25,7 @@ const distDir = process.env.AIS_WEB_DIST ?? join(repoRoot, "apps/web/dist");
 const chromium = process.env.AIS_E2E_CHROMIUM
   ?? ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"].find(p => existsSync(p));
 const evidence = process.env.AIS_E2E_EVIDENCE;
-const scratchRoot = process.env.AIS_WEB_E2E_SCRATCH ?? join(repoRoot, "../../../../.data/DynacomSolutions/AiSwitcher/scratch");
+const scratchRoot = process.env.AIS_WEB_E2E_SCRATCH ?? tmpdir();
 
 const ROUTES = [
   "/", "/identities", "/local-models", "/local-models/example", "/limits", "/usage", "/usage/gateway", "/gateway", "/usage/models", "/usage/sources", "/usage/projects", "/usage/repos", "/usage/orgs", "/dashboard/herdr", "/dashboard/processes", "/breakdown", "/breakdown/consumers",
@@ -397,7 +398,7 @@ beforeAll(async () => {
   if (!chromium) throw new Error("no Chromium found; set AIS_E2E_CHROMIUM");
   if (!existsSync(join(distDir, "index.html"))) throw new Error(`apps/web is not built (${distDir}/index.html missing); run pnpm build in apps/web`);
   await mkdir(scratchRoot, { recursive: true });
-  runDir = await mkdtemp(join(scratchRoot, "20261126-limits-e2e-"));
+  runDir = await mkdtemp(join(scratchRoot, "ais-web-e2e-"));
   const home = join(runDir, "home");
   await mkdir(home, { recursive: true });
   const port = await freePort();
