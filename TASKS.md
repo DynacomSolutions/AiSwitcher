@@ -377,7 +377,7 @@ One refresher per login across replicas and hosts, early renewal, a dead grant n
 | 227 | Credential store holds only logins the gateway manages; WebUI ownership from the gateway list | done | claude | store-owned-matches-gateway | 15.221 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/612 (375b818), Opus review fixed.<br>Prune removed 2 stale rows; live host copies kept. |
 | 260 | No false folder-login warning for a gateway-routed claude folder | done | claude | folder-gateway-mismatch | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/679 (5bc9eb2), released v0.5.86.<br>Host route-all reset the stale cached account.<br>Live WebUI pod 0.5.86: no mismatch on any identity. |
 | 316 | Route-all routes every account the gateway holds | done | claude | route-all-gateway-held | | | Gateway admin list decides held: live grants only (not revoked, renewal signal, no newer error). Heartbeat and member store are the fallback.<br>Logged-out claude folders and codex folders with a pi copy are routed, not refused.<br>Local login is backed up first.<br>Shipped in v0.5.111 (PRs 774, 775). Installed on the agent host. All identities routed and live calls pass.<br>Codex needs the local gateway service (ais gateway local install). |
-| 332 | Restore the restricted Claude login lost from the gateway store and stop the overwrite | in_progress | claude | gateway-identities-cleanup | | 2026-11-25 23:00 ICT | Login left the store 18:41 ICT; 502s from 19:49 ICT.<br>Root cause trace running. |
+| 332 | Restore the restricted Claude login lost from the gateway store and stop the overwrite | done | claude | gateway-identities-cleanup | | | Restored: member store row v8176 holds a real login, renewed by the gateway; 2956 HTTP 200, 0 login-dead in 6 h (26 Nov 14:50 ICT).<br>Overwrite stopped: guard PR https://github.com/DynacomSolutions/AiSwitcher/pull/820 (3da29b6a), live in gateway 0.5.124. |
 
 ## 16. Console data on Headlamp dashboards
 ETA: 2026-11-20 19:00 ICT
@@ -468,15 +468,16 @@ ETA: 2026-12-12 18:00 ICT
 | 314 | Crush normalised session export | todo | | | 20.313 | | |
 
 ## 21. Gateway identities and agent pools
-ETA: 2026-11-26 18:00 ICT
+ETA: 2026-12-03 18:00 ICT
 - Clean up gateway identities, give each provider an agent pool and make T3 read pools live from the gateway.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 328 | Keep only the Go subscription OpenCode identity in the gateway | in_progress | claude | gateway-identities-cleanup | | 2026-11-26 12:00 ICT | Record removed identities and pools in scratch first. |
-| 329 | Agent pools for Grok, OpenCode and Z.ai with the org identity | in_progress | claude | gateway-identities-cleanup | | 2026-11-26 14:00 ICT | Same pattern as the Claude and Codex pools. |
-| 330 | Give the Kimi pool its correct name, with every reference updated | in_progress | claude | gateway-identities-cleanup | | 2026-11-26 14:00 ICT | Pool now named like the Claude pool. |
-| 331 | T3 on the host and in pods reads every identity and pool live from the gateway | in_progress | claude | gateway-identities-cleanup | 21.329, 21.330 | 2026-11-26 18:00 ICT | No static or cached pool lists in code, T3 config or cluster values. |
+| 328 | Keep only the Go subscription OpenCode identity in the gateway | done | claude | gateway-identities-cleanup | | | Store registry lists only the Go subscription identity and its pool (v8031, 2 tombstones); 3 other pin apps revoked.<br>Their encrypted auth rows stay: no hard-delete route, see 21.344. |
+| 329 | Agent pools for Grok, OpenCode and Z.ai with the org identity | done | claude | gateway-identities-cleanup | | | Apps agents-grok, agents-opencode, agents-zai, org identity pool records.<br>26 Nov 14:48 ICT, the host and a cluster pod: Grok 200 grok-4.7-build, Z.ai 200 glm-4.5-air, OpenCode 429 (pool usage limit to 18 Dec). |
+| 330 | Give the Kimi pool its correct name, with every reference updated | done | claude | gateway-identities-cleanup | | | Kimi pool is app t3-kimi-pool and instance t3-kimi-pool-acp (disabled as before); no Claude-named Kimi pool app or instance left.<br>26 Nov 14:48 ICT: 429 pool usage limit (resets 27 Nov 10:32 ICT), host and pod. Old Claude-driver homes kept: Claude session data. |
+| 331 | T3 on the host and in pods reads every identity and pool live from the gateway | done | claude | gateway-identities-cleanup | 21.329, 21.330 | | Host: profile-sync ticker reads GET /apps every 5 min; `ais gateway t3-instances sync --check` rc 0, 24 instances current (26 Nov 14:51 ICT).<br>Pods: chart seeds no pool; live sync 78 runs, 0 failures. .cluster PRs 3431, 3467, 3469 merged. |
+| 344 | Hard-delete store auth rows of removed OpenCode identities | todo | | | 21.328 | | Retire and app revoke are done; the 3 encrypted auth rows stay in the store.<br>Needs an admin delete route for store files. |
 
 ## 22. T3 question cards for ZCode threads
 ETA: 2026-11-26 17:00 ICT
