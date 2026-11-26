@@ -13,8 +13,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { Cdp, type Session } from "../../chrome-extension/test/e2e/cdp.ts";
 import { countdownUntil } from "../src/lib/format.ts";
 import { formatResetTimes } from "../src/lib/reset-time.ts";
@@ -52,6 +52,13 @@ const SYNTHETIC_LIMITS: LimitsResponse = {
         { label: "Week", category: "week", usedPercent: 95, resetsAtMs: RESET_AT + 86_400_000, note: "over budget: $1234.56 of $1000.00" },
         { label: "Month", category: "month", usedPercent: 100, resetsAtMs: RESET_AT - 60_000 }, // a reset in the past shows "now"
       ],
+      manualReset: {
+        availableCount: 2,
+        grants: [
+          { id: "SYNTHETIC_FIXTURE-claude-full", label: "Full reset", kind: "full", resetsLeft: 1, usableNow: true, paused: false, endsAt: "2026-12-01T22:27:07.649Z" },
+          { id: "SYNTHETIC_FIXTURE-claude-fable", label: "Fable reset", kind: "fable", resetsLeft: 1, usableNow: false, paused: false, endsAt: "2026-12-02T22:27:07.649Z" },
+        ],
+      },
     },
     {
       toolName: "claude",
@@ -71,7 +78,10 @@ const SYNTHETIC_LIMITS: LimitsResponse = {
       manualReset: {
         availableCount: 2,
         label: "Full reset",
-        creditExpiries: [{ id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_003", label: "Full reset", endsAt: "2026-12-01T22:27:07.649Z" }],
+        creditExpiries: [
+          { id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_003", label: "Full reset", endsAt: "2026-12-01T22:27:07.649Z" },
+          { id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_004", label: "Full reset", endsAt: "2026-12-02T22:27:07.649Z" },
+        ],
       },
     },
     {
@@ -97,7 +107,7 @@ const SYNTHETIC_LIMITS: LimitsResponse = {
       identity: { name: "SYNTHETIC_FIXTURE-codex-host-source", ...SYNTHETIC_IDENTITY },
       status: "live",
       windows: [],
-      manualReset: { availableCount: 3 },
+      manualReset: { availableCount: 3, expiresAt: "Dec 31, 8:00 PM" },
     },
     {
       toolName: "codex",
@@ -574,6 +584,16 @@ for (const vp of VIEWPORTS) {
       await checkLimitsCards(vp.width, vp.height, "/limits/anthropic", { lines: 4, notes: 1, plans: 2, poolLines: 0, wrappedAtLeast: vp.width === 360 ? 1 : 0 });
     }, 40_000);
 
+    test("Anthropic and OpenAI reset controls match at this mobile width", async () => {
+      const anthropic = await captureResetCard(vp.width, vp.height, "anthropic", "SYNTHETIC_FIXTURE-long-plan");
+      const openai = await captureResetCard(vp.width, vp.height, "openai", "SYNTHETIC_FIXTURE-codex-credit");
+      expect(anthropic.heading).toBe("Reset credits (2)");
+      expect(openai.heading).toBe("Reset credits (2)");
+      expect(openai.headingStyle).toBe(anthropic.headingStyle);
+      expect(openai.actions).toBe(1);
+      expect(openai.expiryRows).toBe(2);
+    }, 40_000);
+
     test("/limits/openai shows Codex reset availability, expiry, and known zero", async () => {
       await setViewport(vp.width, vp.height);
       const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
@@ -583,17 +603,23 @@ for (const vp of VIEWPORTS) {
         await open("/limits/openai");
         await waitFor("Codex manual reset states", 10_000, async () => page.eval<boolean>(`(() => {
           const text = document.querySelector('main')?.innerText ?? '';
-          return text.includes('Manual reset available ×2: Full reset') && text.includes('No manual reset available');
+          return text.includes('Reset credits') && text.includes('2 available') && text.includes('No reset credits available');
         })()`));
-        const state = await page.eval<{ positive: boolean; zero: boolean; expiry: boolean }>(`(() => {
+        const state = await page.eval<{ positive: boolean; zero: boolean; expiryCount: number; stale: boolean; repeatedFirstExpiry: boolean; kindBadge: boolean }>(`(() => {
           const text = document.querySelector('main')?.innerText ?? '';
+          const openaiCard = [...document.querySelectorAll('main [data-slot="card"]')].find(card => card.textContent?.includes('SYNTHETIC_FIXTURE-codex-credit'));
+          const openaiText = openaiCard?.textContent ?? '';
           return {
-            positive: text.includes('Manual reset available ×2: Full reset'),
-            zero: text.includes('No manual reset available'),
-            expiry: text.includes('Full reset: expires'),
+            positive: openaiText.includes('Reset credits') && openaiText.includes('2 available'),
+            zero: text.includes('No reset credits available'),
+            expiryCount: (openaiText.match(/Full reset: expires/g) ?? []).length,
+            stale: text.includes('Reset status may be out of date.'),
+            repeatedFirstExpiry: (() => { const date = new Date('2026-12-01T22:27:07.649Z').toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }); return openaiText.indexOf(date) !== openaiText.lastIndexOf(date); })(),
+            kindBadge: [...(openaiCard?.querySelectorAll('[data-slot="badge"]') ?? [])].some(b => b.textContent?.trim() === 'Full'),
           };
         })()`);
-        expect(state).toEqual({ positive: true, zero: true, expiry: true });
+        expect(state).toEqual({ positive: true, zero: true, expiryCount: 2, repeatedFirstExpiry: false, kindBadge: true, stale: true });
+        expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('expires Dec 31, 8:00 PM')`)).toBe(true);
         expect(await page.eval<string[]>(`[...document.querySelectorAll('main button[aria-label^="Use reset on"]')].map(b => b.getAttribute('aria-label')).sort()`)).toEqual([
           "Use reset on SYNTHETIC_FIXTURE-codex-credit",
           "Use reset on SYNTHETIC_FIXTURE-codex-other-credit",
@@ -725,8 +751,67 @@ for (const vp of VIEWPORTS) {
   });
 }
 
+function scrollToResetCard(identity: string): boolean {
+  const card = [...document.querySelectorAll<HTMLElement>("main [data-slot=card]")].find((candidate) => candidate.innerText.includes(identity));
+  if (!card) return false;
+  card.scrollIntoView({ block: "center" });
+  return true;
+}
+
+async function captureResetCard(width: number, height: number, provider: "anthropic" | "openai", identity: string) {
+  await setViewport(width, height);
+  const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+    source: `(${limitsStub.toString()})(${JSON.stringify(LIMITS_ANSWERS)})`,
+  });
+  try {
+    await open(`/limits/${provider}`);
+    await waitFor(`${provider} reset card`, 8_000, () => page.eval<boolean>(`(${scrollToResetCard.toString()})(${JSON.stringify(identity)})`));
+    if (evidence) {
+      await mkdir(evidence, { recursive: true });
+      await writeFile(join(evidence, `${width}-${provider}-reset-card.png`), await page.screenshot());
+    }
+    await page.eval(`(() => {
+      const card = [...document.querySelectorAll('main [data-slot=card]')].find(c => c.innerText.includes(${JSON.stringify(identity)}));
+      card?.querySelector('button[aria-label^="Use reset on"], button:not([aria-label])')?.click();
+    })()`);
+    await waitFor(`${provider} reset confirmation`, 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
+    const result = await page.eval<{ heading: string; headingStyle: string; actionClass: string; actions: number; expiryRows: number; confirmationOrder: string[]; confirmationActionClass: string }>(`(() => {
+      const card = [...document.querySelectorAll('main [data-slot=card]')].find(c => c.innerText.includes(${JSON.stringify(identity)}));
+      const heading = [...(card?.querySelectorAll('*') ?? [])].find(el => el.classList.contains('font-medium') && el.textContent?.trim().startsWith('Reset credits'));
+      const action = card?.querySelector('button[aria-label^="Use reset on"], button:not([aria-label])');
+      const dialog = document.querySelector('[role=alertdialog]');
+      return {
+        heading: heading?.textContent?.trim() ?? '',
+        headingStyle: heading ? getComputedStyle(heading).fontSize + '/' + getComputedStyle(heading).fontWeight : '',
+        actionClass: action?.className ?? '',
+        actions: card?.querySelectorAll('button[aria-label^="Use reset on"]').length ?? 0,
+        expiryRows: [...(card?.querySelectorAll('.text-muted-foreground') ?? [])].filter(el => /expires|expired/.test(el.textContent ?? '')).length,
+        confirmationOrder: [...(dialog?.querySelectorAll('button') ?? [])].map(button => button.textContent?.trim() ?? ''),
+        confirmationActionClass: dialog?.querySelector('[data-slot="alert-dialog-action"]')?.className ?? '',
+      };
+    })()`);
+    await page.eval(`Array.from(document.querySelectorAll('[role=alertdialog] button')).find(button => button.textContent?.trim() === 'Cancel')?.click()`);
+    await waitFor(`${provider} confirmation closed`, 5_000, () => page.eval<boolean>(`!document.querySelector('[role=alertdialog]')`));
+    return result;
+  } finally {
+    await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+  }
+}
+
 // The desktop grid. The countdown was cut off here, and a long plan badge covered the status badge.
 describe("1280x900", () => {
+  test("Anthropic and OpenAI reset controls match on desktop", async () => {
+    const anthropic = await captureResetCard(1280, 900, "anthropic", "SYNTHETIC_FIXTURE-long-plan");
+    const openai = await captureResetCard(1280, 900, "openai", "SYNTHETIC_FIXTURE-codex-credit");
+    expect(openai.headingStyle).toBe(anthropic.headingStyle);
+    expect(openai.actionClass).toBe(anthropic.actionClass);
+    expect(openai.confirmationOrder).toEqual(["Cancel", "Confirm use reset"]);
+    expect(anthropic.confirmationOrder).toEqual(["Cancel", "Use reset"]);
+    expect(openai.confirmationActionClass).toBe(anthropic.confirmationActionClass);
+    expect(openai.actions).toBe(1);
+    expect(openai.expiryRows).toBe(2);
+  }, 40_000);
+
   // Each card of the grid is narrow, so every reset line wraps here.
   test("/limits/anthropic keeps each reset countdown in full", async () => {
     await checkLimitsCards(1280, 900, "/limits/anthropic", { lines: 4, notes: 1, plans: 2, poolLines: 0, wrappedAtLeast: 1 });

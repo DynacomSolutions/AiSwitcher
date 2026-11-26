@@ -127,6 +127,35 @@ function OverageBlock({ overage }: { overage: OverageInfo }) {
 
 const GRANT_KIND: Record<ResetGrant["kind"], string> = { full: "Full", fable: "Fable only", other: "Other" };
 
+function ResetCreditsHeading({ count, capturedAt, stale }: { count: number; capturedAt?: string; stale?: boolean }) {
+  return (
+    <div className="flex items-center gap-2 font-medium">
+      <RotateCcw aria-hidden className="size-3.5 shrink-0" />
+      Reset credits ({count})
+      {capturedAt ? (
+        <span className={stale ? "font-normal text-amber-600 dark:text-amber-400" : "font-normal text-muted-foreground"}>
+          {stale ? "last seen " : "seen "}{relTime(capturedAt)}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+function ResetKindBadge({ kind }: { kind: ResetGrant["kind"] }) {
+  const variant = kind === "full" ? "success" : kind === "fable" ? "warning" : "muted";
+  return <Badge variant={variant}>{GRANT_KIND[kind]}</Badge>;
+}
+
+function ResetCreditAction({ ariaLabel, onClick }: { ariaLabel?: string; onClick: () => void }) {
+  return <Button variant="outline" size="sm" className="h-7 shrink-0 text-xs" aria-label={ariaLabel} onClick={onClick}>Use reset</Button>;
+}
+
+function formatCreditExpiry(endsAt: string): string {
+  const state = Date.parse(endsAt) > Date.now() ? "expires" : "expired";
+  const date = new Date(endsAt).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+  return `${state} ${date}`;
+}
+
 function grantState(grant: ResetGrant, cooldown: boolean): string {
   if (grant.resetsLeft <= 0) return "used up";
   if (grant.paused) return "paused";
@@ -282,28 +311,36 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
   const [using, setUsing] = useState<ResetGrant | null>(null);
   const [usingCodex, setUsingCodex] = useState(false);
   if (!reset.grants) {
-    // Codex credits (and old cached Claude reads): one summary line.
+    // Codex has account-level credits, so it has one action and one summary row.
     const available = reset.availableCount > 0;
-    const count = reset.availableCount > 1 ? ` ×${reset.availableCount}` : "";
-    const label = reset.label ? `: ${reset.label}` : "";
-    const expiry = reset.expiresAt ? ` (expires ${reset.expiresAt})` : "";
     const canSpendCodex = result.toolName === "codex" && result.gatewayManaged === true && result.status === "live" && !reset.stale && available && !result.identity.retired && !result.identity.swapPool;
+    const expiries = reset.creditExpiries ?? [];
+    const kind = /\bfull\b/i.test(reset.label ?? "") ? "full" : /\bfable\b/i.test(reset.label ?? "") ? "fable" : undefined;
     return (
       <>
         <Separator />
-        <div className={`flex items-start gap-2 text-xs ${available && !reset.stale ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>
-          <RotateCcw aria-hidden className="mt-0.5 size-3.5 shrink-0" />
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <p>{available ? `Manual reset available${count}${label}${expiry}` : "No manual reset available"}</p>
-              {canSpendCodex ? <Button variant="outline" size="sm" className="h-7 text-xs" aria-label={`Use reset on ${result.identity.name}`} onClick={() => setUsingCodex(true)}>Use reset</Button> : null}
+        <div className="space-y-2 text-xs">
+          <ResetCreditsHeading count={reset.availableCount} />
+          {reset.stale ? <p className="text-muted-foreground">Reset status may be out of date.</p> : null}
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0 space-y-0.5">
+              {available && reset.label ? (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {kind ? <ResetKindBadge kind={kind} /> : null}
+                  <span className="min-w-0 break-words">{reset.label}</span>
+                </div>
+              ) : null}
+              <div className="text-muted-foreground">
+                {available ? `${reset.availableCount} available` : "No reset credits available"}
+              </div>
+              {expiries.length === 0 && reset.expiresAt ? <div className="text-muted-foreground">expires {reset.expiresAt}</div> : null}
+              {expiries.map((credit) => (
+                <div key={credit.id} className="break-words text-muted-foreground">
+                  {credit.label ?? credit.id}: {formatCreditExpiry(credit.endsAt)}
+                </div>
+              ))}
             </div>
-            {reset.stale ? <p>Reset status may be out of date.</p> : null}
-            {reset.creditExpiries?.map((credit) => (
-              <p key={credit.id} className="text-muted-foreground">
-                {credit.label ?? credit.id}: expires {new Date(credit.endsAt).toLocaleString()}
-              </p>
-            ))}
+            {canSpendCodex ? <ResetCreditAction ariaLabel={`Use reset on ${result.identity.name}`} onClick={() => setUsingCodex(true)} /> : null}
           </div>
         </div>
         {usingCodex ? <UseCodexResetDialog identity={result.identity.name} availableCount={reset.availableCount} onClose={() => setUsingCodex(false)} /> : null}
@@ -317,16 +354,7 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
     <>
       <Separator />
       <div className="space-y-2 text-xs">
-        <div className="flex items-center gap-2 font-medium">
-          <RotateCcw aria-hidden className="size-3.5 shrink-0" />
-          Reset credits ({reset.grants.length})
-          {reset.grantsCapturedAt ? (
-            <span className={reset.stale ? "font-normal text-amber-600 dark:text-amber-400" : "font-normal text-muted-foreground"}>
-              {reset.stale ? "last seen " : "seen "}
-              {relTime(reset.grantsCapturedAt)}
-            </span>
-          ) : null}
-        </div>
+        <ResetCreditsHeading count={reset.grants.length} capturedAt={reset.grantsCapturedAt} stale={reset.stale} />
         {reset.stale ? (
           <p className="text-muted-foreground">Anthropic lists reset credits only near a limit; this is the last list it sent.</p>
         ) : null}
@@ -337,20 +365,18 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
             <li key={g.id} className="flex items-start justify-between gap-2">
               <div className="min-w-0 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <Badge variant={g.kind === "full" ? "success" : g.kind === "fable" ? "warning" : "muted"}>{GRANT_KIND[g.kind]}</Badge>
+                  <ResetKindBadge kind={g.kind} />
                   <span className="min-w-0 break-words" title={g.id}>
                     {g.label ?? g.id}
                   </span>
                 </div>
                 <div className="text-muted-foreground">
                   {g.resetsLeft} left · {grantState(g, cooldown)}
-                  {g.endsAt ? ` · ${Date.parse(g.endsAt) > Date.now() ? "expires" : "expired"} ${new Date(g.endsAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}` : ""}
+                  {g.endsAt ? ` · ${formatCreditExpiry(g.endsAt)}` : ""}
                 </div>
               </div>
               {canSpend && g.usableNow && g.resetsLeft > 0 ? (
-                <Button variant="outline" size="sm" className="h-7 shrink-0 text-xs" onClick={() => setUsing(g)}>
-                  Use reset
-                </Button>
+                <ResetCreditAction onClick={() => setUsing(g)} />
               ) : null}
             </li>
           ))}
