@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
+import { readdir } from "node:fs/promises";
 import { isDataError } from "../../src/gateway/ledger-buffer.ts";
 import { PgUsageReadings } from "../../src/gateway/usage-readings.ts";
 import { migrate, PgGatewayStore } from "../../src/gateway/pg-store.ts";
@@ -108,14 +109,25 @@ if (!url && process.env.CI && !optOut) {
     test("migrate is idempotent", async () => {
       await reset();
       await migrate(url);
-      await migrate(url);
-      await Promise.all([migrate(url), migrate(url)]);
       const sql = new SQL(url);
       try {
-        const rows = await sql`SELECT version FROM schema_migrations`;
-        expect(rows.length).toBe(15);
+        const firstRun = (await sql`SELECT version FROM schema_migrations ORDER BY version`).map((r: { version: string }) => r.version);
+        await migrate(url);
+        await Promise.all([migrate(url), migrate(url)]);
+        const rows = await sql`SELECT version FROM schema_migrations ORDER BY version`;
+        const repeatRun = rows.map((r: { version: string }) => r.version);
+        const files = await readdir(new URL("../../src/gateway/migrations/", import.meta.url));
+        const diskVersions = files
+          .filter((file) => /^\d{4}_.+\.sql$/.test(file))
+          .map((file) => file.slice(0, -4))
+          .sort();
+        expect(firstRun).toEqual(diskVersions);
+        expect(repeatRun).toEqual(diskVersions);
+        expect(diskVersions).toContain("0016_reset_credit_invalidations");
         const t = await sql`SELECT to_regclass('gateway_usage') AS r`;
         expect(t[0].r).toBe("gateway_usage");
+        const resetTable = await sql`SELECT to_regclass('reset_credit_invalidations') AS r`;
+        expect(resetTable[0].r).toBe("reset_credit_invalidations");
         const ext = await sql`SELECT 1 AS x FROM pg_extension WHERE extname = 'timescaledb'`;
         const requireTimescale = Boolean(process.env.CI) && !optOut;
         if (requireTimescale) expect(ext.length).toBe(1);
