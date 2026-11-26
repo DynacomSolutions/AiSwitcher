@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { PoolHoldGate, heldStreamResponse, wantsStream, type PoolHoldLimits } from "../../src/gateway/pool-hold.ts";
+import { PoolHoldGate, confirmedPoolAnswers, heldStreamResponse, wantsStream, type PoolHoldLimits } from "../../src/gateway/pool-hold.ts";
 import { createGatewayApp, type GatewayDeps } from "../../src/gateway/app.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { PrometheusMetrics, noopMetrics } from "../../src/gateway/metrics.ts";
-import { weeklyUtilisation } from "../../src/gateway/native-limit.ts";
+import { anthropicLimitResponse, claudeCompatibilityLimitMessage, weeklyUtilisation } from "../../src/gateway/native-limit.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { generateToken } from "../../src/gateway/tokens.ts";
 import type { GatewayApp } from "../../src/gateway/types.ts";
@@ -537,6 +537,54 @@ describe("a served hold, an unserved stream and the pings (unit)", () => {
     }
     return text;
   };
+
+  test("held timeout recalculates the real reset countdown at emission", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    const emissionStart = new Date("2026-11-26T08:50:00.000Z");
+    const resetAt = Date.parse("2026-11-26T11:40:00.000Z");
+    let nowMs = emissionStart.getTime();
+    const initial = anthropicLimitResponse({ claim: "short", resetAtSec: resetAt / 1000, guessed: false, windows: [] }, emissionStart, true);
+    const startMessage = (await initial.json() as { error: { message: string } }).error.message;
+    const res = heldStreamResponse({
+      limits: { ...limits, maxMs: 1, checkMs: 5000 }, gate, bytes: 1000,
+      now: () => new Date(nowMs), sleep: async (ms) => { nowMs += ms; },
+      replay: async () => { throw new Error("timeout must not replay"); },
+      limitMessage: () => claudeCompatibilityLimitMessage(startMessage, new Date(nowMs)),
+    });
+    const text = await res.text();
+    expect(text).toContain("(reset after 2h 50m 0s)");
+    expect(text).toMatch(/Resets at 2026-11-26T11:40:00\.000Z\./);
+    expect(text).toContain('"type":"rate_limit_error"');
+    expect(gate.held).toBe(0);
+  });
+
+  test("a held gateway 429 keeps the Anthropic error class and reset opening", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    const now = new Date("2026-11-25T00:00:00.000Z");
+    const resetAt = new Date(now.getTime() + 2 * HOURS).toISOString();
+    const answer = anthropicLimitResponse({ claim: "short", resetAtSec: Date.parse(resetAt) / 1000, guessed: false, windows: [] }, now, true);
+    confirmedPoolAnswers.add(answer);
+    const text = await heldStreamResponse({ ...input(gate, async () => answer), now: () => now }).text();
+    expect(text).toContain('"type":"rate_limit_error"');
+    expect(text).toContain('"status":429');
+    expect(text).toContain("You've hit your 5-hour limit");
+    expect(text).toContain("(reset after 2h 0s)");
+    expect(text).toMatch(/Resets at 2026-11-25T02:00:00\.000Z\./);
+    expect(text).not.toContain("provider returned HTTP 429:");
+  });
+
+  test("a held 429 preserves the absence of a provider-confirmed countdown", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    const now = new Date("2026-11-25T00:00:00.000Z");
+    const answer = anthropicLimitResponse({ claim: "short", resetAtSec: now.getTime() / 1000 + 300, guessed: true, windows: [] }, now, true);
+    confirmedPoolAnswers.add(answer);
+    const text = await heldStreamResponse({ ...input(gate, async () => answer), now: () => now }).text();
+    expect(text).toContain('"status":429');
+    expect(text).not.toContain("(reset after ");
+  });
 
   test("F1: a served hold leaves the hold count at once, but its body stays in the byte count until the stream ends", async () => {
     const gate = new PoolHoldGate(limits);

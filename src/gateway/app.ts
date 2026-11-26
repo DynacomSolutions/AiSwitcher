@@ -17,7 +17,7 @@ import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadReque
 import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
-import { fullWindowReset, genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit, type LimitCandidate } from "./native-limit.ts";
+import { claudeCompatibilityLimitMessage, fullWindowReset, genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit, type LimitCandidate } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
@@ -1001,7 +1001,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       now: deps.now,
       sleep: deps.sleep ?? defaultSleep,
       drain: deps.drainSignal,
-      limitMessage: limitText,
+      limitMessage: () => claudeCompatibilityLimitMessage(limitText, deps.now()),
       onEvent: (e) => {
         deps.metrics.poolHold?.(app.name, e);
         // A served replay wrote its own row with the real status. Any other end writes the one row of this request.
@@ -1132,7 +1132,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       const usages = await memberUsages(app, deps, model);
       const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
       const now = deps.now();
-      const answer = nativeLimitResponse(app.provider, usages, reserve, now, limitResets) ?? (why === undefined ? undefined : genericLimitResponse(style, summariseLimit(usages, reserve, now, limitResets).resetAtSec, now, `AIS gateway: ${why}`));
+      const answer = nativeLimitResponse(app.provider, usages, reserve, now, limitResets, app.target.kind === "pool" && app.provider === "claude") ?? (why === undefined ? undefined : genericLimitResponse(style, summariseLimit(usages, reserve, now, limitResets).resetAtSec, now, `AIS gateway: ${why}`));
       if (answer) {
         record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
         return answer;
