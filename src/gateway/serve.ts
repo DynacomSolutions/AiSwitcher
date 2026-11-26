@@ -938,21 +938,46 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       return out;
     }),
     spendCodexReset: hooks.spendCodexReset ?? (async (identity, redeemRequestId) => {
+      const before = await usage.get("codex", identity).catch(() => undefined);
       // Resolve or refresh the login before taking the spend lock. Credential refresh uses the same distributed account lock.
       const credential = await creds.get("codex", identity);
       const lock = await refreshBackend.acquire({ provider: "codex", identity }, 15_000);
+      let result: Awaited<ReturnType<typeof consumeCodexResetForIdentity>>;
       try {
-        return await consumeCodexResetForIdentity(identity, redeemRequestId, { creds, fetch: hooks.fetch ?? fetch, credential });
+        result = await consumeCodexResetForIdentity(identity, redeemRequestId, { creds, fetch: hooks.fetch ?? fetch, credential });
       } finally {
         try {
           await resetCredits.invalidate(identity);
         } catch (err) {
           console.warn(`gateway: Codex reset credit cache invalidation failed (${errorTag(err)})`);
         } finally {
-          void usage.refreshNow("codex", identity).catch(() => undefined);
           await lock.release().catch(() => undefined);
         }
       }
+      if (result.result !== "reset" && result.result !== "already_redeemed") return { ...result, reconciliation: { status: "not_needed" as const } };
+
+      // Read only this account from OpenAI. A different replica may still have the pre-reset shared cache.
+      let latest = before;
+      // Keep the fresh reads inside the console's 30-second Gateway request timeout.
+      const deadline = Date.now() + 6_000;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const finished = await Promise.race([
+          usage.refreshNow("codex", identity).then(() => true, () => true),
+          new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
+        ]);
+        if (timer) clearTimeout(timer);
+        if (!finished) break;
+        latest = await usage.get("codex", identity).catch(() => latest);
+        const changed = JSON.stringify(latest?.windows ?? []) !== JSON.stringify(before?.windows ?? []);
+        if (latest && !latest.stale && (changed || !before)) {
+          return { ...result, reconciliation: { status: "confirmed" as const, usage: latest } };
+        }
+      }
+      return { ...result, reconciliation: { status: "pending" as const, ...(latest ? { usage: { ...latest, stale: true } } : {}) } };
     }),
     browserPoolMembers,
     browserIdentityExists,

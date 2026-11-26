@@ -6,7 +6,7 @@ import { windowsFromUsageBody } from "../../src/cli/limits/claude-limits.ts";
 import type { ToolLimitResult } from "../../src/cli/limits/types.ts";
 import { extraUsageFromBody, parseUsageBody } from "../../src/identities/claude-usage-api.ts";
 import type { Identity } from "../../src/identities/types.ts";
-import { loadGatewayLimits, mapGatewayLimitRow, mapGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, type GatewayLimitRow, type GatewayLimitsView } from "../../src/server/gateway-limits.ts";
+import { loadGatewayLimits, mapGatewayLimitRow, mapGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, useCodexResetViaGateway, type GatewayLimitRow, type GatewayLimitsView } from "../../src/server/gateway-limits.ts";
 
 const RESET_SESSION = "2026-11-19T18:00:00.000Z";
 const RESET_WEEK = "2026-11-20T15:00:00.000Z";
@@ -363,6 +363,30 @@ describe("reset grants from the gateway", () => {
     writeFileSync(secretsPath, "AIS_GATEWAY_ADMIN_URL=https://gw.test/admin/\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n");
     expect(await useClaudeResetViaGateway("m 1", "g/1", { fetch: fake, secretsPath })).toMatchObject({ result: "reset" });
     expect(calls).toEqual([{ url: "https://gw.test/admin/limits/claude/m%201/resets/g%2F1", method: "POST", auth: "Bearer SYNTHETIC_FIXTURE_token" }]);
+  });
+
+  test("Codex consume returns mapped account-scoped usage from reconciliation", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ais-gwspend-"));
+    const secretsPath = join(dir, "secrets");
+    writeFileSync(secretsPath, "AIS_GATEWAY_ADMIN_URL=https://gw.test/admin\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n");
+    const redeemRequestId = "edcd553c-a594-4e1c-9aa8-0101110d4ca6";
+    const fake = (async () => Response.json({
+      identity: "codex-member",
+      result: "reset",
+      windowsReset: 1,
+      reconciliation: {
+        status: "confirmed",
+        usage: { status: "live", maxUtilization: 0, capturedAt: STAMP, windows: [{ label: "~7d", utilization: 0 }] },
+      },
+    })) as unknown as typeof fetch;
+    const result = await useCodexResetViaGateway("codex-member", redeemRequestId, { fetch: fake, secretsPath });
+    expect(result).toMatchObject({
+      result: "reset",
+      reconciliation: {
+        status: "confirmed",
+        usage: { toolName: "codex", identity: { name: "codex-member" }, status: "live", windows: [{ usedPercent: 0, category: "week" }] },
+      },
+    });
   });
 
   test("gateway refusals keep their status and reason; no admin config is 503", async () => {
