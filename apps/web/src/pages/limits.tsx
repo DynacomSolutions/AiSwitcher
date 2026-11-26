@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { CreditCard, RotateCcw } from "lucide-react";
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { ToolBadge } from "@/components/badges";
@@ -127,11 +127,11 @@ function OverageBlock({ overage }: { overage: OverageInfo }) {
 
 const GRANT_KIND: Record<ResetGrant["kind"], string> = { full: "Full", fable: "Fable only", other: "Other" };
 
-function ResetCreditsHeading({ count, capturedAt, stale }: { count?: number; capturedAt?: string; stale?: boolean }) {
+function ResetCreditsHeading({ count, capturedAt, stale }: { count: number; capturedAt?: string; stale?: boolean }) {
   return (
     <div className="flex items-center gap-2 font-medium">
       <RotateCcw aria-hidden className="size-3.5 shrink-0" />
-      Reset credits{count !== undefined ? ` (${count})` : ""}
+      Reset credits ({count})
       {capturedAt ? (
         <span className={stale ? "font-normal text-amber-600 dark:text-amber-400" : "font-normal text-muted-foreground"}>
           {stale ? "last seen " : "seen "}{relTime(capturedAt)}
@@ -141,13 +141,13 @@ function ResetCreditsHeading({ count, capturedAt, stale }: { count?: number; cap
   );
 }
 
-function ResetKindBadge({ kind, children }: { kind: ResetGrant["kind"]; children: ReactNode }) {
+function ResetKindBadge({ kind }: { kind: ResetGrant["kind"] }) {
   const variant = kind === "full" ? "success" : kind === "fable" ? "warning" : "muted";
-  return <Badge variant={variant}>{children}</Badge>;
+  return <Badge variant={variant}>{GRANT_KIND[kind]}</Badge>;
 }
 
-function ResetCreditAction({ label = "Use reset", ariaLabel, onClick }: { label?: string; ariaLabel?: string; onClick: () => void }) {
-  return <Button variant="outline" size="sm" className="h-7 shrink-0 text-xs" aria-label={ariaLabel} onClick={onClick}>{label}</Button>;
+function ResetCreditAction({ ariaLabel, onClick }: { ariaLabel?: string; onClick: () => void }) {
+  return <Button variant="outline" size="sm" className="h-7 shrink-0 text-xs" aria-label={ariaLabel} onClick={onClick}>Use reset</Button>;
 }
 
 function formatCreditExpiry(endsAt: string): string {
@@ -315,24 +315,25 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
     const available = reset.availableCount > 0;
     const canSpendCodex = result.toolName === "codex" && result.gatewayManaged === true && result.status === "live" && !reset.stale && available && !result.identity.retired && !result.identity.swapPool;
     const expiries = reset.creditExpiries ?? [];
+    const kind = /\bfull\b/i.test(reset.label ?? "") ? "full" : /\bfable\b/i.test(reset.label ?? "") ? "fable" : undefined;
     return (
       <>
         <Separator />
         <div className="space-y-2 text-xs">
-          <ResetCreditsHeading stale={reset.stale} />
+          <ResetCreditsHeading count={reset.availableCount} />
           {reset.stale ? <p className="text-muted-foreground">Reset status may be out of date.</p> : null}
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0 space-y-0.5">
-              <div className="flex flex-wrap items-center gap-1.5">
-                <ResetKindBadge kind={/full/i.test(reset.label ?? "") ? "full" : /fable/i.test(reset.label ?? "") ? "fable" : "other"}>
-                  {/full/i.test(reset.label ?? "") ? "Full" : /fable/i.test(reset.label ?? "") ? "Fable only" : result.toolName === "codex" ? "OpenAI" : "Anthropic"}
-                </ResetKindBadge>
-                <span>{reset.label ?? "Reset credit"}</span>
-              </div>
+              {available && reset.label ? (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {kind ? <ResetKindBadge kind={kind} /> : null}
+                  <span className="min-w-0 break-words">{reset.label}</span>
+                </div>
+              ) : null}
               <div className="text-muted-foreground">
                 {available ? `${reset.availableCount} available` : "No reset credits available"}
               </div>
-              {expiries.length === 0 && reset.expiresAt ? <div className="text-muted-foreground">{formatCreditExpiry(reset.expiresAt)}</div> : null}
+              {expiries.length === 0 && reset.expiresAt ? <div className="text-muted-foreground">expires {reset.expiresAt}</div> : null}
               {expiries.map((credit) => (
                 <div key={credit.id} className="break-words text-muted-foreground">
                   {credit.label ?? credit.id}: {formatCreditExpiry(credit.endsAt)}
@@ -364,7 +365,7 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
             <li key={g.id} className="flex items-start justify-between gap-2">
               <div className="min-w-0 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <ResetKindBadge kind={g.kind}>{GRANT_KIND[g.kind]}</ResetKindBadge>
+                  <ResetKindBadge kind={g.kind} />
                   <span className="min-w-0 break-words" title={g.id}>
                     {g.label ?? g.id}
                   </span>

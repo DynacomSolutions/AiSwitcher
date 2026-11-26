@@ -107,7 +107,7 @@ const SYNTHETIC_LIMITS: LimitsResponse = {
       identity: { name: "SYNTHETIC_FIXTURE-codex-host-source", ...SYNTHETIC_IDENTITY },
       status: "live",
       windows: [],
-      manualReset: { availableCount: 3 },
+      manualReset: { availableCount: 3, expiresAt: "Dec 31, 8:00 PM" },
     },
     {
       toolName: "codex",
@@ -587,8 +587,8 @@ for (const vp of VIEWPORTS) {
     test("Anthropic and OpenAI reset controls match at this mobile width", async () => {
       const anthropic = await captureResetCard(vp.width, vp.height, "anthropic", "SYNTHETIC_FIXTURE-long-plan");
       const openai = await captureResetCard(vp.width, vp.height, "openai", "SYNTHETIC_FIXTURE-codex-credit");
-      expect(anthropic.heading).toBe("Reset credits");
-      expect(openai.heading).toBe("Reset credits");
+      expect(anthropic.heading).toBe("Reset credits (2)");
+      expect(openai.heading).toBe("Reset credits (2)");
       expect(openai.headingStyle).toBe(anthropic.headingStyle);
       expect(openai.actions).toBe(1);
       expect(openai.expiryRows).toBe(2);
@@ -619,6 +619,7 @@ for (const vp of VIEWPORTS) {
           };
         })()`);
         expect(state).toEqual({ positive: true, zero: true, expiryCount: 2, repeatedFirstExpiry: false, kindBadge: true, stale: true });
+        expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('expires Dec 31, 8:00 PM')`)).toBe(true);
         expect(await page.eval<string[]>(`[...document.querySelectorAll('main button[aria-label^="Use reset on"]')].map(b => b.getAttribute('aria-label')).sort()`)).toEqual([
           "Use reset on SYNTHETIC_FIXTURE-codex-credit",
           "Use reset on SYNTHETIC_FIXTURE-codex-other-credit",
@@ -780,7 +781,7 @@ async function captureResetCard(width: number, height: number, provider: "anthro
       const action = card?.querySelector('button[aria-label^="Use reset on"], button:not([aria-label])');
       const dialog = document.querySelector('[role=alertdialog]');
       return {
-        heading: heading?.textContent?.trim().split(' (')[0] ?? '',
+        heading: heading?.textContent?.trim() ?? '',
         headingStyle: heading ? getComputedStyle(heading).fontSize + '/' + getComputedStyle(heading).fontWeight : '',
         actionClass: action?.className ?? '',
         actions: card?.querySelectorAll('button[aria-label^="Use reset on"]').length ?? 0,
