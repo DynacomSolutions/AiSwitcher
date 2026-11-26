@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { CreditCard, RotateCcw } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { ToolBadge } from "@/components/badges";
@@ -37,7 +37,7 @@ import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
 import { formatResetTimes } from "@/lib/reset-time";
 import { AccountWarnings } from "@/components/account-line";
-import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseResetResult } from "@/types/api";
+import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseCodexResetResult, UseResetResult } from "@/types/api";
 
 function StatusBadge({ status }: { status: LimitFetchStatus }) {
   switch (status) {
@@ -217,21 +217,87 @@ function UseResetDialog({ identity, grant, onClose }: { identity: string; grant:
   );
 }
 
+function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: string; availableCount: number; onClose: () => void }) {
+  const qc = useQueryClient();
+  const submitted = useRef(false);
+  const requestId = useRef<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: (redeemRequestId: string) => api.useCodexReset(identity, redeemRequestId),
+    retry: false,
+    onSuccess: (result: UseCodexResetResult) => {
+      void qc.invalidateQueries({ queryKey: qk.limits });
+      void qc.invalidateQueries({ queryKey: qk.poolsUsage });
+      if (result.result === "reset") {
+        const description = result.windowsReset > 0
+          ? `${result.windowsReset} limit ${result.windowsReset === 1 ? "window" : "windows"} reset on ${result.identity}.`
+          : `OpenAI confirmed the reset for ${result.identity}.`;
+        toast.success("Reset used", { description });
+      } else if (result.result === "already_redeemed") {
+        toast.info("Reset already redeemed", { description: `This request was already processed for ${result.identity}.` });
+      } else if (result.result === "nothing_to_reset") {
+        toast.info("No windows reset", { description: `${result.identity} had no eligible limit windows.` });
+      } else {
+        toast.error("No reset credit", { description: `${result.identity} has no available reset credit.` });
+      }
+      onClose();
+    },
+    onError: () => {
+      void qc.invalidateQueries({ queryKey: qk.limits });
+      void qc.invalidateQueries({ queryKey: qk.poolsUsage });
+    },
+  });
+  return (
+    <AlertDialog open onOpenChange={(open) => !open && !mutation.isPending && onClose()}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Use a reset on {identity}?</AlertDialogTitle>
+          <AlertDialogDescription>
+            This spends one of {availableCount} available reset credits on this Codex account. The reset cannot be returned.
+            The provider may refuse the request. If the outcome is unknown, refresh Limits before you try again.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {mutation.error ? <p role="alert" className="text-sm text-destructive">{mutation.error.message}</p> : null}
+        {mutation.isPending ? <p role="status" className="text-sm text-muted-foreground">Sending reset request…</p> : null}
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={mutation.isPending}>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            disabled={mutation.isPending || submitted.current}
+            onClick={(event) => {
+              event.preventDefault();
+              if (submitted.current || mutation.isPending) return;
+              submitted.current = true;
+              requestId.current ??= crypto.randomUUID();
+              mutation.mutate(requestId.current);
+            }}
+          >
+            {mutation.isPending ? "Using reset…" : "Confirm use reset"}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
 function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: ToolLimitResult }) {
   const [using, setUsing] = useState<ResetGrant | null>(null);
+  const [usingCodex, setUsingCodex] = useState(false);
   if (!reset.grants) {
     // Codex credits (and old cached Claude reads): one summary line.
     const available = reset.availableCount > 0;
     const count = reset.availableCount > 1 ? ` ×${reset.availableCount}` : "";
     const label = reset.label ? `: ${reset.label}` : "";
     const expiry = reset.expiresAt ? ` (expires ${reset.expiresAt})` : "";
+    const canSpendCodex = result.toolName === "codex" && result.gatewayManaged === true && result.status === "live" && !reset.stale && available && !result.identity.retired && !result.identity.swapPool;
     return (
       <>
         <Separator />
         <div className={`flex items-start gap-2 text-xs ${available && !reset.stale ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>
           <RotateCcw aria-hidden className="mt-0.5 size-3.5 shrink-0" />
-          <div>
-            <p>{available ? `Manual reset available${count}${label}${expiry}` : "No manual reset available"}</p>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <p>{available ? `Manual reset available${count}${label}${expiry}` : "No manual reset available"}</p>
+              {canSpendCodex ? <Button variant="outline" size="sm" className="h-7 text-xs" aria-label={`Use reset on ${result.identity.name}`} onClick={() => setUsingCodex(true)}>Use reset</Button> : null}
+            </div>
             {reset.stale ? <p>Reset status may be out of date.</p> : null}
             {reset.creditExpiries?.map((credit) => (
               <p key={credit.id} className="text-muted-foreground">
@@ -240,6 +306,7 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
             ))}
           </div>
         </div>
+        {usingCodex ? <UseCodexResetDialog identity={result.identity.name} availableCount={reset.availableCount} onClose={() => setUsingCodex(false)} /> : null}
       </>
     );
   }

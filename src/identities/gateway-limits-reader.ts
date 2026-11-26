@@ -165,7 +165,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
   if (!r || typeof r.provider !== "string" || !LIMIT_TOOLS.has(r.provider) || typeof r.identity !== "string" || r.identity === "") return undefined;
   const toolName = r.provider as ToolConfig["toolName"];
   const identity: Identity = { name: r.identity, label: r.identity, configDir: "" };
-  const base = { toolName, provider: providerForTool(toolName), identity };
+  const base = { toolName, provider: providerForTool(toolName), identity, gatewayManaged: true };
   const windows: LimitWindow[] = [];
   for (const rawWindow of Array.isArray(r.windows) ? r.windows : []) {
     const w = rawWindow as Record<string, unknown> | null;
@@ -204,7 +204,6 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
     // "rate-limited" with a figure is a live reading at 100% (codex/kimi/zai) or a stale claude backoff (stale: true).
     status: r.stale === true ? "cached" : "live",
     ...(capturedAt ? { capturedAt } : {}),
-    // codex credits are shown as a note only: the gateway never routes a member at or over 100%, so they are never spent.
     ...(extraUsage ? { extraUsage, ...(r.provider === "codex" ? {} : { overage: overageFromExtraUsage(extraUsage) }) } : {}),
   };
 }

@@ -67,6 +67,8 @@ import { clearLoginRevoked, recordLoginRevoked } from "../identities/gateway-rev
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
 import { useClaudeReset } from "../server/claude-resets.ts";
+import { consumeCodexResetForIdentity } from "./account.ts";
+import { MemoryResetCreditInvalidations, PgResetCreditInvalidations } from "./reset-credit-cache.ts";
 import { createManagementCheck, GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, listGatewayManagedAccountsStrict, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
@@ -121,6 +123,8 @@ export interface GatewayHooks {
   usageFor?: GatewayDeps["usageFor"];
   /** Tests: replaces the reset spend behind POST /limits/claude/:identity/resets/:grant. */
   spendReset?(identity: string, grantId: string): Promise<unknown>;
+  /** Tests: replaces the one Codex consume behind POST /limits/codex/:identity/resets/use. */
+  spendCodexReset?(identity: string, redeemRequestId: string): Promise<unknown>;
   /** Replaces the AIS adapter fetch behind the default (cached) usage source. */
   fetchUsage?: FetchUsage;
   canonical?: GatewayDeps["canonical"];
@@ -812,7 +816,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   // The usage source bounds every shared call itself.
   const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : sharedSql;
   const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
+  const resetCreditInvalidations = readingsSql ? new PgResetCreditInvalidations(readingsSql) : new MemoryResetCreditInvalidations();
   const resetCredits = createCodexResetSource({
+    invalidations: resetCreditInvalidations,
     fetchCredits: async (identity) => fetchCodexResetCredits(
       await creds.get("codex", identity),
       hooks.fetch ? (input, init) => hooks.fetch!(input, init) : fetch,
@@ -930,6 +936,23 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       const out = await useClaudeReset(identity, grantId, { noRefresh: true });
       void usage.refreshNow("claude", identity).catch(() => {});
       return out;
+    }),
+    spendCodexReset: hooks.spendCodexReset ?? (async (identity, redeemRequestId) => {
+      // Resolve or refresh the login before taking the spend lock. Credential refresh uses the same distributed account lock.
+      const credential = await creds.get("codex", identity);
+      const lock = await refreshBackend.acquire({ provider: "codex", identity }, 15_000);
+      try {
+        return await consumeCodexResetForIdentity(identity, redeemRequestId, { creds, fetch: hooks.fetch ?? fetch, credential });
+      } finally {
+        try {
+          await resetCredits.invalidate(identity);
+        } catch (err) {
+          console.warn(`gateway: Codex reset credit cache invalidation failed (${errorTag(err)})`);
+        } finally {
+          void usage.refreshNow("codex", identity).catch(() => undefined);
+          await lock.release().catch(() => undefined);
+        }
+      }
     }),
     browserPoolMembers,
     browserIdentityExists,

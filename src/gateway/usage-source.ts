@@ -14,6 +14,11 @@ import type { SharedReading, UsageReadings } from "./usage-readings.ts";
 
 export const USAGE_TTL_MS = 45_000;
 
+export interface CodexResetSource {
+  (identity: string): Promise<ManualResetInfo | undefined>;
+  invalidate(identity: string): Promise<void>;
+}
+
 /** Reads the provider's manual reset inventory with the same account-scoped headers as Codex traffic. */
 export async function fetchCodexResetCredits(
   credential: ProviderCredential,
@@ -26,12 +31,15 @@ export async function fetchCodexResetCredits(
     signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) return undefined;
-  const body = await response.json() as { available_count?: unknown; credits?: unknown };
+  const raw = await response.json().catch(() => undefined) as unknown;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const body = raw as { available_count?: unknown; credits?: unknown };
   const credits = Array.isArray(body.credits) ? body.credits as Array<{ id?: unknown; title?: unknown; status?: unknown; expires_at?: unknown }> : undefined;
   const available = credits?.filter((credit) => credit.status === "available") ?? [];
   const count = body.available_count;
-  if (!(typeof count === "number" && Number.isFinite(count) && count >= 0) && !credits) return undefined;
-  const availableCount = typeof count === "number" && Number.isFinite(count) && count >= 0 ? Math.floor(count) : available.length;
+  // The upstream details contract requires available_count. Missing or malformed data is unknown, never zero.
+  if (!(typeof count === "number" && Number.isSafeInteger(count) && count >= 0)) return undefined;
+  const availableCount = count;
   const creditExpiries = available.flatMap((credit) => {
     const expiry = typeof credit.expires_at === "string" ? Date.parse(credit.expires_at) : Number.NaN;
     return Number.isFinite(expiry) && typeof credit.id === "string"
@@ -49,30 +57,61 @@ export async function fetchCodexResetCredits(
 /** Cache Codex reset credits per identity so repeated Console polls do not hit the provider. */
 export function createCodexResetSource(opts: {
   fetchCredits(identity: string): Promise<ManualResetInfo | undefined>;
+  invalidations?: import("./reset-credit-cache.ts").ResetCreditInvalidations;
   ttlMs?: number;
   now?: () => number;
-}) {
+}): CodexResetSource {
   const ttl = opts.ttlMs ?? USAGE_TTL_MS;
   const now = opts.now ?? Date.now;
-  const entries = new Map<string, { value: ManualResetInfo; at: number }>();
-  const inflight = new Map<string, Promise<ManualResetInfo | undefined>>();
-  return async (identity: string): Promise<ManualResetInfo | undefined> => {
-    const entry = entries.get(identity);
+  const entries = new Map<string, { value: ManualResetInfo; at: number; version: string }>();
+  const inflight = new Map<string, { version: string | undefined; promise: Promise<ManualResetInfo | undefined> }>();
+  const source = async (identity: string): Promise<ManualResetInfo | undefined> => {
+    let version: string | undefined = opts.invalidations ? undefined : "unshared";
+    try { if (opts.invalidations) version = await opts.invalidations.version(identity); } catch { /* The cache cannot be trusted when shared state is unavailable. */ }
+    let entry = entries.get(identity);
+    if (entry && (version === undefined || entry.version !== version)) {
+      entries.delete(identity);
+      entry = undefined;
+    }
     if (entry && now() - entry.at < ttl) return entry.value;
     let running = inflight.get(identity);
-    if (!running) {
-      running = opts.fetchCredits(identity).then((value) => {
-        if (value) entries.set(identity, { value, at: now() });
-        else if (entry) entries.set(identity, { value: { ...entry.value, stale: true }, at: now() });
-        return value ?? (entry ? { ...entry.value, stale: true } : undefined);
-      }).catch(() => {
-        if (entry) entries.set(identity, { value: { ...entry.value, stale: true }, at: now() });
-        return entry ? { ...entry.value, stale: true } : undefined;
-      }).finally(() => inflight.delete(identity));
+    if (!running || running.version !== version) {
+      const promise = (async (): Promise<ManualResetInfo | undefined> => {
+        let value = await opts.fetchCredits(identity).catch(() => undefined);
+        let currentVersion = version;
+        if (opts.invalidations) {
+          try {
+            currentVersion = await opts.invalidations.version(identity);
+            if (version === undefined || currentVersion !== version) {
+              // The first generation was unknown or changed during this read. Fetch against the current generation.
+              value = await opts.fetchCredits(identity).catch(() => undefined);
+              const confirmedVersion = await opts.invalidations.version(identity);
+              if (confirmedVersion !== currentVersion) value = undefined;
+              currentVersion = confirmedVersion;
+            }
+          } catch {
+            // If generation state is unavailable, use a live read and do not cache it.
+            value = await opts.fetchCredits(identity).catch(() => undefined);
+            currentVersion = undefined;
+          }
+        }
+        if (!value && entry && entry.version === currentVersion) value = { ...entry.value, stale: true };
+        if (value && currentVersion !== undefined) entries.set(identity, { value, at: now(), version: currentVersion });
+        return value;
+      })().finally(() => {
+        if (inflight.get(identity)?.promise === promise) inflight.delete(identity);
+      });
+      running = { version, promise };
       inflight.set(identity, running);
     }
-    return running;
+    return running.promise;
   };
+  return Object.assign(source, {
+    async invalidate(identity: string): Promise<void> {
+      entries.delete(identity);
+      await opts.invalidations?.invalidate(identity);
+    },
+  });
 }
 
 /** The providers with a usage reader: `fetchPoolUsage` (claude, codex, kimi, zai) and the OpenCode Go read. Others (grok, ali) have no source. */

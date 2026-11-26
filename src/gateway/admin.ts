@@ -79,6 +79,8 @@ export interface AdminDeps {
   canonical?(provider: GatewayProvider, identity: string): Promise<string>;
   /** Spends one Claude reset grant of a managed identity with the store's member credential (POST /limits/claude/:identity/resets/:grant); absent when the gateway cannot. Throws an error with a numeric `status` and a short message to refuse. */
   spendReset?(identity: string, grantId: string): Promise<unknown>;
+  /** Spends one Codex reset on the named member and invalidates shared reset and usage reads. */
+  spendCodexReset?(identity: string, redeemRequestId: string): Promise<unknown>;
 }
 
 /** One GET /limits row: a managed identity plus the usage source's reading of it (no reading yet: unavailable). */
@@ -342,6 +344,22 @@ export function createAdminApp(deps: AdminDeps): Hono {
     } catch (e) {
       const status = (e as { status?: unknown }).status;
       const known = status === 400 || status === 404 || status === 409 || status === 429 ? status : 502;
+      return Response.json({ error: e instanceof Error ? e.message.slice(0, 300) : "reset failed" }, { status: known });
+    }
+  });
+
+  // A Codex consume has no grant id. The identity path pins the stored login used for its one POST.
+  hono.post("/limits/codex/:identity/resets/use", async (c) => {
+    if (!deps.spendCodexReset) return err(404, "Codex reset spending is not available");
+    const requested = decodeURIComponent(c.req.param("identity"));
+    const identity = (await deps.canonical?.("codex", requested).catch(() => requested)) ?? requested;
+    try {
+      const body = await c.req.json().catch(() => undefined) as { redeemRequestId?: unknown } | undefined;
+      if (typeof body?.redeemRequestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.redeemRequestId)) return err(400, "a valid reset request ID is required");
+      return c.json(await deps.spendCodexReset(identity, body.redeemRequestId));
+    } catch (e) {
+      const status = (e as { status?: unknown }).status;
+      const known = status === 400 || status === 403 || status === 404 || status === 409 || status === 429 ? status : 502;
       return Response.json({ error: e instanceof Error ? e.message.slice(0, 300) : "reset failed" }, { status: known });
     }
   });

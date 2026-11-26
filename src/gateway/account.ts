@@ -70,6 +70,64 @@ export interface AccountResult {
   cls: string;
 }
 
+/** Spends one Codex reset on this exact stored member. The consume request is sent once. */
+export async function consumeCodexResetForIdentity(
+  identity: string,
+  redeemRequestId: string,
+  deps: Pick<GatewayDeps, "creds" | "fetch"> & { credential?: import("./providers/shared.ts").ProviderCredential },
+): Promise<{ identity: string; result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number }> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(redeemRequestId)) {
+    throw Object.assign(new Error("A valid reset request ID is required"), { status: 400 });
+  }
+  const adapter = adapterFor("codex");
+  const credential = deps.credential ?? await deps.creds.get("codex", identity);
+  if (credential.identity !== identity) throw Object.assign(new Error("Codex credential identity did not match the requested account"), { status: 409 });
+  let credits: Response;
+  try {
+    credits = await deps.fetch(CODEX_CREDITS_URL, {
+      method: "GET",
+      headers: upstreamHeaders(adapter, credential, new Headers({ accept: "application/json" })),
+      signal: AbortSignal.timeout(10_000),
+      redirect: "manual",
+    });
+  } catch {
+    throw Object.assign(new Error("Codex reset credits could not be checked"), { status: 502 });
+  }
+  if (!credits.ok) {
+    await discard(credits);
+    throw Object.assign(new Error(`Codex reset credits answered HTTP ${credits.status}`), { status: credits.status === 403 ? 403 : 502 });
+  }
+  const inventory = await credits.json().catch(() => undefined);
+  if (availableCount(inventory) === undefined) throw Object.assign(new Error("Codex reset credits could not be verified"), { status: 502 });
+
+  // Codex consumes the next available credit for this authenticated account. Do not retry this POST.
+  let spent: Response;
+  try {
+    spent = await deps.fetch(`${CODEX_CREDITS_URL}/consume`, {
+      method: "POST",
+      headers: upstreamHeaders(adapter, credential, new Headers({ accept: "application/json", "content-type": "application/json" })),
+      body: JSON.stringify({ redeem_request_id: redeemRequestId }),
+      signal: AbortSignal.timeout(10_000),
+      redirect: "manual",
+    });
+  } catch {
+    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
+  }
+  if (!spent.ok) {
+    await discard(spent);
+    throw Object.assign(new Error(`Codex refused the reset (HTTP ${spent.status})`), { status: [400, 403, 404, 409, 429].includes(spent.status) ? spent.status : 502 });
+  }
+  const response = await spent.json().catch(() => undefined) as { code?: unknown; windows_reset?: unknown } | undefined;
+  const { code, windows_reset: windowsReset = 0 } = response ?? {};
+  if (code !== "reset" && code !== "nothing_to_reset" && code !== "no_credit" && code !== "already_redeemed") {
+    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
+  }
+  if (typeof windowsReset !== "number" || !Number.isSafeInteger(windowsReset) || windowsReset < 0) {
+    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
+  }
+  return { identity, result: code, windowsReset };
+}
+
 async function discard(res: Response): Promise<void> {
   try {
     await res.body?.cancel();

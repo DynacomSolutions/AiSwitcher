@@ -3,6 +3,7 @@ import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { pickIdentity } from "../../src/gateway/select.ts";
 import { createCodexResetSource, fetchCodexResetCredits, createUsageSource as createUsageSourceRaw, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
 import { MemoryUsageReadings, type UsageReadings } from "../../src/gateway/usage-readings.ts";
+import { MemoryResetCreditInvalidations } from "../../src/gateway/reset-credit-cache.ts";
 
 /** The source with a silent log by default, so the tests print no `usage-read` lines. A test that reads the log passes its own. */
 const createUsageSource = (o: Parameters<typeof createUsageSourceRaw>[0]): ReturnType<typeof createUsageSourceRaw> => createUsageSourceRaw({ log: () => {}, ...o });
@@ -54,6 +55,10 @@ describe("Codex reset source", () => {
     expect(first).not.toHaveProperty("grants");
     expect(second).toEqual({ availableCount: 0 });
   });
+  test.each([null, {}, { credits: [] }, { available_count: "0", credits: [] }])("treats invalid inventory %j as unknown", async (body) => {
+    const result = await fetchCodexResetCredits({ identity: "codex-a", accessToken: "access-SYNTHETIC_FIXTURE_A" }, async () => Response.json(body));
+    expect(result).toBeUndefined();
+  });
   test("caches repeated reads, keeps known zero, and retains a prior result after errors", async () => {
     let now = 1_000;
     let calls = 0;
@@ -78,6 +83,73 @@ describe("Codex reset source", () => {
     expect(calls).toBe(2);
     expect(await source("codex-b")).toBeUndefined();
     expect(calls).toBe(3);
+  });
+
+  test("a spend invalidation clears reset counts on every replica", async () => {
+    const invalidations = new MemoryResetCreditInvalidations();
+    let count = 2;
+    let calls = 0;
+    const sourceA = createCodexResetSource({ invalidations, fetchCredits: async () => { calls++; return { availableCount: count }; } });
+    const sourceB = createCodexResetSource({ invalidations, fetchCredits: async () => { calls++; return { availableCount: count }; } });
+    expect(await sourceA("codex-SYNTHETIC_FIXTURE")).toEqual({ availableCount: 2 });
+    expect(await sourceB("codex-SYNTHETIC_FIXTURE")).toEqual({ availableCount: 2 });
+    count = 1;
+    await sourceA.invalidate("codex-SYNTHETIC_FIXTURE");
+    expect(await sourceB("codex-SYNTHETIC_FIXTURE")).toEqual({ availableCount: 1 });
+    expect(calls).toBe(3);
+  });
+
+  test("a read from an old generation cannot complete as the current value", async () => {
+    const invalidations = new MemoryResetCreditInvalidations();
+    let release!: () => void;
+    let started!: () => void;
+    const firstFetch = new Promise<void>((r) => (release = r));
+    const fetchStarted = new Promise<void>((r) => (started = r));
+    let count = 2;
+    let calls = 0;
+    const source = createCodexResetSource({ invalidations, fetchCredits: async () => {
+      calls++;
+      if (calls === 1) { started(); await firstFetch; }
+      return { availableCount: count };
+    } });
+    const oldRead = source("codex-SYNTHETIC_FIXTURE");
+    await fetchStarted;
+    count = 1;
+    await source.invalidate("codex-SYNTHETIC_FIXTURE");
+    release();
+    expect(await oldRead).toEqual({ availableCount: 1 });
+    expect(calls).toBe(2);
+  });
+
+  test("a failed read after a spend cannot restore a previous credit count", async () => {
+    const identity = "codex-SYNTHETIC_FIXTURE";
+    const invalidations = new MemoryResetCreditInvalidations();
+    let calls = 0;
+    const source = createCodexResetSource({ invalidations, ttlMs: 0, fetchCredits: async () => {
+      calls++;
+      if (calls === 1) return { availableCount: 1 };
+      if (calls === 2) await invalidations.invalidate(identity);
+      return undefined;
+    } });
+    expect(await source(identity)).toEqual({ availableCount: 1 });
+    expect(await source(identity)).toBeUndefined();
+    expect(calls).toBe(3);
+  });
+
+  test("a failed initial generation check fetches live before it can cache a value", async () => {
+    let checks = 0;
+    let calls = 0;
+    const invalidations = {
+      version: async () => {
+        checks++;
+        if (checks === 1) throw new Error("synthetic version read failure");
+        return "current";
+      },
+      invalidate: async () => {},
+    };
+    const source = createCodexResetSource({ invalidations, fetchCredits: async () => ({ availableCount: ++calls === 1 ? 2 : 1 }) });
+    expect(await source("codex-SYNTHETIC_FIXTURE")).toEqual({ availableCount: 1 });
+    expect(calls).toBe(2);
   });
 });
 

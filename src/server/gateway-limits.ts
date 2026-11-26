@@ -97,3 +97,33 @@ export async function useClaudeResetViaGateway(
   }
   return body;
 }
+
+/** Spends one Codex reset through the gateway admin API on the named stored identity. */
+export async function useCodexResetViaGateway(
+  identity: string,
+  redeemRequestId: string,
+  deps: { fetch?: typeof fetch; secretsPath?: string; timeoutMs?: number } = {},
+): Promise<{ identity: string; result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number }> {
+  const cfg = await gatewayAdminConfig({ ...(deps.secretsPath ? { secretsPath: deps.secretsPath } : {}) });
+  if (!cfg) throw new HttpError(503, "gateway admin is not configured on this console");
+  let res: Response;
+  try {
+    res = await (deps.fetch ?? fetch)(`${cfg.url}/limits/codex/${encodeURIComponent(identity)}/resets/use`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${cfg.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ redeemRequestId }),
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 30_000),
+    });
+  } catch {
+    throw new HttpError(502, "gateway admin unreachable. The reset outcome may be unknown; refresh limits before another attempt.");
+  }
+  const body = (await res.json().catch(() => undefined)) as { identity?: unknown; result?: unknown; windowsReset?: unknown; error?: unknown } | undefined;
+  if (!res.ok) {
+    const status = [400, 403, 404, 409, 429, 503].includes(res.status) ? res.status : 502;
+    throw new HttpError(status, typeof body?.error === "string" ? body.error.slice(0, 300) : `gateway admin answered ${res.status}`);
+  }
+  if (body?.identity !== identity) throw new HttpError(502, "gateway confirmed a reset for a different identity");
+  if (body.result !== "reset" && body.result !== "nothing_to_reset" && body.result !== "no_credit" && body.result !== "already_redeemed") throw new HttpError(502, "gateway returned an unknown Codex reset outcome. Refresh limits before another attempt.");
+  if (!Number.isSafeInteger(body.windowsReset) || (body.windowsReset as number) < 0) throw new HttpError(502, "gateway returned an invalid Codex reset response. Refresh limits before another attempt.");
+  return { identity, result: body.result, windowsReset: body.windowsReset as number };
+}

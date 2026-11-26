@@ -12,6 +12,8 @@ export interface Identity {
   aliases?: string[];
   /** True only for a retired identity: kept for usage history, never launched. */
   retired?: boolean;
+  /** Present only for the Claude identity that owns a swap pool. */
+  swapPool?: { accounts: string[] };
   /** ISO timestamp of the retirement, when recorded. */
   retiredAt?: string;
 }
@@ -287,6 +289,12 @@ export interface UseResetResult {
   cooldownUntil?: string;
 }
 
+export interface UseCodexResetResult {
+  identity: string;
+  result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed";
+  windowsReset: number;
+}
+
 export type LimitFetchStatus = "live" | "cached" | "unavailable" | "pending";
 
 /** The account behind an identity's login. Never holds a secret. */
@@ -315,9 +323,11 @@ export interface ToolLimitResult {
   error?: string;
   capturedAt?: string;
   overage?: OverageInfo;
-  /** Codex credits (shown as a note: the gateway never spends them) and Claude extra usage. */
+  /** Codex credits and Claude extra usage. */
   extraUsage?: ExtraUsageInfo;
   manualReset?: ManualResetInfo;
+  /** True when the Gateway credential store owns this provider identity. */
+  gatewayManaged?: boolean;
   account?: AccountInfo;
   /** Short account plan label from real wire data, e.g. "Max 20x", "Plus", "Go".
    * Absent when the provider exposes no plan or it could not be read: render nothing then. */
