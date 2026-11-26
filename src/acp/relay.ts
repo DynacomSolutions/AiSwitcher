@@ -30,7 +30,7 @@
  * Every other line passes unchanged, byte for byte. A line this code cannot read passes unchanged too.
  */
 import { redactText } from "../gateway/upstream-error.ts";
-import { fromDroidAnswer, toDroidForm, type FormMap } from "./question-form.ts";
+import { fromButtonAnswer, toButtonForm, type FormMap } from "./question-form.ts";
 import { endpointFromServers, resetFromText, type LimitSnoozer, type McpEndpoint } from "./limit-snooze.ts";
 
 /** Why a turn failed, from the agent's own records. */
@@ -199,12 +199,34 @@ export class AcpRelay {
    * remembered, and the client's answer to a permission request is noted.
    */
   fromClient(line: string): string | undefined {
-    if (this.forms.size > 0 && line.includes('"result"')) {
-      const answer = this.formAnswer(line);
-      if (answer !== undefined) return answer;
+    if (this.forms.size > 0) {
+      if (line.includes('"result"')) {
+        const answer = this.formAnswer(line);
+        if (answer !== undefined) return answer;
+      }
+      this.dropForm(line);
     }
     this.trackClient(line);
     return undefined;
+  }
+
+  /** A client error answer or a cancel request ends a form: its map is no longer needed. */
+  private dropForm(line: string): void {
+    if (!line.includes('"error"') && !line.includes("cancel_request")) return;
+    let msg: Json | undefined;
+    try {
+      msg = obj(JSON.parse(line));
+    } catch {
+      return;
+    }
+    if (!msg) return;
+    const key = msg.method === "$/cancel_request" ? idKey(obj(msg.params)?.requestId) : msg.method === undefined && msg.error !== undefined ? idKey(msg.id) : undefined;
+    if (key !== undefined) this.forms.delete(key);
+  }
+
+  /** The session ended: no rewritten form can be answered any more. */
+  clearForms(): void {
+    this.forms.clear();
   }
 
   private formAnswer(line: string): string | undefined {
@@ -220,7 +242,7 @@ export class AcpRelay {
     const result = obj(msg.result);
     if (key === undefined || !map || !result) return undefined;
     this.forms.delete(key);
-    return JSON.stringify({ ...msg, result: fromDroidAnswer(result, map) });
+    return JSON.stringify({ ...msg, result: fromButtonAnswer(result, map) });
   }
 
   private trackClient(line: string): void {
@@ -367,7 +389,7 @@ export class AcpRelay {
     if (msg.method === "session/request_permission") return this.permissionRequest(msg, line);
     if (msg.method === "elicitation/create" && this.opts.questionForms) {
       const key = idKey(msg.id);
-      const form = key !== undefined ? toDroidForm(obj(msg.params) ?? {}) : undefined;
+      const form = key !== undefined ? toButtonForm(obj(msg.params) ?? {}) : undefined;
       if (key === undefined || !form) return [line];
       this.forms.set(key, form.map);
       this.opts.log?.("acp-relay: a question form was rewritten so the client shows its options");

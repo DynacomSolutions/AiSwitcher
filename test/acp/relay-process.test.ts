@@ -580,3 +580,37 @@ describe("in-turn limit watch (end to end)", () => {
     expect(await a.exit).toBe(0);
   }, 30_000);
 });
+
+describe("client to agent bytes", () => {
+  /** `cat` as the agent echoes what it gets on stdin to stdout, which the relay passes on line by line. */
+  async function through(chunks: Buffer[]): Promise<Buffer> {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const got: Buffer[] = [];
+    stdout.on("data", (c: Buffer) => got.push(c));
+    const done = runAcpRelay({ command: "/bin/cat", args: [], stdin, stdout, stderr: new PassThrough(), log: () => {}, limit: false });
+    for (const c of chunks) {
+      stdin.write(c);
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    stdin.end();
+    await done;
+    return Buffer.concat(got);
+  }
+
+  test("lines split across chunks arrive whole", async () => {
+    const out = await through([Buffer.from('{"a":'), Buffer.from('1}\n{"b"'), Buffer.from(":2}\n")]);
+    expect(out.toString()).toBe('{"a":1}\n{"b":2}\n');
+  });
+
+  test("a last line with no newline arrives at end", async () => {
+    const out = await through([Buffer.from('{"a":1}\n{"tail":true}')]);
+    expect(out.toString()).toBe('{"a":1}\n{"tail":true}');
+  });
+
+  test("CRLF and invalid UTF-8 keep their exact bytes", async () => {
+    const input = Buffer.concat([Buffer.from('{"x":"a"}\r\n'), Buffer.from([0x7b, 0x22, 0xff, 0xfe, 0xc3, 0x28, 0x22, 0x7d, 0x0a])]);
+    const out = await through([input]);
+    expect(out.equals(input)).toBe(true);
+  });
+});
