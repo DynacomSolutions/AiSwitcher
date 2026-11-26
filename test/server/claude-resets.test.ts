@@ -170,15 +170,16 @@ describe("useClaudeReset", () => {
     let invalidated = 0;
     const app = createApp({
       token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1", peerPort: 50000, peerUid: () => process.getuid?.(),
-      codexUseReset: async (identity) => { seen.push(identity); return { identity }; },
+      codexUseReset: async (identity, requestId) => { seen.push(`${identity}:${requestId}`); return { identity, result: "nothing_to_reset", windowsReset: 0 }; },
       invalidateLimits: () => void invalidated++,
     });
     const path = "/api/limits/codex/codex-SYNTHETIC_FIXTURE-member/resets/use";
+    const redeemRequestId = crypto.randomUUID();
     expect((await app.request(path, { method: "POST", headers: { Host: "127.0.0.1:47129" } })).status).toBe(403);
-    const ok = await app.request(path, { method: "POST", headers: { Host: "127.0.0.1:47129", "X-AIS-Console": "1" } });
+    const ok = await app.request(path, { method: "POST", headers: { Host: "127.0.0.1:47129", "X-AIS-Console": "1", "content-type": "application/json" }, body: JSON.stringify({ redeemRequestId }) });
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ identity: "codex-SYNTHETIC_FIXTURE-member" });
-    expect(seen).toEqual(["codex-SYNTHETIC_FIXTURE-member"]);
+    expect(await ok.json()).toEqual({ identity: "codex-SYNTHETIC_FIXTURE-member", result: "nothing_to_reset", windowsReset: 0 });
+    expect(seen).toEqual([`codex-SYNTHETIC_FIXTURE-member:${redeemRequestId}`]);
     expect(invalidated).toBe(1);
   });
   test("with a gateway admin configured the route delegates to the gateway and reads no host token", async () => {

@@ -113,7 +113,7 @@ export interface ConsoleAppDeps extends GuardDeps {
   /** Test seam for POST /api/limits/claude/:identity/resets/:grant; defaults to Anthropic's reset endpoint. */
   claudeUseReset?: (identity: string, grantId: string) => Promise<claudeResets.UseResetResult>;
   /** Test seam for POST /api/limits/codex/:identity/resets/use; defaults to the authenticated Gateway store. */
-  codexUseReset?: (identity: string) => Promise<{ identity: string }>;
+  codexUseReset?: (identity: string, redeemRequestId: string) => Promise<{ identity: string; result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number }>;
   /** Test seam: drops the cached /api/limits reads after a spent reset; defaults to the scan daemon's cache. */
   invalidateLimits?: () => void;
   /** Test seam for GET /api/usage/projects; defaults to reading the collector's projects.json. */
@@ -393,8 +393,10 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   // A confirmed Codex consume has no provider grant id. It is pinned to the named identity in the Gateway store.
   app.post("/api/limits/codex/:identity/resets/use", async (c) => {
     const identity = decodeSegment(c.req.param("identity"));
-    const spend = deps.codexUseReset ?? ((name) => useCodexResetViaGateway(name));
-    const result = await spend(identity);
+    const body = await c.req.json().catch(() => undefined) as { redeemRequestId?: unknown } | undefined;
+    if (typeof body?.redeemRequestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.redeemRequestId)) throw new HttpError(400, "a valid reset request ID is required");
+    const spend = deps.codexUseReset ?? ((name, requestId) => useCodexResetViaGateway(name, requestId));
+    const result = await spend(identity, body.redeemRequestId);
     (deps.invalidateLimits ?? invalidateLimitsCache)();
     return c.json(result);
   });

@@ -55,6 +55,10 @@ describe("Codex reset source", () => {
     expect(first).not.toHaveProperty("grants");
     expect(second).toEqual({ availableCount: 0 });
   });
+  test.each([null, {}, { credits: [] }, { available_count: "0", credits: [] }])("treats invalid inventory %j as unknown", async (body) => {
+    const result = await fetchCodexResetCredits({ identity: "codex-a", accessToken: "access-SYNTHETIC_FIXTURE_A" }, async () => Response.json(body));
+    expect(result).toBeUndefined();
+  });
   test("caches repeated reads, keeps known zero, and retains a prior result after errors", async () => {
     let now = 1_000;
     let calls = 0;
@@ -93,6 +97,44 @@ describe("Codex reset source", () => {
     await sourceA.invalidate("codex-SYNTHETIC_FIXTURE");
     expect(await sourceB("codex-SYNTHETIC_FIXTURE")).toEqual({ availableCount: 1 });
     expect(calls).toBe(3);
+  });
+
+  test("a read from an old generation cannot complete as the current value", async () => {
+    const invalidations = new MemoryResetCreditInvalidations();
+    let release!: () => void;
+    let started!: () => void;
+    const firstFetch = new Promise<void>((r) => (release = r));
+    const fetchStarted = new Promise<void>((r) => (started = r));
+    let count = 2;
+    let calls = 0;
+    const source = createCodexResetSource({ invalidations, fetchCredits: async () => {
+      calls++;
+      if (calls === 1) { started(); await firstFetch; }
+      return { availableCount: count };
+    } });
+    const oldRead = source("codex-SYNTHETIC_FIXTURE");
+    await fetchStarted;
+    count = 1;
+    await source.invalidate("codex-SYNTHETIC_FIXTURE");
+    release();
+    expect(await oldRead).toEqual({ availableCount: 1 });
+    expect(calls).toBe(2);
+  });
+
+  test("a failed initial generation check fetches live before it can cache a value", async () => {
+    let checks = 0;
+    let calls = 0;
+    const invalidations = {
+      version: async () => {
+        checks++;
+        if (checks === 1) throw new Error("synthetic version read failure");
+        return "current";
+      },
+      invalidate: async () => {},
+    };
+    const source = createCodexResetSource({ invalidations, fetchCredits: async () => ({ availableCount: ++calls === 1 ? 2 : 1 }) });
+    expect(await source("codex-SYNTHETIC_FIXTURE")).toEqual({ availableCount: 1 });
+    expect(calls).toBe(2);
   });
 });
 

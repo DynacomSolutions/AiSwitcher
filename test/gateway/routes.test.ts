@@ -534,11 +534,13 @@ describe("served from pool state", () => {
     });
   }
 
-  test("codex reset credits read from the usage summary shape too, and unreadable members are skipped", async () => {
+  test("codex reset credits read from the usage summary shape and unknown member inventory stays unavailable", async () => {
     await addApp("c", "codex", "openai");
     let n = 0;
     reply = () => (++n === 1 ? new Response("nope", { status: 500 }) : new Response(JSON.stringify({ rate_limit_reset_credits: { available_count: 4 } })));
-    expect(await (await call("c", "/wham/rate-limit-reset-credits", { method: "GET" })).json()).toEqual({ available_count: 4 });
+    const res = await call("c", "/wham/rate-limit-reset-credits", { method: "GET" });
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ error: { message: "AIS gateway: reset credit figures are not available for every account in this app" } });
   });
 
   test("codex reset credits: 502 when no member can be read", async () => {
@@ -1236,21 +1238,37 @@ describe("account API of the other providers", () => {
   test("codex: spending a credit goes to the member that has one, with its login", async () => {
     await addApp("c", "codex", "openai");
     usage.a = { status: "live", maxUtilization: 5, capturedAt: "" };
-    reply = (s) => (s.method === "GET" ? Response.json({ available_count: s.headers.get("authorization") === "Bearer tok-b" ? 1 : 0 }) : Response.json({ ok: true }));
+    reply = (s) => (s.method === "GET" ? Response.json({ available_count: s.headers.get("authorization") === "Bearer tok-b" ? 1 : 0 }) : Response.json({ code: "nothing_to_reset", windows_reset: 0 }));
+    const redeemRequestId = crypto.randomUUID();
     for (const path of ["/api/codex/rate-limit-reset-credits/consume", "/backend-api/wham/rate-limit-reset-credits/consume"]) {
       seen.length = 0;
-      const res = await call("c", path, { method: "POST", body: "{}" });
+      const res = await call("c", path, { method: "POST", body: JSON.stringify({ redeem_request_id: redeemRequestId }) });
       expect(res.status).toBe(200);
       const post = seen.find((x) => x.method === "POST")!;
       expect(new URL(post.url).pathname).toBe("/backend-api/wham/rate-limit-reset-credits/consume");
       expect(post.headers.get("authorization")).toBe("Bearer tok-b");
+      expect(JSON.parse(post.body!)).toEqual({ redeem_request_id: redeemRequestId });
     }
   });
   test("codex: a pinned consume goes to that identity", async () => {
     await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
-    await call("c", "/wham/rate-limit-reset-credits/consume", { method: "POST", body: "{}" });
-    expect(seen).toHaveLength(1);
-    expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+    reply = (s) => s.method === "GET" ? Response.json({ available_count: 1 }) : Response.json({ code: "reset", windows_reset: 2 });
+    const redeemRequestId = crypto.randomUUID();
+    const res = await call("c", "/wham/rate-limit-reset-credits/consume", { method: "POST", body: JSON.stringify({ redeem_request_id: redeemRequestId }) });
+    expect(res.status).toBe(200);
+    const posts = seen.filter((s) => s.method === "POST");
+    expect(posts).toHaveLength(1);
+    expect(new URL(posts[0]!.url).pathname).toBe("/backend-api/wham/rate-limit-reset-credits/consume");
+    expect(posts[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+    expect(posts[0]!.headers.get("chatgpt-account-id")).toBe("acct");
+    expect(JSON.parse(posts[0]!.body!)).toEqual({ redeem_request_id: redeemRequestId });
+  });
+  test("codex reset preserves an upstream 403", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    reply = (s) => s.method === "GET" ? Response.json({ available_count: 1 }) : new Response("forbidden", { status: 403 });
+    const res = await call("c", "/wham/rate-limit-reset-credits/consume", { method: "POST", body: JSON.stringify({ redeem_request_id: crypto.randomUUID() }) });
+    expect(res.status).toBe(403);
+    expect(seen.filter((s) => s.method === "POST")).toHaveLength(1);
   });
   for (const [method, path, want] of [
     ["GET", "/backend-api/plugins/featured", "/backend-api/plugins/featured"],

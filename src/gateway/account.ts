@@ -73,8 +73,12 @@ export interface AccountResult {
 /** Spends one Codex reset on this exact stored member. The consume request is sent once. */
 export async function consumeCodexResetForIdentity(
   identity: string,
+  redeemRequestId: string,
   deps: Pick<GatewayDeps, "creds" | "fetch"> & { credential?: import("./providers/shared.ts").ProviderCredential },
-): Promise<{ identity: string }> {
+): Promise<{ identity: string; result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number }> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(redeemRequestId)) {
+    throw Object.assign(new Error("A valid reset request ID is required"), { status: 400 });
+  }
   const adapter = adapterFor("codex");
   const credential = deps.credential ?? await deps.creds.get("codex", identity);
   if (credential.identity !== identity) throw Object.assign(new Error("Codex credential identity did not match the requested account"), { status: 409 });
@@ -94,9 +98,7 @@ export async function consumeCodexResetForIdentity(
     throw Object.assign(new Error(`Codex reset credits answered HTTP ${credits.status}`), { status: 502 });
   }
   const inventory = await credits.json().catch(() => undefined);
-  if ((availableCount(inventory) ?? 0) <= 0) {
-    throw Object.assign(new Error("This Codex account has no available reset credits"), { status: 409 });
-  }
+  if (availableCount(inventory) === undefined) throw Object.assign(new Error("Codex reset credits could not be verified"), { status: 502 });
 
   // Codex consumes the next available credit for this authenticated account. Do not retry this POST.
   let spent: Response;
@@ -104,7 +106,7 @@ export async function consumeCodexResetForIdentity(
     spent = await deps.fetch(`${CODEX_CREDITS_URL}/consume`, {
       method: "POST",
       headers: upstreamHeaders(adapter, credential, new Headers({ accept: "application/json", "content-type": "application/json" })),
-      body: "{}",
+      body: JSON.stringify({ redeem_request_id: redeemRequestId }),
       signal: AbortSignal.timeout(10_000),
       redirect: "manual",
     });
@@ -115,8 +117,16 @@ export async function consumeCodexResetForIdentity(
     await discard(spent);
     throw Object.assign(new Error(`Codex refused the reset (HTTP ${spent.status})`), { status: [400, 403, 404, 409, 429].includes(spent.status) ? spent.status : 502 });
   }
-  await spent.body?.cancel().catch(() => undefined);
-  return { identity };
+  const response = await spent.json().catch(() => undefined) as { code?: unknown; windows_reset?: unknown } | undefined;
+  const code = response?.code;
+  if (code !== "reset" && code !== "nothing_to_reset" && code !== "no_credit" && code !== "already_redeemed") {
+    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
+  }
+  const windowsReset = response?.windows_reset;
+  if (!Number.isSafeInteger(windowsReset) || (windowsReset as number) < 0) {
+    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
+  }
+  return { identity, result: code, windowsReset: windowsReset as number };
 }
 
 async function discard(res: Response): Promise<void> {
@@ -295,6 +305,12 @@ export async function forwardAccount(r: AccountRequest): Promise<AccountResult> 
 
 async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
   const noMember = (): AccountResult => ({ res: providerError(r.style, 409, "no login is available for this app", "no_login"), cls });
+  if (r.op === "codex-consume" && r.method === "POST") {
+    const requestId = jsonField(r.body, "redeem_request_id");
+    if (!requestId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
+      return { res: providerError(r.style, 400, "a valid reset request ID is required", "invalid_request"), cls };
+    }
+  }
   let url = r.url;
   let owner: OwnerFinder | undefined;
 

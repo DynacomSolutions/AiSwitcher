@@ -37,7 +37,7 @@ import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
 import { formatResetTimes } from "@/lib/reset-time";
 import { AccountWarnings } from "@/components/account-line";
-import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseResetResult } from "@/types/api";
+import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseCodexResetResult, UseResetResult } from "@/types/api";
 
 function StatusBadge({ status }: { status: LimitFetchStatus }) {
   switch (status) {
@@ -220,12 +220,22 @@ function UseResetDialog({ identity, grant, onClose }: { identity: string; grant:
 function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: string; availableCount: number; onClose: () => void }) {
   const qc = useQueryClient();
   const submitted = useRef(false);
+  const requestId = useRef<string | null>(null);
   const mutation = useMutation({
-    mutationFn: () => api.useCodexReset(identity),
-    onSuccess: (result) => {
+    mutationFn: (redeemRequestId: string) => api.useCodexReset(identity, redeemRequestId),
+    retry: false,
+    onSuccess: (result: UseCodexResetResult) => {
       void qc.invalidateQueries({ queryKey: qk.limits });
       void qc.invalidateQueries({ queryKey: qk.poolsUsage });
-      toast.success("Reset used", { description: `One reset credit was used on ${result.identity}.` });
+      if (result.result === "reset") {
+        toast.success("Reset used", { description: `${result.windowsReset} limit windows reset on ${result.identity}.` });
+      } else if (result.result === "already_redeemed") {
+        toast.info("Reset already redeemed", { description: `This request was already processed for ${result.identity}.` });
+      } else if (result.result === "nothing_to_reset") {
+        toast.info("No windows reset", { description: `${result.identity} had no eligible limit windows.` });
+      } else {
+        toast.error("No reset credit", { description: `${result.identity} has no available reset credit.` });
+      }
       onClose();
     },
     onError: () => {
@@ -253,7 +263,8 @@ function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: 
               event.preventDefault();
               if (submitted.current || mutation.isPending) return;
               submitted.current = true;
-              mutation.mutate();
+              requestId.current ??= crypto.randomUUID();
+              mutation.mutate(requestId.current);
             }}
           >
             {mutation.isPending ? "Using reset…" : "Confirm use reset"}

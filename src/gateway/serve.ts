@@ -124,7 +124,7 @@ export interface GatewayHooks {
   /** Tests: replaces the reset spend behind POST /limits/claude/:identity/resets/:grant. */
   spendReset?(identity: string, grantId: string): Promise<unknown>;
   /** Tests: replaces the one Codex consume behind POST /limits/codex/:identity/resets/use. */
-  spendCodexReset?(identity: string): Promise<unknown>;
+  spendCodexReset?(identity: string, redeemRequestId: string): Promise<unknown>;
   /** Replaces the AIS adapter fetch behind the default (cached) usage source. */
   fetchUsage?: FetchUsage;
   canonical?: GatewayDeps["canonical"];
@@ -937,17 +937,19 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       void usage.refreshNow("claude", identity).catch(() => {});
       return out;
     }),
-    spendCodexReset: hooks.spendCodexReset ?? (async (identity) => {
+    spendCodexReset: hooks.spendCodexReset ?? (async (identity, redeemRequestId) => {
       // Resolve or refresh the login before taking the spend lock. Credential refresh uses the same distributed account lock.
       const credential = await creds.get("codex", identity);
       const lock = await refreshBackend.acquire({ provider: "codex", identity }, 15_000);
       try {
-        const out = await consumeCodexResetForIdentity(identity, { creds, fetch: hooks.fetch ?? fetch, credential });
-        await resetCredits.invalidate(identity).catch(() => undefined);
-        void usage.refreshNow("codex", identity).catch(() => undefined);
-        return out;
+        return await consumeCodexResetForIdentity(identity, redeemRequestId, { creds, fetch: hooks.fetch ?? fetch, credential });
       } finally {
-        await lock.release().catch(() => undefined);
+        try {
+          await resetCredits.invalidate(identity);
+        } finally {
+          void usage.refreshNow("codex", identity).catch(() => undefined);
+          await lock.release().catch(() => undefined);
+        }
       }
     }),
     browserPoolMembers,

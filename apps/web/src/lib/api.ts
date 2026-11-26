@@ -33,6 +33,7 @@ import type {
   GatewayAppDto,
   GatewayAppPatch,
   GatewayRotateResult,
+  UseCodexResetResult,
   UseResetResult,
   BrowsersResponse,
   PushStatusResponse,
@@ -183,8 +184,8 @@ export const api = {
   useClaudeReset: (identity: string, grantId: string) =>
     request<UseResetResult>(`/api/limits/claude/${encodeURIComponent(identity)}/resets/${encodeURIComponent(grantId)}`, { method: "POST" }),
 
-  useCodexReset: (identity: string) =>
-    request<{ identity: string }>(`/api/limits/codex/${encodeURIComponent(identity)}/resets/use`, { method: "POST" }),
+  useCodexReset: (identity: string, redeemRequestId: string) =>
+    request<UseCodexResetResult>(`/api/limits/codex/${encodeURIComponent(identity)}/resets/use`, { method: "POST", body: { redeemRequestId } }),
 
   getPush: () => request<PushStatusResponse>("/api/push"),
   subscribePush: (subscription: PushSubscriptionJSON) =>

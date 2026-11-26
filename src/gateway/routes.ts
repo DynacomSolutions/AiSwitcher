@@ -525,6 +525,6 @@ async function readResetCredits(ctx: ServeContext): Promise<Response> {
       }
     }),
   );
-  if (names.length > 0 && known === 0) return providerError(ctx.style, 502, "reset credit figures are not available for this app", "reset_credits_unavailable");
+  if (known !== names.length) return providerError(ctx.style, 502, "reset credit figures are not available for every account in this app", "reset_credits_unavailable");
   return json({ available_count: total });
 }

@@ -289,6 +289,12 @@ export interface UseResetResult {
   cooldownUntil?: string;
 }
 
+export interface UseCodexResetResult {
+  identity: string;
+  result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed";
+  windowsReset: number;
+}
+
 export type LimitFetchStatus = "live" | "cached" | "unavailable" | "pending";
 
 /** The account behind an identity's login. Never holds a secret. */

@@ -94,6 +94,14 @@ const SYNTHETIC_LIMITS: LimitsResponse = {
     {
       toolName: "codex",
       provider: "openai",
+      identity: { name: "SYNTHETIC_FIXTURE-codex-host-source", ...SYNTHETIC_IDENTITY },
+      status: "live",
+      windows: [],
+      manualReset: { availableCount: 3 },
+    },
+    {
+      toolName: "codex",
+      provider: "openai",
       identity: { name: "SYNTHETIC_FIXTURE-codex-stale", ...SYNTHETIC_IDENTITY },
       status: "live",
       windows: [],
@@ -119,6 +127,7 @@ const SYNTHETIC_LIMITS: LimitsResponse = {
       provider: "openai",
       identity: { name: "SYNTHETIC_FIXTURE-codex-retired", ...SYNTHETIC_IDENTITY, retired: true },
       status: "live",
+      gatewayManaged: true,
       windows: [],
       manualReset: { availableCount: 2 },
     },
@@ -127,6 +136,7 @@ const SYNTHETIC_LIMITS: LimitsResponse = {
       provider: "openai",
       identity: { name: "SYNTHETIC_FIXTURE-codex-pool", ...SYNTHETIC_IDENTITY, swapPool: { accounts: ["member"] } },
       status: "live",
+      gatewayManaged: true,
       windows: [],
       manualReset: { availableCount: 2 },
     },
@@ -183,8 +193,9 @@ function limitsAndSpendStub(answers: Record<string, unknown>): void {
     if (u.origin === location.origin && u.pathname.startsWith("/api/limits/codex/") && u.pathname.endsWith("/resets/use")) {
       calls.push({ path: u.pathname, method: init?.method ?? "GET", body: typeof init?.body === "string" ? init.body : null });
       const status = (window as unknown as { __aisCodexResetStatus?: number }).__aisCodexResetStatus ?? 200;
+      const result = (window as unknown as { __aisCodexResetResult?: string }).__aisCodexResetResult ?? "nothing_to_reset";
       return Promise.resolve(status === 200
-        ? Response.json({ identity: "SYNTHETIC_FIXTURE-codex-credit" })
+        ? Response.json({ identity: "SYNTHETIC_FIXTURE-codex-credit", result, windowsReset: 0 })
         : Response.json({ error: "Codex refused reset (SYNTHETIC_FIXTURE)" }, { status }));
     }
     return real(input, init);
@@ -583,7 +594,10 @@ for (const vp of VIEWPORTS) {
           };
         })()`);
         expect(state).toEqual({ positive: true, zero: true, expiry: true });
-        expect(await page.eval<number>(`document.querySelectorAll('main button[aria-label^="Use reset on"]').length`)).toBe(2);
+        expect(await page.eval<string[]>(`[...document.querySelectorAll('main button[aria-label^="Use reset on"]')].map(b => b.getAttribute('aria-label')).sort()`)).toEqual([
+          "Use reset on SYNTHETIC_FIXTURE-codex-credit",
+          "Use reset on SYNTHETIC_FIXTURE-codex-other-credit",
+        ]);
         if (evidence) {
           await mkdir(evidence, { recursive: true });
           await writeFile(join(evidence, `${vp.width}-limits-codex-resets.png`), await page.screenshot());
@@ -596,7 +610,7 @@ for (const vp of VIEWPORTS) {
       }
     }, 40_000);
 
-    test("Codex reset confirmation cancels safely and sends one mocked request", async () => {
+    test("Codex reset confirmation cancels safely and reports one provider no-op request", async () => {
       await setViewport(vp.width, vp.height);
       const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
         source: `(${limitsAndSpendStub.toString()})(${JSON.stringify(LIMITS_ANSWERS)})`,
@@ -623,10 +637,13 @@ for (const vp of VIEWPORTS) {
         await page.eval(`document.querySelector(${JSON.stringify(resetButton)}).click()`);
         await waitFor("second Codex reset confirmation", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
         await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset').click(); [...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset')?.click()`);
-        await waitFor("mocked Codex reset success", 5_000, () => page.eval<boolean>(`!document.querySelector('[role=alertdialog]') && document.body.innerText.includes('Reset used')`));
-        expect(await page.eval<Array<{ path: string; method: string }>>(`window.__aisCodexResetCalls.map(({ path, method }) => ({ path, method }))`)).toEqual([
-          { path: "/api/limits/codex/SYNTHETIC_FIXTURE-codex-credit/resets/use", method: "POST" },
+        await waitFor("provider no-op feedback", 5_000, () => page.eval<boolean>(`!document.querySelector('[role=alertdialog]') && document.body.innerText.includes('No windows reset')`));
+        expect(await page.eval<Array<{ path: string; method: string; body: string | null }>>(`window.__aisCodexResetCalls.map(({ path, method, body }) => ({ path, method, body }))`)).toEqual([
+          { path: "/api/limits/codex/SYNTHETIC_FIXTURE-codex-credit/resets/use", method: "POST", body: expect.any(String) },
         ]);
+        const requestBody = await page.eval<{ redeemRequestId: string }>(`JSON.parse(window.__aisCodexResetCalls[0].body)`);
+        expect(requestBody.redeemRequestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+        expect(await page.eval<boolean>(`document.body.innerText.includes('Reset used')`)).toBe(false);
       } finally {
         await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
       }

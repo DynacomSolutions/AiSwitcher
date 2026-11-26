@@ -80,7 +80,7 @@ export interface AdminDeps {
   /** Spends one Claude reset grant of a managed identity with the store's member credential (POST /limits/claude/:identity/resets/:grant); absent when the gateway cannot. Throws an error with a numeric `status` and a short message to refuse. */
   spendReset?(identity: string, grantId: string): Promise<unknown>;
   /** Spends one Codex reset on the named member and invalidates shared reset and usage reads. */
-  spendCodexReset?(identity: string): Promise<unknown>;
+  spendCodexReset?(identity: string, redeemRequestId: string): Promise<unknown>;
 }
 
 /** One GET /limits row: a managed identity plus the usage source's reading of it (no reading yet: unavailable). */
@@ -354,10 +354,12 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const requested = decodeURIComponent(c.req.param("identity"));
     const identity = (await deps.canonical?.("codex", requested).catch(() => requested)) ?? requested;
     try {
-      return c.json(await deps.spendCodexReset(identity));
+      const body = await c.req.json().catch(() => undefined) as { redeemRequestId?: unknown } | undefined;
+      if (typeof body?.redeemRequestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.redeemRequestId)) return err(400, "a valid reset request ID is required");
+      return c.json(await deps.spendCodexReset(identity, body.redeemRequestId));
     } catch (e) {
       const status = (e as { status?: unknown }).status;
-      const known = status === 400 || status === 404 || status === 409 || status === 429 ? status : 502;
+      const known = status === 400 || status === 403 || status === 404 || status === 409 || status === 429 ? status : 502;
       return Response.json({ error: e instanceof Error ? e.message.slice(0, 300) : "reset failed" }, { status: known });
     }
   });
