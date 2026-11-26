@@ -512,7 +512,7 @@ ETA: 2026-12-12 18:00 ICT
 | 388 | Back up raw sessions across nodes and providers | in_progress | codex | sessions-every-provider | 20.296, 20.307 | 2026-11-26 23:00 ICT | Inventory source stores per node and take consistent SQLite copies in read-only mode.<br>Back up each node to its own restic repository in the HoardDB bucket.<br>Drill restore, restored row counts, ordering and SHA-256 checks for non-SQLite files.<br>Add per-provider snapshot, restore, storage and alert metrics. Forecast: 16:00 GMT. Do not enable backfill or shipper. |
 | 389 | Index and ship Grok sessions | todo | | | 20.312 | 2026-12-03 18:00 ICT | Add the Grok Build reader, identity mapping and backup-client coverage.<br>Prove restored row counts, ordering and checksums, then add Grok metrics and alerts. |
 | 390 | Index and ship Kimi sessions | todo | | | 20.312 | 2026-12-03 18:00 ICT | Add the Kimi CLI and Kimi Code readers, identity mapping and backup-client coverage.<br>Prove restored row counts, ordering and checksums, then add Kimi metrics and alerts. |
-| 391 | Choose backup scope for mixed OpenCode and Cursor stores | blocked_on_owner | Thomas | | | | Needed from Thomas: choose session-only SQLite copies versus complete encrypted database copies. This gate applies to mixed OpenCode and Cursor stores. |
+| 391 | Choose backup scope for mixed OpenCode and Cursor stores | done | | | | | Decision confirmed: use session-only SQLite copies.<br>Verify restored session rows and exclude login data. |
 
 ## 21. Gateway identities and agent pools
 ETA: 2026-12-03 18:00 ICT
