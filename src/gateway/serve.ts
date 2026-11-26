@@ -58,7 +58,7 @@ import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
 import { MemoryUsageReadings, PgUsageReadings, type UsageReadings } from "./usage-readings.ts";
-import { createUsageSource, fetchPoolUsage, withOpencodeUsage, type FetchUsage } from "./usage-source.ts";
+import { createCodexResetSource, createUsageSource, fetchCodexResetCredits, fetchPoolUsage, withOpencodeUsage, type FetchUsage } from "./usage-source.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
@@ -812,6 +812,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   // The usage source bounds every shared call itself.
   const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : sharedSql;
   const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
+  const resetCredits = createCodexResetSource({
+    fetchCredits: async (identity) => fetchCodexResetCredits(await creds.get("codex", identity)),
+  });
   const usage = createUsageSource({
     fetchUsage: hooks.fetchUsage ?? withOpencodeUsage(creds, fetchPoolUsage),
     shared: sharedReadings,
@@ -915,6 +918,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     identityState: hooks.identityState ?? defaultIdentityState,
     // The same cached usage reads the proxy selects on: the console Limits page shows them through GET /limits.
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
+    resetCreditsFor: resetCredits,
+
     poolMembers,
     canonical,
     // The member's stored credential spends the grant; never refreshed here (the keep-alive owns rotation).

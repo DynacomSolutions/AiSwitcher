@@ -23,8 +23,8 @@ const MAX_OVERLAP_HOURS = 24 * 30;
 const MAX_USAGE_DAYS = 90;
 
 const PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"];
-/** Providers whose subscription usage the usage source can read (GET /limits). The others have no account windows. */
-export const LIMITS_PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "zai"];
+/** Gateway providers checked by GET /limits. Empty unsupported readings are omitted so host data stays visible. */
+export const LIMITS_PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"];
 const STYLES: readonly ApiStyle[] = ["anthropic", "openai"];
 /** Paths the proxy port answers itself; an app of this name could never be reached. */
 const RESERVED_NAMES = new Set(["healthz", "readyz", "metrics", "browser"]);
@@ -69,6 +69,8 @@ export interface AdminDeps {
   sessions?: SessionsAdminDeps & { token: string };
   /** One identity's cached subscription usage (GET /limits); absent when the gateway has no usage source. */
   usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
+  /** Codex reset credits for one managed identity. Undefined means the provider read failed. */
+  resetCreditsFor?(identity: string): Promise<import("../cli/limits/types.ts").ManualResetInfo | undefined>;
   /** The member accounts of every swap pool of one provider (GET /limits). */
   poolMembers?(provider: GatewayProvider): Promise<string[]>;
   /** Resolves an alias to the identity's canonical name (GET /limits). */
@@ -311,7 +313,10 @@ export function createAdminApp(deps: AdminDeps): Hono {
       for (const identity of names) {
         if (identityFilter !== undefined && identity !== identityFilter) continue;
         const usage = await deps.usageFor(provider, identity).catch(() => undefined);
-        limits.push({ provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }) });
+        const manualReset = provider === "codex" ? await deps.resetCreditsFor?.(identity).catch(() => undefined) : undefined;
+        const hasWindows = (usage?.windows?.length ?? 0) > 0;
+        if (!hasWindows && !manualReset) continue;
+        limits.push({ provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }), ...(manualReset ? { manualReset } : {}) });
       }
     }
     return c.json({ limits });

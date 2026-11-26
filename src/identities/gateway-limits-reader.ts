@@ -39,7 +39,7 @@ export interface GatewayLimitsView {
 }
 
 /** The providers whose subscription windows the gateway usage source reads. */
-const LIMIT_TOOLS = new Set<string>(["claude", "codex", "kimi", "zai"]);
+const LIMIT_TOOLS = new Set<string>(["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"]);
 
 /**
  * The console label and category of a gateway window, identical to the host adapters' rows.
@@ -109,6 +109,31 @@ function parseManualReset(raw: unknown): ManualResetInfo | undefined {
     ...(Array.isArray(m.grants) ? { grants } : {}),
     ...(typeof m.cooldownUntil === "string" ? { cooldownUntil: m.cooldownUntil } : {}),
     ...(typeof m.grantsCapturedAt === "string" ? { grantsCapturedAt: m.grantsCapturedAt } : {}),
+    ...(Array.isArray(m.creditExpiries) ? { creditExpiries: m.creditExpiries.flatMap((v) => {
+      const c = v as Record<string, unknown> | null;
+      return c && typeof c.id === "string" && typeof c.endsAt === "string" && Number.isFinite(Date.parse(c.endsAt))
+        ? [{ id: c.id, ...(typeof c.label === "string" ? { label: c.label } : {}), endsAt: new Date(c.endsAt).toISOString() }]
+        : [];
+    }) } : {}),
+    ...(m.stale === true ? { stale: true } : {}),
+  };
+}
+
+/** Codex reset credits have a different wire shape from Claude grants. Keep only provider-reported fields. */
+function parseCodexReset(raw: unknown): ManualResetInfo | undefined {
+  const m = raw as Record<string, unknown> | null;
+  if (!m || typeof m !== "object" || typeof m.availableCount !== "number" || !Number.isFinite(m.availableCount) || m.availableCount < 0) return undefined;
+  const creditExpiries = Array.isArray(m.creditExpiries) ? m.creditExpiries.flatMap((v) => {
+    const c = v as Record<string, unknown> | null;
+    return c && typeof c.id === "string" && typeof c.endsAt === "string" && Number.isFinite(Date.parse(c.endsAt))
+      ? [{ id: c.id, ...(typeof c.label === "string" ? { label: c.label } : {}), endsAt: new Date(c.endsAt).toISOString() }]
+      : [];
+  }) : undefined;
+  return {
+    availableCount: Math.floor(m.availableCount),
+    ...(typeof m.label === "string" ? { label: m.label } : {}),
+    ...(typeof m.expiresAt === "string" ? { expiresAt: m.expiresAt } : {}),
+    ...(creditExpiries ? { creditExpiries } : {}),
     ...(m.stale === true ? { stale: true } : {}),
   };
 }
@@ -158,7 +183,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
   const capturedAt = typeof r.capturedAt === "string" ? r.capturedAt : undefined;
   const plan = rowPlanLabel(r);
   if (r.status === "unavailable" || windows.length === 0) {
-    const resetOnly = r.provider === "claude" ? parseManualReset(r.manualReset) : undefined;
+    const resetOnly = r.provider === "claude" ? parseManualReset(r.manualReset) : r.provider === "codex" ? parseCodexReset(r.manualReset) : undefined;
     return {
       ...base,
       windows: [],
@@ -170,7 +195,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
     };
   }
   const extraUsage = parseExtraUsage(r.extraUsage);
-  const manualReset = r.provider === "claude" ? parseManualReset(r.manualReset) : undefined;
+  const manualReset = r.provider === "claude" ? parseManualReset(r.manualReset) : r.provider === "codex" ? parseCodexReset(r.manualReset) : undefined;
   return {
     ...base,
     windows,
