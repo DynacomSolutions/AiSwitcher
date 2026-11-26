@@ -9,11 +9,15 @@ import type { Identity } from "../../src/identities/types.ts";
 // Temp registries and stores only; token values are short synthetic strings.
 const NAME = "acme";
 const saved: Record<string, string> = {};
+let savedOwner: string | undefined;
 let root = "";
 let claudeDir = "";
 let piDir = "";
 
 beforeEach(async () => {
+  // The registries below are now read at call time, so this temp claude login would count as gateway-managed: act as the gateway process.
+  savedOwner = process.env.AIS_GATEWAY_OWNER;
+  process.env.AIS_GATEWAY_OWNER = "1";
   root = await mkdtemp(join(tmpdir(), "ais-claude-read-error-"));
   claudeDir = join(root, "claude", NAME);
   piDir = join(root, "pi", NAME);
@@ -27,6 +31,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  if (savedOwner === undefined) delete process.env.AIS_GATEWAY_OWNER;
+  else process.env.AIS_GATEWAY_OWNER = savedOwner;
   (CLAUDE_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved.claude!;
   (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved.pi!;
   await rm(root, { recursive: true, force: true });

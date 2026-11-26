@@ -496,6 +496,8 @@ describe("refreshIdentityOAuthGrant: openai-codex", () => {
 });
 
 describe("refreshIdentityOAuthGrant: anthropic", () => {
+  beforeEach(() => ownerRole.on());
+  afterEach(() => ownerRole.off());
   test("exchanges at the platform token endpoint and preserves unknown credential keys", async () => {
     await json(CLAUDE_FILE(), {
       claudeAiOauth: {

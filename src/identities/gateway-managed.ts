@@ -30,12 +30,9 @@ export function isGatewayOwnerProcess(): boolean {
 export const GATEWAY_REFRESH_TOOLS = ["claude", "codex", "grok", "kimi"] as const;
 export type GatewayRefreshTool = (typeof GATEWAY_REFRESH_TOOLS)[number];
 
-const REGISTRY_OF: Record<GatewayRefreshTool, string> = {
-  claude: CLAUDE_CONFIG.identitiesJsonPath,
-  codex: CODEX_CONFIG.identitiesJsonPath,
-  grok: GROK_CONFIG.identitiesJsonPath,
-  kimi: KIMI_CONFIG.identitiesJsonPath,
-};
+/** Read at call time, never copied at import: a module that first loads while a config path is overridden would keep the override for good. */
+export const registryOf = (tool: GatewayRefreshTool): string =>
+  ({ claude: CLAUDE_CONFIG, codex: CODEX_CONFIG, grok: GROK_CONFIG, kimi: KIMI_CONFIG })[tool].identitiesJsonPath;
 
 /**
  * Tools whose login is a browser session the gateway renews itself (not an OAuth grant, so they are not in
@@ -74,7 +71,7 @@ export async function listGatewayManagedAccounts(registryPath?: string, tool: st
  */
 export async function listGatewayManagedAccountsStrict(registryPath?: string, tool: string = "claude"): Promise<Identity[]> {
   if (!isGatewayServedTool(tool)) return [];
-  const file = await loadIdentitiesFile(registryPath ?? REGISTRY_OF[tool]);
+  const file = await loadIdentitiesFile(registryPath ?? registryOf(tool));
   if (tool !== "claude") return file.identities.filter((i) => !isRetired(i) && !i.swapPool);
   // A retired member of a routed pool stays listed (the pool still names it); every other live identity is the gateway's.
   const names = new Set<string>();
@@ -100,7 +97,7 @@ export function createManagementCheck(opts: { ttlMs?: number; now?: () => number
     if (!hit || now() - hit.at >= ttl) {
       try {
         const path = opts.registryPath?.(tool);
-        const file = await loadIdentitiesFile(path ?? REGISTRY_OF[tool]);
+        const file = await loadIdentitiesFile(path ?? registryOf(tool));
         const managed = new Set((await listGatewayManagedAccountsStrict(path, tool)).map((i) => i.name));
         hit = { at: now(), managed, plain: new Set(file.identities.filter((i) => !i.swapPool).map((i) => i.name)) };
         cache.set(tool, hit);
@@ -121,7 +118,7 @@ export function createManagementCheck(opts: { ttlMs?: number; now?: () => number
 async function routedElsewhere(tool: string, identityName: string, registryPath?: string): Promise<boolean> {
   if (!isMemberStoreTool(tool)) return false;
   try {
-    const identity = (await loadIdentitiesFile(registryPath ?? REGISTRY_OF[tool])).identities.find((i) => i.name === identityName);
+    const identity = (await loadIdentitiesFile(registryPath ?? registryOf(tool))).identities.find((i) => i.name === identityName);
     return identity !== undefined && folderHoldsGatewayEntry(tool, identity);
   } catch {
     return false;

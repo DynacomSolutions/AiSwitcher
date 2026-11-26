@@ -29,6 +29,8 @@ const GROK_FILE = () => join(dirs.grok, "auth.json");
 const KIMI_FILE = () => join(dirs.kimi, "credentials", "kimi-code.json");
 const PI_AUTH = () => join(dirs.pi, "auth.json");
 
+let savedOwner: string | undefined;
+
 beforeEach(async () => {
   const root = await mkdtemp(join(tmpdir(), "ais-oauth-reconcile-"));
   tempDirs.push(root);
@@ -39,6 +41,9 @@ beforeEach(async () => {
     kimi: join(root, "kimi-identities", ACME),
     pi: join(root, "pi-identities", ACME),
   };
+  // The temp claude login counts as gateway-managed now that registries are read at call time: act as the gateway process.
+  savedOwner = process.env.AIS_GATEWAY_OWNER;
+  process.env.AIS_GATEWAY_OWNER = "1";
   for (const dir of Object.values(dirs)) await mkdir(dir, { recursive: true });
   for (const [tool, path] of [
     ["claude", CLAUDE_CONFIG],
@@ -57,6 +62,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  if (savedOwner === undefined) delete process.env.AIS_GATEWAY_OWNER;
+  else process.env.AIS_GATEWAY_OWNER = savedOwner;
   for (const [tool, path] of [
     ["claude", CLAUDE_CONFIG],
     ["codex", CODEX_CONFIG],
