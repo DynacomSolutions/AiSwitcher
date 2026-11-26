@@ -585,6 +585,8 @@ minted token with `deliveryError`.
 
 ### Gateway identities
 
+`PUT /api/gateway/pools/:tool/:pool/members/:member` adds an existing Claude or Codex identity by canonical name. It uses the console mutation guard and a version-checked registry write. Repeating it returns `changed: false` without a write. It neither creates a login nor changes the active account. A missing pool or member returns 404; retired, nested, Bedrock or disallowed members and concurrent edits return 409.
+
 `POST /api/gateway/identities/:tool` adds a login slot (an identity) for tool
 `claude` or `codex` through the gateway credential store. Body `{ name, label,
 description?, pool? }`. `name` is a slug (lowercase letters, digits, single
