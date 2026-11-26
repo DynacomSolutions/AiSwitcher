@@ -133,6 +133,8 @@ export interface RelayProcessOptions {
   limit?: LimitSnoozer | false;
   /** See RelayOptions.answerIdlePermissions. */
   answerIdlePermissions?: boolean;
+  /** See RelayOptions.questionForms. */
+  questionForms?: boolean;
   /** The in-turn limit watch interval. Default IN_TURN_WATCH_MS. Only used when the adapter has inTurnLimit. */
   inTurnWatchMs?: number;
   /** The agent's name in error messages. Default: the executable's file name. */
@@ -193,7 +195,7 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     flushHeld();
   };
   const limit = opts.limit === false ? undefined : (opts.limit ?? new LimitSnoozer({ log }));
-  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log, toAgent, ...(limit ? { limit } : {}), ...(opts.answerIdlePermissions === false ? { answerIdlePermissions: false } : {}) });
+  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log, toAgent, ...(limit ? { limit } : {}), ...(opts.answerIdlePermissions === false ? { answerIdlePermissions: false } : {}), ...(opts.questionForms ? { questionForms: true } : {}) });
 
   return new Promise<number>((resolve) => {
     let done = false;
@@ -230,18 +232,27 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     // Client to agent.
     stdin.on("data", (chunk: Buffer | string) => {
       const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      // Whole lines go to the agent, so the relay can change the answer to a question form. A partial line waits.
+      const out: string[] = [];
       for (const line of fromClient.push(bytes)) {
+        const text = line.toString("utf8");
+        let changed: string | undefined;
         try {
-          relay.fromClient(line.toString("utf8"));
+          changed = relay.fromClient(text);
         } catch {
           // Tracking a prompt must never stop it from being sent.
         }
+        out.push(changed ?? text);
       }
       scheduleWatch(); // a prompt may have opened
-      if (child.stdin.writable) child.stdin.write(bytes);
+      if (out.length > 0 && child.stdin.writable) child.stdin.write(out.map((l) => `${l}\n`).join(""));
       flushHeld();
     });
-    stdin.on("end", () => child.stdin.end());
+    stdin.on("end", () => {
+      const rest = fromClient.rest(); // a last line with no newline
+      if (rest.length > 0 && child.stdin.writable) child.stdin.write(rest);
+      child.stdin.end();
+    });
     child.stdin.on("error", () => {}); // the agent closed its stdin: nothing more to send
 
     // Agent to client, in order.
