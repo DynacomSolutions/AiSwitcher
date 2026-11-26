@@ -53,7 +53,8 @@ RUN case "${TARGETARCH}" in \
 FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get upgrade -y --no-install-recommends \
- && apt-get install -y --no-install-recommends util-linux ca-certificates \
+ && apt-get install -y --no-install-recommends util-linux ca-certificates libzstd1=1.5.7+dfsg-1+deb13u1 \
+ && test "$(dpkg-query -W -f='${Version}' libzstd1)" = "1.5.7+dfsg-1+deb13u1" \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=kubectl /usr/local/bin/kubectl /usr/local/bin/kubectl
 COPY --from=server /out/ais /usr/local/bin/ais
