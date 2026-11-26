@@ -477,3 +477,11 @@ ETA: 2026-11-26 18:00 ICT
 | 329 | Agent pools for Grok, OpenCode and Z.ai with the org identity | in_progress | claude | gateway-identities-cleanup | | 2026-11-26 14:00 ICT | Same pattern as the Claude and Codex pools. |
 | 330 | Give the Kimi pool its correct name, with every reference updated | in_progress | claude | gateway-identities-cleanup | | 2026-11-26 14:00 ICT | Pool now named like the Claude pool. |
 | 331 | T3 on the host and in pods reads every identity and pool live from the gateway | in_progress | claude | gateway-identities-cleanup | 21.329, 21.330 | 2026-11-26 18:00 ICT | No static or cached pool lists in code, T3 config or cluster values. |
+
+## 22. T3 question cards for ZCode threads
+ETA: 2026-11-26 17:00 ICT
+- ZCode questions must show their options as buttons in T3, and every answer must reach the agent.
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 343 | ZCode question cards keep their options | in_progress | claude | zcode-question-card | | 2026-11-26 17:00 ICT | Cause: ZCode sends an elicitation form that T3 shows as text fields only.<br>Fix: the ACP relay rewrites the form for T3 and maps the answer back. |

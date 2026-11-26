@@ -2,8 +2,9 @@
  * Runs an ACP agent behind the relay (relay.ts): this process takes the agent's place for the client, starts the real
  * agent and passes both directions line by line (ACP is newline-delimited JSON-RPC on stdin and stdout).
  *
- * - Client to agent: every byte is passed at once and unchanged. A complete line is shown to the relay just before its
- *   last bytes are passed, so the relay can note where the agent's records stand before the agent sees the prompt.
+ * - Client to agent: whole lines, in order. A complete line is shown to the relay before it is passed, so the relay can
+ *   note where the agent's records stand before the agent sees the prompt. A line the relay does not change keeps its
+ *   exact bytes (CRLF and invalid UTF-8 included); only the client's answer to a rewritten question form is replaced.
  * - Agent to client: one line at a time, in order. An unchanged line keeps its bytes. Each write is waited for, so
  *   nothing is still pending when this process ends (Bun drops pending stdout at `process.exit`).
  * - stderr is the agent's own: it goes on to this process's stderr unchanged, and a short tail is kept. Signals go to the
@@ -133,6 +134,8 @@ export interface RelayProcessOptions {
   limit?: LimitSnoozer | false;
   /** See RelayOptions.answerIdlePermissions. */
   answerIdlePermissions?: boolean;
+  /** See RelayOptions.questionForms. */
+  questionForms?: boolean;
   /** The in-turn limit watch interval. Default IN_TURN_WATCH_MS. Only used when the adapter has inTurnLimit. */
   inTurnWatchMs?: number;
   /** The agent's name in error messages. Default: the executable's file name. */
@@ -193,7 +196,7 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
     flushHeld();
   };
   const limit = opts.limit === false ? undefined : (opts.limit ?? new LimitSnoozer({ log }));
-  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log, toAgent, ...(limit ? { limit } : {}), ...(opts.answerIdlePermissions === false ? { answerIdlePermissions: false } : {}) });
+  const relay = new AcpRelay({ ...(opts.adapter ? { adapter: opts.adapter } : {}), log, toAgent, ...(limit ? { limit } : {}), ...(opts.answerIdlePermissions === false ? { answerIdlePermissions: false } : {}), ...(opts.questionForms ? { questionForms: true } : {}) });
 
   return new Promise<number>((resolve) => {
     let done = false;
@@ -223,25 +226,35 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
       done = true;
       if (graceTimer !== undefined) clearTimeout(graceTimer);
       stopWatch();
+      relay.clearForms();
       for (const [s, h] of handlers) process.off(s, h);
       resolve(code);
     };
 
+    const NEWLINE = Buffer.from("\n");
     // Client to agent.
     stdin.on("data", (chunk: Buffer | string) => {
       const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      // Whole lines go to the agent, so the relay can change the answer to a question form. A partial line waits.
+      const out: Buffer[] = [];
       for (const line of fromClient.push(bytes)) {
+        let changed: string | undefined;
         try {
-          relay.fromClient(line.toString("utf8"));
+          changed = relay.fromClient(line.toString("utf8"));
         } catch {
           // Tracking a prompt must never stop it from being sent.
         }
+        out.push(changed !== undefined ? Buffer.from(`${changed}\n`) : Buffer.concat([line, NEWLINE]));
       }
       scheduleWatch(); // a prompt may have opened
-      if (child.stdin.writable) child.stdin.write(bytes);
+      if (out.length > 0 && child.stdin.writable) child.stdin.write(Buffer.concat(out));
       flushHeld();
     });
-    stdin.on("end", () => child.stdin.end());
+    stdin.on("end", () => {
+      const rest = fromClient.rest(); // a last line with no newline
+      if (rest.length > 0 && child.stdin.writable) child.stdin.write(rest);
+      child.stdin.end();
+    });
     child.stdin.on("error", () => {}); // the agent closed its stdin: nothing more to send
 
     // Agent to client, in order.
@@ -254,7 +267,6 @@ export function runAcpRelay(opts: RelayProcessOptions): Promise<number> {
         if (clientGone || sealed) return done();
         stdout.write(bytes, () => done());
       });
-    const NEWLINE = Buffer.from("\n");
     const pass = (line: Buffer): void => {
       if (agentClosed) return; // the agent's end was taken: no agent line follows the error answer
       chain = chain.then(async () => {

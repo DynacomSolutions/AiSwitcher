@@ -30,6 +30,7 @@
  * Every other line passes unchanged, byte for byte. A line this code cannot read passes unchanged too.
  */
 import { redactText } from "../gateway/upstream-error.ts";
+import { fromButtonAnswer, toButtonForm, type FormMap } from "./question-form.ts";
 import { endpointFromServers, resetFromText, type LimitSnoozer, type McpEndpoint } from "./limit-snooze.ts";
 
 /** Why a turn failed, from the agent's own records. */
@@ -74,6 +75,11 @@ export interface RelayOptions {
    * agents where it was not measured, so their own wake turns and approval mode reach the client unchanged.
    */
   answerIdlePermissions?: boolean;
+  /**
+   * Whether an `elicitation/create` question form is rewritten into the shape T3 Code shows as option buttons, and the
+   * answer mapped back (question-form.ts). On for ZCode only.
+   */
+  questionForms?: boolean;
 }
 
 /** JSON-RPC "internal error": the code agents use for a failed provider call. */
@@ -173,6 +179,8 @@ export class AcpRelay {
   /** The latest `Resets at <ISO>Z` text seen in a session's message chunks (Grok shows its limit text there). */
   private readonly lastResetText = new Map<string, string>();
   private readonly newSessions = new Map<string, McpEndpoint>();
+  /** Question forms rewritten for the client, by request id, until the client answers. */
+  private readonly forms = new Map<string, FormMap>();
 
   constructor(private readonly opts: RelayOptions = {}) {}
 
@@ -186,10 +194,58 @@ export class AcpRelay {
   }
 
   /**
-   * A line the client sends to the agent, seen before the agent gets it. It is never changed; a `session/prompt`
-   * request is remembered, and the client's answer to a permission request is noted.
+   * A line the client sends to the agent, seen before the agent gets it. It is unchanged, except the client's answer to
+   * a rewritten question form, which is returned with the agent's own field names. A `session/prompt` request is
+   * remembered, and the client's answer to a permission request is noted.
    */
-  fromClient(line: string): void {
+  fromClient(line: string): string | undefined {
+    if (this.forms.size > 0) {
+      if (line.includes('"result"')) {
+        const answer = this.formAnswer(line);
+        if (answer !== undefined) return answer;
+      }
+      this.dropForm(line);
+    }
+    this.trackClient(line);
+    return undefined;
+  }
+
+  /** A client error answer or a cancel request ends a form: its map is no longer needed. */
+  private dropForm(line: string): void {
+    if (!line.includes('"error"') && !line.includes("cancel_request")) return;
+    let msg: Json | undefined;
+    try {
+      msg = obj(JSON.parse(line));
+    } catch {
+      return;
+    }
+    if (!msg) return;
+    const key = msg.method === "$/cancel_request" ? idKey(obj(msg.params)?.requestId) : msg.method === undefined && msg.error !== undefined ? idKey(msg.id) : undefined;
+    if (key !== undefined) this.forms.delete(key);
+  }
+
+  /** The session ended: no rewritten form can be answered any more. */
+  clearForms(): void {
+    this.forms.clear();
+  }
+
+  private formAnswer(line: string): string | undefined {
+    let msg: Json | undefined;
+    try {
+      msg = obj(JSON.parse(line));
+    } catch {
+      return undefined;
+    }
+    if (!msg || msg.method !== undefined) return undefined;
+    const key = idKey(msg.id);
+    const map = key !== undefined ? this.forms.get(key) : undefined;
+    const result = obj(msg.result);
+    if (key === undefined || !map || !result) return undefined;
+    this.forms.delete(key);
+    return JSON.stringify({ ...msg, result: fromButtonAnswer(result, map) });
+  }
+
+  private trackClient(line: string): void {
     if (this.asked.size > 0 && line.includes('"outcome"')) this.notePermissionAnswer(line);
     if (this.opts.limit && /"session\/(new|load|resume)"/.test(line)) this.noteSessionSetup(line);
     if (!line.includes('"session/prompt"')) return;
@@ -303,7 +359,7 @@ export class AcpRelay {
 
   /** A line the agent sent. Returns the lines the client gets: the same line, or the changed answer to a prompt. */
   async fromAgent(line: string): Promise<string[]> {
-    if (this.prompts.size === 0 && this.newSessions.size === 0 && !line.includes('session/')) return [line];
+    if (this.prompts.size === 0 && this.newSessions.size === 0 && !line.includes('session/') && !(this.opts.questionForms && line.includes('"elicitation/create"'))) return [line];
     let msg: Json | undefined;
     try {
       msg = obj(JSON.parse(line));
@@ -331,6 +387,14 @@ export class AcpRelay {
     }
     if (typeof msg.method === "string" && /(^|\/)session\/prompt_complete$|session_notification$|session\/update$/.test(msg.method) && this.opts.limit) this.xaiPromptComplete(msg);
     if (msg.method === "session/request_permission") return this.permissionRequest(msg, line);
+    if (msg.method === "elicitation/create" && this.opts.questionForms) {
+      const key = idKey(msg.id);
+      const form = key !== undefined ? toButtonForm(obj(msg.params) ?? {}) : undefined;
+      if (key === undefined || !form) return [line];
+      this.forms.set(key, form.map);
+      this.opts.log?.("acp-relay: a question form was rewritten so the client shows its options");
+      return [JSON.stringify({ ...msg, params: form.params })];
+    }
     if (msg.method !== undefined) return [line];
     const key = idKey(msg.id);
     const setup = key !== undefined ? this.newSessions.get(key) : undefined;

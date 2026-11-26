@@ -77,5 +77,5 @@ export async function runAcpRelayProcess(argv: string[], opts: AcpRelayOptions =
   const adapter = adapterFor(agentId, env);
   // The idle-permission answer was measured with kimi-code only; other agents keep their own wake turns and approval mode.
   // zcode: plain pass-through plus the error for a prompt left open when the agent ends (no adapter, no limit snooze).
-  return runAcpRelay({ command: install.executable, args: agentArgs, env, agentName: agentId, ...(adapter ? { adapter } : {}), ...(agentId === "kimi-code" ? {} : { answerIdlePermissions: false }), ...(agentId === ZCODE_AGENT_ID ? { limit: false as const } : {}) });
+  return runAcpRelay({ command: install.executable, args: agentArgs, env, agentName: agentId, ...(adapter ? { adapter } : {}), ...(agentId === "kimi-code" ? {} : { answerIdlePermissions: false }), ...(agentId === ZCODE_AGENT_ID ? { limit: false as const, questionForms: true } : {}) });
 }
