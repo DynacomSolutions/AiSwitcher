@@ -1,10 +1,11 @@
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createAlerter } from "../../src/gateway/alerts.ts";
 import { createGatewayApp, styleForPath } from "../../src/gateway/app.ts";
 import { instrumentRefresh, keepAliveOnce, trackedHeartbeatWrite, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
+import { MemoryResetCreditInvalidations } from "../../src/gateway/reset-credit-cache.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { OAuthRefreshError } from "../../src/identities/oauth-refresh.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
@@ -1621,6 +1622,35 @@ describe("single refresher: dead logins, seeded metrics and the renewal route", 
 });
 
 describe("Codex reset credits", () => {
+  test("cache invalidation failure preserves the provider outcome and releases the spend lock", async () => {
+    const invalidate = spyOn(MemoryResetCreditInvalidations.prototype, "invalidate").mockRejectedValue(new Error("synthetic cache failure"));
+    try {
+      let posts = 0;
+      const g = await boot({
+        canonical: async (_provider, identity) => identity,
+        fetchUsage: async () => undefined,
+        fetch: (async (_input, init) => {
+          if (init?.method !== "POST") return Response.json({ available_count: 1 });
+          posts++;
+          return posts === 1 ? Response.json({ code: "reset" }) : new Response(null, { status: 403 });
+        }) as typeof fetch,
+      });
+      const spend = () => fetch(`http://127.0.0.1:${g.adminPort}/limits/codex/codex-member/resets/use`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" },
+        body: JSON.stringify({ redeemRequestId: crypto.randomUUID() }),
+      });
+      const first = await spend();
+      expect(first.status).toBe(200);
+      expect(await first.json()).toEqual({ identity: "codex-member", result: "reset", windowsReset: 0 });
+      expect((await spend()).status).toBe(403);
+      expect(invalidate).toHaveBeenCalledTimes(2);
+      expect(posts).toBe(2);
+    } finally {
+      invalidate.mockRestore();
+    }
+  });
+
   test("uses the injected fetch and keeps a confirmed zero when usage has no windows", async () => {
     await seed();
     const resetRequests: string[] = [];

@@ -228,7 +228,10 @@ function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: 
       void qc.invalidateQueries({ queryKey: qk.limits });
       void qc.invalidateQueries({ queryKey: qk.poolsUsage });
       if (result.result === "reset") {
-        toast.success("Reset used", { description: `${result.windowsReset} limit windows reset on ${result.identity}.` });
+        const description = result.windowsReset > 0
+          ? `${result.windowsReset} limit ${result.windowsReset === 1 ? "window" : "windows"} reset on ${result.identity}.`
+          : `OpenAI confirmed the reset for ${result.identity}.`;
+        toast.success("Reset used", { description });
       } else if (result.result === "already_redeemed") {
         toast.info("Reset already redeemed", { description: `This request was already processed for ${result.identity}.` });
       } else if (result.result === "nothing_to_reset") {

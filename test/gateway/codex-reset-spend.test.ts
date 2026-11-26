@@ -37,18 +37,19 @@ describe("Codex reset spend", () => {
   });
 
   test.each([
+    ["reset", "reset"],
     ["nothing_to_reset", "nothing_to_reset"],
     ["no_credit", "no_credit"],
     ["already_redeemed", "already_redeemed"],
-  ] as const)("reports the provider outcome %s without treating it as a fresh spend", async (code, result) => {
+  ] as const)("reports the provider outcome %s when the provider omits the window count", async (code, result) => {
     const out = await consumeCodexResetForIdentity(IDENTITY, crypto.randomUUID(), {
       creds: { get: async () => ({ identity: IDENTITY, accessToken: "access-SYNTHETIC_FIXTURE_member" }) },
-      fetch: (async (_input: string | URL | Request, init?: RequestInit) => init?.method === "POST" ? Response.json({ code, windows_reset: 0 }) : Response.json({ available_count: 1 })) as typeof fetch,
+      fetch: (async (_input: string | URL | Request, init?: RequestInit) => init?.method === "POST" ? Response.json({ code }) : Response.json({ available_count: 1 })) as typeof fetch,
     } as never);
-    expect(out.result).toBe(result);
+    expect(out).toEqual({ identity: IDENTITY, result, windowsReset: 0 });
   });
 
-  test.each([undefined, {}, { code: "reset" }, { code: "reset", windows_reset: -1 }])("rejects malformed or empty consume response %j", async (body) => {
+  test.each([undefined, {}, { code: "reset", windows_reset: null }, { code: "reset", windows_reset: "1" }, { code: "reset", windows_reset: -1 }])("rejects malformed or empty consume response %j", async (body) => {
     await expect(consumeCodexResetForIdentity(IDENTITY, crypto.randomUUID(), {
       creds: { get: async () => ({ identity: IDENTITY, accessToken: "access-SYNTHETIC_FIXTURE_member" }) },
       fetch: (async (_input: string | URL | Request, init?: RequestInit) => init?.method === "POST" ? new Response(body === undefined ? "" : JSON.stringify(body)) : Response.json({ available_count: 1 })) as typeof fetch,
@@ -67,13 +68,14 @@ describe("Codex reset spend", () => {
     expect(posts).toBe(1);
   });
 
-  test("an upstream 403 stays a 403 and does not retry the consume", async () => {
+  test.each(["GET", "POST"])("preserves a provider 403 on %s", async (refusedMethod) => {
     let posts = 0;
     try {
       await consumeCodexResetForIdentity(IDENTITY, crypto.randomUUID(), {
         creds: { get: async () => ({ identity: IDENTITY, accessToken: "access-SYNTHETIC_FIXTURE_member" }) },
         fetch: (async (_input: string | URL | Request, init?: RequestInit) => {
-          if (init?.method === "POST") { posts++; return new Response("forbidden", { status: 403 }); }
+          if (init?.method === "POST") posts++;
+          if (init?.method === refusedMethod) return new Response("forbidden", { status: 403 });
           return Response.json({ available_count: 1 });
         }) as typeof fetch,
       } as never);
@@ -81,6 +83,6 @@ describe("Codex reset spend", () => {
     } catch (error) {
       expect((error as { status?: number }).status).toBe(403);
     }
-    expect(posts).toBe(1);
+    expect(posts).toBe(refusedMethod === "POST" ? 1 : 0);
   });
 });

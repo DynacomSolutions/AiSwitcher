@@ -68,7 +68,7 @@ import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
 import { useClaudeReset } from "../server/claude-resets.ts";
 import { consumeCodexResetForIdentity } from "./account.ts";
-import { PgResetCreditInvalidations } from "./reset-credit-cache.ts";
+import { MemoryResetCreditInvalidations, PgResetCreditInvalidations } from "./reset-credit-cache.ts";
 import { createManagementCheck, GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, listGatewayManagedAccountsStrict, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
@@ -816,7 +816,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   // The usage source bounds every shared call itself.
   const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : sharedSql;
   const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
-  const resetCreditInvalidations = new PgResetCreditInvalidations(sharedSql);
+  const resetCreditInvalidations = readingsSql ? new PgResetCreditInvalidations(readingsSql) : new MemoryResetCreditInvalidations();
   const resetCredits = createCodexResetSource({
     invalidations: resetCreditInvalidations,
     fetchCredits: async (identity) => fetchCodexResetCredits(
@@ -946,6 +946,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       } finally {
         try {
           await resetCredits.invalidate(identity);
+        } catch (err) {
+          console.warn(`gateway: Codex reset credit cache invalidation failed (${errorTag(err)})`);
         } finally {
           void usage.refreshNow("codex", identity).catch(() => undefined);
           await lock.release().catch(() => undefined);

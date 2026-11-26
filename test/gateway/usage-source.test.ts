@@ -121,6 +121,21 @@ describe("Codex reset source", () => {
     expect(calls).toBe(2);
   });
 
+  test("a failed read after a spend cannot restore a previous credit count", async () => {
+    const identity = "codex-SYNTHETIC_FIXTURE";
+    const invalidations = new MemoryResetCreditInvalidations();
+    let calls = 0;
+    const source = createCodexResetSource({ invalidations, ttlMs: 0, fetchCredits: async () => {
+      calls++;
+      if (calls === 1) return { availableCount: 1 };
+      if (calls === 2) await invalidations.invalidate(identity);
+      return undefined;
+    } });
+    expect(await source(identity)).toEqual({ availableCount: 1 });
+    expect(await source(identity)).toBeUndefined();
+    expect(calls).toBe(3);
+  });
+
   test("a failed initial generation check fetches live before it can cache a value", async () => {
     let checks = 0;
     let calls = 0;

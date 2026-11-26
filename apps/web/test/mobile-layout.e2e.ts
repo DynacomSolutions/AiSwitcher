@@ -746,6 +746,10 @@ describe("1280x900", () => {
         await mkdir(evidence, { recursive: true });
         await writeFile(join(evidence, "1280-codex-reset-limits-multi.png"), await page.screenshot());
       }
+      await page.eval(`window.__aisCodexResetResult = 'reset'; document.querySelector(${JSON.stringify(resetButton)}).click()`);
+      await waitFor("desktop confirmation", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
+      await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset').click()`);
+      await waitFor("confirmed reset without a window count", 5_000, () => page.eval<boolean>(`document.body.innerText.includes('OpenAI confirmed the reset for SYNTHETIC_FIXTURE-codex-credit.')`));
     } finally {
       await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
     }

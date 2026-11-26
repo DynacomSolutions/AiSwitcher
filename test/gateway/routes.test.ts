@@ -1253,7 +1253,7 @@ describe("account API of the other providers", () => {
   test("codex: a pinned consume goes to that identity", async () => {
     await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
     reply = (s) => s.method === "GET" ? Response.json({ available_count: 1 }) : Response.json({ code: "reset", windows_reset: 2 });
-    const redeemRequestId = crypto.randomUUID();
+    const redeemRequestId = "SYNTHETIC_FIXTURE-opaque-idempotency-key";
     const res = await call("c", "/wham/rate-limit-reset-credits/consume", { method: "POST", body: JSON.stringify({ redeem_request_id: redeemRequestId }) });
     expect(res.status).toBe(200);
     const posts = seen.filter((s) => s.method === "POST");

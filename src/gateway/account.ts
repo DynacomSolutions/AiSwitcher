@@ -95,7 +95,7 @@ export async function consumeCodexResetForIdentity(
   }
   if (!credits.ok) {
     await discard(credits);
-    throw Object.assign(new Error(`Codex reset credits answered HTTP ${credits.status}`), { status: 502 });
+    throw Object.assign(new Error(`Codex reset credits answered HTTP ${credits.status}`), { status: credits.status === 403 ? 403 : 502 });
   }
   const inventory = await credits.json().catch(() => undefined);
   if (availableCount(inventory) === undefined) throw Object.assign(new Error("Codex reset credits could not be verified"), { status: 502 });
@@ -118,15 +118,14 @@ export async function consumeCodexResetForIdentity(
     throw Object.assign(new Error(`Codex refused the reset (HTTP ${spent.status})`), { status: [400, 403, 404, 409, 429].includes(spent.status) ? spent.status : 502 });
   }
   const response = await spent.json().catch(() => undefined) as { code?: unknown; windows_reset?: unknown } | undefined;
-  const code = response?.code;
+  const { code, windows_reset: windowsReset = 0 } = response ?? {};
   if (code !== "reset" && code !== "nothing_to_reset" && code !== "no_credit" && code !== "already_redeemed") {
     throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
   }
-  const windowsReset = response?.windows_reset;
-  if (!Number.isSafeInteger(windowsReset) || (windowsReset as number) < 0) {
+  if (typeof windowsReset !== "number" || !Number.isSafeInteger(windowsReset) || windowsReset < 0) {
     throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
   }
-  return { identity, result: code, windowsReset: windowsReset as number };
+  return { identity, result: code, windowsReset };
 }
 
 async function discard(res: Response): Promise<void> {
@@ -305,12 +304,6 @@ export async function forwardAccount(r: AccountRequest): Promise<AccountResult> 
 
 async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
   const noMember = (): AccountResult => ({ res: providerError(r.style, 409, "no login is available for this app", "no_login"), cls });
-  if (r.op === "codex-consume" && r.method === "POST") {
-    const requestId = jsonField(r.body, "redeem_request_id");
-    if (!requestId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
-      return { res: providerError(r.style, 400, "a valid reset request ID is required", "invalid_request"), cls };
-    }
-  }
   let url = r.url;
   let owner: OwnerFinder | undefined;
 

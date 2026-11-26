@@ -95,9 +95,9 @@ export function createCodexResetSource(opts: {
             currentVersion = undefined;
           }
         }
+        if (!value && entry && entry.version === currentVersion) value = { ...entry.value, stale: true };
         if (value && currentVersion !== undefined) entries.set(identity, { value, at: now(), version: currentVersion });
-        else if (!value && entry && version !== undefined && entry.version === version) entries.set(identity, { value: { ...entry.value, stale: true }, at: now(), version: entry.version });
-        return value ?? (entry && version !== undefined && entry.version === version ? { ...entry.value, stale: true } : undefined);
+        return value;
       })().finally(() => {
         if (inflight.get(identity)?.promise === promise) inflight.delete(identity);
       });
