@@ -22,9 +22,9 @@ import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
 import { poolModels } from "./models-union.ts";
-import { errorTypeOfBody, firstEventOf, isModelCall, retryReasonForStatus, retryReasonForStreamError, type FirstEvent, type RetryInfo } from "./overload.ts";
+import { firstEventOf, isModelCall, type FirstEvent, type RetryInfo } from "./overload.ts";
 import { collapseSlashes, PIN_FORWARD, routeFor, serveRoute, sideDailyLimitFromEnv, type AccountOp, type ResetCreditsCache } from "./routes.ts";
-import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity, usageForModel, utilisationOf } from "./select.ts";
+import { DEFAULT_RESERVE_PERCENT, eligibleMembers, memberUsages, pickIdentity, reserveUtilisationOf, usageForModel, utilisationOf } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, UsageRow } from "./types.ts";
@@ -294,6 +294,15 @@ function isSubscriptionUsageError(type: string | undefined, code: string | undef
   if (type && /^(insufficient_quota|usage_limit_reached|quota_exceeded|billing_hard_limit_reached)$/i.test(type)) return true;
   if (code && /^(insufficient_quota|usage_limit_reached|quota_exceeded|billing_hard_limit_reached)$/i.test(code)) return true;
   return message !== undefined && /(?:you['’]ve hit your .{0,40}limit|usage limit (?:reached|exhausted)|subscription (?:usage )?limit (?:reached|exhausted))/i.test(message);
+}
+
+function subscriptionResetAt(bytes: Uint8Array): number | undefined {
+  try {
+    const top = JSON.parse(new TextDecoder().decode(bytes)) as { resets_at?: unknown; error?: { resets_at?: unknown }; response?: { error?: { resets_at?: unknown } } };
+    const value = top.error?.resets_at ?? top.response?.error?.resets_at ?? top.resets_at;
+    const reset = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+    return Number.isFinite(reset) && reset > 0 ? Math.floor(reset) : undefined;
+  } catch { return undefined; }
 }
 
 function isSubscriptionUsageBody(bytes: Uint8Array): boolean {
@@ -986,7 +995,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     fullPoolAnswers.add(out);
     // End now when every live member has a still-valid, provider-confirmed limit for this request scope.
     // A burst 429, credential hold, or overload never enters this proof set, so those requests still wait and fail over.
-    const members = app.target.kind === "pool" ? await deps.poolMembers(app.provider).catch(() => []) : [];
+    const members = app.target.kind === "pool" ? await eligibleMembers(app, deps).catch(() => []) : [];
     const nowMs = deps.now().getTime();
     const allProven = members.length > 0 && (await Promise.all(members.map(async (name) => {
       const account = provenQuota.get(exKey(name));
@@ -1081,6 +1090,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       }
     }
   }
+  if (app.target.kind === "pool" && "identity" in picked) {
+    // Recheck immediately before a send. Held replays must not bypass the configured reserve.
+    const current = usageForModel(await deps.usageFor(app.provider, picked.identity).catch(() => undefined), model);
+    const currentUtil = reserveUtilisationOf(current);
+    if (currentUtil !== undefined && currentUtil >= (app.reservePercent ?? DEFAULT_RESERVE_PERCENT)) picked = { reject: "no-headroom" };
+  }
   const pick = picked;
   if ("reject" in pick) {
     const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
@@ -1171,6 +1186,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       if (!quota) return { quota: false, res: p.res };
       const headers = new Headers(p.res.headers);
       headers.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
+      const reset = subscriptionResetAt(p.bytes);
+      if (reset !== undefined) {
+        headers.set(SUBSCRIPTION_RESET_HEADER, String(reset));
+        limitResets.push({ resetAtSec: reset, claim: "long" });
+      }
       return { quota: true, res: new Response(p.res.body, { status: p.res.status, statusText: p.res.statusText, headers }) };
     }
     if (res.status !== 403) return { quota: false, res };
@@ -1179,25 +1199,19 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (!quota) return { quota: false, res: p.res };
     const headers = new Headers(p.res.headers);
     headers.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
+    const reset = subscriptionResetAt(p.bytes);
+    if (reset !== undefined) {
+      headers.set(SUBSCRIPTION_RESET_HEADER, String(reset));
+      limitResets.push({ resetAtSec: reset, claim: "long" });
+    }
     return { quota: true, res: new Response(p.res.body, { status: p.res.status, statusText: p.res.statusText, headers }) };
   };
 
 
-  /**
-   * An overload or server error before any content: 529, 500, 502, 503, 504, or an event-stream answer whose first event
-   * is an overloaded or api error (Anthropic sends these inside a 200). Only a bounded prefix is read; a normal stream
-   * is decided on its first event line and flows on unchanged. The response returned carries every byte read.
-   */
+  /** A bounded stream prefix may confirm subscription exhaustion before the client sees any response event. */
   const retryable = async (res: Response): Promise<{ retry?: RetryInfo; res: Response }> => {
     if (side || !isModelCall(req.method, rest)) return { res };
     const requestId = upstreamRequestId(res.headers);
-    if (retryReasonForStatus(res.status) !== undefined) {
-      const p = await peek(res, ERROR_PEEK_BYTES);
-      const errorType = errorTypeOfBody(p.bytes);
-      const reason = retryReasonForStatus(res.status, errorType);
-      if (reason === undefined) return { res: p.res };
-      return { retry: { reason, http: res.status, ...(errorType ? { errorType } : {}), ...(requestId ? { requestId } : {}) }, res: p.res };
-    }
     if (res.status === 200 && (res.headers.get("content-type") ?? "").includes("text/event-stream")) {
       const p = await peekFirstEvent(res, ERROR_PEEK_BYTES);
       if (p.first.state !== "error") return { res: p.res };
@@ -1207,10 +1221,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         const id = requestId ?? p.first.requestId;
         return { retry: { reason: "server_error", quota: true, http: 200, errorType: p.first.errorType, ...(id ? { requestId: id } : {}) }, res: new Response(p.res.body, { status: 200, headers }) };
       }
-      const reason = retryReasonForStreamError(p.first.errorType);
-      if (reason === undefined) return { res: p.res };
-      const id = requestId ?? p.first.requestId;
-      return { retry: { reason, http: res.status, ...(p.first.errorType ? { errorType: p.first.errorType } : {}), ...(id ? { requestId: id } : {}) }, res: p.res };
+      return { res: p.res };
     }
     return { res };
   };
@@ -1266,7 +1277,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return again;
   };
   try {
-    const poolReplay = app.target.kind === "pool" && replayable;
+    const poolReplay = app.target.kind === "pool" && replayable && !side && isModelCall(req.method, rest);
     let first: Response | undefined;
     let credErr: unknown;
     try {
@@ -1469,6 +1480,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   releaseBody?.();
   const headers = new Headers(up.headers);
   headers.delete(SUBSCRIPTION_EXHAUSTED_HEADER);
+  headers.delete(SUBSCRIPTION_RESET_HEADER);
   // A provider's answer passes through unchanged: this header only says whose answer it is. A limit answer the gateway made itself has its own header.
   if (!headers.has(GATEWAY_ERROR_HEADER)) headers.set(GATEWAY_UPSTREAM_HEADER, app.provider);
   if (mediaRemoved > 0) headers.set(MEDIA_REMOVED_HEADER, String(mediaRemoved));
@@ -1594,6 +1606,7 @@ const defaultSleep = (ms: number, signal: AbortSignal): Promise<void> =>
 const BURST_HOLD_MAX_MS = 60_000;
 /** Internal marker set on a 429 whose body proved Codex subscription exhaustion; stripped before the client sees it. */
 const SUBSCRIPTION_EXHAUSTED_HEADER = "x-ais-subscription-exhausted";
+const SUBSCRIPTION_RESET_HEADER = "x-ais-subscription-reset-at";
 
 /** True when a 429 proves subscription exhaustion (unified status or a 5h/7d window `rejected`, or Codex `usage_limit_reached`), not a transient rate limit. */
 export function provesSubscriptionExhaustion(headers: Headers): boolean {
@@ -1664,6 +1677,8 @@ export function exhaustedUntil(headers: Headers, nowMs: number): number {
   const iso = Date.parse(headers.get("anthropic-ratelimit-unified-reset") ?? "");
   if (Number.isFinite(unified) && unified > 0) candidates.push(unified < 1e11 ? unified * 1000 : unified);
   else if (Number.isFinite(iso)) candidates.push(iso);
+  const bodyReset = Number(headers.get(SUBSCRIPTION_RESET_HEADER) ?? "");
+  if (Number.isFinite(bodyReset) && bodyReset > 0) candidates.push(bodyReset < 1e11 ? bodyReset * 1000 : bodyReset);
   const retry = headers.get("retry-after");
   if (retry !== null) {
     const secs = Number(retry);

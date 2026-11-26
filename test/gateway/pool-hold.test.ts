@@ -26,6 +26,7 @@ describe("a full pool holds a streamed request until a member has room", () => {
   let clock = T0.getTime();
   let readings: Record<string, PoolUsage | undefined>;
   let seen: string[];
+  let seenAt: number[];
   let sleeps: number[];
   let drain: AbortController;
   const events: string[] = [];
@@ -43,6 +44,7 @@ describe("a full pool holds a streamed request until a member has room", () => {
     usageCalls = 0;
     clock = T0.getTime();
     seen = [];
+    seenAt = [];
     sleeps = [];
     events.length = 0;
     drain = new AbortController();
@@ -50,6 +52,7 @@ describe("a full pool holds a streamed request until a member has room", () => {
       hostname: "127.0.0.1", port: 0,
       async fetch(req) {
         seen.push(req.headers.get("authorization") ?? "");
+        seenAt.push(clock);
         await req.arrayBuffer();
         if (upstream429) {
           return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "limit" } }), {
@@ -291,7 +294,7 @@ describe("a full pool holds a streamed request until a member has room", () => {
     expect(seen.length - before).toBeLessThan(10);
   });
 
-  test("a held replay ends with the native reset error as soon as every member confirms exhaustion", async () => {
+  test("a held replay never sends work to members below 100 percent but above the reserve", async () => {
     readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
     const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     const gw = createGatewayApp(deps);
@@ -306,9 +309,9 @@ describe("a full pool holds a streamed request until a member has room", () => {
     const text = await res.text();
     expect(text).toContain("event: error");
     expect(text).toContain("rate_limit_error");
-    expect(text).toContain("Resets at");
-    expect(events).toContain("failed");
-    expect(clock - T0.getTime()).toBeLessThan(120_000);
+    expect(seenAt.every((at) => at >= T0.getTime() + 3 * HOURS)).toBe(true);
+    expect(clock - T0.getTime()).toBeGreaterThanOrEqual(3 * HOURS);
+    expect(clock - T0.getTime()).toBeLessThan(6 * HOURS);
   });
 
   test("P3/S1: one 3 h hold then served writes one ledger row and no rejection metric", async () => {

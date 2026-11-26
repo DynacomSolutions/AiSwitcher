@@ -7,7 +7,7 @@ import { GatewayCredentialError, RefreshCooldownError } from "../../src/gateway/
 import { providerError } from "../../src/gateway/errors.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { noopMetrics } from "../../src/gateway/metrics.ts";
-import { pickIdentity } from "../../src/gateway/select.ts";
+import { eligibleMembers, pickIdentity } from "../../src/gateway/select.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { generateToken, hashSecret, parseToken } from "../../src/gateway/tokens.ts";
 import type { GatewayApp, UsageRow } from "../../src/gateway/types.ts";
@@ -410,6 +410,24 @@ describe("caps and selection", () => {
     usage.a = live(100);
     usage.b = live(100);
     expect(await pickIdentity(app, deps)).toEqual({ reject: "no-headroom" });
+  });
+
+  test("a held replay can probe 100 percent members but skips members below 100 and above reserve", async () => {
+    const app = baseApp({ name: "pool", target: { kind: "pool" }, reservePercent: 80 });
+    usage.a = live(95);
+    usage.b = live(100);
+    expect(await pickIdentity(app, deps, undefined, undefined, true)).toEqual({ identity: "b" });
+    usage.b = live(99);
+    expect(await pickIdentity(app, deps, undefined, undefined, true)).toEqual({ reject: "no-headroom" });
+  });
+
+  test("pool selection and capacity checks share logged-out eligibility", async () => {
+    const app = baseApp({ name: "pool", target: { kind: "pool" }, reservePercent: 80 });
+    const withDead = { ...deps, creds: { ...deps.creds, loggedOut: async (_provider: string, name: string) => name === "a" } } as GatewayDeps;
+    usage.a = live(10);
+    usage.b = live(20);
+    expect(await eligibleMembers(app, withDead)).toEqual(["b"]);
+    expect(await pickIdentity(app, withDead)).toEqual({ identity: "b" });
   });
 
   test("pool picks lowest utilisation below reserve", async () => {
@@ -1724,6 +1742,22 @@ describe("native limit answers", () => {
     expect(res.headers.get("x-codex-primary-reset-at")).toBe("1793622600");
   });
 
+  test("Codex uses the official per-member resets_at body to choose the earliest pool reset", async () => {
+    const token = await addApp(baseApp({ name: "codex-reset-pool", provider: "codex", style: "openai", target: { kind: "pool" }, reservePercent: 100 }));
+    usage.a = live(10);
+    usage.b = live(20);
+    handler = (_req, seenReq) => {
+      const member = [...seenReq.headers.values()].find((value) => value.includes("tok-"))?.replace(/^Bearer /, "");
+      const reset = member === "tok-a" ? 1_793_626_800 : 1_793_622_600;
+      return new Response(JSON.stringify({ error: { type: "usage_limit_reached", message: "usage limit reached", resets_at: reset, resets_in_seconds: 9000 } }), { status: 429, headers: { "content-type": "application/json" } });
+    };
+    const res = await call("/codex-reset-pool/v1/responses", token, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(seen.map((request) => [...request.headers.values()].find((value) => value.includes("tok-"))?.replace(/^Bearer /, ""))).toEqual(["tok-a", "tok-b"]);
+    expect(res.headers.get("x-codex-secondary-reset-at")).toBe("1793622600");
+    expect((await res.json() as { error: { resets_at: number } }).error.resets_at).toBe(1793622600);
+  });
+
   test("a provider without a native shape keeps the generic reason", async () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", target: { kind: "pool" }, reservePercent: 50 }));
     usage.a = live(90);
@@ -1934,7 +1968,7 @@ describe("pool usage signals before streamed content", () => {
   test("Anthropic and Codex Responses quota errors switch before emitting any member error", async () => {
     const cases = [
       ["claude", "anthropic", "/v1/messages", 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"weekly usage limit reached"}}\n\n'],
-      ["codex", "openai", "/v1/responses", 'event: error\ndata: {"type":"error","error":{"code":"usage_limit_reached","message":"usage limit reached"}}\n\n'],
+      ["codex", "openai", "/v1/responses", ': ping\n\nevent: response.created\ndata: {"type":"response.created"}\n\nevent: response.in_progress\ndata: {"type":"response.in_progress"}\n\nevent: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"usage_limit_reached","message":"usage limit reached"}}}\n\n'],
     ] as const;
     for (const [provider, style, path, quotaEvent] of cases) {
       const token = await addApp(baseApp({ name: `stream-${provider}`, provider, style, target: { kind: "pool" } }));

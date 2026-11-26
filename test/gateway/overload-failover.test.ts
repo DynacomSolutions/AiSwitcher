@@ -102,69 +102,68 @@ describe("pool failover on overload and server errors before content", () => {
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     });
 
-  test.each([529, 500, 502, 503, 504])("HTTP %i from one member goes to the next member, and the client gets that answer", async (status) => {
-    handler = (m) => (m === "a" ? (status === 529 ? overloaded(status, "req_a") : new Response(OVERLOAD_BODY("req_a").replace("overloaded_error", "api_error"), { status, headers: { "request-id": "req_a" } })) : new Response('{"type":"message"}', { headers: { "content-type": "application/json", "request-id": "req_b" } }));
+  test.each([529, 500, 502, 503, 504])("HTTP %i from a member reaches the harness intact without switching", async (status) => {
+    const body = status === 529 ? OVERLOAD_BODY("req_a") : OVERLOAD_BODY("req_a").replace("overloaded_error", "api_error");
+    handler = () => new Response(body, { status, headers: { "content-type": "application/json", "request-id": "req_a" } });
     const res = await post(createGatewayApp(deps));
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe('{"type":"message"}');
-    expect(res.headers.get("request-id")).toBe("req_b");
-    expect(who).toEqual(["a", "b"]);
-    expect(failovers).toEqual([{ app: "pool", reason: status === 529 ? "overloaded" : "server_error" }]);
-    const line = logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return {}; } }).find((l) => l.event === "failover");
-    expect(line).toMatchObject({ app: "pool", reason: status === 529 ? "overloaded" : "server_error", http: status, requestId: "req_a" });
+    expect(res.status).toBe(status);
+    expect(await res.text()).toBe(body);
+    expect(res.headers.get("request-id")).toBe("req_a");
+    expect(res.headers.get(GATEWAY_ERROR_HEADER)).toBeNull();
+    expect(res.headers.get("retry-after")).toBeNull();
+    expect(who).toEqual(["a"]);
+    expect(failovers).toEqual([]);
   });
 
-  test("a 200 stream whose first event is an overloaded error goes to the next member", async () => {
+  test("a 200 stream overload error reaches the harness without switching", async () => {
     handler = (m) => (m === "a" ? errorStream("req_a") : okStream());
     const res = await post(createGatewayApp(deps), { stream: true });
     expect(res.status).toBe(200);
     const text = await res.text();
-    expect(text).toContain("message_start");
-    expect(text).not.toContain("overloaded_error");
-    expect(who).toEqual(["a", "b"]);
-    expect(failovers).toEqual([{ app: "pool", reason: "overloaded" }]);
-    const line = logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return {}; } }).find((l) => l.event === "failover");
-    expect(line).toMatchObject({ reason: "overloaded", http: 200, errorType: "overloaded_error", requestId: "req_a" });
+    expect(text).toContain("overloaded_error");
+    expect(who).toEqual(["a"]);
+    expect(failovers).toEqual([]);
   });
 
-  test("a 200 stream whose first event is an api_error also fails over; other error types do not", async () => {
+  test("a 200 stream api_error and other provider errors reach the harness", async () => {
     handler = (m) => (m === "a" ? errorStream("req_a", "api_error") : okStream());
-    expect(await (await post(createGatewayApp(deps), { stream: true })).text()).toContain("message_start");
-    expect(who).toEqual(["a", "b"]);
+    expect(await (await post(createGatewayApp(deps), { stream: true })).text()).toContain("api_error");
+    expect(who).toEqual(["a"]);
     who.length = 0;
     handler = () => errorStream("req_x", "invalid_request_error");
     const res = await post(createGatewayApp(deps), { stream: true });
     expect(await res.text()).toContain("invalid_request_error");
     expect(who).toEqual(["a"]);
+    expect(failovers).toEqual([]);
   });
 
-  test("when every member overloads, the last upstream answer comes back unchanged with its request id", async () => {
+  test("an overload from the selected member comes back unchanged with its request id", async () => {
     handler = (m) => overloaded(529, `req_${m}`);
     const res = await post(createGatewayApp(deps));
     expect(res.status).toBe(529);
-    expect(await res.text()).toBe(OVERLOAD_BODY("req_b"));
-    expect(res.headers.get("request-id")).toBe("req_b");
+    expect(await res.text()).toBe(OVERLOAD_BODY("req_a"));
+    expect(res.headers.get("request-id")).toBe("req_a");
     expect(res.headers.get(GATEWAY_UPSTREAM_HEADER)).toBe("claude");
     expect(res.headers.get(GATEWAY_ERROR_HEADER)).toBeNull();
-    expect(who).toEqual(["a", "b"]); // each member once
+    expect(who).toEqual(["a"]);
   });
 
-  test("when every member answers a stream error first, the exact bytes of the last one are re-sent", async () => {
+  test("a stream error response is returned byte for byte from the selected member", async () => {
     handler = (m) => errorStream(`req_${m}`);
     const res = await post(createGatewayApp(deps), { stream: true });
     expect(res.status).toBe(200);
-    const expected = await errorStream("req_b").text();
+    const expected = await errorStream("req_a").text();
     expect(await res.text()).toBe(expected);
-    expect(res.headers.get("request-id")).toBe("req_b");
-    expect(who).toEqual(["a", "b"]);
+    expect(res.headers.get("request-id")).toBe("req_a");
+    expect(who).toEqual(["a"]);
   });
 
   test("an overload does not mark the member exhausted: the next request tries it first again", async () => {
     let calls = 0;
     handler = (m) => (m === "a" && calls++ === 0 ? overloaded(529, "req_a") : okStream());
     const gw = createGatewayApp(deps);
-    expect((await post(gw)).status).toBe(200);
-    expect(who).toEqual(["a", "b"]);
+    expect((await post(gw)).status).toBe(529);
+    expect(who).toEqual(["a"]);
     who.length = 0;
     expect((await post(gw)).status).toBe(200);
     expect(who).toEqual(["a"]);
@@ -229,7 +228,7 @@ describe("pool failover on overload and server errors before content", () => {
     expect(who).toEqual(["a"]);
   });
 
-  test("a held request fails over after one member overloads and serves the healthy member", async () => {
+  test("a held replay keeps reserve members out of real upstream requests", async () => {
     usage = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 3 * HOURS) };
     await store.putApp({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     deps.usageFor = async (_p, id) => {
@@ -241,14 +240,11 @@ describe("pool failover on overload and server errors before content", () => {
     let n = 0;
     handler = () => (n++ === 0 ? overloaded(529, "req_first") : okStream());
     const res = await post(createGatewayApp(deps), { stream: true });
-    expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).toContain("event: ping");
-    expect(text).toContain("message_start");
-    expect(text).not.toContain("event: error");
-    expect(who).toHaveLength(2);
-    expect(who[0]).not.toBe(who[1]!);
-    expect(failovers).toEqual([{ app: "pool", reason: "overloaded" }]);
+    expect(text).toContain("overloaded_error");
+    expect(who).toEqual(["a"]);
+    expect(failovers).toEqual([]);
   });
 
   const quota429 = (): Response => new Response("{}", { status: 429, headers: { "content-type": "application/json", "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(Math.floor((T0.getTime() + 3 * HOURS) / 1000)), "retry-after": "10800" } });
@@ -265,8 +261,8 @@ describe("pool failover on overload and server errors before content", () => {
         ? new Response(new ReadableStream<Uint8Array>({ async start(c) { c.enqueue(enc.encode(whole.slice(0, cut))); await Bun.sleep(20); c.enqueue(enc.encode(whole.slice(cut))); c.close(); } }), { headers: { "content-type": "text/event-stream" } })
         : okStream();
     const res = await post(createGatewayApp(deps), { stream: true });
-    expect(await res.text()).toContain("message_start");
-    expect(who).toEqual(["a", "b"]);
+    expect(await res.text()).toContain("overloaded_error");
+    expect(who).toEqual(["a"]);
   });
 
   test("peekFirstEvent puts every byte it read back in front of the rest", async () => {
@@ -282,29 +278,29 @@ describe("pool failover on overload and server errors before content", () => {
   test("a stream with CRLF line ends is read the same way", async () => {
     handler = (m) => (m === "a" ? new Response(`event: error\r\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}\r\n\r\n`, { headers: { "content-type": "text/event-stream" } }) : okStream());
     const res = await post(createGatewayApp(deps), { stream: true });
-    expect(await res.text()).toContain("message_start");
-    expect(who).toEqual(["a", "b"]);
+    expect(await res.text()).toContain("overloaded_error");
+    expect(who).toEqual(["a"]);
     expect(firstEventOf(enc.encode("event: message_start\r\ndata: {}\r\n\r\n")).state).toBe("pass");
   });
 
-  test("quota then overload returns the actual overload error", async () => {
+  test("quota may switch, then a provider overload returns intact without another switch", async () => {
     three();
     handler = (m) => (m === "a" ? quota429() : overloaded(529, "req_b"));
     const res = await post(createGatewayApp(deps), { stream: true });
     expect(res.status).toBe(529);
     expect(await res.text()).toContain("overloaded_error");
     expect(who).toEqual(["a", "b"]);
-    expect(failovers.map((f) => f.reason)).toEqual([]);
+    expect(failovers).toEqual([]);
   });
 
-  test("overload then quota then a healthy member: the third member answers", async () => {
+  test("a selected member overload ends the request before any quota member is tried", async () => {
     three();
     handler = (m) => (m === "a" ? overloaded(529, "req_a") : m === "b" ? quota429() : okStream());
     const res = await post(createGatewayApp(deps), { stream: true });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain("message_start");
-    expect(who).toEqual(["a", "b", "c"]);
-    expect(failovers.map((f) => f.reason)).toEqual(["overloaded", "quota"]);
+    expect(res.status).toBe(529);
+    expect(await res.text()).toContain("overloaded_error");
+    expect(who).toEqual(["a"]);
+    expect(failovers).toEqual([]);
   });
 
   test("a credential failure on the first member, an overload on the second, then a healthy third", async () => {
@@ -313,9 +309,9 @@ describe("pool failover on overload and server errors before content", () => {
     deps.creds = { ...deps.creds, get: async (p: GatewayApp["provider"], id: string) => { if (id === "a") throw new GatewayCredentialError("refresh-failed", p, id); return get(p, id); } } as GatewayDeps["creds"];
     handler = (m) => (m === "b" ? overloaded(529, "req_b") : okStream());
     const res = await post(createGatewayApp(deps), { stream: true });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain("message_start");
-    expect(who).toEqual(["b", "c"]);
+    expect(res.status).toBe(529);
+    expect(await res.text()).toContain("overloaded_error");
+    expect(who).toEqual(["b"]);
   });
 
   test("a body that breaks while it is read does not end the request: the next member answers", async () => {
@@ -349,7 +345,7 @@ describe("pool failover on overload and server errors before content", () => {
     expect(res.status).toBe(529);
     expect(await res.text()).toBe(OVERLOAD_BODY("req_a"));
     expect(res.headers.get("request-id")).toBe("req_a");
-    expect(who).toEqual(["a", "b"]);
+    expect(who).toEqual(["a"]);
   });
 
   test("a second member whose 403 body breaks in the quota check leaves the first member's overload answer standing", async () => {
@@ -367,7 +363,7 @@ describe("pool failover on overload and server errors before content", () => {
     expect(res.status).toBe(529);
     expect(await res.text()).toBe(OVERLOAD_BODY("req_a"));
     expect(res.headers.get("request-id")).toBe("req_a");
-    expect(who).toEqual(["a", "b"]);
+    expect(who).toEqual(["a"]);
   });
 
   test.each([
@@ -376,15 +372,15 @@ describe("pool failover on overload and server errors before content", () => {
     ["cx", "/cx/backend-api/codex/responses"],
     ["km", "/km/chat/completions"],
     ["zz", "/zz/chat/completions"],
-  ])("an OpenAI-style pool app %s at %s fails over on a 529 as clients really send it", async (_name, path) => {
+  ])("an OpenAI-style pool app %s at %s returns a 529 without switching", async (_name, path) => {
     handler = (m) => (m === "a" ? overloaded(529, "req_a") : new Response('{"ok":true}', { headers: { "content-type": "application/json" } }));
     const res = await createGatewayApp(deps).request(`http://gw.test${path}`, {
       method: "POST", body: JSON.stringify({ model: "m", stream: false }), headers: { authorization: `Bearer ${tokens[path.split("/")[1]!]}`, "content-type": "application/json" },
     });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe('{"ok":true}');
-    expect(who).toEqual(["a", "b"]);
-    expect(failovers).toEqual([{ app: path.split("/")[1]!, reason: "overloaded" }]);
+    expect(res.status).toBe(529);
+    expect(await res.text()).toBe(OVERLOAD_BODY("req_a"));
+    expect(who).toEqual(["a"]);
+    expect(failovers).toEqual([]);
   });
 
   test("isModelCall matches model-call routes only", () => {
@@ -403,15 +399,16 @@ describe("pool failover on overload and server errors before content", () => {
     const res = await post(createGatewayApp(deps), { stream: false });
     expect(who.filter((m) => m === "a")).toHaveLength(1);
     expect(who.filter((m) => m === "b").length).toBeLessThanOrEqual(2);
-    expect(res.status).toBe(429);
-    expect(await res.text()).toBe("{}");
+    expect(res.status).toBe(529);
+    expect(await res.text()).toBe(OVERLOAD_BODY("req_a"));
+    expect(who).toEqual(["a"]);
   });
 
-  test("the failover log line names the member left and the member tried", async () => {
+  test("provider errors do not write a failover log line", async () => {
     handler = (m) => (m === "a" ? overloaded(529, "req_a") : okStream());
     await (await post(createGatewayApp(deps))).text();
-    const line = logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return {}; } }).find((l) => l.event === "failover");
-    expect(line).toMatchObject({ from: "a", to: "b" });
+    const lines = logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return {}; } });
+    expect(lines.some((line) => line.event === "failover")).toBe(false);
   });
 
   test("a file upload or a message batch never fails over on an overload", async () => {
@@ -432,6 +429,7 @@ describe("pool failover on overload and server errors before content", () => {
     expect(firstEventOf(d("event: message_start\n")).state).toBe("pass");
     expect(firstEventOf(d("event: error\ndata: {\"type\":\"error\",\"er")).state).toBe("pending");
     expect(firstEventOf(d("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n"))).toMatchObject({ state: "error", errorType: "overloaded_error" });
+    expect(firstEventOf(d(": ping\n\nevent: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"usage_limit_reached\",\"message\":\"usage limit reached\"}}}\n\n"))).toMatchObject({ state: "error", errorCode: "usage_limit_reached", errorMessage: "usage limit reached" });
     expect(firstEventOf(d("{\"not\":\"sse\"}\n")).state).toBe("pass");
   });
 });
