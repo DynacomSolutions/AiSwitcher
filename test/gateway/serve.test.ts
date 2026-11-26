@@ -1620,6 +1620,35 @@ describe("single refresher: dead logins, seeded metrics and the renewal route", 
   });
 });
 
+describe("Codex reset credits", () => {
+  test("uses the injected fetch and keeps a confirmed zero when usage has no windows", async () => {
+    await seed();
+    const resetRequests: string[] = [];
+    const g = await boot({
+      usageFor: undefined,
+      identityState: async () => "ok",
+      poolMembers: async (provider) => provider === "codex" ? ["codex-member"] : [],
+      fetchUsage: async (provider) => provider === "codex" ? { status: "live", maxUtilization: 0, windows: [], capturedAt: new Date().toISOString() } : undefined,
+      fetch: (async (input, init) => {
+        const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+        if (url.pathname === "/backend-api/wham/rate-limit-reset-credits") {
+          resetRequests.push(url.pathname);
+          return Response.json({ available_count: 0 });
+        }
+        return fetch(`http://127.0.0.1:${upstream.port}${url.pathname}${url.search}`, init);
+      }) as typeof fetch,
+    });
+    const admin = (path: string, init: RequestInit = {}) => fetch(`http://127.0.0.1:${g.adminPort}${path}`, {
+      ...init,
+      headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json", ...init.headers },
+    });
+    expect((await admin("/apps/codex-app", { method: "PUT", body: JSON.stringify({ owner: "o", namespace: "ns", provider: "codex", style: "openai", target: { kind: "pin", identity: "codex-member" } }) })).status).toBe(201);
+    const { limits } = await (await admin("/limits?provider=codex")).json() as { limits: Array<Record<string, unknown>> };
+    expect(limits.find((row) => row.identity === "codex-member")).toMatchObject({ status: "live", maxUtilization: 0, manualReset: { availableCount: 0 } });
+    expect(resetRequests).toContain("/backend-api/wham/rate-limit-reset-credits");
+  });
+});
+
 describe("usage warm readiness", () => {
   const metricsText = async (g: { port: number }): Promise<string> => (await fetch(`${base(g)}/metrics`)).text();
   const readyText = async (g: { port: number }): Promise<{ status: number; text: string }> => {

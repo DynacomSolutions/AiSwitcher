@@ -813,7 +813,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : sharedSql;
   const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
   const resetCredits = createCodexResetSource({
-    fetchCredits: async (identity) => fetchCodexResetCredits(await creds.get("codex", identity)),
+    fetchCredits: async (identity) => fetchCodexResetCredits(
+      await creds.get("codex", identity),
+      hooks.fetch ? (input, init) => hooks.fetch!(input, init) : fetch,
+    ),
   });
   const usage = createUsageSource({
     fetchUsage: hooks.fetchUsage ?? withOpencodeUsage(creds, fetchPoolUsage),
@@ -1028,7 +1031,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       const key = `${provider}\u0000${c}`;
       if (prefilled.has(key)) return;
       prefilled.add(key);
-      await usage.prefill(provider, c).catch(() => undefined);
+      // A custom usageFor hook disables the source-backed warm set, so keep probe prefill for those hosts.
+      if (hooks.usageFor) await usage.prefill(provider, c).catch(() => undefined);
     };
     for (const app of await store.listApps()) {
       if (app.state !== "active") continue;

@@ -100,7 +100,7 @@ describe("admin GET /limits", () => {
     expect(res.status).toBe(200);
     const { limits } = (await res.json()) as { limits: Array<Record<string, unknown>> };
     expect(limits.map((r) => `${r.provider}/${r.identity}`)).toEqual([
-      "claude/m1", "claude/m2", "codex/c1",
+      "claude/m1", "claude/m2", "claude/solo", "codex/c1", "codex/c2", "kimi/k9", "opencode/opencode-member",
     ]);
     // Every read used the canonical name, once per identity.
     expect(asked.sort()).toEqual(["ali/ali-member", "claude/m1", "claude/m2", "claude/solo", "codex/c1", "codex/c2", "grok/grok-member", "kimi/k9", "opencode/opencode-member"]);
@@ -110,11 +110,10 @@ describe("admin GET /limits", () => {
     expect(m1.windows).toEqual(reading().windows);
     expect(m1.extraUsage).toEqual(reading().extraUsage);
     expect(limits[1]).toMatchObject({ identity: "m2", stale: true, status: "rate-limited" });
-    // A cold identity answers unavailable with no figure; the background refresh fills it in later.
-    // Cold identities without a reading do not replace host-side provider data.
-    expect(limits).not.toContainEqual(expect.objectContaining({ identity: "solo" }));
-    expect(limits).not.toContainEqual(expect.objectContaining({ identity: "c2" }));
-    expect(limits.every((row) => !["grok", "ali", "opencode"].includes(String(row.provider)))).toBe(true);
+    // An identity with no reading does not replace host-side provider data.
+    expect(limits.find((row) => row.identity === "solo")).toMatchObject({ status: "unavailable" });
+    expect(limits.find((row) => row.identity === "c2")).toMatchObject({ status: "unavailable", error: "not authenticated" });
+    expect(limits.every((row) => !["grok", "ali"].includes(String(row.provider)))).toBe(true);
   });
 
   test("Codex rows carry per-identity reset credits from the gateway reader", async () => {
@@ -128,6 +127,59 @@ describe("admin GET /limits", () => {
     expect(limits[1]?.manualReset).toEqual({ availableCount: 0 });
   });
 
+
+  test("all-provider limits retain reset-only and managed failure rows while leaving unsupported rows to the host", async () => {
+    const app = appWith({
+      usageFor: async (provider, identity) => {
+        if (provider === "claude" && identity === "m1") return reading({ windows: [], manualReset: { availableCount: 1, grants: [{ id: "cedar_ember_SYNTHETIC_FIXTURE_001", kind: "full", resetsLeft: 1, usableNow: true, paused: false }] } });
+        if (provider === "codex" && identity === "c1") return readings.get("codex/c1");
+        if (provider === "opencode") return { status: "unavailable", error: "quota service failed", capturedAt: STAMP };
+        return undefined;
+      },
+      resetCreditsFor: async () => undefined,
+    });
+    await put(app, "grok-app", { provider: "grok", style: "openai", target: { kind: "pin", identity: "grok-member" } });
+    await put(app, "ali-app", { provider: "ali", style: "anthropic", target: { kind: "pin", identity: "ali-member" } });
+    await put(app, "open-code", { provider: "opencode", style: "openai", target: { kind: "pin", identity: "oc1" } });
+    const { limits } = await (await call(app, "/limits")).json() as { limits: Array<Record<string, unknown>> };
+    expect(limits.find((row) => row.identity === "m1")?.manualReset).toMatchObject({ availableCount: 1 });
+    expect(limits.find((row) => row.identity === "c1")?.windows).toEqual(readings.get("codex/c1")?.windows);
+    expect(limits.find((row) => row.identity === "oc1")).toMatchObject({ status: "unavailable", error: "quota service failed" });
+    expect(limits.some((row) => row.identity === "grok-member" || row.identity === "ali-member")).toBe(false);
+  });
+
+  test("a failed Codex reset read does not delay the all-provider response or hide other figures", async () => {
+    const concurrent: string[] = [];
+    let active = 0;
+    let peak = 0;
+    const app = appWith({
+      resetCreditsFor: async (identity) => {
+        active++;
+        peak = Math.max(peak, active);
+        concurrent.push(identity);
+        await Bun.sleep(40);
+        active--;
+        throw new Error("reset service failed");
+      },
+    });
+    for (let i = 0; i < 20; i++) {
+      const identity = `codex-${i}`;
+      await put(app, `c-${i}`, { provider: "codex", style: "openai", target: { kind: "pin", identity } });
+      readings.set(`codex/${identity}`, { status: "live", maxUtilization: 0, windows: [], capturedAt: STAMP });
+    }
+    try {
+      const started = Date.now();
+      const { limits } = await (await call(app, "/limits")).json() as { limits: Array<Record<string, unknown>> };
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(peak).toBeGreaterThan(1);
+      expect(concurrent).toHaveLength(21);
+      expect(limits.find((row) => row.identity === "m1")).toMatchObject({ provider: "claude", status: "live" });
+      expect(limits.filter((row) => String(row.identity).startsWith("codex-") && row.maxUtilization === 0)).toHaveLength(20);
+    } finally {
+      for (let i = 0; i < 20; i++) readings.delete(`codex/codex-${i}`);
+    }
+  });
+
   test("an OpenCode no-plan answer does not replace the host reading with an empty row", async () => {
     const app = appWith({ usageFor: async () => ({ status: "unavailable", noPlan: true, capturedAt: STAMP }) });
     await put(app, "open-code", { provider: "opencode", style: "openai", target: { kind: "pin", identity: "oc1" } });
@@ -139,11 +191,11 @@ describe("admin GET /limits", () => {
     const app = appWith({});
     await put(app, "solo", { target: { kind: "pin", identity: "solo" } });
     const claude = (await (await call(app, "/limits?provider=claude")).json()) as { limits: Array<{ identity: string }> };
-    expect(claude.limits.map((r) => r.identity)).toEqual(["m1", "m2"]);
+    expect(claude.limits.map((r) => r.identity)).toEqual(["m1", "m2", "solo"]);
     const one = (await (await call(app, "/limits?provider=claude&identity=m2")).json()) as { limits: Array<{ identity: string }> };
     expect(one.limits.map((r) => r.identity)).toEqual(["m2"]);
     const cold = (await (await call(app, "/limits?provider=claude&identity=solo")).json()) as { limits: unknown[] };
-    expect(cold.limits).toEqual([]);
+    expect(cold.limits).toMatchObject([{ provider: "claude", identity: "solo", status: "unavailable" }]);
     const none = (await (await call(app, "/limits?identity=absent")).json()) as { limits: unknown[] };
     expect(none.limits).toEqual([]);
     // grok is a gateway provider but the usage source reads no grok windows.
@@ -160,8 +212,9 @@ describe("admin GET /limits", () => {
       },
     });
     const { limits } = (await (await call(app, "/limits?provider=claude")).json()) as { limits: Array<Record<string, unknown>> };
-    expect(limits).toHaveLength(1);
-    expect(limits[0]).toMatchObject({ identity: "m2", stale: true });
+    expect(limits).toHaveLength(2);
+    expect(limits.find((row) => row.identity === "m1")).toMatchObject({ status: "unavailable" });
+    expect(limits.find((row) => row.identity === "m2")).toMatchObject({ identity: "m2", stale: true });
   });
 });
 describe("admin reset grants", () => {

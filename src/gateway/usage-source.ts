@@ -76,7 +76,7 @@ export function createCodexResetSource(opts: {
 }
 
 /** The providers with a usage reader: `fetchPoolUsage` (claude, codex, kimi, zai) and the OpenCode Go read. Others (grok, ali) have no source. */
-const USAGE_READER_PROVIDERS: ReadonlySet<string> = new Set(["claude", "codex", "kimi", "zai", "opencode"]);
+export const USAGE_READER_PROVIDERS: ReadonlySet<GatewayProvider> = new Set(["claude", "codex", "kimi", "zai", "opencode"]);
 
 /** `fresh`: read the source now, past any short-lived shared cache (claude's one-minute last-good file). */
 export type FetchUsage = (provider: GatewayProvider, identity: string, opts?: { fresh?: boolean }) => Promise<PoolUsage | undefined>;
