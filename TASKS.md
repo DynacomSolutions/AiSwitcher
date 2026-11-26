@@ -436,7 +436,7 @@ ETA: 2026-11-25 18:00 ICT
 | 283 | Measure before and after p50 and p90 | done | claude | ci-speed | 19.280, 19.281 | | Before p50/p90: Linux 16.2/19.1, macOS 12.6/14.7, Windows build 8.0/9.5 min.<br>After, 2 warm runs: Linux 8.9/8.9, macOS 5.9/6.1, Windows build 4.5/4.6 min. |
 | 315 | Full test suite only per release | done | claude | ci-full-suite-release | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/749.<br>Pushes run only the tests their changes select.<br>test-shard moved to release.yml, with Postgres. |
 | 322 | Sync guard reads registry paths at call time | done | claude | fix-host-sync-owned-test | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/798.<br>Cause of the v0.5.115 release failures: a path frozen at import kept a test override. |
-| 324 | gateway-managed.ts: read registry paths at call time | in_progress | claude | | 19.322 | 2026-11-26 21:00 ICT | Same import-time copy (`REGISTRY_OF`) as 19.322.<br>No failure seen yet. |
+| 324 | gateway-managed.ts: read registry paths at call time | done | claude | | 19.322 | | Merged in #856 (`9ef5c55e`): `gateway-managed.ts` and `route-all.ts` read registry paths at call time.<br>New tests change the path after import.<br>4 old tests read the real registry before the fix. |
 | 341 | Make board-only pushes pass without node_modules, so `git-base land` works again | todo | | | | | The base pre-push hook runs privacy, identifier and secret scans, then `bun run typecheck` and `bun run lint`.<br>`git-base land` has no `node_modules`, so tsc is not found and the push fails (26 Nov 01:51 ICT, board-only change).<br>A task worktree needs `bun install --frozen-lockfile` first (about 3 minutes). |
 
 ## 20. Sessions in the AIS database
