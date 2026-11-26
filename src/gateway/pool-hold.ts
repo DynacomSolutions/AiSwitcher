@@ -13,6 +13,7 @@
  */
 
 import { summariseUpstreamError } from "./upstream-error.ts";
+import { claudeCompatibilityLimitMessage } from "./native-limit.ts";
 
 export interface PoolHoldLimits {
   /** Longest one request is held. Default 6 h. */
@@ -185,7 +186,7 @@ export interface HeldStreamInput {
   /** Sends the buffered request through the proxy again. */
   replay(signal: AbortSignal): Promise<Response>;
   /** The text of the limit answer that started the hold, for the final error event. */
-  limitMessage: string;
+  limitMessage: string | (() => string);
   onEvent?(event: "held" | "served" | "failed" | "timeout" | "drained" | "cancelled"): void;
 }
 
@@ -259,7 +260,8 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
               return end();
             }
             if (input.now().getTime() - startedMs >= input.limits.maxMs) {
-              send(sse("error", { type: "error", error: { type: "rate_limit_error", message: input.limitMessage } }));
+              const message = typeof input.limitMessage === "function" ? input.limitMessage() : input.limitMessage;
+              send(sse("error", { type: "error", error: { type: "rate_limit_error", message } }));
               finish("timeout");
               return end();
             }
@@ -299,12 +301,12 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
             }
             // An unconfirmed gateway capacity answer keeps the hold open. Confirmed limits and provider errors exit above.
             if (confirmedPoolAnswers.has(res)) {
-              send(sse("error", await errorEvent(res)));
+              send(sse("error", await errorEvent(res, input.now())));
               finish("failed");
               return end();
             }
             if (visiblePoolErrors.has(res)) {
-              send(sse("error", await errorEvent(res)));
+              send(sse("error", await errorEvent(res, input.now())));
               finish("failed");
               return end();
             }
@@ -342,7 +344,7 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
               releaseServedBytes();
               return end();
             }
-            send(sse("error", await errorEvent(res)));
+            send(sse("error", await errorEvent(res, input.now())));
             finish("failed");
             return end();
           }
@@ -373,11 +375,15 @@ function replayNote(h: Headers): Uint8Array | undefined {
 }
 
 /** The SSE error event for a replay answer that is not a stream: the provider's own error object when it has one. */
-async function errorEvent(res: Response): Promise<unknown> {
+async function errorEvent(res: Response, now: Date): Promise<unknown> {
   let message = `provider returned HTTP ${res.status}`;
   try {
     const summary = summariseUpstreamError(new TextEncoder().encode((await res.text()).slice(0, 64 * 1024)));
-    if (summary?.message) message = `${message}: ${summary.message}`;
+    if (summary?.message) {
+      const gatewayLimit = res.headers.get("x-ais-gateway-error") === "provider_limit" && res.status === 429;
+      message = gatewayLimit ? claudeCompatibilityLimitMessage(summary.message, now) : `${message}: ${summary.message}`;
+      return { type: "error", error: { type: summary.type ?? summary.code ?? "api_error", message, status: res.status } };
+    }
     return { type: "error", error: { type: summary?.type ?? summary?.code ?? "api_error", message, status: res.status } };
   } catch {
     // Keep the status when the provider sends no readable body.
