@@ -91,6 +91,7 @@ export async function pickIdentity(
   deps: Pick<GatewayDeps, "usageFor" | "poolMembers"> & Partial<Pick<GatewayDeps, "creds">>,
   exclude?: string | ReadonlySet<string>,
   model?: string,
+  allowFull = false,
 ): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" | "no-identities" }> {
   const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
   if (app.target.kind === "pin") {
@@ -120,6 +121,10 @@ export async function pickIdentity(
   // A window at 100% is full whatever the reserve says (reserve 100 must not let a full account through).
   const known = chooseBest(rows, { belowPercent: Math.min(reserve, 99.999), requireKnown: true });
   if (known) return { identity: known };
+  if (allowFull) {
+    const full = chooseBest(rows, { belowPercent: 100.001, requireKnown: true });
+    if (full) return { identity: full };
+  }
   const unknown = rows.find((r) => r.usage === undefined);
   return unknown ? { identity: unknown.name } : { reject: "no-headroom" };
 }

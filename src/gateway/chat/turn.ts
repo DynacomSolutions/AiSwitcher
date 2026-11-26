@@ -84,8 +84,9 @@ export function promptFailure(message: string, code: number, nowMs: number, data
     const text = shortField(message.replace(/^Internal error: /, ""));
     return { code: "limit", message: text === "" ? "Your usage limit is reached. Try again later." : text, kind: "rate_limit" };
   }
-  const reset = resetFromText(message, nowMs);
-  if (reset || isLimitFailure({ text: message, code: String(code) })) {
+  const limitFailure = isLimitFailure({ text: message, code: String(code) });
+  const reset = limitFailure ? resetFromText(message, nowMs) : undefined;
+  if (limitFailure) {
     return {
       code: "limit",
       message: reset ? `Your usage limit is reached. It resets at ${reset.toISOString()}.` : "Your usage limit is reached. Try again later.",

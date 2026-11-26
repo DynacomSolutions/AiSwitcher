@@ -31,7 +31,7 @@
  */
 import { redactText } from "../gateway/upstream-error.ts";
 import { fromButtonAnswer, toButtonForm, type FormMap } from "./question-form.ts";
-import { endpointFromServers, resetFromText, type LimitSnoozer, type McpEndpoint } from "./limit-snooze.ts";
+import { endpointFromServers, isLimitFailure, resetFromText, type LimitSnoozer, type McpEndpoint } from "./limit-snooze.ts";
 
 /** Why a turn failed, from the agent's own records. */
 export interface TurnFailure {
@@ -345,6 +345,7 @@ export class AcpRelay {
         continue;
       }
       if (!failure) continue;
+      if (!isLimitFailure({ text: failure.message, ...(failure.status !== undefined ? { status: failure.status } : {}), ...(failure.code !== undefined ? { code: failure.code } : {}) })) continue;
       const reset = resetFromText(failure.message, this.now());
       if (!reset) continue;
       const acted = limit.onInTurnLimit(p.sessionId, { text: failure.message, ...(failure.status !== undefined ? { status: failure.status } : {}), ...(failure.code !== undefined ? { code: failure.code } : {}) });

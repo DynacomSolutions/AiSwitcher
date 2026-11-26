@@ -229,13 +229,15 @@ describe("pool failover on overload and server errors before content", () => {
     expect(who).toEqual(["a"]);
   });
 
-  test("a held request whose replay meets an overload fails over to the other member", async () => {
-    usage = { a: weekly(100, T0.getTime() + 3 * HOURS), b: weekly(100, T0.getTime() + 3 * HOURS) };
+  test("a held request fails over after one member overloads and serves the healthy member", async () => {
+    usage = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 3 * HOURS) };
+    await store.putApp({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     deps.usageFor = async (_p, id) => {
       const r = usage[id];
       const reset = Date.parse(r?.windows?.[0]?.resetsAt ?? "");
       return r && reset <= clock ? weekly(10, clock + 7 * 24 * HOURS) : r;
     };
+    deps.sleep = async (ms) => { clock += ms; usage = { a: live(10), b: live(20) }; };
     let n = 0;
     handler = () => (n++ === 0 ? overloaded(529, "req_first") : okStream());
     const res = await post(createGatewayApp(deps), { stream: true });
@@ -285,14 +287,14 @@ describe("pool failover on overload and server errors before content", () => {
     expect(firstEventOf(enc.encode("event: message_start\r\ndata: {}\r\n\r\n")).state).toBe("pass");
   });
 
-  test("quota then overload then a healthy member: the third member answers", async () => {
+  test("quota then overload returns the actual overload error", async () => {
     three();
-    handler = (m) => (m === "a" ? quota429() : m === "b" ? overloaded(529, "req_b") : okStream());
+    handler = (m) => (m === "a" ? quota429() : overloaded(529, "req_b"));
     const res = await post(createGatewayApp(deps), { stream: true });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain("message_start");
-    expect(who).toEqual(["a", "b", "c"]);
-    expect(failovers.map((f) => f.reason)).toEqual(["quota", "overloaded"]);
+    expect(res.status).toBe(529);
+    expect(await res.text()).toContain("overloaded_error");
+    expect(who).toEqual(["a", "b"]);
+    expect(failovers.map((f) => f.reason)).toEqual([]);
   });
 
   test("overload then quota then a healthy member: the third member answers", async () => {
@@ -401,7 +403,8 @@ describe("pool failover on overload and server errors before content", () => {
     const res = await post(createGatewayApp(deps), { stream: false });
     expect(who.filter((m) => m === "a")).toHaveLength(1);
     expect(who.filter((m) => m === "b").length).toBeLessThanOrEqual(2);
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe("{}");
   });
 
   test("the failover log line names the member left and the member tried", async () => {

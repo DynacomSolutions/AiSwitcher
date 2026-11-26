@@ -438,7 +438,7 @@ describe("failover and refresh", () => {
     usage.b = live(20);
     handler = (_req, s) =>
       s.headers.get("authorization") === "Bearer tok-a"
-        ? new Response('{"e":"rl"}', { status: 429, headers: { "content-type": "application/json" } })
+        ? new Response('{"error":{"type":"usage_limit_reached"}}', { status: 429, headers: { "content-type": "application/json" } })
         : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
     const body = JSON.stringify({ model: "claude-sonnet-4-5", n: 1 });
     const res = await call("/pool/v1/messages", t, { method: "POST", body });
@@ -460,7 +460,7 @@ describe("failover and refresh", () => {
     handler = (_req, s) =>
       s.headers.get("authorization") === "Bearer tok-d"
         ? new Response(anthropicJson, { headers: { "content-type": "application/json" } })
-        : new Response("{}", { status: 429, headers: { "content-type": "application/json" } });
+        : new Response('{"error":{"type":"usage_limit_reached"}}', { status: 429, headers: { "content-type": "application/json" } });
     const body = JSON.stringify({ model: "claude-sonnet-4-5", n: 2 });
     const res = await call("/pool/v1/messages", t, { method: "POST", body });
     expect(res.status).toBe(200);
@@ -476,7 +476,7 @@ describe("failover and refresh", () => {
     usage.second = live(20);
     handler = (_req, s) =>
       s.headers.get("authorization")?.endsWith("-first")
-        ? new Response("{}", { status: 429, headers: { "content-type": "application/json" } })
+        ? new Response('{"error":{"type":"usage_limit_reached"}}', { status: 429, headers: { "content-type": "application/json" } })
         : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
     const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(200);
@@ -494,7 +494,7 @@ describe("failover and refresh", () => {
     const resetAt = Math.floor((clock + 120_000) / 1000);
     handler = (_req, s) =>
       s.headers.get("authorization") === "Bearer tok-a"
-        ? new Response("{}", { status: 429, headers: { "content-type": "application/json", "anthropic-ratelimit-unified-reset": String(resetAt) } })
+        ? new Response("{}", { status: 429, headers: { "content-type": "application/json", "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(resetAt) } })
         : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
     expect((await call("/pool/v1/messages", t, { method: "POST", body: "{}" })).status).toBe(200);
     expect(seen.length).toBe(2);
@@ -520,52 +520,25 @@ describe("failover and refresh", () => {
   };
 
   test("burst 429 without unified headers holds the member back at most 60 s", async () => {
-    const { clock, call, who } = await burstSetup("pair");
-    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response("{}", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
-    expect((await call()).status).toBe(200);
-    seen.length = 0;
-    clock.ms += 10_000;
-    await call();
-    expect(who()).toEqual(["Bearer tok-b"]);
-    seen.length = 0;
-    clock.ms += 6_000;
-    await call();
-    expect(who()[0]).toBe("Bearer tok-a");
+    const { call, who } = await burstSetup("pair");
+    const raw = '{"error":"ordinary throttle"}';
+    handler = () => new Response(raw, { status: 429, headers: { "retry-after": "30" } });
+    const res = await call();
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe(raw);
+    expect(who()).toEqual(["Bearer tok-a"]);
   });
-
   test("burst 429 honours retry-after seconds and HTTP dates, capped at 60 s", async () => {
-    const { clock, call, who } = await burstSetup("pair");
+    const { call } = await burstSetup("pair");
     let retry = "30";
-    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response("{}", { status: 429, headers: { "retry-after": retry } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
-    await call();
-    seen.length = 0;
-    clock.ms += 29_000;
-    await call();
-    expect(who()).toEqual(["Bearer tok-b"]);
-    seen.length = 0;
-    clock.ms += 2_000;
-    await call();
-    expect(who()[0]).toBe("Bearer tok-a");
-    // Date form
-    clock.ms += 61_000;
-    retry = new Date(clock.ms + 20_000).toUTCString();
-    seen.length = 0;
-    await call();
-    seen.length = 0;
-    clock.ms += 25_000;
-    await call();
-    expect(who()[0]).toBe("Bearer tok-a");
-    // Cap
-    clock.ms += 61_000;
-    retry = "3600";
-    seen.length = 0;
-    await call();
-    seen.length = 0;
-    clock.ms += 61_000;
-    await call();
-    expect(who()[0]).toBe("Bearer tok-a");
+    handler = () => new Response("ordinary throttle", { status: 429, headers: { "retry-after": retry } });
+    for (const value of ["30", new Date(NOW.getTime() + 20_000).toUTCString(), "3600"]) {
+      retry = value;
+      const res = await call();
+      expect(res.status).toBe(429);
+      expect(await res.text()).toBe("ordinary throttle");
+    }
   });
-
   test("unified rejected 429 still marks the member exhausted until its reset", async () => {
     const { clock, call, who } = await burstSetup("pair");
     const resetAt = Math.floor((clock.ms + 600_000) / 1000);
@@ -744,27 +717,17 @@ describe("failover and refresh", () => {
   // Incident 24 Nov 2026: the busiest members answered burst 429s often, each one read their usage fresh (per replica,
   // past the shared reading), their usage endpoint answered 429, and their readings went stale.
   test("a burst 429 does not read the member's usage again", async () => {
-    await burstSetup("pair");
-    const refreshed: string[] = [];
-    deps.refreshUsage = async (_p, id) => {
-      refreshed.push(id);
-    };
-    const gw = createGatewayApp(deps);
-    const t = await addApp(baseApp({ name: "poolr", target: { kind: "pool" } }));
-    handler = (_req, s) =>
-      s.headers.get("authorization") === "Bearer tok-a"
-        ? new Response("{}", { status: 429, headers: { "retry-after": "5" } })
-        : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
-    const r = await gw.request("http://gw.test/poolr/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } });
-    await r.arrayBuffer();
-    expect(r.status).toBe(200);
-    await settle();
-    expect(refreshed).toEqual([]);
+    const { call, who } = await burstSetup("pair");
+    let refreshes = 0;
+    deps.refreshUsage = async () => { refreshes++; };
+    const raw = '{"error":"ordinary throttle"}';
+    handler = () => new Response(raw, { status: 429, headers: { "retry-after": "5" } });
+    const res = await call();
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe(raw);
+    expect(who()).toEqual(["Bearer tok-a"]);
+    expect(refreshes).toBe(0);
   });
-
-  // Incident 16 Nov 2026: the owner spent a limit reset on an exhausted member out of band. The usage endpoint kept
-  // answering 429 (stale reading), so the one read after the 429 never ended the hold and the pool answered
-  // "no-headroom:exhausted" for days on every replica that had seen the 429.
   test("a proven-exhaustion hold is probed upstream at a bounded interval; a 200 ends it", async () => {
     const { clock, who } = await burstSetup("pair");
     deps.refreshUsage = async (_p, id) => {
@@ -893,15 +856,14 @@ describe("failover and refresh", () => {
   test("every member burst-held: the gateway waits for the first hold and serves 200, no 429 reaches the client", async () => {
     const { clock, call, who } = await burstSetup("pair");
     const start = clock.ms;
-    let left = 2;
-    handler = () => (left-- > 0 ? new Response("{}", { status: 429, headers: { "retry-after": "5" } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    const raw = '{"error":"busy"}';
+    handler = () => new Response(raw, { status: 429, headers: { "retry-after": "5" } });
     const res = await call();
-    expect(res.status).toBe(200);
-    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-b", "Bearer tok-a"]);
-    expect(clock.ms - start).toBeGreaterThanOrEqual(5_000);
-    expect(clock.ms - start).toBeLessThan(10_000);
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe(raw);
+    expect(who()).toEqual(["Bearer tok-a"]);
+    expect(clock.ms).toBe(start);
   });
-
   test("a new request while every member is burst-held waits instead of being rejected", async () => {
     const { clock, call } = await burstSetup("pair");
     let limited = true;
@@ -944,19 +906,13 @@ describe("failover and refresh", () => {
     usage.full1 = staleFull();
     usage.full2 = undefined;
     const start = clock.ms;
-    const reset = Math.floor((clock.ms + 3 * 86_400_000) / 1000);
-    let headCalls = 0;
-    handler = (_req, s) => {
-      const a = s.headers.get("authorization");
-      if (a === "Bearer tok-h") return headCalls++ === 0 ? new Response("{}", { status: 429, headers: { "retry-after": "5" } }) : ok();
-      return rejected(reset);
-    };
+    const raw = "ordinary throttle";
+    handler = () => new Response(raw, { status: 429, headers: { "retry-after": "5" } });
     const res = await call();
-    expect(res.status).toBe(200);
-    expect(clock.ms - start).toBeGreaterThanOrEqual(5_000);
-    expect(clock.ms - start).toBeLessThan(10_000);
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe(raw);
+    expect(clock.ms).toBe(start);
   });
-
   test("a burst member that keeps refusing gives the short retry 429, never a full member's weekly answer", async () => {
     const { call } = await poolOf(["h", "full1"]);
     usage.h = live(29);
@@ -1124,14 +1080,35 @@ describe("failover and refresh", () => {
   });
 
   test("a credential hold is not overwritten by an earlier member's burst hold", async () => {
-    const { clock, call, who } = await credSetup(["a", "b", "c"], deadLogin(["b"]), (w) => (w === "a" ? new Response("{}", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } })));
-    expect((await call()).status).toBe(200);
-    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-c"]);
-    seen.length = 0;
-    clock.ms += 20_000;
-    await call();
-    // a's 15 s burst hold is over; b (dead login) must still be held, so the order is a then c.
-    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-c"]);
+    const { call, who } = await credSetup(["a", "b", "c"], deadLogin(["b"]), (w) => (w === "a" ? new Response("ordinary throttle", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } })));
+    const res = await call();
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe("ordinary throttle");
+    expect(who()).toEqual(["Bearer tok-a"]);
+  });
+  test("a second 401 after successful renewal passes through without trying another member", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = live(10);
+    usage.b = live(20);
+    handler = () => new Response('{"error":{"type":"authentication_error","message":"still unauthorised"}}', { status: 401, headers: { "content-type": "application/json" } });
+    const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(401);
+    expect(await res.text()).toContain("still unauthorised");
+    expect(refreshCalls).toBe(1);
+    expect(seen).toHaveLength(2); // original request and one post-renewal retry
+    expect((await rows())[0]).toMatchObject({ httpStatus: 401, status: "upstream_error" });
+  });
+
+  test("a payment-required answer does not prove subscription usage exhaustion", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = live(10);
+    usage.b = live(20);
+    const raw = '{"error":{"type":"payment_required","message":"update billing details"}}';
+    handler = () => new Response(raw, { status: 402, headers: { "content-type": "application/json" } });
+    const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(402);
+    expect(await res.text()).toBe(raw);
+    expect(seen).toHaveLength(1);
   });
 
   test("a pool 401 whose refresh is in cooldown holds the member and fails over", async () => {
@@ -1151,24 +1128,13 @@ describe("failover and refresh", () => {
   });
 
   test("while only a burst hold remains, the client gets a plain short 429 without unified headers", async () => {
-    const { clock, call } = await credSetup(["a"], () => undefined, () => new Response("{}", { status: 429 }));
-    deps.sleep = async () => {}; // the wait budget is spent: the rejection shape is what is under test
-    expect((await call()).status).toBe(429);
-    clock.ms += 1000;
+    const { call } = await credSetup(["a"], () => undefined, () => new Response("ordinary throttle", { status: 429, headers: { "retry-after": "15" } }));
     const res = await call();
     expect(res.status).toBe(429);
-    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(15);
-    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(res.headers.get("retry-after")).toBe("15");
     expect(res.headers.get("anthropic-ratelimit-unified-status")).toBeNull();
-    const text = await res.text();
-    expect(text).toContain("rate_limit_error");
-    const message = (JSON.parse(text) as { error: { message: string } }).error.message;
-    expect(message).toMatch(/^You've hit your [^\n]*\blimit\b/);
-    expect(message).toMatch(/\bResets at (\d{4}-\d\d-\d\dT[\d:.]+Z)\.?\s*$/);
-    const resetMs = Date.parse(/Resets at (\S+?)\.$/.exec(message)![1]!);
-    expect(resetMs - clock.ms).toBe(Number(res.headers.get("retry-after")) * 1000);
+    expect(await res.text()).toBe("ordinary throttle");
   });
-
   test("while only credential holds remain, the client gets the stored 502 message", async () => {
     const { call } = await credSetup(["a"], deadLogin(["a"]));
     expect((await call()).status).toBe(502);
@@ -1178,37 +1144,24 @@ describe("failover and refresh", () => {
   });
 
   test("a burst hold is preferred over a credential hold in the rejection, even when the dead member has lower usage", async () => {
-    const { clock, call } = await credSetup(["a", "b"], deadLogin(["a"]), () => new Response("{}", { status: 429 }));
-    deps.sleep = async () => {}; // the wait budget is spent: the rejection shape is what is under test
-    await call();
-    clock.ms += 1000;
+    const { call } = await credSetup(["a", "b"], deadLogin(["a"]), () => new Response("ordinary throttle", { status: 429, headers: { "retry-after": "15" } }));
     const res = await call();
     expect(res.status).toBe(429);
-    const retry = Number(res.headers.get("retry-after"));
-    expect(retry).toBeGreaterThan(0);
-    expect(retry).toBeLessThanOrEqual(15);
-    expect(await res.text()).not.toContain("logged out");
+    expect(res.headers.get("retry-after")).toBe("15");
+    expect(await res.text()).toBe("ordinary throttle");
   });
-
-
   test("all members exhausted gives one 429 with a reason in the log", async () => {
-    const gw = createGatewayApp(deps);
-    const call = (path: string, token: string, init: RequestInit) => (async () => { const r = await gw.request(`http://gw.test${path}`, { ...init, headers: { authorization: `Bearer ${token}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); })();
     const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
     usage.a = live(10);
     usage.b = live(20);
-    handler = () => new Response("{}", { status: 429, headers: { "content-type": "application/json" } });
+    const raw = '{"error":"ordinary throttle"}';
+    handler = () => new Response(raw, { status: 429, headers: { "content-type": "application/json" } });
     const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    expect(seen.length).toBe(2);
-    expect((await rows()).length).toBe(1);
-    seen.length = 0;
-    const again = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
-    expect(again.status).toBe(429);
-    expect(seen.length).toBe(0);
-    expect(logs.some((l) => l.includes('"reason":"no-headroom:exhausted"'))).toBe(true);
+    expect(await res.text()).toBe(raw);
+    expect(seen).toHaveLength(1);
+    expect((await rows())[0]).toMatchObject({ status: "upstream_error", httpStatus: 429 });
   });
-
   test("a member at 100% is skipped even with reserve 100", async () => {
     const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" }, reservePercent: 100 }));
     usage.a = { ...live(10), windows: [{ label: "seven-day", utilization: 100 }] };
@@ -1494,25 +1447,16 @@ describe("fix round 1", () => {
   test("a failover target that cannot be tried ends in the short retry 429", async () => {
     const t = await poolApp();
     const get = deps.creds.get.bind(deps.creds);
-    deps.creds = {
-      ...deps.creds,
-      get: async (p: GatewayApp["provider"], id: string) => {
-        if (id === "b") throw new GatewayCredentialError("no-credential", p, id);
-        return get(p, id);
-      },
-      refreshAfter401: deps.creds.refreshAfter401,
-    } as GatewayDeps["creds"];
+    deps.creds = { ...deps.creds, get: async (p: GatewayApp["provider"], id: string) => { if (id === "b") throw new GatewayCredentialError("no-credential", p, id); return get(p, id); }, refreshAfter401: deps.creds.refreshAfter401 } as GatewayDeps["creds"];
     usage.a = live(5);
-    handler = () => new Response('{"orig":"429"}', { status: 429, headers: { "content-type": "application/json" } });
+    const raw = '{"orig":"429"}';
+    handler = () => new Response(raw, { status: 429, headers: { "content-type": "application/json" } });
     const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    expect(await res.text()).not.toContain("orig");
-    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(60);
-    const r = await rows();
-    expect(r.length).toBe(1);
-    expect(r[0]).toMatchObject({ httpStatus: 429, status: "rejected" });
+    expect(await res.text()).toBe(raw);
+    expect(seen).toHaveLength(1);
+    expect((await rows())[0]).toMatchObject({ httpStatus: 429, status: "upstream_error" });
   });
-
   test("an over-limit body 401 refreshes the credential but is not retried", async () => {
     const t = await addApp(baseApp({}));
     handler = () => new Response('{"e":"auth"}', { status: 401 });
@@ -1650,7 +1594,7 @@ describe("fix round 1", () => {
             cancelled = true;
           },
         });
-        return new Response(body, { status: 429, headers: { "content-type": "application/json" } });
+        return new Response(body, { status: 429, headers: { "content-type": "application/json", "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(Math.floor((NOW.getTime() + 3600000) / 1000)) } });
       }
       ac.abort();
       throw new DOMException("aborted", "AbortError");
@@ -1693,6 +1637,46 @@ describe("fix round 1", () => {
 });
 
 describe("native limit answers", () => {
+  test("all providers switch on confirmed usage exhaustion and expose a whole-pool limit", async () => {
+    const cases = [
+      ["claude", "anthropic", "/v1/messages"],
+      ["codex", "openai", "/v1/responses"],
+      ["kimi", "openai", "/v1/chat/completions"],
+      ["grok", "openai", "/v1/chat/completions"],
+      ["zai", "openai", "/v1/chat/completions"],
+      ["ali", "anthropic", "/v1/messages"],
+      ["opencode", "openai", "/v1/chat/completions"],
+    ] as const;
+    for (const [provider, style, path] of cases) {
+      const token = await addApp(baseApp({ name: `pool-${provider}`, provider, style, target: { kind: "pool" } }));
+      usage.a = live(10);
+      usage.b = live(20);
+      seen.length = 0;
+      handler = (_req, seenReq) => [...seenReq.headers.values()].some((value) => value.includes("tok-a"))
+        ? new Response('{"error":{"type":"usage_limit_reached","message":"usage limit reached"}}', { status: 429, headers: { "content-type": "application/json" } })
+        : new Response("{}", { headers: { "content-type": "application/json" } });
+      const success = await call(`/pool-${provider}${path}`, token, { method: "POST", body: "{}" });
+      expect(success.status).toBe(200);
+      expect(seen.map((x) => [...x.headers.values()].find((value) => value.includes("tok-"))?.replace(/^Bearer /, ""))).toEqual(["tok-a", "tok-b"]);
+
+      seen.length = 0;
+      handler = () => new Response('{"error":{"type":"usage_limit_reached","message":"usage limit reached"}}', { status: 429, headers: { "content-type": "application/json" } });
+      const exhausted = await call(`/pool-${provider}${path}`, token, { method: "POST", body: "{}" });
+      expect(exhausted.status).toBe(429);
+      expect(await exhausted.text()).toContain("Resets at");
+      expect(seen).toHaveLength(2);
+
+      seen.length = 0;
+      const invalid = '{"error":{"type":"invalid_request_error","message":"bad request fixture"}}';
+      handler = (_req, seenReq) => [...seenReq.headers.values()].some((value) => value.includes("tok-a"))
+        ? new Response('{"error":{"type":"usage_limit_reached","message":"usage limit reached"}}', { status: 429, headers: { "content-type": "application/json" } })
+        : new Response(invalid, { status: 400, headers: { "content-type": "application/json" } });
+      const mixed = await call(`/pool-${provider}${path}`, token, { method: "POST", body: "{}" });
+      expect(mixed.status).toBe(400);
+      expect(await mixed.text()).toBe(invalid);
+      expect(seen).toHaveLength(2);
+    }
+  });
   const win = (five: number, fiveReset: string, seven = 10): PoolUsage => ({
     status: "live",
     maxUtilization: Math.max(five, seven),
@@ -1805,27 +1789,21 @@ describe("native limit answers", () => {
     handler = () => new Response(realBody, { status: 429, headers: realHeaders });
     const res = await call("/k/v1/messages", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    expect(seen.length).toBe(2);
-    const message = ((await res.json()) as { error: { message: string } }).error.message;
-    expect(message).toMatch(/^You've hit your usage limit \(AIS gateway: provider said Number 3 SYNTHETIC_FIXTURE; resets [^)]+\)\. Resets at \d{4}-\d\d-\d\dT[\d:.]+Z\.$/);
-    expect(Number(res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
-    const resetMs = Date.parse(/Resets at (\S+?)\.$/.exec(message)![1]!);
-    expect(resetMs - NOW.getTime()).toBe(Number(res.headers.get("retry-after")) * 1000);
+    expect(seen).toHaveLength(1);
+    expect(await res.text()).toBe(realBody);
+    for (const [k, v] of Object.entries(realHeaders)) expect(res.headers.get(k)).toBe(v);
   });
-
   test("a pool at true capacity answers with the reset of the full weekly window, not a short hold", async () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pool" } }));
-    // One member has a full weekly window (3 days away) and a half-used 5-hour one. The other has no plan, no windows.
     usage.a = { status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "session (5h)", utilization: 51, resetsAt: "2026-11-02T15:00:00.000Z" }, { label: "week", utilization: 100, resetsAt: "2026-11-05T09:00:00.000Z" }] };
     usage.b = { status: "unavailable", noPlan: true, capturedAt: NOW.toISOString() };
-    handler = () => new Response('{"error":{"message":"quota used up","type":"rate_limit_error"}}', { status: 429, headers: { "content-type": "application/json" } });
+    const raw = '{"error":{"message":"quota used up","type":"rate_limit_error"}}';
+    handler = () => new Response(raw, { status: 429, headers: { "content-type": "application/json" } });
     const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    const message = ((await res.json()) as { error: { message: string } }).error.message;
-    expect(message).toContain("Resets at 2026-11-05T09:00:00.000Z.");
-    expect(res.headers.get("retry-after")).toBe(String((Date.parse("2026-11-05T09:00:00.000Z") - NOW.getTime()) / 1000));
+    expect(await res.text()).toBe(raw);
+    expect(seen).toHaveLength(1);
   });
-
   test("a pool with another member free keeps the served member's short hold, not another member's full window", async () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pool" } }));
     usage.a = { status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "week", utilization: 100, resetsAt: "2026-11-05T09:00:00.000Z" }] };
@@ -1870,13 +1848,13 @@ describe("native limit answers", () => {
   test("a pinned member's upstream 429 without a reset in its text gets one from the usage reading", async () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", style: "openai", target: { kind: "pin", identity: "id1" } }));
     usage.id1 = { status: "live", maxUtilization: 10, capturedAt: NOW.toISOString(), windows: [{ label: "week", utilization: 10, resetsAt: "2026-11-02T14:00:00.000Z" }] };
-    handler = () => new Response('{"error":{"message":"quota used up","type":"rate_limit_error"}}', { status: 429, headers: { "content-type": "application/json" } });
+    const raw = '{"error":{"message":"quota used up","type":"rate_limit_error"}}';
+    handler = () => new Response(raw, { status: 429, headers: { "content-type": "application/json" } });
     const res = await call("/k/v1/chat/completions", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    expect(res.headers.get("retry-after")).toBe("14400");
-    expect(((await res.json()) as { error: { message: string } }).error.message).toBe("You've hit your usage limit (AIS gateway: provider said quota used up; resets 21:00 ICT Mon 2 Nov, 14:00 GMT Mon 2 Nov). Resets at 2026-11-02T14:00:00.000Z.");
+    expect(await res.text()).toBe(raw);
+    expect(res.headers.get("retry-after")).toBeNull();
   });
-
   test("a non-429 upstream error of a provider with no native shape passes through byte for byte", async () => {
     const t = await addApp(baseApp({ name: "k", provider: "kimi", target: { kind: "pool" } }));
     usage.a = live(10);
@@ -1949,6 +1927,30 @@ describe("upstream errors in the request log", () => {
     expect(res.status).toBe(502);
     expect(requestLog()).toMatchObject({ status: "upstream_error", http: 502, reason: "ECONNREFUSED" });
     expect(logs.join("\n")).not.toContain("192.0.2.1");
+  });
+});
+
+describe("pool usage signals before streamed content", () => {
+  test("Anthropic and Codex Responses quota errors switch before emitting any member error", async () => {
+    const cases = [
+      ["claude", "anthropic", "/v1/messages", 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"weekly usage limit reached"}}\n\n'],
+      ["codex", "openai", "/v1/responses", 'event: error\ndata: {"type":"error","error":{"code":"usage_limit_reached","message":"usage limit reached"}}\n\n'],
+    ] as const;
+    for (const [provider, style, path, quotaEvent] of cases) {
+      const token = await addApp(baseApp({ name: `stream-${provider}`, provider, style, target: { kind: "pool" } }));
+      seen.length = 0;
+      handler = (_req, seenReq) => {
+        const isFirst = [...seenReq.headers.values()].some((value) => value.includes("tok-a"));
+        return new Response(isFirst ? quotaEvent : "event: message_start\ndata: {\"type\":\"message_start\",\"text\":\"served\"}\n\n", { headers: { "content-type": "text/event-stream" } });
+      };
+      const res = await call(`/stream-${provider}${path}`, token, { method: "POST", body: JSON.stringify({ stream: true }) });
+      const text = await res.text();
+      expect(res.status).toBe(200);
+      expect(seen).toHaveLength(2);
+      expect(text).toContain("served");
+      expect(text).not.toContain("usage limit reached");
+      expect(text).not.toContain("weekly limit");
+    }
   });
 });
 

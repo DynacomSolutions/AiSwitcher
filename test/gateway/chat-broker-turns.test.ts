@@ -217,16 +217,14 @@ test("a failed session/load shows the restarted notice and counts resume_failed"
   expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="resume_failed"} 1');
 });
 
-test("a rate-limit failure text becomes an error item with code limit and the reset time in the message", async () => {
+test("an ordinary rate-limit failure remains an ACP error", async () => {
   const { broker, store, metrics } = setup();
   const rec = await made(broker);
   await send(broker, rec.id, "limit");
   await until(async () => (await bodies(store, rec.id)).some((b) => b.k === "error"), "error item");
   const err = (await bodies(store, rec.id)).find((b) => b.k === "error") as Extract<ChatBody, { k: "error" }>;
-  expect(err.code).toBe("limit");
-  expect(err.message).toContain("2023-11-15T00:00:00.000Z");
-  expect(err.message).not.toContain("Rate limit reached");
-  expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="limit"} 1');
+  expect(err).toEqual({ k: "error", code: "acp", message: "The agent could not finish this turn." });
+  expect(metrics.render()).toContain('ais_gateway_chat_errors_total{kind="acp"} 1');
   await idleState(store, rec.id);
 });
 

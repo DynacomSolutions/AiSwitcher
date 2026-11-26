@@ -5,12 +5,14 @@
  * within minutes. The hold answers `200 text/event-stream` at once and sends an SSE `ping` every few seconds. The client
  * has its headers, so its 10 minute request timeout is over, and its stream idle watchdog sees data. The gateway replays
  * the buffered request against the pool from time to time. When a member has room, the replay answer becomes the rest of
- * the stream. When the replay meets a 429 (a full pool or a provider limit), the hold continues. When the replay fails for
- * another reason, the stream ends with an SSE `error` event in the provider's shape.
+ * the stream. An uncertain full-pool answer keeps the hold open. A confirmed whole-pool limit or provider error ends the
+ * hold with an SSE `error` event in the provider's shape. An ordinary provider throttle also reaches the client.
  *
  * A shutdown ends every hold at once with a socket reset before any message event. Claude Code retries a reset as a stream.
  * An SSE `error` event before `message_start` would make it resend the request without streaming, and that request is never held.
  */
+
+import { summariseUpstreamError } from "./upstream-error.ts";
 
 export interface PoolHoldLimits {
   /** Longest one request is held. Default 6 h. */
@@ -46,6 +48,10 @@ export function poolHoldFromEnv(env: Record<string, string | undefined> = proces
 
 /** Answers marked by the proxy as "the pool is full" (not a provider 429 that passes through). */
 export const fullPoolAnswers = new WeakSet<Response>();
+/** Full-pool 429s backed by a current provider-confirmed limit for every eligible member and request scope. */
+export const confirmedPoolAnswers = new WeakSet<Response>();
+/** An upstream error from a held replay must end the keepalive and reach the client as its real error. */
+export const visiblePoolErrors = new WeakSet<Response>();
 
 /** Requests the hold replays: they never start a second hold. */
 export const heldReplays = new WeakSet<Request>();
@@ -291,7 +297,17 @@ export function heldStreamResponse(input: HeldStreamInput): Response {
               await res.body?.cancel().catch(() => undefined);
               continue;
             }
-            // A 429 of any kind (a full pool, a provider limit) means the pool is still full: the hold goes on.
+            // An unconfirmed gateway capacity answer keeps the hold open. Confirmed limits and provider errors exit above.
+            if (confirmedPoolAnswers.has(res)) {
+              send(sse("error", await errorEvent(res)));
+              finish("failed");
+              return end();
+            }
+            if (visiblePoolErrors.has(res)) {
+              send(sse("error", await errorEvent(res)));
+              finish("failed");
+              return end();
+            }
             if (res.status === 429 || fullPoolAnswers.has(res)) {
               await res.body?.cancel().catch(() => undefined);
               continue;
@@ -358,13 +374,13 @@ function replayNote(h: Headers): Uint8Array | undefined {
 
 /** The SSE error event for a replay answer that is not a stream: the provider's own error object when it has one. */
 async function errorEvent(res: Response): Promise<unknown> {
-  let message = `AIS gateway: the held request got an answer with status ${res.status} that is not a provider error`;
+  let message = `provider returned HTTP ${res.status}`;
   try {
-    const text = (await res.text()).slice(0, 64 * 1024);
-    const j = JSON.parse(text) as { error?: { type?: unknown; message?: unknown } };
-    if (j.error && typeof j.error.type === "string") return { type: "error", error: { type: j.error.type, message: typeof j.error.message === "string" ? j.error.message : message } };
+    const summary = summariseUpstreamError(new TextEncoder().encode((await res.text()).slice(0, 64 * 1024)));
+    if (summary?.message) message = `${message}: ${summary.message}`;
+    return { type: "error", error: { type: summary?.type ?? summary?.code ?? "api_error", message, status: res.status } };
   } catch {
-    // not JSON: keep the generic message
+    // Keep the status when the provider sends no readable body.
   }
-  return { type: "error", error: { type: "api_error", message } };
+  return { type: "error", error: { type: "api_error", message, status: res.status } };
 }

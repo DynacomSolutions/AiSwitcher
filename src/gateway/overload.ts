@@ -9,6 +9,8 @@ export type RetryReason = "overloaded" | "server_error";
 
 export interface RetryInfo {
   reason: RetryReason;
+  /** A usage-limit error delivered inside a successful event stream. */
+  quota?: boolean;
   http: number;
   errorType?: string;
   requestId?: string;
@@ -36,7 +38,7 @@ export function retryReasonForStatus(status: number, errorType?: string): RetryR
 }
 
 /** What the first bytes of an event stream say. `pending`: not enough bytes yet. `pass`: a normal stream. `error`: the first event is an error event. */
-export type FirstEvent = { state: "pending" } | { state: "pass" } | { state: "error"; errorType?: string; requestId?: string };
+export type FirstEvent = { state: "pending" } | { state: "pass" } | { state: "error"; errorType?: string; errorCode?: string; errorMessage?: string; requestId?: string };
 
 /**
  * Reads the start of an SSE body and decides as early as it can. A normal stream is decided on its first `event:` line
@@ -67,12 +69,16 @@ export function firstEventOf(bytes: Uint8Array): FirstEvent {
       } catch {
         return sawError ? { state: "error" } : { state: "pass" };
       }
-      const obj = (typeof parsed === "object" && parsed !== null ? parsed : {}) as { type?: unknown; error?: { type?: unknown }; request_id?: unknown };
-      const isError = sawError || obj.type === "error";
+      const obj = (typeof parsed === "object" && parsed !== null ? parsed : {}) as { type?: unknown; error?: { type?: unknown; code?: unknown; message?: unknown } | string; response?: { error?: { code?: unknown; message?: unknown } | null }; request_id?: unknown; code?: unknown; message?: unknown };
+      const error = typeof obj.error === "object" && obj.error !== null ? obj.error : undefined;
+      const responseError = obj.response?.error;
+      const isError = sawError || obj.type === "error" || obj.type === "response.failed" || error !== undefined || responseError != null;
       if (!isError) return { state: "pass" };
-      const errorType = typeof obj.error?.type === "string" ? obj.error.type : undefined;
+      const errorType = typeof error?.type === "string" ? error.type : undefined;
+      const errorCode = typeof error?.code === "string" ? error.code : typeof responseError?.code === "string" ? responseError.code : typeof obj.code === "string" ? obj.code : undefined;
+      const errorMessage = typeof error?.message === "string" ? error.message : typeof responseError?.message === "string" ? responseError.message : typeof obj.error === "string" ? obj.error : typeof obj.message === "string" ? obj.message : undefined;
       const requestId = typeof obj.request_id === "string" ? obj.request_id : undefined;
-      return { state: "error", ...(errorType ? { errorType } : {}), ...(requestId ? { requestId } : {}) };
+      return { state: "error", ...(errorType ? { errorType } : {}), ...(errorCode ? { errorCode } : {}), ...(errorMessage ? { errorMessage } : {}), ...(requestId ? { requestId } : {}) };
     }
     return { state: "pass" }; // not an event stream line
   }
