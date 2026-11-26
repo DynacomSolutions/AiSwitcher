@@ -696,7 +696,7 @@ for (const vp of VIEWPORTS) {
         await page.eval(`window.__aisCodexResetResult = 'reset'; window.__aisCodexReconciliation = {
           status: 'confirmed', usage: { toolName: 'codex', provider: 'openai',
             identity: { name: 'SYNTHETIC_FIXTURE-codex-credit' }, gatewayManaged: true,
-            status: 'live', windows: [{ label: 'Week', category: 'week', usedPercent: 0 }] },
+            status: 'live', capturedAt: '2026-11-26T10:00:03.000Z', windows: [{ label: 'Week', category: 'week', usedPercent: 0 }] },
         }; document.querySelector(${JSON.stringify(resetButton)}).click()`);
         await waitFor("Codex reset prompt", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
         expect(await page.eval<string>(`document.querySelector('[role=alertdialog]').innerText`)).toContain("Console checks usage for this account.");
@@ -748,7 +748,7 @@ for (const vp of VIEWPORTS) {
         await open("/limits/openai");
         const resetButton = 'main button[aria-label="Use reset on SYNTHETIC_FIXTURE-codex-credit"]';
         await waitFor("Codex reset button", 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(resetButton)})`));
-        const stale = { ...SYNTHETIC_LIMITS, results: [SYNTHETIC_LIMITS.results.find((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit")!].map((row) => ({ ...row, capturedAt: "2026-11-26T09:00:00.000Z", manualReset: { ...row.manualReset, availableCount: 1 } })) };
+        const stale = { ...SYNTHETIC_LIMITS, results: [SYNTHETIC_LIMITS.results.find((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit")!].map((row) => ({ ...row, capturedAt: "2026-11-26T10:00:01.000Z", manualReset: { ...row.manualReset, availableCount: 1 } })) };
         const fresh = { ...SYNTHETIC_LIMITS, results: [SYNTHETIC_LIMITS.results.find((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit")!].map((row) => ({ ...row, capturedAt: "2026-11-26T10:00:03.000Z", windows: [{ label: "Week", category: "week", usedPercent: 0 }], manualReset: { ...row.manualReset, availableCount: 1 } })) };
         await page.eval(`window.__aisCodexResetResult = 'reset'; window.__aisCodexReconciliation = { status: 'pending' };
           window.__aisLimitsQueue = [${JSON.stringify(stale)}, ${JSON.stringify(fresh)}]; document.querySelector(${JSON.stringify(resetButton)}).click()`);
@@ -950,7 +950,7 @@ describe("1280x900", () => {
         status: 'confirmed',
         usage: { toolName: 'codex', provider: 'openai',
           identity: { name: 'SYNTHETIC_FIXTURE-codex-credit' }, gatewayManaged: true,
-          status: 'live', windows: [{ label: 'Week', category: 'week', usedPercent: 0 }] },
+          status: 'live', capturedAt: '2026-11-26T10:00:03.000Z', windows: [{ label: 'Week', category: 'week', usedPercent: 0 }] },
       }; document.querySelector(${JSON.stringify(resetButton)}).click()`);
       await waitFor("desktop confirmation", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
       await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset').click()`);

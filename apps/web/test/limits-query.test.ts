@@ -16,6 +16,15 @@ const codexRow = (identity: string, usedPercent: number, captured: number, reset
 const payload = (...results: ToolLimitResult[]): LimitsResponse => ({ results, cached: false, fetchedAt: capturedAt(100) });
 
 describe("limits query reset reconciliation", () => {
+  test("keeps fast polling when a newer reading still shows full usage", () => {
+    const initial = payload(codexRow("member-a", 100, 1, 30_000));
+    const unchanged = reconcileLimits(initial, payload(codexRow("member-a", 100, 3)), 3_000);
+    expect(limitsRefetchInterval(unchanged, 3_000)).toBe(2_000);
+    const relieved = reconcileLimits(unchanged, payload(codexRow("member-a", 2, 5)), 5_000);
+    expect(relieved.results[0]?.windows[0]?.usedPercent).toBe(2);
+    expect(limitsRefetchInterval(relieved, 5_000)).toBe(POLL.slow);
+  });
+
   test("returns to ordinary polling after the 30 second accelerated window", () => {
     const cached = payload(codexRow("member-a", 90, 1, 30_000));
 

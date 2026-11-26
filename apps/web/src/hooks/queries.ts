@@ -115,20 +115,20 @@ export function reconcileLimits(current: LimitsResponse | undefined, incoming: L
   const results = incoming.results.map((row) => {
     const key = `${row.toolName}\u0000${row.identity.name}`;
     const previous = previousByKey.get(key);
-    if (!previous) return row;
+    if (!previous || row.toolName !== "codex") return row;
     const oldCaptured = previous.capturedAt ? Date.parse(previous.capturedAt) : Number.NaN;
     const newCaptured = row.capturedAt ? Date.parse(row.capturedAt) : Number.NaN;
     const expiredPending = previous.resetPendingUntil !== undefined && previous.resetPendingUntil <= now;
     const previousWithoutExpiredPending = { ...previous };
     if (expiredPending) delete previousWithoutExpiredPending.resetPendingUntil;
-    if (previous.resetPendingUntil && !expiredPending && (
-      (previous.gatewayManaged && !row.gatewayManaged)
-      || !Number.isFinite(newCaptured)
-      || !Number.isFinite(oldCaptured)
-      || newCaptured <= oldCaptured
-    )) return previous;
     if (previous.gatewayManaged && !row.gatewayManaged) return previousWithoutExpiredPending;
-    if (Number.isFinite(oldCaptured) && (!Number.isFinite(newCaptured) || newCaptured <= oldCaptured)) return previousWithoutExpiredPending;
+    if (Number.isFinite(oldCaptured) && (!Number.isFinite(newCaptured) || newCaptured < oldCaptured)) return previousWithoutExpiredPending;
+    if (previous.resetPendingUntil && !expiredPending) {
+      const relieved = row.status === "live" && Number.isFinite(newCaptured) && newCaptured > oldCaptured && row.windows.some((window) =>
+        previous.windows.some((baseline) => baseline.label === window.label && baseline.model === window.model && window.usedPercent < baseline.usedPercent),
+      );
+      if (!relieved) return { ...previous, manualReset: row.manualReset ?? previous.manualReset };
+    }
     return row;
   });
   return { ...incoming, results };
@@ -149,12 +149,12 @@ export function useLimitsQuery() {
       if (pending) {
         const scoped = await api.getLimits(pending.identity.name);
         const authoritative = scoped.results.find((row) => row.toolName === "codex" && row.identity.name === pending.identity.name && row.gatewayManaged);
-        if (!authoritative) return current ?? api.getLimits();
         const latest = client.getQueryData<LimitsResponse>(qk.limits) ?? current;
         if (!latest) return api.getLimits();
-        const merged = latest?.results.filter((row) => row.toolName !== "codex" || row.identity.name !== pending.identity.name) ?? [];
-        merged.push({ ...authoritative, identity: pending.identity });
-        return reconcileLimits(latest, { ...scoped, results: merged });
+        if (!authoritative) return latest;
+        const results = latest.results.map((row) => row.toolName === "codex" && row.identity.name === pending.identity.name
+          ? { ...authoritative, identity: row.identity } : row);
+        return reconcileLimits(latest, { ...latest, results });
       }
       const incoming = await api.getLimits();
       return reconcileLimits(client.getQueryData<LimitsResponse>(qk.limits), incoming);
