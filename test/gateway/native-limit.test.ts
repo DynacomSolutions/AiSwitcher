@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { FALLBACK_RESET_SECONDS, fullWindowReset, genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit } from "../../src/gateway/native-limit.ts";
+import { FALLBACK_RESET_SECONDS, claudeCompatibilityLimitMessage, fullWindowReset, genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit } from "../../src/gateway/native-limit.ts";
 
 /**
  * Fixtures are synthetic and scrubbed. Their shapes come from the provider-native limit answers the CLIs parse:
@@ -91,12 +91,27 @@ describe("nativeLimitResponse for claude", () => {
     expect(res.headers.get("anthropic-ratelimit-unified-5h-status")).toBe("allowed");
   });
 
-  test("no readings at all still answers natively, with the fallback reset", () => {
+  test("legacy Claude reads get an emission-time countdown with the original reset and headers", async () => {
+    const emitted = new Date("2026-11-02T09:40:00.000Z");
+    const res = nativeLimitResponse("claude", [a, b], 80, emitted, [], true)!;
+    const body = await res.json() as { error: { type: string; message: string } };
+    expect(body.error.type).toBe("rate_limit_error");
+    expect(body.error.message).toContain("(reset after 2h 50m 0s)");
+    expect(body.error.message).toMatch(/Resets at 2026-11-02T12:30:00\.000Z\.$/);
+    expect(res.status).toBe(429);
+    expect(res.headers.get("retry-after")).toBe("10200");
+    expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe("1793622600");
+    expect(claudeCompatibilityLimitMessage("You've hit your 5-hour limit (provider limit). Resets at 2026-11-02T12:30:00.000Z.", emitted)).not.toContain("reset after");
+    expect(claudeCompatibilityLimitMessage("You've hit your 5-hour limit (AIS gateway: all pool members are at their limit; resets 19:30 ICT Mon 2 Nov, 12:30 GMT Mon 2 Nov). Resets at 2026-11-02T09:00:00.000Z.", emitted)).not.toContain("reset after");
+  });
+
+  test("no readings at all still answers natively, with the fallback reset", async () => {
     const res = nativeLimitResponse("claude", [], 80, NOW)!;
     expect(res.status).toBe(429);
     expect(res.headers.get("anthropic-ratelimit-unified-status")).toBe("rejected");
     expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe(String(1793613600 + FALLBACK_RESET_SECONDS));
     expect(res.headers.get("retry-after")).toBe(String(FALLBACK_RESET_SECONDS));
+    expect(await res.clone().text()).not.toContain("reset after");
   });
 });
 

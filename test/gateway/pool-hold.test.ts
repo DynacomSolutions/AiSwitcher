@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { PoolHoldGate, heldStreamResponse, wantsStream, type PoolHoldLimits } from "../../src/gateway/pool-hold.ts";
+import { PoolHoldGate, confirmedPoolAnswers, heldStreamResponse, wantsStream, type PoolHoldLimits } from "../../src/gateway/pool-hold.ts";
 import { createGatewayApp, type GatewayDeps } from "../../src/gateway/app.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { PrometheusMetrics, noopMetrics } from "../../src/gateway/metrics.ts";
-import { weeklyUtilisation } from "../../src/gateway/native-limit.ts";
+import { anthropicLimitResponse, claudeCompatibilityLimitMessage, weeklyUtilisation } from "../../src/gateway/native-limit.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { generateToken } from "../../src/gateway/tokens.ts";
 import type { GatewayApp } from "../../src/gateway/types.ts";
@@ -250,6 +250,112 @@ describe("a full pool holds a streamed request until a member has room", () => {
     expect(clock - T0.getTime()).toBeLessThan(60_000);
   });
 
+  test("a marginal reading waits for a fresh full confirmation before refusing", async () => {
+    const names = Array.from({ length: 10 }, (_, i) => `account-${i}`);
+    const ages = [25, 29, 33, 37, 41, 45, 49, 53, 57, 61];
+    readings = Object.fromEntries(names.map((name, i) => [name, {
+      ...weekly(100, T0.getTime() + 4 * HOURS),
+      capturedAt: new Date(T0.getTime() - ages[i]! * 1_000).toISOString(),
+    }]));
+    deps.poolMembers = async () => names;
+    const refreshes: string[] = [];
+    deps.refreshUsage = async (_provider, identity) => {
+      refreshes.push(identity);
+      readings[identity] = weekly(100, T0.getTime() + 2 * HOURS);
+    };
+    const token = await add(mk("pool", { kind: "pool" }));
+    const started = performance.now();
+    const res = await post(createGatewayApp(deps), "pool", token, false);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBe(7200);
+    expect((await res.json() as { error: { message: string } }).error.message).toContain("(reset after 2h 0s)");
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(clock).toBe(T0.getTime());
+    expect(sleeps).toEqual([]);
+    expect(seen).toEqual([]);
+    expect(refreshes).toEqual(names.slice(6));
+  });
+
+  test("a marginal reading that refreshes below reserve uses that member in the same request", async () => {
+    readings = {
+      a: { ...weekly(100, T0.getTime() + 4 * HOURS), capturedAt: new Date(T0.getTime() - 61_000).toISOString() },
+      b: weekly(100, T0.getTime() + 5 * HOURS),
+    };
+    deps.refreshUsage = async (_provider, identity) => { readings[identity] = weekly(10, T0.getTime() + 7 * 24 * HOURS); };
+    const token = await add(mk("pool", { kind: "pool" }));
+    const res = await post(createGatewayApp(deps), "pool", token);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("message_start");
+    expect(seen).toHaveLength(1);
+    expect(sleeps).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  test("a failed marginal refresh keeps the answer uncertain and limits repeated refresh", async () => {
+    readings = { a: { ...weekly(100, T0.getTime() + 4 * HOURS), capturedAt: new Date(T0.getTime() - 61_000).toISOString() } };
+    deps.poolMembers = async () => ["a"];
+    let refreshes = 0;
+    deps.refreshUsage = async () => { refreshes++; throw new Error("fixture refresh failed"); };
+    const token = await add(mk("pool", { kind: "pool" }));
+    const gw = createGatewayApp(deps);
+    const first = await post(gw, "pool", token, false);
+    const second = await post(gw, "pool", token, false);
+    expect(first.status).toBe(429);
+    expect(second.status).toBe(429);
+    expect(Number(first.headers.get("retry-after"))).toBeLessThanOrEqual(55);
+    expect(refreshes).toBe(1);
+    expect(seen).toEqual([]);
+  });
+
+  test("concurrent marginal checks share one refresh per account", async () => {
+    readings = {
+      a: { ...weekly(100, T0.getTime() + 4 * HOURS), capturedAt: new Date(T0.getTime() - 61_000).toISOString() },
+      b: { ...weekly(100, T0.getTime() + 4 * HOURS), capturedAt: new Date(T0.getTime() - 62_000).toISOString() },
+    };
+    let refreshes = 0;
+    let release!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { release = resolve; });
+    deps.refreshUsage = async (_provider, identity) => {
+      refreshes++;
+      await refreshGate;
+      readings[identity] = weekly(100, T0.getTime() + 4 * HOURS);
+    };
+    const token = await add(mk("pool", { kind: "pool" }));
+    const gw = createGatewayApp(deps);
+    const pending = [post(gw, "pool", token, false), post(gw, "pool", token, false)];
+    await Promise.resolve();
+    await Promise.resolve();
+    release();
+    const results = await Promise.all(pending);
+    expect(results.map((result) => result.status)).toEqual([429, 429]);
+    expect(refreshes).toBe(2);
+    expect(seen).toEqual([]);
+  });
+
+  test("a fresh full window whose reset passed does not prove quota", async () => {
+    readings = { a: { ...weekly(100, T0.getTime() - 1), capturedAt: new Date(T0.getTime() - 1_000).toISOString() } };
+    deps.poolMembers = async () => ["a"];
+    deps.usageFor = async (_provider, identity) => readings[identity];
+    const token = await add(mk("pool", { kind: "pool" }));
+    const res = await post(createGatewayApp(deps), "pool", token, false);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(55);
+    expect(seen).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  test("a fresh rate-limited reading with full usage preserves provider proof", async () => {
+    readings = {
+      a: { ...weekly(100, T0.getTime() + 4 * HOURS), status: "rate-limited" },
+      b: { ...weekly(100, T0.getTime() + 5 * HOURS), status: "rate-limited" },
+    };
+    const token = await add(mk("pool", { kind: "pool" }));
+    const res = await post(createGatewayApp(deps), "pool", token, false);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(60);
+    expect(seen).toEqual([]);
+  });
+
   test("P2: a transient provider throttle during replay surfaces its status and detail", async () => {
     readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
     const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
@@ -432,6 +538,54 @@ describe("a served hold, an unserved stream and the pings (unit)", () => {
     }
     return text;
   };
+
+  test("held timeout recalculates the real reset countdown at emission", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    const emissionStart = new Date("2026-11-26T08:50:00.000Z");
+    const resetAt = Date.parse("2026-11-26T11:40:00.000Z");
+    let nowMs = emissionStart.getTime();
+    const initial = anthropicLimitResponse({ claim: "short", resetAtSec: resetAt / 1000, guessed: false, windows: [] }, emissionStart, true);
+    const startMessage = (await initial.json() as { error: { message: string } }).error.message;
+    const res = heldStreamResponse({
+      limits: { ...limits, maxMs: 1, checkMs: 5000 }, gate, bytes: 1000,
+      now: () => new Date(nowMs), sleep: async (ms) => { nowMs += ms; },
+      replay: async () => { throw new Error("timeout must not replay"); },
+      limitMessage: () => claudeCompatibilityLimitMessage(startMessage, new Date(nowMs)),
+    });
+    const text = await res.text();
+    expect(text).toContain("(reset after 2h 50m 0s)");
+    expect(text).toMatch(/Resets at 2026-11-26T11:40:00\.000Z\./);
+    expect(text).toContain('"type":"rate_limit_error"');
+    expect(gate.held).toBe(0);
+  });
+
+  test("a held gateway 429 keeps the Anthropic error class and reset opening", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    const now = new Date("2026-11-25T00:00:00.000Z");
+    const resetAt = new Date(now.getTime() + 2 * HOURS).toISOString();
+    const answer = anthropicLimitResponse({ claim: "short", resetAtSec: Date.parse(resetAt) / 1000, guessed: false, windows: [] }, now, true);
+    confirmedPoolAnswers.add(answer);
+    const text = await heldStreamResponse({ ...input(gate, async () => answer), now: () => now }).text();
+    expect(text).toContain('"type":"rate_limit_error"');
+    expect(text).toContain('"status":429');
+    expect(text).toContain("You've hit your 5-hour limit");
+    expect(text).toContain("(reset after 2h 0s)");
+    expect(text).toMatch(/Resets at 2026-11-25T02:00:00\.000Z\./);
+    expect(text).not.toContain("provider returned HTTP 429:");
+  });
+
+  test("a held 429 preserves the absence of a provider-confirmed countdown", async () => {
+    const gate = new PoolHoldGate(limits);
+    gate.tryEnter(1000);
+    const now = new Date("2026-11-25T00:00:00.000Z");
+    const answer = anthropicLimitResponse({ claim: "short", resetAtSec: now.getTime() / 1000 + 300, guessed: true, windows: [] }, now, true);
+    confirmedPoolAnswers.add(answer);
+    const text = await heldStreamResponse({ ...input(gate, async () => answer), now: () => now }).text();
+    expect(text).toContain('"status":429');
+    expect(text).not.toContain("(reset after ");
+  });
 
   test("F1: a served hold leaves the hold count at once, but its body stays in the byte count until the stream ends", async () => {
     const gate = new PoolHoldGate(limits);
