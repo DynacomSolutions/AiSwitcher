@@ -123,6 +123,21 @@ export function limitMessage(kind: string, resetAtSec: number, reason?: string, 
   return `You've hit your ${kind} limit (${why}; ${local}). Resets at ${new Date(resetAtSec * 1000).toISOString()}.`;
 }
 
+/** Add the relative reset form used by older T3 Claude drivers to a gateway limit message. */
+export function claudeCompatibilityLimitMessage(message: string, now: Date): string {
+  const reset = / Resets at (\d{4}-\d\d-\d\dT[\d:.]+Z)\.$/.exec(message);
+  if (!reset || !message.startsWith("You've hit your ") || !message.includes(`${GATEWAY_MESSAGE_PREFIX}all pool members are at their limit`)) return message;
+  const baseMessage = message.replace(/; \(reset after [^)]+\)/, "");
+  const resetMs = Date.parse(reset[1]!);
+  const remaining = Math.ceil((resetMs - now.getTime()) / 1000);
+  if (!Number.isFinite(resetMs) || remaining <= 0) return baseMessage;
+  const hours = Math.floor(remaining / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  const seconds = remaining % 60;
+  const countdown = [hours ? `${hours}h` : "", minutes ? `${minutes}m` : "", `${seconds}s`].filter(Boolean).join(" ");
+  return baseMessage.replace(/; (resets [^)]*)\)\. Resets at /, `; $1; (reset after ${countdown})). Resets at `);
+}
+
 /**
  * A limit answer for a provider with no native shape: the provider-style error body, the shared message and `retry-after`.
  * `kind` defaults to "usage".
@@ -148,7 +163,7 @@ function fraction(percent: number): string {
  * Anthropic's own 429 for an exhausted subscription: `rate_limit_error` body plus the unified headers, status
  * `rejected`, reset in epoch seconds. The gateway app marks it `x-ais-gateway` like every answer it makes.
  */
-export function anthropicLimitResponse(info: LimitInfo, now: Date): Response {
+export function anthropicLimitResponse(info: LimitInfo, now: Date, claudePoolCompatibility = false): Response {
   const nowSec = Math.floor(now.getTime() / 1000);
   const retryAfter = Math.max(1, info.resetAtSec - nowSec);
   const headers = new Headers({
@@ -169,7 +184,9 @@ export function anthropicLimitResponse(info: LimitInfo, now: Date): Response {
     headers.set(`anthropic-ratelimit-unified-${abbrev}-reset`, String(slot === info.claim ? info.resetAtSec : (w?.resetsAtSec ?? info.resetAtSec)));
     headers.set(`anthropic-ratelimit-unified-${abbrev}-utilization`, blocked ? "1" : fraction(w?.utilization ?? 0));
   }
-  return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: limitMessage(kindOf(info.claim), info.resetAtSec) } }), { status: 429, headers });
+  const baseMessage = limitMessage(kindOf(info.claim), info.resetAtSec);
+  const message = !claudePoolCompatibility || info.guessed ? baseMessage : claudeCompatibilityLimitMessage(baseMessage, now);
+  return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message } }), { status: 429, headers });
 }
 
 /**
@@ -198,10 +215,10 @@ export function codexLimitResponse(info: LimitInfo, now: Date): Response {
 }
 
 /** The native limit answer for `provider`, or undefined when the provider has no native shape to copy (callers keep their generic error). */
-export function nativeLimitResponse(provider: GatewayProvider, usages: Array<PoolUsage | undefined>, reservePercent: number, now: Date, extra: LimitCandidate[] = []): Response | undefined {
+export function nativeLimitResponse(provider: GatewayProvider, usages: Array<PoolUsage | undefined>, reservePercent: number, now: Date, extra: LimitCandidate[] = [], claudePoolCompatibility = false): Response | undefined {
   if (provider !== "claude" && provider !== "codex") return undefined;
   const info = summariseLimit(usages, reservePercent, now, extra);
-  return provider === "claude" ? anthropicLimitResponse(info, now) : codexLimitResponse(info, now);
+  return provider === "claude" ? anthropicLimitResponse(info, now, claudePoolCompatibility) : codexLimitResponse(info, now);
 }
 
 /**
