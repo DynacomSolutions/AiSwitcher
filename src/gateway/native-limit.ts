@@ -124,7 +124,9 @@ export function limitMessage(kind: string, resetAtSec: number, reason?: string, 
 }
 
 /** Add the relative reset form used by older T3 Claude drivers to a gateway limit message. */
-export function claudeCompatibilityLimitMessage(message: string, now: Date): string {
+export function claudeCompatibilityLimitMessage(message: string, now: Date, confirmedReset = false): string {
+  // A replay can update an existing countdown. Only the source knows whether its initial deadline came from the provider.
+  if (!confirmedReset && !message.includes("(reset after ")) return message;
   const reset = / Resets at (\d{4}-\d\d-\d\dT[\d:.]+Z)\.$/.exec(message);
   if (!reset || !message.startsWith("You've hit your ") || !message.includes(`${GATEWAY_MESSAGE_PREFIX}all pool members are at their limit`)) return message;
   const baseMessage = message.replace(/; \(reset after [^)]+\)/, "");
@@ -185,7 +187,7 @@ export function anthropicLimitResponse(info: LimitInfo, now: Date, claudePoolCom
     headers.set(`anthropic-ratelimit-unified-${abbrev}-utilization`, blocked ? "1" : fraction(w?.utilization ?? 0));
   }
   const baseMessage = limitMessage(kindOf(info.claim), info.resetAtSec);
-  const message = !claudePoolCompatibility || info.guessed ? baseMessage : claudeCompatibilityLimitMessage(baseMessage, now);
+  const message = !claudePoolCompatibility || info.guessed ? baseMessage : claudeCompatibilityLimitMessage(baseMessage, now, true);
   return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message } }), { status: 429, headers });
 }
 
