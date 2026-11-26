@@ -480,9 +480,8 @@ ETA: 2026-12-03 18:00 ICT
 | 344 | Delete store and host copies of the retired OpenCode identities | in_progress | claude | opencode-store-delete | 21.328 | 2026-11-26 21:00 ICT | 3 store rows of the retired identities; personal holds an Alibaba key, saved to ~/.secrets first.<br>Needs an admin store delete route, then the 3 host folders go too (owner, 26 Nov). |
 
 ## 22. T3 question cards for ZCode threads
-ETA: 2026-11-26 17:00 ICT
 - ZCode questions must show their options as buttons in T3, and every answer must reach the agent.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 343 | ZCode question cards keep their options | in_progress | claude | zcode-question-card | | 2026-11-26 17:00 ICT | Cause: ZCode sends an elicitation form that T3 shows as text fields only.<br>Fix: the ACP relay rewrites the form for T3 and maps the answer back. |
+| 343 | ZCode question cards keep their options | done | claude | | | | Merged #844 (30b4d3ed), released v0.5.125 (#845).<br>Live 26 Nov 18:51 ICT: a restarted ZCode session showed option buttons plus skip.<br>The owner's picks reached the agent. |
