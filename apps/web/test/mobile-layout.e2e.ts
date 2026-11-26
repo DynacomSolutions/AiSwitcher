@@ -25,6 +25,7 @@ const distDir = process.env.AIS_WEB_DIST ?? join(repoRoot, "apps/web/dist");
 const chromium = process.env.AIS_E2E_CHROMIUM
   ?? ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"].find(p => existsSync(p));
 const evidence = process.env.AIS_E2E_EVIDENCE;
+const scratchRoot = process.env.AIS_WEB_E2E_SCRATCH ?? tmpdir();
 
 const ROUTES = [
   "/", "/identities", "/local-models", "/local-models/example", "/limits", "/usage", "/usage/gateway", "/gateway", "/usage/models", "/usage/sources", "/usage/projects", "/usage/repos", "/usage/orgs", "/dashboard/herdr", "/dashboard/processes", "/breakdown", "/breakdown/consumers",
@@ -59,6 +60,26 @@ const SYNTHETIC_LIMITS: LimitsResponse = {
       status: "live",
       plan: "Go",
       windows: [{ label: "Session", category: "session", usedPercent: 10, resetsAtMs: RESET_AT }],
+    },
+    {
+      toolName: "codex",
+      provider: "openai",
+      identity: { name: "SYNTHETIC_FIXTURE-codex-credit", ...SYNTHETIC_IDENTITY },
+      status: "live",
+      windows: [{ label: "Week", category: "week", usedPercent: 70, resetsAtMs: RESET_AT }],
+      manualReset: {
+        availableCount: 2,
+        label: "Full reset",
+        creditExpiries: [{ id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_003", label: "Full reset", endsAt: "2026-12-01T22:27:07.649Z" }],
+      },
+    },
+    {
+      toolName: "codex",
+      provider: "openai",
+      identity: { name: "SYNTHETIC_FIXTURE-codex-zero", ...SYNTHETIC_IDENTITY },
+      status: "live",
+      windows: [{ label: "Week", category: "week", usedPercent: 0, resetsAtMs: RESET_AT }],
+      manualReset: { availableCount: 0 },
     },
   ],
 };
@@ -376,7 +397,8 @@ const MEASURE = `(() => {
 beforeAll(async () => {
   if (!chromium) throw new Error("no Chromium found; set AIS_E2E_CHROMIUM");
   if (!existsSync(join(distDir, "index.html"))) throw new Error(`apps/web is not built (${distDir}/index.html missing); run pnpm build in apps/web`);
-  runDir = await mkdtemp(join(tmpdir(), "ais-web-e2e-"));
+  await mkdir(scratchRoot, { recursive: true });
+  runDir = await mkdtemp(join(scratchRoot, "ais-web-e2e-"));
   const home = join(runDir, "home");
   await mkdir(home, { recursive: true });
   const port = await freePort();
@@ -467,6 +489,38 @@ for (const vp of VIEWPORTS) {
     // The rule of the separator needs a line that wraps. At 360 px a reset line is too long for the card.
     test("/limits/anthropic keeps each reset countdown in full", async () => {
       await checkLimitsCards(vp.width, vp.height, "/limits/anthropic", { lines: 4, notes: 1, plans: 2, poolLines: 0, wrappedAtLeast: vp.width === 360 ? 1 : 0 });
+    }, 40_000);
+
+    test("/limits/openai shows Codex reset availability, expiry, and known zero", async () => {
+      await setViewport(vp.width, vp.height);
+      const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+        source: `(${limitsStub.toString()})(${JSON.stringify(LIMITS_ANSWERS)})`,
+      });
+      try {
+        await open("/limits/openai");
+        await waitFor("Codex manual reset states", 10_000, async () => page.eval<boolean>(`(() => {
+          const text = document.querySelector('main')?.innerText ?? '';
+          return text.includes('Manual reset available ×2: Full reset') && text.includes('No manual reset available');
+        })()`));
+        const state = await page.eval<{ positive: boolean; zero: boolean; expiry: boolean }>(`(() => {
+          const text = document.querySelector('main')?.innerText ?? '';
+          return {
+            positive: text.includes('Manual reset available ×2: Full reset'),
+            zero: text.includes('No manual reset available'),
+            expiry: text.includes('Full reset: expires'),
+          };
+        })()`);
+        expect(state).toEqual({ positive: true, zero: true, expiry: true });
+        if (evidence) {
+          await mkdir(evidence, { recursive: true });
+          await writeFile(join(evidence, `${vp.width}-limits-codex-resets.png`), await page.screenshot());
+          await page.eval(`window.scrollTo(0, document.documentElement.scrollHeight)`);
+          await sleep(200);
+          await writeFile(join(evidence, `${vp.width}-limits-codex-resets-zero.png`), await page.screenshot());
+        }
+      } finally {
+        await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+      }
     }, 40_000);
 
     // Pool cards: one reset line for each member of the pool.

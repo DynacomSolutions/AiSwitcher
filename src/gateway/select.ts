@@ -64,16 +64,27 @@ export async function allowedMembers(app: GatewayApp, deps: Pick<GatewayDeps, "p
   return deps.poolMembers(app.provider);
 }
 
+/** Members that selection can actually use. Keep logged-out filtering shared with pool capacity checks. */
+export async function eligibleMembers(app: GatewayApp, deps: Pick<GatewayDeps, "poolMembers"> & Partial<Pick<GatewayDeps, "creds">>): Promise<string[]> {
+  let names = await allowedMembers(app, deps);
+  const loggedOut = deps.creds?.loggedOut;
+  if (app.target.kind === "pool" && loggedOut) {
+    names = (await Promise.all(names.map(async (name) => ((await loggedOut(app.provider, name).catch(() => false)) ? undefined : name))))
+      .filter((name): name is string => name !== undefined);
+  }
+  return names;
+}
+
 /** The usage readings of the members an app may use, for the native limit answer (reset times), as they apply to `model`; `unfiltered` keeps every per-model window. */
 export async function memberUsages(
   app: GatewayApp,
-  deps: Pick<GatewayDeps, "usageFor" | "poolMembers">,
+  deps: Pick<GatewayDeps, "usageFor" | "poolMembers"> & Partial<Pick<GatewayDeps, "creds">>,
   model?: string,
   unfiltered = false,
 ): Promise<Array<PoolUsage | undefined>> {
   let names: string[];
   try {
-    names = await allowedMembers(app, deps);
+    names = await eligibleMembers(app, deps);
   } catch {
     return [];
   }
@@ -91,6 +102,7 @@ export async function pickIdentity(
   deps: Pick<GatewayDeps, "usageFor" | "poolMembers"> & Partial<Pick<GatewayDeps, "creds">>,
   exclude?: string | ReadonlySet<string>,
   model?: string,
+  allowFull = false,
 ): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" | "no-identities" }> {
   const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
   if (app.target.kind === "pin") {
@@ -98,16 +110,9 @@ export async function pickIdentity(
     if (util !== undefined && util >= reserve) return { reject: "reserve" };
     return { identity: app.target.identity };
   }
-  let names = await allowedMembers(app, deps);
+  let names = await eligibleMembers(app, deps);
   // Nothing to choose from at all (as opposed to everything being full): say so.
   if (names.length === 0) return { reject: "no-identities" };
-  // Drop dead or logged-out logins before selection. A probe error keeps the member (the send and failover still guard it).
-  const creds = deps.creds;
-  if (creds?.loggedOut) {
-    const alive = await Promise.all(names.map(async (n) => ((await creds.loggedOut!(app.provider, n).catch(() => false)) ? undefined : n)));
-    names = alive.filter((n): n is string => n !== undefined);
-    if (names.length === 0) return { reject: "no-identities" };
-  }
   const skip = typeof exclude === "string" ? new Set([exclude]) : exclude;
   if (skip && skip.size > 0) names = names.filter((n) => !skip.has(n));
   const rows = await Promise.all(
@@ -120,6 +125,10 @@ export async function pickIdentity(
   // A window at 100% is full whatever the reserve says (reserve 100 must not let a full account through).
   const known = chooseBest(rows, { belowPercent: Math.min(reserve, 99.999), requireKnown: true });
   if (known) return { identity: known };
+  if (allowFull) {
+    const full = chooseBest(rows.filter((r) => (r.usage?.maxUtilization ?? -1) >= 100), { belowPercent: 100.001, requireKnown: true });
+    if (full) return { identity: full };
+  }
   const unknown = rows.find((r) => r.usage === undefined);
   return unknown ? { identity: unknown.name } : { reject: "no-headroom" };
 }

@@ -10,7 +10,7 @@ import { createCallRoutes, type CallHub } from "./browser/routing.ts";
 import { checkCaps, dayStartIct } from "./caps.ts";
 import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
 import { GATEWAY_ERROR_HEADER, GATEWAY_UPSTREAM_HEADER, limitError, markGatewayError, providerError } from "./errors.ts";
-import { CLIENT_RETRY_AFTER_CAP_SECONDS, PoolHoldGate, fullPoolAnswers, heldReplays, heldStreamResponse, poolHoldFromEnv, wantsStream } from "./pool-hold.ts";
+import { CLIENT_RETRY_AFTER_CAP_SECONDS, PoolHoldGate, confirmedPoolAnswers, fullPoolAnswers, heldReplays, heldStreamResponse, poolHoldFromEnv, visiblePoolErrors, wantsStream } from "./pool-hold.ts";
 import type { LedgerBuffer } from "./ledger-buffer.ts";
 import { clientFamily, sessionKeyFromBodyTail, sessionKeyFromHeaders } from "./session-key.ts";
 import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadRequest, KnownBadFiles, MAX_FILE_CHECKS, MEDIA_REMOVED_HEADER, mediaAware, mentionedFileIds, rejectedUpload, withoutFiles, type FileVerdict } from "./media-recovery.ts";
@@ -22,9 +22,9 @@ import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
 import { poolModels } from "./models-union.ts";
-import { errorTypeOfBody, firstEventOf, isModelCall, retryReasonForStatus, retryReasonForStreamError, type FirstEvent, type RetryInfo } from "./overload.ts";
+import { firstEventOf, isModelCall, type FirstEvent, type RetryInfo } from "./overload.ts";
 import { collapseSlashes, PIN_FORWARD, routeFor, serveRoute, sideDailyLimitFromEnv, type AccountOp, type ResetCreditsCache } from "./routes.ts";
-import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity, usageForModel, utilisationOf } from "./select.ts";
+import { DEFAULT_RESERVE_PERCENT, eligibleMembers, memberUsages, pickIdentity, reserveUtilisationOf, usageForModel, utilisationOf } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, UsageRow } from "./types.ts";
@@ -289,6 +289,36 @@ export function isQuotaBody(bytes: Uint8Array): boolean {
   }
 }
 
+/** True only for an explicit subscription-usage exhaustion signal, not a transient rate-limit code. */
+function isSubscriptionUsageError(type: string | undefined, code: string | undefined, message: string | undefined): boolean {
+  if (type && /^(insufficient_quota|usage_limit_reached|quota_exceeded|billing_hard_limit_reached)$/i.test(type)) return true;
+  if (code && /^(insufficient_quota|usage_limit_reached|quota_exceeded|billing_hard_limit_reached)$/i.test(code)) return true;
+  return message !== undefined && /(?:you['’]ve hit your .{0,40}limit|usage limit (?:reached|exhausted)|subscription (?:usage )?limit (?:reached|exhausted))/i.test(message);
+}
+
+function subscriptionResetAt(bytes: Uint8Array): number | undefined {
+  try {
+    const top = JSON.parse(new TextDecoder().decode(bytes)) as { resets_at?: unknown; error?: { resets_at?: unknown }; response?: { error?: { resets_at?: unknown } } };
+    const value = top.error?.resets_at ?? top.response?.error?.resets_at ?? top.resets_at;
+    const reset = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+    return Number.isFinite(reset) && reset > 0 ? Math.floor(reset) : undefined;
+  } catch { return undefined; }
+}
+
+function isSubscriptionUsageBody(bytes: Uint8Array): boolean {
+  try {
+    const top = JSON.parse(new TextDecoder().decode(bytes)) as { type?: unknown; code?: unknown; message?: unknown; error?: { type?: unknown; code?: unknown; message?: unknown } };
+    const error = top.error;
+    return isSubscriptionUsageError(
+      typeof error?.type === "string" ? error.type : typeof error?.code === "string" ? error.code : typeof top.type === "string" ? top.type : typeof top.code === "string" ? top.code : undefined,
+      typeof error?.code === "string" ? error.code : typeof top.code === "string" ? top.code : undefined,
+      typeof error?.message === "string" ? error.message : typeof top.message === "string" ? top.message : typeof top.error === "string" ? top.error : undefined,
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Allocation-free scan for the top-level `model` string of a JSON object. The last duplicate wins, as in
  * JSON.parse, so an allowlist cannot be dodged with `{"model":"ok","model":"other"}`. Returns `ok: false` when the
@@ -481,6 +511,8 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const log = deps.log ?? defaultLog;
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const exhausted = new Map<string, number>();
+  /** Provider-confirmed subscription exhaustion, keyed by member and (when needed) requested model scope. */
+  const provenQuota = new Map<string, number>();
   const resetCredits: ResetCreditsCache = {};
   const accountState = newAccountState();
   const sideGate = new Gate(SIDE_COUNT_MAX_INFLIGHT);
@@ -493,7 +525,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const holdGate = new PoolHoldGate({ ...poolHoldFromEnv(), ...deps.poolHold });
   const hold: HoldCtl = { gate: holdGate, replay: (r) => handle(r) };
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "internal error while handling the request", "internal_error"));
+    proxy(req, deps, log, budget, exhausted, provenQuota, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "internal error while handling the request", "internal_error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   const chatDeps = deps.chat ? { chat: deps.chat } : {};
@@ -507,7 +539,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, provenQuota: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -768,9 +800,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   /** Pool members still marked exhausted (their reset has not passed). */
   const exhaustedNames = async (): Promise<Set<string>> => {
     const out = new Set<string>();
+    const now = deps.now().getTime();
+    for (const [key, until] of [...provenQuota]) if (until <= now) provenQuota.delete(key);
     for (const [k, until] of [...exhausted]) {
       if (until <= deps.now().getTime()) {
         exhausted.delete(k);
+        provenQuota.delete(k);
         holds.delete(k);
         probes.delete(k);
       } else if (k.startsWith(`${app.provider}\u0000`)) {
@@ -808,9 +843,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     const claim = headers.get("anthropic-ratelimit-unified-representative-claim") ?? "";
     limitResets.push({ resetAtSec: reset, claim: claim.startsWith("five_hour") ? "short" : "long" });
   };
-  /** Hold a member after a quota-type answer: until reset when exhaustion is proven (or 402/403), else briefly. */
+  /** Hold a member after confirmed exhaustion until reset, or after an ordinary rate limit for its retry window. */
   const holdQuota = (name: string, res: Response): void => {
     const nowMs = deps.now().getTime();
+    const proofKey = `${exKey(name)}${res.status === 429 && isModelScopedRejection(res.headers) && model !== undefined ? `${MODEL_HOLD_SEP}${model}` : ""}`;
+    const proven = res.headers.get(SUBSCRIPTION_EXHAUSTED_HEADER) === "1" || (res.status === 429 && provesSubscriptionExhaustion(res.headers));
+    if (proven) provenQuota.set(proofKey, exhaustedUntil(res.headers, nowMs));
     if (res.status === 429 && isModelScopedRejection(res.headers)) {
       // Only one model's own window is full (Anthropic's per-model weekly limits): the account still serves every other
       // model, so it is held for this model only, until that window's own reset. Without a model to scope it to, it is a
@@ -820,7 +858,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         exhausted.set(exKey(name), burstHoldUntil(res.headers, nowMs));
         holds.set(exKey(name), { kind: "burst", long: false });
       }
-    } else if (res.status === 402 || res.status === 403 || (res.status === 429 && provesSubscriptionExhaustion(res.headers))) {
+    } else if (res.headers.get(SUBSCRIPTION_EXHAUSTED_HEADER) === "1" || (res.status === 429 && provesSubscriptionExhaustion(res.headers))) {
       if (res.status === 429) noteLimitReset(res.headers);
       holds.delete(exKey(name));
       bridgeUntilReading(name, exKey(name), exhaustedUntil(res.headers, nowMs));
@@ -852,6 +890,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       const util = utilisationOf(usageForModel(reading, forModel));
       if (util !== undefined && util < 100 && exhausted.get(key) === until) {
         exhausted.delete(key);
+        provenQuota.delete(key);
         probes.delete(key);
       }
     });
@@ -954,6 +993,24 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
    */
   const holdOrCap = async (out: Response, why: string): Promise<Response> => {
     fullPoolAnswers.add(out);
+    // End now when every live member has a still-valid, provider-confirmed limit for this request scope.
+    // A burst 429, credential hold, or overload never enters this proof set, so those requests still wait and fail over.
+    const members = app.target.kind === "pool" ? await eligibleMembers(app, deps).catch(() => []) : [];
+    const nowMs = deps.now().getTime();
+    const allProven = members.length > 0 && (await Promise.all(members.map(async (name) => {
+      const account = provenQuota.get(exKey(name));
+      const scoped = model === undefined ? undefined : provenQuota.get(`${exKey(name)}${MODEL_HOLD_SEP}${model}`);
+      if ((account !== undefined && account > nowMs) || (scoped !== undefined && scoped > nowMs)) return true;
+      // A still-current provider usage reading at 100% is definitive for that scope. Reserve and stale readings do not prove exhaustion.
+      const reading = await deps.usageFor(app.provider, name).catch(() => undefined);
+      const capturedAt = Date.parse(reading?.capturedAt ?? "");
+      if (!reading || reading.stale || reading.noPlan || (reading.status !== "live" && reading.status !== "rate-limited") || !Number.isFinite(capturedAt) || nowMs - capturedAt > 45_000) return false;
+      return (utilisationOf(usageForModel(reading, model)) ?? 0) >= 100;
+    }))).every(Boolean);
+    if (allProven) {
+      confirmedPoolAnswers.add(out);
+      return out;
+    }
     if (!replaying) {
       const limitText = await out.clone().text().then((t) => { try { return (JSON.parse(t) as { error?: { message?: string } }).error?.message ?? why; } catch { return why; } }).catch(() => why);
       const held = startHold(limitText, why);
@@ -1014,6 +1071,10 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   };
   let picked = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined, model);
   while ("reject" in picked && picked.reject === "no-headroom" && (await waitForShortHold())) picked = await pickIdentity(app, deps, await exhaustedNames(), model);
+  if (replaying && "reject" in picked && picked.reject === "no-headroom" && app.target.kind === "pool") {
+    // A held replay must contact full-looking members. Their real, scope-specific answer ends the hold promptly.
+    picked = await pickIdentity(app, deps, await exhaustedNames(), model, true);
+  }
   if ("reject" in picked && picked.reject === "no-headroom" && app.target.kind === "pool") {
     // Nobody has headroom and a quota hold stands in the way. The hold only ends early on a live usage reading, and the
     // usage endpoint itself answers 429 for full accounts, so a reset spent out of band (or an early provider reset) would
@@ -1028,6 +1089,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         picked = p;
       }
     }
+  }
+  if (app.target.kind === "pool" && "identity" in picked) {
+    // Recheck immediately before a send. Held replays must not bypass the configured reserve.
+    const current = usageForModel(await deps.usageFor(app.provider, picked.identity).catch(() => undefined), model);
+    const currentUtil = reserveUtilisationOf(current);
+    if (currentUtil !== undefined && currentUtil >= (app.reservePercent ?? DEFAULT_RESERVE_PERCENT)) picked = { reject: "no-headroom" };
   }
   const pick = picked;
   if ("reject" in pick) {
@@ -1111,44 +1178,50 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   /** 429 is quota or rate limit. 402 is a payment-required signal some providers use for exhausted credit. A 403 counts only when its (bounded) JSON body names a quota error type or code. */
   const isQuota = async (res: Response): Promise<{ quota: boolean; res: Response }> => {
     if (side) return { quota: false, res }; // a side route's 402/403/429 is its own, not a sign this login is out of quota
-    if (res.status === 402) return { quota: true, res };
-    if (res.status === 429) {
-      // Only Codex states exhaustion in the body (the (bounded) peek); elsewhere the headers decide and the body is not read.
-      if (app.provider !== "codex") return { quota: true, res };
+    if (res.headers.get(SUBSCRIPTION_EXHAUSTED_HEADER) === "1") return { quota: true, res };
+    if (res.status === 402 || res.status === 429) {
+      if (res.status === 429 && app.provider === "claude" && provesSubscriptionExhaustion(res.headers)) return { quota: true, res };
       const p = await peek(res, ERROR_PEEK_BYTES);
-      if (!(p.whole && /usage_limit_reached/.test(new TextDecoder().decode(p.bytes)))) return { quota: true, res: p.res };
-      const h = new Headers(p.res.headers);
-      h.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
-      return { quota: true, res: new Response(p.res.body, { status: p.res.status, statusText: p.res.statusText, headers: h }) };
+      const quota = p.whole && isSubscriptionUsageBody(p.bytes);
+      if (!quota) return { quota: false, res: p.res };
+      const headers = new Headers(p.res.headers);
+      headers.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
+      const reset = subscriptionResetAt(p.bytes);
+      if (reset !== undefined) {
+        headers.set(SUBSCRIPTION_RESET_HEADER, String(reset));
+        limitResets.push({ resetAtSec: reset, claim: "long" });
+      }
+      return { quota: true, res: new Response(p.res.body, { status: p.res.status, statusText: p.res.statusText, headers }) };
     }
     if (res.status !== 403) return { quota: false, res };
     const p = await peek(res, ERROR_PEEK_BYTES);
-    return { quota: p.whole && isQuotaBody(p.bytes), res: p.res };
+    const quota = p.whole && isSubscriptionUsageBody(p.bytes);
+    if (!quota) return { quota: false, res: p.res };
+    const headers = new Headers(p.res.headers);
+    headers.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
+    const reset = subscriptionResetAt(p.bytes);
+    if (reset !== undefined) {
+      headers.set(SUBSCRIPTION_RESET_HEADER, String(reset));
+      limitResets.push({ resetAtSec: reset, claim: "long" });
+    }
+    return { quota: true, res: new Response(p.res.body, { status: p.res.status, statusText: p.res.statusText, headers }) };
   };
 
 
-  /**
-   * An overload or server error before any content: 529, 500, 502, 503, 504, or an event-stream answer whose first event
-   * is an overloaded or api error (Anthropic sends these inside a 200). Only a bounded prefix is read; a normal stream
-   * is decided on its first event line and flows on unchanged. The response returned carries every byte read.
-   */
+  /** A bounded stream prefix may confirm subscription exhaustion before the client sees any response event. */
   const retryable = async (res: Response): Promise<{ retry?: RetryInfo; res: Response }> => {
     if (side || !isModelCall(req.method, rest)) return { res };
     const requestId = upstreamRequestId(res.headers);
-    if (retryReasonForStatus(res.status) !== undefined) {
-      const p = await peek(res, ERROR_PEEK_BYTES);
-      const errorType = errorTypeOfBody(p.bytes);
-      const reason = retryReasonForStatus(res.status, errorType);
-      if (reason === undefined) return { res: p.res };
-      return { retry: { reason, http: res.status, ...(errorType ? { errorType } : {}), ...(requestId ? { requestId } : {}) }, res: p.res };
-    }
-    if (res.status === 200 && style === "anthropic" && (res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+    if (res.status === 200 && (res.headers.get("content-type") ?? "").includes("text/event-stream")) {
       const p = await peekFirstEvent(res, ERROR_PEEK_BYTES);
       if (p.first.state !== "error") return { res: p.res };
-      const reason = retryReasonForStreamError(p.first.errorType);
-      if (reason === undefined) return { res: p.res };
-      const id = requestId ?? p.first.requestId;
-      return { retry: { reason, http: res.status, ...(p.first.errorType ? { errorType: p.first.errorType } : {}), ...(id ? { requestId: id } : {}) }, res: p.res };
+      if (isSubscriptionUsageError(p.first.errorType, p.first.errorCode, p.first.errorMessage)) {
+        const headers = new Headers(p.res.headers);
+        headers.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
+        const id = requestId ?? p.first.requestId;
+        return { retry: { reason: "server_error", quota: true, http: 200, errorType: p.first.errorType, ...(id ? { requestId: id } : {}) }, res: new Response(p.res.body, { status: 200, headers }) };
+      }
+      return { res: p.res };
     }
     return { res };
   };
@@ -1204,7 +1277,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return again;
   };
   try {
-    const poolReplay = app.target.kind === "pool" && replayable;
+    const poolReplay = app.target.kind === "pool" && replayable && !side && isModelCall(req.method, rest);
     let first: Response | undefined;
     let credErr: unknown;
     try {
@@ -1237,7 +1310,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
           const o = await classify(cur);
           cur = o.res;
           retry = o.retry;
-          if (retry) overloaded.add(pick.identity);
+          if (retry?.quota) {
+            quota = true;
+            holdQuota(pick.identity, cur!);
+            retry = undefined;
+          } else if (retry) overloaded.add(pick.identity);
           if (!cur) credErr = credErr ?? new Error("upstream answer unreadable");
         }
       }
@@ -1281,6 +1358,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         try {
           sq = await isQuota(second);
           o = sq.quota ? { res: sq.res, retry: undefined } : await classify(sq.res);
+          if (o.retry?.quota && o.res) sq = { quota: true, res: o.res };
         } catch (err) {
           if (req.signal.aborted || ctrl.signal.aborted) {
             if (cur) await discard(cur);
@@ -1295,6 +1373,17 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
           credErr = credErr ?? new Error("upstream answer unreadable");
           if (!cur) retry = o.retry;
           continue;
+        }
+        if (quota && !sq.quota && o.res.status >= 400) {
+          // Once one member is exhausted, a real error from the next member is the useful answer.
+          // Do not hide it by trying another login or by synthesising a whole-pool limit.
+          if (cur) await discard(cur);
+          cur = o.res;
+          quota = false;
+          retry = undefined;
+          identity = await canon(next.identity);
+          servedBy = next.identity;
+          break;
         }
         const left = quota ? "quota" : retry ? retry.reason : "credential";
         const from = identity;
@@ -1315,10 +1404,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         else if (retry) overloaded.add(name);
       }
       if (!cur) throw credErr;
+      // A credential failure is not evidence that the remaining pool is out of subscription usage.
+      if (quota && credErr) throw credErr;
       if (quota) {
         // No member is left: the client gets the pool's own out-of-capacity answer, not the last member's 429.
         quietRefusals = replaying || holdable();
-        let out = await outOfCapacity("no-headroom", "no-headroom:exhausted");
+        let out = await outOfCapacity("no-headroom", "no-headroom:exhausted", "no pool member has headroom below the reserve");
         if (out && claudePool && out.status === 429) {
           out = await holdOrCap(out, "no pool member has headroom below the reserve");
           quietRefusals = false;
@@ -1382,63 +1473,18 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
   }
 
-  if (up.status === 429 && !side && app.provider !== "claude" && app.provider !== "codex") {
-    // A provider with no native limit shape: its 429 text has no reset time, so a client such as T3 Code cannot wake the
-    // thread. Unless the text already ends in one, the client gets the generic limit answer with the member's hold time.
-    const p = await peek(up, ERROR_PEEK_BYTES);
-    up = p.res;
-    const upstreamMessage = summariseUpstreamError(p.bytes)?.message;
-    if (!(upstreamMessage !== undefined && LIMIT_RESET_TEXT.test(upstreamMessage))) {
-      const nowDate = deps.now();
-      const heldUntil = exhausted.get(exKey(servedBy));
-      const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
-      const usages = await memberUsages(app, deps, model);
-      // A full window in a usage reading gives the true reset. Only without one does the short hold of the member's own 429 count.
-      // Another member's full window must not beat this member's short hold while a member can still serve.
-      const served = await deps.usageFor(app.provider, servedBy).catch(() => undefined);
-      const servedBlocked = served?.noPlan === true || (served !== undefined && !served.stale && (utilisationOf(served) ?? 0) >= reserve);
-      const anyFree = usages.some((u) => u !== undefined && !u.stale && !u.noPlan && (utilisationOf(u) ?? 100) < reserve);
-      const resetAtSec = (servedBlocked || !anyFree ? fullWindowReset(usages, reserve, nowDate) : undefined)
-        ?? (heldUntil !== undefined && heldUntil > nowDate.getTime() ? Math.ceil(heldUntil / 1000) : summariseLimit(usages, reserve, nowDate, limitResets).resetAtSec);
-      await discard(up);
-      up = genericLimitResponse(style, resetAtSec, nowDate, `AIS gateway: provider said ${redactText(upstreamMessage ?? "rate limit", 120)}`);
-    }
-  }
 
-  if (up.status === 429 && claudePool) {
-    // A provider 429 that reaches the client means the pool is full for this request. A replay of a held request only reports it.
-    if (replaying) {
-      await discard(up);
-      req.signal.removeEventListener("abort", onAbort);
-      return new Response(null, { status: 429 });
-    }
-    if (holdable()) {
-      const p = await peek(up, ERROR_PEEK_BYTES);
-      up = p.res;
-      const message = (p.whole ? summariseUpstreamError(p.bytes)?.message : undefined) ?? "upstream rate limit";
-      quietRefusals = false;
-      const held = startHold(`AIS gateway: provider said ${redactText(message, 200)}`, "upstream-429");
-      if (held) {
-        await discard(up);
-        return held;
-      }
-    }
-  }
 
   // The upstream has answered: no replay is possible or needed any more, so the request bytes can go.
   body = { kind: "none" };
   releaseBody?.();
   const headers = new Headers(up.headers);
   headers.delete(SUBSCRIPTION_EXHAUSTED_HEADER);
+  headers.delete(SUBSCRIPTION_RESET_HEADER);
   // A provider's answer passes through unchanged: this header only says whose answer it is. A limit answer the gateway made itself has its own header.
   if (!headers.has(GATEWAY_ERROR_HEADER)) headers.set(GATEWAY_UPSTREAM_HEADER, app.provider);
   if (mediaRemoved > 0) headers.set(MEDIA_REMOVED_HEADER, String(mediaRemoved));
   stripHopByHop(headers);
-  if (up.status === 429 && claudePool) {
-    // Not held (not streamed, or over the cap): keep a retry-after that Claude Code accepts.
-    const ra = Number(headers.get("retry-after"));
-    if (Number.isFinite(ra) && ra > CLIENT_RETRY_AFTER_CAP_SECONDS) headers.set("retry-after", String(CLIENT_RETRY_AFTER_CAP_SECONDS));
-  }
   if (headers.has("content-encoding")) {
     headers.delete("content-encoding");
     headers.delete("content-length");
@@ -1501,7 +1547,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   });
   // A client that vanishes before pulling again: the request signal ends the upstream read.
   req.signal.addEventListener("abort", () => finish("client_aborted"), { once: true });
-  return new Response(out, { status: httpStatus, statusText: up.statusText, headers });
+  const response = new Response(out, { status: httpStatus, statusText: up.statusText, headers });
+  if (replaying && httpStatus === 429) visiblePoolErrors.add(response);
+  return response;
   }
 }
 
@@ -1558,6 +1606,7 @@ const defaultSleep = (ms: number, signal: AbortSignal): Promise<void> =>
 const BURST_HOLD_MAX_MS = 60_000;
 /** Internal marker set on a 429 whose body proved Codex subscription exhaustion; stripped before the client sees it. */
 const SUBSCRIPTION_EXHAUSTED_HEADER = "x-ais-subscription-exhausted";
+const SUBSCRIPTION_RESET_HEADER = "x-ais-subscription-reset-at";
 
 /** True when a 429 proves subscription exhaustion (unified status or a 5h/7d window `rejected`, or Codex `usage_limit_reached`), not a transient rate limit. */
 export function provesSubscriptionExhaustion(headers: Headers): boolean {
@@ -1628,6 +1677,8 @@ export function exhaustedUntil(headers: Headers, nowMs: number): number {
   const iso = Date.parse(headers.get("anthropic-ratelimit-unified-reset") ?? "");
   if (Number.isFinite(unified) && unified > 0) candidates.push(unified < 1e11 ? unified * 1000 : unified);
   else if (Number.isFinite(iso)) candidates.push(iso);
+  const bodyReset = Number(headers.get(SUBSCRIPTION_RESET_HEADER) ?? "");
+  if (Number.isFinite(bodyReset) && bodyReset > 0) candidates.push(bodyReset < 1e11 ? bodyReset * 1000 : bodyReset);
   const retry = headers.get("retry-after");
   if (retry !== null) {
     const secs = Number(retry);

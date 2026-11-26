@@ -1,5 +1,8 @@
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
+import type { ManualResetInfo } from "../cli/limits/types.ts";
+import type { ProviderCredential } from "./providers/shared.ts";
+import { codexAdapter } from "./providers/codex.ts";
 import { adapterFor as poolAdapterFor } from "../identities/pool/registry.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { fetchZaiLimits } from "../cli/limits/zai-limits.ts";
@@ -11,8 +14,69 @@ import type { SharedReading, UsageReadings } from "./usage-readings.ts";
 
 export const USAGE_TTL_MS = 45_000;
 
+/** Reads the provider's manual reset inventory with the same account-scoped headers as Codex traffic. */
+export async function fetchCodexResetCredits(
+  credential: ProviderCredential,
+  doFetch: (input: string | URL, init?: RequestInit) => Promise<Response> = fetch,
+): Promise<ManualResetInfo | undefined> {
+  const headers = codexAdapter.authHeaders(credential, new Headers());
+  headers.accept = "application/json";
+  const response = await doFetch("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", {
+    headers,
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) return undefined;
+  const body = await response.json() as { available_count?: unknown; credits?: unknown };
+  const credits = Array.isArray(body.credits) ? body.credits as Array<{ id?: unknown; title?: unknown; status?: unknown; expires_at?: unknown }> : undefined;
+  const available = credits?.filter((credit) => credit.status === "available") ?? [];
+  const count = body.available_count;
+  if (!(typeof count === "number" && Number.isFinite(count) && count >= 0) && !credits) return undefined;
+  const availableCount = typeof count === "number" && Number.isFinite(count) && count >= 0 ? Math.floor(count) : available.length;
+  const creditExpiries = available.flatMap((credit) => {
+    const expiry = typeof credit.expires_at === "string" ? Date.parse(credit.expires_at) : Number.NaN;
+    return Number.isFinite(expiry) && typeof credit.id === "string"
+      ? [{ id: credit.id, ...(typeof credit.title === "string" ? { label: credit.title } : {}), endsAt: new Date(expiry).toISOString() }]
+      : [];
+  });
+  return {
+    availableCount,
+    ...(typeof available[0]?.title === "string" ? { label: available[0].title } : {}),
+    ...(creditExpiries[0] ? { expiresAt: new Date(creditExpiries[0].endsAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) } : {}),
+    ...(creditExpiries.length ? { creditExpiries } : {}),
+  };
+}
+
+/** Cache Codex reset credits per identity so repeated Console polls do not hit the provider. */
+export function createCodexResetSource(opts: {
+  fetchCredits(identity: string): Promise<ManualResetInfo | undefined>;
+  ttlMs?: number;
+  now?: () => number;
+}) {
+  const ttl = opts.ttlMs ?? USAGE_TTL_MS;
+  const now = opts.now ?? Date.now;
+  const entries = new Map<string, { value: ManualResetInfo; at: number }>();
+  const inflight = new Map<string, Promise<ManualResetInfo | undefined>>();
+  return async (identity: string): Promise<ManualResetInfo | undefined> => {
+    const entry = entries.get(identity);
+    if (entry && now() - entry.at < ttl) return entry.value;
+    let running = inflight.get(identity);
+    if (!running) {
+      running = opts.fetchCredits(identity).then((value) => {
+        if (value) entries.set(identity, { value, at: now() });
+        else if (entry) entries.set(identity, { value: { ...entry.value, stale: true }, at: now() });
+        return value ?? (entry ? { ...entry.value, stale: true } : undefined);
+      }).catch(() => {
+        if (entry) entries.set(identity, { value: { ...entry.value, stale: true }, at: now() });
+        return entry ? { ...entry.value, stale: true } : undefined;
+      }).finally(() => inflight.delete(identity));
+      inflight.set(identity, running);
+    }
+    return running;
+  };
+}
+
 /** The providers with a usage reader: `fetchPoolUsage` (claude, codex, kimi, zai) and the OpenCode Go read. Others (grok, ali) have no source. */
-const USAGE_READER_PROVIDERS: ReadonlySet<string> = new Set(["claude", "codex", "kimi", "zai", "opencode"]);
+export const USAGE_READER_PROVIDERS: ReadonlySet<GatewayProvider> = new Set(["claude", "codex", "kimi", "zai", "opencode"]);
 
 /** `fresh`: read the source now, past any short-lived shared cache (claude's one-minute last-good file). */
 export type FetchUsage = (provider: GatewayProvider, identity: string, opts?: { fresh?: boolean }) => Promise<PoolUsage | undefined>;

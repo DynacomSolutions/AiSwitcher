@@ -272,7 +272,9 @@ export interface ManualResetInfo {
   cooldownUntil?: string;
   /** When the provider last reported the grant list. */
   grantsCapturedAt?: string;
-  /** Carried over from an earlier read: the latest read did not include the grants. */
+  /** Codex: each currently available credit with its exact provider expiry. */
+  creditExpiries?: { id: string; label?: string; endsAt: string }[];
+  /** True when prior reset data remains after the latest read failed or omitted it. */
   stale?: boolean;
 }
 

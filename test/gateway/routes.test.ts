@@ -976,7 +976,7 @@ describe("claude account paths", () => {
     expect(seen).toHaveLength(0);
   });
   for (const path of ["/v1/sessions", "/v1/messages/batches", "/v1/complete", "/v1/whatever"]) {
-    test(`claude POST ${path} is model traffic: allowlist, ledger row, pool failover on 429`, async () => {
+    test(`claude POST ${path} respects the model allowlist and does not replay an unconfirmed 429`, async () => {
       await addApp("cl", "claude", "anthropic", { models: ["only-this-model"] });
       const refused = await call("cl", path, { method: "POST", body: '{"model":"other-model"}' });
       expect(refused.status).toBeGreaterThanOrEqual(400);
@@ -985,8 +985,9 @@ describe("claude account paths", () => {
       usage.b = { status: "live", maxUtilization: 50, capturedAt: "" };
       reply = (s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response("{}", { status: 429, headers: { "retry-after": "5" } }) : Response.json({ ok: true }));
       const ok = await call("cl", path, { method: "POST", body: '{"model":"only-this-model"}' });
-      expect(ok.status).toBe(200);
-      expect(seen.map((x) => x.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+      expect(ok.status).toBe(429);
+      expect(await ok.text()).toBe("{}");
+      expect(seen.map((x) => x.headers.get("authorization"))).toEqual(["Bearer tok-a"]);
       expect(requests.length).toBeGreaterThan(0);
     });
   }

@@ -17,14 +17,16 @@ import { foldSessionUsage } from "./session-usage.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord, UsageHistoryRow } from "./types.ts";
 import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
+import { USAGE_READER_PROVIDERS } from "./usage-source.ts";
 
 export const DEFAULT_OVERLAP_MS = 24 * 3600_000;
 const MAX_OVERLAP_HOURS = 24 * 30;
 const MAX_USAGE_DAYS = 90;
 
 const PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"];
-/** Providers whose subscription usage the usage source can read (GET /limits). The others have no account windows. */
-export const LIMITS_PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "zai"];
+/** Managed providers checked by GET /limits. Providers without a usage reader do not replace host data. */
+export const LIMITS_PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"];
+/** Providers with a Gateway usage reader. Other providers must not replace host-derived rows with empty Gateway data. */
 const STYLES: readonly ApiStyle[] = ["anthropic", "openai"];
 /** Paths the proxy port answers itself; an app of this name could never be reached. */
 const RESERVED_NAMES = new Set(["healthz", "readyz", "metrics", "browser"]);
@@ -69,6 +71,8 @@ export interface AdminDeps {
   sessions?: SessionsAdminDeps & { token: string };
   /** One identity's cached subscription usage (GET /limits); absent when the gateway has no usage source. */
   usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
+  /** Codex reset credits for one managed identity. Undefined means the provider read failed. */
+  resetCreditsFor?(identity: string): Promise<import("../cli/limits/types.ts").ManualResetInfo | undefined>;
   /** The member accounts of every swap pool of one provider (GET /limits). */
   poolMembers?(provider: GatewayProvider): Promise<string[]>;
   /** Resolves an alias to the identity's canonical name (GET /limits). */
@@ -304,17 +308,28 @@ export function createAdminApp(deps: AdminDeps): Hono {
     if (providerFilter !== undefined && !PROVIDERS.includes(providerFilter as GatewayProvider)) return err(400, "unknown provider");
     const identityFilter = c.req.query("identity");
     const apps = await read.listApps();
-    const limits: AdminLimitRow[] = [];
-    for (const provider of LIMITS_PROVIDERS) {
-      if (providerFilter !== undefined && provider !== providerFilter) continue;
-      const names = await limitsIdentities(deps, apps, provider);
-      for (const identity of names) {
-        if (identityFilter !== undefined && identity !== identityFilter) continue;
-        const usage = await deps.usageFor(provider, identity).catch(() => undefined);
-        limits.push({ provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }) });
+    const providers = LIMITS_PROVIDERS.filter((provider) => providerFilter === undefined || provider === providerFilter);
+    const namesByProvider = await Promise.all(providers.map(async (provider) => ({ provider, names: await limitsIdentities(deps, apps, provider) })));
+    const identities = namesByProvider.flatMap(({ provider, names }) => names
+      .filter((identity) => identityFilter === undefined || identity === identityFilter)
+      .map((identity) => ({ provider, identity })));
+    const limits = new Array<AdminLimitRow>();
+    let next = 0;
+    const workers = Array.from({ length: Math.min(64, identities.length) }, async () => {
+      while (next < identities.length) {
+        const index = next++;
+        const { provider, identity } = identities[index]!;
+        const usage = await deps.usageFor!(provider, identity).catch(() => undefined);
+        const fetchedReset = provider === "codex" ? await deps.resetCreditsFor?.(identity).catch(() => undefined) : undefined;
+        const manualReset = fetchedReset ?? usage?.manualReset;
+        const hasFigure = (usage?.windows?.length ?? 0) > 0 || typeof usage?.maxUtilization === "number";
+        const shouldShowNoFigure = USAGE_READER_PROVIDERS.has(provider) && usage?.noPlan !== true;
+        if (!hasFigure && !manualReset && !shouldShowNoFigure) continue;
+        limits[index] = { provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }), ...(manualReset ? { manualReset } : {}) };
       }
-    }
-    return c.json({ limits });
+    });
+    await Promise.all(workers);
+    return c.json({ limits: limits.filter((row): row is AdminLimitRow => row !== undefined) });
   });
 
   // Spends one reset grant at the gateway, with the member credential from the store. The console never holds that credential.

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { pickIdentity } from "../../src/gateway/select.ts";
-import { createUsageSource as createUsageSourceRaw, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
+import { createCodexResetSource, fetchCodexResetCredits, createUsageSource as createUsageSourceRaw, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
 import { MemoryUsageReadings, type UsageReadings } from "../../src/gateway/usage-readings.ts";
 
 /** The source with a silent log by default, so the tests print no `usage-read` lines. A test that reads the log passes its own. */
@@ -24,6 +24,60 @@ describe("zai token usage", () => {
     expect(u.maxUtilization).toBe(10);
     const zapp: GatewayApp = { ...app, provider: "zai" };
     expect(await pickIdentity(zapp, { usageFor: async () => u, poolMembers: async () => ["id1"] })).toEqual({ identity: "id1" });
+  });
+});
+
+describe("Codex reset source", () => {
+  test("uses account-scoped upstream headers and parses provider credits without converting them to grants", async () => {
+    const calls: Array<{ url: string; auth?: string | null; account?: string | null }> = [];
+    const doFetch = async (input: string | URL, init?: RequestInit): Promise<Response> => {
+      const headers = new Headers(init?.headers);
+      calls.push({ url: String(input), auth: headers.get("authorization"), account: headers.get("chatgpt-account-id") });
+      const index = calls.length;
+      return Response.json({
+        available_count: index === 1 ? 2 : 0,
+        credits: index === 1 ? [{
+          id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_002",
+          title: "Full reset",
+          status: "available",
+          expires_at: "2026-12-01T22:27:07.649Z",
+        }] : [],
+      });
+    };
+    const first = await fetchCodexResetCredits({ identity: "codex-a", accessToken: "access-SYNTHETIC_FIXTURE_A", accountId: "account-SYNTHETIC_FIXTURE_A" }, doFetch);
+    const second = await fetchCodexResetCredits({ identity: "codex-b", accessToken: "access-SYNTHETIC_FIXTURE_B", accountId: "account-SYNTHETIC_FIXTURE_B" }, doFetch);
+    expect(calls).toEqual([
+      { url: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", auth: "Bearer access-SYNTHETIC_FIXTURE_A", account: "account-SYNTHETIC_FIXTURE_A" },
+      { url: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", auth: "Bearer access-SYNTHETIC_FIXTURE_B", account: "account-SYNTHETIC_FIXTURE_B" },
+    ]);
+    expect(first).toMatchObject({ availableCount: 2, creditExpiries: [{ id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_002", endsAt: "2026-12-01T22:27:07.649Z" }] });
+    expect(first).not.toHaveProperty("grants");
+    expect(second).toEqual({ availableCount: 0 });
+  });
+  test("caches repeated reads, keeps known zero, and retains a prior result after errors", async () => {
+    let now = 1_000;
+    let calls = 0;
+    let fail = false;
+    const source = createCodexResetSource({
+      ttlMs: 100,
+      now: () => now,
+      fetchCredits: async () => {
+        calls++;
+        if (fail) throw new Error("synthetic upstream error");
+        return { availableCount: 0 };
+      },
+    });
+    expect(await source("codex-a")).toEqual({ availableCount: 0 });
+    expect(await source("codex-a")).toEqual({ availableCount: 0 });
+    expect(calls).toBe(1);
+    now += 101;
+    fail = true;
+    expect(await source("codex-a")).toEqual({ availableCount: 0, stale: true });
+    expect(calls).toBe(2);
+    expect(await source("codex-a")).toEqual({ availableCount: 0, stale: true });
+    expect(calls).toBe(2);
+    expect(await source("codex-b")).toBeUndefined();
+    expect(calls).toBe(3);
   });
 });
 

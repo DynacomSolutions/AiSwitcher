@@ -116,19 +116,12 @@ calls. A model list is never refused by the reserve (see "Extra routes" below).
 - codex: `429` with `error.type` `usage_limit_reached`, `resets_at` and `resets_in_seconds`, plus `x-codex-primary-*`
   and `x-codex-secondary-*` headers.
 
-A pool fails over to the next member on a member's 429. It waits out short (burst) holds while a member would be
-free. Only when no member is left does it answer in the native shape. Its reset is the earliest across the pool: the
-AIS usage readings plus the resets in the members' own 429 answers during the request (300 s when none is known).
-A pinned app passes a real 429 through unchanged. Other providers keep the generic gateway error, and a pool of such
-a provider passes the last upstream 429 through.
+A pool switches members only when an answer confirms subscription usage exhaustion. It tries each eligible member for the requested model.
+When every member confirms exhaustion, the gateway returns one native limit answer with the earliest known reset. Usage readings count only when current and valid.
+A payment error, ordinary throttle, invalid request or authentication error is not proof of subscription exhaustion. The gateway returns that provider answer intact.
+A pinned app also passes provider errors through unchanged. Other providers use their native error shape when available, or a gateway limit answer with the known reset.
 
-A pool also fails over, before any content, on an upstream overload or server error: HTTP 529, 500, 502, 503 or 504, or an
-Anthropic event stream whose first event is an `overloaded_error` or `api_error` (sent inside a 200). Only a bounded
-prefix of a stream is read, and a normal stream flows on at once. Each other member gets the replayed body once. An
-overload is not quota, so no member is held back. When every member fails, the last upstream answer returns unchanged
-with its request id. Only model-call routes (messages, chat completions, responses, completions) fail over this way: file uploads, message
-batches and other create calls never do. Pinned apps and bodies that cannot be replayed pass the answer through. Each retry counts in
-`ais_gateway_failovers_total{reason}` and writes one `failover` log line.
+A pool switches members only when an answer confirms subscription usage exhaustion. The gateway returns other provider errors intact, including HTTP 500, 502, 503, 504 and 529 answers, plus SSE `overloaded_error` and `api_error` events. It does not replay a request after those answers. A provider quota error may switch only before the gateway emits answer or tool effects. A request whose upstream response body fails before the gateway receives a response can still retry another member. File uploads, message batches and other create calls never replay. Each confirmed quota retry counts in `ais_gateway_failovers_total{reason}` and writes one `failover` log line.
 
 Answers the gateway builds itself carry `x-ais-gateway-error: <reason>`, and their message starts with `AIS gateway: `
 (limit answers keep their `You've hit your ... limit` opening and name the gateway inside the brackets). They never use

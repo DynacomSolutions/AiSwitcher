@@ -221,20 +221,24 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
   const [using, setUsing] = useState<ResetGrant | null>(null);
   if (!reset.grants) {
     // Codex credits (and old cached Claude reads): one summary line.
-    if (reset.availableCount <= 0) return null;
+    const available = reset.availableCount > 0;
     const count = reset.availableCount > 1 ? ` ×${reset.availableCount}` : "";
     const label = reset.label ? `: ${reset.label}` : "";
     const expiry = reset.expiresAt ? ` (expires ${reset.expiresAt})` : "";
     return (
       <>
         <Separator />
-        <div className="flex items-start gap-2 text-xs text-emerald-600 dark:text-emerald-400">
+        <div className={`flex items-start gap-2 text-xs ${available && !reset.stale ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>
           <RotateCcw aria-hidden className="mt-0.5 size-3.5 shrink-0" />
-          <span>
-            Manual reset available{count}
-            {label}
-            {expiry}
-          </span>
+          <div>
+            <p>{available ? `Manual reset available${count}${label}${expiry}` : "No manual reset available"}</p>
+            {reset.stale ? <p>Reset status may be out of date.</p> : null}
+            {reset.creditExpiries?.map((credit) => (
+              <p key={credit.id} className="text-muted-foreground">
+                {credit.label ?? credit.id}: expires {new Date(credit.endsAt).toLocaleString()}
+              </p>
+            ))}
+          </div>
         </div>
       </>
     );

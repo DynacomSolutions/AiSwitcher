@@ -88,7 +88,7 @@ export interface ManualResetInfo {
   cooldownUntil?: string;
   /** Claude only: when the provider last reported the grant list (ISO). Anthropic sends it only near a limit. */
   grantsCapturedAt?: string;
-  /** True when `grants` were carried over from an earlier read because the latest one omitted them. */
+  /** True when prior reset data remains after the latest read failed or omitted it. */
   stale?: boolean;
   /** Codex only: each available credit with its exact expiry (ISO), for the reset-expiry push. */
   creditExpiries?: { id: string; label?: string; endsAt: string }[];

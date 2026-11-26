@@ -26,21 +26,25 @@ describe("a full pool holds a streamed request until a member has room", () => {
   let clock = T0.getTime();
   let readings: Record<string, PoolUsage | undefined>;
   let seen: string[];
+  let seenAt: number[];
   let sleeps: number[];
   let drain: AbortController;
   const events: string[] = [];
   let upstream429 = false;
+  let confirmed429 = true;
   let rows: Array<{ status: string; httpStatus: number }> = [];
   let rejections = 0;
   let usageCalls = 0;
 
   beforeEach(() => {
     upstream429 = false;
+    confirmed429 = true;
     rows = [];
     rejections = 0;
     usageCalls = 0;
     clock = T0.getTime();
     seen = [];
+    seenAt = [];
     sleeps = [];
     events.length = 0;
     drain = new AbortController();
@@ -48,11 +52,12 @@ describe("a full pool holds a streamed request until a member has room", () => {
       hostname: "127.0.0.1", port: 0,
       async fetch(req) {
         seen.push(req.headers.get("authorization") ?? "");
+        seenAt.push(clock);
         await req.arrayBuffer();
         if (upstream429) {
           return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "limit" } }), {
             status: 429,
-            headers: { "content-type": "application/json", "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(Math.floor((T0.getTime() + 3 * HOURS) / 1000)), "retry-after": String(3 * 3600) },
+            headers: { "content-type": "application/json", ...(confirmed429 ? { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(Math.floor((T0.getTime() + 3 * HOURS) / 1000)) } : {}), "retry-after": "5" },
           });
         }
         return new Response('event: message_start\ndata: {"type":"message_start"}\n\n', { headers: { "content-type": "text/event-stream" } });
@@ -103,40 +108,32 @@ describe("a full pool holds a streamed request until a member has room", () => {
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     });
 
-  test("a request that arrives while the pool is full is served after the earliest reset, with no client-visible failure", async () => {
+  test("fresh full usage readings report the earliest reset without a hold", async () => {
     const token = await add(mk("pool", { kind: "pool" }));
     const res = await post(createGatewayApp(deps), "pool", token);
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("text/event-stream");
-    const text = await res.text();
-    expect(text).toContain("event: ping");
-    expect(text).toContain("message_start");
-    expect(text).not.toContain("event: error");
-    // The clock passed the earliest reset (3 h) and no more than one check step beyond it.
-    expect(clock - T0.getTime()).toBeGreaterThanOrEqual(3 * HOURS);
-    expect(clock - T0.getTime()).toBeLessThan(3 * HOURS + 60_000);
-    expect(seen).toHaveLength(1);
-    expect(events).toEqual(["held", "served"]);
+    expect(res.status).toBe(429);
+    expect(await res.text()).toContain("Resets at");
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(60);
+    expect(clock - T0.getTime()).toBeLessThan(1_000);
+    expect(seen).toEqual([]);
+    expect(events).toEqual([]);
   });
 
-  test("a full pool with no known reset (300 s) is held too, and served when a member frees", async () => {
-    // No resetsAt: the answer falls back to 300 s, over the client's 60 s limit.
+  test("fresh full usage readings without a reset report the bounded fallback promptly", async () => {
     readings = { a: { status: "live", maxUtilization: 100, capturedAt: T0.toISOString(), windows: [{ label: "weekly", utilization: 100 }] }, b: { status: "live", maxUtilization: 100, capturedAt: T0.toISOString(), windows: [{ label: "weekly", utilization: 100 }] } };
     const token = await add(mk("pool", { kind: "pool" }));
-    const gw = createGatewayApp(deps);
-    const body = (await post(gw, "pool", token)).text();
-    // After 10 minutes a member frees.
-    const orig = deps.usageFor;
-    deps.usageFor = async (p, id) => (clock >= T0.getTime() + 600_000 ? weekly(20, clock + 7 * 24 * HOURS) : orig(p, id));
-    expect(await body).toContain("message_start");
-    expect(clock - T0.getTime()).toBeGreaterThanOrEqual(600_000);
+    const res = await post(createGatewayApp(deps), "pool", token);
+    expect(res.status).toBe(429);
+    expect(await res.text()).toContain("Resets at");
+    expect(clock - T0.getTime()).toBeLessThan(1_000);
+    expect(events).toEqual([]);
   });
 
   test("a request that is not streamed gets a retry-after the client accepts, not a hold", async () => {
     const token = await add(mk("pool", { kind: "pool" }));
     const res = await post(createGatewayApp(deps), "pool", token, false);
     expect(res.status).toBe(429);
-    expect(Number(res.headers.get("retry-after"))).toBe(55);
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(60);
     expect(events).toEqual([]);
   });
 
@@ -150,7 +147,8 @@ describe("a full pool holds a streamed request until a member has room", () => {
   });
 
   test("a shutdown during a hold resets the stream before any message event, and frees the slot", async () => {
-    const token = await add(mk("pool", { kind: "pool" }));
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     // The first ping step also starts the shutdown: the hold must end there, not wait for a reset.
     deps.sleep = async (ms) => { sleeps.push(ms); clock += ms; drain.abort(); };
     const res = await post(createGatewayApp(deps), "pool", token);
@@ -171,13 +169,14 @@ describe("a full pool holds a streamed request until a member has room", () => {
   });
 
   test("B1: a real Bun server drain gives a Bun client a connection reset, not an SSE error event", async () => {
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
     deps.sleep = undefined as never;
     delete (deps as { sleep?: unknown }).sleep;
     const startedAt = Date.now();
     deps.now = () => new Date(T0.getTime() + (Date.now() - startedAt));
     deps.poolHold = { maxMs: 6 * HOURS, checkMs: 60_000, pingMs: 40 };
-    readings = { a: weekly(100, T0.getTime() + 100 * HOURS), b: weekly(100, T0.getTime() + 100 * HOURS) };
-    const token = await add(mk("pool", { kind: "pool" }));
+    readings = { a: weekly(95, T0.getTime() + 100 * HOURS), b: weekly(95, T0.getTime() + 100 * HOURS) };
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     const gw = createGatewayApp(deps);
     const srv = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, fetch: (r) => gw.fetch(r) });
     try {
@@ -209,6 +208,7 @@ describe("a full pool holds a streamed request until a member has room", () => {
   });
 
   test("N1: a shutdown aborts a replay that has not answered yet", async () => {
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
     let upstreamAborted = false;
     await upstream.stop(true);
     upstream = Bun.serve({
@@ -222,8 +222,8 @@ describe("a full pool holds a streamed request until a member has room", () => {
         return new Response("late");
       },
     });
-    readings = { a: weekly(100, T0.getTime() + 60_000), b: weekly(100, T0.getTime() + 60_000) };
-    const token = await add(mk("pool", { kind: "pool" }));
+    readings = { a: weekly(95, T0.getTime() + 60_000), b: weekly(95, T0.getTime() + 60_000) };
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     const gw = createGatewayApp(deps);
     const res = await post(gw, "pool", token);
     let failure: unknown;
@@ -239,26 +239,23 @@ describe("a full pool holds a streamed request until a member has room", () => {
     expect(upstreamAborted).toBe(true);
   });
 
-  test("P1: a provider 429 on a streamed request (stale readings) is held and served after the reset, not returned with its 3 h retry-after", async () => {
+  test("P1: confirmed provider quota returns the reset error without a 55-second retry loop", async () => {
     readings = { a: weekly(10, T0.getTime() + 7 * 24 * HOURS), b: weekly(10, T0.getTime() + 7 * 24 * HOURS) };
     upstream429 = true;
     const token = await add(mk("pool", { kind: "pool" }));
-    // The provider stops refusing after the hold has run for a while.
-    const orig = deps.sleep!;
-    deps.sleep = async (ms, sig) => { await orig(ms, sig); if (clock >= T0.getTime() + 3 * HOURS) upstream429 = false; };
     const res = await post(createGatewayApp(deps), "pool", token);
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("text/event-stream");
-    const text = await res.text();
-    expect(text).toContain("message_start");
-    expect(text).not.toContain("event: error");
-    expect(events[0]).toBe("held");
-    expect(events.at(-1)).toBe("served");
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(60);
+    expect((await res.text())).toContain("Resets at");
+    expect(clock - T0.getTime()).toBeLessThan(60_000);
   });
 
-  test("P2: a replay that meets a provider 429 continues the hold, and the upstream calls stay bounded", async () => {
-    const token = await add(mk("pool", { kind: "pool" }));
+  test("P2: a transient provider throttle during replay surfaces its status and detail", async () => {
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     const gw = createGatewayApp(deps);
+    upstream429 = true;
+    confirmed429 = false;
     const orig = deps.sleep!;
     deps.sleep = async (ms, sig) => {
       await orig(ms, sig);
@@ -271,36 +268,55 @@ describe("a full pool holds a streamed request until a member has room", () => {
     };
     const res = await post(gw, "pool", token);
     const text = await res.text();
-    expect(text).not.toContain("event: error");
-    expect(text).toContain("message_start");
-    expect(events).not.toContain("failed");
-    expect(events.at(-1)).toBe("served");
-    // One refused call to member a, then the per-replica probe gate (5 min per member): far fewer than the replays.
-    expect(seen.length).toBeLessThan(60);
+    expect(text).toContain("event: error");
+    expect(text).toContain("provider returned HTTP 429: limit");
+    expect(text).not.toContain("message_start");
+    expect(events).toContain("failed");
+    expect(clock - T0.getTime()).toBeLessThan(120_000);
   });
 
-  test("P5: a quota probe that meets a provider 429 holds the request instead of ending it", async () => {
+  test("P5: real quota probes retain the provider reset for immediate client snooze", async () => {
     readings = { a: weekly(10, T0.getTime() + 7 * 24 * HOURS), b: weekly(10, T0.getTime() + 7 * 24 * HOURS) };
     upstream429 = true;
     const token = await add(mk("pool", { kind: "pool" }));
     const gw = createGatewayApp(deps);
     const first = await post(gw, "pool", token, false); // marks both members quota-held from the provider's 429
     await first.arrayBuffer();
-    expect(Number(first.headers.get("retry-after"))).toBeLessThanOrEqual(55);
+    expect(Number(first.headers.get("retry-after"))).toBeGreaterThan(60);
     const before = seen.length;
     readings = { a: weekly(100, T0.getTime() + 3 * HOURS), b: weekly(100, T0.getTime() + 3 * HOURS) };
     const orig = deps.sleep!;
     deps.sleep = async (ms, sig) => { await orig(ms, sig); if (clock >= T0.getTime() + 3 * HOURS) upstream429 = false; };
     const res = await post(gw, "pool", token);
-    expect(res.status).toBe(200);
-    const text = await res.text();
-    expect(text).not.toContain("event: error");
-    expect(text).toContain("message_start");
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(60);
+    expect((await res.text())).toContain("Resets at");
     expect(seen.length - before).toBeLessThan(10);
   });
 
+  test("a held replay never sends work to members below 100 percent but above the reserve", async () => {
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
+    const gw = createGatewayApp(deps);
+    deps.sleep = async (ms) => {
+      sleeps.push(ms);
+      clock += ms;
+      upstream429 = true;
+    };
+    deps.poolHold = { maxMs: 6 * HOURS, checkMs: 1_000, pingMs: 250 };
+    const res = await post(gw, "pool", token);
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("event: error");
+    expect(text).toContain("rate_limit_error");
+    expect(seenAt.every((at) => at >= T0.getTime() + 3 * HOURS)).toBe(true);
+    expect(clock - T0.getTime()).toBeGreaterThanOrEqual(3 * HOURS);
+    expect(clock - T0.getTime()).toBeLessThan(6 * HOURS);
+  });
+
   test("P3/S1: one 3 h hold then served writes one ledger row and no rejection metric", async () => {
-    const token = await add(mk("pool", { kind: "pool" }));
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     const text = await (await post(createGatewayApp(deps), "pool", token)).text();
     expect(text).toContain("message_start");
     expect(rows).toHaveLength(1);
@@ -308,16 +324,21 @@ describe("a full pool holds a streamed request until a member has room", () => {
     expect(rejections).toBe(0);
   });
 
-  test("S1: a hold that times out writes one row", async () => {
-    deps.poolHold = { maxMs: 60_000, checkMs: 30_000, pingMs: 15_000 };
-    const token = await add(mk("pool", { kind: "pool" }));
-    await (await post(createGatewayApp(deps), "pool", token)).text();
-    expect(rows).toEqual([{ status: "rejected", httpStatus: 429 }]);
-    expect(rejections).toBe(0);
+  test("a transient throttle ends a reserve hold with its provider status and detail", async () => {
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
+    upstream429 = true;
+    confirmed429 = false;
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
+    const text = await (await post(createGatewayApp(deps), "pool", token)).text();
+    expect(text).toContain("event: error");
+    expect(text).toContain("provider returned HTTP 429: limit");
+    expect(events).toContain("failed");
   });
 
-  test("S1: a client that leaves during a hold writes one row", async () => {
-    const token = await add(mk("pool", { kind: "pool" }));
+  test("S1: a client that leaves during a held request writes one row", async () => {
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
+    deps.sleep = async (_ms, signal) => await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     const res = await post(createGatewayApp(deps), "pool", token);
     await res.body!.cancel();
     await new Promise((r) => setTimeout(r, 20));
@@ -325,6 +346,7 @@ describe("a full pool holds a streamed request until a member has room", () => {
   });
 
   test("N3: a served replay sends its request-id and rate-limit headers as an SSE comment", async () => {
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
     await upstream.stop(true);
     upstream = Bun.serve({
       hostname: "127.0.0.1", port: 0,
@@ -333,37 +355,40 @@ describe("a full pool holds a streamed request until a member has room", () => {
         return new Response('event: message_start\ndata: {"type":"message_start"}\n\n', { headers: { "content-type": "text/event-stream", "request-id": "req_123", "anthropic-ratelimit-unified-status": "allowed" } });
       },
     });
-    const token = await add(mk("pool", { kind: "pool" }));
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     const text = await (await post(createGatewayApp(deps), "pool", token)).text();
     expect(text).toMatch(/^: ais-replay .*request-id=req_123/m);
     expect(text).toMatch(/^: ais-replay .*anthropic-ratelimit-unified-status=allowed/m);
     expect(text).toContain("message_start");
   });
 
-  test("a hold that outlasts its limit ends with the rate-limit error, never silently", async () => {
-    deps.poolHold = { maxMs: 60_000, checkMs: 30_000, pingMs: 15_000 };
+  test("an unknown reset reports promptly when every fresh usage window is full", async () => {
+    readings = { a: { status: "live", maxUtilization: 100, capturedAt: T0.toISOString(), windows: [{ label: "weekly", utilization: 100 }] }, b: { status: "live", maxUtilization: 100, capturedAt: T0.toISOString(), windows: [{ label: "weekly", utilization: 100 }] } };
     const token = await add(mk("pool", { kind: "pool" }));
-    const text = await (await post(createGatewayApp(deps), "pool", token)).text();
-    expect(text).toContain("rate_limit_error");
-    expect(events).toEqual(["held", "timeout"]);
+    const res = await post(createGatewayApp(deps), "pool", token);
+    expect(res.status).toBe(429);
+    expect(await res.text()).toContain("Resets at");
+    expect(events).toEqual([]);
   });
 
-  test("held requests are capped: the request over the cap gets the plain 429 (retry-after under 60 s)", async () => {
+  test("held requests are capped: an unconfirmed reserve request gets retry-after under 60 s", async () => {
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
     deps.poolHold = { maxHeld: 0 };
-    const token = await add(mk("pool", { kind: "pool" }));
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     const res = await post(createGatewayApp(deps), "pool", token);
     expect(res.status).toBe(429);
     expect(Number(res.headers.get("retry-after"))).toBe(55);
   });
 
   test("a chunked original request: the replay reserves its real size from the body budget, not the 32 MiB cap", async () => {
+    readings = { a: weekly(95, T0.getTime() + 3 * HOURS), b: weekly(95, T0.getTime() + 5 * HOURS) };
     const waiting: number[] = [];
     deps.bodyBudgetBytes = 40 * 1024 * 1024;
     deps.metrics = { ...deps.metrics, bodyBudgetWaiting: (n: number) => { waiting.push(n); } };
     let open!: () => void;
     const gate = new Promise<void>((r) => { open = r; });
     deps.sleep = async (ms) => { await gate; sleeps.push(ms); clock += ms; };
-    const token = await add(mk("pool", { kind: "pool" }));
+    const token = await add({ ...mk("pool", { kind: "pool" }), reservePercent: 90 });
     const gw = createGatewayApp(deps);
     const chunked = (): Promise<Response> => {
       const payload = new TextEncoder().encode(JSON.stringify({ model: "claude-opus-4", stream: true, messages: [] }));

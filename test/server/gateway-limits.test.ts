@@ -138,6 +138,30 @@ describe("mapGatewayLimitRow: codex, kimi, zai", () => {
     expect(claude.overage).toEqual({ active: true, label: "using extra usage" });
   });
 
+  test("Codex gateway reset credits carry known zero and exact provider expiry", () => {
+    const expiresAt = "2026-12-01T22:27:07.649Z";
+    const row = mapGatewayLimitRow({ provider: "codex", identity: "a", status: "live", windows: [{ label: "week", utilization: 0 }], manualReset: {
+      availableCount: 1,
+      creditExpiries: [{ id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_001", label: "Full reset", endsAt: expiresAt }],
+    } })!;
+    expect(row.manualReset).toMatchObject({ availableCount: 1, creditExpiries: [{ id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_001", endsAt: expiresAt }] });
+    expect(mapGatewayLimitRow({ provider: "codex", identity: "a", status: "live", windows: [{ label: "week", utilization: 0 }], manualReset: { availableCount: 0 } })?.manualReset).toEqual({ availableCount: 0 });
+  });
+
+  test("scheduled provider windows stay visible without inventing manual reset credits", () => {
+    for (const provider of ["kimi", "grok", "zai", "ali", "opencode"]) {
+      const row = mapGatewayLimitRow({
+        provider,
+        identity: "provider-SYNTHETIC_FIXTURE",
+        status: "live",
+        windows: [{ label: "week", utilization: 25, resetsAt: RESET_WEEK }],
+        manualReset: { availableCount: 3 },
+      })!;
+      expect(row.windows[0]?.resetsAtMs).toBe(Date.parse(RESET_WEEK));
+      expect(row.manualReset).toBeUndefined();
+    }
+  });
+
   test("approximate-duration labels keep their duration category", () => {
     const r = mapGatewayLimitRow(row("codex", [{ label: "~30d", utilization: 10 }, { label: "~5h", utilization: 20 }, { label: "usage", utilization: 30 }]))!;
     expect(r.windows.map((w) => w.category)).toEqual(["month", "session", "other"]);
@@ -165,7 +189,7 @@ describe("mapGatewayLimits", () => {
         null,
       ],
     });
-    expect(rows.map((r) => r.identity.name)).toEqual(["m1", "m2"]);
+    expect(rows.map((r) => r.identity.name)).toEqual(["m1", "g1", "m2"]);
     expect(rows[1]!.status).toBe("unavailable"); // the only window was malformed
   });
 });
@@ -256,12 +280,22 @@ describe("mergeGatewayLimits", () => {
     expect(merged.results[0]).toMatchObject({ status: "live", capturedAt: STAMP, identity: identity("m1") });
     // No host fallback: the host row's grants never reach a gateway-managed identity.
     expect(merged.results[0]!.manualReset).toBeUndefined();
+    expect(merged.results[2]!.manualReset).toBeUndefined();
     const withGateway = (await mergeGatewayLimits(host, view([gatewayRow("claude", "m1", { manualReset: { availableCount: 2 } })]), {}, noRegistries)) as typeof host;
     expect(withGateway.results[0]!.manualReset).toEqual({ availableCount: 2 });
     expect(merged.results[0]!.windows[0]!.usedPercent).toBe(100);
     expect(merged.results[1]).toEqual(host.results[1]); // the pool is not a managed member row
     expect(merged.results[2]!.status).toBe("live");
     expect(merged.results[2]!.identity).toEqual(identity("c1"));
+  });
+
+  test("an empty gateway response keeps valid host Grok and Ali windows", async () => {
+    const host = payload([
+      hostRow("grok", "g1", { provider: "xai", status: "live", windows: [{ label: "week", category: "week", usedPercent: 35, resetsAtMs: Date.parse(RESET_WEEK) }] }),
+      hostRow("ali", "a1", { provider: "alibaba", status: "live", windows: [{ label: "week", category: "week", usedPercent: 45, resetsAtMs: Date.parse(RESET_WEEK) }] }),
+    ]);
+    const merged = (await mergeGatewayLimits(host, view([]), {}, noRegistries)) as typeof host;
+    expect(merged.results).toEqual(host.results);
   });
 
   test("gateway rows with no host row are added with their registry entry when one exists", async () => {
@@ -312,10 +346,10 @@ describe("reset grants from the gateway", () => {
     expect(row?.manualReset?.grants?.map((g) => [g.id, g.kind, g.usableNow])).toEqual([["full-reset-2611", "full", true], ["launch-2610-fable", "fable", false]]);
   });
 
-  test("a row without grants, a malformed block and a non-claude row carry none", () => {
+  test("a malformed block carries none and Codex ignores Claude grant fields", () => {
     expect(mapGatewayLimitRow(claudeRow(upstreamBody()))?.manualReset).toBeUndefined();
     expect(mapGatewayLimitRow({ ...grantRow, manualReset: { grants: [] } })?.manualReset).toBeUndefined();
-    expect(mapGatewayLimitRow({ provider: "codex", identity: "c1", status: "live", windows: [{ label: "week", utilization: 5 }], manualReset: grantRow.manualReset })?.manualReset).toBeUndefined();
+    expect(mapGatewayLimitRow({ provider: "codex", identity: "c1", status: "live", windows: [{ label: "week", utilization: 5 }], manualReset: grantRow.manualReset })?.manualReset).toEqual({ availableCount: 1, label: "Full reset", stale: true });
   });
 
   test("the spend goes to the gateway admin route with the admin token only", async () => {

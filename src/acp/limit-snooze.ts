@@ -76,13 +76,13 @@ export interface LimitFailure {
   code?: string;
 }
 
-const LIMIT_CODE = /rate[_.-]?limit|usage|quota|limit/i;
+const USAGE_LIMIT_TEXT = /(?:you['’]ve hit your (?:\d+(?:\.\d+)?[- ]hour|weekly|usage) limit|usage limit (?:reached|exhausted)|subscription (?:usage )?limit (?:reached|exhausted))/i;
 /** T3 Code maps this ACP error code to a usage limit. */
 export const USAGE_LIMIT_RPC_CODE = "-32003";
 
 /** Whether a failure is a usage or rate limit (not any other provider error). */
 export function isLimitFailure(f: LimitFailure): boolean {
-  return f.status === 429 || (f.code !== undefined && (f.code === USAGE_LIMIT_RPC_CODE || LIMIT_CODE.test(f.code))) || /usage limit|rate limit/i.test(f.text);
+  return f.code === USAGE_LIMIT_RPC_CODE || USAGE_LIMIT_TEXT.test(f.text);
 }
 
 export type McpFetch = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal }) => Promise<Response>;
