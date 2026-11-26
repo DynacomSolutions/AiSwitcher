@@ -71,6 +71,8 @@ export interface AdminDeps {
   sessions?: SessionsAdminDeps & { token: string };
   /** One identity's cached subscription usage (GET /limits); absent when the gateway has no usage source. */
   usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
+  /** Forces one account-scoped, read-only usage refresh for an explicit limits recheck. */
+  refreshUsageFor?(provider: GatewayProvider, identity: string): Promise<void>;
   /** Codex reset credits for one managed identity. Undefined means the provider read failed. */
   resetCreditsFor?(identity: string): Promise<import("../cli/limits/types.ts").ManualResetInfo | undefined>;
   /** The member accounts of every swap pool of one provider (GET /limits). */
@@ -315,6 +317,12 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const identities = namesByProvider.flatMap(({ provider, names }) => names
       .filter((identity) => identityFilter === undefined || identity === identityFilter)
       .map((identity) => ({ provider, identity })));
+    if (c.req.query("fresh") === "1") {
+      if (providerFilter !== "codex" || !identityFilter || !deps.refreshUsageFor || !identities.some((item) => item.provider === "codex" && item.identity === identityFilter)) {
+        return err(400, "fresh limits reads require one managed Codex identity");
+      }
+      await deps.refreshUsageFor("codex", identityFilter);
+    }
     const limits = new Array<AdminLimitRow>();
     let next = 0;
     const workers = Array.from({ length: Math.min(64, identities.length) }, async () => {

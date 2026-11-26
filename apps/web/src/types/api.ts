@@ -293,6 +293,7 @@ export interface UseCodexResetResult {
   identity: string;
   result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed";
   windowsReset: number;
+  reconciliation?: { status: "confirmed" | "pending" | "not_needed"; usage?: ToolLimitResult };
 }
 
 export type LimitFetchStatus = "live" | "cached" | "unavailable" | "pending";
@@ -332,6 +333,8 @@ export interface ToolLimitResult {
   /** Short account plan label from real wire data, e.g. "Max 20x", "Plus", "Go".
    * Absent when the provider exposes no plan or it could not be read: render nothing then. */
   plan?: string;
+  /** Local query state. A Codex reset rechecks this account until this deadline. */
+  resetPendingUntil?: number;
 }
 
 export interface LimitsResponse {

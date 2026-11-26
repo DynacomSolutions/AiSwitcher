@@ -82,6 +82,16 @@ describe("admin GET /limits", () => {
     expect((await call(app, "/limits", "wrong")).status).toBe(401);
   });
 
+  test("fresh reads require and refresh one Codex identity without a consume", async () => {
+    const refreshed: string[] = [];
+    const app = appWith({ refreshUsageFor: async (provider, identity) => { refreshed.push(`${provider}/${identity}`); } });
+    const response = await call(app, "/limits?provider=codex&identity=c1&fresh=1");
+    expect(response.status).toBe(200);
+    expect(refreshed).toEqual(["codex/c1"]);
+    expect(asked).toEqual(["codex/c1"]);
+    expect((await call(app, "/limits?fresh=1")).status).toBe(400);
+  });
+
   test("one row per managed identity: pool members plus active pins, canonicalised and deduped", async () => {
     const app = appWith({});
     expect((await put(app, "web")).status).toBe(201); // pin m1, already a pool member

@@ -1,7 +1,7 @@
 import { loadAll, type LoadedFile } from "../cli/identities/resolve-tool.ts";
 import type { ToolLimitResult } from "../cli/limits/types.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
-import { loadGatewayLimits, type GatewayLimitsView } from "../identities/gateway-limits-reader.ts";
+import { loadGatewayLimits, mapGatewayLimitRow, type GatewayLimitsView } from "../identities/gateway-limits-reader.ts";
 import { gatewayAdminConfig } from "./gateway-apps.ts";
 import { HttpError } from "./types.ts";
 
@@ -103,7 +103,12 @@ export async function useCodexResetViaGateway(
   identity: string,
   redeemRequestId: string,
   deps: { fetch?: typeof fetch; secretsPath?: string; timeoutMs?: number } = {},
-): Promise<{ identity: string; result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number }> {
+): Promise<{
+  identity: string;
+  result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed";
+  windowsReset: number;
+  reconciliation?: { status: "confirmed" | "pending" | "not_needed"; usage?: ToolLimitResult };
+}> {
   const cfg = await gatewayAdminConfig({ ...(deps.secretsPath ? { secretsPath: deps.secretsPath } : {}) });
   if (!cfg) throw new HttpError(503, "gateway admin is not configured on this console");
   let res: Response;
@@ -117,7 +122,13 @@ export async function useCodexResetViaGateway(
   } catch {
     throw new HttpError(502, "gateway admin unreachable. The reset outcome may be unknown; refresh limits before another attempt.");
   }
-  const body = (await res.json().catch(() => undefined)) as { identity?: unknown; result?: unknown; windowsReset?: unknown; error?: unknown } | undefined;
+  const body = (await res.json().catch(() => undefined)) as {
+    identity?: unknown;
+    result?: unknown;
+    windowsReset?: unknown;
+    reconciliation?: { status?: unknown; usage?: unknown };
+    error?: unknown;
+  } | undefined;
   if (!res.ok) {
     const status = [400, 403, 404, 409, 429, 503].includes(res.status) ? res.status : 502;
     throw new HttpError(status, typeof body?.error === "string" ? body.error.slice(0, 300) : `gateway admin answered ${res.status}`);
@@ -125,5 +136,16 @@ export async function useCodexResetViaGateway(
   if (body?.identity !== identity) throw new HttpError(502, "gateway confirmed a reset for a different identity");
   if (body.result !== "reset" && body.result !== "nothing_to_reset" && body.result !== "no_credit" && body.result !== "already_redeemed") throw new HttpError(502, "gateway returned an unknown Codex reset outcome. Refresh limits before another attempt.");
   if (!Number.isSafeInteger(body.windowsReset) || (body.windowsReset as number) < 0) throw new HttpError(502, "gateway returned an invalid Codex reset response. Refresh limits before another attempt.");
-  return { identity, result: body.result, windowsReset: body.windowsReset as number };
+  const reconciliationStatus = body.reconciliation?.status;
+  const usage = body.reconciliation?.usage
+    ? mapGatewayLimitRow({ ...(body.reconciliation.usage as object), provider: "codex", identity })
+    : undefined;
+  return {
+    identity,
+    result: body.result,
+    windowsReset: body.windowsReset as number,
+    ...(reconciliationStatus === "confirmed" || reconciliationStatus === "pending" || reconciliationStatus === "not_needed"
+      ? { reconciliation: { status: reconciliationStatus, ...(usage ? { usage } : {}) } }
+      : {}),
+  };
 }

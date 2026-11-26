@@ -253,16 +253,35 @@ function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: 
   const mutation = useMutation({
     mutationFn: (redeemRequestId: string) => api.useCodexReset(identity, redeemRequestId),
     retry: false,
-    onSuccess: (result: UseCodexResetResult) => {
-      void qc.invalidateQueries({ queryKey: qk.limits });
+    onSuccess: async (result: UseCodexResetResult) => {
+      // Discard older GET /api/limits work before applying the account-scoped reading from this consume.
+      await qc.cancelQueries({ queryKey: qk.limits });
+      qc.setQueryData<LimitsResponse>(qk.limits, (prev) => prev && ({
+        ...prev,
+        results: prev.results.map((row) => {
+          if (row.toolName !== "codex" || row.identity.name !== result.identity) return row;
+          const reset = row.manualReset;
+          const spent = result.result === "reset" || result.result === "already_redeemed";
+          const manualReset = reset && spent ? { ...reset, stale: true } : reset;
+          const usage = result.reconciliation?.status === "confirmed" ? result.reconciliation.usage : undefined;
+          const pending = result.reconciliation?.status === "pending";
+          return {
+            ...row,
+            ...(usage ? { ...usage, identity: row.identity } : pending ? { status: "cached" as LimitFetchStatus, error: "OpenAI usage refresh is pending. Showing last-known data.", resetPendingUntil: Date.now() + 30_000 } : {}),
+            ...(manualReset ? { manualReset } : {}),
+          };
+        }),
+      }));
       void qc.invalidateQueries({ queryKey: qk.poolsUsage });
+      if (result.result === "reset" || result.result === "already_redeemed") void qc.invalidateQueries({ queryKey: qk.limits });
       if (result.result === "reset") {
-        const description = result.windowsReset > 0
-          ? `${result.windowsReset} limit ${result.windowsReset === 1 ? "window" : "windows"} reset on ${result.identity}.`
-          : `OpenAI confirmed the reset for ${result.identity}.`;
-        toast.success("Reset used", { description });
+        if (result.reconciliation?.status === "confirmed") {
+          toast.success("Reset used", { description: `OpenAI confirmed the reset for ${result.identity}. Fresh usage read for this account.` });
+        } else {
+          toast.info("Reset used, usage pending", { description: `OpenAI confirmed reset for ${result.identity}. Limits keeps the last-known reading.` });
+        }
       } else if (result.result === "already_redeemed") {
-        toast.info("Reset already redeemed", { description: `This request was already processed for ${result.identity}.` });
+        toast.info("Reset already redeemed", { description: result.reconciliation?.status === "confirmed" ? `Request processed for ${result.identity}. Fresh usage read for this account.` : `Request processed for ${result.identity}. Limits keeps the last-known reading.` });
       } else if (result.result === "nothing_to_reset") {
         toast.info("No windows reset", { description: `${result.identity} had no eligible limit windows.` });
       } else {
@@ -282,7 +301,7 @@ function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: 
           <AlertDialogTitle>Use a reset on {identity}?</AlertDialogTitle>
           <AlertDialogDescription>
             This spends one of {availableCount} available reset credits on this Codex account. The reset cannot be returned.
-            The provider may refuse the request. If the outcome is unknown, refresh Limits before you try again.
+            After OpenAI accepts the request, Console checks usage for this account. If OpenAI is slow, Limits keeps the last-known reading and reports pending.
           </AlertDialogDescription>
         </AlertDialogHeader>
         {mutation.error ? <p role="alert" className="text-sm text-destructive">{mutation.error.message}</p> : null}
@@ -434,6 +453,7 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
             {result.error ?? "Quota information is not available for this identity."}
           </p>
         ) : null}
+        {result.status === "cached" && result.error ? <p className="text-sm text-muted-foreground">{result.error}</p> : null}
         {result.windows.length === 0 && !unavailable ? (
           <p className="text-sm text-muted-foreground">This tool reported no quota windows.</p>
         ) : null}

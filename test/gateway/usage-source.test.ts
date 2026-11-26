@@ -15,6 +15,35 @@ const app: GatewayApp = {
   target: { kind: "pin", identity: "id1" }, reservePercent: 80, state: "active", createdAt: "2026-11-01T00:00:00.000Z",
 };
 
+describe("fresh usage refresh ordering", () => {
+  test("a reset reconciliation starts a read after an older fresh read finishes", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+    const releaseFirst = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    const source = createUsageSource({
+      fetchUsage: async (_provider, _identity, opts) => {
+        calls++;
+        if (calls === 1) {
+          started();
+          await releaseFirst;
+          return { status: "live", windows: [{ label: "~7d", utilization: 100 }], capturedAt: "2026-11-26T10:00:00.000Z" };
+        }
+        expect(opts?.fresh).toBe(true);
+        return { status: "live", windows: [{ label: "~7d", utilization: 0 }], capturedAt: "2026-11-26T10:00:01.000Z" };
+      },
+    });
+    const older = source.refreshNow("codex", "codex-SYNTHETIC_FIXTURE");
+    await firstStarted;
+    const reconciliation = source.refreshNowAfterInflight("codex", "codex-SYNTHETIC_FIXTURE");
+    release();
+    await Promise.all([older, reconciliation]);
+    expect(calls).toBe(2);
+    expect(await source.get("codex", "codex-SYNTHETIC_FIXTURE")).toMatchObject({ windows: [{ utilization: 0 }] });
+  });
+});
+
 describe("zai token usage", () => {
   test("the web tools window does not count, so pickIdentity does not refuse", async () => {
     const u = zaiTokenUsage({ tool: "zai", status: "ok", windows: [

@@ -74,6 +74,7 @@ const SYNTHETIC_LIMITS: LimitsResponse = {
       identity: { name: "SYNTHETIC_FIXTURE-codex-credit", ...SYNTHETIC_IDENTITY },
       status: "live",
       gatewayManaged: true,
+      capturedAt: "2026-11-26T09:00:00.000Z",
       windows: [{ label: "Week", category: "week", usedPercent: 70, resetsAtMs: RESET_AT }],
       manualReset: {
         availableCount: 2,
@@ -194,9 +195,16 @@ function limitsStub(answers: Record<string, unknown>): void {
 function limitsAndSpendStub(answers: Record<string, unknown>): void {
   const real = window.fetch.bind(window);
   const calls: Array<{ path: string; method: string; body: string | null }> = [];
+  const limitsCalls: string[] = [];
   const stub = (input: RequestInfo | URL, init?: RequestInit) => {
     const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const u = new URL(raw, location.href);
+    if (u.origin === location.origin && u.pathname === "/api/limits") {
+      limitsCalls.push(u.search);
+      const queue = (window as unknown as { __aisLimitsQueue?: unknown[] }).__aisLimitsQueue;
+      const answer = queue?.length ? queue.shift() : answers[u.pathname];
+      return Promise.resolve(new Response(JSON.stringify(answer), { status: 200, headers: { "content-type": "application/json" } }));
+    }
     if (u.origin === location.origin && Object.hasOwn(answers, u.pathname)) {
       return Promise.resolve(new Response(JSON.stringify(answers[u.pathname]), { status: 200, headers: { "content-type": "application/json" } }));
     }
@@ -204,13 +212,14 @@ function limitsAndSpendStub(answers: Record<string, unknown>): void {
       calls.push({ path: u.pathname, method: init?.method ?? "GET", body: typeof init?.body === "string" ? init.body : null });
       const status = (window as unknown as { __aisCodexResetStatus?: number }).__aisCodexResetStatus ?? 200;
       const result = (window as unknown as { __aisCodexResetResult?: string }).__aisCodexResetResult ?? "nothing_to_reset";
+      const reconciliation = (window as unknown as { __aisCodexReconciliation?: unknown }).__aisCodexReconciliation;
       return Promise.resolve(status === 200
-        ? Response.json({ identity: "SYNTHETIC_FIXTURE-codex-credit", result, windowsReset: 0 })
+        ? Response.json({ identity: "SYNTHETIC_FIXTURE-codex-credit", result, windowsReset: 0, ...(reconciliation ? { reconciliation } : {}) })
         : Response.json({ error: "Codex refused reset (SYNTHETIC_FIXTURE)" }, { status }));
     }
     return real(input, init);
   };
-  Object.assign(window, { __aisCodexResetCalls: calls });
+  Object.assign(window, { __aisCodexResetCalls: calls, __aisLimitsCalls: limitsCalls });
   window.fetch = Object.assign(stub, { preconnect: window.fetch.preconnect });
 }
 
@@ -675,6 +684,112 @@ for (const vp of VIEWPORTS) {
       }
     }, 40_000);
 
+    test("Codex reset applies fresh account usage and keeps pending usage honest", async () => {
+      await setViewport(vp.width, vp.height);
+      const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+        source: `(${limitsAndSpendStub.toString()})(${JSON.stringify(LIMITS_ANSWERS)})`,
+      });
+      try {
+        await open("/limits/openai");
+        const resetButton = 'main button[aria-label="Use reset on SYNTHETIC_FIXTURE-codex-credit"]';
+        await waitFor("Codex reset button", 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(resetButton)})`));
+        await page.eval(`window.__aisCodexResetResult = 'reset'; window.__aisCodexReconciliation = {
+          status: 'confirmed', usage: { toolName: 'codex', provider: 'openai',
+            identity: { name: 'SYNTHETIC_FIXTURE-codex-credit' }, gatewayManaged: true,
+            status: 'live', capturedAt: '2026-11-26T10:00:03.000Z', windows: [{ label: 'Week', category: 'week', usedPercent: 0 }] },
+        }; document.querySelector(${JSON.stringify(resetButton)}).click()`);
+        await waitFor("Codex reset prompt", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
+        expect(await page.eval<string>(`document.querySelector('[role=alertdialog]').innerText`)).toContain("Console checks usage for this account.");
+        await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset').click()`);
+        await waitFor("fresh Codex usage feedback", 5_000, () => page.eval<boolean>(`document.body.innerText.includes('Fresh usage read for this account.')`));
+        expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('0.0%')`)).toBe(true);
+        expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(1);
+        if (evidence) {
+          await mkdir(evidence, { recursive: true });
+          await writeFile(join(evidence, `${vp.width}-codex-reset-confirmed.png`), await page.screenshot());
+        }
+
+      } finally {
+        await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+      }
+    }, 40_000);
+
+    test("a new limits GET after reset cannot replace newer account data", async () => {
+      await setViewport(vp.width, vp.height);
+      const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+        source: `(${limitsAndSpendStub.toString()})(${JSON.stringify(LIMITS_ANSWERS)})`,
+      });
+      try {
+        await open("/limits/openai");
+        const resetButton = 'main button[aria-label="Use reset on SYNTHETIC_FIXTURE-codex-credit"]';
+        await waitFor("Codex reset button", 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(resetButton)})`));
+        const older = { ...SYNTHETIC_LIMITS, results: SYNTHETIC_LIMITS.results.map((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit" ? { ...row, capturedAt: "2026-11-26T09:00:00.000Z", windows: [{ label: "Week", category: "week", usedPercent: 100 }] } : row) };
+        await page.eval(`window.__aisCodexResetResult = 'reset'; window.__aisCodexReconciliation = { status: 'confirmed', usage: {
+          toolName: 'codex', provider: 'openai', identity: { name: 'SYNTHETIC_FIXTURE-codex-credit' }, gatewayManaged: true,
+          status: 'live', capturedAt: '2026-11-26T10:00:00.000Z', windows: [{ label: 'Week', category: 'week', usedPercent: 0 }],
+        }}; window.__aisLimitsQueue = [${JSON.stringify(older)}]; document.querySelector(${JSON.stringify(resetButton)}).click()`);
+        await waitFor("Codex reset prompt", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
+        await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset').click()`);
+        await waitFor("new post-reset limits GET", 8_000, () => page.eval<boolean>(`window.__aisLimitsCalls.length > 1`));
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('0.0%')`)).toBe(true);
+        expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(1);
+      } finally {
+        await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+      }
+    }, 40_000);
+
+    test("pending reset reaches zero through read-only GET rechecks", async () => {
+      await setViewport(vp.width, vp.height);
+      const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+        source: `(${limitsAndSpendStub.toString()})(${JSON.stringify(LIMITS_ANSWERS)})`,
+      });
+      try {
+        await open("/limits/openai");
+        const resetButton = 'main button[aria-label="Use reset on SYNTHETIC_FIXTURE-codex-credit"]';
+        await waitFor("Codex reset button", 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(resetButton)})`));
+        const stale = { ...SYNTHETIC_LIMITS, results: [SYNTHETIC_LIMITS.results.find((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit")!].map((row) => ({ ...row, capturedAt: "2026-11-26T10:00:01.000Z", manualReset: { ...row.manualReset, availableCount: 1 } })) };
+        const fresh = { ...SYNTHETIC_LIMITS, results: [SYNTHETIC_LIMITS.results.find((row) => row.toolName === "codex" && row.identity.name === "SYNTHETIC_FIXTURE-codex-credit")!].map((row) => ({ ...row, capturedAt: "2026-11-26T10:00:03.000Z", windows: [{ label: "Week", category: "week", usedPercent: 0 }], manualReset: { ...row.manualReset, availableCount: 1 } })) };
+        await page.eval(`window.__aisCodexResetResult = 'reset'; window.__aisCodexReconciliation = { status: 'pending' };
+          window.__aisLimitsQueue = [${JSON.stringify(stale)}, ${JSON.stringify(fresh)}]; document.querySelector(${JSON.stringify(resetButton)}).click()`);
+        await waitFor("Codex reset prompt", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
+        await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset').click()`);
+        await waitFor("read-only Codex reconciliation", 8_000, () => page.eval<boolean>(`document.querySelector('main').innerText.includes('1 available') && document.querySelector('main').innerText.includes('0.0%')`));
+        expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(1);
+        expect(await page.eval<boolean>(`window.__aisLimitsCalls.some(q => q.includes('freshCodex=SYNTHETIC_FIXTURE-codex-credit'))`)).toBe(true);
+        expect(await page.eval<boolean>(`window.__aisLimitsCalls.some(q => q.includes('tool=codex') && q.includes('identity=SYNTHETIC_FIXTURE-codex-credit'))`)).toBe(true);
+        expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('1 available')`)).toBe(true);
+        expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('SYNTHETIC_FIXTURE-codex-other-credit')`)).toBe(true);
+      } finally {
+        await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+      }
+    }, 40_000);
+
+    test("Codex reset keeps last-known usage when reconciliation is pending", async () => {
+      await setViewport(vp.width, vp.height);
+      const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+        source: `(${limitsAndSpendStub.toString()})(${JSON.stringify(LIMITS_ANSWERS)})`,
+      });
+      try {
+        await open("/limits/openai");
+        const resetButton = 'main button[aria-label="Use reset on SYNTHETIC_FIXTURE-codex-credit"]';
+        await waitFor("Codex reset button", 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(resetButton)})`));
+        await page.eval(`window.__aisCodexResetResult = 'reset'; window.__aisCodexReconciliation = { status: 'pending' }; document.querySelector(${JSON.stringify(resetButton)}).click()`);
+        await waitFor("Codex reset prompt", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
+        await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset').click()`);
+        await waitFor("pending Codex usage feedback", 5_000, () => page.eval<boolean>(`document.body.innerText.includes('Limits keeps the last-known reading.')`));
+        expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('70.0%')`)).toBe(true);
+        expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(1);
+        expect(await page.eval<boolean>(`!!document.querySelector(${JSON.stringify(resetButton)})`)).toBe(false);
+        if (evidence) {
+          await mkdir(evidence, { recursive: true });
+          await writeFile(join(evidence, `${vp.width}-codex-reset-pending.png`), await page.screenshot());
+        }
+      } finally {
+        await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+      }
+    }, 40_000);
+
     test("Codex reset provider refusal stays visible and does not retry", async () => {
       await setViewport(vp.width, vp.height);
       const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
@@ -831,7 +946,12 @@ describe("1280x900", () => {
         await mkdir(evidence, { recursive: true });
         await writeFile(join(evidence, "1280-codex-reset-limits-multi.png"), await page.screenshot());
       }
-      await page.eval(`window.__aisCodexResetResult = 'reset'; document.querySelector(${JSON.stringify(resetButton)}).click()`);
+      await page.eval(`window.__aisCodexResetResult = 'reset'; window.__aisCodexReconciliation = {
+        status: 'confirmed',
+        usage: { toolName: 'codex', provider: 'openai',
+          identity: { name: 'SYNTHETIC_FIXTURE-codex-credit' }, gatewayManaged: true,
+          status: 'live', capturedAt: '2026-11-26T10:00:03.000Z', windows: [{ label: 'Week', category: 'week', usedPercent: 0 }] },
+      }; document.querySelector(${JSON.stringify(resetButton)}).click()`);
       await waitFor("desktop confirmation", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
       await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent.trim() === 'Confirm use reset').click()`);
       await waitFor("confirmed reset without a window count", 5_000, () => page.eval<boolean>(`document.body.innerText.includes('OpenAI confirmed the reset for SYNTHETIC_FIXTURE-codex-credit.')`));

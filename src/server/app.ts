@@ -114,7 +114,7 @@ export interface ConsoleAppDeps extends GuardDeps {
   /** Test seam for POST /api/limits/claude/:identity/resets/:grant; defaults to Anthropic's reset endpoint. */
   claudeUseReset?: (identity: string, grantId: string) => Promise<claudeResets.UseResetResult>;
   /** Test seam for POST /api/limits/codex/:identity/resets/use; defaults to the authenticated Gateway store. */
-  codexUseReset?: (identity: string, redeemRequestId: string) => Promise<{ identity: string; result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number }>;
+  codexUseReset?: (identity: string, redeemRequestId: string) => Promise<{ identity: string; result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number; reconciliation?: { status: "confirmed" | "pending" | "not_needed"; usage?: unknown } }>;
   /** Test seam: drops the cached /api/limits reads after a spent reset; defaults to the scan daemon's cache. */
   invalidateLimits?: () => void;
   /** Test seam for GET /api/usage/projects; defaults to reading the collector's projects.json. */
@@ -157,12 +157,16 @@ async function registryPoolKeys(): Promise<Set<string>> {
 }
 
 /** The `/api/limits` answer: the host scan merged with the gateway limits, with accounts per row. */
-async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string; identity?: string }, maxAgeS: number, onGateway?: (view: GatewayLimitsView | undefined) => void): Promise<unknown> {
+async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string; identity?: string }, maxAgeS: number, onGateway?: (view: GatewayLimitsView | undefined) => void, freshCodexIdentity?: string): Promise<unknown> {
   // The cluster gateway is the source of truth for the limits of the identities it manages; the host scan covers the rest.
   // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
   const [result, gateway] = await Promise.all([
     runScanIsolated("limits", { ...filters, maxAgeS }, 45_000),
-    (deps.gatewayLimits ?? loadGatewayLimits)().catch(() => undefined),
+    (deps.gatewayLimits
+      ? deps.gatewayLimits()
+      : freshCodexIdentity
+        ? loadGatewayLimits({ provider: "codex", identity: freshCodexIdentity, fresh: true })
+        : loadGatewayLimits()).catch(() => undefined),
   ]);
   onGateway?.(gateway);
   if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "limits scan failed");
@@ -348,7 +352,8 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
     };
-    return c.json(await loadLimitsPayload(deps, filters, numberQuery(c, "maxAge", 45)));
+    const freshCodexIdentity = queryValue(c, "freshCodex");
+    return c.json(await loadLimitsPayload(deps, filters, numberQuery(c, "maxAge", 45), undefined, freshCodexIdentity));
   });
   app.get("/api/usage", async (c) => {
     const filters = {

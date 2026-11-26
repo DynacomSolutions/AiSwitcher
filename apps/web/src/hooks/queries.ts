@@ -1,22 +1,9 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import type { LoginFlowStatus } from "@/types/api";
+import { limitsRefetchInterval, POLL, reconcileLimits } from "@/lib/limits-reconciliation";
+import type { LimitsResponse, LoginFlowStatus } from "@/types/api";
 
-/** Polling intervals from docs/API.md. Files endpoints are on demand. */
-export const POLL = {
-  live: 3_000,
-  flow: 1_500,
-  registry: 10_000,
-  sessions: 15_000,
-  /** /api/sessions/tree: heavy unscoped scans, server caches 15s. */
-  tree: 30_000,
-  /** An open transcript, polled only while the chat is in progress. */
-  transcript: 3_000,
-  slow: 60_000,
-  breakdown: 300_000,
-  /** /api/usage/projects: a file read; the collector rewrites it each cycle. */
-  projects: 120_000,
-} as const;
+export { POLL, reconcileLimits, limitsRefetchInterval } from "@/lib/limits-reconciliation";
 
 export const qk = {
   status: ["status"] as const,
@@ -110,10 +97,26 @@ export function useLocalModelsQuery() {
 }
 
 export function useLimitsQuery() {
+  const client = useQueryClient();
   return useQuery({
     queryKey: qk.limits,
-    queryFn: api.getLimits,
-    refetchInterval: POLL.slow,
+    queryFn: async () => {
+      const current = client.getQueryData<LimitsResponse>(qk.limits);
+      const pending = current?.results.find((row) => row.toolName === "codex" && row.resetPendingUntil && row.resetPendingUntil > Date.now());
+      if (pending) {
+        const scoped = await api.getLimits(pending.identity.name);
+        const authoritative = scoped.results.find((row) => row.toolName === "codex" && row.identity.name === pending.identity.name && row.gatewayManaged);
+        const latest = client.getQueryData<LimitsResponse>(qk.limits) ?? current;
+        if (!latest) return api.getLimits();
+        if (!authoritative) return latest;
+        const results = latest.results.map((row) => row.toolName === "codex" && row.identity.name === pending.identity.name
+          ? { ...authoritative, identity: row.identity } : row);
+        return reconcileLimits(latest, { ...latest, results });
+      }
+      const incoming = await api.getLimits();
+      return reconcileLimits(client.getQueryData<LimitsResponse>(qk.limits), incoming);
+    },
+    refetchInterval: (query) => limitsRefetchInterval(query.state.data),
   });
 }
 

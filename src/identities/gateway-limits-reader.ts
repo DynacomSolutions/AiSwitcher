@@ -223,6 +223,8 @@ export interface LoadGatewayLimitsDeps {
   provider?: string;
   /** Narrows the admin read to one identity (`?identity=`). */
   identity?: string;
+  /** Requests a read-only, account-scoped usage refresh (`?fresh=1`). */
+  fresh?: boolean;
 }
 
 /**
@@ -239,6 +241,7 @@ export async function loadGatewayLimits(deps: LoadGatewayLimitsDeps = {}): Promi
     const query = new URLSearchParams();
     if (deps.provider) query.set("provider", deps.provider);
     if (deps.identity) query.set("identity", deps.identity);
+    if (deps.fresh) query.set("fresh", "1");
     const qs = query.size > 0 ? `?${query}` : "";
     const res = await doFetch(`${url.replace(/\/+$/, "")}/limits${qs}`, {
       headers: { authorization: `Bearer ${token}` },
