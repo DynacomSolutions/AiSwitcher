@@ -94,6 +94,40 @@ export const REPLAY_LIMIT_BYTES = 32 * 1024 * 1024;
 export const ERROR_PEEK_BYTES = 64 * 1024;
 /** Longest all file lookups for one refused request may take together (media-recovery.ts). */
 const FILE_CHECK_BUDGET_MS = 15_000;
+const MARGINAL_QUOTA_REFRESH_BUDGET_MS = 2_500;
+const MARGINAL_QUOTA_REFRESH_COOLDOWN_MS = 30_000;
+
+/** Waits for the real usage source, then reads its updated cache within a fixed request budget. */
+async function refreshMarginalUsage(deps: GatewayDeps, provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined> {
+  if (!deps.refreshUsage) return undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("marginal usage refresh timed out")), MARGINAL_QUOTA_REFRESH_BUDGET_MS);
+    });
+    await Promise.race([deps.refreshUsage(provider, identity), timeout]);
+    return await deps.usageFor(provider, identity).catch(() => undefined);
+  } catch {
+    return undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Returns quota use from windows that have not reset. Expired windows never prove a current quota limit. */
+function quotaProofUtilisation(usage: PoolUsage, model: string | undefined, nowMs: number): number | undefined {
+  const scoped = usageForModel(usage, model);
+  if (!scoped) return undefined;
+  if (usage.windows?.length) {
+    const active = (scoped.windows ?? []).filter((window) => {
+      const reset = Date.parse(window.resetsAt ?? "");
+      return !Number.isFinite(reset) || reset > nowMs;
+    });
+    const values = active.flatMap((window) => Number.isFinite(window.utilization) ? [window.utilization] : []);
+    return values.length ? Math.max(...values) : undefined;
+  }
+  return typeof scoped.maxUtilization === "number" && Number.isFinite(scoped.maxUtilization) ? scoped.maxUtilization : undefined;
+}
 
 /** Headers a front proxy adds that identify the client or the path to it. */
 const PROXY_METADATA = new Set(["cdn-loop", "forwarded", "x-real-ip", "x-request-id", "x-client-ip", "true-client-ip"]);
@@ -513,8 +547,8 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const exhausted = new Map<string, number>();
   /** Provider-confirmed subscription exhaustion, keyed by member and (when needed) requested model scope. */
   const provenQuota = new Map<string, number>();
-  /** Limits background confirmation of marginal full-pool readings to one request per member per minute. */
-  const marginalQuotaRefreshAt = new Map<string, number>();
+  /** Coalesces marginal quota refreshes and limits retries after a failed or inconclusive refresh. */
+  const marginalQuotaRefreshes = new Map<string, { at: number; settled: boolean; promise: Promise<PoolUsage | undefined> }>();
   const resetCredits: ResetCreditsCache = {};
   const accountState = newAccountState();
   const sideGate = new Gate(SIDE_COUNT_MAX_INFLIGHT);
@@ -527,7 +561,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const holdGate = new PoolHoldGate({ ...poolHoldFromEnv(), ...deps.poolHold });
   const hold: HoldCtl = { gate: holdGate, replay: (r) => handle(r) };
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, provenQuota, marginalQuotaRefreshAt, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "internal error while handling the request", "internal_error"));
+    proxy(req, deps, log, budget, exhausted, provenQuota, marginalQuotaRefreshes, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "internal error while handling the request", "internal_error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   const chatDeps = deps.chat ? { chat: deps.chat } : {};
@@ -541,7 +575,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, provenQuota: Map<string, number>, marginalQuotaRefreshAt: Map<string, number>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, provenQuota: Map<string, number>, marginalQuotaRefreshes: Map<string, { at: number; settled: boolean; promise: Promise<PoolUsage | undefined> }>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -999,32 +1033,54 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     // A burst 429, credential hold, or overload never enters this proof set, so those requests still wait and fail over.
     const members = app.target.kind === "pool" ? await eligibleMembers(app, deps).catch(() => []) : [];
     const nowMs = deps.now().getTime();
-    for (const [key, until] of marginalQuotaRefreshAt) if (until <= nowMs) marginalQuotaRefreshAt.delete(key);
-    const allProven = members.length > 0 && (await Promise.all(members.map(async (name) => {
+    const outcomes = members.length > 0 ? await Promise.all(members.map(async (name) => {
       const account = provenQuota.get(exKey(name));
       const scoped = model === undefined ? undefined : provenQuota.get(`${exKey(name)}${MODEL_HOLD_SEP}${model}`);
-      if ((account !== undefined && account > nowMs) || (scoped !== undefined && scoped > nowMs)) return true;
-      // A still-current provider usage reading at 100% is definitive for that scope. Reserve and stale readings do not prove exhaustion.
+      if ((account !== undefined && account > nowMs) || (scoped !== undefined && scoped > nowMs)) return { proven: true, available: false };
+      // A current provider usage reading can prove quota exhaustion. Reserve and stale readings cannot.
       const reading = await deps.usageFor(app.provider, name).catch(() => undefined);
       const capturedAt = Date.parse(reading?.capturedAt ?? "");
-      if (!reading || reading.stale || reading.noPlan || reading.status !== "live" || !Number.isFinite(capturedAt)) return false;
+      if (!reading || reading.stale || reading.noPlan || (reading.status !== "live" && reading.status !== "rate-limited") || !Number.isFinite(capturedAt)) return { proven: false, available: false };
       const ageMs = nowMs - capturedAt;
-      if (ageMs <= 45_000) return (utilisationOf(usageForModel(reading, model)) ?? 0) >= 100;
-      // A bounded inference is safe only for an unscoped full window whose reset is still ahead.
-      // This confirms staggered production snapshots without trusting quota across a reset.
+      if (ageMs <= 45_000) {
+        const util = quotaProofUtilisation(reading, model, nowMs);
+        return { proven: util !== undefined && util >= 100, available: false };
+      }
+      // A marginal full window selects an account for a fresh read. It does not prove quota by itself.
       if (ageMs > 90_000 || !reading.windows?.some((window) =>
         window.model === undefined && window.utilization >= 100 && Date.parse(window.resetsAt ?? "") > nowMs,
-      )) return false;
-      const refreshKey = exKey(name);
-      if (deps.refreshUsage && (marginalQuotaRefreshAt.get(refreshKey) ?? 0) <= nowMs) {
-        marginalQuotaRefreshAt.set(refreshKey, nowMs + 60_000);
-        void deps.refreshUsage(app.provider, name).catch(() => undefined);
+      )) return { proven: false, available: false };
+      const refreshKey = `${app.provider}/${exKey(name)}`;
+      const prior = marginalQuotaRefreshes.get(refreshKey);
+      let refreshed: PoolUsage | undefined;
+      if (prior && !prior.settled) {
+        refreshed = await prior.promise;
+      } else if (prior && nowMs - prior.at < MARGINAL_QUOTA_REFRESH_COOLDOWN_MS) {
+        refreshed = await deps.usageFor(app.provider, name).catch(() => undefined);
+      } else if (deps.refreshUsage) {
+        const state = { at: nowMs, settled: false, promise: Promise.resolve(undefined) as Promise<PoolUsage | undefined> };
+        state.promise = refreshMarginalUsage(deps, app.provider, name);
+        marginalQuotaRefreshes.set(refreshKey, state);
+        void state.promise.then(() => { state.settled = true; });
+        refreshed = await state.promise;
       }
-      return true;
-    }))).every(Boolean);
+      const refreshedAt = Date.parse(refreshed?.capturedAt ?? "");
+      if (!refreshed || refreshed.stale || refreshed.noPlan || (refreshed.status !== "live" && refreshed.status !== "rate-limited") || !Number.isFinite(refreshedAt) || nowMs - refreshedAt > 45_000) return { proven: false, available: false };
+      const util = quotaProofUtilisation(refreshed, model, nowMs);
+      return { proven: util !== undefined && util >= 100, available: util !== undefined && util < (app.reservePercent ?? DEFAULT_RESERVE_PERCENT) };
+    })) : [];
+    const allProven = outcomes.length > 0 && outcomes.every((outcome) => outcome.proven);
     if (allProven) {
       confirmedPoolAnswers.add(out);
       return out;
+    }
+    if (outcomes.some((outcome) => outcome.available) && !replaying && body.kind === "buffered") {
+      const headers = new Headers(req.headers);
+      headers.set("content-length", String(body.bytes.length));
+      headers.delete("transfer-encoding");
+      const retry = new Request(req.url, { method: req.method, headers, body: body.bytes, signal: req.signal });
+      heldReplays.add(retry);
+      return hold.replay(retry);
     }
     if (!replaying) {
       const limitText = await out.clone().text().then((t) => { try { return (JSON.parse(t) as { error?: { message?: string } }).error?.message ?? why; } catch { return why; } }).catch(() => why);
