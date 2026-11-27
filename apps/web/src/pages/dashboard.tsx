@@ -43,7 +43,7 @@ function SummaryCard({
         <CardTitle className="text-2xl tabular-nums">{value}</CardTitle>
       </CardHeader>
       {hint ? (
-        <CardContent className="text-xs text-muted-foreground">{hint}</CardContent>
+        <CardContent className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">{hint}</CardContent>
       ) : null}
     </Card>
   );
