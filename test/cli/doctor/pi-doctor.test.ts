@@ -15,7 +15,12 @@ let dirs: Record<"claude" | "codex" | "grok" | "kimi" | "pi", string> = {} as ne
 
 const ACME = "acme";
 
+let savedOwner: string | undefined;
+
 beforeEach(async () => {
+  // Only the gateway owner can reconcile the synthetic Claude registry member.
+  savedOwner = process.env.AIS_GATEWAY_OWNER;
+  process.env.AIS_GATEWAY_OWNER = "1";
   const root = await mkdtemp(join(tmpdir(), "ais-pi-doctor-"));
   tempDirs.push(root);
   dirs = {
@@ -43,6 +48,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  if (savedOwner === undefined) delete process.env.AIS_GATEWAY_OWNER;
+  else process.env.AIS_GATEWAY_OWNER = savedOwner;
   for (const [tool, path] of [
     ["claude", CLAUDE_CONFIG],
     ["codex", CODEX_CONFIG],
