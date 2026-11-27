@@ -94,13 +94,39 @@ for (const tool of ["claude", "codex"] as const) {
       expect(row.revoked).toBe(false);
     });
 
-    // Only codex stores a mint time in its grant, so only it can compare the error time with it.
-    (tool === "codex" ? test : test.skip)("an error before the stored login was minted does not show", async () => {
-      const fp = await writeLogin(tool, "rt-same", Math.floor(Date.now() / 1000) + 3600);
+    // Only codex stores a mint time in its grant, so only it can show the skew case.
+    for (const skewS of [2, 30]) {
+      (tool === "codex" ? test : test.skip)(`a dead row for the current refresh token still revokes it when the access token is ${skewS} s newer than the row`, async () => {
+        const fp = await writeLogin(tool, "rt-same", Math.floor(Date.now() / 1000) + skewS);
+        const backend = new MemoryRefreshBackend();
+        await journal(backend, fp, "dead", "refresh_token_invalidated");
+        const row = await report(backend);
+        expect(row.revoked).toBe(true);
+        expect(row.lastError).toMatchObject({ code: "refresh_token_invalidated" });
+        expect(row.nextRefreshAt).toBeNull();
+      });
+    }
+
+    (tool === "codex" ? test : test.skip)("a failed row for the current refresh token still shows when the access token is newer than the row", async () => {
+      const fp = await writeLogin(tool, "rt-same", Math.floor(Date.now() / 1000) + 30);
       const backend = new MemoryRefreshBackend();
       await journal(backend, fp, "failed", "transport");
       const row = await report(backend);
-      expect(row.lastError).toBeNull();
+      expect(row.lastError).toMatchObject({ code: "transport" });
+      expect(row.revoked).toBe(false);
+    });
+
+    // Without a refresh token the grant has no fingerprint, so the mint time is the only way to date the error.
+    (tool === "codex" ? test : test.skip)("a grant with no fingerprint falls back to the mint time", async () => {
+      const mintedAt = Math.floor(Date.now() / 1000) + 3600;
+      await writeFile(join(configDir, "auth.json"), JSON.stringify({ tokens: { access_token: jwt(mintedAt, mintedAt + 8 * 3600) }, last_refresh: new Date(mintedAt * 1000).toISOString() }));
+      const backend = new MemoryRefreshBackend();
+      await journal(backend, grantFingerprint({ access_token: "x", refresh_token: "rt-old" }), "failed", "transport");
+      const newer = await report(backend);
+      expect(newer.lastError).toBeNull();
+      await writeFile(join(configDir, "auth.json"), JSON.stringify({ tokens: { access_token: jwt(NOW, NOW + 8 * 3600) }, last_refresh: new Date(NOW * 1000).toISOString() }));
+      const older = await report(backend);
+      expect(older.lastError).toMatchObject({ code: "transport" });
     });
 
     test("a dead row for the current refresh token still revokes the login", async () => {
