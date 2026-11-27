@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
 import { readdir } from "node:fs/promises";
 import { isDataError } from "../../src/gateway/ledger-buffer.ts";
-import { PgPoolResetJournal, poolWindowKey } from "../../src/gateway/pool-reset.ts";
+import { checkCodexRedemptionFence, PgPoolResetJournal, poolWindowKey } from "../../src/gateway/pool-reset.ts";
 import { PgResetCreditInvalidations } from "../../src/gateway/reset-credit-cache.ts";
 import { PgUsageReadings } from "../../src/gateway/usage-readings.ts";
 import { migrate, PgGatewayStore } from "../../src/gateway/pg-store.ts";
@@ -95,7 +95,8 @@ if (!url && process.env.CI && !optOut) {
       expect(await journal.recordAttempt(`${credit}-different`, request, identity, crypto.randomUUID())).toBe(false);
       expect(await journal.inventoryFenceScope(identity)).toEqual({ any: true, relevant: true });
       expect(await journal.inventoryFenceScope(`${identity}-alias`, accountId)).toEqual({ any: true, relevant: true });
-      expect(await journal.inventoryFenceScope(`${identity}-unrelated`)).toEqual({ any: true, relevant: false });
+      expect(await journal.inventoryFenceScope(`${identity}-alias`)).toEqual({ any: true, relevant: true });
+      expect(await journal.inventoryFenceScope(`${identity}-unrelated`, `${accountId}-unrelated`)).toEqual({ any: true, relevant: false });
       await journal.releaseAttempt(credit, crypto.randomUUID());
       expect(await journal.usedCredits([credit])).toEqual(new Set([credit]));
       expect(await journal.manualAttempted(credit)).toBe(true);
@@ -109,6 +110,12 @@ if (!url && process.env.CI && !optOut) {
       expect(await journal.manualAttempted(credit)).toBe(true);
       expect(await journal.usedCredits([credit])).toEqual(new Set([credit]));
       expect(await journal.accountOutcomePending(identity, accountId)).toBe(false);
+      const alias = `${identity}-alias`;
+      const incomplete = {
+        credential: { identity: alias, accessToken: "access-SYNTHETIC_FIXTURE-alias" },
+        inventory: async () => ({ available_count: 2, credits: [{ id: `${credit}-other`, status: "available" }] }),
+      };
+      await expect(checkCodexRedemptionFence(journal, alias, incomplete)).rejects.toThrow("already attempted");
       const relieved = { ...baseline, windows: [{ label: "week", utilization: 20 }] };
       await journal.reconcileReading(identity, relieved);
       expect(await journal.verifiedAt([identity])).toBeUndefined();

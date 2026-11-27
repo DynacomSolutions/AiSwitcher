@@ -347,11 +347,12 @@ export class PgPoolResetJournal {
   }
 
   async inventoryFenceScope(identity: string, accountId?: string): Promise<{ any: boolean; relevant: boolean }> {
+    const account = accountId?.trim() || null;
     const [row] = await this.sql`SELECT
       EXISTS (SELECT 1 FROM codex_pool_reset_attempts UNION ALL SELECT 1 FROM codex_auto_reset_claims) AS has_attempts,
       (EXISTS (SELECT 1 FROM codex_pool_reset_attempts
-        WHERE identity IS NULL OR identity = ${identity} OR account_id = ${accountId ?? null})
-        OR EXISTS (SELECT 1 FROM codex_auto_reset_claims WHERE identity = ${identity} OR account_id = ${accountId ?? null})) AS relevant`;
+        WHERE identity IS NULL OR identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
+        OR EXISTS (SELECT 1 FROM codex_auto_reset_claims WHERE identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)) AS relevant`;
     return { any: row.has_attempts, relevant: row.relevant };
   }
 
