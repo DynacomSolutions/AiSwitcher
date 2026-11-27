@@ -1236,7 +1236,6 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     store,
     autoReset: autoResetConfig,
     ...(poolResetJournal && reservationCleanup ? { poolReset: {
-      activationEnabled: false,
       thresholds: async () => {
         const groups = await Promise.all([...USAGE_READER_PROVIDERS].map((provider) => namedPools(provider)));
         return thresholdReadings(groups.flat().filter(({ tool, pool }) => validPoolRoute(tool, pool)));
