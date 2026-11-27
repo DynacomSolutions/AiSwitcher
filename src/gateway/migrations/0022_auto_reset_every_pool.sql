@@ -10,20 +10,7 @@ INSERT INTO auto_reset_settings (provider, name, enabled)
   SELECT 'codex', name, enabled FROM codex_auto_reset_settings WHERE kind = 'pool'
   ON CONFLICT DO NOTHING;
 
--- Identity permissions are gone. This table records which ones existed. They never become pool settings.
-CREATE TABLE IF NOT EXISTS auto_reset_dropped_identity_settings (
-  provider text NOT NULL,
-  name text NOT NULL,
-  enabled boolean NOT NULL,
-  dropped_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  PRIMARY KEY (provider, name)
-);
-
-INSERT INTO auto_reset_dropped_identity_settings (provider, name, enabled)
-  SELECT 'codex', name, enabled FROM codex_auto_reset_settings WHERE kind = 'identity'
-  ON CONFLICT DO NOTHING;
-
-DELETE FROM codex_auto_reset_settings WHERE kind = 'identity';
+-- Identity rows stay in codex_auto_reset_settings. No query reads them, so they have no effect.
 
 ALTER TABLE codex_auto_reset_claims ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT 'codex';
 

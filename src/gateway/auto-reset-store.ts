@@ -259,6 +259,7 @@ function claimSummary(row: ClaimRow | undefined): AutoResetClaim | undefined {
   };
 }
 
+// Setting queries ignore historical kind = 'identity' rows and leave them in place.
 export class PgAutoResetStore implements AutoResetStore {
   constructor(private readonly sql: SQL) {}
 

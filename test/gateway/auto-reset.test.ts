@@ -135,6 +135,34 @@ describe("Codex renewal recovery", () => {
     expect(h.reads).toContain("missing");
     expect(h.spends).toEqual([]);
     expect(await h.store.lastClaim("codex", "renewal")).toBeUndefined();
+    await h.store.setEnabled("codex", "renewal", false);
+    expect(await h.recovery.recover(input())).toBeUndefined();
+    expect(h.spends).toEqual([]);
+  });
+
+  test("a disable after credit selection blocks the claim and spend", async () => {
+    const h = harness();
+    await allow(h.store);
+    const recovery = createAutoResetRecovery({
+      ...h.options,
+      claim: async (planned) => {
+        await h.store.setEnabled("codex", planned.pool, false);
+        return h.store.claim(planned);
+      },
+    });
+    expect(await recovery.recover(input())).toBeUndefined();
+    expect(await h.store.lastClaim("codex", "renewal")).toBeUndefined();
+    expect(h.spends).toEqual([]);
+  });
+
+  test("chooses credits only from routed members of enabled pools", async () => {
+    const h = harness(undefined, {
+      pools: async () => [{ name: "renewal", members: ["beta"] }, { name: "disabled", members: ["alpha"] }],
+    });
+    await allow(h.store);
+    expect(await h.recovery.recover(input())).toBe("beta");
+    expect(h.reads).toContain("alpha");
+    expect(h.spends).toEqual([{ identity: "beta", creditId: betaCredit, redeemRequestId: expect.any(String) }]);
   });
 
   test("durably records the plan before spend, then records and confirms the result", async () => {

@@ -1208,7 +1208,11 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
     };
     const claim = { pool, identity: identity.name, startedAt: "2026-11-27T08:00:00.000Z", status: "pending" as const };
     const settings: AutoResetResponse = {
-      configured: true, providers: [{ provider: "codex", supported: true, pools: [], memberClaims: { [identity.name]: claim } }],
+      configured: true,
+      providers: [{
+        provider: "codex", supported: true, memberClaims: { [identity.name]: claim },
+        pools: [{ name: pool, enabled: false, members: [identity.name], lastClaim: claim }],
+      }],
     };
     const usage: UsageResponse = {
       generatedAt: initial.fetchedAt,
@@ -1270,10 +1274,13 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       await waitFor("live connection", 5_000, () => page.eval<boolean>(`!document.querySelector(${JSON.stringify(help)})`));
 
       await setQuota(50, 1, "2026-11-27T08:05:00.000Z");
-      await page.eval(`
-        window.__aisLive.answers['/api/limits/auto-reset'].providers[0].memberClaims['fixture-codex'].status = 'reset';
+      await page.eval(`(() => {
+        const view = window.__aisLive.answers['/api/limits/auto-reset'].providers[0];
+        view.memberClaims['fixture-codex'].status = 'reset';
+        view.pools[0].lastClaim.status = 'reset';
+        view.pools[0].enabled = true;
         window.__aisLive.send('change', ['limits', 'auto-reset']);
-      `);
+      })()`);
       await waitText("50.0%");
       await waitText("Reset credits (1)");
       await waitText("Last automatic reset: reset");
@@ -1315,6 +1322,17 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       await capture("after");
 
       await page.eval(`document.querySelector('main a[href="/limits"]').click()`);
+      await waitText("Last claim: reset");
+      await waitText("Automatic reset on");
+      await page.eval(`(() => {
+        const link = document.querySelector('main a[href="/limits/pools/codex/${pool}"]');
+        window.__aisLivePoolCard = link.closest('[data-slot=card]');
+        const rule = window.__aisLive.answers['/api/limits/auto-reset'].providers[0].pools[0];
+        rule.enabled = false;
+        window.__aisLive.send('change', ['auto-reset']);
+      })()`);
+      await waitText("Automatic reset off");
+      expect(await page.eval<boolean>(`window.__aisLivePoolCard === document.querySelector('main a[href="/limits/pools/codex/${pool}"]').closest('[data-slot=card]')`)).toBe(true);
       await waitFor("initial usage figure", 5_000, () => page.eval<boolean>(`
         Array.from(document.querySelectorAll('main [data-slot=card-title]')).some(node => node.textContent === '30')
       `));

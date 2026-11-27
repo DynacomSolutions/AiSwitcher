@@ -36,7 +36,7 @@ export function applyLimitsAutoReset(results: ToolLimitResult[], view: AutoReset
     const pools = new Map(row.pools.map((pool) => [pool.name, pool]));
     applied = applied.map((result) => {
       if (result.toolName !== row.provider || result.provider !== provider) return result;
-      const pool = pools.get(result.identity.name);
+      const pool = result.identity.swapPool ? pools.get(result.identity.name) : undefined;
       if (pool) {
         pools.delete(pool.name);
         return { ...result, autoReset: pool };

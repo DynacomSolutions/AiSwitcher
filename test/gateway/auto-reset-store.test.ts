@@ -60,7 +60,7 @@ async function checkRearm(
   a: AutoResetStore, b: AutoResetStore, ageFirstClaim: (eventKey: string) => Promise<void>,
 ): Promise<string> {
   const first = claim("generation-first", ["epsilon", "zeta"]);
-  const { pool, identity, eventKey, redeemRequestId } = first;
+  const { pool, eventKey, redeemRequestId } = first;
   const next: AutoResetClaimInput = {
     ...claim("generation-next", ["epsilon", "zeta"]),
     eventKey,
@@ -195,10 +195,10 @@ if (!url && process.env.CI && !optOut) {
 } else {
   if (!new URL(url).pathname.includes("test")) throw new Error("The PostgreSQL renewal test needs a database with test in its name");
 
-  test("separate PostgreSQL clients share permissions, claim one winner and preserve audit evidence", async () => {
+  test("separate PostgreSQL clients share pool rules, claim one winner and preserve audit evidence", async () => {
     await migrate(url);
     const sqlA = new SQL(url, { max: 2 });
-    const sqlB = new SQL(url, { max: 2 });
+    const sqlB = new SQL(url, { max: 1 });
     try {
       const a = new PgAutoResetStore(sqlA);
       const b = new PgAutoResetStore(sqlB);
@@ -316,27 +316,57 @@ if (!url && process.env.CI && !optOut) {
       ]);
 
       const target = claim("disabled-during-claim", ["delta"]);
+      // Old identity rows stay in the table. They never allow a claim.
+      await sqlA`INSERT INTO codex_auto_reset_settings (kind, name, enabled)
+        VALUES ('identity', ${target.pool}, true), ('identity', ${target.identity}, true)`;
+      await a.setEnabled("codex", target.pool, false);
+      expect(await b.enabled("codex", target.pool)).toBeFalse();
+      expect(await b.claim(target)).toEqual({ kind: "blocked" });
+
       await a.setEnabled("codex", target.pool, true);
-      const updated = Promise.withResolvers<void>();
+      const [{ pid: claimantPid }] = await sqlB`SELECT pg_backend_pid() AS pid`;
+      const updated = Promise.withResolvers<number>();
       const release = Promise.withResolvers<void>();
       const disable = sqlA.begin(async (tx) => {
+        const [{ pid }] = await tx`SELECT pg_backend_pid() AS pid`;
         await tx`UPDATE auto_reset_settings SET enabled = false WHERE provider = 'codex' AND name = ${target.pool}`;
-        updated.resolve();
+        updated.resolve(pid);
         await release.promise;
       });
-      await updated.promise;
+      const blockerPid = await Promise.race([updated.promise, disable.then(() => { throw new Error("Disable committed early"); })]);
       const pending = b.claim(target);
-      await wait(50);
-      release.resolve();
-      await disable;
-      expect(await pending).toEqual({ kind: "blocked" });
+      const observed = AbortSignal.timeout(750);
+      const waitForRowLock = async () => {
+        while (!observed.aborted) {
+          const [{ blocked }] = await sqlA`SELECT ${blockerPid}::int = ANY(pg_blocking_pids(${claimantPid}::int)) AS blocked`;
+          if (blocked) return true;
+          await wait(5);
+        }
+        return false;
+      };
+      let blockedByDisable: boolean;
+      try {
+        blockedByDisable = await Promise.race([
+          waitForRowLock(),
+          pending.then(() => false),
+        ]);
+      } finally {
+        release.resolve();
+      }
+      expect(await Promise.all([pending, disable])).toEqual([{ kind: "blocked" }, undefined]);
+      expect(blockedByDisable).toBeTrue();
       expect(await a.findClaim(target.eventKey)).toBeUndefined();
+      const legacy = await sqlA`SELECT enabled FROM codex_auto_reset_settings
+        WHERE kind = 'identity' AND name IN (${target.pool}, ${target.identity})`;
+      expect(legacy).toEqual([{ enabled: true }, { enabled: true }]);
     } finally {
       await sqlA`DELETE FROM codex_auto_reset_claims WHERE left(event_key, 13) = 'renewal-test-'`;
       await sqlA`DELETE FROM auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
+      await sqlA`DELETE FROM codex_auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
       await Promise.all([sqlA.close(), sqlB.close()]);
     }
   }, 10_000);
+
   test("PostgreSQL keeps pool settings and claims apart for each provider", async () => {
     await migrate(url);
     const sql = new SQL(url, { max: 2 });
@@ -363,7 +393,7 @@ if (!url && process.env.CI && !optOut) {
     }
   }, 10_000);
 
-  test("the migration keeps Codex pool settings, drops identity settings and records them", async () => {
+  test("the migration keeps Codex pool settings and ignores old identity rows", async () => {
     await migrate(url);
     const sql = new SQL(url, { max: 2 });
     try {
@@ -373,17 +403,17 @@ if (!url && process.env.CI && !optOut) {
       await sql`DELETE FROM schema_migrations WHERE version = '0022_auto_reset_every_pool'`;
       await migrate(url);
       expect(await new PgAutoResetStore(sql).enabled("codex", "renewal-test-legacy-pool")).toBeTrue();
-      // A dropped identity setting never becomes a pool setting for any provider.
+      // An old identity row never becomes a pool setting for any provider.
       const settings = await sql`SELECT provider, name FROM auto_reset_settings WHERE name = 'renewal-test-legacy-member'`;
       expect(settings).toHaveLength(0);
-      const legacy = await sql`SELECT name FROM codex_auto_reset_settings WHERE kind = 'identity' AND name = 'renewal-test-legacy-member'`;
-      expect(legacy).toHaveLength(0);
-      const noted = await sql`SELECT provider, enabled FROM auto_reset_dropped_identity_settings WHERE name = 'renewal-test-legacy-member'`;
-      expect(noted).toEqual([{ provider: "codex", enabled: true }]);
+      // The row stays in place and no store query reads it.
+      const legacy = await sql`SELECT enabled FROM codex_auto_reset_settings WHERE kind = 'identity' AND name = 'renewal-test-legacy-member'`;
+      expect(legacy).toEqual([{ enabled: true }]);
+      const store = new PgAutoResetStore(sql);
+      expect(await store.enabled("codex", "renewal-test-legacy-member")).toBeFalse();
     } finally {
       await sql`DELETE FROM codex_auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
       await sql`DELETE FROM auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
-      await sql`DELETE FROM auto_reset_dropped_identity_settings WHERE left(name, 13) = 'renewal-test-'`;
       await sql.close();
     }
   }, 10_000);

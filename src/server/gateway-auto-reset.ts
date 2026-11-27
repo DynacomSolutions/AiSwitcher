@@ -34,7 +34,9 @@ export function createGatewayAutoResetRequest(deps: GatewayAutoResetDeps = {}) {
       const status = [400, 404, 410, 503].includes(response.status) ? response.status : 502;
       throw new HttpError(status, typeof result?.error === "string" ? result.error.slice(0, 300) : `gateway admin answered ${response.status}`);
     }
-    return method === "GET" ? { ...result, configured: true } : result;
+    // An older gateway still sends `identities`. The console ignores that list.
+    const { identities: _ignored, ...view } = result;
+    return method === "GET" ? { ...view, configured: true } : result;
   };
 }
 
