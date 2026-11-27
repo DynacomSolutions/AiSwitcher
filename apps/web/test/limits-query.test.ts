@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { canSpendCodexReset, SPEND_LOCK_MS } from "../src/lib/codex-reset.ts";
-import { applyRefreshedLimits, limitsRefetchInterval, POLL, reconcileLimits } from "../src/lib/limits-reconciliation.ts";
+import { canSpendCodexReset, creditsAreLastKnown, spendCreditSentence, SPEND_LOCK_MS } from "../src/lib/codex-reset.ts";
+import { adjustRefreshCounts, applyRefreshedLimits, isIdentityRefreshing, limitsRefetchInterval, POLL, reconcileLimits } from "../src/lib/limits-reconciliation.ts";
 import type { LimitsResponse, ToolLimitResult } from "../src/types/api.ts";
 
 const capturedAt = (seconds: number) => new Date(seconds * 1_000).toISOString();
@@ -134,3 +134,60 @@ describe("the Codex use-reset button", () => {
 function registryIdentityOf(name: string) {
   return { name: `SYNTHETIC_FIXTURE-${name}`, label: name, configDir: "synthetic" };
 }
+
+describe("the spend lock survives the server rows", () => {
+  const spentRow = (spentAt: number): ToolLimitResult => ({ ...codexRow("member-a", 100, 1), manualReset: { availableCount: 1, stale: true, spentAt } });
+  const serverRow = (captured: number): ToolLimitResult => ({ ...codexRow("member-a", 100, captured), manualReset: { availableCount: 1 } });
+  const now = 1_000_000;
+
+  test("a poll that returns the server reset keeps spentAt, so the button stays hidden for the lock time", () => {
+    const next = reconcileLimits(payload(spentRow(now - 1_000)), payload(serverRow(5)), now);
+    expect(next.results[0]?.manualReset?.spentAt).toBe(now - 1_000);
+    expect(canSpendCodexReset(next.results[0]!, now)).toBe(false);
+    expect(canSpendCodexReset(next.results[0]!, now + SPEND_LOCK_MS)).toBe(true);
+  });
+
+  test("a manual refresh keeps spentAt too", () => {
+    const next = applyRefreshedLimits(payload(spentRow(now - 1_000)), [payload(serverRow(5))]);
+    expect(next?.results[0]?.manualReset?.spentAt).toBe(now - 1_000);
+  });
+
+  test("a row that was never spent gains no spentAt", () => {
+    const next = reconcileLimits(payload(codexRow("member-a", 100, 1)), payload(serverRow(5)), now);
+    expect(next.results[0]?.manualReset).not.toHaveProperty("spentAt");
+  });
+});
+
+describe("overlapping refresh calls", () => {
+  test("a card keeps spinning until the last call that covers it ends", () => {
+    const empty = new Map<string, number>();
+    const one = adjustRefreshCounts(empty, [{ tool: "codex", identity: "a" }], 1);
+    const both = adjustRefreshCounts(one, [{ tool: "codex", identity: "a" }, { tool: "codex", identity: "b" }], 1);
+    const firstEnded = adjustRefreshCounts(both, [{ tool: "codex", identity: "a" }], -1);
+    expect(isIdentityRefreshing(firstEnded, "codex", "a")).toBe(true);
+    expect(isIdentityRefreshing(firstEnded, "codex", "b")).toBe(true);
+    const secondEnded = adjustRefreshCounts(firstEnded, [{ tool: "codex", identity: "a" }, { tool: "codex", identity: "b" }], -1);
+    expect(isIdentityRefreshing(secondEnded, "codex", "a")).toBe(false);
+    expect(secondEnded.size).toBe(0);
+  });
+
+  test("a call for a whole tool covers every identity of that tool, and no other tool", () => {
+    const counts = adjustRefreshCounts(new Map(), [{ tool: "codex" }], 1);
+    expect(isIdentityRefreshing(counts, "codex", "a")).toBe(true);
+    expect(isIdentityRefreshing(counts, "claude", "a")).toBe(false);
+  });
+});
+
+describe("the spend dialog on a cached card", () => {
+  test("a live count is a fact, and a cached one says last known with its age", () => {
+    expect(spendCreditSentence(3, false, undefined)).toBe("This spends one of 3 available reset credits on this Codex account.");
+    const now = Date.parse("2026-11-27T10:00:00.000Z");
+    const text = spendCreditSentence(3, true, "2026-11-27T09:50:00.000Z", now);
+    expect(text).toContain("last known count is 3");
+    expect(text).toContain("10m");
+    expect(text).not.toContain("available reset credits");
+    expect(creditsAreLastKnown({ ...codexRow("a", 1, 1), status: "cached" })).toBe(true);
+    expect(creditsAreLastKnown({ ...codexRow("a", 1, 1), manualReset: { availableCount: 1, stale: true } })).toBe(true);
+    expect(creditsAreLastKnown({ ...codexRow("a", 1, 1), manualReset: { availableCount: 1 } })).toBe(false);
+  });
+});

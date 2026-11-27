@@ -36,7 +36,7 @@ import { api } from "@/lib/api";
 import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { canSpendCodexReset } from "@/lib/codex-reset";
+import { canSpendCodexReset, creditsAreLastKnown, spendCreditSentence } from "@/lib/codex-reset";
 import { formatResetTimes } from "@/lib/reset-time";
 import { AccountWarnings } from "@/components/account-line";
 import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseCodexResetResult, UseResetResult } from "@/types/api";
@@ -248,7 +248,7 @@ function UseResetDialog({ identity, grant, onClose }: { identity: string; grant:
   );
 }
 
-function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: string; availableCount: number; onClose: () => void }) {
+function UseCodexResetDialog({ identity, availableCount, lastKnown, readAt, onClose }: { identity: string; availableCount: number; lastKnown: boolean; readAt?: string; onClose: () => void }) {
   const qc = useQueryClient();
   const submitted = useRef(false);
   const requestId = useRef<string | null>(null);
@@ -302,7 +302,7 @@ function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: 
         <AlertDialogHeader>
           <AlertDialogTitle>Use a reset on {identity}?</AlertDialogTitle>
           <AlertDialogDescription>
-            This spends one of {availableCount} available reset credits on this Codex account. The reset cannot be returned.
+            {spendCreditSentence(availableCount, lastKnown, readAt)} The reset cannot be returned.
             After OpenAI accepts the request, Console checks usage for this account. If OpenAI is slow, Limits keeps the last-known reading and reports pending.
           </AlertDialogDescription>
         </AlertDialogHeader>
@@ -364,7 +364,7 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
             {canSpendCodex ? <ResetCreditAction ariaLabel={`Use reset on ${result.identity.name}`} onClick={() => setUsingCodex(true)} /> : null}
           </div>
         </div>
-        {usingCodex ? <UseCodexResetDialog identity={result.identity.name} availableCount={reset.availableCount} onClose={() => setUsingCodex(false)} /> : null}
+        {usingCodex ? <UseCodexResetDialog identity={result.identity.name} availableCount={reset.availableCount} lastKnown={creditsAreLastKnown(result)} {...(result.capturedAt ? { readAt: result.capturedAt } : {})} onClose={() => setUsingCodex(false)} /> : null}
       </>
     );
   }
@@ -410,7 +410,7 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
 
 function RefreshButton({ label, onClick, busy, disabled, text }: { label: string; onClick: () => void; busy: boolean; disabled?: boolean; text?: string }) {
   return (
-    <Button variant="outline" size="sm" className={cn("shrink-0", text ? "h-8" : "size-7 p-0")} aria-label={label} title={label} disabled={busy || disabled} onClick={onClick}>
+    <Button variant="outline" size="sm" className={cn("shrink-0", text ? "h-8" : "size-7 p-0")} aria-label={label} aria-busy={busy} title={label} disabled={busy || disabled} onClick={onClick}>
       <RefreshCw aria-hidden className={cn("size-3.5", busy && "animate-spin")} />
       {text ? <span>{text}</span> : null}
     </Button>
@@ -491,18 +491,15 @@ function LimitCard({ result, onRefresh, refreshing }: { result: ToolLimitResult;
 export function LimitsPage() {
   const query = useLimitsQuery();
   const poolsQuery = usePoolsUsageQuery();
-  const refresh = useRefreshLimits();
-  // The identity or tool being refreshed, so only those cards spin. A tool target covers every identity of that tool.
-  const refreshingTargets = refresh.isPending ? refresh.variables : undefined;
-  const isRefreshing = (tool: string, identity: string): boolean =>
-    refreshingTargets?.some((t) => t.tool === tool && (t.identity === undefined || t.identity === identity)) ?? false;
+  const { refresh, isRefreshing, anyRefreshing } = useRefreshLimits();
+  // Each call has its own state: a card spins until every call that covers it ends, and each call reports its own failures.
   const runRefresh = (targets: LimitsRefreshTarget[]) => {
-    refresh.mutate(targets, {
-      onSuccess: ({ failures }) => {
+    refresh(targets).then(
+      ({ failures }) => {
         if (failures.length > 0) toast.error("Refresh failed", { description: failures.map((f) => `${f.target.identity ?? f.target.tool}: ${f.message}`).join("; ") });
       },
-      onError: (error) => toast.error("Refresh failed", { description: error.message }),
-    });
+      (error: unknown) => toast.error("Refresh failed", { description: error instanceof Error ? error.message : String(error) }),
+    );
   };
   // A pool mirrors its active member's token, so its own limits row only ever
   // says "not fetched"; the pool cards above carry the real figures instead.
@@ -537,7 +534,8 @@ export function LimitsPage() {
   const activeGroup = providerGroups.find(([provider]) => provider === active);
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-5" aria-busy={anyRefreshing}>
+      <p role="status" className="sr-only">{anyRefreshing ? "Refreshing limits" : ""}</p>
       <PageHeader
         title="Limits"
         description="Live provider quota per identity. The server caches upstream fetches for 45 seconds. Refresh reads the provider again."

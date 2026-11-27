@@ -972,9 +972,10 @@ describe("1280x900", () => {
       const cards = await page.eval<number>(`document.querySelectorAll('main [data-slot="card"]').length`);
       expect(await page.eval<number>(`document.querySelectorAll('main button[aria-label^="Refresh SYNTHETIC_FIXTURE-"]').length`)).toBe(cards);
       expect(await page.eval<number>(`document.querySelectorAll('main button[aria-label="Refresh all openai limits"]').length`)).toBe(1);
-      // The refresh answers a cached reading with the reason. The reset button stays.
+      // The refresh answers a cached reading with the reason, as the gateway does when the provider read fails: the last known reset
+      // credits come back marked stale (`{ availableCount, stale: true }`), never absent. The reset button stays.
       const row = SYNTHETIC_LIMITS.results.find((r) => r.toolName === "codex" && r.identity.name === "SYNTHETIC_FIXTURE-codex-credit")!;
-      const refreshed = { ...SYNTHETIC_LIMITS, results: [{ ...row, status: "cached", error: "OpenAI rejected this Codex login (SYNTHETIC_FIXTURE). Sign in again.", manualReset: { ...row.manualReset, stale: true } }] };
+      const refreshed = { ...SYNTHETIC_LIMITS, results: [{ ...row, status: "cached", error: "OpenAI rejected this Codex login (SYNTHETIC_FIXTURE). Sign in again.", manualReset: { availableCount: row.manualReset!.availableCount, stale: true } }] };
       await page.eval(`window.__aisLimitsQueue = [${JSON.stringify(refreshed)}]; document.querySelector('main button[aria-label="Refresh SYNTHETIC_FIXTURE-codex-credit"]').click()`);
       await waitFor("the refreshed card", 8_000, () => page.eval<boolean>(`document.querySelector('main').innerText.includes('OpenAI rejected this Codex login (SYNTHETIC_FIXTURE)')`));
       expect(await page.eval<boolean>(`window.__aisLimitsCalls.some(q => q.includes('refresh=1') && q.includes('tool=codex') && q.includes('identity=SYNTHETIC_FIXTURE-codex-credit'))`)).toBe(true);

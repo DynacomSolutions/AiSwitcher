@@ -1,3 +1,4 @@
+import { relTime } from "@/lib/format";
 import type { ToolLimitResult } from "@/types/api";
 
 /** After a Codex reset is spent, the use button stays hidden this long. A second click cannot then spend another credit before the count updates. */
@@ -15,4 +16,19 @@ export function canSpendCodexReset(row: ToolLimitResult, now = Date.now()): bool
   if (reset.spentAt !== undefined && now - reset.spentAt < SPEND_LOCK_MS) return false;
   if (row.resetPendingUntil !== undefined && row.resetPendingUntil > now) return false;
   return true;
+}
+
+/**
+ * The first sentence of the spend dialog. A live card knows the credit count. A cached card or a stale credit list shows the
+ * last known count and its age, because OpenAI decides on the spend itself and the count may have changed.
+ */
+export function spendCreditSentence(availableCount: number, lastKnown: boolean, readAt: string | undefined, nowMs = Date.now()): string {
+  if (!lastKnown) return `This spends one of ${availableCount} available reset credits on this Codex account.`;
+  const age = readAt && Number.isFinite(Date.parse(readAt)) ? `, read ${relTime(readAt, nowMs)}` : "";
+  return `This spends one reset credit on this Codex account. The last known count is ${availableCount}${age}, so it may be out of date.`;
+}
+
+/** Whether the credit count on a Codex card is the last known one and not a fresh read. */
+export function creditsAreLastKnown(row: ToolLimitResult): boolean {
+  return row.status !== "live" || row.manualReset?.stale === true;
 }
