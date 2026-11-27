@@ -18,7 +18,7 @@ permissions:
 
 # Supersede stale pull-request runs only; pushes and release calls always finish.
 concurrency:
-  group: host-app-${{ github.ref }}
+  group: host-app-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
