@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ExternalLink, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
 import { AccountLine } from "@/components/account-line";
@@ -8,13 +9,6 @@ import { AuthStateBadge, ToolBadge } from "@/components/badges";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -25,20 +19,27 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { flowIsLive, qk, useAuthQuery, useAuthRefreshQuery, useLoginFlowQuery } from "@/hooks/queries";
 import { api, supportsFix } from "@/lib/api";
-import { relTime } from "@/lib/format";
-import { renewalView } from "@/lib/renewal-view";
-import type { AuthEntry, LoginFlowStatus, RenewalRow } from "@/types/api";
+import {
+  AUTH_SORT_LABELS,
+  AUTH_STATE_LABELS,
+  authListLoaded,
+  authTools,
+  combineAuthRows,
+  readAuthParams,
+  showTokenRefresh,
+  visibleAuthRows,
+  withAuthParam,
+  type AuthListParams,
+  type AuthListRow,
+  type AuthSortKey,
+  type AuthStateFilter,
+} from "@/lib/auth-list";
+import { cn } from "@/lib/utils";
+import type { AuthEntry, LoginFlowStatus } from "@/types/api";
 
 export function flowStatusLabel(status: LoginFlowStatus): string {
   switch (status) {
@@ -331,7 +332,7 @@ function AliCookieDialog({ entry, onClose }: { entry: AuthEntry; onClose: () => 
   );
 }
 
-function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: string) => void }) {
+function FixActions({ entry, onFlow, showRefresh }: { entry: AuthEntry; onFlow: (flowId: string) => void; showRefresh: boolean }) {
   const qc = useQueryClient();
   const [keyDialogFor, setKeyDialogFor] = useState<AuthEntry | null>(null);
   const [cookieDialogFor, setCookieDialogFor] = useState<AuthEntry | null>(null);
@@ -340,9 +341,9 @@ function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: stri
     mutationFn: (identity: string) => api.refreshKimiToken(identity),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.auth });
-      toast.success("Token refreshed", { description: `${entry.toolName}/${entry.identity}` });
+      toast.success("Quota read", { description: `${entry.toolName}/${entry.identity}: the token renews only when it had expired` });
     },
-    onError: (error) => toast.error("Refresh failed", { description: error.message }),
+    onError: (error) => toast.error("Quota read failed", { description: error.message }),
   });
 
   const loginMutation = useMutation({
@@ -370,11 +371,12 @@ function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: stri
   return (
     <>
       <div className="flex flex-wrap justify-end gap-1.5">
-        {supportsFix(entry, "refresh") ? (
+        {showRefresh && supportsFix(entry, "refresh") ? (
           <Button
             variant="outline"
             size="sm"
             disabled={refreshMutation.isPending}
+            title="Read the quota now. This renews the token only when it has expired. It does not force a refresh."
             onClick={() => refreshMutation.mutate(entry.identity)}
           >
             Refresh token
@@ -410,194 +412,253 @@ function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: stri
   );
 }
 
-const TONE_VARIANT = { ok: "success", warning: "warning", destructive: "destructive", muted: "secondary" } as const;
-
-function RenewalRowView({ row }: { row: RenewalRow }) {
-  const qc = useQueryClient();
-  const view = renewalView(row);
-  const mutation = useMutation({
-    mutationFn: () => api.refreshCredential(row.tool, row.identity),
-    onSuccess: (result) => {
-      void qc.invalidateQueries({ queryKey: qk.authRefresh });
-      if (result.ok) toast.success("Credential refreshed", { description: `${row.tool}/${row.identity}` });
-      else toast.warning("Refresh did not write cookies", { description: `${row.tool}/${row.identity}` });
-    },
-    onError: (error) => toast.error("Refresh failed", { description: error.message }),
-  });
-  const running = row.host?.running ?? false;
-
+/** The label above a value: visible on a narrow card, read by a screen reader in the wide grid. */
+function Cell({ label, className, children }: { label: string; className?: string; children: ReactNode }) {
   return (
-    <TableRow>
-      <TableCell>
-        <ToolBadge tool={row.tool} />
-      </TableCell>
-      <TableCell className="font-medium">{row.identity}</TableCell>
-      <TableCell className="text-xs text-muted-foreground">{view.renewedBy}</TableCell>
-      <TableCell className="text-xs">{view.lastRefresh}</TableCell>
-      <TableCell className="text-xs text-muted-foreground">{view.nextRefresh}</TableCell>
-      <TableCell className="text-xs text-muted-foreground">{view.expires}</TableCell>
-      <TableCell className="max-w-72 text-xs">
-        <Badge variant={TONE_VARIANT[view.status.tone]}>{view.status.label}</Badge>
-        {view.error ? (
-          <span className="mt-1 block truncate text-destructive" title={view.error}>
-            {view.error}
-          </span>
-        ) : null}
-      </TableCell>
-      <TableCell className="text-right">
-        {view.canRefreshHere ? (
-          <Button variant="outline" size="sm" disabled={mutation.isPending || running} onClick={() => mutation.mutate()}>
-            {running || mutation.isPending ? "Refreshing…" : "Refresh now"}
-          </Button>
-        ) : null}
-      </TableCell>
-    </TableRow>
+    <div data-slot="auth-cell" className={cn("min-w-0 space-y-0.5", className)}>
+      <span className="block text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[60rem]:sr-only">{label}</span>
+      <div className="min-w-0 space-y-1 text-xs">{children}</div>
+    </div>
   );
 }
 
-/** Credential renewal: the gateway renews its own logins, this host renews the rest. */
-function RenewalCard() {
-  const query = useAuthRefreshQuery();
-  const rows = query.data?.rows ?? [];
-  const gatewayState = query.data?.gateway?.state;
-  const healthy = rows.filter((r) => renewalView(r).status.tone === "ok").length;
+/** A second value inside one cell, such as the kind under the auth state. Its label shows on a card only. */
+function SubValue({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
+      <span className="text-[11px] text-muted-foreground @[60rem]:sr-only">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+/** Grid of the wide layout. The narrow layout stacks each row as a card. */
+const GRID = "@[60rem]:grid-cols-[minmax(8rem,1.3fr)_6rem_4.5rem_5rem_5rem_7.5rem_minmax(6.5rem,1fr)_10rem]";
+
+const TONE_VARIANT = { ok: "success", warning: "warning", destructive: "destructive", muted: "secondary" } as const;
+
+function AuthRowView({ row, onFlow }: { row: AuthListRow; onFlow: (flowId: string) => void }) {
+  const qc = useQueryClient();
+  const refreshMutation = useMutation({
+    mutationFn: () => api.refreshCredential(row.tool, row.identity),
+    onSuccess: (result) => {
+      void qc.invalidateQueries({ queryKey: qk.authRefresh });
+      if (result.ok) toast.success("Credential refreshed", { description: row.key });
+      else toast.warning("Refresh did not write cookies", { description: row.key });
+    },
+    onError: (error) => toast.error("Refresh failed", { description: error.message }),
+  });
+  const running = row.renewal?.host?.running ?? false;
+  const entry = row.entry;
 
   return (
-    <Card className="gap-3">
-      <CardHeader>
-        <CardTitle className="text-base">Scheduled credential renewal</CardTitle>
-        <CardDescription>
-          The gateway renews the logins it owns every few hours. This host renews only the logins the gateway does
-          not own, on a 10-minute loop while the daemon runs.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        {query.isLoading ? (
-          <div className="h-16 animate-pulse rounded-lg bg-muted" />
-        ) : rows.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No renewals recorded yet. The first pass runs about 15 seconds after the daemon starts,
-            and refreshable credentials appear here.
-          </p>
+    <li
+      data-slot="auth-row"
+      data-key={row.key}
+      className={cn("grid grid-cols-2 items-start gap-x-4 gap-y-3 p-3 @2xl:grid-cols-5 @[60rem]:gap-x-3 @[60rem]:py-2.5", GRID)}
+    >
+      <div data-slot="auth-cell" className="col-span-2 min-w-0 space-y-1 @2xl:col-span-5 @[60rem]:col-span-1">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <ToolBadge tool={row.tool} />
+          <span className="min-w-0 break-all text-sm font-medium">{row.identity}</span>
+        </div>
+        {entry?.account ? <AccountLine account={entry.account} /> : null}
+      </div>
+      <Cell label="Auth state" className="col-span-1">
+        <AuthStateBadge state={row.state} />
+        <SubValue label="Kind">
+          {row.kind ? (
+            <Badge variant="outline" className="font-mono text-[10px]">
+              {row.kind}
+            </Badge>
+          ) : (
+            <span className="text-muted-foreground">-</span>
+          )}
+        </SubValue>
+      </Cell>
+      <Cell label="Expires">
+        <span title={row.entry?.expiresAt ? new Date(row.entry.expiresAt).toLocaleString() : undefined}>{row.expires}</span>
+      </Cell>
+      <Cell label="Last renewal">{row.lastRenewal}</Cell>
+      <Cell label="Next renewal">{row.nextRenewal}</Cell>
+      <Cell label="Renewal status" className="col-span-2 @2xl:col-span-1">
+        {row.status ? (
+          <Badge variant={TONE_VARIANT[row.status.tone]} title={row.status.label} className="max-w-full shrink whitespace-normal break-words text-left">
+            {row.status.label}
+          </Badge>
         ) : (
-          <>
-            <p className="mb-3 text-xs text-muted-foreground">
-              {healthy} of {rows.length} renewing cleanly
-              {gatewayState && gatewayState !== "ok" ? " (gateway renewal state unavailable)" : ""}
-            </p>
-            <div className="overflow-hidden rounded-lg border">
-              <Table>
-                <TableHeader>
-                  <TableRow className="hover:bg-transparent">
-                    <TableHead>Tool</TableHead>
-                    <TableHead>Identity</TableHead>
-                    <TableHead>Renewed by</TableHead>
-                    <TableHead>Last refresh</TableHead>
-                    <TableHead>Next refresh</TableHead>
-                    <TableHead>Token expires</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead className="text-right"> </TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {rows.map((row) => (
-                    <RenewalRowView key={`${row.tool}/${row.identity}`} row={row} />
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          </>
+          <span className="text-muted-foreground">-</span>
         )}
-      </CardContent>
-    </Card>
+        <SubValue label="Renewed by">
+          <span className="text-muted-foreground" title={row.renewedBy}>
+            {row.renewedBy}
+          </span>
+        </SubValue>
+      </Cell>
+      <Cell label="Detail and last error" className="col-span-2 @2xl:col-span-5 @[60rem]:col-span-1">
+        {row.error ? (
+          <span className="block break-words text-destructive" title={row.error}>
+            {row.error}
+          </span>
+        ) : row.detail ? null : (
+          <span className="text-muted-foreground">-</span>
+        )}
+        {row.detail ? <span className="mt-0.5 block break-words text-muted-foreground">{row.detail}</span> : null}
+      </Cell>
+      <div data-slot="auth-cell" className="col-span-2 flex min-w-0 flex-wrap justify-start gap-1.5 @2xl:col-span-5 @[60rem]:col-span-1 @[60rem]:justify-end">
+        {entry && !row.retired ? <FixActions entry={entry} onFlow={onFlow} showRefresh={showTokenRefresh(row)} /> : null}
+        {row.canRefreshHere ? (
+          <Button variant="outline" size="sm" title="Run the renewal pass of this host for this login now" disabled={refreshMutation.isPending || running} onClick={() => refreshMutation.mutate()}>
+            {running || refreshMutation.isPending ? "Renewing…" : "Run host renewal"}
+          </Button>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
+const ALL = "all";
+
+/** The one list of the Auth page: auth state and renewal of every identity and tool. View options live in the URL (replace). */
+function AuthList({ onFlow }: { onFlow: (flowId: string) => void }) {
+  const authQuery = useAuthQuery();
+  const renewalQuery = useAuthRefreshQuery();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const rows = combineAuthRows(authQuery.data?.entries ?? [], renewalQuery.data?.rows ?? []);
+  const toolNames = authTools(rows);
+  // Both answers must have settled: the renewal report names tools that the auth probe does not list.
+  const listLoaded = authListLoaded(rows.length, authQuery.isPending, renewalQuery.isPending);
+  const params = readAuthParams(searchParams, listLoaded ? toolNames : undefined);
+  const unknownTool = listLoaded && (searchParams.get("tool") ?? "") !== params.tool;
+  // An unknown tool in the URL reads as "all tools"; the address is corrected with history replace.
+  useEffect(() => {
+    if (unknownTool) setSearchParams(withAuthParam(searchParams, "tool", ""), { replace: true });
+  }, [unknownTool, searchParams, setSearchParams]);
+  const setParam = (key: keyof AuthListParams, value: string) => setSearchParams(withAuthParam(searchParams, key, value), { replace: true });
+
+  const visible = visibleAuthRows(rows, params);
+  const attention = rows.filter((r) => r.attention).length;
+  const gatewayState = renewalQuery.data?.gateway?.state;
+  const loading = (authQuery.isLoading && !authQuery.data) || (renewalQuery.isLoading && !renewalQuery.data);
+
+  if (loading) return <div className="h-64 animate-pulse rounded-xl bg-muted" />;
+  if (authQuery.isError && !authQuery.data) return <ErrorBanner message={authQuery.error.message} />;
+  if (rows.length === 0) return <EmptyState title="No auth entries" description="Create identities first; their credentials are checked here." />;
+
+  return (
+    <section aria-labelledby="auth-list-title" className="space-y-3">
+      <div className="space-y-1">
+        <h2 id="auth-list-title" className="text-base font-semibold">
+          Credentials and scheduled renewal
+        </h2>
+        <p className="text-xs text-muted-foreground">
+          The gateway renews the logins it owns every few hours. This host renews only the logins the gateway does not own, on a
+          10-minute loop while the daemon runs.
+        </p>
+        <p className="text-xs text-muted-foreground" role="status">
+          {rows.length - attention} of {rows.length} healthy, {attention} need attention
+          {gatewayState && gatewayState !== "ok" ? " (gateway renewal state unavailable)" : ""}
+        </p>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          value={params.q}
+          onChange={(e) => setParam("q", e.target.value)}
+          placeholder="Filter by tool, identity or error"
+          aria-label="Filter credentials"
+          className="h-8 w-full max-w-xs text-xs"
+        />
+        <Select value={params.tool || ALL} onValueChange={(v) => setParam("tool", v === ALL ? "" : v)}>
+          <SelectTrigger className="h-8 w-36 text-xs" aria-label="Tool">
+            <SelectValue placeholder="All tools" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL} className="text-xs">
+              All tools
+            </SelectItem>
+            {toolNames.map((tool) => (
+              <SelectItem key={tool} value={tool} className="text-xs">
+                {tool}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={params.state} onValueChange={(v) => setParam("state", v)}>
+          <SelectTrigger className="h-8 w-40 text-xs" aria-label="State">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {(Object.keys(AUTH_STATE_LABELS) as AuthStateFilter[]).map((key) => (
+              <SelectItem key={key} value={key} className="text-xs">
+                {AUTH_STATE_LABELS[key]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={params.sort} onValueChange={(v) => setParam("sort", v)}>
+          <SelectTrigger className="h-8 w-48 text-xs" aria-label="Sort by">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {(Object.keys(AUTH_SORT_LABELS) as AuthSortKey[]).map((key) => (
+              <SelectItem key={key} value={key} className="text-xs">
+                {AUTH_SORT_LABELS[key]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {params.sort !== "default" ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 text-xs"
+            aria-label={params.dir === "asc" ? "Sort order: ascending. Switch to descending" : "Sort order: descending. Switch to ascending"}
+            onClick={() => setParam("dir", params.dir === "asc" ? "desc" : "asc")}
+          >
+            {params.dir === "asc" ? "Ascending" : "Descending"}
+          </Button>
+        ) : null}
+      </div>
+
+      {visible.length === 0 ? (
+        <EmptyState title="No matches" description="No credential matches these filters." />
+      ) : (
+        <div className="@container overflow-hidden rounded-xl border">
+          <div aria-hidden data-slot="auth-head" className={cn("hidden border-b bg-muted/40 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[60rem]:grid @[60rem]:gap-x-3", GRID)}>
+            <span>Identity</span>
+            <span>Auth state, kind</span>
+            <span>Expires</span>
+            <span>Last renewal</span>
+            <span>Next renewal</span>
+            <span>Renewal status, renewed by</span>
+            <span>Detail and last error</span>
+            <span className="text-right">Actions</span>
+          </div>
+          <ul className="divide-y">
+            {visible.map((row) => (
+              <AuthRowView key={row.key} row={row} onFlow={onFlow} />
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
   );
 }
 
 export function AuthPage() {
   const query = useAuthQuery();
-  // Retired identities are listed last and never offer fixes.
-  const entries = [...(query.data?.entries ?? [])].sort(
-    (a, b) => Number(a.state === "retired") - Number(b.state === "retired"),
-  );
   const [activeFlowId, setActiveFlowId] = useState<string | null>(null);
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="Auth"
-        description="Credential health for every identity across every registry. Logins run the real CLI's own flow right here, so no terminal is needed."
+        description="Credential health and scheduled renewal for every identity across every registry. Logins run the real CLI's own flow right here, so no terminal is needed."
         updatedAt={query.dataUpdatedAt}
       />
 
-      <RenewalCard />
-
-      {query.isLoading && !query.data ? (
-        <div className="h-64 animate-pulse rounded-xl bg-muted" />
-      ) : query.isError && !query.data ? (
-        <ErrorBanner message={query.error.message} />
-      ) : entries.length === 0 ? (
-        <EmptyState title="No auth entries" description="Create identities first; their credentials are checked here." />
-      ) : (
-        <div className="overflow-hidden rounded-xl border">
-          <Table>
-            <TableHeader>
-              <TableRow className="hover:bg-transparent">
-                <TableHead>Tool</TableHead>
-                <TableHead>Identity</TableHead>
-                <TableHead>Account</TableHead>
-                <TableHead>Kind</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead>Detail</TableHead>
-                <TableHead className="text-right">Fixes</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {entries.map((entry) => (
-                <TableRow key={`${entry.toolName}/${entry.identity}`}>
-                  <TableCell>
-                    <ToolBadge tool={entry.toolName} />
-                  </TableCell>
-                  <TableCell className="font-medium">{entry.identity}</TableCell>
-                  <TableCell className="max-w-80 whitespace-normal">
-                    <AccountLine account={entry.account} />
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant="outline" className="font-mono text-[10px]">
-                      {entry.kind}
-                    </Badge>
-                  </TableCell>
-                  <TableCell>
-                    <AuthStateBadge state={entry.state} />
-                  </TableCell>
-                  <TableCell className="max-w-72">
-                    <span
-                      className={`block truncate text-xs ${entry.state === "ok" ? "" : "text-muted-foreground"}`}
-                      title={
-                        [
-                          entry.detail,
-                          entry.expiresAt ? `expires ${new Date(entry.expiresAt).toLocaleString()}` : undefined,
-                          entry.lastRefreshAt ? `last refresh ${relTime(entry.lastRefreshAt)}` : undefined,
-                          entry.refreshError,
-                        ]
-                          .filter(Boolean)
-                          .join("\n") || undefined
-                      }
-                    >
-                      {entry.detail ?? "-"}
-                      {entry.refreshError ? (
-                        <span className="block truncate text-destructive">{entry.refreshError}</span>
-                      ) : null}
-                    </span>
-                  </TableCell>
-                  <TableCell>
-                    <FixActions entry={entry} onFlow={setActiveFlowId} />
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      )}
+      <AuthList onFlow={setActiveFlowId} />
 
       {activeFlowId ? <LoginFlowDialog flowId={activeFlowId} onClose={() => setActiveFlowId(null)} /> : null}
     </div>

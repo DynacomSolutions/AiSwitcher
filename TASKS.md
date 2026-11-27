@@ -363,7 +363,7 @@ AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gat
 | 342 | Pod-local TLS health check for the CONNECT listener, loopback tunnel tests | todo | | | 14.334 | | Cluster probes tunnel CONNECT to 127.0.0.1:47130 and skip the inner TLS server.<br>Add a gateway-owned health name (for example ais-gateway-health.invalid) so probes test TLS without leaving the pod.<br>Add tests: loopback CONNECT tunnels, a tunnel that closes after the 200 answer. |
 
 ## 15. Gateway logins never revoked by AIS
-ETA: 2026-11-24 08:00 ICT
+ETA: 2026-11-27 18:00 ICT
 One refresher per login across replicas and hosts, early renewal, a dead grant never sent again, renewal state visible on the WebUI and in metrics.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -379,6 +379,9 @@ One refresher per login across replicas and hosts, early renewal, a dead grant n
 | 260 | No false folder-login warning for a gateway-routed claude folder | done | claude | folder-gateway-mismatch | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/679 (5bc9eb2), released v0.5.86.<br>Host route-all reset the stale cached account.<br>Live WebUI pod 0.5.86: no mismatch on any identity. |
 | 316 | Route-all routes every account the gateway holds | done | claude | route-all-gateway-held | | | Gateway admin list decides held: live grants only (not revoked, renewal signal, no newer error). Heartbeat and member store are the fallback.<br>Logged-out claude folders and codex folders with a pi copy are routed, not refused.<br>Local login is backed up first.<br>Shipped in v0.5.111 (PRs 774, 775). Installed on the agent host. All identities routed and live calls pass.<br>Codex needs the local gateway service (ais gateway local install). |
 | 332 | Restore the restricted Claude login lost from the gateway store and stop the overwrite | done | claude | gateway-identities-cleanup | | | Restored: member store row v8176 holds a real login, renewed by the gateway; 2956 HTTP 200, 0 login-dead in 6 h (26 Nov 14:50 ICT).<br>Overwrite stopped: guard PR https://github.com/DynacomSolutions/AiSwitcher/pull/820 (3da29b6a), live in gateway 0.5.124. |
+| 395 | Old login errors never show after a new sign-in | in_review | claude | auth-after-relogin | | 2026-11-27 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/873.<br>A journal error for another refresh token no longer shows. A dead row for the current token always counts. The mint time is used only without a fingerprint.<br>Tests cover claude and codex. |
+| 396 | Auth page shows one combined list of identities, tools and renewal | in_review | claude | auth-after-relogin | | 2026-11-27 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/873.<br>One row per identity and tool, with filter and sort in the URL.<br>The table starts at a 1280 px laptop screen. Cards below it have no empty cells.<br>Screenshots at 360, 1280 and 1920 px (and 1440 px) kept in the evidence folder, version 5. |
+| 397 | Find why a gateway identity logs credential_error 502 after a new sign-in | in_review | claude | auth-after-relogin | | 2026-11-27 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/873.<br>Status means no usable credential. Cause: dead login until the new sign-in. No errors after 05:47 UTC. No config fix needed.<br>Request rows now log the code. |
 
 ## 16. Console data on Headlamp dashboards
 ETA: 2026-11-20 19:00 ICT
