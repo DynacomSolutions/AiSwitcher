@@ -85,7 +85,8 @@ export function invalidateLimitsCache(): void {
  * fresh every time, so its own flag is meaningless). `/api/limits` keeps
  * honouring its caller-supplied `?maxAge=` (clamped to a 5s floor, same as
  * scan-worker.ts's own limitsEnvelope did) rather than the fixed default,
- * since that is a documented API parameter, not an internal cache detail. */
+ * since that is a documented API parameter, not an internal cache detail. Only the separate
+ * `noCache` flag (a manual refresh) skips the cache: `maxAge=0` or a negative value keeps the floor. */
 async function cachedScan<T>(
   kind: "tree" | "transcript" | "limits" | "sessions",
   params: Omit<ScanRequest, "kind">,
@@ -98,7 +99,7 @@ async function cachedScan<T>(
     if (!result.ok) throw new Error(result.error ?? `${kind} scan failed`);
     return result;
   };
-  const maxAgeMs = kind === "limits" && typeof params.maxAgeS === "number" ? (params.maxAgeS <= 0 ? 0 : Math.max(5, params.maxAgeS)) * 1000 : undefined;
+  const maxAgeMs = kind === "limits" && typeof params.maxAgeS === "number" ? (params.noCache === true ? 0 : Math.max(5, params.maxAgeS)) * 1000 : undefined;
   // usage/breakdown/tree/sessions are the slow scans (tokscale can run for
   // minutes; tree/sessions walk every transcript): serve the last-good value
   // immediately and refresh in the background. Only usage/breakdown have a

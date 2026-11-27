@@ -115,6 +115,8 @@ test("GET /api/limits?refresh=1 skips the scan cache and asks the gateway for fr
       out.tab = await get("/api/limits?refresh=1&tool=codex");
       out.noTool = await get("/api/limits?refresh=1");
       out.plain = await get("/api/limits?tool=codex");
+      out.zeroAge = await get("/api/limits?tool=codex&maxAge=0");
+      out.negativeAge = await get("/api/limits?tool=codex&maxAge=-5");
       out.scans = scans;
       console.log(JSON.stringify(out));
     `], { env: { ...process.env, HOME: home, AIS_SECRETS_FILE: join(home, ".secrets") }, stdout: "pipe", stderr: "pipe", timeout: 30_000 });
@@ -125,15 +127,17 @@ test("GET /api/limits?refresh=1 skips the scan cache and asks the gateway for fr
       tab: { status: number };
       noTool: { status: number };
       plain: { status: number };
-      scans: Array<{ tool?: string; identity?: string; maxAgeS?: number }>;
+      scans: Array<{ tool?: string; identity?: string; maxAgeS?: number; noCache?: boolean }>;
     };
     expect(out.one.status).toBe(200);
     expect(out.one.body.results[0]).toMatchObject({ status: "cached", error: "OpenAI rejected this Codex login" });
     expect(out.tab.status).toBe(200);
     expect(out.noTool.status).toBe(400);
-    // A refresh reads with no cache age at the scan and asks the gateway with fresh=1. A plain read keeps the 45 second age and no fresh.
-    expect(out.scans.map((x) => x.maxAgeS)).toEqual([0, 0, 45]);
-    expect(asked).toEqual(["/limits?provider=codex&identity=c1&fresh=1", "/limits?provider=codex&fresh=1", "/limits"]);
+    // A refresh sets the separate noCache flag at the scan and asks the gateway with fresh=1. A plain read keeps the age and no flag.
+    // A maxAge of 0 or a negative value is no refresh: it sets no flag, so the scan keeps its 5 second floor.
+    expect(out.scans.map((x) => x.noCache === true)).toEqual([true, true, false, false, false]);
+    expect(out.scans.map((x) => x.maxAgeS)).toEqual([45, 45, 45, 0, -5]);
+    expect(asked).toEqual(["/limits?provider=codex&identity=c1&fresh=1", "/limits?provider=codex&fresh=1", "/limits", "/limits", "/limits"]);
   } finally {
     gateway.stop(true);
     await rm(home, { recursive: true, force: true });

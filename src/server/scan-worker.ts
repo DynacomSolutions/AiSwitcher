@@ -59,6 +59,8 @@ export interface ScanRequest {
   identity?: string;
   cwd?: string;
   maxAgeS?: number;
+  /** Limits only: a manual refresh reads again whatever the cache holds. The 5 second floor of `maxAgeS` stays for every other caller. */
+  noCache?: boolean;
   /** Breakdown and tree: lookback window in days. */
   days?: number;
   /** Tree and sessions: only sessions whose transcript changed within
@@ -99,7 +101,7 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
         payload = await refreshUsageSnapshot();
         break;
       case "limits":
-        payload = await limitsEnvelope(cache, req.tool, req.identity, req.maxAgeS ?? 45);
+        payload = await limitsEnvelope(cache, req.tool, req.identity, req.maxAgeS ?? 45, req.noCache === true);
         break;
       case "sessions": {
         const flags = flagsFor(req.tool, req.identity);

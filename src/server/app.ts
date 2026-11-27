@@ -161,7 +161,7 @@ async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string;
   // The cluster gateway is the source of truth for the limits of the identities it manages; the host scan covers the rest.
   // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
   const [result, gateway] = await Promise.all([
-    runScanIsolated("limits", { ...filters, maxAgeS: refresh ? 0 : maxAgeS }, 45_000),
+    runScanIsolated("limits", { ...filters, maxAgeS, ...(refresh ? { noCache: true } : {}) }, 45_000),
     (deps.gatewayLimits
       ? deps.gatewayLimits()
       : refresh && filters.tool
