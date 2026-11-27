@@ -22,7 +22,7 @@ const review: PoolResetReview = {
   members: [candidate.identity], availability: "available", candidate,
 };
 
-function fixture(options: { gatewayMs?: number; consoleMs?: number; confirmWait?: Promise<void>; stallFetch?: boolean } = {}) {
+function fixture(options: { gatewayMs?: number; consoleMs?: number; activationEnabled?: boolean; confirmWait?: Promise<void>; stallFetch?: boolean } = {}) {
   let spendCalls = 0;
   let forwarded = 0;
   let invalidateCalls = 0;
@@ -34,6 +34,7 @@ function fixture(options: { gatewayMs?: number; consoleMs?: number; confirmWait?
     poolReset: {
       thresholds: async () => [{ tool: "codex", pool, observedAt: 1_000, percent: 93, complete: true }],
       review: async (tool, name) => tool === "codex" && name === pool ? review : undefined,
+      activationEnabled: options.activationEnabled,
       confirmTimeoutMs: options.gatewayMs,
       confirm: async (name, selection, signal) => {
         expect(name).toBe(pool);
@@ -79,6 +80,17 @@ test("gateway requires full admin auth and checks the explicit selection before 
   expect(await reading.json()).toEqual(review);
   expect((await admin.request(path, { headers, method: "POST", body: JSON.stringify({ candidate }) })).status).toBe(400);
   expect((await admin.request(poolLimitsPath("claude", pool), { headers, method: "POST", body: JSON.stringify(confirmation) })).status).toBe(404);
+  expect(state().spendCalls).toBe(0);
+});
+
+test("the rollout gate pauses pool alerts and blocks redemption", async () => {
+  const { admin, state } = fixture({ activationEnabled: false });
+  const headers = { authorization: `Bearer ${ADMIN}` };
+  expect(await (await admin.request(POOL_THRESHOLDS_PATH, { headers })).json()).toEqual({ pools: [] });
+  const response = await admin.request(path, { headers });
+  expect(await response.json()).toEqual({ ...review, availability: "unavailable", candidate: undefined });
+  const post = await admin.request(path, { method: "POST", headers, body: JSON.stringify(confirmation) });
+  expect(post.status).toBe(409);
   expect(state().spendCalls).toBe(0);
 });
 

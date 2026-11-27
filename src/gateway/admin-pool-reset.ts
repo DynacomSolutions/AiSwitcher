@@ -7,6 +7,7 @@ import type { GatewayProvider } from "./types.ts";
 export interface PoolResetAdmin {
   thresholds(): Promise<PoolThreshold[]>;
   review(tool: GatewayProvider, pool: string, signal: AbortSignal): Promise<PoolResetReview | undefined>;
+  activationEnabled?: boolean;
   confirmTimeoutMs?: number;
   confirm(pool: string, selection: PoolResetConfirmation, signal: AbortSignal, deadlineAt: number): Promise<PoolResetResult | undefined>;
 }
@@ -26,17 +27,22 @@ export function registerPoolResetAdmin(hono: Hono, deps: PoolResetAdmin, provide
   const json = (body: unknown, status = 200) => Response.json(body, { status, headers });
   const missing = () => json({ error: "The gateway pool was not found." }, 404);
 
-  hono.get(POOL_THRESHOLDS_PATH, async () => json({ pools: await deps.thresholds() }));
+  hono.get(POOL_THRESHOLDS_PATH, async () => json({ pools: deps.activationEnabled === false ? [] : await deps.thresholds() }));
   hono.get(POOL_LIMITS_ROUTE, async (c) => {
     const tool = providers.find((provider) => provider === c.req.param("tool"));
     if (!tool || !validPoolRoute(tool, c.req.param("pool"))) return missing();
     const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(15_000)]);
     const review = await deps.review(tool, c.req.param("pool"), signal);
-    return review ? json(review) : missing();
+    if (!review) return missing();
+    if (deps.activationEnabled === false && review.availability === "available") {
+      return json({ ...review, availability: "unavailable", candidate: undefined });
+    }
+    return json(review);
   });
   hono.post(POOL_LIMITS_ROUTE, async (c) => {
     if (!validPoolRoute(c.req.param("tool"), c.req.param("pool"))) return missing();
     if (c.req.param("tool") !== "codex") return json({ error: "This provider has no supported pool reset credit." }, 404);
+    if (deps.activationEnabled === false) return json({ error: "Pool reset confirmation is temporarily unavailable." }, 409);
     const timeout = deps.confirmTimeoutMs ?? GATEWAY_POOL_CONFIRM_MS;
     const deadlineAt = performance.now() + timeout;
     return withPoolResetDeadline(timeout, async (deadline) => {
