@@ -594,6 +594,26 @@ deadline in the message (default `TZ`).
 The VAPID key pair (`push-vapid.json`) and subscriptions (`push-subscriptions.json`)
 live in the console state dir, mode 0600.
 
+With subscribers, Console checks gateway pool usage every five minutes. A
+fully observed window average of at least 90% starts a pool alert. Console
+records the crossing in `<state dir>/pool-threshold-push.json` before delivery.
+All observed windows must have current readings to prove usage below 90%.
+A verified reset can replace an alert while usage remains above the threshold.
+The pool must fall below 90% before a new crossing. `AIS_RESET_PUSH=0` also
+turns off these pool alerts.
+
+`Dismiss` closes the notification. `Use reset` opens
+`/limits/pools/:tool/:pool?reset=1` when the gateway finds an eligible credit.
+A notification tap opens the same review on iOS Home Screen installations.
+
+`GET /api/limits/pools/:tool/:pool` reads the gateway's current review.
+`POST /api/limits/pools/codex/:pool` takes `candidate` and `redeemRequestId`.
+The candidate names the account and credit with their expiry and weekly reset
+times. A changed selection requires a new confirmation. Console sends one
+request after confirmation and the gateway records its attempt before the
+provider POST. Both routes use the Console guard. The POST also requires
+`X-AIS-Console: 1`.
+
 ### Gateway apps
 
 All gateway reads and writes go through the gateway admin API server-side

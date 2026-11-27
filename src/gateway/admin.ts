@@ -18,6 +18,7 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord, UsageHistoryRow } from "./types.ts";
 import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
 import { USAGE_READER_PROVIDERS } from "./usage-source.ts";
+import { registerPoolResetAdmin, type PoolResetAdmin } from "./admin-pool-reset.ts";
 import type { AutoResetStore } from "./auto-reset-store.ts";
 import type { AutoResetPool } from "./auto-reset.ts";
 import { CODEX_AUTO_RESET_PATH, type AutoResetScope, type AutoResetStatus } from "./auto-reset-view.ts";
@@ -100,6 +101,7 @@ export interface AdminDeps {
   spendReset?(identity: string, grantId: string): Promise<unknown>;
   /** Spends one Codex reset on the named member and invalidates shared reset and usage reads. */
   spendCodexReset?(identity: string, redeemRequestId: string): Promise<unknown>;
+  poolReset?: PoolResetAdmin;
   autoReset?: { store: AutoResetStore; pools: () => Promise<AutoResetPool[]> };
 }
 
@@ -322,6 +324,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
   registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserHub ? { hub: deps.browserHub } : {}), ...(deps.onBindingRevoked ? { onBindingRevoked: deps.onBindingRevoked } : {}), ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
 
   registerStoreAdmin(hono, deps.storeAdmin, (status, message, extra) => Response.json({ error: message, ...extra }, { status }));
+  if (deps.poolReset) registerPoolResetAdmin(hono, deps.poolReset, LIMITS_PROVIDERS);
   registerFavouritesAdmin(hono, deps.favourites, err, deps.metrics);
   registerSessionsAdmin(hono, deps.sessions, (status, message, extra) => Response.json({ error: message, ...extra }, { status }));
 

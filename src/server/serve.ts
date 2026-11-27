@@ -191,7 +191,12 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   if (process.env.AIS_RESET_PUSH !== "0") {
     // Imported here, not at the top: every ais command loads this module.
     const { ResetExpiryNotifier } = await import("./reset-expiry-push.ts");
-    resetExpiryPush = new ResetExpiryNotifier({ scanLimits: () => runScanIsolated("limits", { maxAgeS: 45 }, 45_000) });
+    const { readPoolThresholds, readPoolResetReview } = await import("./gateway-pool-reset.ts");
+    resetExpiryPush = new ResetExpiryNotifier({
+      scanLimits: () => runScanIsolated("limits", { maxAgeS: 45 }, 45_000),
+      scanPoolThresholds: readPoolThresholds,
+      reviewPoolReset: readPoolResetReview,
+    });
     resetExpiryPush.start();
   }
 

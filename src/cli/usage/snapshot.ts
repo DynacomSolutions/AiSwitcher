@@ -1,4 +1,5 @@
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { trySharedFileLock } from "../../shared/file-lock.ts";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import { lstatSync, rmSync, statSync } from "node:fs";
@@ -679,37 +680,7 @@ function validNativeCaptureFailure(value: unknown): value is NativeCaptureFailur
 
 let activeRefresh: Promise<UsageSnapshot> | undefined;
 
-export async function acquireSnapshotLock(path: string): Promise<(() => Promise<void>) | undefined> {
-  const lockPath = `${path}.lock`;
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const fd = openSync(lockPath, "a", 0o600);
-  try { chmodSync(lockPath, 0o600); } finally { closeSync(fd); }
-  // flock's child holds a kernel advisory lock on the shared hostPath inode
-  // for the whole refresh. The kernel releases it on process exit, including
-  // crashes and pod restarts, without PID/hostname/clock based reclamation.
-  const flock = Bun.which("flock", { PATH: process.env.PATH ?? "" });
-  if (!flock) throw new Error("snapshot-lock-unavailable");
-  const child = Bun.spawn([flock, "-n", lockPath, "/bin/sh", "-c", "printf locked; cat >/dev/null"], {
-    stdin: "pipe", stdout: "pipe", stderr: "ignore",
-  });
-  try {
-    const reader = child.stdout.getReader();
-    const result = await Promise.race([reader.read(), child.exited.then(() => ({ done: true as const, value: undefined }))]);
-    if (!result || result.done || new TextDecoder().decode(result.value) !== "locked") {
-      child.stdin.end();
-      await child.exited;
-      return undefined;
-    }
-    return async () => {
-      child.stdin.end();
-      await child.exited;
-    };
-  } catch {
-    child.stdin.end();
-    await child.exited;
-    return undefined;
-  }
-}
+export const acquireSnapshotLock = trySharedFileLock;
 
 function snapshotPath(path = USAGE_SNAPSHOT_FILE): string {
   return path;

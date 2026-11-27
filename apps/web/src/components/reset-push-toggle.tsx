@@ -37,9 +37,7 @@ function unsupportedReason(): string {
 }
 
 /**
- * Turns reset-expiry push notifications on or off for this browser. The daemon
- * sends one when an unspent Claude or Codex reset is 7 days from expiry, then 3
- * days, then 24 hours.
+ * Turns reset expiry and pool usage alerts on or off for this browser.
  */
 export function ResetPushToggle() {
   const [state, setState] = useState<PushState>("loading");
@@ -72,9 +70,9 @@ export function ResetPushToggle() {
   const turnOn = async () => {
     setBusy(true);
     try {
+      const permission = await Notification.requestPermission();
       const reg = await registration();
       if (!reg) return setState("unsupported");
-      const permission = await Notification.requestPermission();
       if (permission !== "granted") return setState(permission === "denied" ? "denied" : "off");
       const { publicKey } = await api.getPush();
       const key = keyBytes(publicKey);
@@ -86,7 +84,7 @@ export function ResetPushToggle() {
       sub ??= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
       await api.subscribePush(sub.toJSON());
       setState("on");
-      toast.success("Reset reminders on", { description: "You will get a notification 7 days, 3 days and 24 hours before a reset expires." });
+      toast.success("Reset and pool notifications on");
     } catch (error) {
       toast.error("Could not turn on notifications", { description: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -131,15 +129,15 @@ export function ResetPushToggle() {
         <div className="flex min-w-0 items-start gap-2 text-sm">
           {on ? <BellRing aria-hidden className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" /> : <BellOff aria-hidden className="mt-0.5 size-4 shrink-0 text-muted-foreground" />}
           <div className="min-w-0">
-            <div className="font-medium">Reset expiry notifications</div>
+            <div className="font-medium">Reset and pool notifications</div>
             <div className="text-xs text-muted-foreground">
               {state === "unsupported"
                 ? unsupportedReason()
                 : state === "denied"
                   ? "Notifications are blocked for this site. Allow them in the browser's site settings."
                   : on
-                    ? "On for this device: 7 days, 3 days and 24 hours before an unspent reset expires."
-                    : "Get a notification 7 days, 3 days and 24 hours before an unspent Claude or Codex reset expires."}
+                    ? "On for this device. Get pool alerts at 90% usage and reset expiry reminders."
+                    : "Get pool alerts at 90% usage and reminders 7 days, 3 days and 24 hours before a reset expires."}
             </div>
           </div>
         </div>

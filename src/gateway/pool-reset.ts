@@ -1,0 +1,244 @@
+import type { SQL } from "bun";
+import type { ManualResetInfo } from "../cli/limits/types.ts";
+import type { PoolUsage } from "../identities/pool/adapter.ts";
+import type { CodexCreditSelection, CodexRedemptionGuard, consumeCodexResetForIdentity } from "./account.ts";
+import { bounded } from "./refresh-guard.ts";
+import { chooseAutoResetCandidate, liveCredits, MIN_WEEKLY_REMAINING_MS, weeklyWindow } from "./auto-reset.ts";
+import { POOL_RESET_THRESHOLD, type PoolResetCandidate, type PoolResetConfirmation, type PoolResetResult, type PoolResetReview, type PoolThreshold } from "./pool-reset-view.ts";
+import type { GatewayProvider } from "./types.ts";
+import { USAGE_TTL_MS } from "./usage-source.ts";
+
+export const poolWindowKey = (window: NonNullable<PoolUsage["windows"]>[number]): string =>
+  JSON.stringify([window.label.trim().toLowerCase(), window.model?.trim().toLowerCase() ?? ""]);
+
+export function poolUtilisation(readings: ReadonlyArray<PoolUsage | undefined>, now: number): Pick<PoolThreshold, "percent" | "complete"> {
+  if (!readings.length) return { complete: false };
+  const windows = new Map<string, number[]>();
+  let complete = true;
+  for (const reading of readings) {
+    const age = now - Date.parse(reading?.capturedAt ?? "");
+    if (!reading?.windows?.length || reading.stale || reading.noPlan || reading.status === "unavailable" || !(age >= 0 && age <= USAGE_TTL_MS)) {
+      return { complete: false };
+    }
+    const seen = new Set<string>();
+    for (const window of reading.windows) {
+      const key = poolWindowKey(window);
+      if (seen.has(key)) return { complete: false };
+      seen.add(key);
+      const reset = window.resetsAt === undefined ? Infinity : Date.parse(window.resetsAt);
+      if (!window.label.trim() || !(reset > now) || !Number.isFinite(window.utilization) || window.utilization < 0) {
+        complete = false;
+        continue;
+      }
+      const values = windows.get(key) ?? [];
+      values.push(window.utilization);
+      windows.set(key, values);
+    }
+  }
+  const averages = [];
+  for (const values of windows.values()) {
+    if (values.length !== readings.length) complete = false;
+    else averages.push(values.reduce((total, value) => total + value, 0) / readings.length);
+  }
+  return averages.length ? { percent: Math.max(...averages), complete } : { complete: false };
+}
+
+type UsageProof = Record<string, number>;
+
+function usageProof(reading: PoolUsage): UsageProof {
+  return Object.fromEntries((reading.windows ?? []).map((window) => [poolWindowKey(window), window.utilization]));
+}
+
+function provesRelief(reading: PoolUsage | undefined, consumedAt: number, baseline: UsageProof): boolean {
+  if (!reading || reading.stale || reading.status === "unavailable" || !(Date.parse(reading.capturedAt) > consumedAt)) return false;
+  return reading.windows?.some((window) => window.utilization < baseline[poolWindowKey(window)]) === true;
+}
+
+export function codexResetRelieved(reading: PoolUsage | undefined, consumedAt: number, baseline: PoolUsage | undefined): boolean {
+  return !!baseline && provesRelief(reading, consumedAt, usageProof(baseline));
+}
+
+export interface NamedGatewayPool {
+  tool: GatewayProvider;
+  pool: string;
+  members: string[];
+}
+
+export function poolResetReview(
+  scope: NamedGatewayPool,
+  readings: ReadonlyArray<PoolUsage | undefined>,
+  inventories: ReadonlyArray<ManualResetInfo | undefined>,
+  usedCredits: ReadonlySet<string>,
+  now: number,
+): PoolResetReview {
+  const review = { ...scope, ...poolUtilisation(readings, now), observedAt: now };
+  if (scope.tool !== "codex") return { ...review, availability: "unsupported" };
+  if (review.percent === undefined) return { ...review, availability: "unavailable" };
+  if (review.percent < POOL_RESET_THRESHOLD) return { ...review, availability: review.complete ? "below_threshold" : "unavailable" };
+  const windows = readings.map((reading) => weeklyWindow(reading, now));
+  if (windows.some((window) => !window)) return { ...review, availability: "unavailable" };
+  const eligible = windows.flatMap((window, index) =>
+    window && window.reset - now >= MIN_WEEKLY_REMAINING_MS &&
+      readings[index]?.windows?.some((usage) => usage.utilization > 0)
+      ? [{ weeklyReset: window.reset, identity: scope.members[index], inventory: inventories[index] }] : []);
+  if (eligible.some(({ inventory }) => !inventory || inventory.stale)) return { ...review, availability: "unavailable" };
+  const candidate = chooseAutoResetCandidate(eligible.flatMap(({ identity, inventory, weeklyReset }) =>
+    liveCredits(inventory, now).flatMap(({ id, expiry }) => usedCredits.has(id) ? [] : [{
+      pool: scope.pool, identity, creditId: id, creditExpiresAt: expiry, weeklyReset,
+    }])), now);
+  if (!candidate) return { ...review, availability: "no_credit" };
+  const { identity, creditId, creditExpiresAt, weeklyReset } = candidate;
+  return { ...review, availability: "available", candidate: { identity, creditId, creditExpiresAt, weeklyReset } };
+}
+
+export function samePoolResetCandidate(a: PoolResetCandidate | undefined, b: PoolResetCandidate): boolean {
+  return a?.identity === b.identity && a.creditId === b.creditId &&
+    a.creditExpiresAt === b.creditExpiresAt && a.weeklyReset === b.weeklyReset;
+}
+
+type BeforePost = Parameters<Parameters<CodexRedemptionGuard>[0]>[0];
+type SpendResult = Awaited<ReturnType<typeof consumeCodexResetForIdentity>>;
+
+interface ConfirmPoolDeps {
+  journal: Pick<PgPoolResetJournal, "manualAttempted" | "recordAttempt" | "markConsumed">;
+  guard: CodexRedemptionGuard;
+  assess: (pool: string, signal: AbortSignal) => Promise<{ review: PoolResetReview; readings: Array<PoolUsage | undefined> } | undefined>;
+  members: (pool: string) => Promise<string[] | undefined>;
+  spend: (beforePost: BeforePost, identity: string, requestId: string, selection: CodexCreditSelection) => Promise<SpendResult>;
+  version: (identity: string) => Promise<string>;
+  reconcile: (identity: string, baseline: PoolUsage | undefined, consumedAt: number, version?: string) => Promise<{ status: "confirmed" | "pending" }>;
+  now: () => number;
+}
+
+export async function confirmPoolReset(
+  pool: string,
+  confirmation: PoolResetConfirmation,
+  signal: AbortSignal,
+  deps: ConfirmPoolDeps,
+): Promise<PoolResetResult | undefined> {
+  const { candidate, redeemRequestId } = confirmation;
+  const { identity, creditId } = candidate;
+  const spend = await deps.guard(async (invalidate) => {
+    signal.throwIfAborted();
+    if (await bounded(deps.journal.manualAttempted(creditId), 2_000, "pool reset journal")) return { status: "already_attempted" as const };
+    const current = await deps.assess(pool, signal);
+    signal.throwIfAborted();
+    if (!current) return undefined;
+    if (!samePoolResetCandidate(current.review.candidate, candidate)) return { status: "changed" as const, review: current.review };
+    const baseline = current.readings[current.review.members.indexOf(identity)];
+    const stillCurrent = () => {
+      const now = deps.now();
+      return !signal.aborted && now < candidate.creditExpiresAt &&
+        candidate.weeklyReset - now >= MIN_WEEKLY_REMAINING_MS && now - current.review.observedAt < USAGE_TTL_MS;
+    };
+    let version: string | undefined;
+    let postStarted = false;
+    let result: SpendResult;
+    try {
+      result = await deps.spend(async () => {
+        signal.throwIfAborted();
+        if (!await bounded(deps.journal.recordAttempt(creditId, redeemRequestId), 2_000, "pool reset journal")) {
+          throw Object.assign(new Error("This reset request was already attempted. Check current limits."), { status: 409 });
+        }
+        await invalidate(identity);
+        version = await deps.version(identity);
+      }, identity, redeemRequestId, {
+        id: creditId,
+        endsAt: new Date(candidate.creditExpiresAt).toISOString(),
+        signal,
+        now: deps.now,
+        stillCurrent,
+        stillEligible: async () => {
+          const members = await deps.members(pool);
+          const expected = new Set(current.review.members);
+          return stillCurrent() && members?.length === expected.size && members.every((member) => expected.has(member));
+        },
+        onPost: () => { postStarted = true; },
+        finishPostAfterDeadline: true,
+      });
+    } catch (error) {
+      if (postStarted) return { status: "pending" as const };
+      throw error;
+    }
+    if (result.creditId !== undefined && result.creditId !== creditId) return { status: "pending" as const };
+    if (result.result === "already_redeemed") return { status: "already_attempted" as const };
+    if (result.result !== "reset") return { status: "declined" as const };
+    const consumedAt = deps.now();
+    if (baseline && version !== undefined) {
+      await bounded(deps.journal.markConsumed(creditId, identity, version, baseline, consumedAt), 2_000, "pool reset recovery").catch(() => undefined);
+    }
+    return { baseline, version, consumedAt };
+  });
+  if (!spend || spend.status !== undefined) return spend;
+  const reconciled = await deps.reconcile(identity, spend.baseline, spend.consumedAt, spend.version)
+    .catch(() => ({ status: "pending" as const }));
+  return { status: reconciled.status };
+}
+
+/** Idempotency records for the explicit credit POST. Both reset paths share the redemption lock. */
+export class PgPoolResetJournal {
+  constructor(private readonly sql: SQL) {}
+
+  async usedCredits(ids: string[]): Promise<Set<string>> {
+    if (!ids.length) return new Set();
+    const rows = await this.sql`SELECT credit_id FROM codex_pool_reset_attempts WHERE credit_id IN ${this.sql(ids)}
+      UNION SELECT credit_id FROM codex_auto_reset_claims WHERE credit_id IN ${this.sql(ids)}`;
+    return new Set(rows.map((row: { credit_id: string }) => row.credit_id));
+  }
+
+  async manualAttempts(ids: string[]): Promise<Set<string>> {
+    if (!ids.length) return new Set();
+    const rows = await this.sql`SELECT credit_id FROM codex_pool_reset_attempts WHERE credit_id IN ${this.sql(ids)}`;
+    return new Set(rows.map((row: { credit_id: string }) => row.credit_id));
+  }
+
+  async manualAttempted(id: string): Promise<boolean> {
+    const rows = await this.sql`SELECT 1 FROM codex_pool_reset_attempts WHERE credit_id = ${id}`;
+    return rows.length > 0;
+  }
+
+  async recordAttempt(creditId: string, redeemRequestId: string): Promise<boolean> {
+    const rows = await this.sql`INSERT INTO codex_pool_reset_attempts (credit_id, redeem_request_id)
+      VALUES (${creditId}, ${redeemRequestId}) ON CONFLICT DO NOTHING RETURNING credit_id`;
+    return rows.length === 1;
+  }
+
+  async markConsumed(creditId: string, identity: string, version: string, baseline: PoolUsage, consumedAt: number): Promise<void> {
+    const proof = JSON.stringify(usageProof(baseline));
+    await this.sql`UPDATE codex_pool_reset_attempts SET identity = ${identity}, version = ${version}::bigint,
+      baseline = ${proof}::text::jsonb, consumed_at = ${new Date(consumedAt).toISOString()}::text::timestamptz WHERE credit_id = ${creditId}`;
+  }
+
+  async reconcileReading(identity: string, reading: PoolUsage | undefined): Promise<void> {
+    if (!reading || reading.stale || reading.status === "unavailable") return;
+    const pending = await this.sql`SELECT attempt.version::text AS version, consumed_at, baseline
+      FROM codex_pool_reset_attempts attempt JOIN reset_credit_invalidations invalidation
+        ON invalidation.provider = 'codex' AND invalidation.identity = attempt.identity AND invalidation.version = attempt.version
+      WHERE attempt.identity = ${identity} AND baseline IS NOT NULL ORDER BY consumed_at DESC LIMIT 1`;
+    const row = pending[0];
+    if (row && provesRelief(reading, new Date(row.consumed_at).getTime(), row.baseline)) {
+      await this.markVerified(identity, String(row.version));
+    }
+  }
+
+  async verifiedAt(identities: string[]): Promise<number | undefined> {
+    if (!identities.length) return undefined;
+    const rows = await this.sql`SELECT max(verified_at) AS at FROM (
+      SELECT verified_at FROM reset_credit_invalidations WHERE provider = 'codex' AND identity IN ${this.sql(identities)}
+      UNION ALL SELECT recovered_at FROM codex_auto_reset_claims WHERE identity IN ${this.sql(identities)} AND status = 'reset'
+    ) AS verified`;
+    const value: unknown = rows[0]?.at;
+    const timestamp = value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : NaN;
+    return Number.isFinite(timestamp) ? timestamp : undefined;
+  }
+
+  async markVerified(identity: string, version: string): Promise<void> {
+    await this.sql`WITH verified AS (
+      UPDATE reset_credit_invalidations SET verified_at = clock_timestamp(), verified_version = version
+      WHERE provider = 'codex' AND identity = ${identity} AND version = ${version}::bigint
+        AND verified_version IS DISTINCT FROM version RETURNING version
+    )
+    UPDATE codex_pool_reset_attempts SET baseline = NULL
+      WHERE identity = ${identity} AND baseline IS NOT NULL AND version <= (SELECT version FROM verified)`;
+  }
+}

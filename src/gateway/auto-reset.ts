@@ -13,7 +13,7 @@ export type { AutoResetClaimSummary } from "./auto-reset-store.ts";
 
 const RECOVERY_MS = 25_000;
 const READING_MAX_AGE_MS = 45_000;
-const MIN_WEEKLY_REMAINING_MS = 5 * 60_000;
+export const MIN_WEEKLY_REMAINING_MS = 5 * 60_000;
 const NATURAL_RESET_WAIT_MS = 8_000;
 const NATURAL_RESET_VERIFY_MS = 4_000;
 const NATURAL_RESET_CREDIT_MS = 60_000;
@@ -85,7 +85,7 @@ function currentReading(time: string | undefined, now: number): boolean {
   return age >= 0 && age <= READING_MAX_AGE_MS;
 }
 
-function weeklyWindow(usage: PoolUsage | undefined, now: number) {
+export function weeklyWindow(usage: PoolUsage | undefined, now: number) {
   if (!usage || usage.stale || usage.noPlan || usage.status === "unavailable" || !currentReading(usage.capturedAt, now)) return undefined;
   const windows = usage.windows?.filter((w) => w.model === undefined && /^(?:week|weekly|7d)$/i.test(w.label.trim()));
   if (windows?.length !== 1) return undefined;
@@ -109,7 +109,7 @@ export function exhaustedWeeklyReset(usage: AutoResetUsage | undefined, now: num
 }
 
 /** Keep only provider-listed credits with a usable ID and an absolute future expiry. */
-function liveCredits(info: ManualResetInfo | undefined, now: number) {
+export function liveCredits(info: ManualResetInfo | undefined, now: number) {
   if (!info || info.stale || !Number.isSafeInteger(info.availableCount) || info.availableCount < 1) return [];
   if (info.readAt !== undefined && !currentReading(info.readAt, now)) return [];
   const ids = new Map<string, number>();

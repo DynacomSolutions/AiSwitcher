@@ -24,8 +24,7 @@ self.addEventListener("fetch", (event) => {
   );
 });
 
-// Push reminders from the console daemon (reset expiry). The payload is
-// { title, body, tag, url }; the server encrypts it for this browser only.
+// The daemon encrypts reset reminders and pool alerts for this browser.
 self.addEventListener("push", (event) => {
   let data = {};
   try {
@@ -34,12 +33,16 @@ self.addEventListener("push", (event) => {
     data = { body: event.data ? event.data.text() : "" };
   }
   const title = typeof data.title === "string" && data.title ? data.title : "AIS Console";
+  const actions = [];
+  if (data.poolAlert === "review") actions.push({ action: "review-reset", title: "Use reset" });
+  if (data.poolAlert === "review" || data.poolAlert === "dismiss") actions.push({ action: "dismiss", title: "Dismiss" });
   event.waitUntil(
     self.registration.showNotification(title, {
       body: typeof data.body === "string" ? data.body : "",
       tag: typeof data.tag === "string" ? data.tag : undefined,
       icon: "/icon-192.png",
       badge: "/badge-96.png",
+      ...(actions.length ? { actions } : {}),
       data: { url: typeof data.url === "string" && data.url.startsWith("/") ? data.url : "/" },
     }),
   );
@@ -47,12 +50,16 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const url = new URL(event.notification.data?.url ?? "/", self.location.origin).href;
+  if (event.action === "dismiss") return;
+  const target = new URL(event.notification.data?.url ?? "/", self.location.origin);
+  const url = target.origin === self.location.origin ? target.href : self.location.origin;
   event.waitUntil(
-    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((windows) => {
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (windows) => {
       for (const client of windows) {
         if (new URL(client.url).origin === self.location.origin && "focus" in client) {
-          return client.navigate(url).then((c) => (c ?? client).focus());
+          if (client.url === url) return client.focus();
+          const navigated = await client.navigate(url).catch(() => null);
+          if (navigated) return navigated.focus();
         }
       }
       return self.clients.openWindow(url);

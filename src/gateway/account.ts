@@ -83,6 +83,7 @@ export interface CodexCreditSelection {
   stillCurrent(): boolean;
   stillEligible(): Promise<boolean>;
   onPost(): void;
+  finishPostAfterDeadline?: boolean;
 }
 
 /** Spends one Codex reset on this exact stored member. The consume request is sent once. */
@@ -142,7 +143,7 @@ export async function consumeCodexResetForIdentity(
       method: "POST",
       headers: upstreamHeaders(adapter, credential, new Headers({ accept: "application/json", "content-type": "application/json" })),
       body: JSON.stringify({ redeem_request_id: redeemRequestId, ...(selection ? { credit_id: selection.id } : {}) }),
-      signal: operationSignal(),
+      signal: selection?.finishPostAfterDeadline ? AbortSignal.timeout(10_000) : operationSignal(),
       redirect: "manual",
     });
   } catch {

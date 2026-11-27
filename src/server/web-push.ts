@@ -35,6 +35,7 @@ export interface PushMessage {
   tag?: string;
   /** Console path the notification opens. */
   url?: string;
+  poolAlert?: "review" | "dismiss";
 }
 
 export interface SendResult {

@@ -24,6 +24,8 @@ import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { isOperationalPath, publicHostsFromEnv, viaPublicHost } from "./public-host.ts";
 import { aliSessionOnce, aliSetupSelfTest, listAliAccounts, type AliSetupDeps } from "./ali-session.ts";
 import { createAutoResetRecovery, type AutoResetPool, type AutoResetUsage } from "./auto-reset.ts";
+import { codexResetRelieved, confirmPoolReset, PgPoolResetJournal, poolResetReview, poolUtilisation, type NamedGatewayPool } from "./pool-reset.ts";
+import { POOL_THRESHOLDS_PATH, validPoolRoute, type PoolThreshold } from "./pool-reset-view.ts";
 import { PgAutoResetStore, type AutoResetStore } from "./auto-reset-store.ts";
 import { withStoreWaitTimeout } from "./admin-store.ts";
 import { SessionStore } from "./sessions/session-store.ts";
@@ -60,7 +62,7 @@ import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
 import { MemoryUsageReadings, PgUsageReadings, type UsageReadings } from "./usage-readings.ts";
-import { createCodexResetSource, createUsageSource, fetchCodexResetCredits, fetchGatewayCodexUsage, fetchPoolUsage, withOpencodeUsage, type FetchUsage } from "./usage-source.ts";
+import { createCodexResetSource, createUsageSource, fetchCodexResetCredits, fetchGatewayCodexUsage, fetchPoolUsage, withOpencodeUsage, USAGE_READER_PROVIDERS, type FetchUsage } from "./usage-source.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
@@ -388,7 +390,9 @@ export function appPoolMemberNames(file: IdentitiesFile): string[] {
 }
 
 /** Named Codex pools can authorise only accounts in the gateway routing union. */
-export function codexAutoResetPools(file: IdentitiesFile, routed: string[]): AutoResetPool[] {
+export const codexAutoResetPools = namedGatewayPools;
+
+function namedGatewayPools(file: IdentitiesFile, routed: string[]): AutoResetPool[] {
   const real = file.identities.filter((identity) => !isRetired(identity) && !isSwapPool(identity));
   const union = new Set(routed);
   return poolsOf(file).map((pool) => {
@@ -845,6 +849,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : sharedSql;
   const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
   const resetCreditInvalidations = hooks.resetCreditInvalidations ?? (readingsSql ? new PgResetCreditInvalidations(readingsSql) : new MemoryResetCreditInvalidations());
+  const poolResetJournal = readingsSql ? new PgPoolResetJournal(readingsSql) : undefined;
   const redemptionScope = { provider: "internal-codex-redemption", identity: "gateway" };
   const localRedemptionQueue = new MemoryRefreshBackend();
   const generation = (identity: string) => bounded(resetCreditInvalidations.version(identity), 2_000, "Codex reset generation");
@@ -903,9 +908,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const autoResetConfig = hooks.autoReset ?? (hooks.openStore || hooks.ping ? undefined : {
     store: new PgAutoResetStore(sharedSql),
     pools: async () => {
-      const file = await loadIdentitiesFile(TOOL_CONFIGS.codex.identitiesJsonPath);
-      const members = await poolMembers("codex");
-      return codexAutoResetPools(file, await Promise.all(members.map((name) => canonical("codex", name))));
+      return (await namedPools("codex")).map(({ pool, members }) => ({ name: pool, members }));
     },
   });
   const autoReset = autoResetConfig && (() => {
@@ -943,7 +946,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         const credential = await codexCredential(identity);
         signal.throwIfAborted();
         const inventory = await fetchCodexResetCredits(credential, hooks.fetch ?? fetch, signal, clock, "automatic");
-        return before === await generation(identity) ? inventory : undefined;
+        if (!inventory || before !== await generation(identity)) return undefined;
+        const credits = inventory.creditExpiries;
+        if (!poolResetJournal || !credits?.length) return inventory;
+        const attempted = await bounded(poolResetJournal.manualAttempts(credits.map(({ id }) => id)), 2_000, "pool reset journal");
+        return { ...inventory, creditExpiries: credits.filter(({ id }) => !attempted.has(id)) };
       },
       spend: (identity, id, requestId, signal, evidence) => {
         evidence.postAttempted(false);
@@ -975,19 +982,134 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     };
   })();
 
-  async function spendCodexCredit(identity: string, redeemRequestId: string, selection?: CodexCreditSelection) {
+  async function spendLockedCodexCredit(
+    beforePost: Parameters<Parameters<CodexRedemptionGuard>[0]>[0],
+    identity: string,
+    redeemRequestId: string,
+    selection?: CodexCreditSelection,
+  ) {
+    // Credential lookup can take the account lock itself.
+    selection?.signal.throwIfAborted();
+    const credential = await codexCredential(identity);
+    const lock = await refreshBackend.acquire({ provider: "codex", identity }, 15_000);
+    try {
+      if (selection && !await selection.stillEligible()) return { identity, result: "no_credit" as const, windowsReset: 0 };
+      return await consumeCodexResetForIdentity(identity, redeemRequestId, { creds, fetch: hooks.fetch ?? fetch, credential }, selection, beforePost);
+    } finally {
+      await lock.release().catch(() => undefined);
+    }
+  }
+
+  async function spendCodexCredit(identity: string, redeemRequestId: string, selection?: CodexCreditSelection, invalidated?: (version: string) => void) {
     return withCodexRedemption(async (beforePost) => {
-      // Acquire the redemption lock before any account lock. Credential lookup can take the account lock itself.
-      selection?.signal.throwIfAborted();
-      const credential = await codexCredential(identity);
-      const lock = await refreshBackend.acquire({ provider: "codex", identity }, 15_000);
-      try {
-        if (selection && !await selection.stillEligible()) return { identity, result: "no_credit" as const, windowsReset: 0 };
-        return await consumeCodexResetForIdentity(identity, redeemRequestId, { creds, fetch: hooks.fetch ?? fetch, credential }, selection, beforePost);
-      } finally {
-        await lock.release().catch(() => undefined);
+      if (selection && poolResetJournal &&
+        await bounded(poolResetJournal.manualAttempted(selection.id), 2_000, "pool reset journal")) {
+        return { identity, result: "no_credit" as const, windowsReset: 0 };
       }
+      return spendLockedCodexCredit(async (name) => {
+        await beforePost(name);
+        if (invalidated && poolResetJournal) {
+          const version = await generation(name).catch(() => undefined);
+          if (version !== undefined) invalidated(version);
+        }
+      }, identity, redeemRequestId, selection);
     });
+  }
+
+  const clock = () => now().getTime();
+  async function namedPools(provider: GatewayProvider): Promise<NamedGatewayPool[]> {
+    const file = await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath);
+    const members = await poolMembers(provider);
+    const names = await Promise.all(members.map((name) => canonical(provider, name)));
+    return namedGatewayPools(file, names).map(({ name, members }) => ({ tool: provider, pool: name, members }));
+  }
+
+  async function thresholdReadings(scopes: NamedGatewayPool[]) {
+    const readings = new Map<string, Promise<Awaited<ReturnType<typeof usage.get>>>>();
+    const read = (provider: GatewayProvider, identity: string) => {
+      const key = JSON.stringify([provider, identity]);
+      const reading = readings.get(key) ?? bounded((async () => {
+        if (await creds.loggedOut?.(provider, identity)) return undefined;
+        await usage.refreshManual(provider, identity);
+        if (usage.lastFailure(provider, identity)) return undefined;
+        const current = await usage.get(provider, identity);
+        if (provider === "codex" && poolResetJournal) {
+          await bounded(poolResetJournal.reconcileReading(identity, current), 2_000, "pool reset recovery").catch(() => undefined);
+        }
+        return current;
+      })(), 12_000, "pool usage").catch(() => undefined);
+      readings.set(key, reading);
+      return reading;
+    };
+    return Promise.all(scopes.map(async (scope): Promise<PoolThreshold> => {
+      const current = await Promise.all(scope.members.map((identity) => read(scope.tool, identity)));
+      const verifiedResetAt = scope.tool === "codex" && poolResetJournal
+        ? await bounded(poolResetJournal.verifiedAt(scope.members), 2_000, "pool recovery").catch(() => undefined)
+        : undefined;
+      const observedAt = clock();
+      return { tool: scope.tool, pool: scope.pool, observedAt, ...poolUtilisation(current, observedAt), verifiedResetAt };
+    }));
+  }
+
+  async function assessPoolReset(tool: GatewayProvider, pool: string, signal: AbortSignal) {
+    const scope = (await namedPools(tool)).find((entry) => entry.pool === pool);
+    if (!scope) return undefined;
+    if (tool !== "codex") {
+      const [threshold] = await thresholdReadings([scope]);
+      return { review: { ...threshold, members: scope.members, availability: "unsupported" as const }, readings: [] };
+    }
+    const fetched = await Promise.all(scope.members.map(async (identity) => {
+      try {
+        if (await creds.loggedOut?.("codex", identity)) return undefined;
+        const credential = await codexCredential(identity);
+        signal.throwIfAborted();
+        const [reading, inventory] = await Promise.all([
+          fetchGatewayCodexUsage(credential, hooks.fetch ?? fetch, clock, signal).catch(() => undefined),
+          fetchCodexResetCredits(credential, hooks.fetch ?? fetch, signal, clock, "automatic").catch(() => undefined),
+        ]);
+        return { reading, inventory };
+      } catch {
+        return undefined;
+      }
+    }));
+    signal.throwIfAborted();
+    const ids = [...new Set(fetched.flatMap((row) => row?.inventory?.creditExpiries?.map(({ id }) => id) ?? []))];
+    const used = await bounded(poolResetJournal!.usedCredits(ids), 2_000, "pool reset journal");
+    const readings = fetched.map((row) => row?.reading);
+    return { review: poolResetReview(scope, readings, fetched.map((row) => row?.inventory), used, clock()), readings };
+  }
+
+  async function reconcileCodexReset(
+    identity: string,
+    baseline: Awaited<ReturnType<typeof usage.get>>,
+    consumedAt: number,
+    version?: string,
+    before = baseline,
+  ) {
+    // Read only this account from OpenAI. A different replica may still have the pre-reset shared cache.
+    let latest = before;
+    // Keep the fresh reads inside the console's 30-second Gateway request timeout.
+    const deadline = Date.now() + 6_000;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finished = await Promise.race([
+        (attempt === 0 ? usage.refreshNowAfterInflight("codex", identity) : usage.refreshNow("codex", identity)).then(() => true, () => true),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (!finished) break;
+      latest = await usage.get("codex", identity).catch(() => latest);
+      if (codexResetRelieved(latest, consumedAt, baseline)) {
+        if (version !== undefined && poolResetJournal) {
+          await bounded(poolResetJournal.markVerified(identity, version), 2_000, "pool reset recovery").catch(() => undefined);
+        }
+        return { status: "confirmed" as const, usage: latest };
+      }
+    }
+    return { status: "pending" as const, ...(latest ? { usage: { ...latest, stale: true } } : {}) };
   }
   const browserPoolMembers = hooks.browserPoolMembers ?? defaultBrowserPoolMembers;
   const browserIdentityExists = hooks.browserIdentityExists ?? defaultBrowserIdentityExists;
@@ -1060,6 +1182,23 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const admin = createAdminApp({
     store,
     autoReset: autoResetConfig,
+    ...(poolResetJournal ? { poolReset: {
+      thresholds: async () => {
+        const groups = await Promise.all([...USAGE_READER_PROVIDERS].map((provider) => namedPools(provider)));
+        return thresholdReadings(groups.flat().filter(({ tool, pool }) => validPoolRoute(tool, pool)));
+      },
+      review: async (provider, pool, signal) => (await assessPoolReset(provider, pool, signal))?.review,
+      confirm: (pool, confirmation, signal) => confirmPoolReset(pool, confirmation, signal, {
+        journal: poolResetJournal,
+        guard: withCodexRedemption,
+        assess: (name, abort) => assessPoolReset("codex", name, abort),
+        members: async (name) => (await namedPools("codex")).find((entry) => entry.pool === name)?.members,
+        spend: spendLockedCodexCredit,
+        version: generation,
+        reconcile: reconcileCodexReset,
+        now: clock,
+      }),
+    } } : {}),
     readStore: inner,
     adminToken: opts.adminToken,
     now,
@@ -1103,42 +1242,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       const before = await usage.get("codex", identity).catch(() => undefined);
       const beforeAt = before ? Date.parse(before.capturedAt) : Number.NaN;
       const baseline = before && !before.stale && before.status !== "unavailable" && Number.isFinite(beforeAt) ? before : undefined;
-      const result = await spendCodexCredit(identity, redeemRequestId);
+      let version: string | undefined;
+      const result = await spendCodexCredit(identity, redeemRequestId, undefined, (value) => { version = value; });
       if (result.result !== "reset" && result.result !== "already_redeemed") return { ...result, reconciliation: { status: "not_needed" as const } };
 
-      // Read only this account from OpenAI. A different replica may still have the pre-reset shared cache.
-      let latest: typeof before = before;
-      const consumedAt = Date.now();
-      const relieved = (candidate: typeof before): boolean => {
-        if (!baseline || !candidate || candidate.stale || candidate.status === "unavailable") return false;
-        const capturedAt = Date.parse(candidate.capturedAt);
-        if (!Number.isFinite(capturedAt) || capturedAt <= consumedAt || !(candidate.windows?.length)) return false;
-        const key = (window: NonNullable<typeof candidate.windows>[number]) => `${window.label.trim().toLowerCase()}\u0000${window.model?.trim().toLowerCase() ?? ""}`;
-        const previous = new Map((baseline.windows ?? []).map((window) => [key(window), window.utilization]));
-        return candidate.windows.some((window) => {
-          const used = previous.get(key(window));
-          return typeof used === "number" && window.utilization < used;
-        });
-      };
-      // Keep the fresh reads inside the console's 30-second Gateway request timeout.
-      const deadline = Date.now() + 6_000;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) break;
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const finished = await Promise.race([
-          (attempt === 0 ? usage.refreshNowAfterInflight("codex", identity) : usage.refreshNow("codex", identity)).then(() => true, () => true),
-          new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
-        ]);
-        if (timer) clearTimeout(timer);
-        if (!finished) break;
-        latest = await usage.get("codex", identity).catch(() => latest);
-        if (relieved(latest)) {
-          return { ...result, reconciliation: { status: "confirmed" as const, usage: latest } };
-        }
-      }
-      return { ...result, reconciliation: { status: "pending" as const, ...(latest ? { usage: { ...latest, stale: true } } : {}) } };
+      const reconciliation = await reconcileCodexReset(identity, baseline, Date.now(), result.result === "reset" ? version : undefined, before);
+      return { ...result, reconciliation };
     }),
     browserPoolMembers,
     browserIdentityExists,
@@ -1409,11 +1518,16 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     srv.timeout(req, 0); // A long generation is not idle.
     return proxy.fetch(req, { ip: srv.requestIP(req)?.address });
   }
+  const handleAdmin = withStoreWaitTimeout<import("bun").Server<undefined>>((req) =>
+    relay && req.method === "POST" && new URL(req.url).pathname === RELAY_PATH ? relay.handleRelay(req) : admin.fetch(req));
   const adminServer = Bun.serve({
     hostname: hooks.host ?? "0.0.0.0",
     port: opts.adminPort,
-    // The store long poll (/store/wait) outlasts Bun's 10 s idle timeout: its request timeout is switched off.
-    fetch: withStoreWaitTimeout((req) => (relay && req.method === "POST" && new URL(req.url).pathname === RELAY_PATH ? relay.handleRelay(req) : admin.fetch(req))),
+    fetch(req, server) {
+      const path = new URL(req.url).pathname;
+      if (path === POOL_THRESHOLDS_PATH || path.startsWith("/limits/pools/")) server.timeout(req, 30);
+      return handleAdmin(req, server);
+    },
   });
 
   const checkLedger = watchLedger(ledger, alerter);
