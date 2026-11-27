@@ -117,6 +117,8 @@ const hooks = (over: Partial<GatewayHooks> = {}): GatewayHooks => ({
   ledger: { max: 1000, flushMs: 3_600_000 },
   refreshIntervalMs: 3_600_000,
   exit: () => undefined,
+  // The production settle phase waits for 2 s of quiet; the tests do not.
+  drain: { settleQuietMs: 30, settleMaxMs: 300 },
   noHeartbeat: true,
   ...over,
 });

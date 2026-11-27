@@ -1,4 +1,5 @@
 import { startUsageProxy, type RunningUsageProxy } from "./usage-proxy.ts";
+import { DrainStats, drainTiming, settle, waitIdle, type DrainTiming } from "./drain.ts";
 import { parseToken, verifyToken } from "./tokens.ts";
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
@@ -174,6 +175,8 @@ export interface GatewayHooks {
   aliSetup?: AliSetupDeps;
   /** Host names the gateway is public under; metrics, health and pairing are 404 there. Defaults to AIS_GATEWAY_PUBLIC_HOSTS. */
   publicHosts?: string[];
+  /** Drain timing (drain.ts). Defaults come from AIS_GATEWAY_DRAIN_* in the environment. */
+  drain?: Partial<DrainTiming>;
   /** Longest stop() waits for the keep-alive pass (ali renewals are abandoned at once on drain). Default 10 s, well inside the 30 s grace. */
   stopCeilingMs?: number;
   /** Tests: do not read or write the shared gateway heartbeat file. */
@@ -1414,6 +1417,16 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   metrics.connectProxy = () => ({ configured: connectConfigured, up: connectProxy !== undefined, downSeconds: Math.floor(connectDownMs() / 1000), failures: connectFailures });
   // Readiness answers the same in /readyz, in ais_gateway_ready and in ready(): a configured CONNECT proxy must listen.
   const isReady = (): boolean => warmed && !draining && usageGate.isReady() && (!connectConfigured || connectProxy !== undefined);
+  // Drain bookkeeping (drain.ts). Probe and metrics requests are not client work: they never count as in flight.
+  const drainCfg = drainTiming(process.env, hooks.drain);
+  let probesInFlight = 0;
+  let lastArrivalAt = 0;
+  let refusing = false;
+  const drainStats = new DrainStats(() => ({
+    requests: Math.max(0, server.pendingRequests - probesInFlight),
+    tunnels: connectProxy?.tunnels?.().busy ?? 0,
+  }));
+  metrics.sections.push(() => drainStats.render());
   metrics.readiness = () => ({ ready: isReady(), state: usageGate.state() });
   metrics.usageWarmup = () => ({ seconds: (usageGate.result()?.durationMs ?? 0) / 1000, timeouts: usageWarmupTimeouts, cold: usageWarmupCold });
   let storeSynced = false;
@@ -1602,21 +1615,38 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       close: (ws) => hub.detach(ws),
     },
     async fetch(req, srv) {
-      if (!draining && warmed && req.method === "GET" && new URL(req.url).pathname === "/browser/connect") {
-        // Authentication is the first `hello` message; the token is never in the URL.
-        if (srv.upgrade(req)) return undefined as unknown as Response;
-        return markGatewayResponse(new Response("AIS gateway: websocket upgrade required\n", { status: 426, headers: { [GATEWAY_ERROR_HEADER]: "upgrade_required" } }));
-      }
-      const res = markGatewayResponse(await route(req, srv));
-      if (draining) {
-        // Keep-alive clients reconnect (to another replica) instead of reusing this connection.
-        try {
-          res.headers.set("connection", "close");
-        } catch {
-          return new Response(res.body, { status: res.status, statusText: res.statusText, headers: new Headers([...res.headers, ["connection", "close"]]) });
+      const path = new URL(req.url).pathname;
+      // Health, readiness and metrics are the kubelet's and the monitoring's: never client work, never refused while draining.
+      const probe = path === "/healthz" || path === "/readyz" || path === "/metrics";
+      if (probe) probesInFlight += 1;
+      else lastArrivalAt = Date.now();
+      try {
+        if (refusing && !probe) {
+          // After the settle phase of a drain: the Service no longer lists this pod, so a client that still arrives retries elsewhere.
+          drainStats.refusedTotal += 1;
+          const refused = providerError(await styleForPath({ store }, path), 503, "this gateway replica is restarting, retry the request", "draining");
+          refused.headers.set("retry-after", "1");
+          refused.headers.set("connection", "close");
+          return refused;
         }
+        if (!draining && warmed && req.method === "GET" && path === "/browser/connect") {
+          // Authentication is the first `hello` message; the token is never in the URL.
+          if (srv.upgrade(req)) return undefined as unknown as Response;
+          return markGatewayResponse(new Response("AIS gateway: websocket upgrade required\n", { status: 426, headers: { [GATEWAY_ERROR_HEADER]: "upgrade_required" } }));
+        }
+        const res = markGatewayResponse(await route(req, srv));
+        if (draining) {
+          // Keep-alive clients reconnect (to another replica) instead of reusing this connection.
+          try {
+            res.headers.set("connection", "close");
+          } catch {
+            return new Response(res.body, { status: res.status, statusText: res.statusText, headers: new Headers([...res.headers, ["connection", "close"]]) });
+          }
+        }
+        return res;
+      } finally {
+        if (probe) probesInFlight -= 1;
       }
-      return res;
     },
   });
   async function route(req: Request, srv: { timeout(r: Request, s: number): void; requestIP(r: Request): { address: string } | null }): Promise<Response> {
@@ -1981,6 +2011,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       draining = true;
+      drainStats.begin();
       drainCtrl.abort();
       // The chat drain starts at once: new prompts are refused and asks end as cancelled. Turns in flight finish. It is awaited below, after the servers stop.
       const chatDrain = chat?.broker.drain().catch(() => undefined);
@@ -1996,8 +2027,26 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       await connectAttempt?.catch(() => undefined);
       if (importTimer) clearInterval(importTimer);
       store.stop();
-      // Bun's stop(false) refuses new connections and resolves once active requests are done.
-      await Promise.all([server.stop(false), adminServer.stop(false), connectProxy?.stop(false)]);
+      // Phase 1: serve on while the Service and the routers drop this pod (see drain.ts). Readiness already fails.
+      await settle({ startedAt: drainStats.startedAtMs, lastArrivalAt: () => Math.max(lastArrivalAt, connectProxy?.tunnels?.().lastArrivalAt ?? 0), timing: drainCfg });
+      // Phase 2: new requests and tunnels get a retryable 503. Probes and metrics still answer.
+      drainStats.phase = "refuse";
+      refusing = true;
+      connectProxy?.refuseNew?.();
+      // Phase 3: leave when no request, stream or tunnel is in flight. There is no timer; the ceiling is opt-in and counts what it cuts.
+      drainStats.phase = "wait";
+      const waited = await waitIdle({ startedAt: drainStats.startedAtMs, load: () => ({ requests: Math.max(0, server.pendingRequests - probesInFlight), tunnels: connectProxy?.tunnels?.().busy ?? 0 }), timing: drainCfg });
+      if (waited.outcome === "ceiling") {
+        const cut = waited.cut.requests + waited.cut.tunnels;
+        drainStats.cutTotal += cut;
+        console.error(`gateway: drain ceiling reached after ${drainCfg.ceilingMs} ms; the shutdown cuts ${waited.cut.requests} request(s) and ${waited.cut.tunnels} tunnel(s)`);
+        // Stay up long enough for one scrape to read the count, then close what is left.
+        await new Promise<void>((r) => setTimeout(r, drainCfg.cutHoldMs));
+        await Promise.all([server.stop(true), adminServer.stop(true), connectProxy?.stop(true)]);
+      } else {
+        // Nothing is in flight: the listeners close at once. Bun's stop(false) would also wait for active requests.
+        await Promise.all([server.stop(false), adminServer.stop(false), connectProxy?.stop(false)]);
+      }
       // Refreshes and the keep-alive in flight finish (or fail) before the backend that guards them goes away.
       // A browser renewal is abandoned at once and the pass given a short ceiling, so the ledger below is always flushed inside the grace period.
       aliAbort.abort();
@@ -2024,6 +2073,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       // The shared pool and listener close once, after every component that used them.
       await releaseGatewayListener(opts.databaseUrl);
       await releaseGatewaySql(opts.databaseUrl);
+      drainStats.end();
     })();
     return stopping;
   };
@@ -2047,6 +2097,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
           tlsDir: connect.tlsDir,
           ...(connect.publishCaTo ? { publishCaTo: connect.publishCaTo } : {}),
           appForToken,
+          // The kubelet's readiness and liveness probes tunnel to the proxy port on loopback: they are not client traffic.
+          isProbeTarget: (host: string, port: number) => port === (server.port as number) && (host === "127.0.0.1" || host === "localhost" || host === "::1"),
           // The gateway's own route for the app, with the client's method, headers (same token) and body.
           serve: async (app, path, req) => {
             const hasBody = req.body !== null && req.method !== "GET" && req.method !== "HEAD";
