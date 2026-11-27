@@ -63,7 +63,7 @@ import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
 import { enableMemberStore, hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreEnabled, setLocalWriteHook } from "../identities/gateway-members.ts";
-import { clearLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
+import { clearLoginRevoked, readLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
 import { useClaudeReset } from "../server/claude-resets.ts";
@@ -927,9 +927,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     identityState: hooks.identityState ?? defaultIdentityState,
     // The same cached usage reads the proxy selects on: the console Limits page shows them through GET /limits.
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
-    refreshUsageFor: async (provider, identity) => usage.refreshNow(provider, await canonical(provider, identity)),
+    refreshUsageFor: async (provider, identity) => usage.refreshManual(provider, await canonical(provider, identity)),
     usageFailureFor: async (provider, identity) => usage.lastFailure(provider, await canonical(provider, identity)),
-    invalidateResetCreditsFor: async (identity) => resetCredits.invalidate(await canonical("codex", identity)),
+    loginRevokedFor: async (provider, identity) => (memberStoreEnabled() && isMemberStoreTool(provider) ? readLoginRevoked(provider, await canonical(provider, identity)) !== undefined : false),
+    refreshResetCreditsFor: async (identity) => resetCredits.expire(await canonical("codex", identity)),
     resetCreditsFor: resetCredits,
 
     poolMembers,

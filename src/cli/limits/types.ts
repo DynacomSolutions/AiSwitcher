@@ -152,6 +152,8 @@ export interface ToolLimitResult {
   manualReset?: ManualResetInfo;
   /** True when the Gateway credential store owns this provider identity. */
   gatewayManaged?: boolean;
+  /** True when the gateway reports the stored login dead (the provider refused its refresh token): only a new sign-in helps. */
+  loginRevoked?: true;
   /** See ExtraUsageInfo. Present only on a live fetch that reported it. */
   extraUsage?: ExtraUsageInfo;
   /** Short human-readable account plan label, e.g. "Max 20x", "Pro", "Team",

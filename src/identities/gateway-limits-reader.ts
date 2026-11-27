@@ -23,6 +23,8 @@ export interface GatewayLimitRow {
   windows?: Array<{ label: string; utilization: number; resetsAt?: string; model?: string }>;
   extraUsage?: ExtraUsageInfo;
   manualReset?: ManualResetInfo;
+  /** The gateway found the stored login dead (the provider refused its refresh token). */
+  loginRevoked?: boolean;
   /** Claude: the profile plan the gateway reads hourly (type and rate-limit tier). */
   plan?: { type: string; tier?: string; checkedAt?: string; stale?: boolean };
   /** Other providers: the short plan display label from the limits fetch. */
@@ -165,7 +167,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
   if (!r || typeof r.provider !== "string" || !LIMIT_TOOLS.has(r.provider) || typeof r.identity !== "string" || r.identity === "") return undefined;
   const toolName = r.provider as ToolConfig["toolName"];
   const identity: Identity = { name: r.identity, label: r.identity, configDir: "" };
-  const base = { toolName, provider: providerForTool(toolName), identity, gatewayManaged: true };
+  const base = { toolName, provider: providerForTool(toolName), identity, gatewayManaged: true, ...(r.loginRevoked === true ? { loginRevoked: true as const } : {}) };
   const windows: LimitWindow[] = [];
   for (const rawWindow of Array.isArray(r.windows) ? r.windows : []) {
     const w = rawWindow as Record<string, unknown> | null;

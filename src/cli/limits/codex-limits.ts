@@ -2,7 +2,6 @@ import type { Identity } from "../../identities/types.ts";
 import { isLimitsProbe } from "../../shared/limits-probe.ts";
 import { hasMemberCopy, memberDir, memberStoreEnabled, memberStoreRoot } from "../../identities/gateway-members.ts";
 import { classifyLogin } from "../../identities/gateway-routed.ts";
-import { readLoginRevoked } from "../../identities/gateway-revoked.ts";
 import { codexAccountOf, codexAuthPath, parseCodexAuth, readCodexAuthText } from "../../identities/codex-auth.ts";
 import { readFileSync } from "node:fs";
 import { loadGatewayLimits, type LoadGatewayLimitsDeps } from "../../identities/gateway-limits-reader.ts";
@@ -630,8 +629,11 @@ export async function fetchCodexLimitsViaStore(identity: Identity, deps: CodexSt
     });
     if (res.status === 401 || res.status === 403) {
       // A login the gateway found dead (the provider refused its refresh token) is never renewed: only a new sign-in helps.
-      const dead = readLoginRevoked("codex", identity.name, deps.memberRoot);
-      if (dead) return { ...base, windows: [], status: "unavailable", error: `OpenAI rejected this Codex login (${dead.code}). Sign in again in the AIS portal, Identities tab.` };
+      // The gateway API says so. This code never opens a login file to find out.
+      const view = await loadGatewayLimits({ provider: "codex", identity: identity.name, ...deps.gateway });
+      if (view.rows.some((row) => row.toolName === "codex" && row.identity.name === identity.name && row.loginRevoked === true)) {
+        return { ...base, windows: [], status: "unavailable", error: "OpenAI rejected this Codex login. Sign in again in the AIS portal, Identities tab." };
+      }
       return { ...base, windows: [], status: "unavailable", error: `usage endpoint answered HTTP ${res.status} for the gateway member store login; the AIS gateway renews it (is the gateway running?)` };
     }
     if (!res.ok) return { ...base, windows: [], status: "unavailable", error: `usage endpoint answered HTTP ${res.status}` };

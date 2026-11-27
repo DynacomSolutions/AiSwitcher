@@ -454,3 +454,13 @@ describe("mapGatewayLimitRow: plan labels", () => {
     expect(mapGatewayLimitRow(row("kimi", { planLabel: "" }))!.plan).toBeUndefined();
   });
 });
+
+describe("mapGatewayLimitRow: a dead login", () => {
+  test("loginRevoked rides on the row, on an unavailable and on a cached reading, and never on a plain one", () => {
+    const dead = mapGatewayLimitRow({ provider: "codex", identity: "c1", status: "unavailable", windows: [], loginRevoked: true });
+    expect(dead?.loginRevoked).toBe(true);
+    expect(mapGatewayLimitRow({ provider: "codex", identity: "c1", status: "unavailable", windows: [] })?.loginRevoked).toBeUndefined();
+    const cached = mapGatewayLimitRow({ provider: "codex", identity: "c1", status: "live", stale: true, windows: [{ label: "week", utilization: 15 }], loginRevoked: true });
+    expect(cached?.loginRevoked).toBe(true);
+  });
+});

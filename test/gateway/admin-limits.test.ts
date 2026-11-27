@@ -92,7 +92,7 @@ describe("admin GET /limits", () => {
     expect((await call(app, "/limits?fresh=1")).status).toBe(400);
   });
 
-  test("a tab refresh reads every identity of the provider again, drops cached Codex reset credits and keeps going past a failed read", async () => {
+  test("a tab refresh reads every identity of the provider again, expires cached Codex reset credits and keeps going past a failed read", async () => {
     const refreshed: string[] = [];
     const invalidated: string[] = [];
     const app = appWith({
@@ -101,7 +101,7 @@ describe("admin GET /limits", () => {
         refreshed.push(`${provider}/${identity}`);
         if (identity === "c2") throw new Error("OpenAI refused");
       },
-      invalidateResetCreditsFor: async (identity) => { invalidated.push(identity); },
+      refreshResetCreditsFor: async (identity) => { invalidated.push(identity); },
     });
     const response = await call(app, "/limits?provider=codex&fresh=1");
     expect(response.status).toBe(200);
@@ -110,6 +110,56 @@ describe("admin GET /limits", () => {
     // A provider with no managed identity answers an empty list, and an unmanaged identity is refused.
     expect((await call(app, "/limits?provider=kimi&fresh=1")).status).toBe(200);
     expect((await call(app, "/limits?provider=codex&identity=nobody&fresh=1")).status).toBe(400);
+  });
+
+  test("an identity read a moment ago is not read again: the recent reading stands and the credits are not asked again", async () => {
+    const credits: string[] = [];
+    let ran = true;
+    const app = appWith({
+      refreshUsageFor: async () => ran,
+      refreshResetCreditsFor: async (identity) => { credits.push(identity); },
+    });
+    await call(app, "/limits?provider=codex&identity=c1&fresh=1");
+    expect(credits).toEqual(["c1"]);
+    ran = false; // the usage source joined a read in flight or found a young reading
+    const second = await call(app, "/limits?provider=codex&identity=c1&fresh=1");
+    expect(second.status).toBe(200);
+    expect(credits).toEqual(["c1"]);
+    expect(((await second.json()) as { limits: unknown[] }).limits).toHaveLength(1);
+  });
+
+  test("a slow refresh answers inside its budget with the cached rows of the reads still running", async () => {
+    const app = appWith({
+      poolMembers: async (provider) => (provider === "codex" ? ["c1", "c2"] : []),
+      refreshUsageFor: () => new Promise<boolean>(() => {}),
+      freshReadMs: 10_000,
+      freshBudgetMs: 30,
+    });
+    const started = Date.now();
+    const response = await call(app, "/limits?provider=codex&fresh=1");
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { limits: Array<{ identity: string }> }).limits.map((r) => r.identity).sort()).toEqual(["c1", "c2"]);
+  });
+
+  test("a row carries loginRevoked when the gateway found the stored login dead", async () => {
+    const app = appWith({
+      poolMembers: async (provider) => (provider === "codex" ? ["c1", "c2"] : []),
+      usageFailureFor: async (_provider, identity) => (identity === "c2" ? { error: "OpenAI rejected this Codex login", at: STAMP } : undefined),
+      loginRevokedFor: async (_provider, identity) => identity === "c2",
+    });
+    const body = (await (await call(app, "/limits?provider=codex")).json()) as { limits: Array<{ identity: string; loginRevoked?: boolean }> };
+    expect(body.limits.find((r) => r.identity === "c2")?.loginRevoked).toBe(true);
+    expect(body.limits.find((r) => r.identity === "c1")?.loginRevoked).toBeUndefined();
+  });
+
+  test("a fresh read with no provider is refused with a text that says the identity is optional", async () => {
+    const app = appWith({ refreshUsageFor: async () => true });
+    const response = await call(app, "/limits?fresh=1");
+    expect(response.status).toBe(400);
+    const text = JSON.stringify(await response.json());
+    expect(text).toContain("require a provider");
+    expect(text).not.toContain("and a managed identity");
   });
 
   test("a cached or empty row says why: the newest failed read of that identity", async () => {
