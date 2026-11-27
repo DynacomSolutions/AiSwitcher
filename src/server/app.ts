@@ -381,7 +381,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     "pools-usage": { load: deps.poolsUsage ?? poolsUsage, intervalMs: 60_000 },
     "gateway-usage": { load: () => gatewayUsage(7), intervalMs: 60_000 },
     "usage-projects": { load: () => (deps.usageProjects ?? readUsageProjects)() ?? { pending: true, rows: [] }, intervalMs: 120_000, pendingIntervalMs: 5_000 },
-    "codex-auto-reset": { load: () => autoReset("GET"), intervalMs: 10_000 },
+    "auto-reset": { load: () => autoReset("GET"), intervalMs: 10_000 },
   }, deps.consoleEventSignal);
   app.get("/api/events", (c) => events.stream(c));
 
@@ -457,8 +457,8 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     return c.json(result);
   });
   registerGatewayAutoReset(app, autoReset, {
-    read: () => events.read("codex-auto-reset"),
-    changed: () => events.invalidate("codex-auto-reset"),
+    read: () => events.read("auto-reset"),
+    changed: () => events.invalidate("auto-reset"),
   });
   registerGatewayPoolReset(app, deps.gatewayAutoReset, (status) => {
     resetChanged();

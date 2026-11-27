@@ -13,7 +13,7 @@ const RESET = "2026-11-27T14:00:00.000Z";
 function claim(key: string, members = ["alpha", "beta"]): AutoResetClaimInput {
   const names = members.map((name) => `renewal-test-${name}`);
   return {
-    eventKey: `renewal-test-${key}`, pool: "renewal-test-pool", identity: names[0],
+    provider: "codex", eventKey: `renewal-test-${key}`, pool: "renewal-test-pool", identity: names[0],
     creditId: `credit-SYNTHETIC_FIXTURE-${key}`, creditExpiresAt: EXPIRES, startedAt: AT,
     redeemRequestId: randomUUID(),
     usageEvidence: names.map((identity) => ({ identity, resetAt: RESET, capturedAt: AT, weeklyUtilisation: 100 })),
@@ -28,15 +28,13 @@ function claim(key: string, members = ["alpha", "beta"]): AutoResetClaimInput {
 async function checkContract(a: AutoResetStore, b: AutoResetStore): Promise<void> {
   const original = claim("original");
   const { pool, identity, eventKey, creditId } = original;
-  expect(await a.enabled("pool", pool)).toBeFalse();
+  expect(await a.enabled("codex", pool)).toBeFalse();
   expect(await b.claim(original)).toEqual({ kind: "blocked" });
-  await a.setEnabled("pool", pool, true);
-  expect(await b.claim(original)).toEqual({ kind: "blocked" });
-  await a.setEnabled("identity", identity, true);
-  expect(await b.enabled("identity", identity)).toBeTrue();
-  await b.setEnabled("pool", pool, false);
+  await a.setEnabled("codex", pool, true);
+  expect(await b.enabled("codex", pool)).toBeTrue();
+  await b.setEnabled("codex", pool, false);
   expect(await a.claim(original)).toEqual({ kind: "blocked" });
-  await a.setEnabled("pool", pool, true);
+  await a.setEnabled("codex", pool, true);
 
   const result = await Promise.all([a.claim(original), b.claim({ ...original, redeemRequestId: randomUUID() })]);
   expect(result.map((r) => r.kind).sort()).toEqual(["created", "existing"]);
@@ -46,14 +44,12 @@ async function checkContract(a: AutoResetStore, b: AutoResetStore): Promise<void
 
   await b.finish(eventKey, "reset", creditId);
   await a.finish(eventKey, "rejected");
-  expect(await a.lastClaim("identity", identity)).toMatchObject({ status: "reset", creditedId: creditId });
-  expect(await b.lastClaim("pool", pool)).toMatchObject({ status: "reset", creditedId: creditId });
+  expect(await a.lastMemberClaim("codex", identity)).toMatchObject({ status: "reset", creditedId: creditId });
+  expect(await b.lastClaim("codex", pool)).toMatchObject({ status: "reset", creditedId: creditId });
 
   const overlap = claim("overlap", ["beta", "gamma"]);
-  await a.setEnabled("identity", overlap.identity, true);
   expect(await b.claim(overlap)).toEqual({ kind: "blocked" });
   const disjoint = claim("disjoint", ["gamma"]);
-  await a.setEnabled("identity", disjoint.identity, true);
   expect(await b.claim({ ...disjoint, creditId })).toEqual({ kind: "blocked" });
   expect(await b.claim(disjoint)).toEqual({ kind: "created" });
 }
@@ -74,8 +70,7 @@ async function checkRearm(
   };
   const settledAt = dated(5);
   const recoveredAt = dated(800);
-  await a.setEnabled("pool", pool, true);
-  await a.setEnabled("identity", identity, true);
+  await a.setEnabled("codex", pool, true);
   expect(await a.claim(first)).toEqual({ kind: "created" });
   await b.markRecovered(eventKey, redeemRequestId, recoveredAt);
   expect(await b.findClaim(eventKey)).toMatchObject({ generation: 1, status: "pending" });
@@ -123,14 +118,12 @@ async function checkRearm(
 async function checkReportedCreditFence(store: AutoResetStore) {
   const original = claim("reported-original", ["reporter"]);
   const next = claim("reported-another", ["other"]);
-  await store.setEnabled("pool", original.pool, true);
-  await store.setEnabled("identity", original.identity, true);
-  await store.setEnabled("identity", next.identity, true);
+  await store.setEnabled("codex", original.pool, true);
   expect(await store.claim(original)).toEqual({ kind: "created" });
   await store.recordReportedCredit(original.redeemRequestId, next.creditId);
   expect(await store.claim(next)).toEqual({ kind: "blocked" });
   await store.finish(original.eventKey, "unknown");
-  expect(await store.lastClaim("identity", original.identity)).toMatchObject({
+  expect(await store.lastMemberClaim("codex", original.identity)).toMatchObject({
     status: "unknown", creditId: original.creditId, creditedId: next.creditId,
   });
   expect(await store.claim(next)).toEqual({ kind: "blocked" });
@@ -158,8 +151,7 @@ describe("memory Codex renewal store", () => {
       let clock = Date.parse(AT);
       const store = new MemoryAutoResetStore(() => clock);
       const first = claim(outcome);
-      await store.setEnabled("pool", first.pool, true);
-      await store.setEnabled("identity", first.identity, true);
+      await store.setEnabled("codex", first.pool, true);
       await store.claim(first);
       if (outcome !== "pending") {
         await store.finish(first.eventKey, outcome === "mismatched" ? "reset" : outcome, "credit-SYNTHETIC_FIXTURE-wrong");
@@ -180,8 +172,7 @@ describe("memory Codex renewal store", () => {
     const store = new MemoryAutoResetStore(() => clock);
     const original = claim("early");
     const later = claim("later");
-    await store.setEnabled("pool", original.pool, true);
-    await store.setEnabled("identity", original.identity, true);
+    await store.setEnabled("codex", original.pool, true);
     expect(await store.claim(original)).toEqual({ kind: "created" });
     clock += 24_999;
     expect(await store.claim(later)).toEqual({ kind: "blocked" });
@@ -254,7 +245,6 @@ if (!url && process.env.CI && !optOut) {
         const unrelated = "account-SYNTHETIC_FIXTURE-unrelated";
         expect(await journal.accountOutcomePending(reporting.identity, unrelated)).toBe(false);
         expect(await journal.recordAttempt(poolReported.creditId, randomUUID(), alias, randomUUID(), accountId)).toBe(false);
-        await a.setEnabled("identity", member, true);
         expect(await b.claim(poolReported)).toEqual({ kind: "blocked" });
 
         // Roll back both writes to simulate failures before commit.
@@ -292,13 +282,12 @@ if (!url && process.env.CI && !optOut) {
       }
 
       const automatic = claim("armed-automatic", ["auto-pending"]);
-      await a.setEnabled("identity", automatic.identity, true);
       expect(await a.claim(automatic)).toEqual({ kind: "created" });
       expect(await a.beginSpend(automatic.redeemRequestId, automatic.identity, accountId)).toBe(true);
       expect(await b.beginSpend(automatic.redeemRequestId, automatic.identity, accountId)).toBe(false);
       await expect(checkCodexRedemptionFence(journal, alias, explicit)).rejects.toThrow("unresolved outcome");
       await expect(checkCodexRedemptionFence(journal, alias, unspecified)).rejects.toThrow("unresolved outcome");
-      expect(await b.lastClaim("identity", automatic.identity)).toMatchObject({ spendPending: true });
+      expect(await b.lastMemberClaim("codex", automatic.identity)).toMatchObject({ spendPending: true });
       await a.finish(automatic.eventKey, "unknown", undefined, {
         redeemRequestId: automatic.redeemRequestId, finishedAt: AT, outcome: "consume_unknown",
       });
@@ -327,7 +316,6 @@ if (!url && process.env.CI && !optOut) {
       ]);
 
       const target = claim("disabled-during-claim", ["delta"]);
-      await a.setEnabled("identity", target.identity, true);
       const updated = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
       const disable = sqlA.begin(async (tx) => {
@@ -344,8 +332,59 @@ if (!url && process.env.CI && !optOut) {
       expect(await a.findClaim(target.eventKey)).toBeUndefined();
     } finally {
       await sqlA`DELETE FROM codex_auto_reset_claims WHERE left(event_key, 13) = 'renewal-test-'`;
-      await sqlA`DELETE FROM codex_auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
+      await sqlA`DELETE FROM auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
       await Promise.all([sqlA.close(), sqlB.close()]);
     }
   }, 10_000);
+  test("PostgreSQL keeps pool settings and claims apart for each provider", async () => {
+    await migrate(url);
+    const sql = new SQL(url, { max: 2 });
+    try {
+      const store = new PgAutoResetStore(sql);
+      const codex = claim("provider-codex", ["pg-alpha"]);
+      const claude: AutoResetClaimInput = { ...claim("provider-claude", ["pg-alpha"]), provider: "claude" };
+      expect(await store.claim(claude)).toEqual({ kind: "blocked" });
+      await store.setEnabled("codex", claude.pool, true);
+      expect(await store.enabled("claude", claude.pool)).toBeFalse();
+      expect(await store.claim(claude)).toEqual({ kind: "blocked" });
+      await store.setEnabled("claude", claude.pool, true);
+      expect(await store.claim(claude)).toEqual({ kind: "created" });
+      // The same member name under another provider is a different account, so it does not wait for the 25 second guard.
+      expect(await store.claim(codex)).toEqual({ kind: "created" });
+      expect(await store.lastClaim("claude", claude.pool)).toMatchObject({ creditId: claude.creditId });
+      expect(await store.lastMemberClaim("claude", claude.identity)).toMatchObject({ creditId: claude.creditId });
+      const rows = await sql`SELECT provider FROM codex_auto_reset_claims WHERE event_key = ${claude.eventKey}`;
+      expect(rows[0]?.provider).toBe("claude");
+    } finally {
+      await sql`DELETE FROM codex_auto_reset_claims WHERE left(event_key, 13) = 'renewal-test-'`;
+      await sql`DELETE FROM auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
+      await sql.close();
+    }
+  }, 10_000);
+
+  test("the migration keeps Codex pool settings, drops identity settings and records them", async () => {
+    await migrate(url);
+    const sql = new SQL(url, { max: 2 });
+    try {
+      await sql`INSERT INTO codex_auto_reset_settings (kind, name, enabled) VALUES
+        ('pool', 'renewal-test-legacy-pool', true), ('identity', 'renewal-test-legacy-member', true)
+        ON CONFLICT (kind, name) DO UPDATE SET enabled = EXCLUDED.enabled`;
+      await sql`DELETE FROM schema_migrations WHERE version = '0022_auto_reset_every_pool'`;
+      await migrate(url);
+      expect(await new PgAutoResetStore(sql).enabled("codex", "renewal-test-legacy-pool")).toBeTrue();
+      // A dropped identity setting never becomes a pool setting for any provider.
+      const settings = await sql`SELECT provider, name FROM auto_reset_settings WHERE name = 'renewal-test-legacy-member'`;
+      expect(settings).toHaveLength(0);
+      const legacy = await sql`SELECT name FROM codex_auto_reset_settings WHERE kind = 'identity' AND name = 'renewal-test-legacy-member'`;
+      expect(legacy).toHaveLength(0);
+      const noted = await sql`SELECT provider, enabled FROM auto_reset_dropped_identity_settings WHERE name = 'renewal-test-legacy-member'`;
+      expect(noted).toEqual([{ provider: "codex", enabled: true }]);
+    } finally {
+      await sql`DELETE FROM codex_auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
+      await sql`DELETE FROM auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
+      await sql`DELETE FROM auto_reset_dropped_identity_settings WHERE left(name, 13) = 'renewal-test-'`;
+      await sql.close();
+    }
+  }, 10_000);
+
 }

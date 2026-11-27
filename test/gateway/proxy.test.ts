@@ -2262,8 +2262,7 @@ describe("automatic Codex pool reset proxy", () => {
     const token = await addCodex();
     const pool = "synthetic-pool";
     const policyStore = new MemoryAutoResetStore(() => deps.now().getTime());
-    await policyStore.setEnabled("pool", pool, true);
-    await policyStore.setEnabled("identity", "a", true);
+    await policyStore.setEnabled("codex", pool, true);
     deps.creds.loggedOut = async (_provider, name) => name === "b";
     usage.a = live(10);
     let creditReads = 0;
@@ -2313,8 +2312,7 @@ describe("automatic Codex pool reset proxy", () => {
       if (claim?.status === "pending") joined.resolve();
       return claim;
     };
-    await policyStore.setEnabled("pool", pool, true);
-    await policyStore.setEnabled("identity", account, true);
+    await policyStore.setEnabled("codex", pool, true);
     deps.poolMembers = async () => [account];
     let restored = false;
     let attempts = 0;
@@ -2665,4 +2663,86 @@ describe("automatic Codex pool reset proxy", () => {
     expect(cancelled).toBe(true);
     expect(await response.text()).toBe(first429);
   }, 30_000);
+});
+
+describe("automatic Claude pool reset proxy", () => {
+  const body = JSON.stringify({ model: "claude-sonnet-4-5", max_tokens: 1, messages: [{ role: "user", content: "fixture" }] });
+  const limitBody = '{"type":"error","error":{"type":"rate_limit_error","message":"Claude usage limit reached"}}';
+  const addClaudePool = () => addApp(baseApp({ name: "cpool", provider: "claude", style: "anthropic", target: { kind: "pool" } }));
+  const fullWeek = (): PoolUsage => ({
+    ...live(100), windows: [{ label: "seven-day", utilization: 100, resetsAt: "2026-11-06T10:00:00.000Z" }],
+  });
+  const exhausted = (scope = "7d") => new Response(limitBody, {
+    status: 429,
+    headers: { "content-type": "application/json", "retry-after": "89", [`anthropic-ratelimit-unified-${scope}-status`]: "rejected", "anthropic-ratelimit-unified-reset": "1793622600" },
+  });
+  const send = (token: string) => callRaw("/cpool/v1/messages", token, { method: "POST", body });
+
+  test("a Claude pool uses the Claude recovery, never the Codex one", async () => {
+    const token = await addClaudePool();
+    const asked: string[][] = [];
+    let codex = 0;
+    deps.autoReset = { enabled: async () => true, recover: async () => { codex++; return undefined; } };
+    deps.autoResets = {
+      claude: { enabled: async () => true, recover: async (input) => { asked.push(input.members); return "b"; } },
+    };
+    usage.a = fullWeek();
+    usage.b = fullWeek();
+    let sent = 0;
+    handler = () => (++sent <= 1 ? exhausted() : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    const response = await send(token);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(anthropicJson);
+    expect(asked).toEqual([["a", "b"]]);
+    expect(sent).toBe(2);
+    expect(codex).toBe(0);
+  });
+
+  test("a Codex-only recovery never runs for a Claude pool", async () => {
+    const token = await addClaudePool();
+    let recoveries = 0;
+    deps.autoReset = { enabled: async () => true, recover: async () => { recoveries++; return "b"; } };
+    usage.a = live(10);
+    usage.b = live(10);
+    handler = () => exhausted();
+    const response = await send(token);
+    expect(response.status).toBe(429);
+    await response.arrayBuffer();
+    expect(recoveries).toBe(0);
+  });
+
+  test("a rejection of one model window is not a reset case", async () => {
+    const token = await addClaudePool();
+    let recoveries = 0;
+    deps.autoResets = { claude: { enabled: async () => true, recover: async () => { recoveries++; return "b"; } } };
+    usage.a = live(10);
+    usage.b = live(10);
+    handler = () => exhausted("7d_oi");
+    await (await send(token)).arrayBuffer();
+    expect(recoveries).toBe(0);
+  });
+
+  test("with every rule off the Claude 429 follows the ordinary path", async () => {
+    const token = await addClaudePool();
+    let recoveries = 0;
+    deps.autoResets = { claude: { enabled: async () => false, recover: async () => { recoveries++; return "b"; } } };
+    usage.a = live(10);
+    usage.b = live(10);
+    handler = () => exhausted();
+    const response = await send(token);
+    expect(response.status).toBe(429);
+    await response.arrayBuffer();
+    expect(recoveries).toBe(0);
+  });
+
+  test("a failed recovery keeps the pool's own out-of-capacity answer", async () => {
+    const token = await addClaudePool();
+    deps.autoResets = { claude: { enabled: async () => true, recover: async () => undefined } };
+    usage.a = live(10);
+    usage.b = live(10);
+    handler = () => exhausted();
+    const response = await send(token);
+    expect(response.status).toBe(429);
+    await response.arrayBuffer();
+  });
 });

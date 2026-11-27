@@ -1,4 +1,4 @@
-import type { AutoResetStatus } from "../../gateway/auto-reset-view.ts";
+import type { AutoResetLastClaim, AutoResetStatus } from "../../gateway/auto-reset-view.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 
 /** Generic bucket derived from a window's actual duration/semantics, not
@@ -153,7 +153,10 @@ export interface ToolLimitResult {
   /** See ManualResetInfo. Present only when the provider reports at least
    * one usable manual reset right now. */
   manualReset?: ManualResetInfo;
+  /** The automatic reset setting of a pool row. */
   autoReset?: AutoResetStatus;
+  /** The last claim that a pool made on this member. Read only: a member has no setting. */
+  autoResetClaim?: AutoResetLastClaim;
   /** True when the Gateway credential store owns this provider identity. */
   gatewayManaged?: boolean;
   /** True when the gateway reports the stored login dead (the provider refused its refresh token): only a new sign-in helps. */

@@ -7,7 +7,7 @@ const HEARTBEAT_MS = 15_000;
 const ROLLOVER_MS = 25_000;
 const CHECK_MS = 1_000;
 
-export type ConsoleTopic = "limits" | "usage" | "pools-usage" | "gateway-usage" | "usage-projects" | "codex-auto-reset";
+export type ConsoleTopic = "limits" | "usage" | "pools-usage" | "gateway-usage" | "usage-projects" | "auto-reset";
 
 interface ReadSource {
   load: () => unknown | Promise<unknown>;
