@@ -54,6 +54,7 @@ interface SpendEvidence {
 
 interface RecoveryOptions {
   store: AutoResetStore;
+  claim?: (input: Parameters<AutoResetStore["claim"]>[0], signal: AbortSignal) => ReturnType<AutoResetStore["claim"]>;
   pools: () => Promise<AutoResetPool[]>;
   freshUsage: (identity: string, signal: AbortSignal) => Promise<AutoResetUsage | undefined>;
   readCredits: (identity: string, signal: AbortSignal) => Promise<ManualResetInfo | undefined>;
@@ -161,7 +162,7 @@ function withSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 export function createAutoResetRecovery({
-  store, pools, freshUsage, readCredits, spend, now = Date.now, confirmationBudgetMs = CONFIRMATION_MS, log = console.info,
+  store, claim: claimCredit = (input) => store.claim(input), pools, freshUsage, readCredits, spend, now = Date.now, confirmationBudgetMs = CONFIRMATION_MS, log = console.info,
 }: RecoveryOptions): AutoResetRecovery {
   async function enabledPools(): Promise<AutoResetPool[]> {
     const all = await pools();
@@ -322,10 +323,10 @@ export function createAutoResetRecovery({
     };
     const redeemRequestId = randomUUID();
     signal.throwIfAborted();
-    const claim = await store.claim({
+    const claim = await claimCredit({
       eventKey, identity, pool, creditId, creditExpiresAt: iso(creditExpiresAt), startedAt: iso(decisionTime),
       redeemRequestId, provider429At, usageEvidence: evidence, creditEvidence,
-    });
+    }, signal);
     if (claim.kind === "existing") return follow(eventKey, claim.claim, input, deadline);
     if (claim.kind === "blocked") return undefined;
 

@@ -24,6 +24,7 @@ import sessionsOneCopy0015 from "./migrations/0015_sessions_one_copy.sql" with {
 import resetCreditInvalidations0016 from "./migrations/0016_reset_credit_invalidations.sql" with { type: "text" };
 import codexAutoReset0017 from "./migrations/0017_codex_auto_reset.sql" with { type: "text" };
 import codexPoolReset0018 from "./migrations/0018_codex_pool_reset.sql" with { type: "text" };
+import codexPoolResetAccount0019 from "./migrations/0019_codex_pool_reset_account.sql" with { type: "text" };
 import type { PgListener } from "./pg-listen.ts";
 import { pgPoolOptions } from "./pg-pool.ts";
 
@@ -48,6 +49,7 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0016_reset_credit_invalidations", sql: resetCreditInvalidations0016 },
   { version: "0017_codex_auto_reset", sql: codexAutoReset0017 },
   { version: "0018_codex_pool_reset", sql: codexPoolReset0018 },
+  { version: "0019_codex_pool_reset_account", sql: codexPoolResetAccount0019 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */

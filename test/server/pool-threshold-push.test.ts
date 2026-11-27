@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PoolResetReview, PoolThreshold } from "../../src/gateway/pool-reset-view.ts";
@@ -12,16 +12,16 @@ afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-function setup() {
+function setup(useStateDirectory = false) {
   const directory = mkdtempSync(join(tmpdir(), "ais-pool-threshold-"));
   directories.push(directory);
-  const path = join(directory, "episodes.json");
+  const path = join(directory, useStateDirectory ? "pool-threshold-push.json" : "episodes.json");
   const messages: PushMessage[] = [];
   const row: PoolThreshold = { tool: "codex", pool: "sample pool", percent: 90, complete: true, observedAt: 1_000 };
   const state = { enabled: true, rows: [row], canReset: true, failSend: false, stateAtSend: "", waitForScan: Promise.resolve() };
   const scan = Promise.withResolvers<void>();
   const notifier = () => new ResetExpiryNotifier({
-    poolStatePath: path,
+    ...(useStateDirectory ? {} : { poolStatePath: path }),
     scanLimits: async () => ({ ok: true }),
     scanPoolThresholds: async () => {
       scan.resolve();
@@ -40,7 +40,7 @@ function setup() {
     },
     log: () => {},
   });
-  return { state, row, notifier, messages, scan: scan.promise, path };
+  return { state, row, notifier, messages, scan: scan.promise, path, directory };
 }
 
 test("persists a crossing before delivery and preserves it across daemon restart", async () => {
@@ -59,6 +59,27 @@ test("persists a crossing before delivery and preserves it across daemon restart
     tag: "pool-threshold:/limits/pools/codex/sample%20pool",
     poolAlert: "review",
   });
+});
+
+test("the persistent pool directory keeps thresholds separate from Console lifecycle state", async () => {
+  const { notifier, directory, path } = setup(true);
+  const { directory: webState } = setup();
+  const previousPoolState = process.env.AIS_WEB_POOL_STATE_DIR;
+  const previousWebState = process.env.AIS_WEB_STATE_DIR;
+  try {
+    process.env.AIS_WEB_POOL_STATE_DIR = directory;
+    process.env.AIS_WEB_STATE_DIR = webState;
+    expect(await notifier().tickPools()).toBe(1);
+    expect(await notifier().tickPools()).toBe(0);
+    expect(existsSync(path)).toBe(true);
+    expect(existsSync(join(webState, "pool-threshold-push.json"))).toBe(false);
+    expect(existsSync(join(directory, "server.json"))).toBe(false);
+  } finally {
+    if (previousPoolState === undefined) delete process.env.AIS_WEB_POOL_STATE_DIR;
+    else process.env.AIS_WEB_POOL_STATE_DIR = previousPoolState;
+    if (previousWebState === undefined) delete process.env.AIS_WEB_STATE_DIR;
+    else process.env.AIS_WEB_STATE_DIR = previousWebState;
+  }
 });
 
 test("unknown cannot clear a crossing and complete recovery rearms it with the same tag", async () => {

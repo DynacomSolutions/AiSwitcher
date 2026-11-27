@@ -286,7 +286,7 @@ export class ResetExpiryNotifier {
     try {
       const hasSubscribers = this.deps.hasSubscribers ?? (async () => (await loadSubscriptions()).length > 0);
       if (!await hasSubscribers()) return 0;
-      const path = this.deps.poolStatePath ?? join(consoleWebDir(), "pool-threshold-push.json");
+      const path = this.deps.poolStatePath ?? join(process.env.AIS_WEB_POOL_STATE_DIR?.trim() || consoleWebDir(), "pool-threshold-push.json");
       releaseLock = await trySharedFileLock(path);
       if (!releaseLock) return 0;
       const episodes = await loadPoolEpisodes(path);

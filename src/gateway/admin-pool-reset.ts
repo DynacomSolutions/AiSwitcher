@@ -8,7 +8,7 @@ export interface PoolResetAdmin {
   thresholds(): Promise<PoolThreshold[]>;
   review(tool: GatewayProvider, pool: string, signal: AbortSignal): Promise<PoolResetReview | undefined>;
   confirmTimeoutMs?: number;
-  confirm(pool: string, selection: PoolResetConfirmation, signal: AbortSignal): Promise<PoolResetResult | undefined>;
+  confirm(pool: string, selection: PoolResetConfirmation, signal: AbortSignal, deadlineAt: number): Promise<PoolResetResult | undefined>;
 }
 
 function validConfirmation(value: unknown): value is PoolResetConfirmation {
@@ -37,13 +37,15 @@ export function registerPoolResetAdmin(hono: Hono, deps: PoolResetAdmin, provide
   hono.post(POOL_LIMITS_ROUTE, async (c) => {
     if (!validPoolRoute(c.req.param("tool"), c.req.param("pool"))) return missing();
     if (c.req.param("tool") !== "codex") return json({ error: "This provider has no supported pool reset credit." }, 404);
-    return withPoolResetDeadline(deps.confirmTimeoutMs ?? GATEWAY_POOL_CONFIRM_MS, async (deadline) => {
+    const timeout = deps.confirmTimeoutMs ?? GATEWAY_POOL_CONFIRM_MS;
+    const deadlineAt = performance.now() + timeout;
+    return withPoolResetDeadline(timeout, async (deadline) => {
       const confirmation: unknown = await c.req.json().catch(() => undefined);
       if (!validConfirmation(confirmation)) return json({ error: "A confirmed account, credit and valid request ID are required." }, 400);
       const signal = AbortSignal.any([c.req.raw.signal, deadline]);
       try {
         signal.throwIfAborted();
-        const result = await deps.confirm(c.req.param("pool"), confirmation, signal);
+        const result = await deps.confirm(c.req.param("pool"), confirmation, signal, deadlineAt);
         return result ? json(result) : missing();
       } catch (error) {
         if (signal.aborted) return json({ status: "pending" } satisfies PoolResetResult);

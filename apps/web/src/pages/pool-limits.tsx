@@ -33,6 +33,7 @@ function PoolLimits({ tool, pool }: { tool: string; pool: string }) {
   const query = useQuery({
     queryKey: key,
     queryFn: () => api.getPoolResetReview(tool, pool),
+    staleTime: 0,
     refetchOnMount: "always",
     refetchOnWindowFocus: false,
     retry: false,

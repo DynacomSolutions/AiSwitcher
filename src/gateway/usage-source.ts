@@ -40,6 +40,15 @@ export async function fetchCodexResetCredits(
   now: () => number = Date.now,
   purpose: "manual" | "automatic" = "manual",
 ): Promise<ManualResetInfo | undefined> {
+  return codexResetInventory(await fetchCodexCreditInventory(credential, doFetch, signal), now(), purpose);
+}
+
+export async function fetchCodexCreditInventory(
+  credential: ProviderCredential,
+  doFetch: (input: string | URL, init?: RequestInit) => Promise<Response>,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  signal?.throwIfAborted();
   const response = await doFetch(CODEX_CREDITS_URL, {
     headers: { ...codexAdapter.authHeaders(credential, new Headers()), accept: "application/json" },
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
@@ -49,7 +58,23 @@ export async function fetchCodexResetCredits(
     void response.body?.cancel().catch(() => undefined);
     return undefined;
   }
-  return codexResetInventory(await response.json().catch(() => undefined), now(), purpose);
+  return response.json().catch(() => undefined);
+}
+
+/** A complete inventory accounts for every available credit, including credits without a usable expiry. */
+export function codexCreditIds(raw: unknown): { ids: Set<string>; complete: boolean } {
+  const body = raw as { available_count?: unknown; credits?: unknown } | undefined | null;
+  const ids = new Set<string>();
+  if (!Array.isArray(body?.credits)) return { ids, complete: body?.credits == null && body?.available_count === 0 };
+  let available = 0;
+  let complete = true;
+  for (const credit of body.credits) {
+    if (typeof credit?.status !== "string") complete = false;
+    if (credit?.status !== "available") continue;
+    available++;
+    if (typeof credit.id === "string" && credit.id.trim()) ids.add(credit.id);
+  }
+  return { ids, complete: complete && available === ids.size && available === body.available_count };
 }
 
 export function codexResetInventory(raw: unknown, now: number, purpose: "manual" | "automatic" = "manual"): ManualResetInfo | undefined {
@@ -94,36 +119,47 @@ interface WhamProofWindow {
   reset_at?: unknown;
 }
 
-function additionalCodexWindows(raw: unknown, now: number): NonNullable<PoolUsage["windows"]> | undefined {
-  if (raw == null) return [];
-  if (!Array.isArray(raw)) return undefined;
+function additionalCodexWindows(raw: unknown, now: number, purpose: "automatic" | "pool") {
   const windows: NonNullable<PoolUsage["windows"]> = [];
+  if (!Array.isArray(raw)) return { windows, incomplete: raw != null };
+  let incomplete = false;
   for (const entry of raw as Array<{ normal_model_slug?: unknown; metered_feature?: unknown; rate_limit?: WhamProofLimit | null } | null>) {
     const model = entry?.normal_model_slug ?? entry?.metered_feature;
     const limit = entry?.rate_limit;
     if (typeof model !== "string" || !/[a-z0-9]/i.test(model) || !limit ||
-      typeof limit.allowed !== "boolean" || typeof limit.limit_reached !== "boolean") return undefined;
+      (purpose === "automatic" && (typeof limit.allowed !== "boolean" || typeof limit.limit_reached !== "boolean"))) {
+      incomplete = true;
+      continue;
+    }
     const scoped = [limit.primary_window, limit.secondary_window].filter((window) => window != null);
-    if (!scoped.length && limit.allowed && !limit.limit_reached) return undefined;
+    if (!scoped.length && (purpose === "pool" || (limit.allowed && !limit.limit_reached))) incomplete = true;
     for (const { used_percent: utilization, limit_window_seconds: seconds, reset_at: reset } of scoped) {
       if (typeof utilization !== "number" || !Number.isFinite(utilization) || utilization < 0 ||
         typeof seconds !== "number" || !Number.isSafeInteger(seconds) || seconds <= 0 ||
-        typeof reset !== "number" || !Number.isSafeInteger(reset) || reset * 1000 <= now || reset * 1000 > 8.64e15) return undefined;
+        typeof reset !== "number" || !Number.isSafeInteger(reset) ||
+        (purpose === "automatic" && reset * 1000 <= now) || Math.abs(reset * 1000) > 8.64e15) {
+        incomplete = true;
+        continue;
+      }
       const label = categorizeByMinutes(seconds / 60);
       windows.push({ label, utilization, resetsAt: new Date(reset * 1000).toISOString(), model });
     }
-    if (!limit.allowed || limit.limit_reached) windows.push({ label: "provider limit", utilization: 100, model });
+    if (purpose === "automatic" && (!limit.allowed || limit.limit_reached)) windows.push({ label: "provider limit", utilization: 100, model });
   }
-  return windows;
+  return { windows, incomplete };
 }
 
-/** Reads usage with the gateway credential. Strict reads supply evidence for a spend or replay. */
+type CodexGatewayUsage = AutoResetUsage & { incompleteWindows?: true };
+
+/** Reads usage with the gateway credential. Automatic renewal requires stricter proof than pool alerts. */
 export async function fetchGatewayCodexUsage(
   credential: ProviderCredential,
   doFetch: typeof fetch,
   now: () => number,
   signal: AbortSignal,
-): Promise<AutoResetUsage | undefined> {
+  purpose: "automatic" | "pool" = "automatic",
+): Promise<CodexGatewayUsage | undefined> {
+  signal.throwIfAborted();
   const response = await doFetch(CODEX_WHAM_USAGE_URL, {
     headers: { ...codexAdapter.authHeaders(credential, new Headers()), accept: "application/json" },
     signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
@@ -137,33 +173,44 @@ export async function fetchGatewayCodexUsage(
   signal.throwIfAborted();
   const capturedAt = now();
   const snapshot = snapshotFromWham(body, capturedAt);
-  if (!snapshot) return undefined;
+  if (!snapshot && purpose === "automatic") return undefined;
   const limit = body?.rate_limit;
   const raw = [limit?.primary_window, limit?.secondary_window];
-  const windows = [snapshot.primary, snapshot.secondary].flatMap((window) => {
-    if (!window) return [];
+  const hasDuration = (window: WhamProofWindow | null | undefined): boolean =>
+    typeof window?.limit_window_seconds === "number" && Number.isSafeInteger(window.limit_window_seconds) && window.limit_window_seconds > 0;
+  const windows = [snapshot?.primary, snapshot?.secondary].flatMap((window, index) => {
+    if (!window || (purpose === "pool" && !hasDuration(raw[index]))) return [];
     const mins = window.windowDurationMins;
-    const category = mins === undefined ? "other" : categorizeByMinutes(mins);
+    const durationCategory = mins === undefined ? "other" : categorizeByMinutes(mins);
+    const category = purpose === "pool" && durationCategory === "week" &&
+      (raw[index]?.limit_window_seconds !== 604_800 || !Number.isSafeInteger(raw[index]?.reset_at))
+      ? "other" : durationCategory;
     const label = category !== "other" ? category : mins === undefined ? "usage" : mins >= 1440 ? `~${Math.round(mins / 1440)}d` : `~${Math.round(mins / 60)}h`;
     const reset = new Date((window.resetsAt ?? Number.NaN) * 1000);
-    return [{ label, utilization: window.usedPercent, ...(Number.isFinite(reset.getTime()) ? { resetsAt: reset.toISOString() } : {}) }];
+    // An unknown reset time cannot prove that a Codex pool window is still current.
+    const resetsAt = Number.isFinite(reset.getTime()) ? reset.toISOString() : purpose === "pool" ? "" : undefined;
+    return [{ label, utilization: window.usedPercent, ...(resetsAt !== undefined ? { resetsAt } : {}) }];
   });
-  const maxUtilization = Math.max(...windows.map((window) => window.utilization));
+  const maxUtilization = windows.length ? Math.max(...windows.map((window) => window.utilization)) : undefined;
   const weekly = raw.filter((window) => window?.limit_window_seconds === 604_800);
   const reset = weekly[0]?.reset_at;
-  const weeklyProof = weekly.length === 1 && windows.filter((window) => window.label === "week").length === 1 &&
+  const weeklyProof = maxUtilization !== undefined && weekly.length === 1 && windows.filter((window) => window.label === "week").length === 1 &&
     typeof reset === "number" && Number.isSafeInteger(reset) && reset * 1000 > capturedAt && reset * 1000 <= 8.64e15 &&
     raw.every((window) => window == null || (typeof window.used_percent === "number" && Number.isFinite(window.used_percent) && window.used_percent >= 0)) &&
     (limit?.allowed === undefined || limit.allowed === (maxUtilization < 100)) &&
     (limit?.limit_reached === undefined || limit.limit_reached === (maxUtilization >= 100));
-  const modelWindows = additionalCodexWindows(body?.additional_rate_limits, capturedAt);
-  if (!weeklyProof || !modelWindows) return undefined;
-  const extraUsage = extraUsageFromCredits(snapshot);
-  const planLabel = codexPlanLabel(snapshot.planType);
+  const model = additionalCodexWindows(body?.additional_rate_limits, capturedAt, purpose);
+  if (purpose === "automatic" && (!weeklyProof || model.incomplete)) return undefined;
+  if (!windows.length && !model.windows.length) return undefined;
+  const incomplete = model.incomplete || raw.some((window, index) => window != null &&
+    (!(index === 0 ? snapshot?.primary : snapshot?.secondary) || !hasDuration(window)));
+  const extraUsage = snapshot && extraUsageFromCredits(snapshot);
+  const planLabel = codexPlanLabel(snapshot?.planType);
   return {
-    status: maxUtilization >= 100 ? "rate-limited" : "live",
-    maxUtilization,
-    windows: [...windows, ...modelWindows],
+    status: (maxUtilization ?? 0) >= 100 ? "rate-limited" : "live",
+    ...(maxUtilization !== undefined ? { maxUtilization } : {}),
+    windows: [...windows, ...model.windows],
+    ...(purpose === "pool" && incomplete ? { incompleteWindows: true } : {}),
     capturedAt: new Date(capturedAt).toISOString(),
     ...(typeof limit?.allowed === "boolean" ? { codexRateLimitAllowed: limit.allowed } : {}),
     ...(extraUsage ? { extraUsage } : {}),

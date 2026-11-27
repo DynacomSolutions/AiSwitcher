@@ -47,8 +47,7 @@ describe("pool threshold and manual reset review", () => {
   });
 });
 
-function harness() {
-  const readings = [usage(94, 92), usage(98, 90)];
+function harness(readings = [usage(94, 92), usage(98, 90)]) {
   const review = poolResetReview(pool, readings, [inventory(creditA, 1), inventory(creditB, 2)], new Set(), NOW);
   const confirmation: PoolResetConfirmation = { candidate: review.candidate!, redeemRequestId: crypto.randomUUID() };
   let release = Promise.resolve();
@@ -74,8 +73,11 @@ function harness() {
   const posts: Record<string, unknown>[] = [];
   const postStarted = Promise.withResolvers<void>();
   const assessStarted = Promise.withResolvers<void>();
-  const state = { waitForPost: Promise.resolve(), waitForAssess: Promise.resolve(), review, ambiguous: false, verified: true, members: review.members };
-  const credential = { identity: "sample-a", accessToken: "token-SYNTHETIC_FIXTURE" };
+  const state = {
+    waitForPost: Promise.resolve(), waitForAssess: Promise.resolve(), afterJournal: () => {}, review, ambiguous: false,
+    verified: true, members: review.members, now: NOW, refreshReview: false, deadlineAt: Infinity,
+  };
+  const credential = { identity: "sample-a", accessToken: "token-SYNTHETIC_FIXTURE", accountId: "account-SYNTHETIC_FIXTURE" };
   const doFetch = (async (_url, init) => {
     expect(locked).toBe(true);
     if (init?.method === "POST") {
@@ -91,21 +93,35 @@ function harness() {
     }] });
   }) as typeof fetch;
   const run = (selection = confirmation, signal = new AbortController().signal) => confirmPoolReset(pool.pool, selection, signal, {
-    now: () => NOW,
+    now: () => state.now,
+    deadlineAt: state.deadlineAt,
     guard,
     journal: {
       manualAttempted: async (id) => tried.has(id),
       markConsumed: async () => { steps.push("consumed"); },
-      recordAttempt: async (id, request) => {
+      recordAttempt: async (id, request, identity, accountId) => {
+        expect(identity).toBe(credential.identity);
+        expect(accountId).toBe(credential.accountId);
         if (tried.has(id) || requests.has(request)) return false;
         steps.push("journal");
         tried.add(id);
         requests.add(request);
+        state.afterJournal();
         return true;
+      },
+      releaseAttempt: async (id, request) => {
+        expect(locked).toBe(true);
+        steps.push("release");
+        tried.delete(id);
+        requests.delete(request);
       },
     },
     version: async () => "1",
     assess: async () => {
+      if (!locked && state.refreshReview) {
+        const fresh = [usage(30, 67), usage(32, 60)].map((reading) => ({ ...reading, capturedAt: iso(state.now) }));
+        return { review: poolResetReview(pool, fresh, [], new Set(), state.now), readings: fresh };
+      }
       expect(locked).toBe(true);
       assessStarted.resolve();
       await state.waitForAssess;
@@ -138,7 +154,7 @@ describe("pool reset confirmation", () => {
   test("holds the spend guard and records exactly one POST across competing requests", async () => {
     const { run, posts, steps, confirmation } = harness();
     expect(await Promise.all([run(), run()])).toEqual([{ status: "confirmed" }, { status: "already_attempted" }]);
-    expect(steps).toEqual(["journal", "invalidate", "post", "consumed"]);
+    expect(steps).toEqual(["invalidate", "journal", "post", "consumed"]);
     expect(posts).toEqual([{ credit_id: creditA, redeem_request_id: confirmation.redeemRequestId }]);
   });
 
@@ -190,5 +206,44 @@ test("a POST already in progress can finish and still prevents another POST", as
   provider.resolve();
   expect(await attempt).toEqual({ status: "confirmed" });
   expect(await run()).toEqual({ status: "already_attempted" });
-  expect(steps).toEqual(["journal", "invalidate", "post", "consumed"]);
+  expect(steps).toEqual(["invalidate", "journal", "post", "consumed"]);
+});
+
+test("releases an attempt on a definite pre-POST abort and allows the same confirmation to retry", async () => {
+  const { run, state, steps, posts, confirmation } = harness();
+  const controller = new AbortController();
+  state.afterJournal = () => controller.abort();
+  await expect(run(confirmation, controller.signal)).resolves.toEqual({ status: "declined" });
+  expect(steps).toEqual(["invalidate", "journal", "release"]);
+  expect(posts).toHaveLength(0);
+
+  state.afterJournal = () => {};
+  expect(await run()).toEqual({ status: "confirmed" });
+  expect(posts).toHaveLength(1);
+});
+
+test.each([false, true])("checks the remaining crossing proof at the POST boundary (second crossing %s)", async (anotherCrossing) => {
+  const readings = [usage(94, anotherCrossing ? 91 : 60), usage(98, anotherCrossing ? 91 : 70)];
+  for (const reading of readings) reading.windows![0].resetsAt = iso(NOW + 1_000);
+  const { run, state, posts, steps } = harness(readings);
+  state.refreshReview = true;
+  state.afterJournal = () => { state.now += 1_000; };
+  if (anotherCrossing) {
+    expect(await run()).toEqual({ status: "confirmed" });
+    expect(posts).toHaveLength(1);
+  } else {
+    expect(await run()).toMatchObject({
+      status: "changed", review: { availability: "below_threshold", percent: 63.5, observedAt: NOW + 1_000 },
+    });
+    expect(steps).toEqual(["invalidate", "journal", "release"]);
+    expect(posts).toEqual([]);
+  }
+});
+
+test("an elapsed preflight deadline stops the POST even before the timeout signal fires", async () => {
+  const { run, state, steps, posts } = harness();
+  state.deadlineAt = performance.now() - 1;
+  expect(await run()).toEqual({ status: "declined" });
+  expect(steps).toEqual([]);
+  expect(posts).toHaveLength(0);
 });
