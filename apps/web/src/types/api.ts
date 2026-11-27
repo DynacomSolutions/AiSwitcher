@@ -47,21 +47,25 @@ export type PoolResetResult =
   | { status: "already_attempted" }
   | { status: "pending" | "confirmed" | "declined" };
 
+/** Automatic reset is a pool setting only. A member can show the last claim that its pool made. */
+export interface AutoResetLastClaim {
+  pool: string;
+  identity: string;
+  startedAt: string;
+  creditExpiresAt?: string;
+  status: "pending" | "reset" | "rejected" | "unknown";
+}
 export interface AutoResetStatus {
   name: string;
   enabled: boolean;
-  lastClaim?: {
-    pool: string;
-    identity: string;
-    startedAt: string;
-    creditExpiresAt?: string;
-    status: "pending" | "reset" | "rejected" | "unknown";
-  };
+  lastClaim?: AutoResetLastClaim;
 }
-export type AutoResetResponse = { configured: false } | {
-  configured: true;
-  pools: Array<AutoResetStatus & { members: string[] }>;
-};
+export type AutoResetPoolStatus = AutoResetStatus & { members: string[] };
+export type AutoResetProvider = "codex" | "claude";
+export type AutoResetProviderView =
+  | { provider: AutoResetProvider; supported: true; pools: AutoResetPoolStatus[]; memberClaims: Record<string, AutoResetLastClaim> }
+  | { provider: string; supported: false; reason: string };
+export type AutoResetResponse = { configured: false } | { configured: true; providers: AutoResetProviderView[] };
 
 /* Status */
 

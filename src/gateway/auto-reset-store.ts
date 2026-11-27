@@ -1,5 +1,6 @@
 import type { SQL } from "bun";
 import type { CodexResetOutcome } from "./account.ts";
+import type { AutoResetProvider } from "./auto-reset-view.ts";
 
 type ClaimStatus = "pending" | "reset" | "rejected" | "unknown";
 type TerminalStatus = Exclude<ClaimStatus, "pending">;
@@ -38,6 +39,7 @@ export interface AutoResetClaim extends AutoResetClaimSummary {
 }
 
 export interface AutoResetClaimInput extends Omit<AutoResetClaimSummary, "status" | "creditedId" | "spendPending"> {
+  provider: AutoResetProvider;
   eventKey: string;
   redeemRequestId: string;
   provider429At?: number;
@@ -58,13 +60,19 @@ interface ClaimFinish {
   unsent?: boolean;
 }
 
+/**
+ * Automatic reset is a setting of a pool. No identity can be set. `lastMemberClaim` only reads the claim that a pool made on a member.
+ */
 export interface AutoResetStore {
-  enabled(pool: string): Promise<boolean>;
-  setEnabled(pool: string, enabled: boolean): Promise<void>;
-  lastClaim(pool: string): Promise<AutoResetClaimSummary | undefined>;
+  enabled(provider: AutoResetProvider, pool: string): Promise<boolean>;
+  setEnabled(provider: AutoResetProvider, pool: string, enabled: boolean): Promise<void>;
+  lastClaim(provider: AutoResetProvider, pool: string): Promise<AutoResetClaimSummary | undefined>;
+  lastMemberClaim(provider: AutoResetProvider, identity: string): Promise<AutoResetClaimSummary | undefined>;
   findClaim(eventKey: string, generation?: number): Promise<AutoResetClaim | undefined>;
   claim(input: AutoResetClaimInput): Promise<ClaimResult>;
   beginSpend(redeemRequestId: string, identity: string, accountId?: string): Promise<boolean>;
+  /** True while a claim on this member has a POST with no recorded outcome. A manual spend must wait for it. */
+  spendPending(provider: AutoResetProvider, identity: string): Promise<boolean>;
   recordReportedCredit(redeemRequestId: string, creditId: string, knownOutcome?: CodexResetOutcome): Promise<void>;
   finish(eventKey: string, status: TerminalStatus, creditedId?: string, result?: ClaimFinish): Promise<void>;
   markRecovered(eventKey: string, redeemRequestId: string, recoveredAt: string): Promise<void>;
@@ -105,19 +113,27 @@ export class MemoryAutoResetStore implements AutoResetStore {
 
   constructor(private readonly now: () => number = Date.now) {}
 
-  async enabled(pool: string): Promise<boolean> {
-    return this.settings.get(pool) === true;
+  async enabled(provider: AutoResetProvider, pool: string): Promise<boolean> {
+    return this.settings.get(JSON.stringify([provider, pool])) === true;
   }
 
-  async setEnabled(pool: string, enabled: boolean): Promise<void> {
-    this.settings.set(pool, enabled);
+  async setEnabled(provider: AutoResetProvider, pool: string, enabled: boolean): Promise<void> {
+    this.settings.set(JSON.stringify([provider, pool]), enabled);
   }
 
-  async lastClaim(pool: string): Promise<AutoResetClaimSummary | undefined> {
+  async lastClaim(provider: AutoResetProvider, pool: string): Promise<AutoResetClaimSummary | undefined> {
+    return this.latest(provider, "pool", pool);
+  }
+
+  async lastMemberClaim(provider: AutoResetProvider, identity: string): Promise<AutoResetClaimSummary | undefined> {
+    return this.latest(provider, "identity", identity);
+  }
+
+  private latest(provider: AutoResetProvider, field: "pool" | "identity", name: string): AutoResetClaimSummary | undefined {
     let latest: { key: string; summary: AutoResetClaim } | undefined;
     for (const [key, generations] of this.claims) {
-      for (const { summary } of generations) {
-        if (summary.pool !== pool) continue;
+      for (const { input, summary } of generations) {
+        if (input.provider !== provider || summary[field] !== name) continue;
         if (!latest || summary.startedAt > latest.summary.startedAt || (summary.startedAt === latest.summary.startedAt &&
           (key < latest.key || (key === latest.key && summary.generation > latest.summary.generation)))) latest = { key, summary };
       }
@@ -139,11 +155,11 @@ export class MemoryAutoResetStore implements AutoResetStore {
     if (existing && !canRearmClaim(existing, input.provider429At, Date.parse(input.startedAt), input.usageEvidence)) {
       return { kind: "existing", claim: { ...existing } };
     }
-    if (!this.settings.get(input.pool) || this.claimedCredits.has(input.creditId)) return { kind: "blocked" };
+    if (this.settings.get(JSON.stringify([input.provider, input.pool])) !== true || this.claimedCredits.has(input.creditId)) return { kind: "blocked" };
     const recordedAt = this.now();
     const members = new Set(input.usageEvidence.map((row) => row.identity));
     for (const claims of this.claims.values()) {
-      if (claims.some((claim) => claim.recordedAt > recordedAt - OVERLAP_MS &&
+      if (claims.some((claim) => claim.input.provider === input.provider && claim.recordedAt > recordedAt - OVERLAP_MS &&
         claim.input.usageEvidence.some((row) => members.has(row.identity)))) return { kind: "blocked" };
     }
     const { pool, identity, creditId, creditExpiresAt, startedAt } = input;
@@ -157,6 +173,13 @@ export class MemoryAutoResetStore implements AutoResetStore {
     this.claims.set(input.eventKey, generations);
     this.claimedCredits.add(creditId);
     return { kind: "created" };
+  }
+
+  async spendPending(provider: AutoResetProvider, identity: string): Promise<boolean> {
+    for (const claims of this.claims.values()) {
+      if (claims.some(({ input, summary }) => input.provider === provider && summary.identity === identity && summary.spendPending === true)) return true;
+    }
+    return false;
   }
 
   async beginSpend(redeemRequestId: string, identity: string): Promise<boolean> {
@@ -245,22 +268,37 @@ function claimSummary(row: ClaimRow | undefined): AutoResetClaim | undefined {
   };
 }
 
+// Codex pool rules stay in codex_auto_reset_settings (kind = 'pool'), where they were first stored.
+// Other providers use auto_reset_settings. Nothing copies or rewrites a stored rule.
 // Setting queries ignore historical kind = 'identity' rows and leave them in place.
 export class PgAutoResetStore implements AutoResetStore {
   constructor(private readonly sql: SQL) {}
 
-  async enabled(pool: string): Promise<boolean> {
-    const rows = await this.sql`SELECT enabled FROM codex_auto_reset_settings WHERE kind = 'pool' AND name = ${pool}`;
+  async enabled(provider: AutoResetProvider, pool: string): Promise<boolean> {
+    const rows = provider === "codex"
+      ? await this.sql`SELECT enabled FROM codex_auto_reset_settings WHERE kind = 'pool' AND name = ${pool}`
+      : await this.sql`SELECT enabled FROM auto_reset_settings WHERE provider = ${provider} AND name = ${pool}`;
     return rows[0]?.enabled === true;
   }
 
-  async setEnabled(pool: string, enabled: boolean): Promise<void> {
-    await this.sql`INSERT INTO codex_auto_reset_settings (kind, name, enabled) VALUES ('pool', ${pool}, ${enabled})
-      ON CONFLICT (kind, name) DO UPDATE SET enabled = EXCLUDED.enabled`;
+  async setEnabled(provider: AutoResetProvider, pool: string, enabled: boolean): Promise<void> {
+    if (provider === "codex") {
+      await this.sql`INSERT INTO codex_auto_reset_settings (kind, name, enabled) VALUES ('pool', ${pool}, ${enabled})
+        ON CONFLICT (kind, name) DO UPDATE SET enabled = EXCLUDED.enabled`;
+      return;
+    }
+    await this.sql`INSERT INTO auto_reset_settings (provider, name, enabled) VALUES (${provider}, ${pool}, ${enabled})
+      ON CONFLICT (provider, name) DO UPDATE SET enabled = EXCLUDED.enabled`;
   }
 
-  async lastClaim(pool: string): Promise<AutoResetClaimSummary | undefined> {
-    const rows = await this.sql`SELECT * FROM codex_auto_reset_claims WHERE pool = ${pool}
+  async lastClaim(provider: AutoResetProvider, pool: string): Promise<AutoResetClaimSummary | undefined> {
+    const rows = await this.sql`SELECT * FROM codex_auto_reset_claims WHERE provider = ${provider} AND pool = ${pool}
+      ORDER BY started_at DESC, event_key, generation DESC LIMIT 1`;
+    return summary(rows[0]);
+  }
+
+  async lastMemberClaim(provider: AutoResetProvider, identity: string): Promise<AutoResetClaimSummary | undefined> {
+    const rows = await this.sql`SELECT * FROM codex_auto_reset_claims WHERE provider = ${provider} AND identity = ${identity}
       ORDER BY started_at DESC, event_key, generation DESC LIMIT 1`;
     return summary(rows[0]);
   }
@@ -273,7 +311,7 @@ export class PgAutoResetStore implements AutoResetStore {
   }
 
   async claim(input: AutoResetClaimInput): Promise<ClaimResult> {
-    const { eventKey, pool, identity, creditId, creditExpiresAt, startedAt, redeemRequestId, usageEvidence, creditEvidence, provider429At } = input;
+    const { provider, eventKey, pool, identity, creditId, creditExpiresAt, startedAt, redeemRequestId, usageEvidence, creditEvidence, provider429At } = input;
     const members = JSON.stringify(usageEvidence.map((row) => row.identity));
     return this.sql.begin(async (tx): Promise<ClaimResult> => {
       await tx`SET LOCAL statement_timeout = '2s'`;
@@ -287,31 +325,39 @@ export class PgAutoResetStore implements AutoResetStore {
       }
       const generation = (existing?.generation ?? 0) + 1;
 
-      // Lock the pool rule through commit to serialise the claim with a disable.
-      const rules = await tx`SELECT enabled FROM codex_auto_reset_settings
-        WHERE kind = 'pool' AND name = ${pool} FOR SHARE`;
-      if (rules[0]?.enabled !== true) return { kind: "blocked" };
+      // Lock the enabled pool row through insert and commit so an administrator's disable cannot race the check.
+      const settings = provider === "codex"
+        ? await tx`SELECT name FROM codex_auto_reset_settings WHERE enabled AND kind = 'pool' AND name = ${pool} FOR SHARE`
+        : await tx`SELECT name FROM auto_reset_settings WHERE enabled AND provider = ${provider} AND name = ${pool} FOR SHARE`;
+      if (settings.length !== 1) return { kind: "blocked" };
 
       const rows = await tx`WITH requested AS (
           SELECT ARRAY(SELECT jsonb_array_elements_text(${members}::text::jsonb)) AS members
         )
         INSERT INTO codex_auto_reset_claims
-          (event_key, generation, pool, identity, credit_id, credit_expires_at, started_at, provider_429_at, redeem_request_id, members, usage_evidence, credit_evidence)
-        SELECT ${eventKey}, ${generation}, ${pool}, ${identity}, ${creditId}, ${creditExpiresAt}, ${startedAt},
+          (provider, event_key, generation, pool, identity, credit_id, credit_expires_at, started_at, provider_429_at, redeem_request_id, members, usage_evidence, credit_evidence)
+        SELECT ${provider}, ${eventKey}, ${generation}, ${pool}, ${identity}, ${creditId}, ${creditExpiresAt}, ${startedAt},
           ${provider429At === undefined ? null : new Date(provider429At).toISOString()}, ${redeemRequestId},
           requested.members, ${JSON.stringify(usageEvidence)}::text::jsonb, ${JSON.stringify(creditEvidence)}::text::jsonb
-        FROM requested WHERE NOT EXISTS (
+        FROM requested WHERE (${provider}::text <> 'codex' OR NOT EXISTS (
           SELECT 1 FROM codex_pool_reset_attempts WHERE credit_id = ${creditId} OR credited_id = ${creditId}
             OR (outcome IS NULL AND consumed_at IS NULL AND identity = ${identity})
-        ) AND NOT EXISTS (
+        )) AND NOT EXISTS (
           SELECT 1 FROM codex_auto_reset_claims AS earlier
-          WHERE earlier.credited_id = ${creditId} OR (earlier.spend_pending AND earlier.identity = ${identity})
-            OR (earlier.recorded_at > statement_timestamp() - ${OVERLAP_MS}::int * interval '1 ms'
+          WHERE earlier.credited_id = ${creditId}
+            OR (earlier.provider = ${provider} AND earlier.spend_pending AND earlier.identity = ${identity})
+            OR (earlier.provider = ${provider} AND earlier.recorded_at > statement_timestamp() - ${OVERLAP_MS}::int * interval '1 ms'
               AND earlier.members && requested.members)
         )
         ON CONFLICT DO NOTHING RETURNING event_key`;
       return rows.length === 1 ? { kind: "created" } : { kind: "blocked" };
     });
+  }
+
+  async spendPending(provider: AutoResetProvider, identity: string): Promise<boolean> {
+    const rows = await this.sql`SELECT 1 FROM codex_auto_reset_claims
+      WHERE provider = ${provider} AND identity = ${identity} AND spend_pending LIMIT 1`;
+    return rows.length === 1;
   }
 
   async beginSpend(redeemRequestId: string, identity: string, accountId?: string): Promise<boolean> {

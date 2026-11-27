@@ -24,6 +24,8 @@ import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { isOperationalPath, publicHostsFromEnv, viaPublicHost } from "./public-host.ts";
 import { aliSessionOnce, aliSetupSelfTest, listAliAccounts, type AliSetupDeps } from "./ali-session.ts";
 import { createAutoResetRecovery, type AutoResetPool, type AutoResetUsage } from "./auto-reset.ts";
+import type { AutoResetProvider } from "./auto-reset-view.ts";
+import { consumeClaudeResetForIdentity, fetchGatewayClaudeState } from "./claude-reset.ts";
 import { checkCodexRedemptionFence, codexResetRelieved, confirmPoolReset, PgPoolResetJournal, PoolResetReservationCleanup, poolResetReview, poolUtilisation, type NamedGatewayPool } from "./pool-reset.ts";
 import { POOL_THRESHOLDS_PATH, validPoolRoute, type PoolThreshold } from "./pool-reset-view.ts";
 import { PgAutoResetStore, type AutoResetStore } from "./auto-reset-store.ts";
@@ -127,9 +129,11 @@ export interface GatewayHooks {
   usageFor?: GatewayDeps["usageFor"];
   /** Tests: replaces the reset spend behind POST /limits/claude/:identity/resets/:grant. */
   spendReset?(identity: string, grantId: string): Promise<unknown>;
+  /** Tests: replaces the Claude POST inside the redemption lock, so the lock and the claim fence still apply. */
+  claudeReset?(identity: string, grantId: string): Promise<unknown>;
   /** Tests: replaces the one Codex consume behind POST /limits/codex/:identity/resets/use. */
   spendCodexReset?(identity: string, redeemRequestId: string, signal?: AbortSignal): Promise<unknown>;
-  autoReset?: { store: AutoResetStore; pools: () => Promise<AutoResetPool[]> };
+  autoReset?: { store: AutoResetStore; pools: (provider: AutoResetProvider) => Promise<AutoResetPool[]> };
   /** Tests: shares reset generations between gateway replicas. */
   resetCreditInvalidations?: ResetCreditInvalidations;
   /** Replaces the AIS adapter fetch behind the default (cached) usage source. */
@@ -917,8 +921,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     (async (provider: GatewayProvider): Promise<string[]> => onlyManaged(provider, await defaultPoolMembers(provider), poolManaged));
   const autoResetConfig = hooks.autoReset ?? (hooks.openStore || hooks.ping ? undefined : {
     store: new PgAutoResetStore(sharedSql),
-    pools: async () => {
-      return (await namedPools("codex")).map(({ pool, members }) => ({ name: pool, members }));
+    pools: async (provider: AutoResetProvider) => {
+      return (await namedPools(provider)).map(({ pool, members }) => ({ name: pool, members }));
     },
   });
   const autoReset = autoResetConfig && (() => {
@@ -930,7 +934,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     };
     const clock = () => now().getTime();
     const recovery = createAutoResetRecovery({
-      ...autoResetConfig,
+      provider: "codex",
+      store: autoResetConfig.store,
+      pools: () => autoResetConfig.pools("codex"),
       now: clock,
       claim: (input, signal) => withRedemptionLock(async () => {
         signal.throwIfAborted();
@@ -989,20 +995,73 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         });
       },
     });
+    return publishingRecovery("codex", recovery);
+  })();
+
+  async function claudeCredential(identity: string) {
+    const credential = await creds.get("claude", identity);
+    if (credential.identity !== identity) throw new Error("Claude credential does not match the requested account");
+    return credential;
+  }
+
+  // Claude: the same engine behind an adapter that reads grants (cedar_ember) and spends one with the stored gateway credential.
+  const claudeAutoReset = autoResetConfig && (() => {
+    const clock = () => now().getTime();
+    const doFetch = hooks.fetch ?? fetch;
+    const readState = async (identity: string, signal: AbortSignal) => {
+      if (await creds.loggedOut?.("claude", identity)) return undefined;
+      signal.throwIfAborted();
+      return fetchGatewayClaudeState(await claudeCredential(identity), doFetch, clock, signal);
+    };
+    const recovery = createAutoResetRecovery({
+      provider: "claude",
+      store: autoResetConfig.store,
+      pools: () => autoResetConfig.pools("claude"),
+      now: clock,
+      claim: (input, signal) => withRedemptionLock(async () => {
+        signal.throwIfAborted();
+        return autoResetConfig.store.claim(input);
+      }),
+      freshUsage: async (identity, signal) => (await readState(identity, signal))?.usage,
+      readCredits: async (identity, signal) => (await readState(identity, signal))?.credits,
+      spend: (identity, id, requestId, signal, evidence) => {
+        evidence.postAttempted(false);
+        return withRedemptionLock(async () => {
+          signal.throwIfAborted();
+          const credential = await claudeCredential(identity);
+          const lock = await refreshBackend.acquire({ provider: "claude", identity }, 15_000);
+          try {
+            signal.throwIfAborted();
+            return await consumeClaudeResetForIdentity(identity, credential, doFetch, {
+              id, endsAt: evidence.endsAt, signal, now: clock, stillCurrent: evidence.stillCurrent,
+              stillEligible: async () => evidence.stillCurrent(),
+              beforePost: async () => {
+                const armed = await bounded(autoResetConfig.store.beginSpend(requestId, identity, credential.accountId), 2_000, "Claude reset outcome");
+                if (!armed) throw Object.assign(new Error("Another reset is pending for this account"), { status: 409, postAttempted: false });
+              },
+              onPost: () => evidence.postAttempted(true),
+            });
+          } finally {
+            await lock.release().catch(() => undefined);
+          }
+        });
+      },
+    });
+    return publishingRecovery("claude", recovery);
+  })();
+
+  function publishingRecovery(provider: GatewayProvider, recovery: ReturnType<typeof createAutoResetRecovery>) {
     return {
       enabled: recovery.enabled,
       async recover(input: Parameters<typeof recovery.recover>[0]) {
         const confirmed = new Map<string, AutoResetUsage>();
-        const identity = await recovery.recover({
-          ...input,
-          onConfirmed: (name, reading) => confirmed.set(name, reading),
-        });
+        const identity = await recovery.recover({ ...input, onConfirmed: (name, reading) => confirmed.set(name, reading) });
         const reading = identity === undefined ? undefined : confirmed.get(identity);
-        if (identity !== undefined && reading) void usage.publish("codex", identity, reading).catch(() => undefined);
+        if (identity !== undefined && reading) void usage.publish(provider, identity, reading).catch(() => undefined);
         return identity;
       },
     };
-  })();
+  }
 
   async function spendLockedCodexCredit(
     beforePost: BeforeCodexPost,
@@ -1203,6 +1262,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const appDeps: GatewayDeps = {
     drainSignal: drainCtrl.signal,
     autoReset,
+    autoResets: { ...(autoReset ? { codex: autoReset } : {}), ...(claudeAutoReset ? { claude: claudeAutoReset } : {}) },
     withCodexRedemption,
     codexResetGenerations,
     store,
@@ -1293,11 +1353,15 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     poolMembers,
     canonical,
     // The member's stored credential spends the grant; never refreshed here (the keep-alive owns rotation).
-    spendReset: hooks.spendReset ?? (async (identity, grantId) => {
-      const out = await useClaudeReset(identity, grantId, { noRefresh: true });
+    // It shares the redemption lock with the automatic spend, and it waits for an unresolved automatic POST on the same member.
+    spendReset: hooks.spendReset ?? ((identity, grantId) => withRedemptionLock(async () => {
+      if (autoResetConfig && await bounded(autoResetConfig.store.spendPending("claude", identity), 2_000, "Claude reset outcome")) {
+        throw Object.assign(new Error("An automatic Claude reset on this account has no recorded outcome yet"), { status: 409 });
+      }
+      const out = await (hooks.claudeReset ?? ((name, grant) => useClaudeReset(name, grant, { noRefresh: true })))(identity, grantId);
       void usage.refreshNow("claude", identity).catch(() => {});
       return out;
-    }),
+    })),
     spendCodexReset: hooks.spendCodexReset ?? (async (identity, redeemRequestId, signal) => {
       const before = await usage.get("codex", identity).catch(() => undefined);
       const beforeAt = before ? Date.parse(before.capturedAt) : Number.NaN;

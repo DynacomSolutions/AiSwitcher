@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { Link } from "react-router-dom";
 import { poolLimitsPath } from "@/lib/api";
 
-import { AutoResetControl } from "@/components/auto-reset-control";
+import { AutoResetControl, AutoResetUnsupported } from "@/components/auto-reset-control";
 import { AccountWarnings } from "@/components/account-line";
 import { ToolBadge } from "@/components/badges";
 import { Badge } from "@/components/ui/badge";
@@ -14,7 +14,7 @@ import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, formatTokens } from "@/lib/format";
 import { formatResetTimes } from "@/lib/reset-time";
 import { partialLabel, summarisePools, type MemberPeriod, type PeriodTotal, type PoolSummary } from "@/lib/pool-usage";
-import type { AutoResetStatus, ToolName } from "@/types/api";
+import type { AutoResetPoolStatus, AutoResetProvider, AutoResetProviderView, ToolName } from "@/types/api";
 
 function tone(percent: number): string | undefined {
   if (percent >= 90) return "bg-red-500";
@@ -57,7 +57,15 @@ function memberTokens(p: MemberPeriod): string {
   return formatTokens(p.native.tokens + p.gateway.tokens);
 }
 
-function PoolCard({ pool, autoReset }: { pool: PoolSummary; autoReset?: AutoResetStatus }) {
+/** The control for a pool of a provider with a reset API, or the not-supported note for a provider without one. */
+function PoolAutoReset({ name, view }: { name: string; view?: AutoResetProviderView }) {
+  if (!view) return null;
+  if (!view.supported) return <AutoResetUnsupported provider={view.provider} reason={view.reason} />;
+  const setting = view.pools.find((pool) => pool.name === name);
+  return setting ? <AutoResetControl provider={view.provider} setting={setting} /> : null;
+}
+
+function PoolCard({ pool, autoReset }: { pool: PoolSummary; autoReset?: AutoResetProviderView }) {
   return (
     <Card className="gap-4">
       <CardHeader className="space-y-0">
@@ -71,7 +79,7 @@ function PoolCard({ pool, autoReset }: { pool: PoolSummary; autoReset?: AutoRese
         <CardDescription>{pool.active ? `Active member: ${pool.active}` : "No active member"}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {autoReset ? <AutoResetControl setting={autoReset} /> : null}
+        <PoolAutoReset name={pool.name} view={autoReset} />
         <div className="grid grid-cols-2 gap-4">
           <TotalBlock title="Today" total={pool.today} />
           <TotalBlock title="Last 7 days" total={pool.week} />
@@ -137,8 +145,23 @@ function PoolCard({ pool, autoReset }: { pool: PoolSummary; autoReset?: AutoRese
   );
 }
 
+function MissingPoolCard({ provider, pool }: { provider: AutoResetProvider; pool: AutoResetPoolStatus }) {
+  return (
+    <Card className="gap-4">
+      <CardHeader className="space-y-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <Link className="min-w-0 break-words font-medium underline-offset-4 hover:underline" to={poolLimitsPath(provider, pool.name)}>{pool.name}</Link>
+          <ToolBadge tool={provider} />
+          <Badge variant="muted">{pool.members.length} members</Badge>
+        </div>
+      </CardHeader>
+      <CardContent><AutoResetControl provider={provider} setting={pool} /></CardContent>
+    </Card>
+  );
+}
+
 /** Pools with summed usage and limits; shown instead of the pool's own "unavailable" mirror row. */
-export function PoolUsageCards({ autoResetPools }: { autoResetPools?: Array<AutoResetStatus & { members: string[] }> }) {
+export function PoolUsageCards({ autoReset }: { autoReset?: AutoResetProviderView[] }) {
   const pools = usePoolsUsageQuery();
   const usage = useUsageQuery();
   const limits = useLimitsQuery();
@@ -146,11 +169,14 @@ export function PoolUsageCards({ autoResetPools }: { autoResetPools?: Array<Auto
     () => (pools.data ? summarisePools(pools.data.pools, usage.data?.results ?? [], limits.data?.results ?? [], pools.data) : []),
     [pools.data, usage.data, limits.data],
   );
-  const poolSettings = new Map(autoResetPools?.map((pool) => [pool.name, pool]));
-  const reportedCodexPools = new Set(summaries.filter((pool) => pool.tool === "codex").map((pool) => pool.name));
-  const missingCodexPools = (autoResetPools ?? []).filter((pool) => !reportedCodexPools.has(pool.name));
+  const providers = new Map((autoReset ?? []).map((row) => [row.provider, row]));
+  // A pool of a provider with a reset API shows even when its usage rows are missing, so its setting stays reachable.
+  const reported = new Set(summaries.map((pool) => `${pool.tool}/${pool.name}`));
+  const missing = (autoReset ?? []).flatMap((row) => row.supported
+    ? row.pools.filter((pool) => !reported.has(`${row.provider}/${pool.name}`)).map((pool) => ({ provider: row.provider, pool }))
+    : []);
   const usageError = pools.isError && !pools.data ? pools.error.message : undefined;
-  if (summaries.length === 0 && missingCodexPools.length === 0 && !usageError) return null;
+  if (summaries.length === 0 && missing.length === 0 && !usageError) return null;
   const loading = usage.isLoading || limits.isLoading;
   return (
     <section className="space-y-3">
@@ -161,19 +187,10 @@ export function PoolUsageCards({ autoResetPools }: { autoResetPools?: Array<Auto
       {usageError ? <p className="text-sm text-muted-foreground">Pool usage could not be loaded: {usageError}</p> : null}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         {summaries.map((p) => (
-          <PoolCard key={p.key} pool={p} autoReset={p.tool === "codex" ? poolSettings.get(p.name) : undefined} />
+          <PoolCard key={p.key} pool={p} autoReset={providers.get(p.tool)} />
         ))}
-        {missingCodexPools.map((pool) => (
-          <Card key={`codex/${pool.name}`} className="gap-4">
-            <CardHeader className="space-y-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <Link className="min-w-0 break-words font-medium underline-offset-4 hover:underline" to={poolLimitsPath("codex", pool.name)}>{pool.name}</Link>
-                <ToolBadge tool="codex" />
-                <Badge variant="muted">{pool.members.length} members</Badge>
-              </div>
-            </CardHeader>
-            <CardContent><AutoResetControl setting={pool} /></CardContent>
-          </Card>
+        {missing.map(({ provider, pool }) => (
+          <MissingPoolCard key={`${provider}/${pool.name}`} provider={provider} pool={pool} />
         ))}
       </div>
     </section>

@@ -10,7 +10,7 @@ const queries = new Map<string, QueryKey>([
   ["pools-usage", qk.poolsUsage],
   ["gateway-usage", qk.gatewayUsage(7)],
   ["usage-projects", qk.usageProjects],
-  ["codex-auto-reset", qk.autoReset],
+  ["auto-reset", qk.autoReset],
 ]);
 
 export function useConsoleEvents(): boolean {

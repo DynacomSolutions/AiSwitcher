@@ -320,9 +320,9 @@ export class PgPoolResetJournal {
     const own = ownClaim ?? null;
     const rows = await this.sql`SELECT credit_id FROM codex_pool_reset_attempts WHERE credit_id IN ${this.sql(ids)}
       UNION SELECT credited_id FROM codex_pool_reset_attempts WHERE credited_id IN ${this.sql(ids)}
-      UNION SELECT credit_id FROM codex_auto_reset_claims WHERE credit_id IN ${this.sql(ids)}
+      UNION SELECT credit_id FROM codex_auto_reset_claims WHERE provider = 'codex' AND credit_id IN ${this.sql(ids)}
         AND redeem_request_id IS DISTINCT FROM ${own}::uuid
-      UNION SELECT credited_id FROM codex_auto_reset_claims WHERE credited_id IN ${this.sql(ids)}`;
+      UNION SELECT credited_id FROM codex_auto_reset_claims WHERE provider = 'codex' AND credited_id IN ${this.sql(ids)}`;
     return new Set(rows.map((row: { credit_id: string }) => row.credit_id));
   }
 
@@ -340,7 +340,7 @@ export class PgPoolResetJournal {
         AND (identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
       UNION ALL
       SELECT 1 FROM codex_auto_reset_claims
-      WHERE spend_pending
+      WHERE provider = 'codex' AND spend_pending
         AND (identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
     ) AS pending`;
     return row.pending === true;
@@ -349,10 +349,11 @@ export class PgPoolResetJournal {
   async inventoryFenceScope(identity: string, accountId?: string): Promise<{ any: boolean; relevant: boolean }> {
     const account = accountId?.trim() || null;
     const [row] = await this.sql`SELECT
-      EXISTS (SELECT 1 FROM codex_pool_reset_attempts UNION ALL SELECT 1 FROM codex_auto_reset_claims) AS has_attempts,
+      EXISTS (SELECT 1 FROM codex_pool_reset_attempts UNION ALL SELECT 1 FROM codex_auto_reset_claims WHERE provider = 'codex') AS has_attempts,
       (EXISTS (SELECT 1 FROM codex_pool_reset_attempts
         WHERE identity IS NULL OR identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
-        OR EXISTS (SELECT 1 FROM codex_auto_reset_claims WHERE identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)) AS relevant`;
+        OR EXISTS (SELECT 1 FROM codex_auto_reset_claims
+          WHERE provider = 'codex' AND (identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL))) AS relevant`;
     return { any: row.has_attempts, relevant: row.relevant };
   }
 
@@ -366,7 +367,7 @@ export class PgPoolResetJournal {
           AND (identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
       ) AND NOT EXISTS (
         SELECT 1 FROM codex_auto_reset_claims
-        WHERE spend_pending
+        WHERE provider = 'codex' AND spend_pending
           AND (identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
       )
       ON CONFLICT DO NOTHING RETURNING credit_id`;
@@ -418,7 +419,8 @@ export class PgPoolResetJournal {
     if (!identities.length) return undefined;
     const rows = await this.sql`SELECT max(verified_at) AS at FROM (
       SELECT verified_at FROM reset_credit_invalidations WHERE provider = 'codex' AND identity IN ${this.sql(identities)}
-      UNION ALL SELECT recovered_at FROM codex_auto_reset_claims WHERE identity IN ${this.sql(identities)} AND status = 'reset'
+      UNION ALL SELECT recovered_at FROM codex_auto_reset_claims
+        WHERE provider = 'codex' AND identity IN ${this.sql(identities)} AND status = 'reset'
     ) AS verified`;
     const value: unknown = rows[0]?.at;
     const timestamp = value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : NaN;

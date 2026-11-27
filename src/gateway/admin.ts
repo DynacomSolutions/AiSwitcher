@@ -21,7 +21,11 @@ import { USAGE_READER_PROVIDERS } from "./usage-source.ts";
 import { registerPoolResetAdmin, type PoolResetAdmin } from "./admin-pool-reset.ts";
 import type { AutoResetStore } from "./auto-reset-store.ts";
 import type { AutoResetPool } from "./auto-reset.ts";
-import { CODEX_AUTO_RESET_PATH, type AutoResetStatus, type AutoResetView } from "./auto-reset-view.ts";
+import {
+  AUTO_RESET_PATH, AUTO_RESET_PROVIDERS, AUTO_RESET_UNSUPPORTED, AUTO_RESET_UNSUPPORTED_REASON, isAutoResetProvider,
+  type AutoResetLastClaim, type AutoResetPoolStatus, type AutoResetProvider, type AutoResetProviderView, type AutoResetUnsupportedProvider,
+  type AutoResetUnsupportedView, type AutoResetView,
+} from "./auto-reset-view.ts";
 
 export const DEFAULT_OVERLAP_MS = 24 * 3600_000;
 const MAX_OVERLAP_HOURS = 24 * 30;
@@ -102,7 +106,7 @@ export interface AdminDeps {
   /** Spends one Codex reset on the named member and invalidates shared reset and usage reads. */
   spendCodexReset?(identity: string, redeemRequestId: string, signal?: AbortSignal): Promise<unknown>;
   poolReset?: PoolResetAdmin;
-  autoReset?: { store: AutoResetStore; pools: () => Promise<AutoResetPool[]> };
+  autoReset?: { store: AutoResetStore; pools: (provider: AutoResetProvider) => Promise<AutoResetPool[]> };
 }
 
 /** Longest one provider read of a manual refresh may take. The console waits 40 s for a whole refresh, so a slow read must not use it all. */
@@ -295,7 +299,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
   const read = deps.readStore ?? store;
   const hono = new Hono();
-  const err = (status: 400 | 401 | 404 | 409 | 422 | 429 | 500 | 503, message: string): Response => Response.json({ error: message }, { status, ...(status === 429 ? { headers: { "retry-after": "5" } } : {}) });
+  const err = (status: 400 | 401 | 404 | 409 | 410 | 422 | 429 | 500 | 503, message: string): Response => Response.json({ error: message }, { status, ...(status === 429 ? { headers: { "retry-after": "5" } } : {}) });
 
   // The favourites token (derived from the admin token) opens GET and POST /favourites and nothing else.
   const favouritesBearer = deps.adminToken ? favouritesToken(deps.adminToken) : undefined;
@@ -413,30 +417,74 @@ export function createAdminApp(deps: AdminDeps): Hono {
     return c.json({ limits: limits.filter((row): row is AdminLimitRow => row !== undefined) });
   });
 
-  hono.get(CODEX_AUTO_RESET_PATH, async (c) => {
+  /** The pools of one provider with their setting, last claim, and the last claim a pool made on each member. */
+  async function autoResetProviderView(provider: AutoResetProvider): Promise<AutoResetProviderView | undefined> {
     const settings = deps.autoReset;
-    if (!settings) return err(404, "Codex automatic resets are not available");
-    const status = async (name: string): Promise<AutoResetStatus> => {
-      const [enabled, claim] = await Promise.all([settings.store.enabled(name), settings.store.lastClaim(name)]);
-      if (!claim) return { name, enabled };
-      const { pool, identity, startedAt, creditExpiresAt, status, spendPending } = claim;
-      return { name, enabled, lastClaim: { pool, identity, startedAt, creditExpiresAt, status, spendPending } };
+    if (!settings) return undefined;
+    const pools = await settings.pools(provider);
+    const claim = (summary: Awaited<ReturnType<AutoResetStore["lastClaim"]>>): AutoResetLastClaim | undefined => {
+      if (!summary) return undefined;
+      const { pool, identity, startedAt, creditExpiresAt, status, spendPending } = summary;
+      return { pool, identity, startedAt, creditExpiresAt, status, ...(spendPending ? { spendPending } : {}) };
     };
-    const pools = await Promise.all((await settings.pools()).map(async ({ name, members }) => ({ ...await status(name), members })));
-    return c.json({ pools } satisfies AutoResetView, 200, { "cache-control": "no-store" });
+    const poolRows = await Promise.all(pools.map(async ({ name, members }): Promise<AutoResetPoolStatus> => {
+      const [enabled, last] = await Promise.all([settings.store.enabled(provider, name), settings.store.lastClaim(provider, name)]);
+      const lastClaim = claim(last);
+      return { name, enabled, members, ...(lastClaim ? { lastClaim } : {}) };
+    }));
+    const memberClaims: Record<string, AutoResetLastClaim> = {};
+    await Promise.all([...new Set(pools.flatMap((pool) => pool.members))].map(async (member) => {
+      const last = claim(await settings.store.lastMemberClaim(provider, member));
+      if (last) memberClaims[member] = last;
+    }));
+    return { provider, supported: true, pools: poolRows, memberClaims };
+  }
+
+  const noAutoReset = () => err(404, "Automatic resets are not available");
+  const unsupportedView = (provider: AutoResetUnsupportedProvider): AutoResetUnsupportedView => ({
+    provider, supported: false, reason: AUTO_RESET_UNSUPPORTED_REASON,
+  });
+  const noHeaders = { "cache-control": "no-store" };
+
+  hono.get(AUTO_RESET_PATH, async (c) => {
+    if (!deps.autoReset) return noAutoReset();
+    const supported = await Promise.all(AUTO_RESET_PROVIDERS.map((provider) => autoResetProviderView(provider)));
+    const view: AutoResetView = {
+      providers: [...supported.filter((row): row is AutoResetProviderView => row !== undefined), ...AUTO_RESET_UNSUPPORTED.map(unsupportedView)],
+    };
+    return c.json(view, 200, noHeaders);
   });
 
-  hono.put(`${CODEX_AUTO_RESET_PATH}/pool`, async (c) => {
+  // Codex used this path first, so `GET /limits/codex/auto-reset` keeps working as the Codex form of the generic path.
+  hono.get("/limits/:provider/auto-reset", async (c) => {
+    if (!deps.autoReset) return noAutoReset();
+    const provider = c.req.param("provider");
+    if (isAutoResetProvider(provider)) return c.json(await autoResetProviderView(provider), 200, noHeaders);
+    if ((AUTO_RESET_UNSUPPORTED as readonly string[]).includes(provider)) return c.json(unsupportedView(provider as AutoResetUnsupportedProvider), 200, noHeaders);
+    return err(404, "no such provider");
+  });
+
+  hono.put("/limits/:provider/auto-reset/:kind", async (c) => {
     const settings = deps.autoReset;
-    if (!settings) return err(404, "Codex automatic resets are not available");
+    if (!settings) return noAutoReset();
+    const provider = c.req.param("provider");
+    // An identity can never carry this setting. The old path answers with a clear error and writes nothing.
+    if (c.req.param("kind") === "identity") {
+      return err(410, "Automatic reset is a pool setting only. Identity settings are removed.");
+    }
+    if (c.req.param("kind") !== "pool") return err(400, "scope must be pool");
+    if ((AUTO_RESET_UNSUPPORTED as readonly string[]).includes(provider)) {
+      return err(400, `${provider} has no reset credit or grant API, so automatic reset is not supported`);
+    }
+    if (!isAutoResetProvider(provider)) return err(404, "no such provider");
     const body: unknown = await c.req.json().catch(() => undefined);
     if (!isObj(body) || typeof body.name !== "string" || !body.name.trim() || typeof body.enabled !== "boolean") {
       return err(400, "name and boolean enabled are required");
     }
     const name = body.name;
-    if (!(await settings.pools()).some((pool) => pool.name === name)) return err(404, "no such Codex pool");
-    await settings.store.setEnabled(name, body.enabled);
-    return c.json({ name, enabled: body.enabled });
+    if (!(await settings.pools(provider)).some((pool) => pool.name === name)) return err(404, `no such ${provider} pool`);
+    await settings.store.setEnabled(provider, name, body.enabled);
+    return c.json({ provider, name, enabled: body.enabled });
   });
 
   // Spends one reset grant at the gateway, with the member credential from the store. The console never holds that credential.

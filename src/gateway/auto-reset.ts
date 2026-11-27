@@ -7,6 +7,7 @@ import {
   canRearmClaim, type AutoResetClaim, type AutoResetClaimInput, type AutoResetClaimSummary,
   type AutoResetCreditEvidence, type AutoResetStore,
 } from "./auto-reset-store.ts";
+import type { AutoResetProvider } from "./auto-reset-view.ts";
 import { bounded } from "./refresh-guard.ts";
 import { reserveUtilisationOf, usageForModel } from "./select.ts";
 
@@ -21,6 +22,14 @@ const NATURAL_RESET_CREDIT_MS = 60_000;
 const CONFIRMATION_MS = 8_000;
 const REPLAY_RESERVE_MS = 2_000;
 const CONFIRMATION_READ_MS = 2_000;
+
+/** The weekly window label of each provider. Claude names it "seven-day". Codex names it "week". */
+const WEEKLY_LABEL: Record<AutoResetProvider, RegExp> = {
+  codex: /^(?:week|weekly|7d)$/i,
+  claude: /^seven-day$/i,
+};
+
+const PROVIDER_LABEL: Record<AutoResetProvider, string> = { codex: "Codex", claude: "Claude" };
 
 export interface AutoResetPool {
   name: string;
@@ -54,6 +63,8 @@ interface SpendEvidence {
 }
 
 interface RecoveryOptions {
+  /** The provider whose pools this engine renews. It defaults to Codex. */
+  provider?: AutoResetProvider;
   store: AutoResetStore;
   claim?: (input: Parameters<AutoResetStore["claim"]>[0], signal: AbortSignal) => ReturnType<AutoResetStore["claim"]>;
   pools: () => Promise<AutoResetPool[]>;
@@ -87,9 +98,9 @@ function currentReading(time: string | undefined, now: number): boolean {
   return age >= 0 && age <= READING_MAX_AGE_MS;
 }
 
-export function weeklyWindow(usage: PoolUsage | undefined, now: number) {
+export function weeklyWindow(usage: PoolUsage | undefined, now: number, provider: AutoResetProvider = "codex") {
   if (!usage || usage.stale || usage.noPlan || usage.status === "unavailable" || !currentReading(usage.capturedAt, now)) return undefined;
-  const windows = usage.windows?.filter((w) => w.model === undefined && /^(?:week|weekly|7d)$/i.test(w.label.trim()));
+  const windows = usage.windows?.filter((w) => w.model === undefined && WEEKLY_LABEL[provider].test(w.label.trim()));
   if (windows?.length !== 1) return undefined;
   const [{ utilization, resetsAt }] = windows;
   const reset = absoluteTime(resetsAt);
@@ -97,17 +108,17 @@ export function weeklyWindow(usage: PoolUsage | undefined, now: number) {
   return { utilization, reset };
 }
 
-function exhaustedWeeklyWindow(usage: AutoResetUsage | undefined, now: number) {
+function exhaustedWeeklyWindow(usage: AutoResetUsage | undefined, now: number, provider: AutoResetProvider = "codex") {
   if (usage?.codexRateLimitAllowed === true) return undefined;
   const extra = usage?.extraUsage;
   if (extra?.available || (extra?.enabled && extra.stale)) return undefined;
-  const window = weeklyWindow(usage, now);
+  const window = weeklyWindow(usage, now, provider);
   return window && window.utilization >= 100 ? window : undefined;
 }
 
 /** Proof of an account-wide weekly limit for the cached probe and fresh recovery paths. */
-export function exhaustedWeeklyReset(usage: AutoResetUsage | undefined, now: number): number | undefined {
-  return exhaustedWeeklyWindow(usage, now)?.reset;
+export function exhaustedWeeklyReset(usage: AutoResetUsage | undefined, now: number, provider: AutoResetProvider = "codex"): number | undefined {
+  return exhaustedWeeklyWindow(usage, now, provider)?.reset;
 }
 
 /** Keep only provider-listed credits with a usable ID and an absolute future expiry. */
@@ -144,9 +155,11 @@ function reasonFor(winner: AutoResetCandidate, next: AutoResetCandidate | undefi
   return "credit_id_order";
 }
 
-function hasHeadroom(reading: AutoResetUsage | undefined, input: RecoverInput, now: number, since: number): reading is AutoResetUsage {
+function hasHeadroom(
+  reading: AutoResetUsage | undefined, input: RecoverInput, now: number, since: number, provider: AutoResetProvider,
+): reading is AutoResetUsage {
   if (!reading || reading.status !== "live" || reading.codexRateLimitAllowed === false ||
-    !weeklyWindow(reading, now) || absoluteTime(reading.capturedAt) < since) return false;
+    !weeklyWindow(reading, now, provider) || absoluteTime(reading.capturedAt) < since) return false;
   const scoped = input.model === undefined ? reading : usageForModel(reading, input.model);
   const utilisation = reserveUtilisationOf(scoped);
   return scoped?.windows?.every((w) => Number.isFinite(w.utilization) && w.utilization >= 0) === true &&
@@ -163,11 +176,11 @@ function withSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 export function createAutoResetRecovery({
-  store, claim: claimCredit = (input) => store.claim(input), pools, freshUsage, readCredits, spend, now = Date.now, confirmationBudgetMs = CONFIRMATION_MS, log = console.info,
+  provider = "codex", store, claim: claimCredit = (input) => store.claim(input), pools, freshUsage, readCredits, spend, now = Date.now, confirmationBudgetMs = CONFIRMATION_MS, log = console.info,
 }: RecoveryOptions): AutoResetRecovery {
   async function enabledPools(): Promise<AutoResetPool[]> {
     const all = await pools();
-    const rules = await Promise.all(all.map(async (pool) => ({ pool, enabled: await store.enabled(pool.name) })));
+    const rules = await Promise.all(all.map(async (pool) => ({ pool, enabled: await store.enabled(provider, pool.name) })));
     return rules.filter((rule) => rule.enabled).map((rule) => rule.pool);
   }
 
@@ -186,7 +199,7 @@ export function createAutoResetRecovery({
         const reading = await withSignal(freshUsage(identity, readSignal), readSignal).catch(() => undefined);
         signal.throwIfAborted();
         const confirmedAt = now();
-        if (hasHeadroom(reading, input, confirmedAt, Math.max(since, readStartedAt))) {
+        if (hasHeadroom(reading, input, confirmedAt, Math.max(since, readStartedAt), provider)) {
           if (onHeadroom) await withSignal(onHeadroom(confirmedAt).catch(() => undefined), signal);
           input.onConfirmed?.(identity, reading);
           return identity;
@@ -242,18 +255,20 @@ export function createAutoResetRecovery({
     if (provider429At !== undefined && (!Number.isSafeInteger(provider429At) || provider429At > readStartedAt ||
       checkedAt - provider429At >= RECOVERY_MS)) return undefined;
 
-    const windows = readings.map((reading) => weeklyWindow(reading, checkedAt));
+    const windows = readings.map((reading) => weeklyWindow(reading, checkedAt, provider));
+    // Codex keeps its first key shape. Other providers add their name, so equal identity names never share a claim.
     const eventKey = windows.every((window) => window !== undefined)
-      ? createHash("sha256").update(JSON.stringify(windows.map((window, index) => [names[index], iso(window.reset)]))).digest("hex")
+      ? createHash("sha256").update(JSON.stringify(windows.map((window, index) => [names[index], iso(window.reset)])
+        .concat(provider === "codex" ? [] : [[provider, ""]]))).digest("hex")
       : undefined;
-    const headroom = readings.findIndex((reading) => hasHeadroom(reading, input, checkedAt, readStartedAt));
+    const headroom = readings.findIndex((reading) => hasHeadroom(reading, input, checkedAt, readStartedAt, provider));
     if (headroom !== -1) {
       if (eventKey) {
         const prior = await store.findClaim(eventKey).catch(() => undefined);
         if (prior?.status === "reset" && !prior.recoveredAt && absoluteTime(prior.finishedAt) <= readStartedAt &&
           (prior.creditedId === undefined || prior.creditedId === prior.creditId)) {
           const winnerIndex = names.indexOf(prior.identity);
-          if (hasHeadroom(readings[winnerIndex], input, checkedAt, readStartedAt)) {
+          if (hasHeadroom(readings[winnerIndex], input, checkedAt, readStartedAt, provider)) {
             await store.markRecovered(eventKey, prior.redeemRequestId, iso(checkedAt)).catch(() => undefined);
           }
         }
@@ -265,7 +280,7 @@ export function createAutoResetRecovery({
 
     if (!eventKey) return undefined;
     const evidence = readings.flatMap((reading, index) => {
-      const weekly = exhaustedWeeklyWindow(reading, checkedAt);
+      const weekly = exhaustedWeeklyWindow(reading, checkedAt, provider);
       if (!reading || !weekly || absoluteTime(reading.capturedAt) < readStartedAt) return [];
       return [{
         identity: names[index], resetAt: iso(weekly.reset), capturedAt: reading.capturedAt,
@@ -325,7 +340,7 @@ export function createAutoResetRecovery({
     const redeemRequestId = randomUUID();
     signal.throwIfAborted();
     const claim = await claimCredit({
-      eventKey, identity, pool, creditId, creditExpiresAt: iso(creditExpiresAt), startedAt: iso(decisionTime),
+      provider, eventKey, identity, pool, creditId, creditExpiresAt: iso(creditExpiresAt), startedAt: iso(decisionTime),
       redeemRequestId, provider429At, usageEvidence: evidence, creditEvidence,
     }, signal);
     if (claim.kind === "existing") return follow(eventKey, claim.claim, input, deadline);
@@ -334,7 +349,7 @@ export function createAutoResetRecovery({
     const audit = (status: AutoResetClaimSummary["status"], outcome?: string, creditedId?: string): void => {
       try {
         log(JSON.stringify({
-          event: "codex-auto-reset", status, pool, identity, creditId, redeemRequestId,
+          event: `${provider}-auto-reset`, provider, status, pool, identity, creditId, redeemRequestId,
           eventKey, startedAt: iso(decisionTime), creditExpiresAt: iso(creditExpiresAt),
           provider429At: provider429At === undefined ? undefined : iso(provider429At),
           reason: creditEvidence.reason, imminentResetAt: creditEvidence.imminentResetAt,
@@ -411,7 +426,7 @@ export function createAutoResetRecovery({
   }
 
   return {
-    enabled: () => bounded(enabledPools(), 1_500, "Codex auto-reset rules").then((rules) => rules.length > 0),
+    enabled: () => bounded(enabledPools(), 1_500, `${PROVIDER_LABEL[provider]} auto-reset rules`).then((rules) => rules.length > 0),
     recover(input) {
       const started = performance.now();
       const deadline = Math.min(input.deadlineAt ?? Infinity, started + RECOVERY_MS);

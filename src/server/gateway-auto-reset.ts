@@ -1,5 +1,5 @@
 import type { Hono } from "hono";
-import { CODEX_AUTO_RESET_PATH } from "../gateway/auto-reset-view.ts";
+import { AUTO_RESET_PATH, AUTO_RESET_UNSUPPORTED, isAutoResetProvider } from "../gateway/auto-reset-view.ts";
 import { gatewayAdminConfig } from "./gateway-apps.ts";
 import { HttpError } from "./types.ts";
 
@@ -8,8 +8,9 @@ export interface GatewayAutoResetDeps {
   fetch?: typeof fetch;
 }
 
+/** Reads or sets automatic reset through the gateway admin API. `path` is the admin path, for example `/limits/auto-reset`. */
 export function createGatewayAutoResetRequest(deps: GatewayAutoResetDeps = {}) {
-  return async function request(method: "GET" | "PUT", body?: { name: string; enabled: boolean }): Promise<Record<string, unknown>> {
+  return async function request(method: "GET" | "PUT", path: string = AUTO_RESET_PATH, body?: unknown): Promise<Record<string, unknown>> {
     const admin = await (deps.adminConfig ?? gatewayAdminConfig)({});
     if (!admin) {
       if (method === "GET") return { configured: false };
@@ -17,7 +18,7 @@ export function createGatewayAutoResetRequest(deps: GatewayAutoResetDeps = {}) {
     }
     let response: Response;
     try {
-      response = await (deps.fetch ?? fetch)(`${admin.url}${CODEX_AUTO_RESET_PATH}${method === "PUT" ? "/pool" : ""}`, {
+      response = await (deps.fetch ?? fetch)(`${admin.url}${path}`, {
         method,
         headers: { authorization: `Bearer ${admin.token}`, "content-type": "application/json" },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -30,12 +31,17 @@ export function createGatewayAutoResetRequest(deps: GatewayAutoResetDeps = {}) {
     if (response.status === 404 && method === "GET") return { configured: false };
     const result = await response.json().catch(() => undefined) as Record<string, unknown> | undefined;
     if (!response.ok || !result) {
-      const status = [400, 404, 503].includes(response.status) ? response.status : 502;
+      const status = [400, 404, 410, 503].includes(response.status) ? response.status : 502;
       throw new HttpError(status, typeof result?.error === "string" ? result.error.slice(0, 300) : `gateway admin answered ${response.status}`);
     }
-    return method === "GET" ? { pools: result.pools, configured: true } : result;
+    // An older gateway still sends `identities`. The console ignores that list.
+    const { identities: _ignored, ...view } = result;
+    return method === "GET" ? { ...view, configured: true } : result;
   };
 }
+
+const knownProvider = (provider: string): boolean =>
+  isAutoResetProvider(provider) || (AUTO_RESET_UNSUPPORTED as readonly string[]).includes(provider);
 
 export function registerGatewayAutoReset(
   app: Hono,
@@ -43,11 +49,21 @@ export function registerGatewayAutoReset(
   events: { read(): Promise<unknown>; changed(): void },
 ): void {
   const headers = { "cache-control": "no-store" };
-  app.get(`/api${CODEX_AUTO_RESET_PATH}`, async (c) => c.json(await events.read(), 200, headers));
-  app.put(`/api${CODEX_AUTO_RESET_PATH}/pool`, async (c) => {
+  app.get(`/api${AUTO_RESET_PATH}`, async (c) => c.json(await events.read(), 200, headers));
+  app.get("/api/limits/:provider/auto-reset", async (c) => {
+    const provider = c.req.param("provider");
+    if (!knownProvider(provider)) throw new HttpError(404, "no such provider");
+    return c.json(await request("GET", `/limits/${provider}/auto-reset`), 200, headers);
+  });
+  app.put("/api/limits/:provider/auto-reset/:kind", async (c) => {
+    const provider = c.req.param("provider");
+    if (!knownProvider(provider)) throw new HttpError(404, "no such provider");
+    const kind = c.req.param("kind");
+    // Automatic reset is a pool setting only. An identity form is gone, so the console answers and calls no gateway.
+    if (kind !== "pool") throw new HttpError(410, "Automatic reset is a pool setting only. Identity settings are removed.");
     const body = await c.req.json().catch(() => undefined);
     if (typeof body?.name !== "string" || typeof body?.enabled !== "boolean") throw new HttpError(400, "name and boolean enabled are required");
-    const result = await request("PUT", { name: body.name, enabled: body.enabled });
+    const result = await request("PUT", `/limits/${provider}/auto-reset/${kind}`, { name: body.name, enabled: body.enabled });
     events.changed();
     return c.json(result, 200, headers);
   });

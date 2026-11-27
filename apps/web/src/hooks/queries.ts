@@ -12,7 +12,7 @@ export const qk = {
   identities: ["identities"] as const,
   permissions: ["permissions"] as const,
   limits: ["limits"] as const,
-  autoReset: ["codex-auto-reset"] as const,
+  autoReset: ["auto-reset"] as const,
   localModels: ["local-models"] as const,
   usage: ["usage"] as const,
   poolsUsage: ["pools-usage"] as const,

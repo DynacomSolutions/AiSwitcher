@@ -1,8 +1,14 @@
-import { formatAutoResetStatus } from "../gateway/auto-reset.ts";
+import { formatAutoResetClaim, formatAutoResetStatus } from "../gateway/auto-reset.ts";
+
 import { bold, dim, gray } from "../colors.ts";
 import { canonicalUsageProvider, usageProviderLabel } from "../usage/providers.ts";
 import { renderBar, staleSuffix } from "./bar.ts";
 import type { LimitCategory, ToolLimitResult } from "./types.ts";
+
+function autoResetNote(result: ToolLimitResult): string | undefined {
+  if (result.autoReset) return formatAutoResetStatus(result.autoReset);
+  return result.autoResetClaim ? `last automatic reset: ${formatAutoResetClaim(result.autoResetClaim)}` : undefined;
+}
 
 const ANSI = /\x1b\[[0-9;]*m/g;
 const COLUMN_GAP = 3;
@@ -207,7 +213,8 @@ function buildIdentityBlock(result: ToolLimitResult, isLast: boolean, ctx: Ctx):
   const continuation = isLast ? DETAIL_INDENT_LAST : DETAIL_INDENT;
   const branch = `${connector}${identityHeading(result)}`;
 
-  const statusRows: Row[] = result.autoReset ? [{ indent: continuation, label: "", plain: formatAutoResetStatus(result.autoReset) }] : [];
+  const note = autoResetNote(result);
+  const statusRows: Row[] = note ? [{ indent: continuation, label: "", plain: note }] : [];
   if (isMirroredPool(result, ctx.all)) {
     return { branch, rows: [{ indent: continuation, label: "", plain: poolPointer(result) }, ...statusRows] };
   }
@@ -264,7 +271,8 @@ function renderRow(row: Row, prefixWidth: number, ctx: Ctx): string {
 /** `name  worst-label [bar] pct  resets …  ↺N` — one line per identity. */
 function compactLine(result: ToolLimitResult, nameWidth: number, labelWidth: number, ctx: Ctx): string {
   const name = result.identity.name.padEnd(nameWidth);
-  const autoReset = result.autoReset ? `  ${gray(formatAutoResetStatus(result.autoReset))}` : "";
+  const note = autoResetNote(result);
+  const autoReset = note ? `  ${gray(note)}` : "";
   if (isMirroredPool(result, ctx.all)) return `  ${bold(name)}  ${gray(poolPointer(result))}${autoReset}`;
   if (result.status === "pending") return `  ${bold(name)}  ${gray(`${ctx.spinnerFrame} loading…`)}`;
   if (result.status === "unavailable" || result.windows.length === 0) {

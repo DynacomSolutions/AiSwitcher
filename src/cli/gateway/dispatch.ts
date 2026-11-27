@@ -29,7 +29,7 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   if (sub === "usage") return runUsageCommand(flags, merged);
   if (sub === "auto-reset") {
     const { runAutoResetCommand } = await import("./auto-reset.ts");
-    return runAutoResetCommand(rest, boolFlag(flags, "json"), merged);
+    return runAutoResetCommand(rest, boolFlag(flags, "json"), merged, stringFlag(flags, "provider"));
   }
   if (sub === "usage-history") {
     const { runUsageHistoryCommand } = await import("./usage-history.ts");

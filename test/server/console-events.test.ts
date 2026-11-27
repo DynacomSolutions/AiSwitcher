@@ -39,7 +39,7 @@ test("the observer shares reads, ignores transport timestamps and sends changed 
     "pools-usage": unchanged,
     "gateway-usage": unchanged,
     "usage-projects": unchanged,
-    "codex-auto-reset": { load: () => ({ lastClaim: { status: claim } }), intervalMs: 1_000 },
+    "auto-reset": { load: () => ({ lastClaim: { status: claim } }), intervalMs: 1_000 },
   }, stop.signal);
   const app = new Hono().get("/events", (c) => events.stream(c));
   const response = await app.request("/events");
@@ -71,7 +71,7 @@ test("the observer shares reads, ignores transport timestamps and sends changed 
         const data = /^event: change\ndata: (.+)/.exec(frame)?.[1];
         if (data) for (const topic of JSON.parse(data) as string[]) topics.add(topic);
       }
-      expect(topics).toEqual(new Set(["limits", "usage", "codex-auto-reset"]));
+      expect(topics).toEqual(new Set(["limits", "usage", "auto-reset"]));
     }
     expect(calls).toBe(3);
     // Ending the lifetime closes both live response bodies so daemon drain can finish.
@@ -148,7 +148,7 @@ test("manual reset results and rule writes immediately invalidate their shared J
       method: "PUT", headers: mutationHeaders, body: JSON.stringify({ name: "fixture", enabled: true }),
     });
     expect(rule.status).toBe(200);
-    expect(await readFrame(reader)).toBe(changeFrame("codex-auto-reset"));
+    expect(await readFrame(reader)).toBe(changeFrame("auto-reset"));
     expect(await get(settings)).toMatchObject({ pools: [{ enabled: true }] });
 
     expect((await consume()).status).toBe(200);
@@ -177,7 +177,7 @@ test("rollover closes the response body and the next connection reuses reads tha
     "pools-usage": source,
     "gateway-usage": source,
     "usage-projects": source,
-    "codex-auto-reset": source,
+    "auto-reset": source,
   });
   const app = new Hono().get("/events", (c) => events.stream(c));
   const initial = (await app.request("/events")).body!.getReader();
@@ -214,7 +214,7 @@ test("a mutation during a read shares one replacement and no caller receives the
     "pools-usage": unchanged,
     "gateway-usage": unchanged,
     "usage-projects": unchanged,
-    "codex-auto-reset": unchanged,
+    "auto-reset": unchanged,
   });
   const before = events.read("limits");
   await Promise.resolve();

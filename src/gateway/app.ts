@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import { exhaustedWeeklyReset, type AutoResetRecovery } from "./auto-reset.ts";
+import { isAutoResetProvider } from "./auto-reset-view.ts";
 import { extractToken } from "./auth.ts";
 import { BodyBudget } from "./body-budget.ts";
 import type { BrowserHub } from "./browser/hub.ts";
@@ -40,7 +41,10 @@ export interface GatewayDeps {
   usageFor(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   /** Reads one member's usage from the source now and waits (single-flight); `usageFor` answers with it afterwards. */
   refreshUsage?(provider: GatewayProvider, identity: string): Promise<void>;
+  /** The Codex recovery. `autoResets` carries it too, with the recoveries of the other providers. */
   autoReset?: AutoResetRecovery;
+  /** The automatic reset recovery of each provider with a reset API. */
+  autoResets?: Partial<Record<GatewayProvider, AutoResetRecovery>>;
   withCodexRedemption?: CodexRedemptionGuard;
   /** Encoded canonical member and reset generation pairs, in input order. */
   codexResetGenerations?(identities: readonly string[]): Promise<string[]>;
@@ -1214,8 +1218,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     return undefined;
   };
-  const autoReset = app.provider === "codex" && app.target.kind === "pool" && !side &&
-    body.kind === "buffered" && isModelCall(req.method, rest) ? deps.autoReset : undefined;
+  const autoReset = isAutoResetProvider(app.provider) && app.target.kind === "pool" && !side &&
+    body.kind === "buffered" && isModelCall(req.method, rest)
+    ? deps.autoResets?.[app.provider] ?? (app.provider === "codex" ? deps.autoReset : undefined) : undefined;
   const autoResetSignal = deps.drainSignal ? AbortSignal.any([ctrl.signal, deps.drainSignal]) : ctrl.signal;
   let cachedQuotaProbe = false;
   let rulesEnabled: Promise<boolean> | undefined;
@@ -1272,9 +1277,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       const candidate = members.find((name) => !holds.has(exKey(name)));
       if (candidate === undefined) return undefined;
       const configured = await allowedMembers(app, deps);
-      const readings = await Promise.all(configured.map((name) => deps.usageFor("codex", name)));
+      const readings = await Promise.all(configured.map((name) => deps.usageFor(app.provider, name)));
       const checkedAt = deps.now().getTime();
-      return readings.every((reading) => exhaustedWeeklyReset(reading, checkedAt) !== undefined) ? candidate : undefined;
+      return readings.every((reading) => isAutoResetProvider(app.provider) && exhaustedWeeklyReset(reading, checkedAt, app.provider) !== undefined) ? candidate : undefined;
     };
     const canProbe = await untilStopped(autoResetSignal, async () =>
       await fullCandidate() !== undefined && await enabled()).catch(() => false);
@@ -1392,14 +1397,21 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (side) return { quota: false, res }; // a side route's 402/403/429 is its own, not a sign this login is out of quota
     if (res.headers.get(SUBSCRIPTION_EXHAUSTED_HEADER) === "1") return { quota: true, res };
     if (res.status === 402 || res.status === 429) {
-      if (res.status === 429 && app.provider === "claude" && provesSubscriptionExhaustion(res.headers)) return { quota: true, res };
       const receipt = quotaReceipts.get(res);
+      // Claude proves an exhausted subscription with its headers, so no body is needed. Recovery needs a receipt for this response.
+      const claudeProof = res.status === 429 && app.provider === "claude" && provesSubscriptionExhaustion(res.headers);
+      if (claudeProof && !receipt) return { quota: true, res };
       let initialSignal = !firstQuota && receipt ? startRecovery(receipt.deadlineAt) : undefined;
       if (initialSignal && receipt) {
         const active = await untilStopped(initialSignal, enabled).catch(() => undefined);
         if (ctrl.signal.aborted) {
           void discard(res);
           ctrl.signal.throwIfAborted();
+        }
+        // The headers prove the exhaustion, so a failed or late setting read must not stop failover to the next member.
+        if (claudeProof && active !== true) {
+          releaseAutoReset?.();
+          return { quota: true, res };
         }
         if (active === undefined || initialSignal.aborted || performance.now() >= receipt.deadlineAt) {
           releaseAutoReset?.();
@@ -1420,9 +1432,10 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         releaseAutoReset?.();
         return { quota: false, res: p.res, relay: true };
       }
-      const quota = p.whole && isSubscriptionUsageBody(p.bytes);
-      const codexQuota = receipt && p.whole && isCodexSubscription429(p.bytes);
-      if (codexQuota && !firstQuota && initialSignal) {
+      const quota = claudeProof || (p.whole && isSubscriptionUsageBody(p.bytes));
+      // Only an account-wide limit can be renewed. A rejection of one model window is not a reset case.
+      const recoverable = receipt && p.whole && (claudeProof ? !isModelScopedRejection(res.headers) : isCodexSubscription429(p.bytes));
+      if (recoverable && !firstQuota && initialSignal) {
         firstQuota = {
           ...receipt,
           identity: name === identity ? identity : await untilStopped(initialSignal, () => canon(name)).catch(() => name),
@@ -1435,7 +1448,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       } else if (initialSignal) {
         releaseAutoReset?.();
       }
-      if (!quota && !(codexQuota && firstQuota)) return { quota: false, res: p.res };
+      if (!quota && !(recoverable && firstQuota)) return { quota: false, res: p.res };
       const headers = new Headers(p.res.headers);
       headers.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
       const reset = subscriptionResetAt(p.bytes);
@@ -1516,7 +1529,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         if (name === undefined) return undefined;
         signal.throwIfAborted();
         releaseHolds(name);
-        const credential = await deps.creds.get("codex", restored);
+        const credential = await deps.creds.get(app.provider, restored);
         signal.throwIfAborted();
         const res = await send(credential, signal);
         if (signal.aborted) {
@@ -1526,7 +1539,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         unused = res;
         if (!res.ok) return undefined;
         if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) {
-          const peeked = await peekFirstEvent(res, ERROR_PEEK_BYTES, signal, true);
+          // Codex events need the renewal reader. Other providers use the general first-event check.
+          const peeked = await peekFirstEvent(res, ERROR_PEEK_BYTES, signal, app.provider === "codex");
           if (signal.aborted) {
             void discard(peeked.res);
             return undefined;
@@ -1762,7 +1776,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         cur = restored?.res ?? new Response(original.bytes, { status: 429, statusText: original.statusText, headers: original.headers });
         servedBy = restored?.name ?? original.name;
         identity = restored?.identity ?? original.identity;
-        quota = false;
+        // A Codex client gets the provider's own 429. A Claude client keeps the pool's out-of-capacity answer, with its reset times.
+        quota = restored === undefined && app.provider === "claude";
       } else {
         releaseAutoReset?.();
       }

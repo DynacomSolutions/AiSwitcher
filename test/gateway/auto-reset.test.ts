@@ -25,8 +25,8 @@ function credits(id = alphaCredit, expiry = NOW + 100_000): ManualResetInfo {
   return { availableCount: 1, creditExpiries: [{ id, endsAt: iso(expiry) }] };
 }
 
-async function allow(store: MemoryAutoResetStore): Promise<void> {
-  await store.setEnabled("renewal", true);
+async function allow(store: MemoryAutoResetStore, names = ["alpha", "beta"]): Promise<void> {
+  await store.setEnabled("codex", "renewal", true);
 }
 
 const input = (signal = AbortSignal.timeout(2_500), members = ["alpha", "beta"]) => ({ members, reservePercent: 90, signal });
@@ -124,18 +124,18 @@ describe("Codex renewal recovery", () => {
     await expect(createAutoResetRecovery({ ...options, store: hung }).enabled()).rejects.toThrow("Codex auto-reset rules timed out");
   });
 
-  test("defaults off and verifies every routed member before claiming", async () => {
+  test("defaults off, needs only the pool setting, and verifies every routed member", async () => {
     const h = harness();
     expect(await h.recovery.enabled()).toBeFalse();
     expect(await h.recovery.recover(input())).toBeUndefined();
     expect(h.reads).toEqual([]);
-    await h.store.setEnabled("renewal", true);
+    await h.store.setEnabled("codex", "renewal", true);
     expect(await h.recovery.enabled()).toBeTrue();
     expect(await h.recovery.recover(input(undefined, ["alpha", "beta", "missing"]))).toBeUndefined();
     expect(h.reads).toContain("missing");
     expect(h.spends).toEqual([]);
-    expect(await h.store.lastClaim("renewal")).toBeUndefined();
-    await h.store.setEnabled("renewal", false);
+    expect(await h.store.lastClaim("codex", "renewal")).toBeUndefined();
+    await h.store.setEnabled("codex", "renewal", false);
     expect(await h.recovery.recover(input())).toBeUndefined();
     expect(h.spends).toEqual([]);
   });
@@ -146,12 +146,12 @@ describe("Codex renewal recovery", () => {
     const recovery = createAutoResetRecovery({
       ...h.options,
       claim: async (planned) => {
-        await h.store.setEnabled(planned.pool, false);
+        await h.store.setEnabled("codex", planned.pool, false);
         return h.store.claim(planned);
       },
     });
     expect(await recovery.recover(input())).toBeUndefined();
-    expect(await h.store.lastClaim("renewal")).toBeUndefined();
+    expect(await h.store.lastClaim("codex", "renewal")).toBeUndefined();
     expect(h.spends).toEqual([]);
   });
 
@@ -183,14 +183,14 @@ describe("Codex renewal recovery", () => {
       return claim(planned);
     };
     const recovery = createAutoResetRecovery({ ...h.options, spend: async (...args) => {
-      expect(await h.store.lastClaim("renewal")).toMatchObject({
-        identity: args[0], creditId: alphaCredit, creditExpiresAt: iso(NOW + 100_000), startedAt: iso(NOW), status: "pending",
+      expect(await h.store.lastMemberClaim("codex", args[0])).toMatchObject({
+        creditId: alphaCredit, creditExpiresAt: iso(NOW + 100_000), startedAt: iso(NOW), status: "pending",
       });
       return base(...args);
     } });
     expect(await recovery.recover(input())).toBe("alpha");
     expect(h.spends).toEqual([{ identity: "alpha", creditId: alphaCredit, redeemRequestId: expect.any(String) }]);
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ status: "reset", creditedId: alphaCredit });
+    expect(await h.store.lastClaim("codex", "renewal")).toMatchObject({ status: "reset", creditedId: alphaCredit });
     expect(h.logs.map((line) => JSON.parse(line))).toMatchObject([
       {
         status: "pending", reason: "earliest_expiry", startedAt: iso(NOW), creditExpiresAt: iso(NOW + 100_000),
@@ -240,7 +240,7 @@ describe("Codex renewal recovery", () => {
     await allow(h.store);
     expect(await h.recovery.recover(input())).toBe("alpha");
     expect(h.spends).toMatchObject([{ identity: "alpha", creditId: winner }]);
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ creditId: winner, creditedId: winner });
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({ creditId: winner, creditedId: winner });
   });
 
   test("joins the same winner across recovery instances and sorted member sets", async () => {
@@ -375,7 +375,7 @@ describe("Codex renewal recovery", () => {
     expect(await h.recovery.recover(input())).toBeUndefined();
     expect(await h.recovery.recover(input())).toBeUndefined();
     expect(calls).toBe(1);
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ status: "unknown" });
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({ status: "unknown" });
     expect(h.logs.join("\n")).not.toContain("SYNTHETIC_FIXTURE-private-error");
   });
 
@@ -388,7 +388,7 @@ describe("Codex renewal recovery", () => {
     } });
     expect(await recovery.recover(input())).toBe("alpha");
     expect(h.spends).toHaveLength(1);
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ status: "unknown" });
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({ status: "unknown" });
     expect((await h.store.findClaim(JSON.parse(h.logs[0]).eventKey))?.recoveredAt).toBeUndefined();
   });
 
@@ -418,7 +418,7 @@ describe("Codex renewal recovery", () => {
     await started.promise;
     expect(await pending).toBe("alpha");
     expect(checks).toBeGreaterThanOrEqual(4);
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ status: outcome });
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({ status: outcome });
   });
 
   test.each(["no_credit", "nothing_to_reset", "already_redeemed", "provider_refused"] as const)(
@@ -430,7 +430,7 @@ describe("Codex renewal recovery", () => {
     await allow(h.store);
     expect(await h.recovery.recover(input())).toBeUndefined();
     expect(h.reads).toEqual(["alpha", "beta"]);
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ status: "rejected" });
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({ status: "rejected" });
     expect(JSON.parse(h.logs[1])).toMatchObject({ status: "rejected", outcome });
   });
 
@@ -442,7 +442,7 @@ describe("Codex renewal recovery", () => {
       return { result: "reset", creditId: betaCredit };
     } });
     expect(await recovery.recover(input())).toBeUndefined();
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ status: "unknown", creditedId: betaCredit });
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({ status: "unknown", creditedId: betaCredit });
   });
 
   test("keeps a late automatic mismatch fenced after the caller cancels", async () => {
@@ -469,10 +469,10 @@ describe("Codex renewal recovery", () => {
     await posted.promise;
     controller.abort();
     expect(await answer).toBeUndefined();
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ status: "pending", creditId: alphaCredit });
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({ status: "pending", creditId: alphaCredit });
     acknowledge.resolve();
     await finished.promise;
-    expect(await h.store.lastClaim("renewal")).toMatchObject({
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({
       status: "unknown", creditId: alphaCredit, creditedId: betaCredit,
     });
   });
@@ -487,7 +487,7 @@ describe("Codex renewal recovery", () => {
     } });
     expect(await recovery.recover({ ...input(), model: "model-specific" })).toBeUndefined();
     expect(h.spends).toHaveLength(1);
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ status: "reset" });
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({ status: "reset" });
   });
 
   test.each([
@@ -525,7 +525,7 @@ describe("Codex renewal recovery", () => {
     await allow(h.store);
     expect(await h.recovery.recover(input())).toBe("alpha");
     expect(h.spends).toEqual([]);
-    expect(await h.store.lastClaim("renewal")).toBeUndefined();
+    expect(await h.store.lastClaim("codex", "renewal")).toBeUndefined();
   });
 
   test.each([59_999, 60_000])("claims before the natural reset when credit expiry is near (%i ms)", async (expiryOffset) => {
@@ -556,7 +556,7 @@ describe("Codex renewal recovery", () => {
     await allow(h.store);
     expect(await h.recovery.recover(input())).toBeUndefined();
     expect(h.spends).toHaveLength(0);
-    expect(await h.store.lastClaim("renewal")).toBeUndefined();
+    expect(await h.store.lastClaim("codex", "renewal")).toBeUndefined();
   });
 
   test("reserves replay time when recovery starts late in the caller's budget", async () => {
@@ -597,6 +597,6 @@ describe("Codex renewal recovery", () => {
     controller.abort();
     expect(await pending).toBeUndefined();
     await finished.promise;
-    expect(await h.store.lastClaim("renewal")).toMatchObject({ status: "unknown" });
+    expect(await h.store.lastMemberClaim("codex", "alpha")).toMatchObject({ status: "unknown" });
   });
 });

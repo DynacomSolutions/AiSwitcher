@@ -2171,7 +2171,7 @@ describe("automatic Codex reset integration", () => {
         ? Response.json({ code: "nothing_to_reset" })
         : Response.json({ available_count: 1 })) as typeof fetch,
     }) : undefined;
-    await auto.setEnabled(pool, true);
+    await auto.setEnabled("codex", pool, true);
     const name = "fixture-auto-codex";
     await store.putApp({ ...app, name, provider: "codex", style: "openai", target: { kind: "pool" } });
     const t = generateToken();
@@ -2295,7 +2295,7 @@ describe("automatic Codex reset integration", () => {
     expect(await answer.text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: 1, inferences: 1 });
     expect(record).toHaveBeenCalledWith(state.requests[0].redeem_request_id, otherCredit, "reset");
-    expect(await state.auto.lastClaim(pool)).toMatchObject({
+    expect(await state.auto.lastMemberClaim("codex", identity)).toMatchObject({
       status: "unknown", creditId, creditedId: otherCredit,
     });
   });
@@ -2319,7 +2319,7 @@ describe("automatic Codex reset integration", () => {
     expect(state.counts().posts).toBe(1);
     expect(receipt).toHaveBeenCalledTimes(2);
     expect(finish).toHaveBeenCalledTimes(1);
-    expect(await state.auto.lastClaim(pool)).toMatchObject({ spendPending: true });
+    expect(await state.auto.lastMemberClaim("codex", identity)).toMatchObject({ spendPending: true });
   });
 
   test("a follower on a locally held member gets a real 429 and joins one durable spend", async () => {
@@ -2334,7 +2334,7 @@ describe("automatic Codex reset integration", () => {
       expect(await (await first).json()).toEqual({ accepted: true });
       expect(await (await second).json()).toEqual({ accepted: true });
       expect(state.counts()).toMatchObject({ posts: 1, inferences: 4, inventories: 2 });
-      const claim = await state.auto.lastClaim(pool);
+      const claim = await state.auto.lastMemberClaim("codex", identity);
       expect(claim).toMatchObject({ status: "reset", creditId, creditedId: creditId });
       expect(state.requests).toEqual([{ credit_id: creditId, redeem_request_id: expect.stringMatching(/^[0-9a-f-]{36}$/) }]);
       await waitFor(async () => (await state.readings.load("codex", identity))?.reading.maxUtilization === 10);
@@ -2351,7 +2351,7 @@ describe("automatic Codex reset integration", () => {
     expect(response.headers.get("retry-after")).toBe("81");
     expect(await response.text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: typeof scenario === "number" ? 1 : 0, inferences: 1, inventories: 2 });
-    expect(await state.auto.lastClaim(pool)).toMatchObject({ status: "rejected" });
+    expect(await state.auto.lastMemberClaim("codex", identity)).toMatchObject({ status: "rejected" });
   });
 
   test("does not claim when a configured routed member lacks fresh proof", async () => {
@@ -2360,19 +2360,19 @@ describe("automatic Codex reset integration", () => {
     expect(response.status).toBe(429);
     expect(await response.text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: 0, inferences: 1, inventories: 0 });
-    expect(await state.auto.lastClaim(pool)).toBeUndefined();
+    expect(await state.auto.lastMemberClaim("codex", identity)).toBeUndefined();
   });
 
   test("rejects other reset types before selection and on the locked recheck", async () => {
     const first = await setup("wrong-type");
     expect((await first.call()).status).toBe(429);
     expect(first.counts()).toMatchObject({ posts: 0, inventories: 1 });
-    expect(await first.auto.lastClaim(pool)).toBeUndefined();
+    expect(await first.auto.lastMemberClaim("codex", identity)).toBeUndefined();
 
     const second = await setup("wrong-type-recheck");
     expect((await second.call()).status).toBe(429);
     expect(second.counts()).toMatchObject({ posts: 0, inventories: 2 });
-    expect(await second.auto.lastClaim(pool)).toMatchObject({ status: "rejected" });
+    expect(await second.auto.lastMemberClaim("codex", identity)).toMatchObject({ status: "rejected" });
   });
 
   test("rejects a claim after another replica manually redeems for a different member", async () => {
@@ -2381,7 +2381,7 @@ describe("automatic Codex reset integration", () => {
     expect(response.status).toBe(429);
     expect(await response.text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: 0, inventories: 1 });
-    expect(await state.auto.lastClaim(pool)).toMatchObject({ status: "rejected" });
+    expect(await state.auto.lastMemberClaim("codex", identity)).toMatchObject({ status: "rejected" });
   });
 
   test("preserves the provider 429 while the requested model remains blocked after reset", async () => {
@@ -2396,7 +2396,7 @@ describe("automatic Codex reset integration", () => {
     const state = await setup("generation-unavailable");
     expect(await (await state.call()).text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: 0, inferences: 1, inventories: 0 });
-    expect(await state.auto.lastClaim(pool)).toBeUndefined();
+    expect(await state.auto.lastMemberClaim("codex", identity)).toBeUndefined();
   });
 
   test("keeps the generation advanced after an ambiguous POST and never repeats the spend", async () => {
@@ -2404,7 +2404,7 @@ describe("automatic Codex reset integration", () => {
     expect(await (await state.call()).text()).toBe(quota);
     expect(await state.invalidations.version(identity)).toBe("1");
     expect(state.counts()).toMatchObject({ posts: 1, inferences: 1 });
-    expect(await state.auto.lastClaim(pool)).toMatchObject({ status: "unknown" });
+    expect(await state.auto.lastMemberClaim("codex", identity)).toMatchObject({ status: "unknown" });
   }, 12_000);
 
   test("does not send the POST after the credit generation changes under the lock", async () => {
@@ -2416,9 +2416,171 @@ describe("automatic Codex reset integration", () => {
       expect(response.status).toBe(429);
       expect(await response.text()).toBe(quota);
       expect(state.counts()).toMatchObject({ posts: 0, inferences: 1, inventories: 2 });
-      expect(await state.auto.lastClaim(pool)).toMatchObject({ status: "rejected" });
+      expect(await state.auto.lastMemberClaim("codex", identity)).toMatchObject({ status: "rejected" });
     } finally {
       generation.mockRestore();
     }
+  });
+});
+
+describe("automatic Claude reset integration", () => {
+  const identity = "fixture-claude";
+  const pool = "claude-fixture-pool";
+  const grantId = "full-reset-SYNTHETIC_FIXTURE";
+  const quota = '{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}';
+
+  async function setup(enable: "claude" | "codex" | "none", over: { usageStatus?: number } = {}) {
+    const clock = Date.now();
+    const weeklyReset = new Date(clock + 3_600_000).toISOString();
+    const grantEnds = new Date(clock + 600_000).toISOString();
+    const auto = new MemoryAutoResetStore(() => clock);
+    if (enable === "claude") await auto.setEnabled("claude", pool, true);
+    if (enable === "codex") await auto.setEnabled("codex", pool, true);
+    const name = "fixture-auto-claude";
+    await store.putApp({ ...app, name, provider: "claude", style: "anthropic", target: { kind: "pool" } });
+    const t = generateToken();
+    await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: app.createdAt });
+    let served = false;
+    const posts: Array<Record<string, unknown>> = [];
+    const inferences: string[] = [];
+    const agents: string[] = [];
+    const g = await boot({
+      now: () => new Date(clock),
+      autoReset: { store: auto, pools: async (provider) => provider === "claude" ? [{ name: pool, members: [identity] }] : [] },
+      keepAliveAccounts: async () => [],
+      usageFor: async () => ({
+        status: "live", capturedAt: new Date(clock).toISOString(),
+        windows: [{ label: "seven-day", utilization: served ? 10 : 100, resetsAt: weeklyReset }],
+      }),
+      fetchUsage: async () => undefined,
+      poolMembers: async (provider) => provider === "claude" ? [identity] : [],
+      canonical: async (_provider, member) => member,
+      creds: {
+        loggedOut: async () => false,
+        get: async (_provider, member) => ({ identity: member, accessToken: "access-SYNTHETIC_FIXTURE_CLAUDE" }),
+        refreshAfter401: async () => { throw new Error("unexpected refresh"); },
+      },
+      fetch: (async (url, init) => {
+        const path = new URL(String(url)).pathname;
+        if (path === "/api/oauth/usage") {
+          agents.push(new Headers(init?.headers).get("user-agent") ?? "");
+          if (over.usageStatus) return new Response("{}", { status: over.usageStatus });
+          return Response.json({
+            five_hour: { utilization: 20, resets_at: new Date(clock + 3_600_000).toISOString() },
+            seven_day: { utilization: served ? 10 : 100, resets_at: weeklyReset },
+            cedar_ember: { eligible: true, grants: served ? [] : [
+              { id: grantId, label: "One full limit reset", resets_left: 1, usable_now: true, paused: false, ends_at: grantEnds },
+            ] },
+          });
+        }
+        if (path === "/api/oauth/profile") return Response.json({ organization: { uuid: "org-SYNTHETIC" } });
+        if (path.endsWith("/reset_rate_limits")) {
+          posts.push(JSON.parse(String(init?.body)));
+          served = true;
+          return Response.json({ result: "reset", grant_id: grantId, cleared: ["seven_day"] });
+        }
+        inferences.push(path);
+        return served
+          ? Response.json({ type: "message", content: [] })
+          : new Response(quota, { status: 429, headers: {
+            "content-type": "application/json", "retry-after": "81", "anthropic-ratelimit-unified-7d-status": "rejected",
+          } });
+      }) as typeof fetch,
+    });
+    const call = () => fetch(`${base(g)}/${name}/v1/messages`, {
+      method: "POST", body: '{"model":"claude-fixture","max_tokens":1,"messages":[]}',
+      headers: { authorization: `Bearer ${t.token}`, "content-type": "application/json" },
+    });
+    return { auto, call, posts, inferences, agents };
+  }
+
+  test("a pool setting spends one grant with fakes and replays the request", async () => {
+    const state = await setup("claude");
+    const answer = await state.call();
+    expect(answer.status).toBe(200);
+    expect(await answer.json()).toMatchObject({ type: "message" });
+    expect(state.posts).toHaveLength(1);
+    expect(state.posts[0]).toMatchObject({ program: "cedar_ember", grant_id: grantId });
+    expect(state.agents.every((agent) => agent.startsWith("claude-cli/"))).toBe(true);
+    expect(await state.auto.lastMemberClaim("claude", identity)).toMatchObject({ pool, status: "reset", creditId: grantId });
+    expect(await state.auto.lastClaim("claude", pool)).toMatchObject({ identity, status: "reset" });
+    // The same member name under Codex has no claim.
+    expect(await state.auto.lastMemberClaim("codex", identity)).toBeUndefined();
+  });
+
+  test("the setting is off by default and a Codex pool setting never spends a Claude grant", async () => {
+    for (const enable of ["none", "codex"] as const) {
+      const state = await setup(enable);
+      const answer = await state.call();
+      expect(answer.status).toBe(429);
+      await answer.arrayBuffer();
+      expect(state.posts).toHaveLength(0);
+      expect(await state.auto.lastMemberClaim("claude", identity)).toBeUndefined();
+    }
+  });
+
+  describe("the manual spend", () => {
+    const manual = async (over: Partial<GatewayHooks>) => {
+      const g = await boot({
+        poolMembers: async () => [identity], canonical: async (_provider, member) => member, keepAliveAccounts: async () => [], ...over,
+      });
+      return (member = identity) => fetch(`http://127.0.0.1:${g.adminPort}/limits/claude/${member}/resets/${grantId}`, {
+        method: "POST", headers: { authorization: `Bearer ${ADMIN}` },
+      });
+    };
+    const pendingClaim = async (auto: MemoryAutoResetStore) => {
+      const requestId = crypto.randomUUID();
+      await auto.setEnabled("claude", pool, true);
+      expect(await auto.claim({
+        provider: "claude", eventKey: "manual-spend-fence", pool, identity, creditId: grantId,
+        creditExpiresAt: new Date(Date.now() + 600_000).toISOString(), startedAt: new Date().toISOString(), redeemRequestId: requestId,
+        usageEvidence: [{ identity, resetAt: new Date(Date.now() + 3_600_000).toISOString(), capturedAt: new Date().toISOString(), weeklyUtilisation: 100 }],
+        creditEvidence: { reason: "only_candidate", inventories: [] },
+      })).toEqual({ kind: "created" });
+      expect(await auto.beginSpend(requestId, identity)).toBe(true);
+      return requestId;
+    };
+
+    test("it waits while an automatic Claude spend on the same member has no outcome", async () => {
+      const auto = new MemoryAutoResetStore();
+      let spent = 0;
+      const call = await manual({
+        autoReset: { store: auto, pools: async () => [] },
+        claudeReset: async (member, grant) => { spent++; return { identity: member, grantId: grant, result: "reset", cleared: [] }; },
+      });
+      const requestId = await pendingClaim(auto);
+      const refused = await call();
+      expect(refused.status).toBe(409);
+      expect(spent).toBe(0);
+      // A known outcome clears the fence. The member then accepts the manual spend again.
+      await auto.recordReportedCredit(requestId, grantId, "reset");
+      expect((await call()).status).toBe(200);
+      expect(spent).toBe(1);
+    });
+
+    test("it runs inside the redemption lock, one spend at a time", async () => {
+      let running = 0;
+      let overlap = 0;
+      const call = await manual({
+        autoReset: { store: new MemoryAutoResetStore(), pools: async () => [] },
+        claudeReset: async (member, grant) => {
+          overlap = Math.max(overlap, ++running);
+          await Bun.sleep(30);
+          running--;
+          return { identity: member, grantId: grant, result: "reset", cleared: [] };
+        },
+      });
+      const answers = await Promise.all([call(), call("fixture-claude-other"), call()]);
+      expect(answers.map((answer) => answer.status)).toEqual([200, 200, 200]);
+      expect(overlap).toBe(1);
+    });
+  });
+
+  test("a refused usage read is not proof of a full week, so nothing is spent", async () => {
+    const state = await setup("claude", { usageStatus: 429 });
+    const answer = await state.call();
+    expect(answer.status).toBe(429);
+    await answer.arrayBuffer();
+    expect(state.posts).toHaveLength(0);
   });
 });
