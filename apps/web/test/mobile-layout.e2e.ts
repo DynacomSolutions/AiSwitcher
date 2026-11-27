@@ -960,6 +960,38 @@ describe("1280x900", () => {
     }
   }, 40_000);
 
+  test("OpenAI limits refresh per card and per tab, and a cached card keeps its reset button and shows why", async () => {
+    await setViewport(1280, 900);
+    const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+      source: `(${limitsAndSpendStub.toString()})(${JSON.stringify(LIMITS_ANSWERS)})`,
+    });
+    try {
+      await open("/limits/openai");
+      const resetButton = 'main button[aria-label="Use reset on SYNTHETIC_FIXTURE-codex-credit"]';
+      await waitFor("OpenAI cards", 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(resetButton)})`));
+      const cards = await page.eval<number>(`document.querySelectorAll('main [data-slot="card"]').length`);
+      expect(await page.eval<number>(`document.querySelectorAll('main button[aria-label^="Refresh SYNTHETIC_FIXTURE-"]').length`)).toBe(cards);
+      expect(await page.eval<number>(`document.querySelectorAll('main button[aria-label="Refresh all openai limits"]').length`)).toBe(1);
+      // The refresh answers a cached reading with the reason. The reset button stays.
+      const row = SYNTHETIC_LIMITS.results.find((r) => r.toolName === "codex" && r.identity.name === "SYNTHETIC_FIXTURE-codex-credit")!;
+      const refreshed = { ...SYNTHETIC_LIMITS, results: [{ ...row, status: "cached", error: "OpenAI rejected this Codex login (SYNTHETIC_FIXTURE). Sign in again.", manualReset: { ...row.manualReset, stale: true } }] };
+      await page.eval(`window.__aisLimitsQueue = [${JSON.stringify(refreshed)}]; document.querySelector('main button[aria-label="Refresh SYNTHETIC_FIXTURE-codex-credit"]').click()`);
+      await waitFor("the refreshed card", 8_000, () => page.eval<boolean>(`document.querySelector('main').innerText.includes('OpenAI rejected this Codex login (SYNTHETIC_FIXTURE)')`));
+      expect(await page.eval<boolean>(`window.__aisLimitsCalls.some(q => q.includes('refresh=1') && q.includes('tool=codex') && q.includes('identity=SYNTHETIC_FIXTURE-codex-credit'))`)).toBe(true);
+      expect(await page.eval<boolean>(`!!document.querySelector(${JSON.stringify(resetButton)})`)).toBe(true);
+      expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('Cached')`)).toBe(true);
+      // The tab button asks once for the whole tool.
+      await page.eval(`window.__aisLimitsCalls.length = 0; document.querySelector('main button[aria-label="Refresh all openai limits"]').click()`);
+      await waitFor("the tab refresh request", 8_000, () => page.eval<boolean>(`window.__aisLimitsCalls.some(q => q.includes('refresh=1') && q.includes('tool=codex') && !q.includes('identity='))`));
+      if (evidence) {
+        await mkdir(evidence, { recursive: true });
+        await writeFile(join(evidence, "1280-limits-openai-refresh.png"), await page.screenshot());
+      }
+    } finally {
+      await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+    }
+  }, 40_000);
+
   test("/limits keeps each pool reset countdown in full", async () => {
     await checkLimitsCards(1280, 900, "/limits", { lines: 0, notes: 0, plans: 0, poolLines: 2, wrappedAtLeast: 0 });
   }, 40_000);

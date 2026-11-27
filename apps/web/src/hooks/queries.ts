@@ -1,6 +1,6 @@
-import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import { limitsRefetchInterval, POLL, reconcileLimits } from "@/lib/limits-reconciliation";
+import { applyRefreshedLimits, limitsRefetchInterval, POLL, reconcileLimits } from "@/lib/limits-reconciliation";
 import type { LimitsResponse, LoginFlowStatus } from "@/types/api";
 
 export { POLL, reconcileLimits, limitsRefetchInterval } from "@/lib/limits-reconciliation";
@@ -117,6 +117,35 @@ export function useLimitsQuery() {
       return reconcileLimits(client.getQueryData<LimitsResponse>(qk.limits), incoming);
     },
     refetchInterval: (query) => limitsRefetchInterval(query.state.data),
+  });
+}
+
+export interface LimitsRefreshTarget {
+  tool: string;
+  /** Absent: every identity of the tool. */
+  identity?: string;
+}
+
+/**
+ * Manual refresh of limits. Each target reads the provider again on the server, past its 45 second caches. A target that fails
+ * does not stop the others: the mutation answers with the failures, and the rows that did read replace the rows on screen.
+ */
+export function useRefreshLimits() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (targets: LimitsRefreshTarget[]) => {
+      const settled = await Promise.allSettled(targets.map((target) => api.refreshLimits(target.tool, target.identity)));
+      const responses = settled.flatMap((entry) => (entry.status === "fulfilled" ? [entry.value] : []));
+      const failures = settled.flatMap((entry, index) => (entry.status === "rejected"
+        ? [{ target: targets[index]!, message: entry.reason instanceof Error ? entry.reason.message : String(entry.reason) }]
+        : []));
+      return { responses, failures };
+    },
+    onSuccess: async ({ responses }) => {
+      // Drop older poll work first, so it cannot overwrite the fresh rows.
+      await client.cancelQueries({ queryKey: qk.limits });
+      client.setQueryData<LimitsResponse>(qk.limits, (current) => applyRefreshedLimits(current, responses));
+    },
   });
 }
 

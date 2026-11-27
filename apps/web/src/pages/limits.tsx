@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CreditCard, RotateCcw } from "lucide-react";
+import { CreditCard, RefreshCw, RotateCcw } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -31,10 +31,12 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
-import { qk, useLimitsQuery, usePoolsUsageQuery } from "@/hooks/queries";
+import { qk, useLimitsQuery, usePoolsUsageQuery, useRefreshLimits, type LimitsRefreshTarget } from "@/hooks/queries";
 import { api } from "@/lib/api";
 import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
+import { cn } from "@/lib/utils";
+import { canSpendCodexReset } from "@/lib/codex-reset";
 import { formatResetTimes } from "@/lib/reset-time";
 import { AccountWarnings } from "@/components/account-line";
 import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseCodexResetResult, UseResetResult } from "@/types/api";
@@ -262,7 +264,7 @@ function UseCodexResetDialog({ identity, availableCount, onClose }: { identity: 
           if (row.toolName !== "codex" || row.identity.name !== result.identity) return row;
           const reset = row.manualReset;
           const spent = result.result === "reset" || result.result === "already_redeemed";
-          const manualReset = reset && spent ? { ...reset, stale: true } : reset;
+          const manualReset = reset && spent ? { ...reset, stale: true, spentAt: Date.now() } : reset;
           const usage = result.reconciliation?.status === "confirmed" ? result.reconciliation.usage : undefined;
           const pending = result.reconciliation?.status === "pending";
           return {
@@ -332,7 +334,7 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
   if (!reset.grants) {
     // Codex has account-level credits, so it has one action and one summary row.
     const available = reset.availableCount > 0;
-    const canSpendCodex = result.toolName === "codex" && result.gatewayManaged === true && result.status === "live" && !reset.stale && available && !result.identity.retired && !result.identity.swapPool;
+    const canSpendCodex = canSpendCodexReset(result);
     const expiries = reset.creditExpiries ?? [];
     const kind = /\bfull\b/i.test(reset.label ?? "") ? "full" : /\bfable\b/i.test(reset.label ?? "") ? "fable" : undefined;
     return (
@@ -406,7 +408,16 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
   );
 }
 
-function LimitCard({ result }: { result: ToolLimitResult }) {
+function RefreshButton({ label, onClick, busy, disabled, text }: { label: string; onClick: () => void; busy: boolean; disabled?: boolean; text?: string }) {
+  return (
+    <Button variant="outline" size="sm" className={cn("shrink-0", text ? "h-8" : "size-7 p-0")} aria-label={label} title={label} disabled={busy || disabled} onClick={onClick}>
+      <RefreshCw aria-hidden className={cn("size-3.5", busy && "animate-spin")} />
+      {text ? <span>{text}</span> : null}
+    </Button>
+  );
+}
+
+function LimitCard({ result, onRefresh, refreshing }: { result: ToolLimitResult; onRefresh: (target: LimitsRefreshTarget) => void; refreshing: boolean }) {
   const unavailable = result.status === "unavailable" || result.status === "pending";
   return (
     <Card className="gap-4">
@@ -426,7 +437,14 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
               </Badge>
             ) : null}
           </div>
-          <StatusBadge status={result.status} />
+          <div className="flex shrink-0 items-center gap-2">
+            <StatusBadge status={result.status} />
+            <RefreshButton
+              label={`Refresh ${result.identity.name}`}
+              busy={refreshing}
+              onClick={() => onRefresh({ tool: result.toolName, identity: result.identity.name })}
+            />
+          </div>
         </div>
         {result.account ? (
           <div className="space-y-0.5 text-xs">
@@ -473,6 +491,19 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
 export function LimitsPage() {
   const query = useLimitsQuery();
   const poolsQuery = usePoolsUsageQuery();
+  const refresh = useRefreshLimits();
+  // The identity or tool being refreshed, so only those cards spin. A tool target covers every identity of that tool.
+  const refreshingTargets = refresh.isPending ? refresh.variables : undefined;
+  const isRefreshing = (tool: string, identity: string): boolean =>
+    refreshingTargets?.some((t) => t.tool === tool && (t.identity === undefined || t.identity === identity)) ?? false;
+  const runRefresh = (targets: LimitsRefreshTarget[]) => {
+    refresh.mutate(targets, {
+      onSuccess: ({ failures }) => {
+        if (failures.length > 0) toast.error("Refresh failed", { description: failures.map((f) => `${f.target.identity ?? f.target.tool}: ${f.message}`).join("; ") });
+      },
+      onError: (error) => toast.error("Refresh failed", { description: error.message }),
+    });
+  };
   // A pool mirrors its active member's token, so its own limits row only ever
   // says "not fetched"; the pool cards above carry the real figures instead.
   const poolKeys = useMemo(() => new Set((poolsQuery.data?.pools ?? []).map((p) => `${p.tool}/${p.name}`)), [poolsQuery.data]);
@@ -509,7 +540,7 @@ export function LimitsPage() {
     <div className="space-y-5">
       <PageHeader
         title="Limits"
-        description="Live provider quota per identity. The server caches upstream fetches for 45 seconds."
+        description="Live provider quota per identity. The server caches upstream fetches for 45 seconds. Refresh reads the provider again."
         updatedAt={query.dataUpdatedAt}
       />
 
@@ -544,10 +575,23 @@ export function LimitsPage() {
             <div className="flex items-center gap-2">
               <ProviderLabel provider={provider} size={16} className="text-base font-semibold" />
               <Badge variant="muted">{group.length}</Badge>
+              <div className="ml-auto">
+                <RefreshButton
+                  label={`Refresh all ${provider} limits`}
+                  text="Refresh all"
+                  busy={group.some((r) => isRefreshing(r.toolName, r.identity.name))}
+                  onClick={() => runRefresh([...new Set(group.map((r) => r.toolName))].map((tool) => ({ tool })))}
+                />
+              </div>
             </div>
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
               {group.map((r) => (
-                <LimitCard key={`${r.provider}/${r.toolName}/${r.identity.name}`} result={r} />
+                <LimitCard
+                  key={`${r.provider}/${r.toolName}/${r.identity.name}`}
+                  result={r}
+                  onRefresh={(target) => runRefresh([target])}
+                  refreshing={isRefreshing(r.toolName, r.identity.name)}
+                />
               ))}
             </div>
           </section>

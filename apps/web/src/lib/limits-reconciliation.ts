@@ -45,3 +45,21 @@ export function limitsRefetchInterval(data: LimitsResponse | undefined, now = Da
   const pending = data?.results.some((row) => row.toolName === "codex" && row.resetPendingUntil && row.resetPendingUntil > now);
   return pending ? 2_000 : POLL.slow;
 }
+
+/**
+ * Applies the rows of manual refreshes. A refresh read the provider again, so its row replaces the row on screen even when the
+ * read failed: the failure text then shows on the card. Rows the refresh did not return stay as they are.
+ */
+export function applyRefreshedLimits(current: LimitsResponse | undefined, refreshed: LimitsResponse[]): LimitsResponse | undefined {
+  if (!current) return current;
+  const byKey = new Map<string, LimitsResponse["results"][number]>();
+  for (const response of refreshed) for (const row of response.results) byKey.set(`${row.toolName}\u0000${row.identity.name}`, row);
+  if (byKey.size === 0) return current;
+  const results = current.results.map((row) => {
+    const next = byKey.get(`${row.toolName}\u0000${row.identity.name}`);
+    if (!next) return row;
+    const { resetPendingUntil: _pending, ...clean } = next;
+    return { ...clean, identity: row.identity };
+  });
+  return { ...current, results, fetchedAt: refreshed.at(-1)?.fetchedAt ?? current.fetchedAt };
+}

@@ -164,6 +164,10 @@ export const api = {
 
   getLimits: (freshCodexIdentity?: string) => request<LimitsResponse>(`/api/limits?maxAge=${freshCodexIdentity ? 5 : 45}${freshCodexIdentity ? `&tool=codex&identity=${encodeURIComponent(freshCodexIdentity)}&freshCodex=${encodeURIComponent(freshCodexIdentity)}` : ""}`),
 
+  /** A manual refresh: the server reads the provider again for this tool (and identity), past its 45 second caches. */
+  refreshLimits: (tool: string, identity?: string) =>
+    request<LimitsResponse>(`/api/limits?refresh=1&tool=${encodeURIComponent(tool)}${identity ? `&identity=${encodeURIComponent(identity)}` : ""}`),
+
   getUsage: () => request<UsageResponse>("/api/usage"),
 
   getPoolsUsage: () => request<PoolsUsageResponse>("/api/pools/usage"),

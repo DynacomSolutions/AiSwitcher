@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { limitsRefetchInterval, POLL, reconcileLimits } from "../src/lib/limits-reconciliation.ts";
+import { canSpendCodexReset, SPEND_LOCK_MS } from "../src/lib/codex-reset.ts";
+import { applyRefreshedLimits, limitsRefetchInterval, POLL, reconcileLimits } from "../src/lib/limits-reconciliation.ts";
 import type { LimitsResponse, ToolLimitResult } from "../src/types/api.ts";
 
 const capturedAt = (seconds: number) => new Date(seconds * 1_000).toISOString();
@@ -68,3 +69,68 @@ describe("limits query reset reconciliation", () => {
     expect(result.results[0]).toMatchObject({ gatewayManaged: true, capturedAt: capturedAt(1), windows: [{ usedPercent: 90 }] });
   });
 });
+
+describe("manual refresh of limits", () => {
+  const registryIdentity = (name: string) => ({ name, label: `Registry ${name}`, configDir: "synthetic" });
+
+  test("a refreshed row replaces the row on screen, even a failed read, and keeps the other rows", () => {
+    const stale: ToolLimitResult = { ...codexRow("member-a", 90, 1, 31_000), status: "cached", identity: registryIdentity("SYNTHETIC_FIXTURE-member-a") };
+    const other = codexRow("member-b", 40, 2);
+    const failed: ToolLimitResult = { ...stale, error: "OpenAI rejected this Codex login (refresh_token_invalidated).", identity: { name: stale.identity.name, label: stale.identity.name, configDir: "" } };
+    delete (failed as { resetPendingUntil?: number }).resetPendingUntil;
+
+    const next = applyRefreshedLimits(payload(stale, other), [payload(failed)]);
+    expect(next?.results[0]).toMatchObject({ status: "cached", error: "OpenAI rejected this Codex login (refresh_token_invalidated)." });
+    expect(next?.results[0]?.identity.label).toBe("Registry SYNTHETIC_FIXTURE-member-a");
+    expect(next?.results[0]).not.toHaveProperty("resetPendingUntil");
+    expect(next?.results[1]).toBe(other);
+  });
+
+  test("a fresher reading replaces an older one", () => {
+    const next = applyRefreshedLimits(payload(codexRow("member-a", 90, 1)), [payload(codexRow("member-a", 5, 500))]);
+    expect(next?.results[0]?.windows[0]?.usedPercent).toBe(5);
+  });
+
+  test("an empty answer or no cached data changes nothing", () => {
+    const current = payload(codexRow("member-a", 90, 1));
+    expect(applyRefreshedLimits(current, [payload()])).toBe(current);
+    expect(applyRefreshedLimits(undefined, [current])).toBeUndefined();
+  });
+});
+
+describe("the Codex use-reset button", () => {
+  const withReset = (over: Partial<ToolLimitResult> = {}, reset: Partial<NonNullable<ToolLimitResult["manualReset"]>> = {}): ToolLimitResult => ({
+    ...codexRow("member-a", 100, 1),
+    manualReset: { availableCount: 2, ...reset },
+    ...over,
+  });
+
+  test("shows for a live reading", () => {
+    expect(canSpendCodexReset(withReset())).toBe(true);
+  });
+
+  test("still shows when the reading is cached, unavailable or the credit list is the last known one", () => {
+    expect(canSpendCodexReset(withReset({ status: "cached", error: "OpenAI rejected this Codex login" }))).toBe(true);
+    expect(canSpendCodexReset(withReset({ status: "unavailable", windows: [] }))).toBe(true);
+    expect(canSpendCodexReset(withReset({}, { stale: true }))).toBe(true);
+  });
+
+  test("hides with no credit, for a retired or pooled identity, and for a row the gateway does not manage", () => {
+    expect(canSpendCodexReset(withReset({}, { availableCount: 0 }))).toBe(false);
+    expect(canSpendCodexReset(withReset({ identity: { ...registryIdentityOf("a"), retired: true } }))).toBe(false);
+    expect(canSpendCodexReset(withReset({ gatewayManaged: false }))).toBe(false);
+    expect(canSpendCodexReset({ ...withReset(), manualReset: undefined })).toBe(false);
+    expect(canSpendCodexReset({ ...withReset(), toolName: "claude" })).toBe(false);
+  });
+
+  test("hides right after a spend and during the recheck, so one click cannot spend two credits", () => {
+    const now = 1_000_000;
+    expect(canSpendCodexReset(withReset({}, { spentAt: now - 1_000 }), now)).toBe(false);
+    expect(canSpendCodexReset(withReset({}, { spentAt: now - SPEND_LOCK_MS - 1 }), now)).toBe(true);
+    expect(canSpendCodexReset(withReset({ resetPendingUntil: now + 10_000 }), now)).toBe(false);
+  });
+});
+
+function registryIdentityOf(name: string) {
+  return { name: `SYNTHETIC_FIXTURE-${name}`, label: name, configDir: "synthetic" };
+}

@@ -1,0 +1,18 @@
+import type { ToolLimitResult } from "@/types/api";
+
+/** After a Codex reset is spent, the use button stays hidden this long. A second click cannot then spend another credit before the count updates. */
+export const SPEND_LOCK_MS = 120_000;
+
+/**
+ * Whether a Codex card offers the use-reset button. The button stays while the usage read is cached, unavailable or rate-limited,
+ * and while the credit list is the last known one: OpenAI decides on the spend itself. It hides when no credit is available, for a
+ * retired or pooled identity, while a recheck after a spend runs, and for a short time after a spend.
+ */
+export function canSpendCodexReset(row: ToolLimitResult, now = Date.now()): boolean {
+  const reset = row.manualReset;
+  if (row.toolName !== "codex" || row.gatewayManaged !== true || !reset || reset.grants) return false;
+  if (reset.availableCount <= 0 || row.identity.retired || row.identity.swapPool) return false;
+  if (reset.spentAt !== undefined && now - reset.spentAt < SPEND_LOCK_MS) return false;
+  if (row.resetPendingUntil !== undefined && row.resetPendingUntil > now) return false;
+  return true;
+}
