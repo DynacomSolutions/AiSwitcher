@@ -2262,8 +2262,7 @@ describe("automatic Codex pool reset proxy", () => {
     const token = await addCodex();
     const pool = "synthetic-pool";
     const policyStore = new MemoryAutoResetStore(() => deps.now().getTime());
-    await policyStore.setEnabled("pool", pool, true);
-    await policyStore.setEnabled("identity", "a", true);
+    await policyStore.setEnabled(pool, true);
     deps.creds.loggedOut = async (_provider, name) => name === "b";
     usage.a = live(10);
     let creditReads = 0;
@@ -2313,8 +2312,7 @@ describe("automatic Codex pool reset proxy", () => {
       if (claim?.status === "pending") joined.resolve();
       return claim;
     };
-    await policyStore.setEnabled("pool", pool, true);
-    await policyStore.setEnabled("identity", account, true);
+    await policyStore.setEnabled(pool, true);
     deps.poolMembers = async () => [account];
     let restored = false;
     let attempts = 0;

@@ -71,7 +71,7 @@ function PoolCard({ pool, autoReset }: { pool: PoolSummary; autoReset?: AutoRese
         <CardDescription>{pool.active ? `Active member: ${pool.active}` : "No active member"}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {autoReset ? <AutoResetControl kind="pool" setting={autoReset} /> : null}
+        {autoReset ? <AutoResetControl setting={autoReset} /> : null}
         <div className="grid grid-cols-2 gap-4">
           <TotalBlock title="Today" total={pool.today} />
           <TotalBlock title="Last 7 days" total={pool.week} />
@@ -172,7 +172,7 @@ export function PoolUsageCards({ autoResetPools }: { autoResetPools?: Array<Auto
                 <Badge variant="muted">{pool.members.length} members</Badge>
               </div>
             </CardHeader>
-            <CardContent><AutoResetControl kind="pool" setting={pool} /></CardContent>
+            <CardContent><AutoResetControl setting={pool} /></CardContent>
           </Card>
         ))}
       </div>

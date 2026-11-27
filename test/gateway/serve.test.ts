@@ -2171,8 +2171,7 @@ describe("automatic Codex reset integration", () => {
         ? Response.json({ code: "nothing_to_reset" })
         : Response.json({ available_count: 1 })) as typeof fetch,
     }) : undefined;
-    await auto.setEnabled("pool", pool, true);
-    await auto.setEnabled("identity", identity, true);
+    await auto.setEnabled(pool, true);
     const name = "fixture-auto-codex";
     await store.putApp({ ...app, name, provider: "codex", style: "openai", target: { kind: "pool" } });
     const t = generateToken();
@@ -2296,7 +2295,7 @@ describe("automatic Codex reset integration", () => {
     expect(await answer.text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: 1, inferences: 1 });
     expect(record).toHaveBeenCalledWith(state.requests[0].redeem_request_id, otherCredit, "reset");
-    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({
+    expect(await state.auto.lastClaim(pool)).toMatchObject({
       status: "unknown", creditId, creditedId: otherCredit,
     });
   });
@@ -2320,7 +2319,7 @@ describe("automatic Codex reset integration", () => {
     expect(state.counts().posts).toBe(1);
     expect(receipt).toHaveBeenCalledTimes(2);
     expect(finish).toHaveBeenCalledTimes(1);
-    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ spendPending: true });
+    expect(await state.auto.lastClaim(pool)).toMatchObject({ spendPending: true });
   });
 
   test("a follower on a locally held member gets a real 429 and joins one durable spend", async () => {
@@ -2335,7 +2334,7 @@ describe("automatic Codex reset integration", () => {
       expect(await (await first).json()).toEqual({ accepted: true });
       expect(await (await second).json()).toEqual({ accepted: true });
       expect(state.counts()).toMatchObject({ posts: 1, inferences: 4, inventories: 2 });
-      const claim = await state.auto.lastClaim("identity", identity);
+      const claim = await state.auto.lastClaim(pool);
       expect(claim).toMatchObject({ status: "reset", creditId, creditedId: creditId });
       expect(state.requests).toEqual([{ credit_id: creditId, redeem_request_id: expect.stringMatching(/^[0-9a-f-]{36}$/) }]);
       await waitFor(async () => (await state.readings.load("codex", identity))?.reading.maxUtilization === 10);
@@ -2352,7 +2351,7 @@ describe("automatic Codex reset integration", () => {
     expect(response.headers.get("retry-after")).toBe("81");
     expect(await response.text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: typeof scenario === "number" ? 1 : 0, inferences: 1, inventories: 2 });
-    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ status: "rejected" });
+    expect(await state.auto.lastClaim(pool)).toMatchObject({ status: "rejected" });
   });
 
   test("does not claim when a configured routed member lacks fresh proof", async () => {
@@ -2361,19 +2360,19 @@ describe("automatic Codex reset integration", () => {
     expect(response.status).toBe(429);
     expect(await response.text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: 0, inferences: 1, inventories: 0 });
-    expect(await state.auto.lastClaim("identity", identity)).toBeUndefined();
+    expect(await state.auto.lastClaim(pool)).toBeUndefined();
   });
 
   test("rejects other reset types before selection and on the locked recheck", async () => {
     const first = await setup("wrong-type");
     expect((await first.call()).status).toBe(429);
     expect(first.counts()).toMatchObject({ posts: 0, inventories: 1 });
-    expect(await first.auto.lastClaim("identity", identity)).toBeUndefined();
+    expect(await first.auto.lastClaim(pool)).toBeUndefined();
 
     const second = await setup("wrong-type-recheck");
     expect((await second.call()).status).toBe(429);
     expect(second.counts()).toMatchObject({ posts: 0, inventories: 2 });
-    expect(await second.auto.lastClaim("identity", identity)).toMatchObject({ status: "rejected" });
+    expect(await second.auto.lastClaim(pool)).toMatchObject({ status: "rejected" });
   });
 
   test("rejects a claim after another replica manually redeems for a different member", async () => {
@@ -2382,7 +2381,7 @@ describe("automatic Codex reset integration", () => {
     expect(response.status).toBe(429);
     expect(await response.text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: 0, inventories: 1 });
-    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ status: "rejected" });
+    expect(await state.auto.lastClaim(pool)).toMatchObject({ status: "rejected" });
   });
 
   test("preserves the provider 429 while the requested model remains blocked after reset", async () => {
@@ -2397,7 +2396,7 @@ describe("automatic Codex reset integration", () => {
     const state = await setup("generation-unavailable");
     expect(await (await state.call()).text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: 0, inferences: 1, inventories: 0 });
-    expect(await state.auto.lastClaim("identity", identity)).toBeUndefined();
+    expect(await state.auto.lastClaim(pool)).toBeUndefined();
   });
 
   test("keeps the generation advanced after an ambiguous POST and never repeats the spend", async () => {
@@ -2405,7 +2404,7 @@ describe("automatic Codex reset integration", () => {
     expect(await (await state.call()).text()).toBe(quota);
     expect(await state.invalidations.version(identity)).toBe("1");
     expect(state.counts()).toMatchObject({ posts: 1, inferences: 1 });
-    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ status: "unknown" });
+    expect(await state.auto.lastClaim(pool)).toMatchObject({ status: "unknown" });
   }, 12_000);
 
   test("does not send the POST after the credit generation changes under the lock", async () => {
@@ -2417,7 +2416,7 @@ describe("automatic Codex reset integration", () => {
       expect(response.status).toBe(429);
       expect(await response.text()).toBe(quota);
       expect(state.counts()).toMatchObject({ posts: 0, inferences: 1, inventories: 2 });
-      expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ status: "rejected" });
+      expect(await state.auto.lastClaim(pool)).toMatchObject({ status: "rejected" });
     } finally {
       generation.mockRestore();
     }

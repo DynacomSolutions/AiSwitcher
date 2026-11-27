@@ -21,15 +21,7 @@ function fixture() {
     adminToken: ADMIN,
     instances: { namespaces: [], log() {} },
     now: () => new Date(STAMP),
-    canonical: async (_, name) => name === "fixture-alias" ? MEMBER : name,
-    identityState: async (provider, name) => {
-      if (provider !== "codex") return "missing";
-      if (name === MEMBER || name === "fixture-alias" || name === "fixture-detached") return "ok";
-      if (name === GROUP) return "pool";
-      if (name === "retired") return "retired";
-      return "missing";
-    },
-    autoReset: { store, pools: async () => [{ name: GROUP, members: [MEMBER, "retired", "missing"] }] },
+    autoReset: { store, pools: async () => [{ name: GROUP, members: [MEMBER] }] },
     spendCodexReset: async () => { throw new Error("settings must not spend credits"); },
   });
   const request = (scope = "", token = ADMIN, body?: object) => app.request(BASE + scope, {
@@ -39,48 +31,40 @@ function fixture() {
   return { store, app, request };
 }
 
-test("Codex auto reset requires full admin and canonical scopes", async () => {
+test("Codex auto reset requires full admin and accepts only pool settings", async () => {
   const { request } = fixture();
   for (const token of ["", favouritesToken(ADMIN), instancesToken(ADMIN)]) {
     expect((await request("", token)).status).toBe(401);
     expect((await request("/pool", token, { name: GROUP, enabled: true })).status).toBe(401);
   }
-  expect(await (await request()).json()).toMatchObject({
-    pools: [{ name: GROUP, enabled: false }],
-    identities: [{ name: MEMBER, enabled: false }],
+  expect(await (await request()).json()).toEqual({
+    pools: [{ name: GROUP, enabled: false, members: [MEMBER] }],
   });
   const put = (kind: string, name: string, enabled: unknown = true) => request(`/${kind}`, ADMIN, { name, enabled });
   expect((await put("pool", GROUP, "true")).status).toBe(400);
-  expect((await put("member", MEMBER)).status).toBe(400);
-  expect((await put("pool", "fixture-non-codex-pool")).status).toBe(404);
-  for (const name of [GROUP, "fixture-alias", "retired", "missing"]) {
-    expect((await put("identity", name)).status).toBe(404);
-  }
+  expect((await put("pool", "fixture-unknown-pool")).status).toBe(404);
+  expect((await put("identity", MEMBER)).status).toBe(404);
   expect(await (await put("pool", GROUP)).json()).toEqual({ name: GROUP, enabled: true });
-  expect(await (await put("identity", MEMBER)).json()).toEqual({ name: MEMBER, enabled: true });
-  expect(await (await put("identity", MEMBER, false)).json()).toEqual({ name: MEMBER, enabled: false });
-  expect((await put("identity", "fixture-detached", false)).status).toBe(200);
+  expect(await (await put("pool", GROUP, false)).json()).toEqual({ name: GROUP, enabled: false });
 });
 
 test("Codex auto reset history remains visible without provider reads and excludes claim identifiers", async () => {
   const { store, request } = fixture();
-  await store.setEnabled("pool", GROUP, true);
-  await store.setEnabled("identity", MEMBER, true);
+  await store.setEnabled(GROUP, true);
   expect(await store.claim({
     eventKey: "fixture-event", redeemRequestId: "fixture-redemption",
     pool: GROUP, identity: MEMBER, creditId: "RateLimitResetCredit_SYNTHETIC_FIXTURE", startedAt: STAMP,
     creditExpiresAt: EXPIRY, usageEvidence: [], creditEvidence: { reason: "only_candidate", inventories: [] },
   })).toEqual({ kind: "created" });
   expect(await store.beginSpend("fixture-redemption", MEMBER)).toBe(true);
-  const pending = await (await request()).json() as { identities: unknown[] };
-  expect(pending.identities).toMatchObject([{ name: MEMBER, lastClaim: { status: "pending", spendPending: true } }]);
+  const pending = await (await request()).json();
+  expect(pending).toMatchObject({ pools: [{ name: GROUP, lastClaim: { identity: MEMBER, status: "pending", spendPending: true } }] });
   await store.recordReportedCredit("fixture-redemption", "RateLimitResetCredit_SYNTHETIC_FIXTURE", "reset");
   await store.finish("fixture-event", "reset", "RateLimitResetCredit_SYNTHETIC_FIXTURE");
-  await store.setEnabled("identity", MEMBER, false);
+  await store.setEnabled(GROUP, false);
   const lastClaim = { pool: GROUP, identity: MEMBER, startedAt: STAMP, creditExpiresAt: EXPIRY, status: "reset" };
   expect(await (await request()).json()).toEqual({
-    pools: [{ name: GROUP, enabled: true, members: [MEMBER, "retired", "missing"], lastClaim }],
-    identities: [{ name: MEMBER, enabled: false, lastClaim }],
+    pools: [{ name: GROUP, enabled: false, members: [MEMBER], lastClaim }],
   });
 });
 
@@ -99,19 +83,22 @@ test("console forwards settings through its admin connection and guards mutation
     },
   });
   const headers = { Host: "localhost", authorization: `Bearer ${CONSOLE}` };
-  expect(await (await consoleApp.request(`/api${BASE}`, { headers })).json()).toMatchObject({ configured: true, identities: [{ name: MEMBER, enabled: false }] });
-  const put = (csrf: string, name = MEMBER) => consoleApp.request(`/api${BASE}/identity`, {
+  expect(await (await consoleApp.request(`/api${BASE}`, { headers })).json()).toEqual({
+    configured: true, pools: [{ name: GROUP, enabled: false, members: [MEMBER] }],
+  });
+  const put = (csrf: string, name = GROUP, scope = "pool") => consoleApp.request(`/api${BASE}/${scope}`, {
     method: "PUT",
     headers: { ...headers, "x-ais-console": csrf, "content-type": "application/json" },
     body: JSON.stringify({ name, enabled: true }),
   });
   expect((await put("")).status).toBe(403);
+  expect((await put("1", MEMBER, "identity")).status).toBe(404);
   expect((await put("1", "unknown")).status).toBe(404);
-  expect(await (await put("1")).json()).toEqual({ name: MEMBER, enabled: true });
-  expect(await store.enabled("identity", MEMBER)).toBe(true);
+  expect(await (await put("1")).json()).toEqual({ name: GROUP, enabled: true });
+  expect(await store.enabled(GROUP)).toBe(true);
   expect(calls).toEqual([
     { method: "GET", path: BASE, authorised: true },
-    { method: "PUT", path: `${BASE}/identity`, authorised: true },
-    { method: "PUT", path: `${BASE}/identity`, authorised: true },
+    { method: "PUT", path: `${BASE}/pool`, authorised: true },
+    { method: "PUT", path: `${BASE}/pool`, authorised: true },
   ]);
 });

@@ -1,6 +1,5 @@
 import type {
   AutoResetResponse,
-  AutoResetScope,
   AuthEntry,
   AuthRefreshResponse,
   AuthResponse,
@@ -182,8 +181,8 @@ export const api = {
   confirmPoolReset: (tool: string, pool: string, confirmation: PoolResetConfirmation) =>
     request<PoolResetResult>(`/api${poolLimitsPath(tool, pool)}`, { method: "POST", body: confirmation }),
   getAutoReset: (signal?: AbortSignal) => request<AutoResetResponse>("/api/limits/codex/auto-reset", { signal }),
-  setAutoReset: (kind: AutoResetScope, name: string, enabled: boolean) =>
-    request<{ name: string; enabled: boolean }>(`/api/limits/codex/auto-reset/${kind}`, { method: "PUT", body: { name, enabled } }),
+  setAutoReset: (name: string, enabled: boolean) =>
+    request<{ name: string; enabled: boolean }>("/api/limits/codex/auto-reset/pool", { method: "PUT", body: { name, enabled } }),
 
   getLimits: (freshCodexIdentity?: string, signal?: AbortSignal) => request<LimitsResponse>(`/api/limits?maxAge=${freshCodexIdentity ? 5 : 45}${freshCodexIdentity ? `&tool=codex&identity=${encodeURIComponent(freshCodexIdentity)}&freshCodex=${encodeURIComponent(freshCodexIdentity)}` : ""}`, { signal }),
 

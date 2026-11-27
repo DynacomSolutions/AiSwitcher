@@ -21,7 +21,7 @@ import { USAGE_READER_PROVIDERS } from "./usage-source.ts";
 import { registerPoolResetAdmin, type PoolResetAdmin } from "./admin-pool-reset.ts";
 import type { AutoResetStore } from "./auto-reset-store.ts";
 import type { AutoResetPool } from "./auto-reset.ts";
-import { CODEX_AUTO_RESET_PATH, type AutoResetScope, type AutoResetStatus } from "./auto-reset-view.ts";
+import { CODEX_AUTO_RESET_PATH, type AutoResetStatus, type AutoResetView } from "./auto-reset-view.ts";
 
 export const DEFAULT_OVERLAP_MS = 24 * 3600_000;
 const MAX_OVERLAP_HOURS = 24 * 30;
@@ -413,55 +413,29 @@ export function createAdminApp(deps: AdminDeps): Hono {
     return c.json({ limits: limits.filter((row): row is AdminLimitRow => row !== undefined) });
   });
 
-  async function isCanonicalCodexIdentity(name: string): Promise<boolean> {
-    if (!deps.identityState || !deps.canonical) throw new Error("Codex identity registry unavailable");
-    return await deps.identityState("codex", name) === "ok" && await deps.canonical("codex", name) === name;
-  }
-
-  async function autoResetIdentities(pools: AutoResetPool[]): Promise<string[]> {
-    if (!deps.identityState || !deps.canonical) throw new Error("Codex identity registry unavailable");
-    const { identityState, canonical } = deps;
-    const names = await limitsIdentities({
-      canonical,
-      poolMembers: async () => pools.flatMap((pool) => pool.members),
-    }, await read.listApps(), "codex");
-    const states = await Promise.all(names.map((name) => identityState("codex", name)));
-    return names.filter((_, i) => states[i] === "ok");
-  }
-
   hono.get(CODEX_AUTO_RESET_PATH, async (c) => {
     const settings = deps.autoReset;
     if (!settings) return err(404, "Codex automatic resets are not available");
-    const pools = await settings.pools();
-    const identities = await autoResetIdentities(pools);
-    const status = async (kind: AutoResetScope, name: string): Promise<AutoResetStatus> => {
-      const [enabled, claim] = await Promise.all([settings.store.enabled(kind, name), settings.store.lastClaim(kind, name)]);
+    const status = async (name: string): Promise<AutoResetStatus> => {
+      const [enabled, claim] = await Promise.all([settings.store.enabled(name), settings.store.lastClaim(name)]);
       if (!claim) return { name, enabled };
       const { pool, identity, startedAt, creditExpiresAt, status, spendPending } = claim;
       return { name, enabled, lastClaim: { pool, identity, startedAt, creditExpiresAt, status, spendPending } };
     };
-    const [poolSettings, identitySettings] = await Promise.all([
-      Promise.all(pools.map(async ({ name, members }) => ({ ...await status("pool", name), members }))),
-      Promise.all(identities.map((name) => status("identity", name))),
-    ]);
-    return c.json({ pools: poolSettings, identities: identitySettings }, 200, { "cache-control": "no-store" });
+    const pools = await Promise.all((await settings.pools()).map(async ({ name, members }) => ({ ...await status(name), members })));
+    return c.json({ pools } satisfies AutoResetView, 200, { "cache-control": "no-store" });
   });
 
-  hono.put(`${CODEX_AUTO_RESET_PATH}/:kind`, async (c) => {
+  hono.put(`${CODEX_AUTO_RESET_PATH}/pool`, async (c) => {
     const settings = deps.autoReset;
     if (!settings) return err(404, "Codex automatic resets are not available");
-    const kind = c.req.param("kind");
-    if (kind !== "pool" && kind !== "identity") return err(400, "scope must be pool or identity");
     const body: unknown = await c.req.json().catch(() => undefined);
     if (!isObj(body) || typeof body.name !== "string" || !body.name.trim() || typeof body.enabled !== "boolean") {
       return err(400, "name and boolean enabled are required");
     }
     const name = body.name;
-    const exists = kind === "pool"
-      ? (await settings.pools()).some((pool) => pool.name === name)
-      : await isCanonicalCodexIdentity(name);
-    if (!exists) return err(404, kind === "pool" ? "no such Codex pool" : "no such canonical Codex identity");
-    await settings.store.setEnabled(kind, name, body.enabled);
+    if (!(await settings.pools()).some((pool) => pool.name === name)) return err(404, "no such Codex pool");
+    await settings.store.setEnabled(name, body.enabled);
     return c.json({ name, enabled: body.enabled });
   });
 

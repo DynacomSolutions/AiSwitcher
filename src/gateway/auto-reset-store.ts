@@ -1,7 +1,6 @@
 import type { SQL } from "bun";
 import type { CodexResetOutcome } from "./account.ts";
 
-type Setting = "pool" | "identity";
 type ClaimStatus = "pending" | "reset" | "rejected" | "unknown";
 type TerminalStatus = Exclude<ClaimStatus, "pending">;
 
@@ -60,9 +59,9 @@ interface ClaimFinish {
 }
 
 export interface AutoResetStore {
-  enabled(kind: Setting, name: string): Promise<boolean>;
-  setEnabled(kind: Setting, name: string, enabled: boolean): Promise<void>;
-  lastClaim(kind: Setting, name: string): Promise<AutoResetClaimSummary | undefined>;
+  enabled(pool: string): Promise<boolean>;
+  setEnabled(pool: string, enabled: boolean): Promise<void>;
+  lastClaim(pool: string): Promise<AutoResetClaimSummary | undefined>;
   findClaim(eventKey: string, generation?: number): Promise<AutoResetClaim | undefined>;
   claim(input: AutoResetClaimInput): Promise<ClaimResult>;
   beginSpend(redeemRequestId: string, identity: string, accountId?: string): Promise<boolean>;
@@ -100,25 +99,25 @@ interface MemoryClaim {
 
 /** Test implementation. Claim checks and insertion run together without an await. */
 export class MemoryAutoResetStore implements AutoResetStore {
-  private readonly settings = { pool: new Map<string, boolean>(), identity: new Map<string, boolean>() };
+  private readonly settings = new Map<string, boolean>();
   private readonly claims = new Map<string, MemoryClaim[]>();
   private readonly claimedCredits = new Set<string>();
 
   constructor(private readonly now: () => number = Date.now) {}
 
-  async enabled(kind: Setting, name: string): Promise<boolean> {
-    return this.settings[kind].get(name) === true;
+  async enabled(pool: string): Promise<boolean> {
+    return this.settings.get(pool) === true;
   }
 
-  async setEnabled(kind: Setting, name: string, enabled: boolean): Promise<void> {
-    this.settings[kind].set(name, enabled);
+  async setEnabled(pool: string, enabled: boolean): Promise<void> {
+    this.settings.set(pool, enabled);
   }
 
-  async lastClaim(kind: Setting, name: string): Promise<AutoResetClaimSummary | undefined> {
+  async lastClaim(pool: string): Promise<AutoResetClaimSummary | undefined> {
     let latest: { key: string; summary: AutoResetClaim } | undefined;
     for (const [key, generations] of this.claims) {
       for (const { summary } of generations) {
-        if (summary[kind] !== name) continue;
+        if (summary.pool !== pool) continue;
         if (!latest || summary.startedAt > latest.summary.startedAt || (summary.startedAt === latest.summary.startedAt &&
           (key < latest.key || (key === latest.key && summary.generation > latest.summary.generation)))) latest = { key, summary };
       }
@@ -140,8 +139,7 @@ export class MemoryAutoResetStore implements AutoResetStore {
     if (existing && !canRearmClaim(existing, input.provider429At, Date.parse(input.startedAt), input.usageEvidence)) {
       return { kind: "existing", claim: { ...existing } };
     }
-    if (!this.settings.pool.get(input.pool) || !this.settings.identity.get(input.identity) ||
-      this.claimedCredits.has(input.creditId)) return { kind: "blocked" };
+    if (!this.settings.get(input.pool) || this.claimedCredits.has(input.creditId)) return { kind: "blocked" };
     const recordedAt = this.now();
     const members = new Set(input.usageEvidence.map((row) => row.identity));
     for (const claims of this.claims.values()) {
@@ -247,23 +245,23 @@ function claimSummary(row: ClaimRow | undefined): AutoResetClaim | undefined {
   };
 }
 
+// Setting queries ignore historical kind = 'identity' rows and leave them in place.
 export class PgAutoResetStore implements AutoResetStore {
   constructor(private readonly sql: SQL) {}
 
-  async enabled(kind: Setting, name: string): Promise<boolean> {
-    const rows = await this.sql`SELECT enabled FROM codex_auto_reset_settings WHERE kind = ${kind} AND name = ${name}`;
+  async enabled(pool: string): Promise<boolean> {
+    const rows = await this.sql`SELECT enabled FROM codex_auto_reset_settings WHERE kind = 'pool' AND name = ${pool}`;
     return rows[0]?.enabled === true;
   }
 
-  async setEnabled(kind: Setting, name: string, enabled: boolean): Promise<void> {
-    await this.sql`INSERT INTO codex_auto_reset_settings (kind, name, enabled) VALUES (${kind}, ${name}, ${enabled})
+  async setEnabled(pool: string, enabled: boolean): Promise<void> {
+    await this.sql`INSERT INTO codex_auto_reset_settings (kind, name, enabled) VALUES ('pool', ${pool}, ${enabled})
       ON CONFLICT (kind, name) DO UPDATE SET enabled = EXCLUDED.enabled`;
   }
 
-  async lastClaim(kind: Setting, name: string): Promise<AutoResetClaimSummary | undefined> {
-    const rows = kind === "pool"
-      ? await this.sql`SELECT * FROM codex_auto_reset_claims WHERE pool = ${name} ORDER BY started_at DESC, event_key, generation DESC LIMIT 1`
-      : await this.sql`SELECT * FROM codex_auto_reset_claims WHERE identity = ${name} ORDER BY started_at DESC, event_key, generation DESC LIMIT 1`;
+  async lastClaim(pool: string): Promise<AutoResetClaimSummary | undefined> {
+    const rows = await this.sql`SELECT * FROM codex_auto_reset_claims WHERE pool = ${pool}
+      ORDER BY started_at DESC, event_key, generation DESC LIMIT 1`;
     return summary(rows[0]);
   }
 
@@ -289,11 +287,10 @@ export class PgAutoResetStore implements AutoResetStore {
       }
       const generation = (existing?.generation ?? 0) + 1;
 
-      // Lock both enabled rows through insert and commit so an administrator's disable cannot race the check.
-      const settings = await tx`SELECT kind FROM codex_auto_reset_settings
-        WHERE enabled AND ((kind = 'pool' AND name = ${pool}) OR (kind = 'identity' AND name = ${identity}))
-        ORDER BY kind FOR SHARE`;
-      if (settings.length !== 2) return { kind: "blocked" };
+      // Lock the pool rule through commit to serialise the claim with a disable.
+      const rules = await tx`SELECT enabled FROM codex_auto_reset_settings
+        WHERE kind = 'pool' AND name = ${pool} FOR SHARE`;
+      if (rules[0]?.enabled !== true) return { kind: "blocked" };
 
       const rows = await tx`WITH requested AS (
           SELECT ARRAY(SELECT jsonb_array_elements_text(${members}::text::jsonb)) AS members

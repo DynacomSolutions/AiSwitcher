@@ -228,18 +228,19 @@ function limitsAndSpendStub(answers: Record<string, unknown>): void {
 function autoResetSettingsStub(settings: Extract<AutoResetResponse, { configured: true }>): void {
   const previous = window.fetch.bind(window);
   const path = "/api/limits/codex/auto-reset";
-  const calls: Array<{ scope: string; name: string; enabled: boolean; csrf: string | null }> = [];
+  const calls: Array<{ name: string; enabled: boolean; csrf: string | null }> = [];
   const stub = (input: RequestInfo | URL, init?: RequestInit) => {
     const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const u = new URL(raw, location.href);
     if (u.origin !== location.origin || (u.pathname !== path && !u.pathname.startsWith(path + "/"))) return previous(input, init);
     if (u.pathname === path && init?.method === "GET") return Promise.resolve(Response.json(settings));
-    const scope = u.pathname.slice(path.length + 1);
-    const body = JSON.parse(String(init?.body)) as { name: string; enabled: boolean };
-    const rows = scope === "pool" ? settings.pools : settings.identities;
-    const row = rows.find((r) => r.name === body.name);
-    if (!row || init?.method !== "PUT") return Promise.resolve(Response.json({ error: "invalid settings request" }, { status: 400 }));
-    calls.push({ scope, ...body, csrf: new Headers(init.headers).get("X-AIS-Console") });
+    if (u.pathname !== path + "/pool" || init?.method !== "PUT") {
+      return Promise.resolve(Response.json({ error: "unknown settings route" }, { status: 404 }));
+    }
+    const body = JSON.parse(String(init.body)) as { name: string; enabled: boolean };
+    const row = settings.pools.find((r) => r.name === body.name);
+    if (!row) return Promise.resolve(Response.json({ error: "unknown pool" }, { status: 404 }));
+    calls.push({ ...body, csrf: new Headers(init.headers).get("X-AIS-Console") });
     row.enabled = body.enabled;
     return Promise.resolve(Response.json(body));
   };
@@ -1042,7 +1043,6 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
     const settings = {
       configured: true as const,
       pools: [{ name: pool, members: [unknown, stale, zero, positive], enabled: false, lastClaim }, { name: limitPoolOnly, members: [missing], enabled: false }],
-      identities: [unknown, stale, zero, positive, missing].map((name) => ({ name, enabled: false, ...(name === unknown ? { lastClaim } : {}) })),
     };
     const poolData: PoolsUsageResponse = {
       ...SYNTHETIC_POOLS,
@@ -1052,8 +1052,8 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       source: `(${limitsAndSpendStub.toString()})(${JSON.stringify({ ...LIMITS_ANSWERS, "/api/pools/usage": poolData })});
         (${autoResetSettingsStub.toString()})(${JSON.stringify(settings)})`,
     });
-    const selector = (kind: string, name: string, enable = true) =>
-      `button[aria-label="${enable ? "Enable" : "Disable"} automatic resets for ${kind} ${name}"]`;
+    const selector = (name: string, enable = true) =>
+      `button[aria-label="${enable ? "Enable" : "Disable"} automatic resets for pool ${name}"]`;
     const click = (query: string) => page.eval(`document.querySelector(${JSON.stringify(query)}).click()`);
     const waitForButton = (query: string) => waitFor(query, 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(query)})`));
     const confirm = () => page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent === 'Enable automatic resets').click()`);
@@ -1071,38 +1071,41 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
     };
     try {
       await open("/limits/openai");
-      for (const name of [unknown, stale, zero, positive, missing]) await waitForButton(selector("identity", name));
-      expect(await page.eval<boolean>(`!!document.querySelector('button[aria-label="Use reset on ${positive}"]')`)).toBe(true);
-      expect(await page.eval<string>(`document.querySelector(${JSON.stringify(selector("identity", unknown))}).closest('[data-slot=card]').innerText`)).toContain("Last claim: unknown");
-      expect(await page.eval<string>(`document.querySelector(${JSON.stringify(selector("identity", unknown))}).closest('[data-slot=card]').innerText`)).toContain("Credit expiry");
+      const manualReset = `button[aria-label="Use reset on ${positive}"]`;
+      await waitForButton(manualReset);
+      expect(await page.eval<string>(`(() => {
+        const card = document.querySelector(${JSON.stringify(manualReset)}).closest('[data-slot=card]');
+        const name = card.querySelector('[title="${positive}"]');
+        return getComputedStyle(name).overflowWrap;
+      })()`)).toBe("break-word");
+      expect(await page.eval<number>(`document.querySelectorAll('main button[aria-label*="automatic resets for"]').length`)).toBe(0);
+      expect(await page.eval<string>(`document.querySelector('main').innerText`)).not.toContain(missing);
       await checkWidth();
-      await capture("account", selector("identity", unknown));
-      await click(selector("identity", unknown));
+
+      await open("/limits");
+      await waitForButton(selector(pool));
+      await waitForButton(selector(limitPoolOnly));
+      const poolCardText = await page.eval<string>(`document.querySelector(${JSON.stringify(selector(pool))}).closest('[data-slot=card]').innerText`);
+      expect(poolCardText).toContain("Last claim: unknown");
+      expect(poolCardText).toContain(unknown);
+      expect(poolCardText).toContain("Credit expiry");
+      await checkWidth();
+
+      await click(selector(pool));
       await waitForDialog();
       await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent === 'Cancel').click()`);
       expect(await page.eval<number>(`window.__aisAutoResetSettingsCalls.length`)).toBe(0);
-      await click(selector("identity", unknown));
+      await click(selector(pool));
       await waitForDialog();
       await confirm();
-      await waitForButton(selector("identity", unknown, false));
-      await click(selector("identity", unknown, false));
-      await waitForButton(selector("identity", unknown));
+      await waitForButton(selector(pool, false));
+      await capture("pool", selector(pool, false));
+      await click(selector(pool, false));
+      await waitForButton(selector(pool));
       expect(await page.eval<unknown[]>(`window.__aisAutoResetSettingsCalls`)).toEqual([
-        { scope: "identity", name: unknown, enabled: true, csrf: "1" },
-        { scope: "identity", name: unknown, enabled: false, csrf: "1" },
+        { name: pool, enabled: true, csrf: "1" },
+        { name: pool, enabled: false, csrf: "1" },
       ]);
-      expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(0);
-
-      await open("/limits");
-      await waitForButton(selector("pool", pool));
-      await waitForButton(selector("pool", limitPoolOnly));
-      await checkWidth();
-      await click(selector("pool", pool));
-      await waitForDialog();
-      await confirm();
-      await waitForButton(selector("pool", pool, false));
-      await capture("pool", selector("pool", pool, false));
-      expect(await page.eval<unknown[]>(`window.__aisAutoResetSettingsCalls`)).toEqual([{ scope: "pool", name: pool, enabled: true, csrf: "1" }]);
       expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(0);
     } finally {
       await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
@@ -1173,7 +1176,7 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       }],
     };
     const claim = { pool, identity: identity.name, startedAt: "2026-11-27T08:00:00.000Z", status: "pending" as const };
-    const settings: AutoResetResponse = { configured: true, identities: [{ name: identity.name, enabled: false, lastClaim: claim }], pools: [] };
+    const settings: AutoResetResponse = { configured: true, pools: [{ name: pool, enabled: false, members: [identity.name], lastClaim: claim }] };
     const usage: UsageResponse = {
       generatedAt: initial.fetchedAt,
       results: [{
@@ -1217,7 +1220,7 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
     try {
       await open("/limits/openai");
       await waitText("Reset credits (2)");
-      await waitText("Last claim: pending");
+      expect(await page.eval<boolean>(`document.querySelector('main').innerText.includes('Automatic reset')`)).toBe(false);
       await page.eval("document.fonts.ready.then(() => true)");
       const before = await measure();
       expect(before).toHaveLength(4);
@@ -1235,15 +1238,13 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
 
       await setQuota(50, 1, "2026-11-27T08:05:00.000Z");
       await page.eval(`
-        const rule = window.__aisLive.answers['/api/limits/codex/auto-reset'].identities[0];
+        const rule = window.__aisLive.answers['/api/limits/codex/auto-reset'].pools[0];
         rule.lastClaim.status = 'reset';
         rule.enabled = true;
         window.__aisLive.send('change', ['limits', 'codex-auto-reset']);
       `);
       await waitText("50.0%");
       await waitText("Reset credits (1)");
-      await waitText("Last claim: reset");
-      await waitText("Automatic reset on");
       expect(await page.eval("window.__aisLive.calls['/api/limits']")).toBe(2);
       expect(await page.eval("window.__aisLive.calls['/api/limits/codex/auto-reset']")).toBe(2);
       expect(await page.eval("window.__aisLive.calls['/api/pools/usage']")).toBe(1);
@@ -1282,6 +1283,17 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       await capture("after");
 
       await page.eval(`document.querySelector('main a[href="/limits"]').click()`);
+      await waitText("Last claim: reset");
+      await waitText("Automatic reset on");
+      await page.eval(`
+        const link = document.querySelector('main a[href="/limits/pools/codex/${pool}"]');
+        window.__aisLivePoolCard = link.closest('[data-slot=card]');
+        const rule = window.__aisLive.answers['/api/limits/codex/auto-reset'].pools[0];
+        rule.enabled = false;
+        window.__aisLive.send('change', ['codex-auto-reset']);
+      `);
+      await waitText("Automatic reset off");
+      expect(await page.eval<boolean>(`window.__aisLivePoolCard === document.querySelector('main a[href="/limits/pools/codex/${pool}"]').closest('[data-slot=card]')`)).toBe(true);
       await waitFor("initial usage figure", 5_000, () => page.eval<boolean>(`
         Array.from(document.querySelectorAll('main [data-slot=card-title]')).some(node => node.textContent === '30')
       `));
