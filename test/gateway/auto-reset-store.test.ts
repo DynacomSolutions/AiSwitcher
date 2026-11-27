@@ -329,7 +329,7 @@ if (!url && process.env.CI && !optOut) {
       const release = Promise.withResolvers<void>();
       const disable = sqlA.begin(async (tx) => {
         const [{ pid }] = await tx`SELECT pg_backend_pid() AS pid`;
-        await tx`UPDATE auto_reset_settings SET enabled = false WHERE provider = 'codex' AND name = ${target.pool}`;
+        await tx`UPDATE codex_auto_reset_settings SET enabled = false WHERE kind = 'pool' AND name = ${target.pool}`;
         updated.resolve(pid);
         await release.promise;
       });
@@ -389,11 +389,12 @@ if (!url && process.env.CI && !optOut) {
     } finally {
       await sql`DELETE FROM codex_auto_reset_claims WHERE left(event_key, 13) = 'renewal-test-'`;
       await sql`DELETE FROM auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
+      await sql`DELETE FROM codex_auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
       await sql.close();
     }
   }, 10_000);
 
-  test("the migration keeps Codex pool settings and ignores old identity rows", async () => {
+  test("the migration leaves stored Codex pool rules and old identity rows in place", async () => {
     await migrate(url);
     const sql = new SQL(url, { max: 2 });
     try {
@@ -403,9 +404,11 @@ if (!url && process.env.CI && !optOut) {
       await sql`DELETE FROM schema_migrations WHERE version = '0022_auto_reset_every_pool'`;
       await migrate(url);
       expect(await new PgAutoResetStore(sql).enabled("codex", "renewal-test-legacy-pool")).toBeTrue();
-      // An old identity row never becomes a pool setting for any provider.
-      const settings = await sql`SELECT provider, name FROM auto_reset_settings WHERE name = 'renewal-test-legacy-member'`;
-      expect(settings).toHaveLength(0);
+      // The migration copies no rule. The stored Codex rule stays where it was, and no old row reaches the new table.
+      const copied = await sql`SELECT provider, name FROM auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
+      expect(copied).toHaveLength(0);
+      const kept = await sql`SELECT enabled FROM codex_auto_reset_settings WHERE kind = 'pool' AND name = 'renewal-test-legacy-pool'`;
+      expect(kept).toEqual([{ enabled: true }]);
       // The row stays in place and no store query reads it.
       const legacy = await sql`SELECT enabled FROM codex_auto_reset_settings WHERE kind = 'identity' AND name = 'renewal-test-legacy-member'`;
       expect(legacy).toEqual([{ enabled: true }]);

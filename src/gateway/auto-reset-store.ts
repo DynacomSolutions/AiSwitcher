@@ -259,16 +259,25 @@ function claimSummary(row: ClaimRow | undefined): AutoResetClaim | undefined {
   };
 }
 
+// Codex pool rules stay in codex_auto_reset_settings (kind = 'pool'), where they were first stored.
+// Other providers use auto_reset_settings. Nothing copies or rewrites a stored rule.
 // Setting queries ignore historical kind = 'identity' rows and leave them in place.
 export class PgAutoResetStore implements AutoResetStore {
   constructor(private readonly sql: SQL) {}
 
   async enabled(provider: AutoResetProvider, pool: string): Promise<boolean> {
-    const rows = await this.sql`SELECT enabled FROM auto_reset_settings WHERE provider = ${provider} AND name = ${pool}`;
+    const rows = provider === "codex"
+      ? await this.sql`SELECT enabled FROM codex_auto_reset_settings WHERE kind = 'pool' AND name = ${pool}`
+      : await this.sql`SELECT enabled FROM auto_reset_settings WHERE provider = ${provider} AND name = ${pool}`;
     return rows[0]?.enabled === true;
   }
 
   async setEnabled(provider: AutoResetProvider, pool: string, enabled: boolean): Promise<void> {
+    if (provider === "codex") {
+      await this.sql`INSERT INTO codex_auto_reset_settings (kind, name, enabled) VALUES ('pool', ${pool}, ${enabled})
+        ON CONFLICT (kind, name) DO UPDATE SET enabled = EXCLUDED.enabled`;
+      return;
+    }
     await this.sql`INSERT INTO auto_reset_settings (provider, name, enabled) VALUES (${provider}, ${pool}, ${enabled})
       ON CONFLICT (provider, name) DO UPDATE SET enabled = EXCLUDED.enabled`;
   }
@@ -308,8 +317,9 @@ export class PgAutoResetStore implements AutoResetStore {
       const generation = (existing?.generation ?? 0) + 1;
 
       // Lock the enabled pool row through insert and commit so an administrator's disable cannot race the check.
-      const settings = await tx`SELECT name FROM auto_reset_settings
-        WHERE enabled AND provider = ${provider} AND name = ${pool} FOR SHARE`;
+      const settings = provider === "codex"
+        ? await tx`SELECT name FROM codex_auto_reset_settings WHERE enabled AND kind = 'pool' AND name = ${pool} FOR SHARE`
+        : await tx`SELECT name FROM auto_reset_settings WHERE enabled AND provider = ${provider} AND name = ${pool} FOR SHARE`;
       if (settings.length !== 1) return { kind: "blocked" };
 
       const rows = await tx`WITH requested AS (

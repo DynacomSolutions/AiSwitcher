@@ -1,4 +1,4 @@
--- Automatic reset is a pool setting for every provider. The old Codex table keeps its name for claims.
+-- Automatic reset is a pool setting for every provider. This table holds the rules of providers other than Codex.
 CREATE TABLE IF NOT EXISTS auto_reset_settings (
   provider text NOT NULL,
   name text NOT NULL,
@@ -6,11 +6,8 @@ CREATE TABLE IF NOT EXISTS auto_reset_settings (
   PRIMARY KEY (provider, name)
 );
 
-INSERT INTO auto_reset_settings (provider, name, enabled)
-  SELECT 'codex', name, enabled FROM codex_auto_reset_settings WHERE kind = 'pool'
-  ON CONFLICT DO NOTHING;
-
--- Identity rows stay in codex_auto_reset_settings. No query reads them, so they have no effect.
+-- Codex pool rules stay in codex_auto_reset_settings. This migration copies and rewrites no rule.
+-- Old identity rows stay there too. No query reads them, so they have no effect.
 
 ALTER TABLE codex_auto_reset_claims ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT 'codex';
 

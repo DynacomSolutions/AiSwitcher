@@ -596,8 +596,9 @@ Send the admin bearer token with every request.
 - `PUT /limits/{provider}/auto-reset/pool` takes `{"name":"example","enabled":true}`. A provider without a reset API answers 400.
 - `PUT /limits/{provider}/auto-reset/identity` answers 410. The identity setting was removed (27 Nov 2026) and the route writes nothing.
 
-The migration `0022_auto_reset_every_pool` copies the Codex pool settings to the new table `auto_reset_settings`.
-Old identity rows stay in `codex_auto_reset_settings`. No query reads them, so they have no effect and never become pool settings.
+Codex pool rules stay in `codex_auto_reset_settings`. The new table `auto_reset_settings` holds the rules of the other providers.
+The migration `0022_auto_reset_every_pool` copies and rewrites no stored rule. Old identity rows stay in `codex_auto_reset_settings`.
+No query reads them, so they have no effect and never become pool settings.
 
 ### Codex reset outcomes that need reconciliation
 
