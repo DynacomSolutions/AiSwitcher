@@ -82,6 +82,7 @@ if (!url && process.env.CI && !optOut) {
     const credit = `credit-SYNTHETIC_FIXTURE-${crypto.randomUUID()}`;
     const request = crypto.randomUUID();
     const reservation = crypto.randomUUID();
+    const reported = credit;
     const accountId = `account-SYNTHETIC_FIXTURE-${crypto.randomUUID()}`;
     const journal = new PgPoolResetJournal(sql);
     const invalidations = new PgResetCreditInvalidations(sql);
@@ -103,13 +104,11 @@ if (!url && process.env.CI && !optOut) {
       expect(await journal.recordAttempt(credit, request, identity, reservation, accountId)).toBe(true);
       await invalidations.invalidate(identity);
       const version = await invalidations.version(identity);
-      await journal.markConsumed(credit, identity, version, baseline, consumedAt);
+      await journal.recordOutcome(credit, reservation, reported, "reset", { version, baseline, consumedAt });
       await journal.releaseAttempt(credit, reservation);
       expect(await journal.manualAttempted(credit)).toBe(true);
-      const reported = `${credit}-reported`;
-      await journal.recordReportedCredit(credit, reservation, reported);
-      expect(await journal.usedCredits([reported, credit])).toEqual(new Set([credit, reported]));
-      expect(await journal.manualAttempted(reported)).toBe(true);
+      expect(await journal.usedCredits([credit])).toEqual(new Set([credit]));
+      expect(await journal.accountOutcomePending(identity, accountId)).toBe(false);
       const relieved = { ...baseline, windows: [{ label: "week", utilization: 20 }] };
       await journal.reconcileReading(identity, relieved);
       expect(await journal.verifiedAt([identity])).toBeUndefined();
@@ -122,7 +121,8 @@ if (!url && process.env.CI && !optOut) {
       await journal.reconcileReading(identity, earlier);
       expect(await journal.verifiedAt([identity])).toBeUndefined();
 
-      await journal.markConsumed(credit, identity, version, baseline, consumedAt);
+      const proof = JSON.stringify({ [poolWindowKey(baseline.windows[0])]: { utilisation: 98, resetsAt: baseline.windows[0].resetsAt } });
+      await sql`UPDATE codex_pool_reset_attempts SET baseline = ${proof}::jsonb WHERE credit_id = ${credit}`;
       await journal.reconcileReading(identity, earlier);
       const verifiedAt = await journal.verifiedAt([identity]);
       expect(verifiedAt).toBeGreaterThan(consumedAt);

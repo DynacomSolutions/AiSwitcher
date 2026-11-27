@@ -2,7 +2,7 @@ import { type SQL } from "bun";
 import { describe, expect, test } from "bun:test";
 import type { ManualResetInfo } from "../../src/cli/limits/types.ts";
 import { consumeCodexResetForIdentity, type CodexRedemptionGuard } from "../../src/gateway/account.ts";
-import { codexResetRelieved, confirmPoolReset, PgPoolResetJournal, PoolResetReservationCleanup, poolResetReview, poolUtilisation, poolWindowKey } from "../../src/gateway/pool-reset.ts";
+import { codexResetRelieved, checkCodexRedemptionFence, confirmPoolReset, PgPoolResetJournal, PoolResetReservationCleanup, poolResetReview, poolUtilisation, poolWindowKey } from "../../src/gateway/pool-reset.ts";
 import type { PoolResetConfirmation } from "../../src/gateway/pool-reset-view.ts";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 
@@ -44,6 +44,8 @@ describe("pool threshold and manual reset review", () => {
     expect(poolResetReview(pool, readings, [inventory(creditA, 1), inventory(creditB, 1)], new Set(), NOW).candidate?.identity).toBe("sample-a");
     expect(poolResetReview(pool, readings, [inventory(creditA, 1), inventory(creditB, 1)], new Set([creditA]), NOW).candidate?.identity).toBe("sample-b");
     expect(poolResetReview(pool, readings, [undefined, inventory(creditB, 1)], new Set(), NOW).availability).toBe("unavailable");
+    expect(poolResetReview(pool, readings, [inventory(creditA, 1), inventory(creditB, 2)], new Set(), NOW, new Set(["sample-a"])).candidate?.identity).toBe("sample-b");
+    expect(poolResetReview(pool, readings, [inventory(creditA, 1), inventory(creditB, 2)], new Set(), NOW, new Set(pool.members)).availability).toBe("unavailable");
     expect(poolResetReview({ ...pool, tool: "claude" }, readings, [], new Set(), NOW)).toMatchObject({ percent: 92, availability: "unsupported" });
   });
 });
@@ -69,7 +71,7 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
       unlock();
     }
   };
-  const tried = new Map<string, { request: string; reservation: string }>();
+  const tried = new Map<string, { request: string; reservation: string; resolved: boolean }>();
   const reported = new Set<string>();
   const requests = new Set<string>();
   const steps: string[] = [];
@@ -78,7 +80,7 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
   const assessStarted = Promise.withResolvers<void>();
   const state = {
     waitForPost: Promise.resolve(), waitForAssess: Promise.resolve(), afterJournal: () => {}, review, ambiguous: false,
-    releaseFailures: 0, reportedCredit: creditA, verified: true, members: review.members, now: NOW, refreshReview: false, deadlineAt: Infinity,
+    releaseFailures: 0, outcomeFailures: 0, windowsReset: 1 as number | undefined, reportedCredit: creditA as string | null | undefined, verified: true, members: review.members, now: NOW, refreshReview: false, deadlineAt: Infinity,
   };
   const cleanup = new PoolResetReservationCleanup(async (id, reservation) => {
     expect(locked).toBe(true);
@@ -101,7 +103,10 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
       postStarted.resolve();
       await state.waitForPost;
       if (state.ambiguous) throw new Error("synthetic lost response");
-      return Response.json({ code: "reset", windows_reset: 2, credit: { id: state.reportedCredit } });
+      return Response.json({
+        code: "reset", windows_reset: state.windowsReset,
+        ...(state.reportedCredit === undefined ? {} : { credit: { id: state.reportedCredit } }),
+      });
     }
     return Response.json({ available_count: 1, credits: [{
       id: creditA, expires_at: iso(NOW + DAY), reset_type: "codex_rate_limits", status: "available",
@@ -114,21 +119,32 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
     cleanup,
     journal: {
       manualAttempted: async (id) => tried.has(id) || reported.has(id),
-      markConsumed: async () => { steps.push("consumed"); },
       recordAttempt: async (id, request, identity, reservation, accountId) => {
         expect(identity).toBe(credential.identity);
         expect(accountId).toBe(credential.accountId);
         if (tried.has(id) || requests.has(request)) return false;
         steps.push("journal");
-        tried.set(id, { request, reservation });
+        tried.set(id, { request, reservation, resolved: false });
         requests.add(request);
         state.afterJournal();
         return true;
       },
-      recordReportedCredit: async (id, reservation, reportedId) => {
+      recordObservedCredit: async (id, reservation, reportedId) => {
         expect(locked).toBe(true);
         expect(tried.get(id)?.reservation).toBe(reservation);
-        steps.push("reported");
+        reported.add(reportedId);
+      },
+      recordOutcome: async (id, reservation, reportedId, outcome, recovery) => {
+        expect(locked).toBe(true);
+        const row = tried.get(id)!;
+        expect(row.reservation).toBe(reservation);
+        expect(outcome).toBe("reset");
+        steps.push(recovery ? "consumed" : "reported");
+        if (state.outcomeFailures > 0) {
+          state.outcomeFailures--;
+          throw new Error("synthetic failure before commit");
+        }
+        row.resolved = true;
         reported.add(reportedId);
       },
     },
@@ -156,7 +172,12 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
       return { status: state.verified ? "confirmed" : "pending" };
     },
   });
-  return { run, state, posts, steps, confirmation, postStarted: postStarted.promise, assessStarted: assessStarted.promise };
+  const otherReplica = {
+    accountOutcomePending: async () => [...tried.values()].some((row) => !row.resolved),
+    usedCredits: async (ids: string[]) => new Set(ids.filter((id) => tried.has(id) || reported.has(id))),
+    inventoryFenceScope: async () => ({ any: tried.size > 0, relevant: tried.size > 0 }),
+  };
+  return { run, state, posts, steps, confirmation, credential, otherReplica, postStarted: postStarted.promise, assessStarted: assessStarted.promise };
 }
 
 describe("pool reset confirmation", () => {
@@ -263,6 +284,62 @@ test("retains both credit IDs from a confirmed pool POST that reports a differen
     candidate: { ...confirmation.candidate, creditId: creditB }, redeemRequestId: crypto.randomUUID(),
   })).toEqual({ status: "already_attempted" });
   expect(posts).toHaveLength(1);
+});
+
+test("two failed outcome writes leave every credit on the account fenced on another replica", async () => {
+  const { run, state, steps, posts, otherReplica, credential } = harness();
+  state.reportedCredit = creditB;
+  state.outcomeFailures = 2;
+  expect(await run()).toEqual({ status: "pending" });
+  expect(steps).toEqual(["invalidate", "journal", "post", "reported", "reported"]);
+
+  const context = {
+    credential,
+    inventory: async () => ({ available_count: 1, credits: [{ id: creditB, status: "available" }] }),
+  };
+  expect(await otherReplica.usedCredits([creditB])).toEqual(new Set());
+  await expect(checkCodexRedemptionFence(otherReplica, credential.identity, { ...context, creditId: creditB }))
+    .rejects.toThrow("unresolved outcome");
+  await expect(checkCodexRedemptionFence(otherReplica, credential.identity, context)).rejects.toThrow("unresolved outcome");
+  expect(posts).toHaveLength(1);
+});
+
+test("a known success clears the account fence and retains its credit fence", async () => {
+  const { run, otherReplica, credential } = harness();
+  expect(await run()).toEqual({ status: "confirmed" });
+  const context = {
+    credential,
+    inventory: async () => ({ available_count: 1, credits: [{ id: creditB, status: "available" }] }),
+  };
+  await expect(checkCodexRedemptionFence(otherReplica, credential.identity, { ...context, creditId: creditA }))
+    .rejects.toThrow("already attempted");
+  await expect(checkCodexRedemptionFence(otherReplica, credential.identity, { ...context, creditId: creditB })).resolves.toBeUndefined();
+  await expect(checkCodexRedemptionFence(otherReplica, credential.identity, context)).resolves.toBeUndefined();
+});
+
+test("a standard success without a credit field records the requested credit and verifies relief", async () => {
+  const { run, state, steps, otherReplica } = harness();
+  state.reportedCredit = undefined;
+  expect(await run()).toEqual({ status: "confirmed" });
+  expect(steps).toEqual(["invalidate", "journal", "post", "consumed"]);
+  expect(await otherReplica.accountOutcomePending()).toBe(false);
+  expect(await otherReplica.usedCredits([creditA])).toEqual(new Set([creditA]));
+});
+
+test("an invalid explicit credit field leaves the account fence in place", async () => {
+  const { run, state, otherReplica } = harness();
+  state.reportedCredit = null;
+  expect(await run()).toEqual({ status: "pending" });
+  expect(await otherReplica.accountOutcomePending()).toBe(true);
+});
+
+test("a malformed response can fence a reported credit without clearing the account guard", async () => {
+  const { run, state, otherReplica } = harness();
+  state.reportedCredit = creditB;
+  state.windowsReset = undefined;
+  expect(await run()).toEqual({ status: "pending" });
+  expect(await otherReplica.usedCredits([creditB])).toEqual(new Set([creditB]));
+  expect(await otherReplica.accountOutcomePending()).toBe(true);
 });
 
 test("requires relief before the baseline window resets naturally", () => {

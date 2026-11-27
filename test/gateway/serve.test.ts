@@ -2253,7 +2253,7 @@ describe("automatic Codex reset integration", () => {
           if (scenario === "ambiguous") throw new Error("synthetic connection reset");
           served = true;
           return Response.json({
-            code: "reset", windows_reset: 1, credit: { id: scenario === "credit-mismatch" ? otherCredit : creditId },
+            code: "reset", windows_reset: 1, ...(scenario === "credit-mismatch" ? { credit: { id: otherCredit } } : {}),
           });
         }
         if (++inferences === 2) followerQuota.resolve();
@@ -2295,10 +2295,32 @@ describe("automatic Codex reset integration", () => {
     expect(answer.status).toBe(429);
     expect(await answer.text()).toBe(quota);
     expect(state.counts()).toMatchObject({ posts: 1, inferences: 1 });
-    expect(record).toHaveBeenCalledWith(state.requests[0].redeem_request_id, otherCredit);
+    expect(record).toHaveBeenCalledWith(state.requests[0].redeem_request_id, otherCredit, "reset");
     expect(await state.auto.lastClaim("identity", identity)).toMatchObject({
       status: "unknown", creditId, creditedId: otherCredit,
     });
+  });
+
+  test("an automatic spend cannot send if its account guard write fails", async () => {
+    const state = await setup("credit-mismatch");
+    spyOn(state.auto, "beginSpend").mockRejectedValue(new Error("synthetic failure before commit"));
+    const response = await state.call();
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe(quota);
+    expect(state.counts().posts).toBe(0);
+  });
+
+  test("an automatic mismatch leaves its account guarded if every outcome write fails", async () => {
+    const state = await setup("credit-mismatch");
+    const receipt = spyOn(state.auto, "recordReportedCredit").mockRejectedValue(new Error("synthetic failure before commit"));
+    const finish = spyOn(state.auto, "finish").mockRejectedValue(new Error("synthetic failure before commit"));
+    const response = await state.call();
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe(quota);
+    expect(state.counts().posts).toBe(1);
+    expect(receipt).toHaveBeenCalledTimes(2);
+    expect(finish).toHaveBeenCalledTimes(1);
+    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ spendPending: true });
   });
 
   test("a follower on a locally held member gets a real 429 and joins one durable spend", async () => {

@@ -437,8 +437,8 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const status = async (kind: AutoResetScope, name: string): Promise<AutoResetStatus> => {
       const [enabled, claim] = await Promise.all([settings.store.enabled(kind, name), settings.store.lastClaim(kind, name)]);
       if (!claim) return { name, enabled };
-      const { pool, identity, startedAt, creditExpiresAt, status } = claim;
-      return { name, enabled, lastClaim: { pool, identity, startedAt, creditExpiresAt, status } };
+      const { pool, identity, startedAt, creditExpiresAt, status, spendPending } = claim;
+      return { name, enabled, lastClaim: { pool, identity, startedAt, creditExpiresAt, status, spendPending } };
     };
     const [poolSettings, identitySettings] = await Promise.all([
       Promise.all(pools.map(async ({ name, members }) => ({ ...await status("pool", name), members }))),

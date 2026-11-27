@@ -11,6 +11,7 @@ export interface AutoResetStatus {
     startedAt: string;
     creditExpiresAt?: string;
     status: "pending" | "reset" | "rejected" | "unknown";
+    spendPending?: true;
   };
 }
 

@@ -71,6 +71,10 @@ test("Codex auto reset history remains visible without provider reads and exclud
     pool: GROUP, identity: MEMBER, creditId: "RateLimitResetCredit_SYNTHETIC_FIXTURE", startedAt: STAMP,
     creditExpiresAt: EXPIRY, usageEvidence: [], creditEvidence: { reason: "only_candidate", inventories: [] },
   })).toEqual({ kind: "created" });
+  expect(await store.beginSpend("fixture-redemption", MEMBER)).toBe(true);
+  const pending = await (await request()).json() as { identities: unknown[] };
+  expect(pending.identities).toMatchObject([{ name: MEMBER, lastClaim: { status: "pending", spendPending: true } }]);
+  await store.recordReportedCredit("fixture-redemption", "RateLimitResetCredit_SYNTHETIC_FIXTURE", "reset");
   await store.finish("fixture-event", "reset", "RateLimitResetCredit_SYNTHETIC_FIXTURE");
   await store.setEnabled("identity", MEMBER, false);
   const lastClaim = { pool: GROUP, identity: MEMBER, startedAt: STAMP, creditExpiresAt: EXPIRY, status: "reset" };

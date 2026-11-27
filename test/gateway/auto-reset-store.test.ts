@@ -229,16 +229,71 @@ if (!url && process.env.CI && !optOut) {
 
       const poolReported = claim("reported-by-pool", ["other"]);
       const poolRequestedId = "credit-SYNTHETIC_FIXTURE-confirmed-requested";
+      const accountId = "account-SYNTHETIC_FIXTURE-confirmed";
       const reservation = randomUUID();
+      const writer = new PgPoolResetJournal(sqlA);
+      const member = poolReported.identity;
+      const alias = claim("same-provider-account", ["alias"]).identity;
+      const explicit = {
+        ...context, creditId: poolReported.creditId,
+        credential: { ...context.credential, identity: alias, accountId },
+      };
+      const unspecified = {
+        ...explicit, creditId: undefined,
+        inventory: async () => ({ available_count: 1, credits: [{ id: poolReported.creditId, status: "available" }] }),
+      };
       try {
-        expect(await journal.recordAttempt(poolRequestedId, randomUUID(), reporting.identity, reservation)).toBe(true);
-        await journal.recordReportedCredit(poolRequestedId, reservation, poolReported.creditId);
+        expect(await writer.recordAttempt(poolRequestedId, randomUUID(), member, reservation, accountId)).toBe(true);
+        await journal.releaseAttempt(poolRequestedId, randomUUID());
+        await expect(checkCodexRedemptionFence(journal, alias, explicit)).rejects.toThrow("unresolved outcome");
+        await expect(checkCodexRedemptionFence(journal, alias, unspecified)).rejects.toThrow("unresolved outcome");
+        expect(await journal.accountOutcomePending(member)).toBe(true);
+        expect(await journal.accountOutcomePending(reporting.identity)).toBe(false);
+        expect(await journal.recordAttempt(poolReported.creditId, randomUUID(), alias, randomUUID(), accountId)).toBe(false);
+        await a.setEnabled("identity", member, true);
+        expect(await b.claim(poolReported)).toEqual({ kind: "blocked" });
+
+        // Roll back both writes to simulate failures before commit.
+        for (let retry = 0; retry < 2; retry++) {
+          await expect(sqlA.begin(async (tx) => {
+            await tx`UPDATE codex_pool_reset_attempts SET credited_id = ${poolReported.creditId}, outcome = 'reset'
+              WHERE reservation_id = ${reservation}::uuid`;
+            throw new Error("synthetic failure before commit");
+          })).rejects.toThrow("synthetic failure before commit");
+        }
+        expect(await journal.usedCredits([poolReported.creditId])).toEqual(new Set());
+        await expect(checkCodexRedemptionFence(journal, alias, explicit)).rejects.toThrow("unresolved outcome");
+        await expect(checkCodexRedemptionFence(journal, alias, unspecified)).rejects.toThrow("unresolved outcome");
+
+        await writer.recordOutcome(poolRequestedId, reservation, poolReported.creditId, "reset");
+        await writer.recordOutcome(poolRequestedId, reservation, poolReported.creditId, "reset");
         await journal.releaseAttempt(poolRequestedId, reservation);
+        expect(await journal.accountOutcomePending(alias, accountId)).toBe(false);
         expect(await journal.usedCredits([poolRequestedId, poolReported.creditId])).toEqual(new Set([poolRequestedId, poolReported.creditId]));
+        await expect(checkCodexRedemptionFence(journal, alias, explicit)).rejects.toThrow("already attempted");
+        await expect(checkCodexRedemptionFence(journal, alias, {
+          ...explicit, creditId: "credit-SYNTHETIC_FIXTURE-next",
+        })).resolves.toBeUndefined();
         expect(await b.claim(poolReported)).toEqual({ kind: "blocked" });
       } finally {
         await sqlA`DELETE FROM codex_pool_reset_attempts WHERE credit_id = ${poolRequestedId}`;
       }
+
+      const automatic = claim("armed-automatic", ["auto-pending"]);
+      await a.setEnabled("identity", automatic.identity, true);
+      expect(await a.claim(automatic)).toEqual({ kind: "created" });
+      expect(await a.beginSpend(automatic.redeemRequestId, automatic.identity, accountId)).toBe(true);
+      expect(await b.beginSpend(automatic.redeemRequestId, automatic.identity, accountId)).toBe(false);
+      await expect(checkCodexRedemptionFence(journal, alias, explicit)).rejects.toThrow("unresolved outcome");
+      await expect(checkCodexRedemptionFence(journal, alias, unspecified)).rejects.toThrow("unresolved outcome");
+      expect(await b.lastClaim("identity", automatic.identity)).toMatchObject({ spendPending: true });
+      await a.finish(automatic.eventKey, "unknown", undefined, {
+        redeemRequestId: automatic.redeemRequestId, finishedAt: AT, outcome: "consume_unknown",
+      });
+      expect(await journal.accountOutcomePending(alias, accountId)).toBe(true);
+      await a.recordReportedCredit(automatic.redeemRequestId, poolReported.creditId, "reset");
+      expect(await journal.accountOutcomePending(alias, accountId)).toBe(false);
+      expect(await journal.usedCredits([poolReported.creditId])).toEqual(new Set([poolReported.creditId]));
 
       const original = claim("original");
       const rows = await sqlA`SELECT redeem_request_id, usage_evidence, credit_evidence, finished_at FROM codex_auto_reset_claims

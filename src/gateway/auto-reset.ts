@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as wait } from "node:timers/promises";
 import type { ManualResetInfo } from "../cli/limits/types.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
+import type { CodexResetOutcome } from "./account.ts";
 import {
   canRearmClaim, type AutoResetClaim, type AutoResetClaimInput, type AutoResetClaimSummary,
   type AutoResetCreditEvidence, type AutoResetStore,
@@ -346,6 +347,7 @@ export function createAutoResetRecovery({
     audit("pending");
     let status: Exclude<AutoResetClaimSummary["status"], "pending"> = "rejected";
     let creditedId: string | undefined;
+    let knownOutcome: CodexResetOutcome | undefined;
     let outcome = "evidence_expired";
     let postAttempted: boolean | undefined;
     let finishedAt: number;
@@ -370,6 +372,7 @@ export function createAutoResetRecovery({
           throw error;
         });
         creditedId = spent.creditId;
+        knownOutcome = spent.result;
         if (creditedId === undefined || creditedId === creditId) {
           outcome = spent.result;
           status = spent.result === "reset" ? "reset" : "rejected";
@@ -380,10 +383,14 @@ export function createAutoResetRecovery({
         outcome = "cancelled_before_post";
       }
     } catch (error) {
-      const refusal = error as { status?: number; postAttempted?: boolean; creditedId?: string } | null;
-      if (refusal?.creditedId !== undefined && refusal.creditedId !== creditId) {
-        creditedId = refusal.creditedId;
+      const refusal = error as { status?: number; postAttempted?: boolean; creditedId?: string; knownOutcome?: CodexResetOutcome } | null;
+      creditedId = refusal?.creditedId;
+      knownOutcome = refusal?.knownOutcome;
+      if (creditedId !== undefined && creditedId !== creditId) {
         outcome = "credit_mismatch";
+      } else if (knownOutcome !== undefined) {
+        outcome = knownOutcome;
+        status = knownOutcome === "reset" ? "reset" : "rejected";
       } else if (postAttempted === false || refusal?.postAttempted === false) {
         status = "rejected";
         outcome = "preflight_failed";
@@ -394,7 +401,9 @@ export function createAutoResetRecovery({
     } finally {
       finishedAt = now();
       audit(status, outcome, creditedId);
-      await store.finish(eventKey, status, creditedId, { redeemRequestId, finishedAt: iso(finishedAt), outcome });
+      await store.finish(eventKey, status, creditedId, {
+        redeemRequestId, finishedAt: iso(finishedAt), outcome, knownOutcome, unsent: postAttempted === false,
+      });
     }
     if (status === "rejected" || (creditedId !== undefined && creditedId !== creditId)) return undefined;
     const mark = status === "reset" ? (at: number) => store.markRecovered(eventKey, redeemRequestId, iso(at)) : undefined;

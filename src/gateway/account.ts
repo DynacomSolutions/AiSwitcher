@@ -86,10 +86,18 @@ export type BeforeCodexPost = (identity: string, context: CodexPostContext) => P
 export class CodexResetFenced extends Error {
   readonly status = 409;
 
-  constructor() {
-    super("This reset credit was already attempted. Check current limits.");
+  constructor(message = "This reset credit was already attempted. Check current limits.") {
+    super(message);
   }
 }
+
+export class CodexResetOutcomePending extends CodexResetFenced {
+  constructor() {
+    super("A previous reset on this Codex account has an unresolved outcome.");
+  }
+}
+
+export type CodexResetOutcome = "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed";
 
 /** Serialises gateway redemptions and records the reset generation before the provider POST. */
 export type CodexRedemptionGuard = <T>(run: (beforePost: BeforeCodexPost) => Promise<T>, automatic?: boolean) => Promise<T>;
@@ -102,7 +110,7 @@ export interface CodexCreditSelection {
   stillCurrent(): boolean;
   stillEligible(): Promise<boolean>;
   onPost(): void;
-  onReportedCredit?(creditId: string): Promise<void>;
+  onKnownOutcome?(creditId: string, outcome: CodexResetOutcome): Promise<void>;
   finishPostAfterDeadline?: boolean;
 }
 
@@ -113,7 +121,7 @@ export async function consumeCodexResetForIdentity(
   deps: Pick<GatewayDeps, "creds" | "fetch"> & { credential?: ProviderCredential; signal?: AbortSignal },
   selection?: CodexCreditSelection,
   beforePost?: BeforeCodexPost,
-): Promise<{ identity: string; result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number; creditId?: string }> {
+): Promise<{ identity: string; result: CodexResetOutcome; windowsReset: number; creditId?: string }> {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(redeemRequestId)) {
     throw Object.assign(new Error("A valid reset request ID is required"), { status: 400 });
   }
@@ -179,38 +187,39 @@ export async function consumeCodexResetForIdentity(
   } catch {
     throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
   }
-  const unknownOutcome = () => new Error("Codex reset outcome is unknown. Refresh limits before another attempt.");
-  if (!spent.ok && !selection?.onReportedCredit) {
-    if (selection) void discard(spent);
-    else await discard(spent);
-  }
-  const response = spent.ok || selection?.onReportedCredit
+  if (!spent.ok && !selection) await discard(spent);
+  const response = spent.ok || selection
     ? await spent.json().catch(() => undefined) as { code?: unknown; windows_reset?: unknown; credit?: { id?: unknown } } | undefined
     : undefined;
   const rawCreditId = response?.credit?.id;
-  const creditId = typeof rawCreditId === "string" && rawCreditId.trim() ? rawCreditId : undefined;
-  const mismatch = selection && creditId !== undefined && creditId !== selection.id ? creditId : undefined;
-  if (mismatch !== undefined && selection?.onReportedCredit) {
-    const record = selection.onReportedCredit;
-    const write = () => bounded(record(mismatch), 2_000, "Codex reported credit journal");
-    try {
-      await write().catch(write);
-    } catch {
-      throw Object.assign(unknownOutcome(), { status: 502, creditedId: mismatch });
-    }
-  }
+  const reportedId = selection && typeof rawCreditId === "string" && rawCreditId.trim() ? rawCreditId : undefined;
   if (!spent.ok) {
     const manualStatus = [400, 403, 404, 409, 429].includes(spent.status) ? spent.status : 502;
     throw Object.assign(new Error(`Codex refused the reset (HTTP ${spent.status})`), {
-      status: selection ? spent.status : manualStatus, creditedId: mismatch,
+      status: selection ? spent.status : manualStatus, creditedId: reportedId,
     });
   }
-  const { code, windows_reset: windowsReset = 0 } = response ?? {};
+  const code = response?.code;
+  const windowsReset = response?.windows_reset === undefined && !selection ? 0 : response?.windows_reset;
+  const hasCredit = response != null && Object.hasOwn(response, "credit");
+  const unknownOutcome = () => new Error("Codex reset outcome is unknown. Refresh limits before another attempt.");
   if ((code !== "reset" && code !== "nothing_to_reset" && code !== "no_credit" && code !== "already_redeemed") ||
-      typeof windowsReset !== "number" || !Number.isSafeInteger(windowsReset) || windowsReset < 0) {
-    throw Object.assign(unknownOutcome(), { status: 502, creditedId: mismatch });
+      typeof windowsReset !== "number" || !Number.isSafeInteger(windowsReset) || windowsReset < 0 ||
+      (selection && hasCredit && reportedId === undefined)) {
+    throw Object.assign(unknownOutcome(), { status: 502, creditedId: reportedId });
   }
-  return { identity, result: code, windowsReset, ...(selection && creditId !== undefined ? { creditId } : {}) };
+  // The standard response omits credit. The requested credit ID is then the effective credit ID.
+  const creditId = reportedId ?? selection?.id;
+  if (creditId !== undefined && selection?.onKnownOutcome) {
+    const record = selection.onKnownOutcome;
+    const write = () => bounded(record(creditId, code), 2_000, "Codex reset outcome journal");
+    try {
+      await write().catch(write);
+    } catch {
+      throw Object.assign(unknownOutcome(), { status: 502, creditedId: creditId, knownOutcome: code });
+    }
+  }
+  return { identity, result: code, windowsReset, ...(creditId === undefined ? {} : { creditId }) };
 }
 
 async function discard(res: Response): Promise<void> {
@@ -388,6 +397,7 @@ export async function forwardAccount(r: AccountRequest): Promise<AccountResult> 
     return await run(r, cls);
   } catch (err) {
     if (r.signal.aborted) throw err;
+    if (err instanceof CodexResetOutcomePending) return { res: providerError(r.style, 409, err.message, "reset_outcome_pending"), cls };
     if (err instanceof CodexResetFenced) return { res: providerError(r.style, 409, err.message, "reset_already_attempted"), cls };
     // A member without a usable login is the client's case (4xx with the reason), never a server error.
     if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) return { res: providerError(r.style, 409, r.app.target.kind === "pin" ? err.clientMessage : "no login is available for this app", "no_login"), cls };

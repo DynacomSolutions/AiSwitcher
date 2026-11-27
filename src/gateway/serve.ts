@@ -71,7 +71,7 @@ import { clearLoginRevoked, readLoginRevoked, recordLoginRevoked } from "../iden
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
 import { useClaudeReset } from "../server/claude-resets.ts";
-import { consumeCodexResetForIdentity, type BeforeCodexPost, type CodexCreditSelection, type CodexRedemptionGuard } from "./account.ts";
+import { CodexResetFenced, consumeCodexResetForIdentity, type BeforeCodexPost, type CodexCreditSelection, type CodexRedemptionGuard } from "./account.ts";
 import { MemoryResetCreditInvalidations, PgResetCreditInvalidations, type ResetCreditInvalidations } from "./reset-credit-cache.ts";
 import { createManagementCheck, GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, listGatewayManagedAccountsStrict, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
@@ -963,6 +963,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         if (!inventory || before !== await generation(identity)) return undefined;
         const credits = inventory.creditExpiries;
         if (!poolResetJournal || !credits?.length) return inventory;
+        if (await bounded(poolResetJournal.accountOutcomePending(identity, credential.accountId), 2_000, "Codex reset outcome")) {
+          return undefined;
+        }
         const attempted = await bounded(poolResetJournal.usedCredits(credits.map(({ id }) => id)), 2_000, "pool reset journal");
         return { ...inventory, creditExpiries: credits.filter(({ id }) => !attempted.has(id)) };
       },
@@ -979,7 +982,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
             await generationsMatch(proof) && evidence.stillCurrent(),
           onPost: () => evidence.postAttempted(true),
           finishPostAfterDeadline: true,
-          onReportedCredit: (reportedId) => autoResetConfig.store.recordReportedCredit(requestId, reportedId),
+          onKnownOutcome: (reportedId, outcome) => autoResetConfig.store.recordReportedCredit(requestId, reportedId, outcome),
+        }, undefined, signal, async (name, context) => {
+          const armed = await bounded(autoResetConfig.store.beginSpend(requestId, name, context.credential.accountId), 2_000, "Codex reset outcome");
+          if (!armed) throw new CodexResetFenced();
         });
       },
     });
@@ -1025,6 +1031,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     selection?: CodexCreditSelection,
     invalidated?: (version: string) => void,
     signal = selection?.signal,
+    prepare?: BeforeCodexPost,
   ) {
     return withCodexRedemption(async (beforePost) => {
       return spendLockedCodexCredit(async (name, context) => {
@@ -1033,6 +1040,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
           const version = await generation(name).catch(() => undefined);
           if (version !== undefined) invalidated(version);
         }
+        await prepare?.(name, context);
       }, identity, redeemRequestId, selection, signal);
     }, selection !== undefined);
   }
@@ -1099,16 +1107,24 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
           fetchGatewayCodexUsage(credential, hooks.fetch ?? fetch, clock, signal, "pool").catch(() => undefined),
           fetchCodexResetCredits(credential, hooks.fetch ?? fetch, signal, clock, "automatic").catch(() => undefined),
         ]);
-        return { reading, inventory };
+        return { reading, inventory, accountId: credential.accountId };
       } catch {
         return undefined;
       }
     }));
     signal.throwIfAborted();
+    const pending = await bounded(Promise.all(scope.members.map(async (identity, index) =>
+      await poolResetJournal!.accountOutcomePending(identity, fetched[index]?.accountId) ? identity : undefined,
+    )), 2_000, "Codex reset outcome");
+    signal.throwIfAborted();
     const ids = [...new Set(fetched.flatMap((row) => row?.inventory?.creditExpiries?.map(({ id }) => id) ?? []))];
     const used = await bounded(poolResetJournal!.usedCredits(ids), 2_000, "pool reset journal");
     const readings = fetched.map((row) => row?.reading);
-    return { review: poolResetReview(scope, readings, fetched.map((row) => row?.inventory), used, clock()), readings };
+    return {
+      review: poolResetReview(scope, readings, fetched.map((row) => row?.inventory), used, clock(),
+        new Set(pending.filter((identity) => identity !== undefined))),
+      readings,
+    };
   }
 
   async function reconcileCodexReset(

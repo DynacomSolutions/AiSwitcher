@@ -91,6 +91,7 @@ describe("Codex reset spend", () => {
 test("the legacy Console consume checks locked inventory against retained pool attempts", async () => {
   const creditId = "credit-SYNTHETIC_FIXTURE-fenced";
   let any = true;
+  let pending = false;
   let inventory: unknown = { available_count: 1, credits: [{ id: creditId, status: "available" }] };
   let posts = 0;
   const consume = () => consumeCodexResetForIdentity(IDENTITY, REQUEST_ID, {
@@ -103,6 +104,7 @@ test("the legacy Console consume checks locked inventory against retained pool a
     }) as typeof fetch,
   }, undefined, (identity, context) => checkCodexRedemptionFence({
     usedCredits: async (ids) => new Set(ids.filter((id) => id === creditId)),
+    accountOutcomePending: async () => pending,
     inventoryFenceScope: async () => ({ any, relevant: any }),
   }, identity, context));
 
@@ -111,6 +113,10 @@ test("the legacy Console consume checks locked inventory against retained pool a
   await expect(consume()).rejects.toThrow("already attempted");
   expect(posts).toBe(0);
   any = false;
+  pending = true;
+  await expect(consume()).rejects.toThrow("unresolved outcome");
+  expect(posts).toBe(0);
+  pending = false;
   expect(await consume()).toMatchObject({ result: "reset" });
   expect(posts).toBe(1);
 });

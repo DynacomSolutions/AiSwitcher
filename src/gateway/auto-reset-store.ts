@@ -1,4 +1,5 @@
 import type { SQL } from "bun";
+import type { CodexResetOutcome } from "./account.ts";
 
 type Setting = "pool" | "identity";
 type ClaimStatus = "pending" | "reset" | "rejected" | "unknown";
@@ -27,6 +28,7 @@ export interface AutoResetClaimSummary {
   startedAt: string;
   status: ClaimStatus;
   creditedId?: string;
+  spendPending?: true;
 }
 
 export interface AutoResetClaim extends AutoResetClaimSummary {
@@ -36,7 +38,7 @@ export interface AutoResetClaim extends AutoResetClaimSummary {
   recoveredAt?: string;
 }
 
-export interface AutoResetClaimInput extends Omit<AutoResetClaimSummary, "status" | "creditedId"> {
+export interface AutoResetClaimInput extends Omit<AutoResetClaimSummary, "status" | "creditedId" | "spendPending"> {
   eventKey: string;
   redeemRequestId: string;
   provider429At?: number;
@@ -53,6 +55,8 @@ interface ClaimFinish {
   redeemRequestId: string;
   finishedAt: string;
   outcome: string;
+  knownOutcome?: CodexResetOutcome;
+  unsent?: boolean;
 }
 
 export interface AutoResetStore {
@@ -61,7 +65,8 @@ export interface AutoResetStore {
   lastClaim(kind: Setting, name: string): Promise<AutoResetClaimSummary | undefined>;
   findClaim(eventKey: string, generation?: number): Promise<AutoResetClaim | undefined>;
   claim(input: AutoResetClaimInput): Promise<ClaimResult>;
-  recordReportedCredit(redeemRequestId: string, creditId: string): Promise<void>;
+  beginSpend(redeemRequestId: string, identity: string, accountId?: string): Promise<boolean>;
+  recordReportedCredit(redeemRequestId: string, creditId: string, knownOutcome?: CodexResetOutcome): Promise<void>;
   finish(eventKey: string, status: TerminalStatus, creditedId?: string, result?: ClaimFinish): Promise<void>;
   markRecovered(eventKey: string, redeemRequestId: string, recoveredAt: string): Promise<void>;
 }
@@ -156,11 +161,23 @@ export class MemoryAutoResetStore implements AutoResetStore {
     return { kind: "created" };
   }
 
-  async recordReportedCredit(redeemRequestId: string, creditId: string): Promise<void> {
+  async beginSpend(redeemRequestId: string, identity: string): Promise<boolean> {
+    for (const claims of this.claims.values()) {
+      const claim = claims.find(({ summary }) => summary.redeemRequestId === redeemRequestId &&
+        summary.identity === identity && summary.status === "pending" && !summary.spendPending && !summary.creditedId);
+      if (!claim) continue;
+      claim.summary.spendPending = true;
+      return true;
+    }
+    return false;
+  }
+
+  async recordReportedCredit(redeemRequestId: string, creditId: string, knownOutcome?: CodexResetOutcome): Promise<void> {
     for (const claims of this.claims.values()) {
       const claim = claims.find(({ input }) => input.redeemRequestId === redeemRequestId);
       if (!claim) continue;
       claim.summary.creditedId = creditId;
+      if (knownOutcome !== undefined) delete claim.summary.spendPending;
       this.claimedCredits.add(creditId);
       return;
     }
@@ -177,6 +194,7 @@ export class MemoryAutoResetStore implements AutoResetStore {
       claim.summary.creditedId = creditedId;
       this.claimedCredits.add(creditedId);
     }
+    if (result?.unsent || (result?.knownOutcome !== undefined && creditedId !== undefined)) delete claim.summary.spendPending;
   }
 
   async markRecovered(eventKey: string, redeemRequestId: string, recoveredAt: string): Promise<void> {
@@ -196,6 +214,7 @@ interface ClaimRow {
   started_at: Date | string;
   status: ClaimStatus;
   credited_id: string | null;
+  spend_pending: boolean;
   generation: number;
   redeem_request_id: string;
   finished_at: Date | string | null;
@@ -212,6 +231,7 @@ function summary(row: ClaimRow | undefined): AutoResetClaimSummary | undefined {
     startedAt: new Date(row.started_at).toISOString(),
     status: row.status,
     ...(row.credited_id === null ? {} : { creditedId: row.credited_id }),
+    ...(row.spend_pending ? { spendPending: true as const } : {}),
   };
 }
 
@@ -285,9 +305,10 @@ export class PgAutoResetStore implements AutoResetStore {
           requested.members, ${JSON.stringify(usageEvidence)}::text::jsonb, ${JSON.stringify(creditEvidence)}::text::jsonb
         FROM requested WHERE NOT EXISTS (
           SELECT 1 FROM codex_pool_reset_attempts WHERE credit_id = ${creditId} OR credited_id = ${creditId}
+            OR (outcome IS NULL AND consumed_at IS NULL AND identity = ${identity})
         ) AND NOT EXISTS (
           SELECT 1 FROM codex_auto_reset_claims AS earlier
-          WHERE earlier.credited_id = ${creditId}
+          WHERE earlier.credited_id = ${creditId} OR (earlier.spend_pending AND earlier.identity = ${identity})
             OR (earlier.recorded_at > statement_timestamp() - ${OVERLAP_MS}::int * interval '1 ms'
               AND earlier.members && requested.members)
         )
@@ -296,16 +317,30 @@ export class PgAutoResetStore implements AutoResetStore {
     });
   }
 
-  async recordReportedCredit(redeemRequestId: string, creditId: string): Promise<void> {
-    const rows = await this.sql`UPDATE codex_auto_reset_claims SET credited_id = ${creditId}
-      WHERE redeem_request_id = ${redeemRequestId}::uuid RETURNING credit_id`;
+  async beginSpend(redeemRequestId: string, identity: string, accountId?: string): Promise<boolean> {
+    const rows = await this.sql`UPDATE codex_auto_reset_claims SET account_id = ${accountId ?? null}, spend_pending = true
+      WHERE redeem_request_id = ${redeemRequestId}::uuid AND status = 'pending' AND identity = ${identity}
+        AND NOT spend_pending AND credited_id IS NULL
+      RETURNING credit_id`;
+    return rows.length === 1;
+  }
+
+  async recordReportedCredit(redeemRequestId: string, creditId: string, knownOutcome?: CodexResetOutcome): Promise<void> {
+    const rows = await this.sql`UPDATE codex_auto_reset_claims SET credited_id = ${creditId},
+        provider_outcome = COALESCE(${knownOutcome ?? null}, provider_outcome),
+        spend_pending = spend_pending AND NOT ${knownOutcome !== undefined}
+      WHERE redeem_request_id = ${redeemRequestId}::uuid AND (credited_id IS NULL OR credited_id = ${creditId})
+      RETURNING credit_id`;
     if (rows.length !== 1) throw new Error("The automatic reset claim is missing");
   }
 
   async finish(eventKey: string, status: TerminalStatus, creditedId?: string, result?: ClaimFinish): Promise<void> {
     const requestId = result?.redeemRequestId ?? null;
+    const resolved = result?.unsent === true || (result?.knownOutcome !== undefined && creditedId !== undefined);
     await this.sql`UPDATE codex_auto_reset_claims SET status = ${status}, credited_id = COALESCE(${creditedId ?? null}, credited_id),
-      finished_at = COALESCE(${result?.finishedAt ?? null}::timestamptz, clock_timestamp()), outcome = ${result?.outcome ?? null}
+      finished_at = COALESCE(${result?.finishedAt ?? null}::timestamptz, clock_timestamp()), outcome = ${result?.outcome ?? null},
+      provider_outcome = COALESCE(${creditedId === undefined ? null : result?.knownOutcome ?? null}, provider_outcome),
+      spend_pending = spend_pending AND NOT ${resolved}
       WHERE event_key = ${eventKey} AND status = 'pending' AND
         CASE WHEN ${requestId}::uuid IS NULL THEN generation = 1 ELSE redeem_request_id = ${requestId}::uuid END`;
   }

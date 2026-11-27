@@ -1326,12 +1326,14 @@ describe("account API of the other providers", () => {
     const selected = explicit ? { credit_id: fenced } : {};
     await addApp("c", "codex", "openai");
     let relevant = true;
+    let outcomePending = false;
     let ids = [fenced];
     let count = 1;
     deps.withCodexRedemption = async (run) => run(async (identity, context) => {
       expect(identity).toBe("b");
       await checkCodexRedemptionFence({
         usedCredits: async (requested) => new Set(requested.filter((id) => id === fenced)),
+        accountOutcomePending: async () => outcomePending,
         inventoryFenceScope: async () => ({ any: true, relevant }),
       }, identity, context);
     });
@@ -1355,6 +1357,13 @@ describe("account API of the other providers", () => {
       expect(seen.filter((req) => req.method === "POST")).toEqual([]);
       count = 1;
     }
+    outcomePending = true;
+    const pending = await consume(safeBody);
+    expect(pending.status).toBe(409);
+    expect(await pending.json()).toMatchObject({ error: { message: expect.stringContaining("unresolved outcome") } });
+    expect(seen.filter((req) => req.method === "POST")).toEqual([]);
+    outcomePending = false;
+
     const allowed = await consume(safeBody);
     expect(allowed.status).toBe(403);
     expect(await allowed.text()).toBe("provider body");
