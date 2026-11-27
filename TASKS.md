@@ -238,7 +238,7 @@ ETA: 2026-11-28 18:00 ICT
 | 340 | Rotate two Kimi gateway app tokens shown in a T3 thread | dropped | | | | | Dropped: Thomas answered no on 26 Nov 2026 01:42 ICT (18:42 GMT 25 Nov), so the two tokens stay as they are.<br>The tokens stay valid and stay in the history of that thread.<br>To rotate later: `ais gateway app rotate <app>` for each app, then `ais gateway t3-instances sync`. |
 | 394 | Limits page: OpenAI cards go stale, reset buttons vanish, no manual refresh | in_progress | claude | console-openai-limits-refresh | | 2026-11-27 16:00 ICT | Owner report 27 Nov 12:12 ICT: all Codex cards show Cached, 6 h old, and no reset buttons.<br>Cause found: the Codex logins need a new sign-in, so every usage and credit read fails.<br>Fix: show the failure on the card, keep reset buttons, add per-card and per-tab refresh that skips the 45 s cache. |
 ## 6. Browser control extension
-ETA: 2026-11-28 01:05 ICT
+ETA: 2026-11-28 01:20 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -278,7 +278,7 @@ ETA: 2026-11-28 01:05 ICT
 | 325 | Same chat keeps its tabs and groups after compaction | done | claude | browser-group-after-compaction | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/808 and https://github.com/DynacomSolutions/AiSwitcher/pull/811 after two Opus reviews.<br>T3 thread id is the chat id. Long child ids become a fixed hash.<br>Live in v0.5.119: a child thread sends the chat id, tab test passed. |
 | 326 | `ais browser headers` masks secret headers | done | claude | browser-headers-mask | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/813, live in v0.5.120.<br>Plain output masks the token. `--tool` and `--reveal` print it for the helpers. |
 | 327 | Rotate the browser agent token that a worker printed | done | claude | | 6.326 | | Rotated 25 Nov 23:03 ICT (16:03 GMT) after a quiet check.<br>Old token gives 401, new token lists browsers.<br>Pool sessions started before the rotation must relaunch for browser calls. |
-| 405 | Stop agents on the tab when the user cancels Chrome debugging | in_progress | codex | ais-cancel-no-pause | | 2026-11-28 01:05 ICT | Use the existing tab stop when Chrome reports Cancel. |
+| 405 | Stop agents on the tab when the user cancels Chrome debugging | in_review | codex | ais-cancel-no-pause | | 2026-11-28 01:20 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/924<br>670 extension unit tests pass. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-15 23:00 ICT
