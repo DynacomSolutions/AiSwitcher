@@ -180,14 +180,15 @@ test("console forwards settings through its admin connection and guards mutation
   expect((await put("1", "nothing", "pool", CLAUDE_POOL)).status).toBe(404);
   expect(await (await put("1", "claude", "pool", CLAUDE_POOL)).json()).toEqual({ provider: "claude", name: CLAUDE_POOL, enabled: true });
   expect(await store.enabled("claude", CLAUDE_POOL)).toBe(true);
-  // The console passes the gateway's refusal of an identity setting through, and nothing is saved.
-  const gone = await put("1", "codex", "identity", MEMBER);
-  expect(gone.status).toBe(410);
-  expect(await store.enabled("codex", MEMBER)).toBe(false);
+  // An identity form, or any other scope, is gone. The console answers 410 itself and sends nothing to the gateway.
+  for (const kind of ["identity", "member"]) {
+    const gone = await put("1", "codex", kind, MEMBER);
+    expect(gone.status).toBe(410);
+    expect(await store.enabled("codex", MEMBER)).toBe(false);
+  }
   expect(calls).toEqual([
     { method: "GET", path: AUTO_RESET_PATH, authorised: true },
     { method: "PUT", path: `${autoResetProviderPath("claude")}/pool`, authorised: true },
     { method: "PUT", path: `${autoResetProviderPath("claude")}/pool`, authorised: true },
-    { method: "PUT", path: `${autoResetProviderPath("codex")}/identity`, authorised: true },
   ]);
 });

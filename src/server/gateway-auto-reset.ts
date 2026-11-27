@@ -59,8 +59,8 @@ export function registerGatewayAutoReset(
     const provider = c.req.param("provider");
     if (!knownProvider(provider)) throw new HttpError(404, "no such provider");
     const kind = c.req.param("kind");
-    // The gateway answers an identity setting with a clear error. The console passes that answer through.
-    if (kind !== "pool" && kind !== "identity") throw new HttpError(400, "scope must be pool");
+    // Automatic reset is a pool setting only. An identity form is gone, so the console answers and calls no gateway.
+    if (kind !== "pool") throw new HttpError(410, "Automatic reset is a pool setting only. Identity settings are removed.");
     const body = await c.req.json().catch(() => undefined);
     if (typeof body?.name !== "string" || typeof body?.enabled !== "boolean") throw new HttpError(400, "name and boolean enabled are required");
     const result = await request("PUT", `/limits/${provider}/auto-reset/${kind}`, { name: body.name, enabled: body.enabled });
