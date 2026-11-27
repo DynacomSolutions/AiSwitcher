@@ -7,9 +7,8 @@ resume readers, auth helpers) to two frontends:
 - **WebUI** (`apps/web`, Vite + React + shadcn/ui), served by the same process.
 - **TUI** (`apps/tui`, Rust + ratatui), which polls this API over HTTP.
 
-Both frontends are **live views**: they poll every endpoint on an interval.
-Every GET below is safe to call repeatedly; responses are plain JSON with no
-streaming/session state. Expensive endpoints (`limits`) are cached server-side.
+Both frontends are live views. The WebUI uses events for limits, usage and reset settings. The TUI polls the JSON API.
+The server caches expensive reads.
 
 ## Server lifecycle
 
@@ -42,7 +41,7 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
   read back through the API.
 - Money/percent fields are numbers; timestamps are ISO 8601 strings.
 
-### Polling intervals used by both frontends
+### Polling intervals
 
 | Endpoint | Interval |
 |---|---|
@@ -53,12 +52,28 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
 | `/api/sessions/tree` | 30s (server caches 15s) |
 | `/api/sessions/transcript` | 3s for an open chat (server caches 4s; appended lines appear within one poll interval) |
 | `/api/files/*` | on demand |
-| `/api/limits`, `/api/usage`, `/api/spend-guard`, `/api/herdr-bridge` | 60s (server caches 45s) |
+| `/api/limits` | 60s for polling clients (server caches 45s) |
+| `/api/usage` | 60s for polling clients (server caches the default read for up to 60s) |
+| `/api/spend-guard`, `/api/herdr-bridge` | 60s |
 | `/api/usage/breakdown` | 300s (server caches 60s; heavy local JSONL scan) |
 | `/api/gateway/usage`, `/api/gateway/apps` | 60s |
 | `/api/usage/projects` | 120s (file read only; the host collector rewrites it each cycle) |
 
 ## Endpoints
+
+### Console events
+
+`GET /api/events` uses the same authentication as the JSON API. It returns `text/event-stream`.
+
+- `ready` opens the stream. `heartbeat` confirms that the connection is active every 15 seconds.
+- `change` carries a JSON array of topics. Topics are `limits`, `usage`, `pools-usage`, `gateway-usage`, `usage-projects`, and `codex-auto-reset`.
+- `rollover` ends the response after approximately 25 seconds, before the 30-second public ingress timeout.
+- The WebUI opens one stream per tab. It keeps the last results visible during a reconnect and refreshes active queries once when the stream resumes.
+- Scoped limit rechecks after a manual Codex reset continue until reconciliation ends.
+
+The observer shares the same reads as the default JSON routes across all streams. It keeps the same cache and observation schedule when a stream rolls over.
+The observer checks reset rules and automatic claims every 10 seconds, limits every 45 seconds, and aggregate usage every 60 seconds.
+It checks project usage every 120 seconds. Pending usage snapshots use shorter intervals.
 
 ### Status
 

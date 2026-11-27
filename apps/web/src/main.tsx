@@ -10,7 +10,7 @@ import "./index.css";
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      // Polling drives freshness; cached data keeps the UI responsive.
+      // Live events and polling refresh data without discarding cached results.
       staleTime: Number.POSITIVE_INFINITY,
       retry: 1,
       refetchOnWindowFocus: false,
