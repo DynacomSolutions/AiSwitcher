@@ -2735,6 +2735,23 @@ describe("automatic Claude pool reset proxy", () => {
     expect(recoveries).toBe(0);
   });
 
+  test("a failed rule read does not stop failover on a header-proven Claude 429", async () => {
+    const token = await addClaudePool();
+    let recoveries = 0;
+    deps.autoResets = {
+      claude: { enabled: async () => { throw new Error("rule store unavailable"); }, recover: async () => { recoveries++; return "b"; } },
+    };
+    usage.a = live(10);
+    usage.b = live(10);
+    let sent = 0;
+    handler = () => (++sent <= 1 ? exhausted() : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    const response = await send(token);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(anthropicJson);
+    expect(sent).toBe(2);
+    expect(recoveries).toBe(0);
+  });
+
   test("a failed recovery keeps the pool's own out-of-capacity answer", async () => {
     const token = await addClaudePool();
     deps.autoResets = { claude: { enabled: async () => true, recover: async () => undefined } };

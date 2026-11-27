@@ -1408,6 +1408,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
           void discard(res);
           ctrl.signal.throwIfAborted();
         }
+        // The headers prove the exhaustion, so a failed or late setting read must not stop failover to the next member.
+        if (claudeProof && active !== true) {
+          releaseAutoReset?.();
+          return { quota: true, res };
+        }
         if (active === undefined || initialSignal.aborted || performance.now() >= receipt.deadlineAt) {
           releaseAutoReset?.();
           return { quota: false, res, relay: true };
