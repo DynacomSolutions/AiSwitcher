@@ -283,6 +283,59 @@ describe("pause and stop", () => {
     expect(await executor.run(call("tabs_context"))).toMatchObject({ ok: true });
   });
 
+  test("Chrome Cancel aborts a call while it recovers its tabs", async () => {
+    const ui = new OverlayUi({ call: async () => undefined, inject: async () => {} });
+    const { api, state, tabs, executor } = setup(ui);
+    state.setSessionsOnTab(tabId => ui.sessionsOn(tabId));
+    const tab = await tabs.create(session);
+    expect(await executor.run(call("read_page", { tabId: tab.id }))).toMatchObject({ ok: true });
+    api.cdpLog.length = 0;
+    const reclaiming = Promise.withResolvers<void>();
+    const recovered = Promise.withResolvers<void>();
+    tabs.reclaim = async () => {
+      reclaiming.resolve();
+      await recovered.promise;
+      return false;
+    };
+
+    const pending = executor.run(call("read_page", { tabId: tab.id }));
+    await reclaiming.promise;
+    api.attachedTabs.delete(tab.id);
+    for (const listener of api.detachListeners) listener(tab.id, "canceled_by_user");
+    recovered.resolve();
+
+    expect(await pending).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(api.cdpLog).toHaveLength(0);
+    expect(api.attachedTabs.size).toBe(0);
+  });
+
+  test("Chrome Cancel during the attach lookup prevents a new debugger attachment", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    const get = api.tabs.get;
+    const attach = api.debugger.attach;
+    let lookups = 0;
+    let attachCalls = 0;
+    api.debugger.attach = async tabId => {
+      attachCalls++;
+      await attach(tabId);
+    };
+    api.tabs.get = async tabId => {
+      if (tabId === tab.id && ++lookups === 2) {
+        await attach(tabId);
+        api.attachedTabs.delete(tabId);
+        for (const listener of api.detachListeners) listener(tabId, "canceled_by_user");
+      }
+      return get(tabId);
+    };
+
+    expect(await executor.run(call("read_page", { tabId: tab.id }))).toMatchObject({ ok: false, error: "stopped_by_user" });
+    await Bun.sleep(0);
+    expect(lookups).toBe(2);
+    expect(attachCalls).toBe(0);
+    expect(api.cdpLog).toHaveLength(0);
+  });
+
   test("target_closed clears the debugger attachment without stopping or pausing", async () => {
     const ui = new OverlayUi({ call: async () => undefined, inject: async () => {} });
     const { api, state, tabs, executor } = setup(ui);

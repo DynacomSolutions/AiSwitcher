@@ -234,19 +234,22 @@ export class Executor {
     if (this.tabs.touch(req.session)) {
       for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void this.markControlled(tabId, req.session);
     }
-    await this.tabs.regrant(req.session).catch(() => {});
-    await this.tabs.reclaim(req.session).catch(() => {});
     const tabId = typeof req.args.tabId === "number" ? req.args.tabId : undefined;
     const controller = this.state.track(id, req.session.id, req.session.identity, tabId);
     this.tabs.callStarted(req.session.id);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : tool === "request_group" ? REQUEST_GROUP_CALL_TIMEOUT_MS : this.defaultTimeout;
-    const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const aborted = new Promise<never>((_, reject) => {
       const onAbort = () => reject(new ToolError(this.abortCode(controller.signal.reason), this.abortMessage(controller.signal.reason)));
       if (controller.signal.aborted) onAbort(); else controller.signal.addEventListener("abort", onAbort, { once: true });
     });
     aborted.catch(() => {});
     try {
+      await Promise.race([this.tabs.regrant(req.session).catch(() => {}), aborted]);
+      this.throwIfAborted(controller.signal);
+      await Promise.race([this.tabs.reclaim(req.session).catch(() => {}), aborted]);
+      this.throwIfAborted(controller.signal);
+      timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
       const content = await Promise.race([this.dispatch(tool, req, controller.signal), aborted]);
       return { id, ok: true, content };
     } catch (e) {
@@ -910,6 +913,7 @@ export class Executor {
     if (this.attached.has(tabId)) return this.awaitEnabled(tabId);
     const current = await this.api.tabs.get(tabId);
     if (current) this.assertDrivable(current); // last guard: no path may attach the debugger to a browser or extension page
+    this.throwIfAborted(sig);
     try {
       await this.api.debugger.attach(tabId);
     } catch (e) {
