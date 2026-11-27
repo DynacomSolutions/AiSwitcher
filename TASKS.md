@@ -309,6 +309,7 @@ ETA: 2026-11-08 18:00 ICT
 | 172 | Codex pool/local-route folders can read usage (codex-home for local gateway routes) | done | claude-20261110-gw-codex-usage | codex-home-local-route | | | A codex folder routed to the local gateway (base_url `http://127.0.0.1:<port>/codex`) showed "could not read usage (-32600)": it holds the API-key entry, and `ais gateway codex-home` took the route name as the app, so it looked for the wrong app key.<br>codex-home, `--check`, the pool entry and rotation now map a local route to its app; the cluster form is unchanged.<br>`ais doctor` names the codex-home command for a routed folder that answers -32600.<br>Not proven live. |
 
 ## 11. Console WebUI: tabbed pages and readable usage charts
+ETA: 2026-11-27 23:00 ICT
 Long console pages split into tabs with their own URL path; usage chart shows totals and readable axes in dark mode.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -321,6 +322,7 @@ Long console pages split into tabs with their own URL path; usage chart shows to
 | 211 | Push notification shows the AIS arrows in the status bar, not a blank circle | done | claude | push-badge-icon | | | Owner report 2026-11-18. Android draws the badge from its alpha channel only; the badge was the opaque app icon. New transparent white-arrows `badge-96.png`. PR #566 merged after CI green (17/17). Released in v0.5.62. |
 | 226 | Auth and Limits pages show the account email of every login; an owner sign-in replaces the gateway account | done | claude | webui-account-emails | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/606 (a69410c), released v0.5.72; host, dev/ais and all 6 ais-gateway pods run 0.5.72.<br>Live: one identity moved to its new account through `ais identities adopt-login`; the cluster gateway serves the new account, the other identity kept its own.<br>Owner request 2026-11-19. Two Claude identities were on the same account and no page showed it.<br>A WebUI sign-in to another account was refused ("gateway not updated"); owner sign-ins now always replace the account, automatic paths keep the guard.<br>Claude: gateway member copy first, mismatch with the identity folder flagged. API-key tools show a label, never the key. |
 | 399 | Fix horizontal overflow on the console Identities page | done | claude | | | | Merged in #899 (`60f28228`): the page was 59 px too wide at 360 px.<br>Causes: an unbroken registry path and a header that did not wrap.<br>New e2e test at 360 and 1280 px. |
+| 400 | Fix 2 px overflow on console pages at 360 px and Auth focus e2e failures | in_progress | claude | console-overflow-auth-focus | | 2026-11-27 23:00 ICT | Found by the e2e suite in #899.<br>Pages: `/`, `/dashboard/herdr`, `/dashboard/processes`.<br>Auth keyboard-focus tests fail at 360 and 1280 px. |
 
 ## 12. CI runner reliability
 Keep CI green when a GitHub-hosted runner image breaks.
