@@ -1237,12 +1237,12 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       await waitFor("live connection", 5_000, () => page.eval<boolean>(`!document.querySelector(${JSON.stringify(help)})`));
 
       await setQuota(50, 1, "2026-11-27T08:05:00.000Z");
-      await page.eval(`
+      await page.eval(`(() => {
         const rule = window.__aisLive.answers['/api/limits/codex/auto-reset'].pools[0];
         rule.lastClaim.status = 'reset';
         rule.enabled = true;
         window.__aisLive.send('change', ['limits', 'codex-auto-reset']);
-      `);
+      })()`);
       await waitText("50.0%");
       await waitText("Reset credits (1)");
       expect(await page.eval("window.__aisLive.calls['/api/limits']")).toBe(2);
@@ -1285,13 +1285,13 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       await page.eval(`document.querySelector('main a[href="/limits"]').click()`);
       await waitText("Last claim: reset");
       await waitText("Automatic reset on");
-      await page.eval(`
+      await page.eval(`(() => {
         const link = document.querySelector('main a[href="/limits/pools/codex/${pool}"]');
         window.__aisLivePoolCard = link.closest('[data-slot=card]');
         const rule = window.__aisLive.answers['/api/limits/codex/auto-reset'].pools[0];
         rule.enabled = false;
         window.__aisLive.send('change', ['codex-auto-reset']);
-      `);
+      })()`);
       await waitText("Automatic reset off");
       expect(await page.eval<boolean>(`window.__aisLivePoolCard === document.querySelector('main a[href="/limits/pools/codex/${pool}"]').closest('[data-slot=card]')`)).toBe(true);
       await waitFor("initial usage figure", 5_000, () => page.eval<boolean>(`
