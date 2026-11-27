@@ -309,7 +309,7 @@ ETA: 2026-11-08 18:00 ICT
 | 172 | Codex pool/local-route folders can read usage (codex-home for local gateway routes) | done | claude-20261110-gw-codex-usage | codex-home-local-route | | | A codex folder routed to the local gateway (base_url `http://127.0.0.1:<port>/codex`) showed "could not read usage (-32600)": it holds the API-key entry, and `ais gateway codex-home` took the route name as the app, so it looked for the wrong app key.<br>codex-home, `--check`, the pool entry and rotation now map a local route to its app; the cluster form is unchanged.<br>`ais doctor` names the codex-home command for a routed folder that answers -32600.<br>Not proven live. |
 
 ## 11. Console WebUI: tabbed pages and readable usage charts
-ETA: 2026-11-27 23:00 ICT
+ETA: 2026-11-28 00:30 ICT
 Long console pages split into tabs with their own URL path; usage chart shows totals and readable axes in dark mode.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -324,6 +324,7 @@ Long console pages split into tabs with their own URL path; usage chart shows to
 | 399 | Fix horizontal overflow on the console Identities page | done | claude | | | | Merged in #899 (`60f28228`): the page was 59 px too wide at 360 px.<br>Causes: an unbroken registry path and a header that did not wrap.<br>New e2e test at 360 and 1280 px. |
 | 400 | Fix 2 px overflow on console pages at 360 px and Auth focus e2e failures | done | claude | console-overflow-auth-focus | | | Merged #913 (66388b4f). Main CI and Host app passed.<br>Dashboard card hint wrapped; page was 546 px at 360 px. Auth focus tests: no fault, 26/26 alone.<br>Found by the e2e suite in #899.<br>Pages: `/`, `/dashboard/herdr`, `/dashboard/processes`.<br>Auth keyboard-focus tests fail at 360 and 1280 px. |
 | 401 | Show provider icons next to tool names, tabs, pills and filters in the console | done | claude | console-provider-icons | | | Owner request 2026-11-27.<br>Merged #909 (ae0e57ab). Main CI (web job) and Host app passed.<br>Limits and reset cards get icons through ToolBadge when #894 merges.<br>One shared tool-to-provider mapping; monogram where no libre mark exists. |
+| 404 | Add provider icons to the Limits provider tabs and remaining name labels | in_progress | claude | limits-tab-icons | 11.401 | 2026-11-28 00:30 ICT | Owner request 2026-11-27.<br>#909 skipped Limits, Auth reset control and pool cards because #894 was open.<br>Live v0.5.130 Limits tabs show no icons. |
 
 ## 12. CI runner reliability
 Keep CI green when a GitHub-hosted runner image breaks.
