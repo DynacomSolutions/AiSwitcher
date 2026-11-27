@@ -224,6 +224,47 @@ describe("usage proxy", () => {
     expect(calls).toHaveLength(0);
   });
 
+  test("tunnels() counts client tunnels, refuseNew() answers 503 with retry-after, probe tunnels and open tunnels carry on", async () => {
+    const echo = net.createServer((c) => c.pipe(c));
+    await new Promise<void>((r) => echo.listen(0, "127.0.0.1", r));
+    running.push({ stop: () => echo.close() });
+    const echoPort = (echo.address() as net.AddressInfo).port;
+    const p = await proxy([], {
+      connectTarget: () => ({ host: "127.0.0.1", port: echoPort }),
+      isProbeTarget: (host, port) => host === "127.0.0.1" && port === 47130,
+      tunnelBusyMs: 150,
+    });
+    expect(p.tunnels?.()).toMatchObject({ open: 0, busy: 0, lastArrivalAt: 0 });
+    const client = await connect(p.port, "example.com:443");
+    const probe = await connect(p.port, "127.0.0.1:47130");
+    expect(client.status).toBe("HTTP/1.1 200 Connection Established");
+    expect(probe.status).toBe("HTTP/1.1 200 Connection Established");
+    // The probe tunnel is not client traffic.
+    expect(p.tunnels?.()).toMatchObject({ open: 1, busy: 1 });
+    expect(p.tunnels?.().lastArrivalAt).toBeGreaterThan(0);
+    // A silent tunnel stops being busy but stays open.
+    await Bun.sleep(250);
+    expect(p.tunnels?.()).toMatchObject({ open: 1, busy: 0 });
+    client.socket.write("ping");
+    await new Promise<Buffer>((r) => client.socket.once("data", r));
+    expect(p.tunnels?.()).toMatchObject({ open: 1, busy: 1 });
+
+    p.refuseNew?.();
+    const refused = await connect(p.port, "example.com:443");
+    expect(refused.status).toBe("HTTP/1.1 503 Service Unavailable");
+    await new Promise<void>((r) => (refused.socket.destroyed ? r() : refused.socket.once("close", () => r())));
+    // Probes still tunnel while the proxy refuses clients, and the open client tunnel still carries bytes.
+    const probe2 = await connect(p.port, "127.0.0.1:47130");
+    expect(probe2.status).toBe("HTTP/1.1 200 Connection Established");
+    client.socket.write("again");
+    expect((await new Promise<Buffer>((r) => client.socket.once("data", r))).toString()).toBe("again");
+    client.socket.destroy();
+    await Bun.sleep(50);
+    expect(p.tunnels?.().open).toBe(0);
+    probe.socket.destroy();
+    probe2.socket.destroy();
+  });
+
   test("api.anthropic.com on a port other than 443 is a plain tunnel", async () => {
     const targets: string[] = [];
     const p = await proxy([], { connectTarget: (host, port) => (targets.push(`${host}:${port}`), { host: "127.0.0.1", port: 1 }) });

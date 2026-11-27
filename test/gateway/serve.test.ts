@@ -87,6 +87,8 @@ function hooks(over: Partial<GatewayHooks> = {}): GatewayHooks {
     ledger: { max: 1000, flushMs: 3_600_000 },
     refreshIntervalMs: 3_600_000,
     exit: (code) => void exits.push(code),
+    // The production settle phase waits for 2 s of quiet; the tests do not.
+    drain: { settleQuietMs: 30, settleMaxMs: 300 },
     ...over,
   };
 }
@@ -526,8 +528,20 @@ describe("serve lifecycle", () => {
     await Bun.sleep(100);
     expect(exits).toEqual([]);
     expect(await status(`${base(g)}/readyz`)).not.toBe(200);
-    // No new connections.
-    expect(await fetch(`${base(g)}/healthz`, { headers: { connection: "close" } }).then((r) => r.status, () => 0)).toBe(0);
+    // The settle phase ends after a short quiet. Then a new client request is refused with a retryable 503, and the
+    // probes still answer (the listener stays open until the stream ends).
+    await waitFor(async () => (await status(`${base(g)}/web/v1/messages`)) === 503);
+    const refused = await fetch(`${base(g)}/web/v1/messages`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
+    expect(refused.status).toBe(503);
+    expect(refused.headers.get("retry-after")).toBe("1");
+    expect(refused.headers.get("connection")).toBe("close");
+    expect(await status(`${base(g)}/healthz`)).toBe(200);
+    const during = await (await fetch(`${base(g)}/metrics`)).text();
+    expect(during).toContain("ais_gateway_draining 1");
+    expect(during).toContain("ais_gateway_inflight_requests 1");
+    expect(during).toContain('ais_gateway_drain_phase{phase="wait"} 1');
+    expect(during).toMatch(/ais_gateway_drain_refused_total [1-9]/);
+    expect(during).toContain("ais_gateway_drain_cut_streams_total 0");
 
     // The stream is still alive and completes.
     release();
@@ -543,6 +557,65 @@ describe("serve lifecycle", () => {
     // The ledger was flushed before exit.
     expect(store.written.length).toBe(1);
     expect(store.written[0]!.outputTokens).toBe(9);
+  });
+});
+
+describe("drain phases", () => {
+  test("the settle phase still serves a request that arrives, with connection: close, then new ones get a retryable 503", async () => {
+    const token = await seed();
+    const g = await boot({ drain: { settleQuietMs: 400, settleMaxMs: 5_000 } }, true);
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const stream = await fetch(`${base(g)}/web/v1/messages/stream`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
+    await stream.body!.getReader().read();
+
+    process.emit("SIGTERM");
+    await Bun.sleep(50);
+    // Readiness fails at once, but a request that still arrives is served: kube-proxy may still send it here.
+    expect(await status(`${base(g)}/readyz`)).toBe(503);
+    const late = await fetch(`${base(g)}/web/v1/messages`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
+    expect(late.status).toBe(200);
+    expect(late.headers.get("connection")).toBe("close");
+    await late.text();
+    // After 400 ms without a new request the replica refuses, and it still holds the stream.
+    // (No polling here: every request that arrives restarts the quiet time.)
+    await Bun.sleep(700);
+    expect(await status(`${base(g)}/web/v1/messages`)).toBe(503);
+    expect(exits).toEqual([]);
+    release();
+    await waitFor(() => exits.length > 0);
+    expect(exits).toEqual([0]);
+  });
+
+  test("with a drain ceiling the replica counts the stream it cuts, stays up for a scrape, then exits", async () => {
+    const token = await seed();
+    const g = await boot({ drain: { settleQuietMs: 20, settleMaxMs: 200, ceilingMs: 300, cutHoldMs: 600, pollMs: 20 } }, true);
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const stream = await fetch(`${base(g)}/web/v1/messages/stream`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
+    await stream.body!.getReader().read();
+    const t0 = Date.now();
+    process.emit("SIGTERM");
+    // The gate stays shut: the stream outlives the ceiling.
+    let seen = "";
+    await waitFor(async () => {
+      seen = await fetch(`${base(g)}/metrics`).then((r) => r.text(), () => "");
+      return seen.includes("ais_gateway_drain_cut_streams_total 1");
+    });
+    expect(exits).toEqual([]);
+    expect(seen).toContain("ais_gateway_drain_inflight_at_start 1");
+    await waitFor(() => exits.length > 0, 5_000);
+    expect(exits).toEqual([0]);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
+  });
+
+  test("a replica with nothing in flight leaves after the settle phase, not after a timer", async () => {
+    await seed();
+    const g = await boot({ drain: { settleQuietMs: 30, settleMaxMs: 300 } }, true);
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const t0 = Date.now();
+    process.emit("SIGTERM");
+    await waitFor(() => exits.length > 0);
+    expect(exits).toEqual([0]);
+    expect(Date.now() - t0).toBeLessThan(1_500);
   });
 });
 

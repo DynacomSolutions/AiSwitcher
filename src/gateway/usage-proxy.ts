@@ -60,6 +60,8 @@ export const NOT_CONNECT_BODY =
 
 const MAX_HEAD = 16 * 1024;
 const HEAD_TIMEOUT_MS = 30_000;
+/** A tunnel that moved no bytes for this long is idle, not in flight (see RunningUsageProxy.tunnels). */
+export const TUNNEL_BUSY_MS = 5_000;
 /** How often the mounted certificate is checked for a renewal. */
 const TLS_RECHECK_MS = 5 * 60_000;
 
@@ -79,6 +81,14 @@ export interface UsageProxyOptions {
   passthroughOrigin?: string | ((host: string) => string);
   /** Test hook: where a plain CONNECT goes instead of the requested host:port. */
   connectTarget?(host: string, port: number): { host: string; port: number };
+  /**
+   * True for a CONNECT that is the gateway's own pod-local probe (its readiness and liveness checks tunnel to the proxy
+   * port on loopback). Such a tunnel is not counted as client traffic and is still served while the proxy refuses new
+   * tunnels, so a draining pod answers /healthz and /readyz to the kubelet until it exits.
+   */
+  isProbeTarget?(host: string, port: number): boolean;
+  /** Tests: how long a silent tunnel counts as busy (default TUNNEL_BUSY_MS). */
+  tunnelBusyMs?: number;
   log?(line: string): void;
   tlsRecheckMs?: number;
   /**
@@ -92,6 +102,18 @@ export interface RunningUsageProxy {
   port: number;
   /** Stops listening; `force` also ends open intercepted connections (plain tunnels end with their sockets). */
   stop(force?: boolean): Promise<void>;
+  /**
+   * Tunnels carrying client traffic (probe tunnels excluded): `open` is every one, `busy` those that moved bytes in the last
+   * `TUNNEL_BUSY_MS`. `lastArrivalAt` is when the last client CONNECT arrived (ms since the epoch, 0 when none did). A drain
+   * waits for `busy` to reach 0: a plain tunnel is a TCP pipe, so ending the process would cut it. A tunnel that stays
+   * silent for longer is idle, and its client reconnects.
+   */
+  tunnels?(): { open: number; busy: number; lastArrivalAt: number };
+  /**
+   * From now on a client CONNECT is refused with 503 and `retry-after`, a status that clients retry on another replica.
+   * Open tunnels and probe tunnels carry on. The listener stays open, so a drain can still be observed.
+   */
+  refuseNew?(): void;
 }
 
 const HOP_BY_HOP = ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"];
@@ -227,12 +249,16 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
   }, opts.tlsRecheckMs ?? TLS_RECHECK_MS);
   recheck.unref?.();
 
+  /** Counted tunnels (client traffic, no probes) and the time each last moved bytes. */
+  const tunnelActivity = new Map<net.Socket, number>();
+  let lastArrivalAt = 0;
+  let refusing = false;
   const server = net.createServer((client) => {
     let head = Buffer.alloc(0);
     // The CONNECT head must arrive promptly; an open tunnel has no timeout.
     client.setTimeout(HEAD_TIMEOUT_MS, () => client.destroy());
     const fail = (status: string, body = ""): void => {
-      const extra = status.startsWith("405") ? "allow: CONNECT\r\ncontent-type: text/plain; charset=utf-8\r\n" : body ? "content-type: text/plain; charset=utf-8\r\n" : "";
+      const extra = status.startsWith("405") ? "allow: CONNECT\r\ncontent-type: text/plain; charset=utf-8\r\n" : status.startsWith("503") ? "retry-after: 1\r\ncontent-type: text/plain; charset=utf-8\r\n" : body ? "content-type: text/plain; charset=utf-8\r\n" : "";
       client.end(`HTTP/1.1 ${status}\r\nconnection: close\r\n${extra}content-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`, () => client.destroy());
     };
     const onData = (chunk: Buffer): void => {
@@ -255,12 +281,27 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
       const host = m[1]!.replace(/^\[|\]$/g, "").toLowerCase();
       const port = Number(m[2]);
       if (port < 1 || port > 65535) return fail("400 Bad Request");
+      const probe = opts.isProbeTarget?.(host, port) === true;
+      if (!probe) {
+        lastArrivalAt = Date.now();
+        // A draining gateway: the client retries on another replica (the Service no longer lists this pod).
+        if (refusing) return fail("503 Service Unavailable", "ais gateway is draining; retry\n");
+      }
       const intercept = port === 443 && covered.has(host);
       const target = intercept ? { host: "127.0.0.1", port: tlsServer.port as number } : (opts.connectTarget?.(host, port) ?? { host, port });
       const upstream = net.connect(target.port, target.host);
       let open = false;
+      const uncount = (): void => void tunnelActivity.delete(client);
+      const touch = (): void => {
+        if (tunnelActivity.has(client)) tunnelActivity.set(client, Date.now());
+      };
       upstream.once("connect", () => {
         open = true;
+        if (!probe) {
+          tunnelActivity.set(client, Date.now());
+          client.on("data", touch);
+          upstream.on("data", touch);
+        }
         client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         if (rest.length > 0) upstream.write(rest);
         client.pipe(upstream);
@@ -272,8 +313,14 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
         else client.destroy();
       });
       client.on("error", () => upstream.destroy());
-      client.on("close", () => upstream.destroy());
-      upstream.on("close", () => client.destroy());
+      client.on("close", () => {
+        uncount();
+        upstream.destroy();
+      });
+      upstream.on("close", () => {
+        uncount();
+        client.destroy();
+      });
     };
     client.on("data", onData);
     client.on("error", () => client.destroy());
@@ -305,6 +352,15 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
   server.on("close", () => down("closed"));
   return {
     port: (server.address() as net.AddressInfo).port,
+    tunnels: () => {
+      const t = Date.now();
+      let busy = 0;
+      for (const at of tunnelActivity.values()) if (t - at < (opts.tunnelBusyMs ?? TUNNEL_BUSY_MS)) busy += 1;
+      return { open: tunnelActivity.size, busy, lastArrivalAt };
+    },
+    refuseNew: () => {
+      refusing = true;
+    },
     stop: async (force = true) => {
       stopped = true;
       clearInterval(recheck);

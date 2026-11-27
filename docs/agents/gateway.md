@@ -1036,6 +1036,28 @@ error or an unexpected close) is closed, reported as not listening, and started 
 closed. The cluster liveness probe also opens a TCP connection to the CONNECT port, so it can restart the container after
 about 3 minutes of a dead listener, before the 5 minute `/healthz` limit, and it catches a listener that dies after start. A failed start releases its loopback TLS listener and renewal timer, so retries leak nothing.
 
+Drain (`src/gateway/drain.ts`, incident 27 Nov 2026: six rolls in 100 minutes cut agent streams). On SIGTERM a replica
+fails `/readyz` at once and then runs three phases. No fixed sleep sets how long it lives.
+1. Settle. The listeners stay open and every request that still arrives is served, with `connection: close`, because
+   kube-proxy and the routers need a moment to stop sending traffic. The phase ends when no client request or CONNECT has
+   arrived for `AIS_GATEWAY_DRAIN_SETTLE_QUIET_MS` (default 2000), at most `AIS_GATEWAY_DRAIN_SETTLE_MAX_MS` (15000) after
+   SIGTERM. Health, readiness and metrics requests never count as arrivals.
+2. Refuse. A new request gets 503 with `retry-after: 1`, `connection: close` and the error reason `draining`, in the
+   provider's error shape. Clients retry that status on the next replica. A new CONNECT gets `503 Service Unavailable` with
+   `retry-after`. The pod-local probe tunnels (CONNECT to 127.0.0.1 on the proxy port) and the probe paths still answer, so
+   the kubelet and the monitoring see the drain.
+3. Wait. The replica exits when no request, stream or busy CONNECT tunnel is in flight. A tunnel counts as busy for 5 s
+   after its last byte (`TUNNEL_BUSY_MS`); an idle tunnel is cut and its client reconnects. There is no timer on this wait.
+   `AIS_GATEWAY_DRAIN_CEILING_MS` (default 0, no ceiling) is for the platform: set it below the pod's grace period. At the
+   ceiling the replica adds what it holds to `ais_gateway_drain_cut_streams_total`, stays up for
+   `AIS_GATEWAY_DRAIN_CUT_HOLD_MS` (default 45000, longer than the 30 s scrape interval) so the count is scraped, and then closes the rest.
+   The grace period must be longer than the ceiling plus the hold.
+Metrics (scrape the pod while it drains: use a Service with `publishNotReadyAddresses`): `ais_gateway_inflight_requests`,
+`ais_gateway_open_tunnels`, `ais_gateway_draining`, `ais_gateway_drain_phase{phase}`, `ais_gateway_drain_seconds`,
+`ais_gateway_drain_inflight_at_start`, `ais_gateway_drain_cut_streams_total` and `ais_gateway_drain_refused_total`.
+Bun's `server.stop(false)` closes idle keep-alive connections at once, which is why the listener stays open until the drain
+ends: a client that reuses an idle connection during the roll gets an answer, not a reset.
+
 The console stands down for every store-owned login (`docs/agents/console-web.md`, `AIS_GATEWAY_STORE_DATABASE_URL`).
 
 ## Member store and routing every identity through the gateway
