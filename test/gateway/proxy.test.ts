@@ -2124,12 +2124,63 @@ describe("automatic Codex pool reset proxy", () => {
       if (sent === 2) return refusal('{"error":{"code":"usage_limit_reached"}}', "3");
       return new Response('event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"server_error"}}}\n\n', { headers: { "content-type": "text/event-stream" } });
     };
-    const response = await request();
+    const response = await request({ body: " \r\n\t" + body });
     expect(sent).toBe(3);
     expect(response.status).toBe(429);
     expect(response.headers.get("retry-after")).toBe("89");
     expect(response.headers.get("x-codex-secondary-reset-at")).toBe("1793622600");
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(enc.encode(first429));
+  });
+
+  const responsesMetadata =
+    'event: response.created\ndata: {"type":"response.created"}\n\n' +
+    'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"message","content":[]}}\n\n' +
+    'event: response.content_part.added\ndata: {"type":"response.content_part.added","part":{"type":"output_text","text":""}}\n\n' +
+    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":""}\n\n';
+  const chatMetadata = 'data: {"choices":[{"delta":{"role":"assistant","content":""},"finish_reason":null}]}\r\n\r\n';
+
+  test.each([
+    ["responses", responsesMetadata + 'event: response.failed\ndata: {"type":"response.failed"}\n\n'],
+    ["responses", responsesMetadata + 'data: {"type":"response.incomplete"}\n\n'],
+    ["responses", responsesMetadata + 'data: {"type":"response.cancelled"}\n\n'],
+    ["responses", responsesMetadata + "data: [DONE]\n\n"],
+    ["responses", responsesMetadata + accepted.trimEnd() + "\n"],
+    ["responses", responsesMetadata + ":".repeat(64 * 1024) + "\n\n" + accepted],
+    ["chat/completions", chatMetadata + 'data: {"error":{"message":"failed"}}\n\n'],
+    ["chat/completions", chatMetadata + 'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'],
+    ["chat/completions", chatMetadata + "data: [DONE]\n\n"],
+    ["chat/completions", chatMetadata],
+  ])("returns the exact first 429 when a %s replay fails before content (%#)", async (path, replay) => {
+    const request = await start(async () => "b");
+    handler = () => seen.length < 3 ? refusal() : new Response(replay, { headers: { "content-type": "text/event-stream" } });
+    const response = await request({}, "/auto/v1/" + path);
+    expect(seen).toHaveLength(3);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("89");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(enc.encode(first429));
+  });
+
+  test.each([
+    ["responses", responsesMetadata, accepted.replace('"ok"', '"é"')],
+    ["responses", responsesMetadata, 'data: {"type":"response.function_call_arguments.delta","delta":"{}"}\n\n'],
+    ["responses", responsesMetadata, 'event: response.completed\ndata: {"response":{"status":"completed"}}\n\n'],
+    ["chat/completions", chatMetadata, 'data: {"choices":[{"delta":{"content":"é"}}]}\r\n\r\n'],
+    ["chat/completions", chatMetadata, 'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{}"}}]}}]}\n\n'],
+    ["chat/completions", chatMetadata, 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'],
+  ])("relays the exact %s replay after content or completion (%#)", async (path, metadata, content) => {
+    const request = await start(async () => "b");
+    const bytes = enc.encode(metadata + content);
+    let at = 0;
+    handler = () => seen.length < 3 ? refusal() : new Response(new ReadableStream<Uint8Array>({
+      pull(stream) {
+        if (at < bytes.length) stream.enqueue(bytes.subarray(at, ++at));
+        else stream.close();
+      },
+    }), { headers: { "content-type": "text/event-stream" } });
+    const response = await request({}, "/auto/v1/" + path);
+    expect(seen).toHaveLength(3);
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
   });
 
   test("failed recovery preserves another provider error in ordinary failover", async () => {
@@ -2486,6 +2537,54 @@ describe("automatic Codex pool reset proxy", () => {
     } finally {
       rule.resolve(false);
       timer.mockRestore();
+    }
+  });
+
+  test("returns the provider 429 headers before reading the body when the rules database fails", async () => {
+    const token = await addCodex();
+    const policyStore = new MemoryAutoResetStore(() => deps.now().getTime());
+    let ruleReads = 0;
+    policyStore.enabled = async () => { ruleReads++; throw new Error("fixture database failure"); };
+    deps.autoReset = createAutoResetRecovery({
+      store: policyStore,
+      pools: async () => [{ name: "synthetic-pool", members: ["a", "b"] }],
+      freshUsage: async () => { throw new Error("unexpected recovery"); },
+      readCredits: async () => { throw new Error("unexpected credit read"); },
+      spend: async () => { throw new Error("unexpected spend"); },
+      now: () => deps.now().getTime(),
+      log: () => {},
+    });
+    let recoveries = 0;
+    const recover = deps.autoReset.recover;
+    deps.autoReset.recover = (input) => { recoveries++; return recover(input); };
+    const finishBody = Promise.withResolvers<void>();
+    let sent = 0;
+    deps.fetch = (async () => {
+      sent++;
+      return new Response(new ReadableStream<Uint8Array>({
+        async pull(stream) {
+          await finishBody.promise;
+          stream.enqueue(enc.encode(first429));
+          stream.close();
+        },
+      }), { status: 429, statusText: "Fixture limit", headers: { "retry-after": "89" } });
+    }) as unknown as typeof fetch;
+    try {
+      const response = await Promise.race([
+        callRaw("/auto/v1/responses", token, { method: "POST", body }),
+        Bun.sleep(1000).then(() => undefined),
+      ]);
+      expect(response?.status).toBe(429);
+      expect(response?.statusText).toBe("Fixture limit");
+      expect(response?.headers.get("retry-after")).toBe("89");
+      expect(response?.headers.get("x-ais-gateway-upstream")).toBe("codex");
+      finishBody.resolve();
+      expect(new Uint8Array(await response!.arrayBuffer())).toEqual(enc.encode(first429));
+      expect(ruleReads).toBe(1);
+      expect(recoveries).toBe(0);
+      expect(sent).toBe(1);
+    } finally {
+      finishBody.resolve();
     }
   });
 

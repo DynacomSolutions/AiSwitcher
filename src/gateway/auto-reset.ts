@@ -145,7 +145,7 @@ function reasonFor(winner: AutoResetCandidate, next: AutoResetCandidate | undefi
 function hasHeadroom(reading: AutoResetUsage | undefined, input: RecoverInput, now: number, since: number): reading is AutoResetUsage {
   if (!reading || reading.status !== "live" || reading.codexRateLimitAllowed === false ||
     !weeklyWindow(reading, now) || absoluteTime(reading.capturedAt) < since) return false;
-  const scoped = usageForModel(reading, input.model);
+  const scoped = input.model === undefined ? reading : usageForModel(reading, input.model);
   const utilisation = reserveUtilisationOf(scoped);
   return scoped?.windows?.every((w) => Number.isFinite(w.utilization) && w.utilization >= 0) === true &&
     utilisation !== undefined && utilisation < Math.min(100, input.reservePercent);
@@ -393,7 +393,7 @@ export function createAutoResetRecovery({
   }
 
   return {
-    enabled: () => bounded(enabledPools(), 1_500, "Codex auto-reset rules").then((rules) => rules.length > 0, () => false),
+    enabled: () => bounded(enabledPools(), 1_500, "Codex auto-reset rules").then((rules) => rules.length > 0),
     recover(input) {
       const started = performance.now();
       const deadline = Math.min(input.deadlineAt ?? Infinity, started + RECOVERY_MS);

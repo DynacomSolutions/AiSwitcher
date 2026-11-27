@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import type { SQL } from "bun";
 import { setTimeout as wait } from "node:timers/promises";
 import type { ManualResetInfo } from "../../src/cli/limits/types.ts";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { MemoryAutoResetStore } from "../../src/gateway/auto-reset-store.ts";
+import { MemoryAutoResetStore, PgAutoResetStore } from "../../src/gateway/auto-reset-store.ts";
 import {
   chooseAutoResetCandidate, createAutoResetRecovery, exhaustedWeeklyReset, type AutoResetCandidate, type AutoResetUsage,
 } from "../../src/gateway/auto-reset.ts";
@@ -109,6 +110,21 @@ describe("Codex renewal choice", () => {
 });
 
 describe("Codex renewal recovery", () => {
+  test("distinguishes an explicitly disabled database rule from a failed read", async () => {
+    const failure = new Error("synthetic database failure");
+    const { options } = harness();
+    const off = new PgAutoResetStore((async () => [{ enabled: false }]) as unknown as SQL);
+    const failed = new PgAutoResetStore((async () => { throw failure; }) as unknown as SQL);
+    expect(await createAutoResetRecovery({ ...options, store: off }).enabled()).toBeFalse();
+    await expect(createAutoResetRecovery({ ...options, store: failed }).enabled()).rejects.toBe(failure);
+  });
+
+  test("rejects when the database rule read exceeds its 1.5-second budget", async () => {
+    const { options } = harness();
+    const hung = new PgAutoResetStore((() => new Promise(() => {})) as unknown as SQL);
+    await expect(createAutoResetRecovery({ ...options, store: hung }).enabled()).rejects.toThrow("Codex auto-reset rules timed out");
+  });
+
   test("defaults off, requires both settings, and verifies every routed member", async () => {
     const h = harness();
     expect(await h.recovery.enabled()).toBeFalse();
@@ -415,6 +431,26 @@ describe("Codex renewal recovery", () => {
     expect(await recovery.recover({ ...input(), model: "model-specific" })).toBeUndefined();
     expect(h.spends).toHaveLength(1);
     expect(await h.store.lastClaim("identity", "alpha")).toMatchObject({ status: "reset" });
+  });
+
+  test.each([
+    { label: "week", utilization: 90, expected: undefined },
+    { label: "provider limit", utilization: 100, expected: undefined },
+    { label: "session", utilization: Number.NaN, expected: undefined },
+    { label: "week", utilization: 89, expected: "alpha" },
+  ])("checks every scoped window with no request model ($label, $utilization)", async ({ label, utilization, expected }) => {
+    const h = harness();
+    await allow(h.store);
+    const recovery = createAutoResetRecovery({ ...h.options, freshUsage: async (identity, signal) => {
+      const reading = await h.options.freshUsage(identity, signal);
+      if (!reading || !h.recovered.has(identity)) return reading;
+      return { ...reading, windows: [...reading.windows!,
+        { label: "week", utilization: 10, model: "other" },
+        { label, utilization, model: "specific" },
+      ] };
+    } });
+    expect(await recovery.recover(input())).toBe(expected);
+    expect(h.spends).toHaveLength(1);
   });
 
   test("waits for imminent natural rollover and confirms headroom before replay", async () => {

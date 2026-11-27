@@ -73,3 +73,90 @@ export function firstEventOf(bytes: Uint8Array): FirstEvent {
   }
   return { state: "pending" };
 }
+
+const CODEX_FAILURE_EVENT = /^(?:response\.)?(?:failed|incomplete|cancelled|canceled|error)$/;
+const CODEX_CONTENT_DELTA = /^response\.(?:output_text|refusal|function_call_arguments|custom_tool_call_input|audio|audio_transcript|output_audio|output_audio_transcript|reasoning_summary_text)\.delta$/;
+const CHAT_SUCCESS_REASONS = new Set(["stop", "tool_calls", "function_call"]);
+
+function objectOf(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+}
+
+function hasText(value: unknown): boolean {
+  return typeof value === "string" && value.length > 0;
+}
+
+function hasChatDelta(choice: Record<string, unknown>): boolean {
+  const delta = objectOf(choice.delta);
+  const fn = objectOf(delta.function_call);
+  return hasText(delta.content) || hasText(delta.refusal) || hasText(fn.name) || hasText(fn.arguments) ||
+    (Array.isArray(delta.tool_calls) && delta.tool_calls.some((call: unknown) => {
+      const tool = objectOf(call);
+      const fn = objectOf(tool.function);
+      const custom = objectOf(tool.custom);
+      return hasText(fn.name) || hasText(fn.arguments) || hasText(custom.name) || hasText(custom.input);
+    }));
+}
+
+function codexRenewalEvent(event: string, data: string): FirstEvent {
+  if (CODEX_FAILURE_EVENT.test(event) || data.trim() === "[DONE]") return { state: "error" };
+  if (!data) return { state: "pending" };
+  let payload: Record<string, unknown>;
+  try {
+    payload = objectOf(JSON.parse(data));
+  } catch {
+    return { state: "pending" };
+  }
+  const type = typeof payload.type === "string" ? payload.type : event;
+  const response = objectOf(payload.response);
+  const status = typeof response.status === "string" ? response.status : "";
+  if (CODEX_FAILURE_EVENT.test(type) || CODEX_FAILURE_EVENT.test(status) || payload.error != null || response.error != null) {
+    return { state: "error" };
+  }
+  if ((type === "response.completed" && status === "completed") || (CODEX_CONTENT_DELTA.test(type) && hasText(payload.delta))) {
+    return { state: "pass" };
+  }
+  if (Array.isArray(payload.choices)) {
+    const choices = payload.choices.map(objectOf);
+    if (choices.some(({ finish_reason }) => typeof finish_reason === "string" && !CHAT_SUCCESS_REASONS.has(finish_reason))) {
+      return { state: "error" };
+    }
+    if (choices.some((choice) => hasChatDelta(choice) ||
+      (typeof choice.finish_reason === "string" && CHAT_SUCCESS_REASONS.has(choice.finish_reason)))) {
+      return { state: "pass" };
+    }
+  }
+  return { state: "pending" };
+}
+
+/** Inspect complete SSE frames for Codex renewal. The caller limits the bytes and retains the original stream. */
+export function codexRenewalEvents(): (bytes: Uint8Array) => FirstEvent {
+  const decoder = new TextDecoder();
+  let afterCR = false;
+  let line = "";
+  let event = "";
+  const data: string[] = [];
+  return (bytes) => {
+    let text = decoder.decode(bytes, { stream: true });
+    if (!text) return { state: "pending" };
+    if (afterCR && text.startsWith("\n")) text = text.slice(1);
+    afterCR = text.endsWith("\r");
+    const lines = text.split(/\r\n|\r|\n/);
+    for (const next of lines.slice(0, -1)) {
+      line += next;
+      if (line === "") {
+        const result = codexRenewalEvent(event, data.join("\n"));
+        if (result.state !== "pending") return result;
+        event = "";
+        data.length = 0;
+      } else if (line.startsWith("event:")) {
+        event = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        data.push(line.slice(5).replace(/^ /, ""));
+      }
+      line = "";
+    }
+    line += lines[lines.length - 1];
+    return { state: "pending" };
+  };
+}
