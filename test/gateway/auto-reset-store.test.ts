@@ -247,8 +247,12 @@ if (!url && process.env.CI && !optOut) {
         await journal.releaseAttempt(poolRequestedId, randomUUID());
         await expect(checkCodexRedemptionFence(journal, alias, explicit)).rejects.toThrow("unresolved outcome");
         await expect(checkCodexRedemptionFence(journal, alias, unspecified)).rejects.toThrow("unresolved outcome");
+        await expect(checkCodexRedemptionFence(journal, alias, {
+          ...explicit, credential: { ...explicit.credential, accountId: undefined },
+        })).rejects.toThrow("unresolved outcome");
         expect(await journal.accountOutcomePending(member)).toBe(true);
-        expect(await journal.accountOutcomePending(reporting.identity)).toBe(false);
+        const unrelated = "account-SYNTHETIC_FIXTURE-unrelated";
+        expect(await journal.accountOutcomePending(reporting.identity, unrelated)).toBe(false);
         expect(await journal.recordAttempt(poolReported.creditId, randomUUID(), alias, randomUUID(), accountId)).toBe(false);
         await a.setEnabled("identity", member, true);
         expect(await b.claim(poolReported)).toEqual({ kind: "blocked" });
@@ -275,6 +279,14 @@ if (!url && process.env.CI && !optOut) {
           ...explicit, creditId: "credit-SYNTHETIC_FIXTURE-next",
         })).resolves.toBeUndefined();
         expect(await b.claim(poolReported)).toEqual({ kind: "blocked" });
+        const missingAccountCredit = "credit-SYNTHETIC_FIXTURE-missing-account";
+        try {
+          expect(await writer.recordAttempt(missingAccountCredit, randomUUID(), member, reservation, " ")).toBe(true);
+          expect(await journal.accountOutcomePending(reporting.identity, unrelated)).toBe(true);
+          expect(await journal.recordAttempt(poolReported.creditId, randomUUID(), alias, randomUUID(), accountId)).toBe(false);
+        } finally {
+          await writer.releaseAttempt(missingAccountCredit, reservation);
+        }
       } finally {
         await sqlA`DELETE FROM codex_pool_reset_attempts WHERE credit_id = ${poolRequestedId}`;
       }

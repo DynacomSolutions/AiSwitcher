@@ -332,12 +332,16 @@ export class PgPoolResetJournal {
   }
 
   async accountOutcomePending(identity: string, accountId?: string): Promise<boolean> {
+    const account = accountId?.trim() || null;
+    // Without both account IDs, distinct identity names cannot rule out an alias.
     const [row] = await this.sql`SELECT EXISTS (
       SELECT 1 FROM codex_pool_reset_attempts
-      WHERE outcome IS NULL AND consumed_at IS NULL AND (identity = ${identity} OR account_id = ${accountId ?? null})
+      WHERE outcome IS NULL AND consumed_at IS NULL
+        AND (identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
       UNION ALL
       SELECT 1 FROM codex_auto_reset_claims
-      WHERE spend_pending AND (identity = ${identity} OR account_id = ${accountId ?? null})
+      WHERE spend_pending
+        AND (identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
     ) AS pending`;
     return row.pending === true;
   }
@@ -352,14 +356,17 @@ export class PgPoolResetJournal {
   }
 
   async recordAttempt(creditId: string, redeemRequestId: string, identity: string, reservationId: string, accountId?: string): Promise<boolean> {
+    const account = accountId?.trim() || null;
     const rows = await this.sql`INSERT INTO codex_pool_reset_attempts (credit_id, redeem_request_id, identity, reservation_id, account_id)
-      SELECT ${creditId}, ${redeemRequestId}::uuid, ${identity}, ${reservationId}::uuid, ${accountId ?? null}
+      SELECT ${creditId}, ${redeemRequestId}::uuid, ${identity}, ${reservationId}::uuid, ${account}
       WHERE NOT EXISTS (
         SELECT 1 FROM codex_pool_reset_attempts
-        WHERE outcome IS NULL AND consumed_at IS NULL AND (identity = ${identity} OR account_id = ${accountId ?? null})
+        WHERE outcome IS NULL AND consumed_at IS NULL
+          AND (identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
       ) AND NOT EXISTS (
         SELECT 1 FROM codex_auto_reset_claims
-        WHERE spend_pending AND (identity = ${identity} OR account_id = ${accountId ?? null})
+        WHERE spend_pending
+          AND (identity = ${identity} OR account_id = ${account} OR account_id IS NULL OR ${account}::text IS NULL)
       )
       ON CONFLICT DO NOTHING RETURNING credit_id`;
     return rows.length === 1;

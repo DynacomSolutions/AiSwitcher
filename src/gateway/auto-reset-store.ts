@@ -318,7 +318,8 @@ export class PgAutoResetStore implements AutoResetStore {
   }
 
   async beginSpend(redeemRequestId: string, identity: string, accountId?: string): Promise<boolean> {
-    const rows = await this.sql`UPDATE codex_auto_reset_claims SET account_id = ${accountId ?? null}, spend_pending = true
+    const account = accountId?.trim() || null;
+    const rows = await this.sql`UPDATE codex_auto_reset_claims SET account_id = ${account}, spend_pending = true
       WHERE redeem_request_id = ${redeemRequestId}::uuid AND status = 'pending' AND identity = ${identity}
         AND NOT spend_pending AND credited_id IS NULL
       RETURNING credit_id`;

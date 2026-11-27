@@ -22,7 +22,14 @@ const review: PoolResetReview = {
   members: [candidate.identity], availability: "available", candidate,
 };
 
-function fixture(options: { gatewayMs?: number; consoleMs?: number; activationEnabled?: boolean; confirmWait?: Promise<void>; stallFetch?: boolean } = {}) {
+function fixture(options: {
+  gatewayMs?: number;
+  consoleMs?: number;
+  activationEnabled?: boolean;
+  confirmWait?: Promise<void>;
+  confirmStarted?: () => void;
+  stallFetch?: boolean;
+} = {}) {
   let spendCalls = 0;
   let forwarded = 0;
   let invalidateCalls = 0;
@@ -39,6 +46,7 @@ function fixture(options: { gatewayMs?: number; consoleMs?: number; activationEn
       confirm: async (name, selection, signal) => {
         expect(name).toBe(pool);
         expect(selection).toEqual(confirmation);
+        options.confirmStarted?.();
         await options.confirmWait;
         signal.throwIfAborted();
         spendCalls++;
@@ -125,6 +133,20 @@ const consolePost = {
   headers: { Host: "localhost:47129", Authorization: `Bearer ${CONSOLE}`, "X-AIS-Console": "1" },
   body: JSON.stringify(confirmation),
 };
+
+test("cancelling the Console request stops gateway confirmation before spend", async () => {
+  const started = Promise.withResolvers<void>();
+  const preflight = Promise.withResolvers<void>();
+  const caller = new AbortController();
+  const { consoleApp, state } = fixture({ confirmWait: preflight.promise, confirmStarted: started.resolve });
+  const request = consoleApp.request(`/api${path}`, { ...consolePost, signal: caller.signal });
+  await started.promise;
+  caller.abort();
+  preflight.resolve();
+  const response = await request;
+  expect(await response.json()).toEqual({ status: "pending" });
+  expect(state()).toEqual({ spendCalls: 0, forwarded: 1, invalidateCalls: 1 });
+});
 
 test("gateway returns pending even if confirmation preflight ignores the deadline", async () => {
   const preflight = Promise.withResolvers<void>();

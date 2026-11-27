@@ -586,6 +586,7 @@ takes `{"name":"example","enabled":true}` and returns the saved name and setting
 
 Before a pool or automatic reset POST, the gateway commits an account guard in PostgreSQL under the shared redemption lock.
 All gateway reset routes check the guard by canonical identity or provider account ID.
+If either credential lacks a provider account ID, the guard blocks the spend because the gateway cannot rule out an alias.
 Pending accounts remain in pool usage calculations. The gateway excludes their credits from reset selection.
 
 A valid provider outcome records both credit IDs and clears the account guard in one write.

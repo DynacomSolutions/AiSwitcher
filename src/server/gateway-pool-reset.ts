@@ -61,7 +61,11 @@ export function registerGatewayPoolReset(app: Hono, deps: GatewayPoolDeps = {}, 
       return { result: result ?? { status: "pending" } satisfies PoolResetResult, status: result ? response.status : 200 };
     };
     const { result, status } = isPost
-      ? await withPoolResetDeadline(deps.confirmTimeoutMs ?? CONSOLE_POOL_CONFIRM_MS, roundTrip, { result: { status: "pending" }, status: 200 })
+      ? await withPoolResetDeadline(
+        deps.confirmTimeoutMs ?? CONSOLE_POOL_CONFIRM_MS,
+        (deadline) => roundTrip(AbortSignal.any([c.req.raw.signal, deadline])),
+        { result: { status: "pending" }, status: 200 },
+      )
       : await roundTrip();
     if (isPost && status === 200 && (result.status === "confirmed" || result.status === "pending")) onReset?.(result.status);
     return Response.json(result, { status, headers: { "cache-control": "no-store" } });
