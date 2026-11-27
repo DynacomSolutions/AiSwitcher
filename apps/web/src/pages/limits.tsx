@@ -36,7 +36,7 @@ import { api } from "@/lib/api";
 import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { canSpendCodexReset, creditsAreLastKnown, spendCreditSentence } from "@/lib/codex-reset";
+import { canSpendCodexReset, creditReadAt, creditsAreLastKnown, spendCreditSentence } from "@/lib/codex-reset";
 import { formatResetTimes } from "@/lib/reset-time";
 import { AccountWarnings } from "@/components/account-line";
 import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseCodexResetResult, UseResetResult } from "@/types/api";
@@ -364,7 +364,7 @@ function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: T
             {canSpendCodex ? <ResetCreditAction ariaLabel={`Use reset on ${result.identity.name}`} onClick={() => setUsingCodex(true)} /> : null}
           </div>
         </div>
-        {usingCodex ? <UseCodexResetDialog identity={result.identity.name} availableCount={reset.availableCount} lastKnown={creditsAreLastKnown(result)} {...(result.capturedAt ? { readAt: result.capturedAt } : {})} onClose={() => setUsingCodex(false)} /> : null}
+        {usingCodex ? <UseCodexResetDialog identity={result.identity.name} availableCount={reset.availableCount} lastKnown={creditsAreLastKnown(result)} {...(creditReadAt(result) ? { readAt: creditReadAt(result)! } : {})} onClose={() => setUsingCodex(false)} /> : null}
       </>
     );
   }

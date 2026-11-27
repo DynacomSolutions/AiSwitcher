@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { canSpendCodexReset, creditsAreLastKnown, spendCreditSentence, SPEND_LOCK_MS } from "../src/lib/codex-reset.ts";
+import { canSpendCodexReset, creditReadAt, creditsAreLastKnown, spendCreditSentence, SPEND_LOCK_MS } from "../src/lib/codex-reset.ts";
 import { adjustRefreshCounts, applyRefreshedLimits, isIdentityRefreshing, limitsRefetchInterval, POLL, reconcileLimits } from "../src/lib/limits-reconciliation.ts";
 import type { LimitsResponse, ToolLimitResult } from "../src/types/api.ts";
 
@@ -91,6 +91,21 @@ describe("manual refresh of limits", () => {
     expect(next?.results[0]?.windows[0]?.usedPercent).toBe(5);
   });
 
+  test("a host-scan row never replaces a gateway card, for any tool", () => {
+    const card = (toolName: "codex" | "claude"): ToolLimitResult => ({ ...codexRow("member-a", 90, 1), toolName, manualReset: { availableCount: 2, readAt: capturedAt(1) } });
+    for (const tool of ["codex", "claude"] as const) {
+      const current = payload(card(tool));
+      const hostRow: ToolLimitResult = { ...card(tool), gatewayManaged: false, status: "unavailable", windows: [], error: "gateway unreachable" };
+      delete (hostRow as { manualReset?: unknown }).manualReset;
+      const next = applyRefreshedLimits(current, [payload(hostRow)]);
+      expect(next?.results[0]).toBe(current.results[0]!);
+      expect(next?.results[0]?.manualReset?.availableCount).toBe(2);
+    }
+    // A gateway row still replaces a host row, and a gateway row replaces a gateway row.
+    const hostOnScreen: ToolLimitResult = { ...codexRow("member-a", 90, 1), gatewayManaged: false };
+    expect(applyRefreshedLimits(payload(hostOnScreen), [payload(codexRow("member-a", 5, 500))])?.results[0]?.windows[0]?.usedPercent).toBe(5);
+  });
+
   test("an empty answer or no cached data changes nothing", () => {
     const current = payload(codexRow("member-a", 90, 1));
     expect(applyRefreshedLimits(current, [payload()])).toBe(current);
@@ -179,6 +194,12 @@ describe("overlapping refresh calls", () => {
 });
 
 describe("the spend dialog on a cached card", () => {
+  test("the dialog age comes from the credit read, never from the usage reading", () => {
+    const row: ToolLimitResult = { ...codexRow("a", 1, 500), manualReset: { availableCount: 2, readAt: capturedAt(100) } };
+    expect(creditReadAt(row)).toBe(capturedAt(100));
+    expect(creditReadAt({ ...row, manualReset: { availableCount: 2 } })).toBeUndefined();
+  });
+
   test("a live count is a fact, and a cached one says last known with its age", () => {
     expect(spendCreditSentence(3, false, undefined)).toBe("This spends one of 3 available reset credits on this Codex account.");
     const now = Date.parse("2026-11-27T10:00:00.000Z");

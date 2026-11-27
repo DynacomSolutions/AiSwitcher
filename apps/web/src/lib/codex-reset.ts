@@ -28,6 +28,11 @@ export function spendCreditSentence(availableCount: number, lastKnown: boolean, 
   return `This spends one reset credit on this Codex account. The last known count is ${availableCount}${age}, so it may be out of date.`;
 }
 
+/** When the gateway read the credit list from OpenAI. The usage reading time is another read and never stands in for it. */
+export function creditReadAt(row: ToolLimitResult): string | undefined {
+  return row.manualReset?.readAt;
+}
+
 /** Whether the credit count on a Codex card is the last known one and not a fresh read. */
 export function creditsAreLastKnown(row: ToolLimitResult): boolean {
   return row.status !== "live" || row.manualReset?.stale === true;

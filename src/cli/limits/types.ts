@@ -92,6 +92,8 @@ export interface ManualResetInfo {
   stale?: boolean;
   /** Codex only: each available credit with its exact expiry (ISO), for the reset-expiry push. */
   creditExpiries?: { id: string; label?: string; endsAt: string }[];
+  /** Codex only: when the gateway read the credit list from OpenAI (ISO). A stale list keeps the time of its own read. */
+  readAt?: string;
 }
 
 /** What one reset grant clears: every limit, only the Fable model's weekly limit, or something not recognised. */

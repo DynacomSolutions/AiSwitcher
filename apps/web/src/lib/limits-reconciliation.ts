@@ -70,6 +70,8 @@ export function applyRefreshedLimits(current: LimitsResponse | undefined, refres
   const results = current.results.map((row) => {
     const next = byKey.get(`${row.toolName}\u0000${row.identity.name}`);
     if (!next) return row;
+    // A gateway card stays when the refresh brings a host-scan row (the gateway was down or the read timed out): the host row has no reset button and no credits.
+    if (row.gatewayManaged && !next.gatewayManaged) return row;
     const { resetPendingUntil: _pending, ...clean } = next;
     return keepSpentAt({ ...clean, identity: row.identity }, row);
   });

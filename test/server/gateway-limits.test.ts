@@ -155,6 +155,12 @@ describe("mapGatewayLimitRow: codex, kimi, zai", () => {
     expect(mapGatewayLimitRow({ provider: "codex", identity: "a", status: "live", windows: [{ label: "week", utilization: 0 }], manualReset: { availableCount: 0 } })?.manualReset).toEqual({ availableCount: 0 });
   });
 
+  test("Codex gateway reset credits keep the time of the credit read, and drop a bad one", () => {
+    const row = (readAt: unknown) => mapGatewayLimitRow({ provider: "codex", identity: "a", status: "live", windows: [{ label: "week", utilization: 0 }], manualReset: { availableCount: 1, readAt } })!;
+    expect(row("2026-11-27T09:00:00.000Z").manualReset?.readAt).toBe("2026-11-27T09:00:00.000Z");
+    expect(row("not a date").manualReset).not.toHaveProperty("readAt");
+  });
+
   test("scheduled provider windows stay visible without inventing manual reset credits", () => {
     for (const provider of ["kimi", "grok", "zai", "ali", "opencode"]) {
       const row = mapGatewayLimitRow({

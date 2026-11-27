@@ -136,6 +136,7 @@ function parseCodexReset(raw: unknown): ManualResetInfo | undefined {
     ...(typeof m.label === "string" ? { label: m.label } : {}),
     ...(typeof m.expiresAt === "string" ? { expiresAt: m.expiresAt } : {}),
     ...(creditExpiries ? { creditExpiries } : {}),
+    ...(typeof m.readAt === "string" && Number.isFinite(Date.parse(m.readAt)) ? { readAt: new Date(m.readAt).toISOString() } : {}),
     ...(m.stale === true ? { stale: true } : {}),
   };
 }
