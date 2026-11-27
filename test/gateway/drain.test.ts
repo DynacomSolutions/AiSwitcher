@@ -10,7 +10,7 @@ function clock() {
 describe("drain timing", () => {
   test("defaults, environment and overrides, in that order", () => {
     expect(drainTiming({})).toEqual(DEFAULT_DRAIN_TIMING);
-    expect(drainTiming({ AIS_GATEWAY_DRAIN_SETTLE_QUIET_MS: "500", AIS_GATEWAY_DRAIN_CEILING_MS: "840000", AIS_GATEWAY_DRAIN_CUT_HOLD_MS: "x" })).toMatchObject({ settleQuietMs: 500, ceilingMs: 840_000, cutHoldMs: 20_000 });
+    expect(drainTiming({ AIS_GATEWAY_DRAIN_SETTLE_QUIET_MS: "500", AIS_GATEWAY_DRAIN_CEILING_MS: "840000", AIS_GATEWAY_DRAIN_CUT_HOLD_MS: "x" })).toMatchObject({ settleQuietMs: 500, ceilingMs: 840_000, cutHoldMs: DEFAULT_DRAIN_TIMING.cutHoldMs });
     expect(drainTiming({ AIS_GATEWAY_DRAIN_SETTLE_QUIET_MS: "500" }, { settleQuietMs: 10 }).settleQuietMs).toBe(10);
   });
 });
