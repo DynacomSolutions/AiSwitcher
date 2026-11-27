@@ -185,11 +185,15 @@ for (const vp of [{ width: 360, height: 740 }, { width: 1280, height: 900 }, { w
       // One list: no separate renewal table, no second card.
       expect(m.tables, detail).toBe(0);
       expect(m.text).not.toContain("Scheduled credential renewal");
-      for (const label of ["Auth state", "Expires", "Last renewal", "Next renewal", "Renewed by", "Last error"]) expect(m.text.toLowerCase(), label).toContain(label.toLowerCase());
+      for (const label of ["Auth state", "Kind", "Expires", "Last renewal", "Next renewal", "Renewed by", "Renewal status", "Detail and last error"]) expect(m.text.toLowerCase(), label).toContain(label.toLowerCase());
       expect(m.text).toContain("refresh_token_invalidated");
       expect(m.text).toContain("Gateway");
-      // The two row actions that exist today.
-      expect(await page.eval<number>(`[...document.querySelectorAll('main button')].filter(b => b.textContent.trim() === 'Refresh now').length`)).toBe(1);
+      // The renewal status of each kind of row, and the probe detail of a healthy row.
+      for (const text of ["Sign-in needed", "Renewing", "Members renewed by the gateway", "token valid", "via gateway: renewed", "oauth", "apikey"]) expect(m.text, text).toContain(text);
+      // The host row has two different actions, each with its own label.
+      expect(await page.eval<number>(`[...document.querySelectorAll('main button')].filter(b => b.textContent.trim() === 'Run host renewal').length`)).toBe(1);
+      expect(await page.eval<number>(`[...document.querySelectorAll('main button')].filter(b => b.textContent.trim() === 'Refresh token').length`)).toBe(1);
+      expect(await page.eval<number>(`[...document.querySelectorAll('main button')].filter(b => b.textContent.trim() === 'Refresh now').length`)).toBe(0);
       expect(await page.eval<number>(`[...document.querySelectorAll('main button')].filter(b => b.textContent.trim() === 'Log in').length`)).toBeGreaterThanOrEqual(4);
       expect(m.scrollWidth <= m.clientWidth, detail).toBe(true);
       expect(m.offenders, detail).toEqual([]);
@@ -220,6 +224,31 @@ for (const vp of [{ width: 360, height: 740 }, { width: 1280, height: 900 }, { w
       expect(await page.eval<string>("location.search")).toBe("?q=kimi");
       expect(await page.eval<number>("history.length")).toBe(before);
       expect(await rowKeys()).toEqual(["kimi/SYNTHETIC_FIXTURE-kimi-host"]);
+    }, 60_000);
+
+    test("the sort direction button writes dir to the URL with history replace", async () => {
+      await setViewport(vp.width, vp.height);
+      await openAuth("?sort=identity");
+      const before = await page.eval<number>("history.length");
+      const first = (await rowKeys())[0];
+      const click = () => page.eval(`[...document.querySelectorAll('main button')].find(b => /^(Ascending|Descending)$/.test(b.textContent.trim())).click()`);
+      await click();
+      await waitFor("descending URL", 5_000, async () => (await page.eval<string>("location.search")) === "?sort=identity&dir=desc");
+      expect((await rowKeys())[0]).not.toBe(first);
+      expect(await page.eval<string>(`[...document.querySelectorAll('main button')].find(b => /^(Ascending|Descending)$/.test(b.textContent.trim())).textContent.trim()`)).toBe("Descending");
+      await click();
+      await waitFor("ascending URL", 5_000, async () => (await page.eval<string>("location.search")) === "?sort=identity");
+      expect((await rowKeys())[0]).toBe(first);
+      expect(await page.eval<number>("history.length")).toBe(before);
+    }, 60_000);
+
+    test("an unknown tool in the URL shows every tool and the address is corrected with history replace", async () => {
+      await setViewport(vp.width, vp.height);
+      await openAuth("?tool=nope&sort=tool");
+      expect((await rowKeys()).sort()).toEqual([...KEYS].sort());
+      await waitFor("corrected URL", 5_000, async () => (await page.eval<string>("location.search")) === "?sort=tool");
+      expect(await page.eval<string>(`document.querySelector('main').innerText.includes('No matches')`)).toBe(false);
+      expect(await page.eval<string>(`document.querySelector('main [role=combobox][aria-label=Tool]').textContent.trim()`)).toBe("All tools");
     }, 60_000);
 
     test("every control is reachable with the keyboard and shows its focus", async () => {

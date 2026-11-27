@@ -46,12 +46,57 @@ describe("combineAuthRows", () => {
   });
 });
 
+describe("renewal information on each row", () => {
+  const host = (tool: string, identity: string, over: Partial<NonNullable<RenewalRow["host"]>> = {}): RenewalRow => ({
+    tool, identity, renewer: "host", gateway: null, note: "",
+    host: { lastAttemptAt: "2026-11-27T05:00:00.000Z", lastSuccessAt: "2026-11-27T05:00:00.000Z", lastError: null, lastDetail: null, revoked: false, consecutiveFailures: 0, running: false, ...over },
+  });
+  const make = (entries: AuthEntry[], renewals: RenewalRow[]) => combineAuthRows(entries, renewals, NOW);
+  test("each row carries its kind and its renewal status label", () => {
+    expect(rows.find((r) => r.key === "codex/b-codex")).toMatchObject({ kind: "oauth", status: { tone: "ok", label: "Renewing" } });
+    expect(rows.find((r) => r.key === "codex/c-dead")).toMatchObject({ status: { tone: "destructive", label: "Sign-in needed" } });
+    expect(rows.find((r) => r.key === "zai/d-key")).toMatchObject({ kind: "apikey", status: null });
+    expect(rows.find((r) => r.key === "grok/f-renewal-only")).toMatchObject({ kind: null });
+  });
+  test("the status label covers a failed refresh, repeated failures, a missing admin and a pool", () => {
+    const list = make(
+      [entry("claude", "pool-a", { kind: "none", state: "gateway" })],
+      [
+        gw("codex", "failed", { lastError: { at: "2026-11-27T05:30:00.000Z", code: "transport", detail: "x" } }),
+        host("kimi", "three", { consecutiveFailures: 3, lastError: "boom" }),
+        host("kimi", "detail", { lastDetail: "kept fresh by another host" }),
+        { tool: "grok", identity: "no-admin", renewer: "gateway", gateway: null, gatewayState: "unconfigured", note: "", host: null },
+        { tool: "claude", identity: "pool-a", renewer: "pool", gateway: null, note: "", host: null },
+      ],
+    );
+    const label = (key: string) => list.find((r) => r.key === key)?.status?.label;
+    expect(label("codex/failed")).toBe("Last refresh failed");
+    expect(label("kimi/three")).toBe("3 failures in a row");
+    expect(label("kimi/detail")).toBe("kept fresh by another host");
+    expect(label("grok/no-admin")).toBe("Gateway admin not set up here");
+    expect(label("claude/pool-a")).toBe("Members renewed by the gateway");
+  });
+  test("the probe detail shows for a healthy row and not for a retired row", () => {
+    const list = make([entry("codex", "ok-one", { detail: "via gateway: renewed" }), entry("codex", "old", { state: "retired", detail: "retired" })], []);
+    expect(list.find((r) => r.key === "codex/ok-one")?.detail).toBe("via gateway: renewed");
+    expect(list.find((r) => r.key === "codex/old")?.detail).toBeNull();
+  });
+  test("the text filter finds a status label", () => {
+    expect(keys(visibleAuthRows(rows, readAuthParams(new URLSearchParams("q=sign-in needed"))))).toEqual(["codex/c-dead"]);
+  });
+});
+
 describe("URL state", () => {
   test("an empty URL reads the defaults", () => {
     expect(readAuthParams(new URLSearchParams(""))).toEqual({ q: "", tool: "", state: "all", sort: "default", dir: "asc" });
   });
   test("an unknown value falls back to the default", () => {
     expect(readAuthParams(new URLSearchParams("sort=nope&state=weird&dir=sideways"))).toMatchObject({ sort: "default", state: "all", dir: "asc" });
+  });
+  test("an unknown tool reads as all tools once the tools are known", () => {
+    expect(readAuthParams(new URLSearchParams("tool=nope&sort=tool"), ["claude", "codex"])).toMatchObject({ tool: "", sort: "tool" });
+    expect(readAuthParams(new URLSearchParams("tool=codex"), ["claude", "codex"]).tool).toBe("codex");
+    expect(withAuthParam(new URLSearchParams("tool=nope&sort=tool"), "tool", "").toString()).toBe("sort=tool");
   });
   test("a default value leaves no key and the other keys stay", () => {
     const p = withAuthParam(new URLSearchParams("tool=codex&sort=expires&dir=desc"), "sort", "default");

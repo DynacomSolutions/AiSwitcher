@@ -374,6 +374,7 @@ function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: stri
             variant="outline"
             size="sm"
             disabled={refreshMutation.isPending}
+            title="Ask the provider for a new token now"
             onClick={() => refreshMutation.mutate(entry.identity)}
           >
             Refresh token
@@ -413,14 +414,16 @@ function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: stri
 function Cell({ label, className, children }: { label: string; className?: string; children: ReactNode }) {
   return (
     <div className={cn("min-w-0 space-y-0.5", className)}>
-      <span className="block text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[76rem]:sr-only">{label}</span>
+      <span className="block text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[84rem]:sr-only">{label}</span>
       <div className="min-w-0 text-xs">{children}</div>
     </div>
   );
 }
 
 /** Grid of the wide layout. The narrow layout stacks each row as a card. */
-const GRID = "@[76rem]:grid-cols-[minmax(10rem,1.4fr)_6.5rem_5.5rem_7rem_7rem_6rem_minmax(7rem,1.2fr)_17rem]";
+const GRID = "@[84rem]:grid-cols-[minmax(9rem,1.3fr)_6rem_4.5rem_5rem_6.5rem_6.5rem_5.5rem_minmax(8rem,1fr)_minmax(6rem,1fr)_14rem]";
+
+const TONE_VARIANT = { ok: "success", warning: "warning", destructive: "destructive", muted: "secondary" } as const;
 
 function AuthRowView({ row, onFlow }: { row: AuthListRow; onFlow: (flowId: string) => void }) {
   const qc = useQueryClient();
@@ -440,9 +443,9 @@ function AuthRowView({ row, onFlow }: { row: AuthListRow; onFlow: (flowId: strin
     <li
       data-slot="auth-row"
       data-key={row.key}
-      className={cn("grid grid-cols-2 items-start gap-x-4 gap-y-3 p-3 @2xl:grid-cols-5 @[76rem]:gap-x-3 @[76rem]:py-2.5", GRID)}
+      className={cn("grid grid-cols-2 items-start gap-x-4 gap-y-3 p-3 @2xl:grid-cols-5 @[84rem]:gap-x-3 @[84rem]:py-2.5", GRID)}
     >
-      <div className="col-span-2 min-w-0 space-y-1 @2xl:col-span-5 @[76rem]:col-span-1">
+      <div className="col-span-2 min-w-0 space-y-1 @2xl:col-span-5 @[84rem]:col-span-1">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <ToolBadge tool={row.tool} />
           <span className="min-w-0 break-all text-sm font-medium">{row.identity}</span>
@@ -452,27 +455,39 @@ function AuthRowView({ row, onFlow }: { row: AuthListRow; onFlow: (flowId: strin
       <Cell label="Auth state" className="col-span-1">
         <AuthStateBadge state={row.state} />
       </Cell>
+      <Cell label="Kind" className="col-span-1">
+        {row.kind ? (
+          <Badge variant="outline" className="font-mono text-[10px]">
+            {row.kind}
+          </Badge>
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        )}
+      </Cell>
       <Cell label="Expires">
         <span title={row.entry?.expiresAt ? new Date(row.entry.expiresAt).toLocaleString() : undefined}>{row.expires}</span>
       </Cell>
       <Cell label="Last renewal">{row.lastRenewal}</Cell>
       <Cell label="Next renewal">{row.nextRenewal}</Cell>
       <Cell label="Renewed by">{row.renewedBy}</Cell>
-      <Cell label="Last error" className="col-span-2 @2xl:col-span-5 @[76rem]:col-span-1">
+      <Cell label="Renewal status" className="col-span-2 @2xl:col-span-1">
+        {row.status ? <Badge variant={TONE_VARIANT[row.status.tone]}>{row.status.label}</Badge> : <span className="text-muted-foreground">-</span>}
+      </Cell>
+      <Cell label="Detail and last error" className="col-span-2 @2xl:col-span-5 @[84rem]:col-span-1">
         {row.error ? (
           <span className="block break-words text-destructive" title={row.error}>
             {row.error}
           </span>
-        ) : (
+        ) : row.detail ? null : (
           <span className="text-muted-foreground">-</span>
         )}
-        {entry?.detail && !["ok", "retired"].includes(row.state) ? <span className="mt-0.5 block break-words text-muted-foreground">{entry.detail}</span> : null}
+        {row.detail ? <span className="mt-0.5 block break-words text-muted-foreground">{row.detail}</span> : null}
       </Cell>
-      <div className="col-span-2 flex flex-wrap justify-start gap-1.5 @2xl:col-span-5 @[76rem]:col-span-1 @[76rem]:justify-end">
+      <div className="col-span-2 flex flex-wrap justify-start gap-1.5 @2xl:col-span-5 @[84rem]:col-span-1 @[84rem]:justify-end">
         {entry && !row.retired ? <FixActions entry={entry} onFlow={onFlow} /> : null}
         {row.canRefreshHere ? (
-          <Button variant="outline" size="sm" disabled={refreshMutation.isPending || running} onClick={() => refreshMutation.mutate()}>
-            {running || refreshMutation.isPending ? "Refreshing…" : "Refresh now"}
+          <Button variant="outline" size="sm" title="Run the renewal pass of this host for this login now" disabled={refreshMutation.isPending || running} onClick={() => refreshMutation.mutate()}>
+            {running || refreshMutation.isPending ? "Renewing…" : "Run host renewal"}
           </Button>
         ) : null}
       </div>
@@ -487,10 +502,17 @@ function AuthList({ onFlow }: { onFlow: (flowId: string) => void }) {
   const authQuery = useAuthQuery();
   const renewalQuery = useAuthRefreshQuery();
   const [searchParams, setSearchParams] = useSearchParams();
-  const params = readAuthParams(searchParams);
+  const rows = combineAuthRows(authQuery.data?.entries ?? [], renewalQuery.data?.rows ?? []);
+  const toolNames = authTools(rows);
+  const listLoaded = rows.length > 0;
+  const params = readAuthParams(searchParams, listLoaded ? toolNames : undefined);
+  const unknownTool = listLoaded && (searchParams.get("tool") ?? "") !== params.tool;
+  // An unknown tool in the URL reads as "all tools"; the address is corrected with history replace.
+  useEffect(() => {
+    if (unknownTool) setSearchParams(withAuthParam(searchParams, "tool", ""), { replace: true });
+  }, [unknownTool, searchParams, setSearchParams]);
   const setParam = (key: keyof AuthListParams, value: string) => setSearchParams(withAuthParam(searchParams, key, value), { replace: true });
 
-  const rows = combineAuthRows(authQuery.data?.entries ?? [], renewalQuery.data?.rows ?? []);
   const visible = visibleAuthRows(rows, params);
   const attention = rows.filter((r) => r.attention).length;
   const gatewayState = renewalQuery.data?.gateway?.state;
@@ -532,7 +554,7 @@ function AuthList({ onFlow }: { onFlow: (flowId: string) => void }) {
             <SelectItem value={ALL} className="text-xs">
               All tools
             </SelectItem>
-            {authTools(rows).map((tool) => (
+            {toolNames.map((tool) => (
               <SelectItem key={tool} value={tool} className="text-xs">
                 {tool}
               </SelectItem>
@@ -580,14 +602,16 @@ function AuthList({ onFlow }: { onFlow: (flowId: string) => void }) {
         <EmptyState title="No matches" description="No credential matches these filters." />
       ) : (
         <div className="@container overflow-hidden rounded-xl border">
-          <div aria-hidden className={cn("hidden border-b bg-muted/40 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[76rem]:grid @[76rem]:gap-x-3", GRID)}>
+          <div aria-hidden className={cn("hidden border-b bg-muted/40 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[84rem]:grid @[84rem]:gap-x-3", GRID)}>
             <span>Identity</span>
             <span>Auth state</span>
+            <span>Kind</span>
             <span>Expires</span>
             <span>Last renewal</span>
             <span>Next renewal</span>
             <span>Renewed by</span>
-            <span>Last error</span>
+            <span>Renewal status</span>
+            <span>Detail, last error</span>
             <span className="text-right">Actions</span>
           </div>
           <ul className="divide-y">

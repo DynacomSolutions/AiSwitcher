@@ -1,6 +1,6 @@
-import type { AuthEntry, AuthState, RenewalRow } from "../types/api";
+import type { AuthEntry, AuthKind, AuthState, RenewalRow } from "../types/api";
 import { relTime, relUntil } from "./format";
-import { renewalView } from "./renewal-view";
+import { renewalView, type RenewalView } from "./renewal-view";
 
 /** Pure model of the Auth page list: one row per identity and tool, joined from the auth probe and the renewal report. */
 
@@ -36,13 +36,17 @@ export const AUTH_STATE_LABELS: Record<AuthStateFilter, string> = {
   ok: "Healthy",
 };
 
-/** Reads the list view from the URL. An unknown value falls back to the default, so an old or hand-made link still opens. */
-export function readAuthParams(params: URLSearchParams): AuthListParams {
+/**
+ * Reads the list view from the URL. An unknown value falls back to the default, so an old or hand-made link still opens.
+ * With `knownTools` (the tools of the loaded list), an unknown tool reads as "all tools".
+ */
+export function readAuthParams(params: URLSearchParams, knownTools?: readonly string[]): AuthListParams {
   const sort = params.get("sort") as AuthSortKey | null;
   const state = params.get("state") as AuthStateFilter | null;
+  const tool = params.get("tool");
   return {
     q: params.get("q") ?? "",
-    tool: params.get("tool") ?? "",
+    tool: tool && (!knownTools || knownTools.includes(tool)) ? tool : "",
     state: state && STATE_FILTERS.includes(state) ? state : "all",
     sort: sort && SORT_KEYS.includes(sort) ? sort : "default",
     dir: params.get("dir") === "desc" ? "desc" : "asc",
@@ -67,6 +71,12 @@ export interface AuthListRow {
   entry: AuthEntry | null;
   renewal: RenewalRow | null;
   state: AuthState;
+  /** How the identity signs in (oauth, apikey, cookie, none), or null when only the renewal report names it. */
+  kind: AuthKind | null;
+  /** The renewal status of the row (label and tone), or null when no renewal row exists. */
+  status: RenewalView["status"] | null;
+  /** The auth probe detail. Retired rows show none. */
+  detail: string | null;
   retired: boolean;
   /** True when something needs a person: the auth state is not healthy, or the renewal shows an error or a sign-in need. */
   attention: boolean;
@@ -117,6 +127,9 @@ export function combineAuthRows(entries: readonly AuthEntry[], renewals: readonl
       entry,
       renewal,
       state,
+      kind: entry?.kind ?? null,
+      status: view?.status ?? null,
+      detail: state === "retired" ? null : entry?.detail ?? null,
       retired: state === "retired",
       attention: (!HEALTHY.has(state) || view?.status.tone === "destructive" || view?.status.tone === "warning" || error !== null) && state !== "retired",
       expires: view && view.expires !== DASH ? view.expires : expiresIso ? relUntil(expiresIso, nowMs) : DASH,
@@ -146,7 +159,7 @@ function matches(row: AuthListRow, params: AuthListParams): boolean {
   if (params.state === "ok" && (row.attention || row.retired)) return false;
   const needle = params.q.trim().toLowerCase();
   if (!needle) return true;
-  const hay = [row.tool, row.identity, row.entry?.account?.email, row.entry?.detail, row.renewedBy, row.error, row.state].filter(Boolean).join(" ").toLowerCase();
+  const hay = [row.tool, row.identity, row.entry?.account?.email, row.detail, row.kind, row.status?.label, row.renewedBy, row.error, row.state].filter(Boolean).join(" ").toLowerCase();
   return hay.includes(needle);
 }
 
