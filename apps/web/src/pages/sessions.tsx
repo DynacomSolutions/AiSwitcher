@@ -1,3 +1,4 @@
+import { ProviderLabel } from "@/components/provider-icon";
 import { Bot, ChevronDown, ChevronRight, Circle, ListCollapse, ListTree } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
@@ -395,7 +396,7 @@ export function SessionsPage() {
             </SelectItem>
             {toolOptions.map((name) => (
               <SelectItem key={name} value={name} className="text-xs">
-                {name}
+                <ProviderLabel provider={name} />
               </SelectItem>
             ))}
           </SelectContent>
@@ -410,7 +411,7 @@ export function SessionsPage() {
             </SelectItem>
             {identityOptions.map((name) => (
               <SelectItem key={name} value={name} className="text-xs">
-                {name}
+                <ProviderLabel provider={name} />
               </SelectItem>
             ))}
           </SelectContent>

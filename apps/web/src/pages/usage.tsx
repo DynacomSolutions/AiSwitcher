@@ -131,7 +131,7 @@ function FilterSelect({ label, value, onChange, options, width = "w-40" }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
-  options: { value: string; label: string }[];
+  options: { value: string; label: string; provider?: boolean }[];
   width?: string;
 }) {
   return (
@@ -142,7 +142,7 @@ function FilterSelect({ label, value, onChange, options, width = "w-40" }: {
       <SelectContent>
         {options.map((option) => (
           <SelectItem key={option.value} value={option.value} className="text-xs">
-            {option.label}
+            {option.provider ? <ProviderLabel provider={option.label} /> : option.label}
           </SelectItem>
         ))}
       </SelectContent>
@@ -472,7 +472,7 @@ export function UsagePage() {
 
       {ready ? (
         <div className="flex flex-wrap items-center gap-2">
-          <FilterSelect label="Provider" value={provider} onChange={setProvider} options={[{ value: "all", label: "All providers" }, ...providerOptions.map((p) => ({ value: p, label: p }))]} />
+          <FilterSelect label="Provider" value={provider} onChange={setProvider} options={[{ value: "all", label: "All providers" }, ...providerOptions.map((p) => ({ value: p, label: p, provider: true }))]} />
           <FilterSelect label="Identity" value={identity} onChange={setIdentity} options={[{ value: "all", label: "All identities" }, ...identityOptions.map((i) => ({ value: i, label: i }))]} />
           <FilterSelect label="Model" value={model} onChange={setModel} options={[{ value: "all", label: "All models" }, ...modelOptions.map((m) => ({ value: m, label: m }))]} width="w-52" />
           <FilterSelect label="Period" value={String(since)} onChange={(v) => setSince(Number(v) as SinceDays)} options={SINCE_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))} width="w-32" />

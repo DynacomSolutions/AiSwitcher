@@ -1,18 +1,7 @@
 import { cn } from "@/lib/utils";
+import { ProviderIcon } from "@/components/provider-icon";
 import { Badge } from "@/components/ui/badge";
 import type { AuthState } from "@/types/api";
-
-/** Per-tool accent dots: subtle brand-adjacent hues on a neutral chip. */
-const TOOL_DOT_CLASSES: Record<string, string> = {
-  claude: "bg-orange-400",
-  codex: "bg-emerald-400",
-  grok: "bg-zinc-200",
-  kimi: "bg-sky-400",
-  zai: "bg-violet-400",
-  ali: "bg-amber-400",
-  pi: "bg-pink-400",
-  opencode: "bg-teal-400",
-};
 
 export function ToolBadge({ tool, className }: { tool: string; className?: string }) {
   return (
@@ -22,10 +11,7 @@ export function ToolBadge({ tool, className }: { tool: string; className?: strin
         className,
       )}
     >
-      <span
-        aria-hidden
-        className={cn("size-1.5 rounded-full", TOOL_DOT_CLASSES[tool] ?? "bg-muted-foreground")}
-      />
+      <ProviderIcon provider={tool} size={12} />
       {tool}
     </span>
   );

@@ -49,6 +49,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useIdentitiesQuery, useAuthQuery, usePoolsUsageQuery, qk } from "@/hooks/queries";
 import { api } from "@/lib/api";
 import { addIdentityBody, addIdentityProblem, canAddGatewayIdentity } from "@/lib/gateway-identity";
+import { ProviderIcon } from "@/components/provider-icon";
 import type { AuthEntry, CreateIdentityBody, IdentityDto, RegistryDto, ToolName } from "@/types/api";
 
 interface IdentityRef {
@@ -931,6 +932,7 @@ export function IdentitiesPage() {
           <TabsList className="h-auto w-full flex-wrap justify-start">
             {registries.map((r) => (
               <TabsTrigger key={r.toolName} value={r.toolName} className="gap-2 px-3">
+                <ProviderIcon provider={r.toolName} size={13} />
                 <span className="font-mono text-xs">{r.toolName}</span>
                 <Badge variant="secondary" className="px-1.5 font-normal">
                   {r.identities.length}
