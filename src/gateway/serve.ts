@@ -24,7 +24,7 @@ import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { isOperationalPath, publicHostsFromEnv, viaPublicHost } from "./public-host.ts";
 import { aliSessionOnce, aliSetupSelfTest, listAliAccounts, type AliSetupDeps } from "./ali-session.ts";
 import { createAutoResetRecovery, type AutoResetPool, type AutoResetUsage } from "./auto-reset.ts";
-import { checkCodexRedemptionFence, codexResetRelieved, confirmPoolReset, PgPoolResetJournal, poolResetReview, poolUtilisation, type NamedGatewayPool } from "./pool-reset.ts";
+import { checkCodexRedemptionFence, codexResetRelieved, confirmPoolReset, PgPoolResetJournal, PoolResetReservationCleanup, poolResetReview, poolUtilisation, type NamedGatewayPool } from "./pool-reset.ts";
 import { POOL_THRESHOLDS_PATH, validPoolRoute, type PoolThreshold } from "./pool-reset-view.ts";
 import { PgAutoResetStore, type AutoResetStore } from "./auto-reset-store.ts";
 import { withStoreWaitTimeout } from "./admin-store.ts";
@@ -71,7 +71,7 @@ import { clearLoginRevoked, readLoginRevoked, recordLoginRevoked } from "../iden
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
 import { useClaudeReset } from "../server/claude-resets.ts";
-import { CodexResetFenced, consumeCodexResetForIdentity, type BeforeCodexPost, type CodexCreditSelection, type CodexRedemptionGuard } from "./account.ts";
+import { consumeCodexResetForIdentity, type BeforeCodexPost, type CodexCreditSelection, type CodexRedemptionGuard } from "./account.ts";
 import { MemoryResetCreditInvalidations, PgResetCreditInvalidations, type ResetCreditInvalidations } from "./reset-credit-cache.ts";
 import { createManagementCheck, GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, listGatewayManagedAccountsStrict, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
@@ -850,6 +850,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
   const resetCreditInvalidations = hooks.resetCreditInvalidations ?? (readingsSql ? new PgResetCreditInvalidations(readingsSql) : new MemoryResetCreditInvalidations());
   const poolResetJournal = readingsSql ? new PgPoolResetJournal(readingsSql) : undefined;
+  const reservationCleanup = poolResetJournal && new PoolResetReservationCleanup(
+    (creditId, reservationId) => poolResetJournal.releaseAttempt(creditId, reservationId),
+  );
   const redemptionScope = { provider: "internal-codex-redemption", identity: "gateway" };
   const localRedemptionQueue = new MemoryRefreshBackend();
   const generation = (identity: string) => bounded(resetCreditInvalidations.version(identity), 2_000, "Codex reset generation");
@@ -859,6 +862,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     try {
       const shared = await refreshBackend.acquire(redemptionScope, 15_000);
       try {
+        if (reservationCleanup?.pending) await reservationCleanup.retry();
         return await run();
       } finally {
         await shared.release().catch(() => undefined);
@@ -869,10 +873,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   }
   const withCodexRedemption: CodexRedemptionGuard = (run, automatic = false) => withRedemptionLock(() => run(async (identity, context) => {
     if (poolResetJournal) {
-      if (!automatic) await checkCodexRedemptionFence(poolResetJournal, identity, context);
-      else if (context.creditId && await bounded(poolResetJournal.manualAttempted(context.creditId), 2_000, "pool reset journal")) {
-        throw new CodexResetFenced();
-      }
+      await checkCodexRedemptionFence(poolResetJournal, identity, context, automatic ? context.redeemRequestId : undefined);
     }
     context.signal?.throwIfAborted();
     // The same locked request already advanced the generation before its first POST.
@@ -933,10 +934,6 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       now: clock,
       claim: (input, signal) => withRedemptionLock(async () => {
         signal.throwIfAborted();
-        if (poolResetJournal && await bounded(poolResetJournal.manualAttempted(input.creditId), 2_000, "pool reset journal")) {
-          return { kind: "blocked" };
-        }
-        signal.throwIfAborted();
         return autoResetConfig.store.claim(input);
       }),
       freshUsage: async (identity, signal) => {
@@ -966,7 +963,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         if (!inventory || before !== await generation(identity)) return undefined;
         const credits = inventory.creditExpiries;
         if (!poolResetJournal || !credits?.length) return inventory;
-        const attempted = await bounded(poolResetJournal.manualAttempts(credits.map(({ id }) => id)), 2_000, "pool reset journal");
+        const attempted = await bounded(poolResetJournal.usedCredits(credits.map(({ id }) => id)), 2_000, "pool reset journal");
         return { ...inventory, creditExpiries: credits.filter(({ id }) => !attempted.has(id)) };
       },
       spend: (identity, id, requestId, signal, evidence) => {
@@ -981,6 +978,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
           stillEligible: async () => proof?.has(identity) === true && evidence.stillCurrent() &&
             await generationsMatch(proof) && evidence.stillCurrent(),
           onPost: () => evidence.postAttempted(true),
+          finishPostAfterDeadline: true,
+          onReportedCredit: (reportedId) => autoResetConfig.store.recordReportedCredit(requestId, reportedId),
         });
       },
     });
@@ -1220,14 +1219,19 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const admin = createAdminApp({
     store,
     autoReset: autoResetConfig,
-    ...(poolResetJournal ? { poolReset: {
+    ...(poolResetJournal && reservationCleanup ? { poolReset: {
       thresholds: async () => {
         const groups = await Promise.all([...USAGE_READER_PROVIDERS].map((provider) => namedPools(provider)));
         return thresholdReadings(groups.flat().filter(({ tool, pool }) => validPoolRoute(tool, pool)));
       },
-      review: async (provider, pool, signal) => (await assessPoolReset(provider, pool, signal))?.review,
+      review: async (provider, pool, signal) => {
+        if (provider === "codex" && reservationCleanup.pending) await withRedemptionLock(async () => {});
+        signal.throwIfAborted();
+        return (await assessPoolReset(provider, pool, signal))?.review;
+      },
       confirm: (pool, confirmation, signal, deadlineAt) => confirmPoolReset(pool, confirmation, signal, {
         journal: poolResetJournal,
+        cleanup: reservationCleanup,
         guard: withCodexRedemption,
         assess: (name, abort) => assessPoolReset("codex", name, abort),
         members: async (name) => (await namedPools("codex")).find((entry) => entry.pool === name)?.members,

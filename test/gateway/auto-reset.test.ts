@@ -420,6 +420,38 @@ describe("Codex renewal recovery", () => {
     expect(await h.store.lastClaim("identity", "alpha")).toMatchObject({ status: "unknown", creditedId: betaCredit });
   });
 
+  test("keeps a late automatic mismatch fenced after the caller cancels", async () => {
+    const h = harness();
+    await allow(h.store);
+    const controller = new AbortController();
+    const posted = Promise.withResolvers<void>();
+    const acknowledge = Promise.withResolvers<void>();
+    const finished = Promise.withResolvers<void>();
+    const finish = h.store.finish.bind(h.store);
+    h.store.finish = async (...args) => {
+      await finish(...args);
+      finished.resolve();
+    };
+    const recovery = createAutoResetRecovery({ ...h.options, spend: async (...args) => {
+      const [, , requestId, , evidence] = args;
+      evidence.postAttempted(true);
+      posted.resolve();
+      await acknowledge.promise;
+      await h.store.recordReportedCredit(requestId, betaCredit);
+      return { result: "reset", creditId: betaCredit };
+    } });
+    const answer = recovery.recover(input(controller.signal));
+    await posted.promise;
+    controller.abort();
+    expect(await answer).toBeUndefined();
+    expect(await h.store.lastClaim("identity", "alpha")).toMatchObject({ status: "pending", creditId: alphaCredit });
+    acknowledge.resolve();
+    await finished.promise;
+    expect(await h.store.lastClaim("identity", "alpha")).toMatchObject({
+      status: "unknown", creditId: alphaCredit, creditedId: betaCredit,
+    });
+  });
+
   test("requires fresh evidence below the app reserve for the requested model", async () => {
     const h = harness();
     await allow(h.store);

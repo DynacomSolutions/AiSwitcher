@@ -61,6 +61,7 @@ export interface AutoResetStore {
   lastClaim(kind: Setting, name: string): Promise<AutoResetClaimSummary | undefined>;
   findClaim(eventKey: string, generation?: number): Promise<AutoResetClaim | undefined>;
   claim(input: AutoResetClaimInput): Promise<ClaimResult>;
+  recordReportedCredit(redeemRequestId: string, creditId: string): Promise<void>;
   finish(eventKey: string, status: TerminalStatus, creditedId?: string, result?: ClaimFinish): Promise<void>;
   markRecovered(eventKey: string, redeemRequestId: string, recoveredAt: string): Promise<void>;
 }
@@ -155,13 +156,27 @@ export class MemoryAutoResetStore implements AutoResetStore {
     return { kind: "created" };
   }
 
+  async recordReportedCredit(redeemRequestId: string, creditId: string): Promise<void> {
+    for (const claims of this.claims.values()) {
+      const claim = claims.find(({ input }) => input.redeemRequestId === redeemRequestId);
+      if (!claim) continue;
+      claim.summary.creditedId = creditId;
+      this.claimedCredits.add(creditId);
+      return;
+    }
+    throw new Error("The automatic reset claim is missing");
+  }
+
   async finish(eventKey: string, status: TerminalStatus, creditedId?: string, result?: ClaimFinish): Promise<void> {
     const claims = this.claims.get(eventKey);
     const claim = result ? claims?.find(({ input }) => input.redeemRequestId === result.redeemRequestId) : claims?.[0];
     if (claim?.summary.status !== "pending") return;
     claim.summary.status = status;
     claim.summary.finishedAt = result?.finishedAt ?? new Date(this.now()).toISOString();
-    if (creditedId !== undefined) claim.summary.creditedId = creditedId;
+    if (creditedId !== undefined) {
+      claim.summary.creditedId = creditedId;
+      this.claimedCredits.add(creditedId);
+    }
   }
 
   async markRecovered(eventKey: string, redeemRequestId: string, recoveredAt: string): Promise<void> {
@@ -269,18 +284,27 @@ export class PgAutoResetStore implements AutoResetStore {
           ${provider429At === undefined ? null : new Date(provider429At).toISOString()}, ${redeemRequestId},
           requested.members, ${JSON.stringify(usageEvidence)}::text::jsonb, ${JSON.stringify(creditEvidence)}::text::jsonb
         FROM requested WHERE NOT EXISTS (
+          SELECT 1 FROM codex_pool_reset_attempts WHERE credit_id = ${creditId} OR credited_id = ${creditId}
+        ) AND NOT EXISTS (
           SELECT 1 FROM codex_auto_reset_claims AS earlier
-          WHERE earlier.recorded_at > statement_timestamp() - ${OVERLAP_MS}::int * interval '1 ms'
-            AND earlier.members && requested.members
+          WHERE earlier.credited_id = ${creditId}
+            OR (earlier.recorded_at > statement_timestamp() - ${OVERLAP_MS}::int * interval '1 ms'
+              AND earlier.members && requested.members)
         )
         ON CONFLICT DO NOTHING RETURNING event_key`;
       return rows.length === 1 ? { kind: "created" } : { kind: "blocked" };
     });
   }
 
+  async recordReportedCredit(redeemRequestId: string, creditId: string): Promise<void> {
+    const rows = await this.sql`UPDATE codex_auto_reset_claims SET credited_id = ${creditId}
+      WHERE redeem_request_id = ${redeemRequestId}::uuid RETURNING credit_id`;
+    if (rows.length !== 1) throw new Error("The automatic reset claim is missing");
+  }
+
   async finish(eventKey: string, status: TerminalStatus, creditedId?: string, result?: ClaimFinish): Promise<void> {
     const requestId = result?.redeemRequestId ?? null;
-    await this.sql`UPDATE codex_auto_reset_claims SET status = ${status}, credited_id = ${creditedId ?? null},
+    await this.sql`UPDATE codex_auto_reset_claims SET status = ${status}, credited_id = COALESCE(${creditedId ?? null}, credited_id),
       finished_at = COALESCE(${result?.finishedAt ?? null}::timestamptz, clock_timestamp()), outcome = ${result?.outcome ?? null}
       WHERE event_key = ${eventKey} AND status = 'pending' AND
         CASE WHEN ${requestId}::uuid IS NULL THEN generation = 1 ELSE redeem_request_id = ${requestId}::uuid END`;

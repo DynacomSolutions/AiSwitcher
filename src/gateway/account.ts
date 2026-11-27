@@ -3,6 +3,7 @@ import { upstreamHeaders } from "./app.ts";
 import { GatewayCredentialError } from "./credentials.ts";
 import { GATEWAY_ERROR_HEADER, GATEWAY_UPSTREAM_HEADER, providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
+import { bounded } from "./refresh-guard.ts";
 import { availableCount, claudeUsageBody, claudeUsageBodyOf, normalisePath, orgSegmentIndex, syntheticClaudeProfile, type AccountOp } from "./routes.ts";
 import { allowedMembers, utilisationOf } from "./select.ts";
 import { CODEX_CREDITS_URL, codexCreditIds, codexResetInventory, fetchCodexCreditInventory } from "./usage-source.ts";
@@ -74,6 +75,7 @@ export interface AccountResult {
 export interface CodexPostContext {
   credential: ProviderCredential;
   creditId?: string;
+  redeemRequestId?: string;
   inventory(): Promise<unknown>;
   signal?: AbortSignal;
   retryAfter401?: boolean;
@@ -100,6 +102,7 @@ export interface CodexCreditSelection {
   stillCurrent(): boolean;
   stillEligible(): Promise<boolean>;
   onPost(): void;
+  onReportedCredit?(creditId: string): Promise<void>;
   finishPostAfterDeadline?: boolean;
 }
 
@@ -162,6 +165,7 @@ export async function consumeCodexResetForIdentity(
   await beforePost?.(identity, {
     credential,
     creditId: selection?.id,
+    redeemRequestId,
     inventory: async () => inventory,
     signal,
   });
@@ -175,22 +179,38 @@ export async function consumeCodexResetForIdentity(
   } catch {
     throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
   }
-  if (!spent.ok) {
+  const unknownOutcome = () => new Error("Codex reset outcome is unknown. Refresh limits before another attempt.");
+  if (!spent.ok && !selection?.onReportedCredit) {
     if (selection) void discard(spent);
     else await discard(spent);
+  }
+  const response = spent.ok || selection?.onReportedCredit
+    ? await spent.json().catch(() => undefined) as { code?: unknown; windows_reset?: unknown; credit?: { id?: unknown } } | undefined
+    : undefined;
+  const rawCreditId = response?.credit?.id;
+  const creditId = typeof rawCreditId === "string" && rawCreditId.trim() ? rawCreditId : undefined;
+  const mismatch = selection && creditId !== undefined && creditId !== selection.id ? creditId : undefined;
+  if (mismatch !== undefined && selection?.onReportedCredit) {
+    const record = selection.onReportedCredit;
+    const write = () => bounded(record(mismatch), 2_000, "Codex reported credit journal");
+    try {
+      await write().catch(write);
+    } catch {
+      throw Object.assign(unknownOutcome(), { status: 502, creditedId: mismatch });
+    }
+  }
+  if (!spent.ok) {
     const manualStatus = [400, 403, 404, 409, 429].includes(spent.status) ? spent.status : 502;
-    throw Object.assign(new Error(`Codex refused the reset (HTTP ${spent.status})`), { status: selection ? spent.status : manualStatus });
+    throw Object.assign(new Error(`Codex refused the reset (HTTP ${spent.status})`), {
+      status: selection ? spent.status : manualStatus, creditedId: mismatch,
+    });
   }
-  const response = await spent.json().catch(() => undefined) as { code?: unknown; windows_reset?: unknown; credit?: { id?: unknown } } | undefined;
   const { code, windows_reset: windowsReset = 0 } = response ?? {};
-  if (code !== "reset" && code !== "nothing_to_reset" && code !== "no_credit" && code !== "already_redeemed") {
-    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
+  if ((code !== "reset" && code !== "nothing_to_reset" && code !== "no_credit" && code !== "already_redeemed") ||
+      typeof windowsReset !== "number" || !Number.isSafeInteger(windowsReset) || windowsReset < 0) {
+    throw Object.assign(unknownOutcome(), { status: 502, creditedId: mismatch });
   }
-  if (typeof windowsReset !== "number" || !Number.isSafeInteger(windowsReset) || windowsReset < 0) {
-    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
-  }
-  const creditId = response?.credit?.id;
-  return { identity, result: code, windowsReset, ...(selection && typeof creditId === "string" ? { creditId } : {}) };
+  return { identity, result: code, windowsReset, ...(selection && creditId !== undefined ? { creditId } : {}) };
 }
 
 async function discard(res: Response): Promise<void> {

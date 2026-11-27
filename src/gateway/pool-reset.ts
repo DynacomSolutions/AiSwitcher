@@ -44,17 +44,25 @@ export function poolUtilisation(readings: ReadonlyArray<PoolUsage | undefined>, 
   return averages.length ? { percent: Math.max(...averages), complete } : { complete: false };
 }
 
-type UsageProof = Record<string, number>;
-
-function usageProof(reading: PoolUsage): UsageProof {
-  return Object.fromEntries((reading.windows ?? []).map((window) => [poolWindowKey(window), window.utilization]));
+function usageProof(reading: PoolUsage) {
+  return Object.fromEntries((reading.windows ?? []).map((window) => [poolWindowKey(window), {
+    utilisation: window.utilization, resetsAt: window.resetsAt,
+  }]));
 }
 
-function provesRelief(reading: PoolUsage | undefined, consumedAt: number, baseline: UsageProof): boolean {
-  if (!reading || reading.stale || reading.status === "unavailable" || !(Date.parse(reading.capturedAt) > consumedAt)) return false;
-  return reading.windows?.some((window) =>
-    (window.resetsAt === undefined || Date.parse(window.resetsAt) > Date.parse(reading.capturedAt)) &&
-    window.utilization < baseline[poolWindowKey(window)]) === true;
+function provesRelief(reading: PoolUsage | undefined, consumedAt: number, baseline: unknown): boolean {
+  if (!reading || reading.stale || reading.status === "unavailable" || !baseline || typeof baseline !== "object") return false;
+  const capturedAt = Date.parse(reading.capturedAt);
+  if (!(capturedAt > consumedAt)) return false;
+  return reading.windows?.some((window) => {
+    const original = (baseline as Record<string, unknown>)[poolWindowKey(window)];
+    // Older proofs stored a number and lack evidence of when the window would reset.
+    if (!original || typeof original !== "object") return false;
+    const { utilisation, resetsAt } = original as { utilisation?: unknown; resetsAt?: unknown };
+    return typeof utilisation === "number" && typeof resetsAt === "string" && Date.parse(resetsAt) > capturedAt &&
+      (window.resetsAt === undefined || Date.parse(window.resetsAt) > capturedAt) &&
+      Number.isFinite(window.utilization) && window.utilization >= 0 && window.utilization < utilisation;
+  }) === true;
 }
 
 export function codexResetRelieved(reading: PoolUsage | undefined, consumedAt: number, baseline: PoolUsage | undefined): boolean {
@@ -100,17 +108,17 @@ export function samePoolResetCandidate(a: PoolResetCandidate | undefined, b: Poo
 }
 
 interface RedemptionFences {
-  usedCredits(ids: string[]): Promise<Set<string>>;
+  usedCredits(ids: string[], ownClaim?: string): Promise<Set<string>>;
   inventoryFenceScope(identity: string, accountId?: string): Promise<{ any: boolean; relevant: boolean }>;
 }
 
 /** Check the account that will send the POST while the shared redemption lock is held. */
-export async function checkCodexRedemptionFence(journal: RedemptionFences, identity: string, context: CodexPostContext): Promise<void> {
+export async function checkCodexRedemptionFence(journal: RedemptionFences, identity: string, context: CodexPostContext, ownClaim?: string): Promise<void> {
   const read = <T>(operation: Promise<T>) => bounded(operation, 2_000, "Codex redemption journal");
   const { credential, creditId, inventory, signal } = context;
   signal?.throwIfAborted();
   if (creditId !== undefined) {
-    if ((await read(journal.usedCredits([creditId]))).has(creditId)) throw new CodexResetFenced();
+    if ((await read(journal.usedCredits([creditId], ownClaim))).has(creditId)) throw new CodexResetFenced();
     return;
   }
   const scope = await read(journal.inventoryFenceScope(identity, credential.accountId));
@@ -125,8 +133,54 @@ export async function checkCodexRedemptionFence(journal: RedemptionFences, ident
 
 type SpendResult = Awaited<ReturnType<typeof consumeCodexResetForIdentity>>;
 
+interface UnsentReservation {
+  creditId: string;
+  inserted: Promise<boolean>;
+  deleting?: Promise<void>;
+}
+
+/** Retains only reservations that this process knows did not send a POST. Use under the shared lock. */
+export class PoolResetReservationCleanup {
+  private readonly unsent = new Map<string, UnsentReservation>();
+
+  constructor(private readonly releaseAttempt: (creditId: string, reservationId: string) => Promise<void>) {}
+
+  get pending(): boolean {
+    return this.unsent.size > 0;
+  }
+
+  get full(): boolean {
+    return this.unsent.size >= 64;
+  }
+
+  async release(creditId: string, reservationId: string, inserted: Promise<boolean>): Promise<void> {
+    this.unsent.set(reservationId, { creditId, inserted });
+    await this.retry(reservationId);
+  }
+
+  async retry(reservationId = this.unsent.keys().next().value): Promise<void> {
+    if (reservationId === undefined) return;
+    const entry = this.unsent.get(reservationId);
+    if (!entry) return;
+    try {
+      // The SQL insert can finish after the request stops waiting for it.
+      // A failed acknowledgement can still leave this exact reservation in the database.
+      if (await bounded(entry.inserted.catch(() => true), 2_000, "pool reset reservation")) {
+        entry.deleting ??= this.releaseAttempt(entry.creditId, reservationId).finally(() => { entry.deleting = undefined; });
+        await bounded(entry.deleting, 2_000, "pool reset journal release");
+      }
+      this.unsent.delete(reservationId);
+    } catch {
+      // Give other queued reservations a chance on the next access.
+      this.unsent.delete(reservationId);
+      this.unsent.set(reservationId, entry);
+    }
+  }
+}
+
 interface ConfirmPoolDeps {
-  journal: Pick<PgPoolResetJournal, "manualAttempted" | "recordAttempt" | "releaseAttempt" | "markConsumed">;
+  journal: Pick<PgPoolResetJournal, "manualAttempted" | "recordAttempt" | "recordReportedCredit" | "markConsumed">;
+  cleanup: PoolResetReservationCleanup;
   guard: CodexRedemptionGuard;
   assess: (pool: string, signal: AbortSignal) => Promise<{ review: PoolResetReview; readings: Array<PoolUsage | undefined> } | undefined>;
   members: (pool: string) => Promise<string[] | undefined>;
@@ -174,7 +228,8 @@ export async function confirmPoolReset(
     };
     let version: string | undefined;
     let postStarted = false;
-    let finalMembership = false;
+    let reserved = false;
+    const reservationId = crypto.randomUUID();
     let attempt: Promise<boolean> | undefined;
     let result: SpendResult;
     try {
@@ -185,17 +240,20 @@ export async function confirmPoolReset(
         if (!stillCurrent()) return;
         version = await deps.version(identity);
         if (!stillCurrent()) return;
-        attempt = deps.journal.recordAttempt(creditId, redeemRequestId, identity, context.credential.accountId);
-        if (!await bounded(attempt, 2_000, "pool reset journal")) throw new CodexResetFenced();
-        if (stillCurrent()) finalMembership = await stillEligible();
+        if (!await stillEligible() || !stillCurrent()) return;
+        if (deps.cleanup.full) throw new Error("The pool reset journal could not clear unsent reservations");
+        attempt = deps.journal.recordAttempt(creditId, redeemRequestId, identity, reservationId, context.credential.accountId);
+        reserved = await bounded(attempt, 2_000, "pool reset journal");
+        if (!reserved) throw new CodexResetFenced();
       }, identity, redeemRequestId, {
         id: creditId,
         endsAt: new Date(candidate.creditExpiresAt).toISOString(),
         signal,
         now: deps.now,
-        stillCurrent: () => stillCurrent() && finalMembership,
+        stillCurrent: () => stillCurrent() && reserved,
         stillEligible,
         onPost: () => { postStarted = true; },
+        onReportedCredit: (reportedId) => deps.journal.recordReportedCredit(creditId, reservationId, reportedId),
         finishPostAfterDeadline: true,
       });
     } catch (error) {
@@ -203,11 +261,7 @@ export async function confirmPoolReset(
       throw error;
     } finally {
       if (attempt && !postStarted) {
-        // A timed-out insert can still commit. Release only this reservation once the insert settles.
-        const release = attempt.then(async (inserted) => {
-          if (inserted) await deps.journal.releaseAttempt(creditId, redeemRequestId);
-        });
-        await bounded(release, 2_000, "pool reset journal release").catch(() => undefined);
+        await deps.cleanup.release(creditId, reservationId, attempt);
       }
     }
     if (!postStarted && crossingExpired) {
@@ -246,21 +300,19 @@ export async function confirmPoolReset(
 export class PgPoolResetJournal {
   constructor(private readonly sql: SQL) {}
 
-  async usedCredits(ids: string[]): Promise<Set<string>> {
+  async usedCredits(ids: string[], ownClaim?: string): Promise<Set<string>> {
     if (!ids.length) return new Set();
+    const own = ownClaim ?? null;
     const rows = await this.sql`SELECT credit_id FROM codex_pool_reset_attempts WHERE credit_id IN ${this.sql(ids)}
-      UNION SELECT credit_id FROM codex_auto_reset_claims WHERE credit_id IN ${this.sql(ids)}`;
-    return new Set(rows.map((row: { credit_id: string }) => row.credit_id));
-  }
-
-  async manualAttempts(ids: string[]): Promise<Set<string>> {
-    if (!ids.length) return new Set();
-    const rows = await this.sql`SELECT credit_id FROM codex_pool_reset_attempts WHERE credit_id IN ${this.sql(ids)}`;
+      UNION SELECT credited_id FROM codex_pool_reset_attempts WHERE credited_id IN ${this.sql(ids)}
+      UNION SELECT credit_id FROM codex_auto_reset_claims WHERE credit_id IN ${this.sql(ids)}
+        AND redeem_request_id IS DISTINCT FROM ${own}::uuid
+      UNION SELECT credited_id FROM codex_auto_reset_claims WHERE credited_id IN ${this.sql(ids)}`;
     return new Set(rows.map((row: { credit_id: string }) => row.credit_id));
   }
 
   async manualAttempted(id: string): Promise<boolean> {
-    const rows = await this.sql`SELECT 1 FROM codex_pool_reset_attempts WHERE credit_id = ${id}`;
+    const rows = await this.sql`SELECT 1 FROM codex_pool_reset_attempts WHERE credit_id = ${id} OR credited_id = ${id}`;
     return rows.length > 0;
   }
 
@@ -273,15 +325,22 @@ export class PgPoolResetJournal {
     return { any: row.has_attempts, relevant: row.relevant };
   }
 
-  async recordAttempt(creditId: string, redeemRequestId: string, identity: string, accountId?: string): Promise<boolean> {
-    const rows = await this.sql`INSERT INTO codex_pool_reset_attempts (credit_id, redeem_request_id, identity, account_id)
-      VALUES (${creditId}, ${redeemRequestId}, ${identity}, ${accountId ?? null}) ON CONFLICT DO NOTHING RETURNING credit_id`;
+  async recordAttempt(creditId: string, redeemRequestId: string, identity: string, reservationId: string, accountId?: string): Promise<boolean> {
+    const rows = await this.sql`INSERT INTO codex_pool_reset_attempts (credit_id, redeem_request_id, identity, reservation_id, account_id)
+      VALUES (${creditId}, ${redeemRequestId}, ${identity}, ${reservationId}, ${accountId ?? null})
+      ON CONFLICT DO NOTHING RETURNING credit_id`;
     return rows.length === 1;
   }
 
-  async releaseAttempt(creditId: string, redeemRequestId: string): Promise<void> {
+  async releaseAttempt(creditId: string, reservationId: string): Promise<void> {
     await this.sql`DELETE FROM codex_pool_reset_attempts
-      WHERE credit_id = ${creditId} AND redeem_request_id = ${redeemRequestId} AND consumed_at IS NULL`;
+      WHERE credit_id = ${creditId} AND reservation_id = ${reservationId} AND credited_id IS NULL AND consumed_at IS NULL`;
+  }
+
+  async recordReportedCredit(creditId: string, reservationId: string, reportedId: string): Promise<void> {
+    const rows = await this.sql`UPDATE codex_pool_reset_attempts SET credited_id = ${reportedId}
+      WHERE credit_id = ${creditId} AND reservation_id = ${reservationId} RETURNING credit_id`;
+    if (rows.length !== 1) throw new Error("The pool reset reservation is missing");
   }
 
   async markConsumed(creditId: string, identity: string, version: string, baseline: PoolUsage, consumedAt: number): Promise<void> {

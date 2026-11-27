@@ -1,7 +1,8 @@
+import { type SQL } from "bun";
 import { describe, expect, test } from "bun:test";
 import type { ManualResetInfo } from "../../src/cli/limits/types.ts";
 import { consumeCodexResetForIdentity, type CodexRedemptionGuard } from "../../src/gateway/account.ts";
-import { confirmPoolReset, poolResetReview, poolUtilisation } from "../../src/gateway/pool-reset.ts";
+import { codexResetRelieved, confirmPoolReset, PgPoolResetJournal, PoolResetReservationCleanup, poolResetReview, poolUtilisation, poolWindowKey } from "../../src/gateway/pool-reset.ts";
 import type { PoolResetConfirmation } from "../../src/gateway/pool-reset-view.ts";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 
@@ -60,6 +61,7 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
     await previous;
     locked = true;
     try {
+      await cleanup.retry();
       return await run(async () => { steps.push("invalidate"); });
     } finally {
       locked = false;
@@ -67,7 +69,8 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
       unlock();
     }
   };
-  const tried = new Set<string>();
+  const tried = new Map<string, { request: string; reservation: string }>();
+  const reported = new Set<string>();
   const requests = new Set<string>();
   const steps: string[] = [];
   const posts: Record<string, unknown>[] = [];
@@ -75,8 +78,20 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
   const assessStarted = Promise.withResolvers<void>();
   const state = {
     waitForPost: Promise.resolve(), waitForAssess: Promise.resolve(), afterJournal: () => {}, review, ambiguous: false,
-    verified: true, members: review.members, now: NOW, refreshReview: false, deadlineAt: Infinity,
+    releaseFailures: 0, reportedCredit: creditA, verified: true, members: review.members, now: NOW, refreshReview: false, deadlineAt: Infinity,
   };
+  const cleanup = new PoolResetReservationCleanup(async (id, reservation) => {
+    expect(locked).toBe(true);
+    steps.push("release");
+    if (state.releaseFailures > 0) {
+      state.releaseFailures--;
+      throw new Error("synthetic release failure");
+    }
+    const row = tried.get(id);
+    if (row?.reservation !== reservation) return;
+    tried.delete(id);
+    requests.delete(row.request);
+  });
   const credential = { identity: "sample-a", accessToken: "token-SYNTHETIC_FIXTURE", accountId: "account-SYNTHETIC_FIXTURE" };
   const doFetch = (async (_url, init) => {
     expect(locked).toBe(true);
@@ -86,7 +101,7 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
       postStarted.resolve();
       await state.waitForPost;
       if (state.ambiguous) throw new Error("synthetic lost response");
-      return Response.json({ code: "reset", windows_reset: 2, credit: { id: creditA } });
+      return Response.json({ code: "reset", windows_reset: 2, credit: { id: state.reportedCredit } });
     }
     return Response.json({ available_count: 1, credits: [{
       id: creditA, expires_at: iso(NOW + DAY), reset_type: "codex_rate_limits", status: "available",
@@ -94,26 +109,27 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
   }) as typeof fetch;
   const run = (selection = confirmation, signal = new AbortController().signal) => confirmPoolReset(pool.pool, selection, signal, {
     now: () => state.now,
-    deadlineAt: state.deadlineAt,
+    get deadlineAt() { return state.deadlineAt; },
     guard,
+    cleanup,
     journal: {
-      manualAttempted: async (id) => tried.has(id),
+      manualAttempted: async (id) => tried.has(id) || reported.has(id),
       markConsumed: async () => { steps.push("consumed"); },
-      recordAttempt: async (id, request, identity, accountId) => {
+      recordAttempt: async (id, request, identity, reservation, accountId) => {
         expect(identity).toBe(credential.identity);
         expect(accountId).toBe(credential.accountId);
         if (tried.has(id) || requests.has(request)) return false;
         steps.push("journal");
-        tried.add(id);
+        tried.set(id, { request, reservation });
         requests.add(request);
         state.afterJournal();
         return true;
       },
-      releaseAttempt: async (id, request) => {
+      recordReportedCredit: async (id, reservation, reportedId) => {
         expect(locked).toBe(true);
-        steps.push("release");
-        tried.delete(id);
-        requests.delete(request);
+        expect(tried.get(id)?.reservation).toBe(reservation);
+        steps.push("reported");
+        reported.add(reportedId);
       },
     },
     version: async () => "1",
@@ -220,6 +236,79 @@ test("releases an attempt on a definite pre-POST abort and allows the same confi
   state.afterJournal = () => {};
   expect(await run()).toEqual({ status: "confirmed" });
   expect(posts).toHaveLength(1);
+});
+
+test("retries a failed reservation release under the shared lock before the next confirmation", async () => {
+  const { run, state, steps, posts } = harness();
+  const controller = new AbortController();
+  state.releaseFailures = 1;
+  state.afterJournal = () => controller.abort();
+  expect(await run(undefined, controller.signal)).toEqual({ status: "declined" });
+  expect(steps).toEqual(["invalidate", "journal", "release"]);
+  expect(posts).toHaveLength(0);
+
+  state.afterJournal = () => {};
+  expect(await run()).toEqual({ status: "confirmed" });
+  expect(steps).toEqual(["invalidate", "journal", "release", "release", "invalidate", "journal", "post", "consumed"]);
+  expect(posts).toHaveLength(1);
+});
+
+test("retains both credit IDs from a confirmed pool POST that reports a different ID", async () => {
+  const { run, state, steps, posts, confirmation } = harness();
+  state.reportedCredit = creditB;
+  expect(await run()).toEqual({ status: "pending" });
+  expect(steps).toEqual(["invalidate", "journal", "post", "reported"]);
+  expect(await run()).toEqual({ status: "already_attempted" });
+  expect(await run({
+    candidate: { ...confirmation.candidate, creditId: creditB }, redeemRequestId: crypto.randomUUID(),
+  })).toEqual({ status: "already_attempted" });
+  expect(posts).toHaveLength(1);
+});
+
+test("requires relief before the baseline window resets naturally", () => {
+  const baseline = usage(94, 92);
+  const resetAt = Date.parse(baseline.windows![0].resetsAt!);
+  const after = (at: number): PoolUsage => ({
+    ...baseline, capturedAt: iso(at),
+    windows: [{ label: "5h", utilization: 10, resetsAt: iso(resetAt + DAY) }, baseline.windows![1]],
+  });
+  expect(codexResetRelieved(after(resetAt - 1), NOW + 1, baseline)).toBe(true);
+  expect(codexResetRelieved(after(resetAt), NOW + 1, baseline)).toBe(false);
+  expect(codexResetRelieved(after(resetAt + 1), NOW + 1, baseline)).toBe(false);
+});
+
+test("persisted recovery verifies only a window with a known future natural reset", async () => {
+  const [baseline] = usage(94, 92).windows!;
+  const key = poolWindowKey(baseline);
+  const consumedAt = new Date(NOW + 1);
+  const resetAt = Date.parse(baseline.resetsAt!);
+  let proof: Record<string, unknown> = { [key]: baseline.utilization };
+  const sql = (async (query: TemplateStringsArray) => {
+    expect(query.join(" ")).toContain("SELECT attempt.version");
+    return [{ version: "7", consumed_at: consumedAt, baseline: proof }];
+  }) as unknown as SQL;
+  const verified: Array<[string, string]> = [];
+  const journal = new PgPoolResetJournal(sql);
+  journal.markVerified = async (identity, version) => { verified.push([identity, version]); };
+  const fresh = (at: number): PoolUsage => ({
+    ...usage(10, 92), capturedAt: iso(at), windows: [{ ...baseline, utilization: 10, resetsAt: iso(resetAt + DAY) }],
+  });
+  await journal.reconcileReading("sample-a", fresh(resetAt - 1));
+  expect(verified).toEqual([]);
+
+  proof = { [key]: { utilisation: baseline.utilization, resetsAt: baseline.resetsAt } };
+  await journal.reconcileReading("sample-a", fresh(resetAt));
+  expect(verified).toEqual([]);
+  await journal.reconcileReading("sample-a", fresh(resetAt - 1));
+  expect(verified).toEqual([["sample-a", "7"]]);
+});
+
+test("does not send the POST if the deadline expires during reservation", async () => {
+  const { run, state, steps, posts } = harness();
+  state.afterJournal = () => { state.deadlineAt = performance.now() - 1; };
+  expect(await run()).toEqual({ status: "declined" });
+  expect(steps).toEqual(["invalidate", "journal", "release"]);
+  expect(posts).toHaveLength(0);
 });
 
 test.each([false, true])("checks the remaining crossing proof at the POST boundary (second crossing %s)", async (anotherCrossing) => {

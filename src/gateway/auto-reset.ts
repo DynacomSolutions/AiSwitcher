@@ -351,7 +351,7 @@ export function createAutoResetRecovery({
     let finishedAt: number;
     const stillCurrent = () => {
       const at = now();
-      return !signal.aborted && at < creditExpiresAt && chosen.weeklyReset - at >= MIN_WEEKLY_REMAINING_MS &&
+      return !signal.aborted && performance.now() < deadline - REPLAY_RESERVE_MS && at < creditExpiresAt && chosen.weeklyReset - at >= MIN_WEEKLY_REMAINING_MS &&
         (provider429At === undefined || at - provider429At < RECOVERY_MS) &&
         evidence.every((row) => absoluteTime(row.resetAt) > at && currentReading(row.capturedAt, at));
     };
@@ -359,11 +359,16 @@ export function createAutoResetRecovery({
       if (stillCurrent()) {
         status = "unknown";
         outcome = "consume_unknown";
-        const spent = await withSignal(spend(identity, creditId, redeemRequestId, signal, {
+        const posting = spend(identity, creditId, redeemRequestId, signal, {
           endsAt: iso(creditExpiresAt),
           stillCurrent,
           postAttempted: (attempted) => { postAttempted = attempted; },
-        }), signal);
+        });
+        const spent = await withSignal(posting, signal).catch((error) => {
+          // The caller can leave while we record an answer to a POST already sent.
+          if (signal.aborted && postAttempted === true) return posting;
+          throw error;
+        });
         creditedId = spent.creditId;
         if (creditedId === undefined || creditedId === creditId) {
           outcome = spent.result;
@@ -375,8 +380,11 @@ export function createAutoResetRecovery({
         outcome = "cancelled_before_post";
       }
     } catch (error) {
-      const refusal = error as { status?: number; postAttempted?: boolean } | null;
-      if (postAttempted === false || refusal?.postAttempted === false) {
+      const refusal = error as { status?: number; postAttempted?: boolean; creditedId?: string } | null;
+      if (refusal?.creditedId !== undefined && refusal.creditedId !== creditId) {
+        creditedId = refusal.creditedId;
+        outcome = "credit_mismatch";
+      } else if (postAttempted === false || refusal?.postAttempted === false) {
         status = "rejected";
         outcome = "preflight_failed";
       } else if (refusal?.status !== undefined && refusal.status >= 400 && refusal.status < 500) {

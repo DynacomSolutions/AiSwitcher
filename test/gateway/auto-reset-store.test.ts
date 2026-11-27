@@ -3,6 +3,7 @@ import { SQL } from "bun";
 import { randomUUID } from "node:crypto";
 import { setTimeout as wait } from "node:timers/promises";
 import { MemoryAutoResetStore, PgAutoResetStore, type AutoResetClaimInput, type AutoResetStore } from "../../src/gateway/auto-reset-store.ts";
+import { checkCodexRedemptionFence, PgPoolResetJournal } from "../../src/gateway/pool-reset.ts";
 import { migrate } from "../../src/gateway/pg-store.ts";
 
 const AT = "2026-11-27T08:00:00.000Z";
@@ -119,7 +120,28 @@ async function checkRearm(
   return eventKey;
 }
 
+async function checkReportedCreditFence(store: AutoResetStore) {
+  const original = claim("reported-original", ["reporter"]);
+  const next = claim("reported-another", ["other"]);
+  await store.setEnabled("pool", original.pool, true);
+  await store.setEnabled("identity", original.identity, true);
+  await store.setEnabled("identity", next.identity, true);
+  expect(await store.claim(original)).toEqual({ kind: "created" });
+  await store.recordReportedCredit(original.redeemRequestId, next.creditId);
+  expect(await store.claim(next)).toEqual({ kind: "blocked" });
+  await store.finish(original.eventKey, "unknown");
+  expect(await store.lastClaim("identity", original.identity)).toMatchObject({
+    status: "unknown", creditId: original.creditId, creditedId: next.creditId,
+  });
+  expect(await store.claim(next)).toEqual({ kind: "blocked" });
+  return { original, next };
+}
+
 describe("memory Codex renewal store", () => {
+  test("fences both the requested and reported credit across claims", async () => {
+    await checkReportedCreditFence(new MemoryAutoResetStore());
+  });
+
   test("shares settings, claims one winner and blocks duplicate credits and overlapping evidence", async () => {
     const store = new MemoryAutoResetStore();
     await checkContract(store, store);
@@ -190,6 +212,33 @@ if (!url && process.env.CI && !optOut) {
       const a = new PgAutoResetStore(sqlA);
       const b = new PgAutoResetStore(sqlB);
       await checkContract(a, b);
+
+      const { original: reporting, next: reported } = await checkReportedCreditFence(a);
+      const journal = new PgPoolResetJournal(sqlB);
+      const reportedIds = [reporting.creditId, reported.creditId];
+      expect(await journal.usedCredits(reportedIds)).toEqual(new Set(reportedIds));
+      expect(await journal.usedCredits(reportedIds, reporting.redeemRequestId)).toEqual(new Set([reported.creditId]));
+      const context = {
+        credential: { identity: reporting.identity, accessToken: "access-SYNTHETIC_FIXTURE-reported" },
+        inventory: async () => ({ available_count: 1, credits: [{ id: reported.creditId, status: "available" }] }),
+      };
+      await expect(checkCodexRedemptionFence(journal, reporting.identity, context)).rejects.toThrow("already attempted");
+      await expect(checkCodexRedemptionFence(journal, reporting.identity, {
+        ...context, creditId: reported.creditId,
+      }, reporting.redeemRequestId)).rejects.toThrow("already attempted");
+
+      const poolReported = claim("reported-by-pool", ["other"]);
+      const poolRequestedId = "credit-SYNTHETIC_FIXTURE-confirmed-requested";
+      const reservation = randomUUID();
+      try {
+        expect(await journal.recordAttempt(poolRequestedId, randomUUID(), reporting.identity, reservation)).toBe(true);
+        await journal.recordReportedCredit(poolRequestedId, reservation, poolReported.creditId);
+        await journal.releaseAttempt(poolRequestedId, reservation);
+        expect(await journal.usedCredits([poolRequestedId, poolReported.creditId])).toEqual(new Set([poolRequestedId, poolReported.creditId]));
+        expect(await b.claim(poolReported)).toEqual({ kind: "blocked" });
+      } finally {
+        await sqlA`DELETE FROM codex_pool_reset_attempts WHERE credit_id = ${poolRequestedId}`;
+      }
 
       const original = claim("original");
       const rows = await sqlA`SELECT redeem_request_id, usage_evidence, credit_evidence, finished_at FROM codex_auto_reset_claims
