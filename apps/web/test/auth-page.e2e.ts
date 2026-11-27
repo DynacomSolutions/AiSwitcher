@@ -5,7 +5,9 @@
 // Env: AIS_E2E_CHROMIUM (binary), AIS_E2E_EVIDENCE (dir for screenshots).
 //
 // The auth and renewal answers are synthetic. The page must show ONE list with one row per identity and tool, keep its
-// filter and sort in the URL (history replace), stay inside the page width at 360 px and be reachable by keyboard.
+// filter and sort in the URL (history replace), stay inside the page width at 360 px, show a table from a laptop width with
+// nothing spilling into a neighbour cell, keep a tool that only the renewal report knows while that report is slow, and be
+// reachable by keyboard.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -43,6 +45,7 @@ const AUTH: AuthResponse = {
     { toolName: "codex", identity: "SYNTHETIC_FIXTURE-codex-healthy", kind: "oauth", state: "ok", detail: "via gateway: renewed", fixable: ["login"], expiresAt: iso(6 * H) },
     { toolName: "codex", identity: "SYNTHETIC_FIXTURE-codex-revoked-with-a-very-long-identity-name", kind: "oauth", state: "expired", detail: "refresh token revoked at the gateway: re-login required", fixable: ["login"] },
     { toolName: "kimi", identity: "SYNTHETIC_FIXTURE-kimi-host", kind: "oauth", state: "ok", detail: "token valid", fixable: ["refresh", "login"], expiresAt: iso(20 * H) },
+    { toolName: "kimi", identity: "SYNTHETIC_FIXTURE-kimi-plain", kind: "oauth", state: "ok", detail: "token valid", fixable: ["refresh", "login"], expiresAt: iso(20 * H) },
     { toolName: "zai", identity: "SYNTHETIC_FIXTURE-zai-key", kind: "apikey", state: "ok", detail: "key present", fixable: ["zai-key"] },
     { toolName: "claude", identity: "SYNTHETIC_FIXTURE-pool", kind: "none", state: "gateway", detail: "pool", fixable: [] },
     { toolName: "codex", identity: "SYNTHETIC_FIXTURE-retired", kind: "oauth", state: "retired", detail: "retired", fixable: ["login"] },
@@ -63,6 +66,18 @@ function authStub(answers: Record<string, unknown>): void {
     return answer === undefined
       ? real(input, init)
       : Promise.resolve(new Response(JSON.stringify(answer), { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  window.fetch = Object.assign(stub, { preconnect: window.fetch.preconnect });
+}
+
+/** Runs in the page after authStub: it answers the renewal report late and with one more row that the auth probe does not list. */
+function slowRenewalStub(report: unknown, delayMs: number): void {
+  const inner = window.fetch.bind(window);
+  const stub = (input: RequestInfo | URL, init?: RequestInit) => {
+    const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const u = new URL(raw, location.href);
+    if (u.origin !== location.origin || u.pathname !== "/api/auth/refresh" || (init?.method ?? "GET") !== "GET") return inner(input, init);
+    return new Promise<Response>((resolve) => setTimeout(() => resolve(new Response(JSON.stringify(report), { status: 200, headers: { "content-type": "application/json" } })), delayMs));
   };
   window.fetch = Object.assign(stub, { preconnect: window.fetch.preconnect });
 }
@@ -104,6 +119,8 @@ async function openAuth(search = "", rows = KEYS.length): Promise<void> {
   await sleep(300);
 }
 
+interface Measure { scrollWidth: number; clientWidth: number; offenders: string[]; clipped: string[]; spills: string[]; gaps: string[]; table: boolean; containerRem: number; rowHeights: number[]; rowHeight: number; tables: number; text: string }
+
 const rowKeys = () => page.eval<string[]>(`[...document.querySelectorAll('main [data-slot=auth-row]')].map(r => r.getAttribute('data-key'))`);
 
 /** The report of the page: overflow, tables and the text of the retired list parts. */
@@ -119,7 +136,36 @@ const MEASURE = `(() => {
     const cs = getComputedStyle(el);
     return el.getBoundingClientRect().width > 1 && (cs.overflowX !== 'visible' || el.classList.contains('truncate')) && el.scrollWidth > el.clientWidth + 1;
   }).map(el => el.tagName.toLowerCase() + '.' + String(el.className).slice(0, 60));
-  return { scrollWidth: de.scrollWidth, clientWidth: vw, offenders: offenders.slice(0, 8), clipped: clipped.slice(0, 8), tables: document.querySelectorAll('main table').length, text: document.querySelector('main').innerText };
+  // An element that runs past its own cell covers the text of the next cell. Overflow is visible there, so clipping tests miss it.
+  const spills = [];
+  for (const cell of document.querySelectorAll('main [data-slot=auth-cell]')) {
+    const c = cell.getBoundingClientRect();
+    for (const el of cell.querySelectorAll('*')) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && (r.right > c.right + 1 || r.left < c.left - 1)) spills.push(el.tagName.toLowerCase() + '.' + String(el.className).slice(0, 40) + ' by=' + Math.round(Math.max(r.right - c.right, c.left - r.left)));
+    }
+  }
+  // An empty grid cell leaves a line of a row shorter than the row.
+  const gaps = [];
+  for (const li of document.querySelectorAll('main [data-slot=auth-row]')) {
+    const cs = getComputedStyle(li);
+    const lr = li.getBoundingClientRect();
+    const left = lr.left + parseFloat(cs.paddingLeft);
+    const right = lr.right - parseFloat(cs.paddingRight);
+    const lines = new Map();
+    for (const ch of li.children) {
+      const r = ch.getBoundingClientRect();
+      const k = Math.round(r.top);
+      const l = lines.get(k) ?? { l: Infinity, r: -Infinity };
+      l.l = Math.min(l.l, r.left);
+      l.r = Math.max(l.r, r.right);
+      lines.set(k, l);
+    }
+    for (const l of lines.values()) if (l.l > left + 1 || l.r < right - 1) gaps.push(li.getAttribute('data-key'));
+  }
+  const head = document.querySelector('main [data-slot=auth-head]');
+  const firstRow = document.querySelector('main [data-slot=auth-row]');
+  return { scrollWidth: de.scrollWidth, clientWidth: vw, offenders: offenders.slice(0, 8), clipped: clipped.slice(0, 8), spills: spills.slice(0, 8), gaps: [...new Set(gaps)].slice(0, 8), table: !!head && getComputedStyle(head).display === 'grid', containerRem: firstRow ? Math.round((firstRow.parentElement.parentElement.clientWidth / 16) * 10) / 10 : 0, rowHeights: [...document.querySelectorAll('main [data-slot=auth-row]')].map(r => Math.round(r.getBoundingClientRect().height)), rowHeight: firstRow ? Math.round(firstRow.getBoundingClientRect().height) : 0, tables: document.querySelectorAll('main table').length, text: document.querySelector('main').innerText };
 })()`;
 
 beforeAll(async () => {
@@ -180,8 +226,8 @@ for (const vp of [{ width: 360, height: 740 }, { width: 1280, height: 900 }, { w
       await setViewport(vp.width, vp.height);
       await openAuth();
       expect((await rowKeys()).sort()).toEqual([...KEYS].sort());
-      const m = await page.eval<{ scrollWidth: number; clientWidth: number; offenders: string[]; clipped: string[]; tables: number; text: string }>(MEASURE);
-      const detail = JSON.stringify(m);
+      const m = await page.eval<Measure>(MEASURE);
+      const detail = JSON.stringify({ ...m, text: undefined });
       // One list: no separate renewal table, no second card.
       expect(m.tables, detail).toBe(0);
       expect(m.text).not.toContain("Scheduled credential renewal");
@@ -190,14 +236,20 @@ for (const vp of [{ width: 360, height: 740 }, { width: 1280, height: 900 }, { w
       expect(m.text).toContain("Gateway");
       // The renewal status of each kind of row, and the probe detail of a healthy row.
       for (const text of ["Sign-in needed", "Renewing", "Members renewed by the gateway", "token valid", "via gateway: renewed", "oauth", "apikey"]) expect(m.text, text).toContain(text);
-      // The host row has two different actions, each with its own label.
+      // The host row offers the real renewal and no weaker refresh. A kimi login without a host renewal keeps "Refresh token", and its tooltip says what it does.
       expect(await page.eval<number>(`[...document.querySelectorAll('main button')].filter(b => b.textContent.trim() === 'Run host renewal').length`)).toBe(1);
-      expect(await page.eval<number>(`[...document.querySelectorAll('main button')].filter(b => b.textContent.trim() === 'Refresh token').length`)).toBe(1);
+      expect(await page.eval<number>(`[...document.querySelectorAll('main [data-key="kimi/SYNTHETIC_FIXTURE-kimi-host"] button')].filter(b => b.textContent.trim() === 'Refresh token').length`)).toBe(0);
+      expect(await page.eval<number>(`[...document.querySelectorAll('main [data-key="kimi/SYNTHETIC_FIXTURE-kimi-plain"] button')].filter(b => b.textContent.trim() === 'Refresh token').length`)).toBe(1);
+      expect(await page.eval<string>(`[...document.querySelectorAll('main button')].find(b => b.textContent.trim() === 'Refresh token').title`)).toContain("only when it has expired");
       expect(await page.eval<number>(`[...document.querySelectorAll('main button')].filter(b => b.textContent.trim() === 'Refresh now').length`)).toBe(0);
       expect(await page.eval<number>(`[...document.querySelectorAll('main button')].filter(b => b.textContent.trim() === 'Log in').length`)).toBeGreaterThanOrEqual(4);
       expect(m.scrollWidth <= m.clientWidth, detail).toBe(true);
       expect(m.offenders, detail).toEqual([]);
       expect(m.clipped, detail).toEqual([]);
+      expect(m.spills, detail).toEqual([]);
+      expect(m.gaps, detail).toEqual([]);
+      // The table starts at a laptop width. A phone keeps the cards.
+      expect(m.table, detail).toBe(vp.width >= 1280);
       if (evidence) {
         await mkdir(evidence, { recursive: true });
         await writeFile(join(evidence, `auth-combined-${vp.width}.png`), await page.send<{ data: string }>("Page.captureScreenshot", { format: "png", captureBeyondViewport: true }).then((r) => Buffer.from(r.data, "base64")));
@@ -219,9 +271,9 @@ for (const vp of [{ width: 360, height: 740 }, { width: 1280, height: 900 }, { w
       await openAuth();
       const before = await page.eval<number>("history.length");
       await page.eval(`(() => { const i = document.querySelector('input[aria-label="Filter credentials"]'); i.focus(); })()`);
-      await page.send("Input.insertText", { text: "kimi" });
+      await page.send("Input.insertText", { text: "kimi-host" });
       await waitFor("filtered list", 5_000, async () => (await rowKeys()).length === 1);
-      expect(await page.eval<string>("location.search")).toBe("?q=kimi");
+      expect(await page.eval<string>("location.search")).toBe("?q=kimi-host");
       expect(await page.eval<number>("history.length")).toBe(before);
       expect(await rowKeys()).toEqual(["kimi/SYNTHETIC_FIXTURE-kimi-host"]);
     }, 60_000);
@@ -279,3 +331,66 @@ for (const vp of [{ width: 360, height: 740 }, { width: 1280, height: 900 }, { w
     }, 90_000);
   });
 }
+
+// The table must start at a laptop width. The breakpoint is a container width, so the sidebar counts.
+for (const width of [1280, 1366, 1440, 1536, 1680, 1920]) {
+  describe(`Auth table at a ${width} px laptop screen`, () => {
+    test("shows the table, with nothing spilling into a neighbour cell and nothing clipped", async () => {
+      await setViewport(width, 900);
+      await openAuth();
+      const m = await page.eval<Measure>(MEASURE);
+      const detail = JSON.stringify({ ...m, text: undefined });
+      expect(m.table, detail).toBe(true);
+      expect(m.scrollWidth <= m.clientWidth, detail).toBe(true);
+      expect(m.offenders, detail).toEqual([]);
+      expect(m.clipped, detail).toEqual([]);
+      expect(m.spills, detail).toEqual([]);
+      expect(m.gaps, detail).toEqual([]);
+      // A compact row, not a tall card: the middle row is far below the 190 px or more of a card.
+      expect([...m.rowHeights].sort((a, b) => a - b)[Math.floor(m.rowHeights.length / 2)], detail).toBeLessThan(120);
+      // The header and the card label use the same words.
+      expect(await page.eval<boolean>(`[...document.querySelectorAll('main [data-slot=auth-head] span')].some(s => s.textContent === 'Detail and last error')`)).toBe(true);
+      if (evidence && [1280, 1440, 1920].includes(width)) {
+        await mkdir(evidence, { recursive: true });
+        await writeFile(join(evidence, `auth-combined-${width}.png`), await page.send<{ data: string }>("Page.captureScreenshot", { format: "png", captureBeyondViewport: true }).then((r) => Buffer.from(r.data, "base64")));
+      }
+    }, 60_000);
+  });
+}
+
+// Below the table width the rows stay cards. Each line of a card must fill the card: an empty grid cell would leave a hole.
+for (const width of [360, 600, 800, 1000]) {
+  describe(`Auth cards at a ${width} px screen`, () => {
+    test("each card line is full and nothing spills", async () => {
+      await setViewport(width, 900);
+      await openAuth();
+      const m = await page.eval<Measure>(MEASURE);
+      const detail = JSON.stringify({ ...m, text: undefined });
+      expect(m.table, detail).toBe(false);
+      expect(m.scrollWidth <= m.clientWidth, detail).toBe(true);
+      expect(m.offenders, detail).toEqual([]);
+      expect(m.spills, detail).toEqual([]);
+      expect(m.gaps, detail).toEqual([]);
+    }, 60_000);
+  });
+}
+
+describe("Auth page while the renewal report is slow", () => {
+  test("a tool that only the renewal report knows stays in the URL", async () => {
+    await setViewport(1280, 900);
+    const grok: RenewalRow = gw("grok", "SYNTHETIC_FIXTURE-grok-renewal-only");
+    const slow = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", { source: `(${slowRenewalStub.toString()})(${JSON.stringify({ ...REFRESH, rows: [...RENEWALS, grok] })}, 1500)` });
+    try {
+      await page.send("Page.navigate", { url: `${base}/auth?tool=grok` });
+      // The auth probe answers at once. The renewal report is still 1.5 s away.
+      await sleep(700);
+      expect(await page.eval<string>("location.search"), "URL while the renewal report is pending").toBe("?tool=grok");
+      await waitFor("the grok row", 20_000, async () => (await rowKeys()).length === 1);
+      expect(await rowKeys()).toEqual(["grok/SYNTHETIC_FIXTURE-grok-renewal-only"]);
+      await sleep(300);
+      expect(await page.eval<string>("location.search"), "URL after both answers").toBe("?tool=grok");
+    } finally {
+      await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: slow.identifier });
+    }
+  }, 60_000);
+});

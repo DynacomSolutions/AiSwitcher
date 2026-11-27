@@ -26,9 +26,11 @@ import { api, supportsFix } from "@/lib/api";
 import {
   AUTH_SORT_LABELS,
   AUTH_STATE_LABELS,
+  authListLoaded,
   authTools,
   combineAuthRows,
   readAuthParams,
+  showTokenRefresh,
   visibleAuthRows,
   withAuthParam,
   type AuthListParams,
@@ -330,7 +332,7 @@ function AliCookieDialog({ entry, onClose }: { entry: AuthEntry; onClose: () => 
   );
 }
 
-function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: string) => void }) {
+function FixActions({ entry, onFlow, showRefresh }: { entry: AuthEntry; onFlow: (flowId: string) => void; showRefresh: boolean }) {
   const qc = useQueryClient();
   const [keyDialogFor, setKeyDialogFor] = useState<AuthEntry | null>(null);
   const [cookieDialogFor, setCookieDialogFor] = useState<AuthEntry | null>(null);
@@ -339,9 +341,9 @@ function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: stri
     mutationFn: (identity: string) => api.refreshKimiToken(identity),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.auth });
-      toast.success("Token refreshed", { description: `${entry.toolName}/${entry.identity}` });
+      toast.success("Quota read", { description: `${entry.toolName}/${entry.identity}: the token renews only when it had expired` });
     },
-    onError: (error) => toast.error("Refresh failed", { description: error.message }),
+    onError: (error) => toast.error("Quota read failed", { description: error.message }),
   });
 
   const loginMutation = useMutation({
@@ -369,12 +371,12 @@ function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: stri
   return (
     <>
       <div className="flex flex-wrap justify-end gap-1.5">
-        {supportsFix(entry, "refresh") ? (
+        {showRefresh && supportsFix(entry, "refresh") ? (
           <Button
             variant="outline"
             size="sm"
             disabled={refreshMutation.isPending}
-            title="Ask the provider for a new token now"
+            title="Read the quota now. This renews the token only when it has expired. It does not force a refresh."
             onClick={() => refreshMutation.mutate(entry.identity)}
           >
             Refresh token
@@ -413,15 +415,25 @@ function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: stri
 /** The label above a value: visible on a narrow card, read by a screen reader in the wide grid. */
 function Cell({ label, className, children }: { label: string; className?: string; children: ReactNode }) {
   return (
-    <div className={cn("min-w-0 space-y-0.5", className)}>
-      <span className="block text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[84rem]:sr-only">{label}</span>
-      <div className="min-w-0 text-xs">{children}</div>
+    <div data-slot="auth-cell" className={cn("min-w-0 space-y-0.5", className)}>
+      <span className="block text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[60rem]:sr-only">{label}</span>
+      <div className="min-w-0 space-y-1 text-xs">{children}</div>
+    </div>
+  );
+}
+
+/** A second value inside one cell, such as the kind under the auth state. Its label shows on a card only. */
+function SubValue({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
+      <span className="text-[11px] text-muted-foreground @[60rem]:sr-only">{label}</span>
+      {children}
     </div>
   );
 }
 
 /** Grid of the wide layout. The narrow layout stacks each row as a card. */
-const GRID = "@[84rem]:grid-cols-[minmax(9rem,1.3fr)_6rem_4.5rem_5rem_6.5rem_6.5rem_5.5rem_minmax(8rem,1fr)_minmax(6rem,1fr)_14rem]";
+const GRID = "@[60rem]:grid-cols-[minmax(8rem,1.3fr)_6rem_4.5rem_5rem_5rem_7.5rem_minmax(6.5rem,1fr)_10rem]";
 
 const TONE_VARIANT = { ok: "success", warning: "warning", destructive: "destructive", muted: "secondary" } as const;
 
@@ -443,9 +455,9 @@ function AuthRowView({ row, onFlow }: { row: AuthListRow; onFlow: (flowId: strin
     <li
       data-slot="auth-row"
       data-key={row.key}
-      className={cn("grid grid-cols-2 items-start gap-x-4 gap-y-3 p-3 @2xl:grid-cols-5 @[84rem]:gap-x-3 @[84rem]:py-2.5", GRID)}
+      className={cn("grid grid-cols-2 items-start gap-x-4 gap-y-3 p-3 @2xl:grid-cols-5 @[60rem]:gap-x-3 @[60rem]:py-2.5", GRID)}
     >
-      <div className="col-span-2 min-w-0 space-y-1 @2xl:col-span-5 @[84rem]:col-span-1">
+      <div data-slot="auth-cell" className="col-span-2 min-w-0 space-y-1 @2xl:col-span-5 @[60rem]:col-span-1">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <ToolBadge tool={row.tool} />
           <span className="min-w-0 break-all text-sm font-medium">{row.identity}</span>
@@ -454,26 +466,36 @@ function AuthRowView({ row, onFlow }: { row: AuthListRow; onFlow: (flowId: strin
       </div>
       <Cell label="Auth state" className="col-span-1">
         <AuthStateBadge state={row.state} />
-      </Cell>
-      <Cell label="Kind" className="col-span-1">
-        {row.kind ? (
-          <Badge variant="outline" className="font-mono text-[10px]">
-            {row.kind}
-          </Badge>
-        ) : (
-          <span className="text-muted-foreground">-</span>
-        )}
+        <SubValue label="Kind">
+          {row.kind ? (
+            <Badge variant="outline" className="font-mono text-[10px]">
+              {row.kind}
+            </Badge>
+          ) : (
+            <span className="text-muted-foreground">-</span>
+          )}
+        </SubValue>
       </Cell>
       <Cell label="Expires">
         <span title={row.entry?.expiresAt ? new Date(row.entry.expiresAt).toLocaleString() : undefined}>{row.expires}</span>
       </Cell>
       <Cell label="Last renewal">{row.lastRenewal}</Cell>
       <Cell label="Next renewal">{row.nextRenewal}</Cell>
-      <Cell label="Renewed by">{row.renewedBy}</Cell>
       <Cell label="Renewal status" className="col-span-2 @2xl:col-span-1">
-        {row.status ? <Badge variant={TONE_VARIANT[row.status.tone]}>{row.status.label}</Badge> : <span className="text-muted-foreground">-</span>}
+        {row.status ? (
+          <Badge variant={TONE_VARIANT[row.status.tone]} title={row.status.label} className="max-w-full shrink whitespace-normal break-words text-left">
+            {row.status.label}
+          </Badge>
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        )}
+        <SubValue label="Renewed by">
+          <span className="text-muted-foreground" title={row.renewedBy}>
+            {row.renewedBy}
+          </span>
+        </SubValue>
       </Cell>
-      <Cell label="Detail and last error" className="col-span-2 @2xl:col-span-5 @[84rem]:col-span-1">
+      <Cell label="Detail and last error" className="col-span-2 @2xl:col-span-5 @[60rem]:col-span-1">
         {row.error ? (
           <span className="block break-words text-destructive" title={row.error}>
             {row.error}
@@ -483,8 +505,8 @@ function AuthRowView({ row, onFlow }: { row: AuthListRow; onFlow: (flowId: strin
         )}
         {row.detail ? <span className="mt-0.5 block break-words text-muted-foreground">{row.detail}</span> : null}
       </Cell>
-      <div className="col-span-2 flex flex-wrap justify-start gap-1.5 @2xl:col-span-5 @[84rem]:col-span-1 @[84rem]:justify-end">
-        {entry && !row.retired ? <FixActions entry={entry} onFlow={onFlow} /> : null}
+      <div data-slot="auth-cell" className="col-span-2 flex min-w-0 flex-wrap justify-start gap-1.5 @2xl:col-span-5 @[60rem]:col-span-1 @[60rem]:justify-end">
+        {entry && !row.retired ? <FixActions entry={entry} onFlow={onFlow} showRefresh={showTokenRefresh(row)} /> : null}
         {row.canRefreshHere ? (
           <Button variant="outline" size="sm" title="Run the renewal pass of this host for this login now" disabled={refreshMutation.isPending || running} onClick={() => refreshMutation.mutate()}>
             {running || refreshMutation.isPending ? "Renewing…" : "Run host renewal"}
@@ -504,7 +526,8 @@ function AuthList({ onFlow }: { onFlow: (flowId: string) => void }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const rows = combineAuthRows(authQuery.data?.entries ?? [], renewalQuery.data?.rows ?? []);
   const toolNames = authTools(rows);
-  const listLoaded = rows.length > 0;
+  // Both answers must have settled: the renewal report names tools that the auth probe does not list.
+  const listLoaded = authListLoaded(rows.length, authQuery.isPending, renewalQuery.isPending);
   const params = readAuthParams(searchParams, listLoaded ? toolNames : undefined);
   const unknownTool = listLoaded && (searchParams.get("tool") ?? "") !== params.tool;
   // An unknown tool in the URL reads as "all tools"; the address is corrected with history replace.
@@ -602,16 +625,14 @@ function AuthList({ onFlow }: { onFlow: (flowId: string) => void }) {
         <EmptyState title="No matches" description="No credential matches these filters." />
       ) : (
         <div className="@container overflow-hidden rounded-xl border">
-          <div aria-hidden className={cn("hidden border-b bg-muted/40 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[84rem]:grid @[84rem]:gap-x-3", GRID)}>
+          <div aria-hidden data-slot="auth-head" className={cn("hidden border-b bg-muted/40 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground @[60rem]:grid @[60rem]:gap-x-3", GRID)}>
             <span>Identity</span>
-            <span>Auth state</span>
-            <span>Kind</span>
+            <span>Auth state, kind</span>
             <span>Expires</span>
             <span>Last renewal</span>
             <span>Next renewal</span>
-            <span>Renewed by</span>
-            <span>Renewal status</span>
-            <span>Detail, last error</span>
+            <span>Renewal status, renewed by</span>
+            <span>Detail and last error</span>
             <span className="text-right">Actions</span>
           </div>
           <ul className="divide-y">

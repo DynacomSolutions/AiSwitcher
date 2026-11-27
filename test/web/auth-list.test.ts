@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { combineAuthRows, readAuthParams, visibleAuthRows, withAuthParam } from "../../apps/web/src/lib/auth-list.ts";
+import { authListLoaded, combineAuthRows, readAuthParams, showTokenRefresh, visibleAuthRows, withAuthParam } from "../../apps/web/src/lib/auth-list.ts";
 import type { AuthEntry, RenewalRow } from "../../apps/web/src/types/api.ts";
 
 const NOW = Date.parse("2026-11-27T06:00:00.000Z");
@@ -126,5 +126,39 @@ describe("visibleAuthRows", () => {
   });
   test("sort by state puts the worst first", () => {
     expect(keys(view("sort=state"))[0]).toBe("codex/c-dead");
+  });
+});
+
+describe("authListLoaded", () => {
+  test("the list is loaded only when both answers have settled", () => {
+    // The renewal report names tools the auth probe does not list, so one answer alone cannot clear a tool in the URL.
+    expect(authListLoaded(3, false, true)).toBe(false);
+    expect(authListLoaded(3, true, false)).toBe(false);
+    expect(authListLoaded(3, false, false)).toBe(true);
+  });
+  test("an empty list is never loaded, so a failed page keeps its URL", () => {
+    expect(authListLoaded(0, false, false)).toBe(false);
+  });
+  test("a tool known only to the renewal report is not unknown once both answers settled", () => {
+    const list = combineAuthRows(ENTRIES, RENEWALS, NOW);
+    const tools = list.map((r) => r.tool);
+    expect(tools).toContain("grok");
+    expect(readAuthParams(new URLSearchParams("tool=grok"), tools).tool).toBe("grok");
+  });
+});
+
+describe("showTokenRefresh", () => {
+  test("a login that this host renews uses Run host renewal, not the weaker Refresh token", () => {
+    const hostRow = combineAuthRows(
+      [entry("kimi", "k-host", { fixable: ["refresh", "login"] })],
+      [{ tool: "kimi", identity: "k-host", renewer: "host", gateway: null, note: "", host: { lastAttemptAt: null, lastSuccessAt: null, lastError: null, lastDetail: null, revoked: false, consecutiveFailures: 0, running: false } }],
+      NOW,
+    )[0]!;
+    expect(hostRow.canRefreshHere).toBe(true);
+    expect(showTokenRefresh(hostRow)).toBe(false);
+  });
+  test("a login with no host renewal keeps Refresh token", () => {
+    const row = combineAuthRows([entry("kimi", "k-plain", { fixable: ["refresh"] })], [], NOW)[0]!;
+    expect(showTokenRefresh(row)).toBe(true);
   });
 });

@@ -148,6 +148,22 @@ export function combineAuthRows(entries: readonly AuthEntry[], renewals: readonl
   return out.sort((a, b) => Number(a.retired) - Number(b.retired));
 }
 
+/**
+ * True when the list may be trusted to name every tool. Both answers must have settled (data or error).
+ * The renewal report names logins the auth probe does not list, so one answer alone can miss a tool in the URL.
+ */
+export function authListLoaded(rowCount: number, authPending: boolean, renewalPending: boolean): boolean {
+  return rowCount > 0 && !authPending && !renewalPending;
+}
+
+/**
+ * "Refresh token" only reads the quota and renews an expired token. A login that this host renews has the real
+ * OAuth refresh, "Run host renewal", so the weaker button hides there.
+ */
+export function showTokenRefresh(row: Pick<AuthListRow, "canRefreshHere">): boolean {
+  return !row.canRefreshHere;
+}
+
 /** The tools that appear in the list, for the tool filter. */
 export function authTools(rows: readonly AuthListRow[]): string[] {
   return [...new Set(rows.map((r) => r.tool))].sort();
