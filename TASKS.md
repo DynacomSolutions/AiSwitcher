@@ -433,6 +433,7 @@ ETA: 2026-11-25 18:00 ICT
 | 277 | Chat: favourites sync pools with no pool-name config | done | claude | | 18.276 | | Merged #755, released v0.5.107.<br>Grok pool star syncs both ways on host and in pods.<br>Pod chart has no pool-name setting. |
 
 ## 19. CI speed and flaky tests
+ETA: 2026-11-27 22:30 ICT
 
 - Faster CI feedback: cache the host app Rust build, fit job timeouts to measured p99, fix flaky tests, then measure.
 
@@ -446,6 +447,7 @@ ETA: 2026-11-25 18:00 ICT
 | 322 | Sync guard reads registry paths at call time | done | claude | fix-host-sync-owned-test | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/798.<br>Cause of the v0.5.115 release failures: a path frozen at import kept a test override. |
 | 324 | gateway-managed.ts: read registry paths at call time | done | claude | | 19.322 | | Merged in #856 (`9ef5c55e`): `gateway-managed.ts` and `route-all.ts` read registry paths at call time.<br>New tests change the path after import.<br>4 old tests read the real registry before the fix. |
 | 341 | Make board-only pushes pass without node_modules, so `git-base land` works again | todo | | | | | The base pre-push hook runs privacy, identifier and secret scans, then `bun run typecheck` and `bun run lint`.<br>`git-base land` has no `node_modules`, so tsc is not found and the push fails (26 Nov 01:51 ICT, board-only change).<br>A task worktree needs `bun install --frozen-lockfile` first (about 3 minutes). |
+| 402 | Give every main push its own full CI run | in_progress | claude | ci-main-no-cancel | | 2026-11-27 22:30 ICT | Owner approved 2026-11-27.<br>A new push cancelled the run before it; board-only pushes left merges without a full run (#899 cancelled twice).<br>Fix: one concurrency group per commit on pushes in ci.yml and host-app.yml; PR runs still cancel. |
 
 ## 20. Sessions in the AIS database
 ETA: 2026-12-12 18:00 ICT
