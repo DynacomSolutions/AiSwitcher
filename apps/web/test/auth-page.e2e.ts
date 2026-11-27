@@ -155,7 +155,7 @@ const MEASURE = `(() => {
     const lines = new Map();
     for (const ch of li.children) {
       const r = ch.getBoundingClientRect();
-      const k = Math.round(r.top);
+      const k = Math.round(r.y);
       const l = lines.get(k) ?? { l: Infinity, r: -Infinity };
       l.l = Math.min(l.l, r.left);
       l.r = Math.max(l.r, r.right);
