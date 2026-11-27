@@ -4,6 +4,7 @@ import type { ParsedArgs } from "../args.ts";
 import { aggregateLimitResults, collectLimitTargets, fetchLimitResults, pendingLimitResult, runLimitsQuery } from "./collect.ts";
 import { formatLimitsReport } from "./report.ts";
 import type { ToolLimitResult } from "./types.ts";
+import { applyLimitsAutoReset, loadLimitsAutoReset } from "./auto-reset.ts";
 
 /**
  * Redraws in place via withLiveRender — the SAME primitive
@@ -28,7 +29,8 @@ export async function runWatch(
   compact = false,
 ): Promise<void> {
   if (!process.stdout.isTTY) {
-    const results = await runLimitsQuery(identityFilter, flags, false);
+    const [rows, settings] = await Promise.all([runLimitsQuery(identityFilter, flags, false), loadLimitsAutoReset(flags)]);
+    const results = applyLimitsAutoReset(rows, settings, identityFilter);
     console.log(formatLimitsReport(results, new Date(), undefined, { compact }));
     return;
   }
@@ -40,11 +42,13 @@ export async function runWatch(
     (tick) => `${statusLine}\n\n${formatLimitsReport(aggregateLimitResults(slots.flat()), new Date(), spinnerChar(tick), { compact })}`,
     async () => {
       while (true) {
+        const settings = loadLimitsAutoReset(flags);
         const targets = await collectLimitTargets(identityFilter, flags);
         // One slot per target, seeded with pending spinner rows (see collect.ts's pendingLimitResult).
         slots = await Promise.all(targets.map(pendingLimitResult));
         statusLine = dim("fetching…");
         await fetchLimitResults(targets, false, explicitTool, (i, resolved) => (slots[i] = resolved));
+        slots = [applyLimitsAutoReset(aggregateLimitResults(slots.flat()), await settings, identityFilter)];
         statusLine = dim(`updated ${new Date().toLocaleTimeString()}`);
         await Bun.sleep(intervalMs);
       }

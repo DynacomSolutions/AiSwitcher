@@ -16,13 +16,15 @@ import { getGatewayListener, releaseGatewayListener } from "./pg-listen.ts";
 import { getGatewaySql, releaseGatewaySql } from "./pg-pool.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { PgRefreshBackend } from "./pg-refresh-backend.ts";
-import { bounded, guardRefresh, JOURNAL_RETENTION_MS, RefreshGuardRetryable, RefreshRefused, type RefreshGuardBackend } from "./refresh-guard.ts";
+import { bounded, guardRefresh, JOURNAL_RETENTION_MS, MemoryRefreshBackend, RefreshGuardRetryable, RefreshRefused, type RefreshGuardBackend } from "./refresh-guard.ts";
 import { isRetired } from "../identities/retired.ts";
 import { allowedAccounts, findPool, isSwapPool, poolsOf } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { isOperationalPath, publicHostsFromEnv, viaPublicHost } from "./public-host.ts";
 import { aliSessionOnce, aliSetupSelfTest, listAliAccounts, type AliSetupDeps } from "./ali-session.ts";
+import { createAutoResetRecovery, type AutoResetPool, type AutoResetUsage } from "./auto-reset.ts";
+import { PgAutoResetStore, type AutoResetStore } from "./auto-reset-store.ts";
 import { withStoreWaitTimeout } from "./admin-store.ts";
 import { SessionStore } from "./sessions/session-store.ts";
 import type { SessionsIngestStore } from "./admin-sessions.ts";
@@ -58,7 +60,7 @@ import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
 import { MemoryUsageReadings, PgUsageReadings, type UsageReadings } from "./usage-readings.ts";
-import { createCodexResetSource, createUsageSource, fetchCodexResetCredits, fetchPoolUsage, withOpencodeUsage, type FetchUsage } from "./usage-source.ts";
+import { createCodexResetSource, createUsageSource, fetchCodexResetCredits, fetchGatewayCodexUsage, fetchPoolUsage, withOpencodeUsage, type FetchUsage } from "./usage-source.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
@@ -67,8 +69,8 @@ import { clearLoginRevoked, readLoginRevoked, recordLoginRevoked } from "../iden
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
 import { useClaudeReset } from "../server/claude-resets.ts";
-import { consumeCodexResetForIdentity } from "./account.ts";
-import { MemoryResetCreditInvalidations, PgResetCreditInvalidations } from "./reset-credit-cache.ts";
+import { consumeCodexResetForIdentity, type CodexCreditSelection, type CodexRedemptionGuard } from "./account.ts";
+import { MemoryResetCreditInvalidations, PgResetCreditInvalidations, type ResetCreditInvalidations } from "./reset-credit-cache.ts";
 import { createManagementCheck, GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, listGatewayManagedAccountsStrict, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
@@ -125,6 +127,9 @@ export interface GatewayHooks {
   spendReset?(identity: string, grantId: string): Promise<unknown>;
   /** Tests: replaces the one Codex consume behind POST /limits/codex/:identity/resets/use. */
   spendCodexReset?(identity: string, redeemRequestId: string): Promise<unknown>;
+  autoReset?: { store: AutoResetStore; pools: () => Promise<AutoResetPool[]> };
+  /** Tests: shares reset generations between gateway replicas. */
+  resetCreditInvalidations?: ResetCreditInvalidations;
   /** Replaces the AIS adapter fetch behind the default (cached) usage source. */
   fetchUsage?: FetchUsage;
   canonical?: GatewayDeps["canonical"];
@@ -380,6 +385,19 @@ export function appPoolMemberNames(file: IdentitiesFile): string[] {
     for (const name of allowedAccounts(pool)) listed.add(findIdentityByNameOrAlias(real, name)?.name ?? name);
   }
   return real.filter((i) => listed.has(i.name)).map((i) => i.name);
+}
+
+/** Named Codex pools can authorise only accounts in the gateway routing union. */
+export function codexAutoResetPools(file: IdentitiesFile, routed: string[]): AutoResetPool[] {
+  const real = file.identities.filter((identity) => !isRetired(identity) && !isSwapPool(identity));
+  const union = new Set(routed);
+  return poolsOf(file).map((pool) => {
+    const members = allowedAccounts(pool).flatMap((name) => {
+      const identity = findIdentityByNameOrAlias(real, name)?.name;
+      return identity !== undefined && union.has(identity) ? [identity] : [];
+    });
+    return { name: pool.name, members: [...new Set(members)] };
+  });
 }
 
 /** The names the gateway manages, in order. A name for a tool the check does not cover stays (the check answers true for it). */
@@ -826,14 +844,50 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   // The usage source bounds every shared call itself.
   const readingsSql = hooks.usageReadings || hooks.ping || hooks.openStore ? undefined : sharedSql;
   const sharedReadings: UsageReadings = hooks.usageReadings ?? (readingsSql ? new PgUsageReadings(readingsSql) : new MemoryUsageReadings());
-  const resetCreditInvalidations = readingsSql ? new PgResetCreditInvalidations(readingsSql) : new MemoryResetCreditInvalidations();
+  const resetCreditInvalidations = hooks.resetCreditInvalidations ?? (readingsSql ? new PgResetCreditInvalidations(readingsSql) : new MemoryResetCreditInvalidations());
+  const redemptionScope = { provider: "internal-codex-redemption", identity: "gateway" };
+  const localRedemptionQueue = new MemoryRefreshBackend();
+  const generation = (identity: string) => bounded(resetCreditInvalidations.version(identity), 2_000, "Codex reset generation");
+  async function withRedemptionLock<T>(run: () => Promise<T>): Promise<T> {
+    // Queue locally so only one contender per replica uses a database connection.
+    const local = await localRedemptionQueue.acquire(redemptionScope, 15_000);
+    try {
+      const shared = await refreshBackend.acquire(redemptionScope, 15_000);
+      try {
+        return await run();
+      } finally {
+        await shared.release().catch(() => undefined);
+      }
+    } finally {
+      await local.release();
+    }
+  }
+  const withCodexRedemption: CodexRedemptionGuard = (run) => withRedemptionLock(() => run(async (identity) => {
+    try {
+      await bounded(resetCredits.invalidate(identity), 2_000, "Codex reset invalidation");
+    } catch (err) {
+      console.warn(`gateway: Codex reset credit cache invalidation failed (${errorTag(err)})`);
+      throw new Error("Codex reset generation could not be updated");
+    }
+  }));
+  const codexResetGenerations = async (identities: readonly string[]): Promise<string[]> => {
+    const names = await Promise.all(identities.map((identity) => canonical("codex", identity)));
+    return withRedemptionLock(() => Promise.all(names.map(async (name) => JSON.stringify([name, await generation(name)]))));
+  };
   const resetCredits = createCodexResetSource({
-    invalidations: resetCreditInvalidations,
-    fetchCredits: async (identity) => fetchCodexResetCredits(
-      await creds.get("codex", identity),
-      hooks.fetch ? (input, init) => hooks.fetch!(input, init) : fetch,
-    ),
+    invalidations: { version: generation, invalidate: (identity) => resetCreditInvalidations.invalidate(identity) },
+    fetchCredits: async (identity) => {
+      const credential = await creds.get("codex", identity);
+      // Wait for any POST that published its generation before this inventory read.
+      await withRedemptionLock(async () => {});
+      return fetchCodexResetCredits(credential, hooks.fetch ?? fetch);
+    },
   });
+  async function codexCredential(identity: string) {
+    const credential = await creds.get("codex", identity);
+    if (credential.identity !== identity) throw new Error("Codex credential does not match the requested account");
+    return credential;
+  }
   const usage = createUsageSource({
     fetchUsage: hooks.fetchUsage ?? withOpencodeUsage(creds, fetchPoolUsage),
     shared: sharedReadings,
@@ -846,6 +900,95 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const poolMembers =
     hooks.poolMembers ??
     (async (provider: GatewayProvider): Promise<string[]> => onlyManaged(provider, await defaultPoolMembers(provider), poolManaged));
+  const autoResetConfig = hooks.autoReset ?? (hooks.openStore || hooks.ping ? undefined : {
+    store: new PgAutoResetStore(sharedSql),
+    pools: async () => {
+      const file = await loadIdentitiesFile(TOOL_CONFIGS.codex.identitiesJsonPath);
+      const members = await poolMembers("codex");
+      return codexAutoResetPools(file, await Promise.all(members.map((name) => canonical("codex", name))));
+    },
+  });
+  const autoReset = autoResetConfig && (() => {
+    // All weekly proofs and the selected inventory must agree with the generations at spend time.
+    const versions = new WeakMap<AbortSignal, Map<string, string>>();
+    const generationsMatch = async (proof: Map<string, string>): Promise<boolean> => {
+      const matches = await Promise.all([...proof].map(async ([name, before]) => before === await generation(name)));
+      return matches.every(Boolean);
+    };
+    const clock = () => now().getTime();
+    const recovery = createAutoResetRecovery({
+      ...autoResetConfig,
+      now: clock,
+      freshUsage: async (identity, signal) => {
+        if (await creds.loggedOut?.("codex", identity)) return undefined;
+        signal.throwIfAborted();
+        const credential = await codexCredential(identity);
+        signal.throwIfAborted();
+        // A pre-POST invalidation must precede every proof that uses its new generation.
+        const before = await withRedemptionLock(() => {
+          signal.throwIfAborted();
+          return generation(identity);
+        });
+        signal.throwIfAborted();
+        const reading = await fetchGatewayCodexUsage(credential, hooks.fetch ?? fetch, clock, signal);
+        if (!reading || before !== await generation(identity)) return undefined;
+        const proof = versions.get(signal) ?? new Map<string, string>();
+        proof.set(identity, before);
+        versions.set(signal, proof);
+        return reading;
+      },
+      readCredits: async (identity, signal) => {
+        const before = versions.get(signal)?.get(identity);
+        if (before === undefined || before !== await generation(identity)) return undefined;
+        const credential = await codexCredential(identity);
+        signal.throwIfAborted();
+        const inventory = await fetchCodexResetCredits(credential, hooks.fetch ?? fetch, signal, clock, "automatic");
+        return before === await generation(identity) ? inventory : undefined;
+      },
+      spend: (identity, id, requestId, signal, evidence) => {
+        evidence.postAttempted(false);
+        const proof = versions.get(signal);
+        return spendCodexCredit(identity, requestId, {
+          id,
+          endsAt: evidence.endsAt,
+          signal,
+          now: clock,
+          stillCurrent: evidence.stillCurrent,
+          stillEligible: async () => proof?.has(identity) === true && evidence.stillCurrent() &&
+            await generationsMatch(proof) && evidence.stillCurrent(),
+          onPost: () => evidence.postAttempted(true),
+        });
+      },
+    });
+    return {
+      enabled: recovery.enabled,
+      async recover(input: Parameters<typeof recovery.recover>[0]) {
+        const confirmed = new Map<string, AutoResetUsage>();
+        const identity = await recovery.recover({
+          ...input,
+          onConfirmed: (name, reading) => confirmed.set(name, reading),
+        });
+        const reading = identity === undefined ? undefined : confirmed.get(identity);
+        if (identity !== undefined && reading) void usage.publish("codex", identity, reading).catch(() => undefined);
+        return identity;
+      },
+    };
+  })();
+
+  async function spendCodexCredit(identity: string, redeemRequestId: string, selection?: CodexCreditSelection) {
+    return withCodexRedemption(async (beforePost) => {
+      // Acquire the redemption lock before any account lock. Credential lookup can take the account lock itself.
+      selection?.signal.throwIfAborted();
+      const credential = await codexCredential(identity);
+      const lock = await refreshBackend.acquire({ provider: "codex", identity }, 15_000);
+      try {
+        if (selection && !await selection.stillEligible()) return { identity, result: "no_credit" as const, windowsReset: 0 };
+        return await consumeCodexResetForIdentity(identity, redeemRequestId, { creds, fetch: hooks.fetch ?? fetch, credential }, selection, beforePost);
+      } finally {
+        await lock.release().catch(() => undefined);
+      }
+    });
+  }
   const browserPoolMembers = hooks.browserPoolMembers ?? defaultBrowserPoolMembers;
   const browserIdentityExists = hooks.browserIdentityExists ?? defaultBrowserIdentityExists;
 
@@ -884,6 +1027,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const drainCtrl = new AbortController();
   const appDeps: GatewayDeps = {
     drainSignal: drainCtrl.signal,
+    autoReset,
+    withCodexRedemption,
+    codexResetGenerations,
     store,
     ledger,
     creds,
@@ -913,6 +1059,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const renewalAccounts = hooks.keepAliveAccounts ?? ((tool: string) => listGatewayManagedAccountsStrict(undefined, tool));
   const admin = createAdminApp({
     store,
+    autoReset: autoResetConfig,
     readStore: inner,
     adminToken: opts.adminToken,
     now,
@@ -956,21 +1103,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       const before = await usage.get("codex", identity).catch(() => undefined);
       const beforeAt = before ? Date.parse(before.capturedAt) : Number.NaN;
       const baseline = before && !before.stale && before.status !== "unavailable" && Number.isFinite(beforeAt) ? before : undefined;
-      // Resolve or refresh the login before taking the spend lock. Credential refresh uses the same distributed account lock.
-      const credential = await creds.get("codex", identity);
-      const lock = await refreshBackend.acquire({ provider: "codex", identity }, 15_000);
-      let result: Awaited<ReturnType<typeof consumeCodexResetForIdentity>>;
-      try {
-        result = await consumeCodexResetForIdentity(identity, redeemRequestId, { creds, fetch: hooks.fetch ?? fetch, credential });
-      } finally {
-        try {
-          await resetCredits.invalidate(identity);
-        } catch (err) {
-          console.warn(`gateway: Codex reset credit cache invalidation failed (${errorTag(err)})`);
-        } finally {
-          await lock.release().catch(() => undefined);
-        }
-      }
+      const result = await spendCodexCredit(identity, redeemRequestId);
       if (result.result !== "reset" && result.result !== "already_redeemed") return { ...result, reconciliation: { status: "not_needed" as const } };
 
       // Read only this account from OpenAI. A different replica may still have the pre-reset shared cache.

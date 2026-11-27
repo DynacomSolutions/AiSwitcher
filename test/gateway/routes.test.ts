@@ -1178,6 +1178,7 @@ describe("daily limits", () => {
     reply = () => new Response(JSON.stringify({ available_count: 1 }));
     let t = NOW.getTime();
     deps.now = () => new Date(t);
+    deps.codexResetGenerations = async (names) => names.map((name) => `${name}:0`);
     const app = createGatewayApp(deps);
     const get = async () => (await app.request("http://gw.test/c/wham/rate-limit-reset-credits", { headers: { authorization: `Bearer ${tokens.c}` } })).text();
     await get();
@@ -1188,6 +1189,34 @@ describe("daily limits", () => {
     t += 61_000;
     await get();
     expect(seen.length).toBe(before + 2);
+  });
+
+  test("pooled reset credit cache follows all member generations and bypasses unavailable generations", async () => {
+    await addApp("c", "codex", "openai");
+    let members = ["a", "b"];
+    let version = 0;
+    let available = true;
+    deps.poolMembers = async () => members;
+    deps.codexResetGenerations = async (names) => {
+      if (!available) throw new Error("synthetic generation read failure");
+      return names.map((name) => `${name}:${name === "b" ? version : 0}`);
+    };
+    reply = (request) => Response.json({ available_count: request.headers.get("authorization") === "Bearer tok-b" ? 1 - version : 1 });
+    const gw = createGatewayApp(deps);
+    const get = async () => (await gw.request("http://gw.test/c/wham/rate-limit-reset-credits", { headers: { authorization: `Bearer ${tokens.c}` } })).json();
+    expect(await get()).toEqual({ available_count: 2 });
+    expect(await get()).toEqual({ available_count: 2 });
+    expect(seen).toHaveLength(2);
+    version++;
+    expect(await get()).toEqual({ available_count: 1 });
+    expect(seen).toHaveLength(4);
+    available = false;
+    expect(await get()).toEqual({ available_count: 1 });
+    expect(seen).toHaveLength(6);
+    available = true;
+    members = ["a"];
+    expect(await get()).toEqual({ available_count: 1 });
+    expect(seen).toHaveLength(7);
   });
 });
 

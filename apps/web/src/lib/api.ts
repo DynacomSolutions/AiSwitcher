@@ -1,4 +1,6 @@
 import type {
+  AutoResetResponse,
+  AutoResetScope,
   AuthEntry,
   AuthRefreshResponse,
   AuthResponse,
@@ -161,6 +163,10 @@ export const api = {
       method: "DELETE",
       body: { alias },
     }),
+
+  getAutoReset: () => request<AutoResetResponse>("/api/limits/codex/auto-reset"),
+  setAutoReset: (kind: AutoResetScope, name: string, enabled: boolean) =>
+    request<{ name: string; enabled: boolean }>(`/api/limits/codex/auto-reset/${kind}`, { method: "PUT", body: { name, enabled } }),
 
   getLimits: (freshCodexIdentity?: string) => request<LimitsResponse>(`/api/limits?maxAge=${freshCodexIdentity ? 5 : 45}${freshCodexIdentity ? `&tool=codex&identity=${encodeURIComponent(freshCodexIdentity)}&freshCodex=${encodeURIComponent(freshCodexIdentity)}` : ""}`),
 

@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createAlerter } from "../../src/gateway/alerts.ts";
 import { createGatewayApp, styleForPath } from "../../src/gateway/app.ts";
-import { instrumentRefresh, keepAliveOnce, trackedHeartbeatWrite, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
+import { MemoryAutoResetStore } from "../../src/gateway/auto-reset-store.ts";
+import { codexAutoResetPools, instrumentRefresh, keepAliveOnce, trackedHeartbeatWrite, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
 import { MemoryResetCreditInvalidations } from "../../src/gateway/reset-credit-cache.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { OAuthRefreshError } from "../../src/identities/oauth-refresh.ts";
@@ -1807,17 +1808,19 @@ describe("Codex reset credits", () => {
     expect(Date.now() - startedAt).toBeLessThan(8_000);
   }, 9_000);
 
-  test("cache invalidation failure preserves the provider outcome and releases the spend lock", async () => {
-    const invalidate = spyOn(MemoryResetCreditInvalidations.prototype, "invalidate").mockRejectedValue(new Error("synthetic cache failure"));
+  test("a failed generation write prevents the POST and releases the spend lock", async () => {
+    const invalidations = new MemoryResetCreditInvalidations();
+    const invalidate = spyOn(invalidations, "invalidate").mockRejectedValueOnce(new Error("synthetic cache failure"));
     try {
       let posts = 0;
       const g = await boot({
+        resetCreditInvalidations: invalidations,
         canonical: async (_provider, identity) => identity,
         fetchUsage: async () => undefined,
         fetch: (async (_input, init) => {
           if (init?.method !== "POST") return Response.json({ available_count: 1 });
           posts++;
-          return posts === 1 ? Response.json({ code: "reset" }) : new Response(null, { status: 403 });
+          return new Response(null, { status: 403 });
         }) as typeof fetch,
       });
       const spend = () => fetch(`http://127.0.0.1:${g.adminPort}/limits/codex/codex-member/resets/use`, {
@@ -1825,14 +1828,110 @@ describe("Codex reset credits", () => {
         headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" },
         body: JSON.stringify({ redeemRequestId: crypto.randomUUID() }),
       });
-      const first = await spend();
-      expect(first.status).toBe(200);
-      expect(await first.json()).toMatchObject({ identity: "codex-member", result: "reset", windowsReset: 0, reconciliation: { status: "pending" } });
+      expect((await spend()).status).toBe(502);
+      expect(posts).toBe(0);
       expect((await spend()).status).toBe(403);
       expect(invalidate).toHaveBeenCalledTimes(2);
-      expect(posts).toBe(2);
+      expect(posts).toBe(1);
     } finally {
       invalidate.mockRestore();
+    }
+  });
+
+  test("a forwarded POST holds the shared lock across credential refresh and invalidates another replica's cache", async () => {
+    const member = "fixture-codex";
+    const otherMember = "fixture-other-codex";
+    const pinned = "fixture-codex-pinned";
+    const pooled = "fixture-codex-pooled";
+    const pinnedToken = generateToken();
+    const pooledToken = generateToken();
+    for (const [name, token, target] of [
+      [pinned, pinnedToken, { kind: "pin", identity: member }],
+      [pooled, pooledToken, { kind: "pool" }],
+    ] as const) {
+      await store.putApp({ ...app, name, provider: "codex", style: "openai", target });
+      await store.addToken({ app: name, prefix: token.prefix, hash: token.hash, createdAt: app.createdAt });
+    }
+    const backend = new MemoryRefreshBackend();
+    const invalidations = new MemoryResetCreditInvalidations();
+    const retryEntered = Promise.withResolvers<void>();
+    const releasePost = Promise.withResolvers<void>();
+    const contender = Promise.withResolvers<void>();
+    const acquire = backend.acquire.bind(backend);
+    let watchForContender = false;
+    const acquireSpy = spyOn(backend, "acquire").mockImplementation((key, timeout) => {
+      if (watchForContender && key.provider !== "codex") contender.resolve();
+      return acquire(key, timeout);
+    });
+    let available = 1;
+    const requests: Array<{ query: string; body: string; header: string | null }> = [];
+    const forwardedBody = '{ "redeem_request_id": "SYNTHETIC_FIXTURE_FORWARDED", "credit_id": "RateLimitResetCredit_SYNTHETIC_FIXTURE_FORWARDED" }';
+    const shared: Partial<GatewayHooks> = {
+      refreshBackend: backend,
+      resetCreditInvalidations: invalidations,
+      keepAliveAccounts: async () => [],
+      poolMembers: async () => [member],
+      canonical: async (_provider, name) => name,
+      fetchUsage: async () => undefined,
+      creds: {
+        get: async (_provider, identity) => {
+          const lock = await backend.acquire({ provider: "codex", identity }, 500);
+          await lock.release();
+          return { identity, accessToken: "access-SYNTHETIC_FIXTURE_OLD" };
+        },
+        refreshAfter401: async (_provider, identity) => {
+          const lock = await backend.acquire({ provider: "codex", identity }, 500);
+          await lock.release();
+          return { identity, accessToken: "access-SYNTHETIC_FIXTURE_NEW" };
+        },
+      },
+      fetch: (async (input, init) => {
+        const url = new URL(String(input));
+        if (init?.method !== "POST") return Response.json({ available_count: available });
+        const headers = new Headers(init.headers);
+        const body = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body as Uint8Array);
+        requests.push({ query: url.search, body, header: headers.get("x-fixture-request") });
+        if (!url.search) return Response.json({ code: "no_credit" });
+        if (headers.get("authorization") === "Bearer access-SYNTHETIC_FIXTURE_OLD") return new Response(null, { status: 401 });
+        retryEntered.resolve();
+        await releasePost.promise;
+        available = 0;
+        return new Response("provider refused", { status: 403, headers: { "retry-after": "15", "content-type": "text/plain" } });
+      }) as typeof fetch,
+    };
+    const a = await boot(shared);
+    const b = await boot(shared);
+    const inventory = () => fetch(`${base(b)}/${pooled}/wham/rate-limit-reset-credits`, { headers: { authorization: `Bearer ${pooledToken.token}` } });
+    expect(await (await inventory()).json()).toEqual({ available_count: 1 });
+    const forward = fetch(`${base(a)}/${pinned}/wham/rate-limit-reset-credits/consume?fixture=1`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${pinnedToken.token}`, "content-type": "application/json", "x-fixture-request": "preserved" },
+      body: forwardedBody,
+    });
+    try {
+      await Promise.race([retryEntered.promise, forward.then(() => { throw new Error("forwarded POST did not refresh"); })]);
+      expect(await invalidations.version(member)).toBe("1");
+      watchForContender = true;
+      const manual = fetch(`http://127.0.0.1:${b.adminPort}/limits/codex/${otherMember}/resets/use`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" },
+        body: JSON.stringify({ redeemRequestId: crypto.randomUUID() }),
+      });
+      await contender.promise;
+      const sent = { query: "?fixture=1", body: forwardedBody, header: "preserved" };
+      expect(requests).toEqual([sent, sent]);
+      releasePost.resolve();
+      const response = await forward;
+      expect(response.status).toBe(403);
+      expect(response.headers.get("retry-after")).toBe("15");
+      expect(await response.text()).toBe("provider refused");
+      expect(await (await manual).json()).toMatchObject({ result: "no_credit" });
+      expect(requests).toHaveLength(3);
+      expect(await invalidations.version(member)).toBe("1");
+      expect(await (await inventory()).json()).toEqual({ available_count: 0 });
+    } finally {
+      releasePost.resolve();
+      acquireSpy.mockRestore();
     }
   });
 
@@ -2023,5 +2122,249 @@ describe("usage warm readiness", () => {
     const rows = (await limits(g)).limits;
     expect(rows.find((l) => l.identity === "m1")?.maxUtilization).toBe(42);
     expect(rows.find((l) => l.identity === "id1")?.status).toBe("unavailable");
+  });
+});
+
+describe("automatic Codex reset integration", () => {
+  const identity = "fixture-codex";
+  const pool = "fixture-pool";
+  const creditId = "RateLimitResetCredit_SYNTHETIC_FIXTURE_CURRENT";
+  const otherCredit = "RateLimitResetCredit_SYNTHETIC_FIXTURE_OTHER";
+  const accountId = "account-SYNTHETIC_FIXTURE_CODEX";
+  const quota = ' { "error" : { "type" : "usage_limit_reached" } } \n';
+
+  test("canonicalises registry aliases and intersects with the routed union", () => {
+    const real = { name: identity, label: identity, configDir: "/x/member", aliases: ["fixture-alias"] };
+    expect(codexAutoResetPools({ version: 1, identities: [
+      real,
+      { name: "not-routed", label: "not-routed", configDir: "/x/not-routed" },
+      { name: pool, label: pool, configDir: "/x/pool",
+        swapPool: { accounts: ["fixture-alias", identity, "not-routed", "absent"] } },
+    ] }, [identity])).toEqual([{ name: pool, members: [identity] }]);
+  });
+
+  type Scenario = "success" | "expired" | "missing" | "logged-out" | "preflight" | "version" | "wrong-type" | "wrong-type-recheck" | "model-blocked" | "manual-race" | "generation-unavailable" | "ambiguous" | 401 | 422;
+
+  async function setup(scenario: Scenario, advanceVersion?: () => void) {
+    let clock = Date.now();
+    const resetAt = Math.floor((clock + 3_600_000) / 1000);
+    const expiry = new Date(clock + 600_000).toISOString();
+    const lock = new MemoryRefreshBackend();
+    const entered = Promise.withResolvers<void>();
+    const releasePost = Promise.withResolvers<void>();
+    const followerQuota = Promise.withResolvers<void>();
+    const auto = new MemoryAutoResetStore(() => clock);
+    const readings = new MemoryUsageReadings(() => clock);
+    const secondIdentity = "fixture-second";
+    const invalidations = new MemoryResetCreditInvalidations();
+    const generations = scenario === "generation-unavailable" ? {
+      version: async () => { throw new Error("synthetic generation failure"); },
+      invalidate: (name: string) => invalidations.invalidate(name),
+    } : invalidations;
+    const manual = scenario === "manual-race" ? await boot({
+      refreshBackend: lock,
+      resetCreditInvalidations: invalidations,
+      canonical: async (_provider, name) => name,
+      fetchUsage: async () => undefined,
+      fetch: (async (_url, init) => init?.method === "POST"
+        ? Response.json({ code: "nothing_to_reset" })
+        : Response.json({ available_count: 1 })) as typeof fetch,
+    }) : undefined;
+    await auto.setEnabled("pool", pool, true);
+    await auto.setEnabled("identity", identity, true);
+    const name = "fixture-auto-codex";
+    await store.putApp({ ...app, name, provider: "codex", style: "openai", target: { kind: "pool" } });
+    const t = generateToken();
+    await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: app.createdAt });
+    const inventory = (id: string, reset_type = "codex_rate_limits") => Response.json({ available_count: 1, credits: [{ status: "available", id, reset_type, expires_at: expiry }] });
+    let served = false;
+    let posts = 0;
+    let inferences = 0;
+    let inventories = 0;
+    let ordinaryFresh = 0;
+    const requests: Array<Record<string, string>> = [];
+    const g = await boot({
+      now: () => new Date(clock),
+      autoReset: { store: auto, pools: async () => [{ name: pool, members: [identity] }] },
+      usageReadings: readings,
+      refreshBackend: lock,
+      resetCreditInvalidations: generations,
+      keepAliveAccounts: async () => [],
+      usageFor: async () => ({
+        status: served ? "live" : "rate-limited",
+        capturedAt: new Date(clock).toISOString(),
+        windows: [{ label: "week", utilization: served ? 10 : 100, resetsAt: new Date(resetAt * 1000).toISOString() }],
+      }),
+      fetchUsage: async (_provider, _identity, opts) => {
+        if (opts?.fresh) ordinaryFresh++;
+        return undefined;
+      },
+      poolMembers: async (provider) => provider === "codex" ? (scenario === "logged-out" || scenario === "manual-race" ? [identity, secondIdentity] : [identity]) : [],
+      canonical: async (_provider, name) => name,
+      creds: {
+        loggedOut: async (_provider, name) => scenario === "logged-out" && name === secondIdentity,
+        get: async (_provider, name) => ({ identity: name, accessToken: "access-SYNTHETIC_FIXTURE_CODEX", accountId }),
+        refreshAfter401: async () => { throw new Error("unexpected refresh"); },
+      },
+      fetch: (async (url, init) => {
+        const path = new URL(String(url)).pathname;
+        expect(new Headers(init?.headers).get("chatgpt-account-id")).toBe(accountId);
+        if (path.endsWith("/usage")) {
+          return Response.json({
+            rate_limit: { allowed: served, primary_window: {
+              limit_window_seconds: 604800, reset_at: resetAt, used_percent: served ? 10 : 100,
+            } },
+            ...(scenario === "model-blocked" && served ? { additional_rate_limits: [{
+              normal_model_slug: "fixture",
+              rate_limit: { allowed: false, limit_reached: true, primary_window: {
+                limit_window_seconds: 18_000, reset_at: resetAt, used_percent: 20,
+              } },
+            }] } : {}),
+          });
+        }
+        if (path.endsWith("/rate-limit-reset-credits")) {
+          inventories++;
+          if (inventories === 1 && manual) {
+            const spent = await fetch(`http://127.0.0.1:${manual.adminPort}/limits/codex/${secondIdentity}/resets/use`, {
+              method: "POST",
+              headers: { authorization: `Bearer ${ADMIN}`, "content-type": "application/json" },
+              body: JSON.stringify({ redeemRequestId: crypto.randomUUID() }),
+            });
+            expect(spent.status).toBe(200);
+            expect(await spent.json()).toMatchObject({ result: "nothing_to_reset" });
+            expect(await invalidations.version(secondIdentity)).toBe("1");
+          }
+          if (scenario === "wrong-type" || (scenario === "wrong-type-recheck" && inventories === 2)) return inventory(creditId, "unrelated");
+          if (inventories === 2) {
+            if (scenario === "expired") clock += 46_000;
+            if (scenario === "missing") return inventory(otherCredit);
+            if (scenario === "preflight") throw new Error("synthetic inventory failure");
+            if (scenario === "version") advanceVersion?.();
+          }
+          return inventory(creditId);
+        }
+        if (path.endsWith("/consume")) {
+          posts++;
+          requests.push(JSON.parse(String(init?.body)));
+          entered.resolve();
+          if (scenario === "success") await releasePost.promise;
+          if (typeof scenario === "number") return new Response(null, { status: scenario });
+          if (scenario === "ambiguous") throw new Error("synthetic connection reset");
+          served = true;
+          return Response.json({ code: "reset", windows_reset: 1, credit: { id: creditId } });
+        }
+        if (++inferences === 2) followerQuota.resolve();
+        return served ? Response.json({ accepted: true })
+          : new Response(quota, { status: 429, headers: { "retry-after": "81" } });
+      }) as typeof fetch,
+    });
+    const call = () => fetch(`${base(g)}/${name}/v1/responses`, {
+      method: "POST", body: '{"model":"fixture","stream":false}',
+      headers: { authorization: `Bearer ${t.token}` },
+    });
+    return {
+      auto, call, entered, releasePost, followerQuota, requests, readings, invalidations,
+      counts: () => ({ posts, inferences, inventories, ordinaryFresh }),
+    };
+  }
+
+  test("a follower on a locally held member gets a real 429 and joins one durable spend", async () => {
+    const state = await setup("success");
+    const first = state.call();
+    try {
+      await state.entered.promise;
+      const second = state.call();
+      await state.followerQuota.promise;
+      expect(state.counts()).toMatchObject({ posts: 1, inferences: 2 });
+      state.releasePost.resolve();
+      expect(await (await first).json()).toEqual({ accepted: true });
+      expect(await (await second).json()).toEqual({ accepted: true });
+      expect(state.counts()).toMatchObject({ posts: 1, inferences: 4, inventories: 2 });
+      const claim = await state.auto.lastClaim("identity", identity);
+      expect(claim).toMatchObject({ status: "reset", creditId, creditedId: creditId });
+      expect(state.requests).toEqual([{ credit_id: creditId, redeem_request_id: expect.stringMatching(/^[0-9a-f-]{36}$/) }]);
+      await waitFor(async () => (await state.readings.load("codex", identity))?.reading.maxUtilization === 10);
+      expect(state.counts().ordinaryFresh).toBe(0);
+    } finally {
+      state.releasePost.resolve();
+    }
+  });
+
+  test.each(["expired", "missing", "preflight", 401, 422] as const)("returns the original 429 when the spend fails (%p)", async (scenario) => {
+    const state = await setup(scenario);
+    const response = await state.call();
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("81");
+    expect(await response.text()).toBe(quota);
+    expect(state.counts()).toMatchObject({ posts: typeof scenario === "number" ? 1 : 0, inferences: 1, inventories: 2 });
+    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ status: "rejected" });
+  });
+
+  test("does not claim when a configured routed member lacks fresh proof", async () => {
+    const state = await setup("logged-out");
+    const response = await state.call();
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe(quota);
+    expect(state.counts()).toMatchObject({ posts: 0, inferences: 1, inventories: 0 });
+    expect(await state.auto.lastClaim("identity", identity)).toBeUndefined();
+  });
+
+  test("rejects other reset types before selection and on the locked recheck", async () => {
+    const first = await setup("wrong-type");
+    expect((await first.call()).status).toBe(429);
+    expect(first.counts()).toMatchObject({ posts: 0, inventories: 1 });
+    expect(await first.auto.lastClaim("identity", identity)).toBeUndefined();
+
+    const second = await setup("wrong-type-recheck");
+    expect((await second.call()).status).toBe(429);
+    expect(second.counts()).toMatchObject({ posts: 0, inventories: 2 });
+    expect(await second.auto.lastClaim("identity", identity)).toMatchObject({ status: "rejected" });
+  });
+
+  test("rejects a claim after another replica manually redeems for a different member", async () => {
+    const state = await setup("manual-race");
+    const response = await state.call();
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe(quota);
+    expect(state.counts()).toMatchObject({ posts: 0, inventories: 1 });
+    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ status: "rejected" });
+  });
+
+  test("preserves the provider 429 while the requested model remains blocked after reset", async () => {
+    const state = await setup("model-blocked");
+    const response = await state.call();
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe(quota);
+    expect(state.counts()).toMatchObject({ posts: 1, inferences: 1 });
+  }, 12_000);
+
+  test("returns the original 429 when shared generations are unavailable", async () => {
+    const state = await setup("generation-unavailable");
+    expect(await (await state.call()).text()).toBe(quota);
+    expect(state.counts()).toMatchObject({ posts: 0, inferences: 1, inventories: 0 });
+    expect(await state.auto.lastClaim("identity", identity)).toBeUndefined();
+  });
+
+  test("keeps the generation advanced after an ambiguous POST and never repeats the spend", async () => {
+    const state = await setup("ambiguous");
+    expect(await (await state.call()).text()).toBe(quota);
+    expect(await state.invalidations.version(identity)).toBe("1");
+    expect(state.counts()).toMatchObject({ posts: 1, inferences: 1 });
+    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ status: "unknown" });
+  }, 12_000);
+
+  test("does not send the POST after the credit generation changes under the lock", async () => {
+    let version = "0";
+    const generation = spyOn(MemoryResetCreditInvalidations.prototype, "version").mockImplementation(async () => version);
+    try {
+      const state = await setup("version", () => { version = "1"; });
+      const response = await state.call();
+      expect(response.status).toBe(429);
+      expect(await response.text()).toBe(quota);
+      expect(state.counts()).toMatchObject({ posts: 0, inferences: 1, inventories: 2 });
+      expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ status: "rejected" });
+    } finally {
+      generation.mockRestore();
+    }
   });
 });

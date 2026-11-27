@@ -1,6 +1,8 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { createGatewayApp, isModelScopedRejection, scopedResetUntil, type GatewayDeps } from "../../src/gateway/app.ts";
+import { createAutoResetRecovery } from "../../src/gateway/auto-reset.ts";
+import { MemoryAutoResetStore } from "../../src/gateway/auto-reset-store.ts";
 import { extractToken } from "../../src/gateway/auth.ts";
 import { checkCaps, dayStartIct } from "../../src/gateway/caps.ts";
 import { GatewayCredentialError, RefreshCooldownError } from "../../src/gateway/credentials.ts";
@@ -2058,4 +2060,510 @@ describe("errors inside a 200 stream", () => {
     expect(events("stream_error").length).toBe(0);
     expect(requested).toEqual([{ status: "upstream_error", httpStatus: 400 }]);
   });
+});
+
+describe("automatic Codex pool reset proxy", () => {
+  const first429 = ' { "error" : { "type" : "usage_limit_reached", "message": "Weekly limit é" } }\n';
+  const body = JSON.stringify({ model: "example", stream: true, input: "fixture" });
+  const accepted = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n';
+
+  const addCodex = (over: Partial<GatewayApp> = {}) => addApp(baseApp({
+    name: "auto", provider: "codex", style: "openai", target: { kind: "pool" }, ...over,
+  }));
+
+  function refusal(text = first429, retry = "89") {
+    return new Response(text, { status: 429, headers: { "retry-after": retry, "x-codex-secondary-reset-at": "1793622600" } });
+  }
+
+  function fullWeek(percent = 100): PoolUsage {
+    return { ...live(percent), windows: [{ label: "week", utilization: percent, resetsAt: "2026-11-06T10:00:00.000Z" }] };
+  }
+
+  async function start(recover: NonNullable<GatewayDeps["autoReset"]>["recover"], enabled = true) {
+    const token = await addCodex();
+    deps.autoReset = { enabled: async () => enabled, recover };
+    const gateway = createGatewayApp(deps);
+    return async (init: RequestInit = {}, path = "/auto/v1/responses") => gateway.request(`http://gw.test${path}`, {
+      method: "POST", body, headers: { authorization: `Bearer ${token}` }, ...init,
+    });
+  }
+
+  test("off preserves the ordinary full-pool answer and skips the cached probe", async () => {
+    let recoveries = 0;
+    const request = await start(async () => { recoveries++; return undefined; }, false);
+    usage.a = fullWeek();
+    usage.b = fullWeek();
+    handler = () => refusal();
+    const cached = await request();
+    expect(cached.headers.get("x-ais-gateway-upstream")).toBeNull();
+    await cached.arrayBuffer();
+    expect(seen).toHaveLength(0);
+    usage.a = live(10);
+    usage.b = live(20);
+    const provider = await request();
+    expect(provider.headers.get("x-ais-gateway-upstream")).toBeNull();
+    await provider.arrayBuffer();
+    expect(seen).toHaveLength(2);
+    expect(recoveries).toBe(0);
+  });
+
+  test("failed recovery returns the first 429 bytes and headers", async () => {
+    const request = await start(async (input) => {
+      const { members, reservePercent, model, deadlineAt } = input;
+      expect(input).toHaveProperty("provider429At", NOW.getTime());
+      expect((deadlineAt ?? 0) - performance.now()).toBeGreaterThan(24_000);
+      expect(members).toEqual(["a", "b"]);
+      expect(reservePercent).toBe(100);
+      expect(model).toBe("example");
+      return "b";
+    });
+    let sent = 0;
+    handler = () => {
+      sent++;
+      if (sent === 1) return refusal();
+      if (sent === 2) return refusal('{"error":{"code":"usage_limit_reached"}}', "3");
+      return new Response('event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"server_error"}}}\n\n', { headers: { "content-type": "text/event-stream" } });
+    };
+    const response = await request();
+    expect(sent).toBe(3);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("89");
+    expect(response.headers.get("x-codex-secondary-reset-at")).toBe("1793622600");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(enc.encode(first429));
+  });
+
+  test("failed recovery preserves another provider error in ordinary failover", async () => {
+    let recoveries = 0;
+    const request = await start(async () => { recoveries++; return "a"; });
+    handler = () => seen.length === 1 ? refusal() : new Response("ordinary error", { status: 503 });
+    const response = await request();
+    expect(response.status).toBe(503);
+    expect(await response.text()).toBe("ordinary error");
+    expect(recoveries).toBe(0);
+  });
+
+  test("replays once as the confirmed member and stops the drain listener after acceptance", async () => {
+    const drain = new AbortController();
+    deps.drainSignal = drain.signal;
+    let replaySignal: AbortSignal | undefined;
+    let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const request = await start(async () => "b");
+    const calls: RequestInit[] = [];
+    deps.fetch = (async (_url: string, init: RequestInit) => {
+      calls.push(init);
+      if (calls.length < 3) return refusal();
+      replaySignal = init.signal ?? undefined;
+      return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        stream = controller;
+        controller.enqueue(enc.encode(accepted));
+      } }), { headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof fetch;
+    const response = await request();
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(3);
+    expect(new Headers(calls[2].headers).get("authorization")).toBe("Bearer tok-b");
+    expect(calls.map((call) => new TextDecoder().decode(call.body as Uint8Array))).toEqual([body, body, body]);
+    drain.abort();
+    expect(replaySignal?.aborted).toBe(false);
+    stream?.enqueue(enc.encode("data: [DONE]\n\n"));
+    stream?.close();
+    expect(await response.text()).toBe(accepted + "data: [DONE]\n\n");
+  });
+
+  test.each([
+    [429, '{"error":{"type":"insufficient_quota"}}', "application/json"],
+    [429, '{"error":{"type":"billing_hard_limit_reached"}}', "application/json"],
+    [429, '{"error":{"type":"rate_limit_exceeded"}}', "application/json"],
+    [402, '{"error":{"type":"usage_limit_reached"}}', "application/json"],
+    [403, '{"error":{"type":"usage_limit_reached"}}', "application/json"],
+    [200, 'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"usage_limit_reached"}}}\n\n', "text/event-stream"],
+  ])("does not claim for status %i with body %s", async (status, text, contentType) => {
+    let checks = 0;
+    let recoveries = 0;
+    const request = await start(async () => { recoveries++; return undefined; });
+    deps.autoReset!.enabled = async () => { checks++; return true; };
+    handler = () => new Response(text, { status, headers: { "content-type": contentType } });
+    await (await request()).arrayBuffer();
+    expect(checks).toBe(status === 429 ? 1 : 0);
+    expect(recoveries).toBe(0);
+    expect(seen.length).toBeGreaterThan(0);
+  });
+
+  test("contacts one provider before running fresh recovery for a full cached pool", async () => {
+    usage.a = fullWeek();
+    usage.b = fullWeek();
+    let members: string[] | undefined;
+    deps.canonical = async (_provider, name) => name === "b" ? "canonical-b" : name;
+    const request = await start(async (input) => {
+      expect(seen).toHaveLength(1);
+      members = input.members;
+      return undefined;
+    });
+    handler = () => refusal('{"error":{"message":"You reached your subscription usage limit"}}');
+    const response = await request();
+    expect(response.headers.get("retry-after")).toBe("89");
+    expect(await response.text()).toContain("subscription usage limit");
+    expect(members).toEqual(["a", "canonical-b"]);
+    expect(seen).toHaveLength(1);
+  });
+
+  test("fresh proof must include a configured logged-out member before spending", async () => {
+    const token = await addCodex();
+    const pool = "synthetic-pool";
+    const policyStore = new MemoryAutoResetStore(() => deps.now().getTime());
+    await policyStore.setEnabled("pool", pool, true);
+    await policyStore.setEnabled("identity", "a", true);
+    deps.creds.loggedOut = async (_provider, name) => name === "b";
+    usage.a = live(10);
+    let creditReads = 0;
+    let spends = 0;
+    const verified: string[] = [];
+    deps.autoReset = createAutoResetRecovery({
+      store: policyStore,
+      pools: async () => [{ name: pool, members: ["a", "b"] }],
+      freshUsage: async (name) => {
+        verified.push(name);
+        return name === "a" ? fullWeek() : undefined;
+      },
+      readCredits: async () => {
+        creditReads++;
+        return { availableCount: 1, creditExpiries: [{ id: "fixture-credit", endsAt: "2026-11-05T00:00:00.000Z" }] };
+      },
+      spend: async () => {
+        spends++;
+        return { result: "reset" };
+      },
+      now: () => deps.now().getTime(),
+      log: () => {},
+    });
+    handler = () => refusal();
+    const response = await call("/auto/v1/responses", token, { method: "POST", body });
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe(first429);
+    expect(seen).toHaveLength(1);
+    expect(verified).toEqual(["a", "b"]);
+    expect(creditReads).toBe(0);
+    expect(spends).toBe(0);
+  });
+
+  test.each(["one replica", "two replicas"] as const)("%s joins the durable claim after each request gets a real 429", async (where) => {
+    const token = await addCodex();
+    const account = "a";
+    const pool = "synthetic-pool";
+    const credit = "RateLimitResetCredit_SYNTHETIC_FIXTURE_FOLLOW";
+    const policyStore = new MemoryAutoResetStore(() => deps.now().getTime());
+    const posted = Promise.withResolvers<void>();
+    const unblockPost = Promise.withResolvers<void>();
+    const joined = Promise.withResolvers<void>();
+    const receipts: Array<{ wall: number | undefined; deadline: number | undefined }> = [];
+    const find = policyStore.findClaim.bind(policyStore);
+    policyStore.findClaim = async (key) => {
+      const claim = await find(key);
+      if (claim?.status === "pending") joined.resolve();
+      return claim;
+    };
+    await policyStore.setEnabled("pool", pool, true);
+    await policyStore.setEnabled("identity", account, true);
+    deps.poolMembers = async () => [account];
+    let restored = false;
+    let attempts = 0;
+    let posts = 0;
+    let clock = NOW.getTime();
+    deps.now = () => new Date(clock);
+    const reading = () => ({ ...fullWeek(restored ? 10 : 100), capturedAt: deps.now().toISOString() });
+    deps.usageFor = async () => reading();
+    const makeReplica = () => {
+      const recovery = createAutoResetRecovery({
+        store: policyStore,
+        pools: async () => [{ name: pool, members: [account] }],
+        freshUsage: async () => reading(),
+        readCredits: async () => ({ availableCount: 1, creditExpiries: [{ id: credit, endsAt: "2026-11-05T00:00:00.000Z" }] }),
+        spend: async () => {
+          posts++;
+          posted.resolve();
+          await unblockPost.promise;
+          restored = true;
+          return { result: "reset", creditId: credit };
+        },
+        now: () => deps.now().getTime(),
+        log: () => {},
+      });
+      return createGatewayApp({ ...deps, autoReset: {
+        enabled: recovery.enabled,
+        recover: (input) => {
+          receipts.push({ wall: input.provider429At, deadline: input.deadlineAt });
+          return recovery.recover(input);
+        },
+      }, fetch: (async () => {
+        attempts++;
+        return restored ? Response.json({ accepted: true }) : refusal();
+      }) as unknown as typeof fetch });
+    };
+    const firstReplica = makeReplica();
+    const secondReplica = where === "one replica" ? firstReplica : makeReplica();
+    const infer = (gateway: ReturnType<typeof makeReplica>) => gateway.request("http://gw.test/auto/v1/responses", {
+      method: "POST", body, headers: { authorization: `Bearer ${token}` },
+    });
+    const first = infer(firstReplica);
+    try {
+      await posted.promise;
+      clock += 1_000;
+      const second = infer(secondReplica);
+      await joined.promise;
+      expect(attempts).toBe(2);
+      expect(receipts.map((entry) => entry.wall)).toEqual([NOW.getTime(), NOW.getTime() + 1_000]);
+      expect(receipts[1].deadline ?? 0).toBeGreaterThan(receipts[0].deadline ?? Infinity);
+      unblockPost.resolve();
+      expect(await (await first).json()).toEqual({ accepted: true });
+      expect(await (await second).json()).toEqual({ accepted: true });
+      expect(posts).toBe(1);
+      expect(attempts).toBe(4);
+    } finally {
+      unblockPost.resolve();
+    }
+  });
+
+  test("never probes a reserve-only, short-window-only or stale cached refusal", async () => {
+    const token = await addCodex({ reservePercent: 80 });
+    deps.autoReset = {
+      enabled: async () => { throw new Error("unexpected eligibility read"); },
+      recover: async () => { throw new Error("unexpected recovery"); },
+    };
+    const send = async () => call("/auto/v1/responses", token, { method: "POST", body });
+    usage.a = fullWeek(90);
+    usage.b = fullWeek();
+    expect((await send()).status).toBe(429);
+    usage.a = { ...fullWeek(), windows: [{ label: "session", utilization: 100, resetsAt: "2026-11-02T11:00:00.000Z" }] };
+    expect((await send()).status).toBe(429);
+    // A stale reading permits ordinary inference. The fresh full-pool probe stays inapplicable.
+    usage.a = { ...fullWeek(), stale: true };
+    expect((await send()).status).toBe(200);
+    expect(seen).toHaveLength(1);
+  });
+
+  test("guards pins, side calls and unbuffered bodies", async () => {
+    const token = await addCodex();
+    const pin = await addCodex({ name: "auto-pin", target: { kind: "pin", identity: "a" } });
+    let checks = 0;
+    deps.autoReset = { enabled: async () => { checks++; return true; }, recover: async () => undefined };
+    handler = () => refusal();
+    const scripts = [
+      call("/auto-pin/v1/responses", pin, { method: "POST", body }),
+      call("/auto/v1/audio/transcriptions", token, { method: "POST", body }),
+      call("/auto/v1/responses", token, { method: "POST", body, headers: { "content-length": String(33 * 1024 * 1024) } }),
+    ];
+    expect((await Promise.all(scripts)).map((res) => res.status)).toEqual([429, 429, 429]);
+    expect(checks).toBe(0);
+  });
+
+  test.each(["client", "drain"] as const)("ends recovery on %s cancellation", async (kind) => {
+    const controller = new AbortController();
+    if (kind === "drain") deps.drainSignal = controller.signal;
+    const began = Promise.withResolvers<void>();
+    let stopped: AbortSignal | undefined;
+    const request = await start(async ({ signal }) => {
+      stopped = signal;
+      began.resolve();
+      return new Promise(() => {});
+    });
+    handler = () => refusal();
+    const pending = request(kind === "client" ? { signal: controller.signal } : {});
+    await began.promise;
+    controller.abort();
+    const response = await pending;
+    expect(stopped?.aborted).toBe(true);
+    expect(response.status).toBe(kind === "client" ? 499 : 429);
+    await response.arrayBuffer();
+  });
+
+  const shortenHoldTimer = () => {
+    const original = globalThis.setTimeout;
+    return spyOn(globalThis, "setTimeout").mockImplementation(((...[fn, delay, ...args]: Parameters<typeof original>) =>
+      original(fn, delay !== undefined && delay > 24_000 && delay <= 25_000 ? 40 : delay, ...args)
+    ) as typeof setTimeout);
+  };
+
+  test("off still waits for a slow upstream 429 body", async () => {
+    const bodyStarted = Promise.withResolvers<void>();
+    const finishBody = Promise.withResolvers<void>();
+    const request = await start(async () => { throw new Error("unexpected recovery"); }, false);
+    let sent = 0;
+    deps.fetch = (async () => {
+      if (++sent > 1) return refusal();
+      return new Response(new ReadableStream<Uint8Array>({
+        async pull(stream) {
+          bodyStarted.resolve();
+          await finishBody.promise;
+          stream.enqueue(enc.encode(first429));
+          stream.close();
+        },
+      }), { status: 429 });
+    }) as unknown as typeof fetch;
+    let answered = false;
+    const timer = shortenHoldTimer();
+    try {
+      const pending = request().then((response) => {
+        answered = true;
+        return response;
+      });
+      await bodyStarted.promise;
+      await Bun.sleep(80);
+      expect(answered).toBe(false);
+      expect(sent).toBe(1);
+      finishBody.resolve();
+      const response = await pending;
+      expect(response.status).toBe(429);
+      expect(response.headers.get("x-ais-gateway-upstream")).toBeNull();
+      await response.arrayBuffer();
+      expect(sent).toBe(2);
+    } finally {
+      finishBody.resolve();
+      timer.mockRestore();
+    }
+  });
+
+  test("captures both 429 clocks before inspecting the slow body", async () => {
+    const policyRead = Promise.withResolvers<void>();
+    const finishBody = Promise.withResolvers<void>();
+    let receipt: { wall?: number; deadline?: number } | undefined;
+    let wall = NOW.getTime();
+    let beforeHeaders = 0;
+    let afterHeaders = 0;
+    deps.now = () => new Date(wall);
+    const request = await start(async ({ provider429At, deadlineAt }) => {
+      receipt = { wall: provider429At, deadline: deadlineAt };
+      return undefined;
+    });
+    deps.autoReset!.enabled = async () => {
+      afterHeaders = performance.now();
+      policyRead.resolve();
+      return true;
+    };
+    let sent = 0;
+    deps.fetch = (async () => {
+      if (++sent > 1) return refusal();
+      beforeHeaders = performance.now();
+      return new Response(new ReadableStream<Uint8Array>({
+        async pull(stream) {
+          await finishBody.promise;
+          stream.enqueue(enc.encode(first429));
+          stream.close();
+        },
+      }), { status: 429 });
+    }) as unknown as typeof fetch;
+    const pending = request();
+    try {
+      await policyRead.promise;
+      wall += 1_000;
+      await Bun.sleep(10);
+      finishBody.resolve();
+      const response = await pending;
+      expect(response.status).toBe(429);
+      expect(await response.text()).toBe(first429);
+      expect(receipt?.wall).toBe(NOW.getTime());
+      expect(receipt?.deadline ?? 0).toBeGreaterThanOrEqual(beforeHeaders + 25_000);
+      expect(receipt?.deadline ?? Infinity).toBeLessThanOrEqual(afterHeaders + 25_000);
+    } finally {
+      finishBody.resolve();
+    }
+  });
+
+  test("returns the original 429 when the rule lookup stalls", async () => {
+    const rule = Promise.withResolvers<boolean>();
+    let recoveries = 0;
+    const request = await start(async () => { recoveries++; return undefined; });
+    deps.autoReset!.enabled = () => rule.promise;
+    handler = () => refusal();
+    const timer = shortenHoldTimer();
+    try {
+      const response = await Promise.race([request(), Bun.sleep(1000).then(() => undefined)]);
+      expect(response?.status).toBe(429);
+      expect(response?.headers.get("retry-after")).toBe("89");
+      expect(response?.headers.get("x-codex-secondary-reset-at")).toBe("1793622600");
+      expect(await response?.text()).toBe(first429);
+      expect(seen).toHaveLength(1);
+      expect(recoveries).toBe(0);
+    } finally {
+      rule.resolve(false);
+      timer.mockRestore();
+    }
+  });
+
+  test("returns the initial 429 headers by the deadline and preserves its unread body", async () => {
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let recoveries = 0;
+    const request = await start(async () => { recoveries++; return undefined; });
+    deps.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      start(stream) {
+        controller = stream;
+        stream.enqueue(enc.encode(first429.substring(0, 40)));
+      },
+    }), { status: 429, headers: { "retry-after": "89", "x-codex-secondary-reset-at": "1793622600" } })) as unknown as typeof fetch;
+    const timer = shortenHoldTimer();
+    try {
+      const response = await request();
+      expect(response.status).toBe(429);
+      expect(response.headers.get("retry-after")).toBe("89");
+      expect(response.headers.get("x-codex-secondary-reset-at")).toBe("1793622600");
+      expect(recoveries).toBe(0);
+      controller?.enqueue(enc.encode(first429.substring(40)));
+      controller?.close();
+      expect(await response.text()).toBe(first429);
+    } finally {
+      timer.mockRestore();
+    }
+  });
+
+  test.each(["headers", "JSON body"] as const)("returns the exact first 429 if replay stalls at %s", async (stage) => {
+    let calls = 0;
+    let cancelled = false;
+    const headers = Promise.withResolvers<Response>();
+    const signal = Promise.withResolvers<AbortSignal>();
+    const stalled = () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(enc.encode("{")); },
+      cancel() { cancelled = true; },
+    }), { headers: { "content-type": "application/json" } });
+    const request = await start(async () => "b");
+    deps.fetch = (async (_url: string, init?: RequestInit) => {
+      if (++calls < 3) return refusal();
+      signal.resolve(init!.signal!);
+      return stage === "headers" ? headers.promise : stalled();
+    }) as unknown as typeof fetch;
+    const timer = shortenHoldTimer();
+    try {
+      const response = await request();
+      expect((await signal.promise).aborted).toBe(true);
+      expect(response.status).toBe(429);
+      expect(response.headers.get("retry-after")).toBe("89");
+      expect(await response.text()).toBe(first429);
+      if (stage === "headers") {
+        headers.resolve(stalled());
+        await Bun.sleep(0);
+      }
+      expect(cancelled).toBe(true);
+    } finally {
+      timer.mockRestore();
+    }
+  });
+
+  test("caps recovery at 25s even if the replay stalls before its first event", async () => {
+    let signal: AbortSignal | undefined;
+    let cancelled = false;
+    const request = await start(async () => "b");
+    let calls = 0;
+    deps.fetch = (async (_url: string, init: RequestInit) => {
+      if (++calls < 3) return refusal();
+      signal = init.signal ?? undefined;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(enc.encode("event: response.output_text.delta\n")); },
+        cancel() { cancelled = true; },
+      }), { headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof fetch;
+    const at = performance.now();
+    const response = await request();
+    expect(performance.now() - at).toBeLessThan(28_000);
+    expect(signal?.aborted).toBe(true);
+    expect(cancelled).toBe(true);
+    expect(await response.text()).toBe(first429);
+  }, 30_000);
 });

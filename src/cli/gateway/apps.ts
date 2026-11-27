@@ -98,7 +98,7 @@ export class Admin {
   }
 }
 
-export async function connect(deps: GatewayCliDeps): Promise<{ admin: Admin; secretsPath: string | undefined }> {
+export async function connect(deps: Pick<GatewayCliDeps, "secretsPath" | "fetch">): Promise<{ admin: Admin; secretsPath: string | undefined }> {
   const url = (await readSecretsKey("AIS_GATEWAY_ADMIN_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_URL;
   const token = (await readSecretsKey("AIS_GATEWAY_ADMIN_TOKEN", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!url || !token) throw new CliUsageError("AIS_GATEWAY_ADMIN_URL and AIS_GATEWAY_ADMIN_TOKEN must be set in ~/.secrets");

@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { Cdp, type Session } from "../../chrome-extension/test/e2e/cdp.ts";
 import { countdownUntil } from "../src/lib/format.ts";
 import { formatResetTimes } from "../src/lib/reset-time.ts";
-import type { LimitsResponse, PoolsUsageResponse } from "../src/types/api.ts";
+import type { AutoResetResponse, LimitsResponse, PoolsUsageResponse } from "../src/types/api.ts";
 
 const repoRoot = join(import.meta.dir, "../../..");
 const distDir = process.env.AIS_WEB_DIST ?? join(repoRoot, "apps/web/dist");
@@ -220,6 +220,28 @@ function limitsAndSpendStub(answers: Record<string, unknown>): void {
     return real(input, init);
   };
   Object.assign(window, { __aisCodexResetCalls: calls, __aisLimitsCalls: limitsCalls });
+  window.fetch = Object.assign(stub, { preconnect: window.fetch.preconnect });
+}
+
+function autoResetSettingsStub(settings: Extract<AutoResetResponse, { configured: true }>): void {
+  const previous = window.fetch.bind(window);
+  const path = "/api/limits/codex/auto-reset";
+  const calls: Array<{ scope: string; name: string; enabled: boolean; csrf: string | null }> = [];
+  const stub = (input: RequestInfo | URL, init?: RequestInit) => {
+    const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const u = new URL(raw, location.href);
+    if (u.origin !== location.origin || (u.pathname !== path && !u.pathname.startsWith(path + "/"))) return previous(input, init);
+    if (u.pathname === path && init?.method === "GET") return Promise.resolve(Response.json(settings));
+    const scope = u.pathname.slice(path.length + 1);
+    const body = JSON.parse(String(init?.body)) as { name: string; enabled: boolean };
+    const rows = scope === "pool" ? settings.pools : settings.identities;
+    const row = rows.find((r) => r.name === body.name);
+    if (!row || init?.method !== "PUT") return Promise.resolve(Response.json({ error: "invalid settings request" }, { status: 400 }));
+    calls.push({ scope, ...body, csrf: new Headers(init.headers).get("X-AIS-Console") });
+    row.enabled = body.enabled;
+    return Promise.resolve(Response.json(body));
+  };
+  Object.assign(window, { __aisAutoResetSettingsCalls: calls });
   window.fetch = Object.assign(stub, { preconnect: window.fetch.preconnect });
 }
 
@@ -520,6 +542,9 @@ beforeAll(async () => {
       HOME: home,
       AIS_WEB_STATE_DIR: join(runDir, "state"),
       AIS_WEB_DIST: distDir,
+      AIS_SECRETS_FILE: join(home, ".secrets"),
+      AIS_GATEWAY_ADMIN_URL: "",
+      AIS_GATEWAY_ADMIN_TOKEN: "",
       AIS_SPEND_GUARD: "0",
       AIS_HERDR_BRIDGE: "0",
       AIS_AUTH_REFRESH_INTERVAL_MS: "0",
@@ -997,3 +1022,88 @@ describe("1280x900", () => {
     await checkLimitsCards(1280, 900, "/limits", { lines: 0, notes: 0, plans: 0, poolLines: 2, wrappedAtLeast: 0 });
   }, 40_000);
 });
+
+for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 }]) {
+  test(`Codex automatic reset controls at ${viewport.width}px`, async () => {
+    await setViewport(viewport.width, viewport.height);
+    const pool = "fixture-auto-codex-pool";
+    const unknown = "SYNTHETIC_FIXTURE-codex-unknown";
+    const stale = "SYNTHETIC_FIXTURE-codex-stale";
+    const zero = "SYNTHETIC_FIXTURE-codex-zero";
+    const positive = "SYNTHETIC_FIXTURE-codex-credit";
+    const missing = "fixture-missing-limit-row";
+    const limitPoolOnly = "fixture-pool-without-usage";
+    const lastClaim = {
+      pool, identity: unknown, status: "unknown" as const,
+      startedAt: "2026-11-27T08:00:00.000Z", creditExpiresAt: "2026-12-01T08:00:00.000Z",
+    };
+    const settings = {
+      configured: true as const,
+      pools: [{ name: pool, members: [unknown, stale, zero, positive], enabled: false, lastClaim }, { name: limitPoolOnly, members: [missing], enabled: false }],
+      identities: [unknown, stale, zero, positive, missing].map((name) => ({ name, enabled: false, ...(name === unknown ? { lastClaim } : {}) })),
+    };
+    const poolData: PoolsUsageResponse = {
+      ...SYNTHETIC_POOLS,
+      pools: [{ tool: "codex", name: pool, members: settings.pools[0]!.members.map((name) => ({ name, allowed: true })) }],
+    };
+    const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+      source: `(${limitsAndSpendStub.toString()})(${JSON.stringify({ ...LIMITS_ANSWERS, "/api/pools/usage": poolData })});
+        (${autoResetSettingsStub.toString()})(${JSON.stringify(settings)})`,
+    });
+    const selector = (kind: string, name: string, enable = true) =>
+      `button[aria-label="${enable ? "Enable" : "Disable"} automatic resets for ${kind} ${name}"]`;
+    const click = (query: string) => page.eval(`document.querySelector(${JSON.stringify(query)}).click()`);
+    const waitForButton = (query: string) => waitFor(query, 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(query)})`));
+    const confirm = () => page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent === 'Enable automatic resets').click()`);
+    const waitForDialog = () => waitFor("automatic reset confirmation", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
+    const checkWidth = async () => {
+      const m = await page.eval<{ scrollWidth: number; clientWidth: number; bodyScrollWidth: number; offenders: string[] }>(MEASURE);
+      expect(m.scrollWidth, m.offenders.join("\n")).toBeLessThanOrEqual(m.clientWidth);
+      expect(m.bodyScrollWidth, m.offenders.join("\n")).toBeLessThanOrEqual(m.clientWidth);
+    };
+    const capture = async (label: string, control: string) => {
+      if (!evidence) return;
+      await mkdir(evidence, { recursive: true });
+      await page.eval(`document.querySelector(${JSON.stringify(control)}).scrollIntoView({block:'center'})`);
+      await writeFile(join(evidence, `${viewport.width}-codex-auto-reset-${label}-verified.png`), await page.screenshot());
+    };
+    try {
+      await open("/limits/openai");
+      for (const name of [unknown, stale, zero, positive, missing]) await waitForButton(selector("identity", name));
+      expect(await page.eval<boolean>(`!!document.querySelector('button[aria-label="Use reset on ${positive}"]')`)).toBe(true);
+      expect(await page.eval<string>(`document.querySelector(${JSON.stringify(selector("identity", unknown))}).closest('[data-slot=card]').innerText`)).toContain("Last claim: unknown");
+      expect(await page.eval<string>(`document.querySelector(${JSON.stringify(selector("identity", unknown))}).closest('[data-slot=card]').innerText`)).toContain("Credit expiry");
+      await checkWidth();
+      await capture("account", selector("identity", unknown));
+      await click(selector("identity", unknown));
+      await waitForDialog();
+      await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent === 'Cancel').click()`);
+      expect(await page.eval<number>(`window.__aisAutoResetSettingsCalls.length`)).toBe(0);
+      await click(selector("identity", unknown));
+      await waitForDialog();
+      await confirm();
+      await waitForButton(selector("identity", unknown, false));
+      await click(selector("identity", unknown, false));
+      await waitForButton(selector("identity", unknown));
+      expect(await page.eval<unknown[]>(`window.__aisAutoResetSettingsCalls`)).toEqual([
+        { scope: "identity", name: unknown, enabled: true, csrf: "1" },
+        { scope: "identity", name: unknown, enabled: false, csrf: "1" },
+      ]);
+      expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(0);
+
+      await open("/limits");
+      await waitForButton(selector("pool", pool));
+      await waitForButton(selector("pool", limitPoolOnly));
+      await checkWidth();
+      await click(selector("pool", pool));
+      await waitForDialog();
+      await confirm();
+      await waitForButton(selector("pool", pool, false));
+      await capture("pool", selector("pool", pool, false));
+      expect(await page.eval<unknown[]>(`window.__aisAutoResetSettingsCalls`)).toEqual([{ scope: "pool", name: pool, enabled: true, csrf: "1" }]);
+      expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(0);
+    } finally {
+      await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+    }
+  }, 60_000);
+}

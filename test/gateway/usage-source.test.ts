@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { pickIdentity } from "../../src/gateway/select.ts";
-import { createCodexResetSource, fetchCodexResetCredits, createUsageSource as createUsageSourceRaw, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
+import { codexResetInventory, createCodexResetSource, fetchCodexResetCredits, fetchGatewayCodexUsage, createUsageSource as createUsageSourceRaw, fetchOpencodeUsage, withOpencodeUsage, zaiTokenUsage } from "../../src/gateway/usage-source.ts";
 import { MemoryUsageReadings, type UsageReadings } from "../../src/gateway/usage-readings.ts";
 import { MemoryResetCreditInvalidations } from "../../src/gateway/reset-credit-cache.ts";
 
@@ -88,6 +88,21 @@ describe("Codex reset source", () => {
   test.each([null, {}, { credits: [] }, { available_count: "0", credits: [] }])("treats invalid inventory %j as unknown", async (body) => {
     const result = await fetchCodexResetCredits({ identity: "codex-a", accessToken: "access-SYNTHETIC_FIXTURE_A" }, async () => Response.json(body));
     expect(result).toBeUndefined();
+  });
+  test("keeps legacy inventory visible and accepts only Codex reset credits for automatic use", () => {
+    const now = Date.parse("2026-11-27T00:00:00.000Z");
+    const expires_at = "2026-12-01T00:00:00.000Z";
+    const credit = { status: "available", expires_at };
+    const inventory = { available_count: 3, credits: [
+      { ...credit, id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_LEGACY" },
+      { ...credit, id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_OTHER", reset_type: "other" },
+      { ...credit, id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_CODEX", reset_type: "codex_rate_limits" },
+    ] };
+    expect(codexResetInventory(inventory, now)?.creditExpiries).toHaveLength(3);
+    expect(codexResetInventory(inventory, now, "automatic")).toMatchObject({
+      availableCount: 3,
+      creditExpiries: [{ id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_CODEX", endsAt: expires_at }],
+    });
   });
   test("caches repeated reads, keeps known zero, and retains a prior result after errors", async () => {
     let now = 1_000;
@@ -906,5 +921,71 @@ describe("codex reset credits on a manual refresh", () => {
     source.expire("a");
     expect((await source("a"))?.availableCount).toBe(2);
     expect(await shared.version("a")).toBe(version);
+  });
+});
+
+describe("direct Codex auto-reset usage", () => {
+  const now = Date.parse("2026-11-02T00:00:00.000Z");
+  const identity = "codex-SYNTHETIC_FIXTURE";
+  const credential = { identity, accessToken: "access-SYNTHETIC_FIXTURE", accountId: "account-SYNTHETIC_FIXTURE" };
+  const resetAt = (now + 3_600_000) / 1000;
+
+  function read(used: number, allowed?: boolean, absolute = true, additional_rate_limits?: unknown) {
+    const fetcher = (async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/backend-api/wham/usage");
+      expect(new Headers(init?.headers).get("chatgpt-account-id")).toBe(credential.accountId);
+      return Response.json({ rate_limit: { allowed, primary_window: {
+        used_percent: used, limit_window_seconds: 604800,
+        ...(absolute ? { reset_at: resetAt } : { reset_after_seconds: 3600 }),
+      } }, additional_rate_limits });
+    }) as typeof fetch;
+    return fetchGatewayCodexUsage(credential, fetcher, () => now, new AbortController().signal);
+  }
+
+  test("uses the absolute reset and a consistent optional permission flag", async () => {
+    expect(await read(100, false)).toMatchObject({
+      status: "rate-limited", codexRateLimitAllowed: false,
+      windows: [{ label: "week", utilization: 100, resetsAt: new Date(resetAt * 1000).toISOString() }],
+    });
+    expect(await read(10, true)).toMatchObject({ status: "live", codexRateLimitAllowed: true });
+    expect(await read(100)).toMatchObject({ status: "rate-limited" });
+    expect(await read(100, true)).toBeUndefined();
+    expect(await read(10, false)).toBeUndefined();
+    expect(await read(100, false, false)).toBeUndefined();
+  });
+
+  test("keeps scoped windows separate from the account total and rejects malformed model evidence", async () => {
+    const model = "fixture-model";
+    const window = { used_percent: 99, limit_window_seconds: 604_800, reset_at: resetAt };
+    const allowed = { normal_model_slug: model, rate_limit: { allowed: true, limit_reached: false, primary_window: window } };
+    expect(await read(10, true, true, [allowed])).toMatchObject({
+      status: "live",
+      maxUtilization: 10,
+      windows: [{ label: "week", utilization: 10 }, { label: "week", model, utilization: 99 }],
+    });
+    expect(await read(10, true, true, [{ ...allowed, rate_limit: { ...allowed.rate_limit, primary_window: { ...window, used_percent: "unknown" } } }])).toBeUndefined();
+    expect(await read(100, false, false, [allowed])).toBeUndefined();
+  });
+
+  test("a direct publication survives an older upstream poll and reaches the shared cache", async () => {
+    const polling = Promise.withResolvers<void>();
+    const finishPoll = Promise.withResolvers<PoolUsage>();
+    const shared = new MemoryUsageReadings(() => now);
+    const source = createUsageSource({
+      shared,
+      now: () => now,
+      fetchUsage: async () => {
+        polling.resolve();
+        return finishPoll.promise;
+      },
+    });
+    const pending = source.refreshNow("codex", identity);
+    await polling.promise;
+    const recovered = { ...live(10), capturedAt: new Date(now).toISOString() };
+    await source.publish("codex", identity, recovered);
+    finishPoll.resolve({ ...live(100), capturedAt: new Date(now - 1_000).toISOString() });
+    await pending;
+    expect(await source.get("codex", identity)).toEqual(recovered);
+    expect((await shared.load("codex", identity))?.reading).toEqual(recovered);
   });
 });

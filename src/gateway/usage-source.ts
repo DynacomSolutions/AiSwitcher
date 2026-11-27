@@ -4,6 +4,9 @@ import type { ManualResetInfo } from "../cli/limits/types.ts";
 import type { ProviderCredential } from "./providers/shared.ts";
 import { codexAdapter } from "./providers/codex.ts";
 import { adapterFor as poolAdapterFor } from "../identities/pool/registry.ts";
+import type { AutoResetUsage } from "./auto-reset.ts";
+import { categorizeByMinutes } from "../cli/limits/bucket.ts";
+import { CODEX_WHAM_USAGE_URL, codexPlanLabel, extraUsageFromCredits, snapshotFromWham } from "../cli/limits/codex-limits.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { fetchZaiLimits } from "../cli/limits/zai-limits.ts";
 import { fetchOpencodeGoQuotaForKey } from "../cli/limits/opencode-limits.ts";
@@ -27,39 +30,144 @@ export interface CodexResetSource {
   peek(identity: string): ManualResetInfo | undefined;
 }
 
-/** Reads the provider's manual reset inventory with the same account-scoped headers as Codex traffic. */
+export const CODEX_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+
+/** Reads the provider's inventory with the same account-scoped headers as Codex traffic. */
 export async function fetchCodexResetCredits(
   credential: ProviderCredential,
   doFetch: (input: string | URL, init?: RequestInit) => Promise<Response> = fetch,
+  signal?: AbortSignal,
+  now: () => number = Date.now,
+  purpose: "manual" | "automatic" = "manual",
 ): Promise<ManualResetInfo | undefined> {
-  const headers = codexAdapter.authHeaders(credential, new Headers());
-  headers.accept = "application/json";
-  const response = await doFetch("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", {
-    headers,
-    signal: AbortSignal.timeout(10_000),
+  const response = await doFetch(CODEX_CREDITS_URL, {
+    headers: { ...codexAdapter.authHeaders(credential, new Headers()), accept: "application/json" },
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
+    redirect: "manual",
   });
-  if (!response.ok) return undefined;
-  const raw = await response.json().catch(() => undefined) as unknown;
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => undefined);
+    return undefined;
+  }
+  return codexResetInventory(await response.json().catch(() => undefined), now(), purpose);
+}
+
+export function codexResetInventory(raw: unknown, now: number, purpose: "manual" | "automatic" = "manual"): ManualResetInfo | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const body = raw as { available_count?: unknown; credits?: unknown };
-  const credits = Array.isArray(body.credits) ? body.credits as Array<{ id?: unknown; title?: unknown; status?: unknown; expires_at?: unknown }> : undefined;
-  const available = credits?.filter((credit) => credit.status === "available") ?? [];
+  const credits = Array.isArray(body.credits) ? body.credits as Array<{ id?: unknown; title?: unknown; status?: unknown; expires_at?: unknown; reset_type?: unknown }> : undefined;
+  const available = credits?.filter((credit) => credit?.status === "available") ?? [];
   const count = body.available_count;
   // The upstream details contract requires available_count. Missing or malformed data is unknown, never zero.
   if (!(typeof count === "number" && Number.isSafeInteger(count) && count >= 0)) return undefined;
   const availableCount = count;
+  const otherTypes = purpose === "automatic"
+    ? new Set(available.filter((credit) => credit.reset_type !== "codex_rate_limits").map((credit) => credit.id))
+    : undefined;
   const creditExpiries = available.flatMap((credit) => {
-    const expiry = typeof credit.expires_at === "string" ? Date.parse(credit.expires_at) : Number.NaN;
+    if (otherTypes?.has(credit.id)) return [];
+    const expiry = typeof credit.expires_at === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(credit.expires_at)
+      ? Date.parse(credit.expires_at) : Number.NaN;
     return Number.isFinite(expiry) && typeof credit.id === "string"
       ? [{ id: credit.id, ...(typeof credit.title === "string" ? { label: credit.title } : {}), endsAt: new Date(expiry).toISOString() }]
       : [];
   });
   return {
     availableCount,
-    readAt: new Date().toISOString(),
+    readAt: new Date(now).toISOString(),
     ...(typeof available[0]?.title === "string" ? { label: available[0].title } : {}),
     ...(creditExpiries[0] ? { expiresAt: new Date(creditExpiries[0].endsAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) } : {}),
     ...(creditExpiries.length ? { creditExpiries } : {}),
+  };
+}
+
+interface WhamProofLimit {
+  allowed?: unknown;
+  limit_reached?: unknown;
+  primary_window?: WhamProofWindow | null;
+  secondary_window?: WhamProofWindow | null;
+}
+
+interface WhamProofWindow {
+  used_percent?: unknown;
+  limit_window_seconds?: unknown;
+  reset_at?: unknown;
+}
+
+function additionalCodexWindows(raw: unknown, now: number): NonNullable<PoolUsage["windows"]> | undefined {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) return undefined;
+  const windows: NonNullable<PoolUsage["windows"]> = [];
+  for (const entry of raw as Array<{ normal_model_slug?: unknown; metered_feature?: unknown; rate_limit?: WhamProofLimit | null } | null>) {
+    const model = entry?.normal_model_slug ?? entry?.metered_feature;
+    const limit = entry?.rate_limit;
+    if (typeof model !== "string" || !/[a-z0-9]/i.test(model) || !limit ||
+      typeof limit.allowed !== "boolean" || typeof limit.limit_reached !== "boolean") return undefined;
+    const scoped = [limit.primary_window, limit.secondary_window].filter((window) => window != null);
+    if (!scoped.length && limit.allowed && !limit.limit_reached) return undefined;
+    for (const { used_percent: utilization, limit_window_seconds: seconds, reset_at: reset } of scoped) {
+      if (typeof utilization !== "number" || !Number.isFinite(utilization) || utilization < 0 ||
+        typeof seconds !== "number" || !Number.isSafeInteger(seconds) || seconds <= 0 ||
+        typeof reset !== "number" || !Number.isSafeInteger(reset) || reset * 1000 <= now || reset * 1000 > 8.64e15) return undefined;
+      const label = categorizeByMinutes(seconds / 60);
+      windows.push({ label, utilization, resetsAt: new Date(reset * 1000).toISOString(), model });
+    }
+    if (!limit.allowed || limit.limit_reached) windows.push({ label: "provider limit", utilization: 100, model });
+  }
+  return windows;
+}
+
+/** Reads usage with the gateway credential. Strict reads supply evidence for a spend or replay. */
+export async function fetchGatewayCodexUsage(
+  credential: ProviderCredential,
+  doFetch: typeof fetch,
+  now: () => number,
+  signal: AbortSignal,
+): Promise<AutoResetUsage | undefined> {
+  const response = await doFetch(CODEX_WHAM_USAGE_URL, {
+    headers: { ...codexAdapter.authHeaders(credential, new Headers()), accept: "application/json" },
+    signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+    redirect: "manual",
+  });
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => undefined);
+    return { status: "unavailable", capturedAt: new Date(now()).toISOString(), error: `usage endpoint answered HTTP ${response.status}` };
+  }
+  const body = await response.json() as { rate_limit?: WhamProofLimit | null; additional_rate_limits?: unknown } | null;
+  signal.throwIfAborted();
+  const capturedAt = now();
+  const snapshot = snapshotFromWham(body, capturedAt);
+  if (!snapshot) return undefined;
+  const limit = body?.rate_limit;
+  const raw = [limit?.primary_window, limit?.secondary_window];
+  const windows = [snapshot.primary, snapshot.secondary].flatMap((window) => {
+    if (!window) return [];
+    const mins = window.windowDurationMins;
+    const category = mins === undefined ? "other" : categorizeByMinutes(mins);
+    const label = category !== "other" ? category : mins === undefined ? "usage" : mins >= 1440 ? `~${Math.round(mins / 1440)}d` : `~${Math.round(mins / 60)}h`;
+    const reset = new Date((window.resetsAt ?? Number.NaN) * 1000);
+    return [{ label, utilization: window.usedPercent, ...(Number.isFinite(reset.getTime()) ? { resetsAt: reset.toISOString() } : {}) }];
+  });
+  const maxUtilization = Math.max(...windows.map((window) => window.utilization));
+  const weekly = raw.filter((window) => window?.limit_window_seconds === 604_800);
+  const reset = weekly[0]?.reset_at;
+  const weeklyProof = weekly.length === 1 && windows.filter((window) => window.label === "week").length === 1 &&
+    typeof reset === "number" && Number.isSafeInteger(reset) && reset * 1000 > capturedAt && reset * 1000 <= 8.64e15 &&
+    raw.every((window) => window == null || (typeof window.used_percent === "number" && Number.isFinite(window.used_percent) && window.used_percent >= 0)) &&
+    (limit?.allowed === undefined || limit.allowed === (maxUtilization < 100)) &&
+    (limit?.limit_reached === undefined || limit.limit_reached === (maxUtilization >= 100));
+  const modelWindows = additionalCodexWindows(body?.additional_rate_limits, capturedAt);
+  if (!weeklyProof || !modelWindows) return undefined;
+  const extraUsage = extraUsageFromCredits(snapshot);
+  const planLabel = codexPlanLabel(snapshot.planType);
+  return {
+    status: maxUtilization >= 100 ? "rate-limited" : "live",
+    maxUtilization,
+    windows: [...windows, ...modelWindows],
+    capturedAt: new Date(capturedAt).toISOString(),
+    ...(typeof limit?.allowed === "boolean" ? { codexRateLimitAllowed: limit.allowed } : {}),
+    ...(extraUsage ? { extraUsage } : {}),
+    ...(planLabel ? { planLabel } : {}),
   };
 }
 
@@ -172,6 +280,7 @@ export function withOpencodeUsage(creds: { get(provider: GatewayProvider, identi
 interface Entry {
   value: PoolUsage | undefined;
   at: number;
+  publishedAt?: number;
 }
 
 /**
@@ -270,6 +379,16 @@ export function createUsageSource(opts: {
     if (running && !fresh) return running;
     const runningFresh = freshInflight.get(key);
     if (runningFresh) return runningFresh;
+    const started = performance.now();
+    const write = (value: PoolUsage | undefined, at: number) => {
+      const publishedAt = entries.get(key)?.publishedAt;
+      entries.set(key, { value, at, publishedAt });
+    };
+    const newerPublication = () => (entries.get(key)?.publishedAt ?? -Infinity) >= started;
+    const outdated = (reading: PoolUsage | undefined) => {
+      const current = entries.get(key);
+      return newerPublication() || (current?.publishedAt !== undefined && capturedMs(reading) < capturedMs(current.value));
+    };
     const run = (async () => {
       // A plain read already in flight may answer from before the quota answer: let it land, then read again.
       if (running) await running;
@@ -277,9 +396,10 @@ export function createUsageSource(opts: {
       let loaded = false;
       let claimed = false;
       const useShared = (s: SharedReading): void => {
+        if (outdated(s.reading)) return;
         opts.onRead?.(provider, "shared");
         if (USAGE_READER_PROVIDERS.has(provider)) setState(provider, identity, "ok");
-        entries.set(key, { value: s.reading, at: now() - s.ageMs + jitter() });
+        write(s.reading, now() - s.ageMs + jitter());
       };
       /** No figure upstream: the newer of the local figure and the shared one, always stale (display only). */
       const noFigure = async (prev: PoolUsage | undefined): Promise<PoolUsage | undefined> => {
@@ -312,13 +432,15 @@ export function createUsageSource(opts: {
             }
           }
         }
+        if (newerPublication()) return;
         opts.onRead?.(provider, "upstream");
         let u: PoolUsage | undefined;
         try {
           u = await opts.fetchUsage(provider, identity, fresh ? { fresh: true } : undefined);
         } finally {
-          lastUpstream.set(key, now());
+          if (!newerPublication()) lastUpstream.set(key, now());
         }
+        if (outdated(u ?? entries.get(key)?.value)) return;
         // A reading with no figure (the usage API answered 429, as Anthropic's does for an account at its limit, or was
         // unavailable) keeps the last figure: answering "no limits" for a full account is wrong (T3 showed "No limits reported").
         const prev = entries.get(key)?.value;
@@ -338,14 +460,16 @@ export function createUsageSource(opts: {
         } else {
           value = await noFigure(prev);
         }
-        entries.set(key, { value, at });
+        if (!outdated(value)) write(value, at);
       } catch (err) {
+        if (newerPublication()) return;
         noteOutcome(provider, identity, { status: "unavailable", error: err instanceof Error ? err.message : String(err), capturedAt: "" } as PoolUsage, false);
         // Keep the old figure; retry after the next ttl.
-        entries.set(key, { value: await noFigure(entries.get(key)?.value), at: now() });
+        const value = await noFigure(entries.get(key)?.value);
+        if (!outdated(value)) write(value, now());
       } finally {
         // A poll that left no reading must not make the others wait for the hold to run out.
-        if (claimed && !hasFigure(entries.get(key)?.value)) await guarded((s) => s.release(provider, identity), undefined);
+        if (claimed && (newerPublication() || !hasFigure(entries.get(key)?.value))) await guarded((s) => s.release(provider, identity), undefined);
         if (fresh) freshInflight.delete(key);
         else inflight.delete(key);
       }
@@ -359,6 +483,19 @@ export function createUsageSource(opts: {
       const e = entries.get(keyOf(provider, identity));
       if (!e || now() - e.at >= ttl) void refresh(provider, identity);
       return e?.value;
+    },
+    /** Publishes a confirmed direct reading locally and to the shared cache. */
+    async publish(provider: GatewayProvider, identity: string, reading: PoolUsage): Promise<void> {
+      const key = keyOf(provider, identity);
+      const current = entries.get(key)?.value;
+      if (!hasFigure(reading) || reading.stale || (current && !current.stale && capturedMs(current) > capturedMs(reading))) return;
+      const age = now() - capturedMs(reading);
+      if (age < 0 || age >= ttl) return;
+      entries.set(key, { value: reading, at: now() - age, publishedAt: performance.now() });
+      lastUpstream.set(key, now() - age);
+      opts.onRead?.(provider, "upstream");
+      noteOutcome(provider, identity, reading, false);
+      await guarded((s) => s.save(provider, identity, reading, age), undefined);
     },
     /** Fills the cache from shared readings at start (warm-up). A reading older than the ttl is shown stale and read again. Never overwrites an entry. */
     seed(rows: Array<{ provider: GatewayProvider; identity: string; reading: PoolUsage; ageMs: number }>): void {
