@@ -943,7 +943,7 @@ export function IdentitiesPage() {
 
       {active ? (
         <div className="space-y-3">
-          <p className="font-mono text-xs text-muted-foreground" title={active.path}>
+          <p className="font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]" title={active.path}>
             {active.path}
           </p>
           <RegistryTable key={active.toolName} registry={active} authFor={authFor} />
