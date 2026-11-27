@@ -928,6 +928,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     // The same cached usage reads the proxy selects on: the console Limits page shows them through GET /limits.
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
     refreshUsageFor: async (provider, identity) => usage.refreshNow(provider, await canonical(provider, identity)),
+    usageFailureFor: async (provider, identity) => usage.lastFailure(provider, await canonical(provider, identity)),
+    invalidateResetCreditsFor: async (identity) => resetCredits.invalidate(await canonical("codex", identity)),
     resetCreditsFor: resetCredits,
 
     poolMembers,

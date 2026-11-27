@@ -73,6 +73,10 @@ export interface AdminDeps {
   usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   /** Forces one account-scoped, read-only usage refresh for an explicit limits recheck. */
   refreshUsageFor?(provider: GatewayProvider, identity: string): Promise<void>;
+  /** Why the newest usage read of one identity failed, or undefined when it worked (GET /limits shows it on a cached row). */
+  usageFailureFor?(provider: GatewayProvider, identity: string): Promise<{ error: string; at: string } | undefined>;
+  /** Drops the cached Codex reset credits of one identity, so the next read asks OpenAI (a manual refresh). */
+  invalidateResetCreditsFor?(identity: string): Promise<void>;
   /** Codex reset credits for one managed identity. Undefined means the provider read failed. */
   resetCreditsFor?(identity: string): Promise<import("../cli/limits/types.ts").ManualResetInfo | undefined>;
   /** The member accounts of every swap pool of one provider (GET /limits). */
@@ -86,6 +90,9 @@ export interface AdminDeps {
 }
 
 /** One GET /limits row: a managed identity plus the usage source's reading of it (no reading yet: unavailable). */
+/** Longest one provider read of a manual refresh may take. */
+const FRESH_READ_MS = 20_000;
+
 type AdminLimitRow = { provider: GatewayProvider; identity: string } & Omit<PoolUsage, "capturedAt"> & { capturedAt?: string };
 
 /** Constant-time comparison: both sides are hashed first so lengths never leak. */
@@ -317,11 +324,27 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const identities = namesByProvider.flatMap(({ provider, names }) => names
       .filter((identity) => identityFilter === undefined || identity === identityFilter)
       .map((identity) => ({ provider, identity })));
+    // A manual refresh (`fresh=1`) reads the provider again for every matching identity, past the 45 second caches. It needs a
+    // provider, and an identity when one is named must be managed. Each read is bounded, and a failed read never fails the answer:
+    // the row then carries the failure text.
     if (c.req.query("fresh") === "1") {
-      if (providerFilter !== "codex" || !identityFilter || !deps.refreshUsageFor || !identities.some((item) => item.provider === "codex" && item.identity === identityFilter)) {
-        return err(400, "fresh limits reads require one managed Codex identity");
+      if (providerFilter === undefined || !deps.refreshUsageFor || (identityFilter !== undefined && identities.length === 0)) {
+        return err(400, "fresh limits reads require a provider and a managed identity");
       }
-      await deps.refreshUsageFor("codex", identityFilter);
+      let nextFresh = 0;
+      const freshWorkers = Array.from({ length: Math.min(4, identities.length) }, async () => {
+        while (nextFresh < identities.length) {
+          const { provider, identity } = identities[nextFresh++]!;
+          if (provider === "codex") await deps.invalidateResetCreditsFor?.(identity).catch(() => undefined);
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([
+            deps.refreshUsageFor!(provider, identity).catch(() => undefined),
+            new Promise<void>((resolve) => { timer = setTimeout(resolve, FRESH_READ_MS); }),
+          ]);
+          if (timer) clearTimeout(timer);
+        }
+      });
+      await Promise.all(freshWorkers);
     }
     const limits = new Array<AdminLimitRow>();
     let next = 0;
@@ -335,7 +358,9 @@ export function createAdminApp(deps: AdminDeps): Hono {
         const hasFigure = (usage?.windows?.length ?? 0) > 0 || typeof usage?.maxUtilization === "number";
         const shouldShowNoFigure = USAGE_READER_PROVIDERS.has(provider) && usage?.noPlan !== true;
         if (!hasFigure && !manualReset && !shouldShowNoFigure) continue;
-        limits[index] = { provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }), ...(manualReset ? { manualReset } : {}) };
+        // A reading that is not fresh says why: the newest failed read of this identity (a rejected login, a rate limit).
+        const failure = await deps.usageFailureFor?.(provider, identity).catch(() => undefined);
+        limits[index] = { provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }), ...(failure && (usage?.stale === true || !hasFigure) ? { error: failure.error } : {}), ...(manualReset ? { manualReset } : {}) };
       }
     });
     await Promise.all(workers);

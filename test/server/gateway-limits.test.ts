@@ -91,6 +91,13 @@ describe("mapGatewayLimitRow: claude", () => {
     expect(row.overage).toEqual({ active: true, label: "using extra usage" });
   });
 
+  test("a cached reading carries the reason it is not fresh, and a live one carries none", () => {
+    const why = mapGatewayLimitRow(claudeRow(upstreamBody(), { stale: true, error: "usage endpoint answered HTTP 429" }))!;
+    expect(why.status).toBe("cached");
+    expect(why.error).toBe("usage endpoint answered HTTP 429");
+    expect("error" in mapGatewayLimitRow(claudeRow(upstreamBody(), { error: "old failure" }))!).toBe(false);
+  });
+
   test("no figure is unavailable with an honest reason", () => {
     const empty = mapGatewayLimitRow(claudeRow({}))!;
     expect(empty.status).toBe("unavailable");
@@ -226,6 +233,17 @@ describe("loadGatewayLimits", () => {
     expect(view.configured).toBe(true);
     expect(view.rows).toHaveLength(1);
     expect(view.rows[0]!.windows).toEqual(windowsFromUsageBody(upstreamBody()));
+  });
+
+  test("a manual refresh asks for fresh reads of one provider, and of one identity when named", async () => {
+    const urls: string[] = [];
+    const fake = (async (u: string | URL | Request) => {
+      urls.push(String(u));
+      return Response.json({ limits: [] });
+    }) as unknown as typeof fetch;
+    await loadGatewayLimits({ fetch: fake, secretsPath: secrets(creds), provider: "codex", fresh: true });
+    await loadGatewayLimits({ fetch: fake, secretsPath: secrets(creds), provider: "codex", identity: "c1", fresh: true });
+    expect(urls).toEqual(["http://gw.invalid/limits?provider=codex&fresh=1", "http://gw.invalid/limits?provider=codex&identity=c1&fresh=1"]);
   });
 
   test("failures become a short error without the token", async () => {

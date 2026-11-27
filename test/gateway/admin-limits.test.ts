@@ -92,6 +92,50 @@ describe("admin GET /limits", () => {
     expect((await call(app, "/limits?fresh=1")).status).toBe(400);
   });
 
+  test("a tab refresh reads every identity of the provider again, drops cached Codex reset credits and keeps going past a failed read", async () => {
+    const refreshed: string[] = [];
+    const invalidated: string[] = [];
+    const app = appWith({
+      poolMembers: async (provider) => (provider === "codex" ? ["c1", "c2", "c3"] : []),
+      refreshUsageFor: async (provider, identity) => {
+        refreshed.push(`${provider}/${identity}`);
+        if (identity === "c2") throw new Error("OpenAI refused");
+      },
+      invalidateResetCreditsFor: async (identity) => { invalidated.push(identity); },
+    });
+    const response = await call(app, "/limits?provider=codex&fresh=1");
+    expect(response.status).toBe(200);
+    expect(refreshed.sort()).toEqual(["codex/c1", "codex/c2", "codex/c3"]);
+    expect(invalidated.sort()).toEqual(["c1", "c2", "c3"]);
+    // A provider with no managed identity answers an empty list, and an unmanaged identity is refused.
+    expect((await call(app, "/limits?provider=kimi&fresh=1")).status).toBe(200);
+    expect((await call(app, "/limits?provider=codex&identity=nobody&fresh=1")).status).toBe(400);
+  });
+
+  test("a cached or empty row says why: the newest failed read of that identity", async () => {
+    const app = appWith({
+      poolMembers: async (provider) => (provider === "codex" ? ["c1", "c2"] : []),
+      usageFailureFor: async (_provider, identity) => (identity === "c1" || identity === "c2" ? { error: "OpenAI rejected this Codex login", at: STAMP } : undefined),
+    });
+    readings.set("codex/c1", { status: "live", stale: true, maxUtilization: 15, windows: [{ label: "week", utilization: 15, resetsAt: RESET_WEEK }], capturedAt: STAMP });
+    try {
+      const body = (await (await call(app, "/limits?provider=codex")).json()) as { limits: Array<{ identity: string; stale?: boolean; error?: string }> };
+      expect(body.limits.find((r) => r.identity === "c1")).toMatchObject({ stale: true, error: "OpenAI rejected this Codex login" });
+      expect(body.limits.find((r) => r.identity === "c2")?.error).toBe("OpenAI rejected this Codex login");
+    } finally {
+      readings.set("codex/c1", { status: "live", maxUtilization: 15, windows: [{ label: "week", utilization: 15, resetsAt: RESET_WEEK }], capturedAt: STAMP });
+    }
+  });
+
+  test("a fresh live row carries no failure text", async () => {
+    const app = appWith({
+      poolMembers: async (provider) => (provider === "codex" ? ["c1"] : []),
+      usageFailureFor: async () => ({ error: "old failure", at: STAMP }),
+    });
+    const body = (await (await call(app, "/limits?provider=codex")).json()) as { limits: Array<{ identity: string; error?: string }> };
+    expect(body.limits.find((r) => r.identity === "c1")?.error).toBeUndefined();
+  });
+
   test("one row per managed identity: pool members plus active pins, canonicalised and deduped", async () => {
     const app = appWith({});
     expect((await put(app, "web")).status).toBe(201); // pin m1, already a pool member

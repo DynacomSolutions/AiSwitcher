@@ -198,9 +198,14 @@ export function createUsageSource(opts: {
   let sharedDown = false;
   /** The last upstream read state per member (`ok` or `failed`), so a change is logged once, not every poll. */
   const lastState = new Map<string, "ok" | "failed">();
+  /** The newest failed read per member, until a read works again. */
+  const lastFailure = new Map<string, { error: string; at: string }>();
   /** Logs when a member's usage read starts or stops failing: a stale figure is otherwise silent. The error text goes in the log line only. */
   const setState = (provider: GatewayProvider, identity: string, state: "ok" | "failed", error?: string): void => {
     const key = keyOf(provider, identity);
+    // The newest failure text stays for the Limits page, which shows why a card is cached. A good read clears it.
+    if (state === "failed") lastFailure.set(key, { error: error ?? "no reading", at: new Date(now()).toISOString() });
+    else lastFailure.delete(key);
     const before = lastState.get(key);
     if (before === state || (before === undefined && state === "ok")) return;
     lastState.set(key, state);
@@ -346,6 +351,10 @@ export function createUsageSource(opts: {
     refreshNowAfterInflight: (provider: GatewayProvider, identity: string): Promise<void> => {
       const running = freshInflight.get(keyOf(provider, identity));
       return running ? running.then(() => refresh(provider, identity, true)) : refresh(provider, identity, true);
+    },
+    /** Why the newest upstream read of this member failed, or undefined when the last read worked. The text carries no token. */
+    lastFailure(provider: GatewayProvider, identity: string): { error: string; at: string } | undefined {
+      return lastFailure.get(keyOf(provider, identity));
     },
     /** Waits for fetches in flight (tests). */
     async idle(): Promise<void> {

@@ -740,3 +740,20 @@ describe("usage read log", () => {
     expect(events(logs).map((e) => e.outcome)).toEqual(["failed", "recovered"]);
   });
 });
+
+describe("lastFailure", () => {
+  test("keeps the newest read failure until a read works again", async () => {
+    let fail = true;
+    const src = createUsageSource({
+      ttlMs: 45_000,
+      fetchUsage: async () => (fail ? { status: "unavailable", error: "usage endpoint answered HTTP 401", capturedAt: "" } as PoolUsage : live(10)),
+    });
+    expect(src.lastFailure("codex", "a")).toBeUndefined();
+    await src.refreshNow("codex", "a");
+    expect(src.lastFailure("codex", "a")?.error).toBe("usage endpoint answered HTTP 401");
+    expect(src.lastFailure("codex", "b")).toBeUndefined();
+    fail = false;
+    await src.refreshNow("codex", "a");
+    expect(src.lastFailure("codex", "a")).toBeUndefined();
+  });
+});

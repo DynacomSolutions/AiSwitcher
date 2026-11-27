@@ -139,6 +139,36 @@ describe("the plan on each limits path", () => {
   });
 });
 
+describe("a rejected store login", () => {
+  test("the usage read says the Codex login is dead when the gateway marked it, and keeps the plain text otherwise", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ais-codex-revoked-"));
+    try {
+      const dir = join(root, "codex", "member");
+      await mkdir(dir, { recursive: true });
+      const auth = JSON.stringify({ tokens: { access_token: "SYNTHETIC_FIXTURE-access", refresh_token: "SYNTHETIC_FIXTURE-refresh" } });
+      await writeFile(join(dir, "auth.json"), auth);
+      const identity = { name: "member", label: "member", configDir: join(root, "identity") };
+      const rejected = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
+
+      const plain = await fetchCodexLimitsViaStore(identity, { fetchImpl: rejected, memberRoot: root });
+      expect(plain.error).toContain("HTTP 401");
+
+      const { refreshFingerprint, refreshOf } = await import("../../../src/identities/gateway-routed.ts");
+      const fingerprint = refreshFingerprint(refreshOf("codex", auth)!);
+      await writeFile(join(dir, "login-revoked.json"), JSON.stringify({ at: "2026-11-26T22:56:00.000Z", code: "refresh_token_invalidated", fingerprint }));
+      const dead = await fetchCodexLimitsViaStore(identity, { fetchImpl: rejected, memberRoot: root });
+      expect(dead.status).toBe("unavailable");
+      expect(dead.error).toBe("OpenAI rejected this Codex login (refresh_token_invalidated). Sign in again in the AIS portal, Identities tab.");
+
+      // A new sign-in (a different refresh token) makes the marker stale: the plain text comes back.
+      await writeFile(join(dir, "auth.json"), JSON.stringify({ tokens: { access_token: "SYNTHETIC_FIXTURE-access-2", refresh_token: "SYNTHETIC_FIXTURE-refresh-2" } }));
+      expect((await fetchCodexLimitsViaStore(identity, { fetchImpl: rejected, memberRoot: root })).error).toContain("HTTP 401");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("extraUsageFromCredits", () => {
   test("maps the credits block", () => {
     expect(extraUsageFromCredits({})).toBeUndefined();

@@ -203,6 +203,8 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
     ...(plan ? { plan } : {}),
     // "rate-limited" with a figure is a live reading at 100% (codex/kimi/zai) or a stale claude backoff (stale: true).
     status: r.stale === true ? "cached" : "live",
+    // A cached reading says why it is not fresh (the gateway's newest failed read), so the card does not hide it.
+    ...(r.stale === true && typeof r.error === "string" && r.error ? { error: r.error } : {}),
     ...(capturedAt ? { capturedAt } : {}),
     ...(extraUsage ? { extraUsage, ...(r.provider === "codex" ? {} : { overage: overageFromExtraUsage(extraUsage) }) } : {}),
   };
