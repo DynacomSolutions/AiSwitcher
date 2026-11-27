@@ -394,6 +394,48 @@ if (!url && process.env.CI && !optOut) {
     }
   }, 10_000);
 
+  test("a pending Claude claim without an account ID does not fence any Codex identity", async () => {
+    await migrate(url);
+    const sql = new SQL(url, { max: 2 });
+    try {
+      const store = new PgAutoResetStore(sql);
+      const journal = new PgPoolResetJournal(sql);
+      const claude: AutoResetClaimInput = { ...claim("fence-claude", ["fence-claude-member"]), provider: "claude" };
+      await store.setEnabled("claude", claude.pool, true);
+      expect(await store.claim(claude)).toEqual({ kind: "created" });
+      // The Claude spend has no Codex account ID, so account_id stays NULL while spend_pending is true.
+      expect(await store.beginSpend(claude.redeemRequestId, claude.identity)).toBe(true);
+      const [stored] = await sql`SELECT provider, account_id, spend_pending FROM codex_auto_reset_claims WHERE event_key = ${claude.eventKey}`;
+      expect(stored).toMatchObject({ provider: "claude", account_id: null, spend_pending: true });
+
+      const codexIdentity = "renewal-test-fence-codex-member";
+      const codexCredit = "credit-SYNTHETIC_FIXTURE-fence-codex";
+      const codexAccount = "account-SYNTHETIC_FIXTURE-fence-codex";
+      expect(await journal.accountOutcomePending(codexIdentity, codexAccount)).toBe(false);
+      expect(await journal.accountOutcomePending(codexIdentity)).toBe(false);
+      expect(await journal.usedCredits([claude.creditId])).toEqual(new Set());
+      const reservation = randomUUID();
+      try {
+        expect(await journal.recordAttempt(codexCredit, randomUUID(), codexIdentity, reservation, codexAccount)).toBe(true);
+      } finally {
+        await journal.releaseAttempt(codexCredit, reservation);
+      }
+
+      // A pending Codex claim with no account ID still fences Codex identities.
+      const codex = claim("fence-codex", ["fence-codex-pending"]);
+      await store.setEnabled("codex", codex.pool, true);
+      expect(await store.claim(codex)).toEqual({ kind: "created" });
+      expect(await store.beginSpend(codex.redeemRequestId, codex.identity)).toBe(true);
+      expect(await journal.accountOutcomePending(codexIdentity, codexAccount)).toBe(true);
+      expect(await journal.recordAttempt(codexCredit, randomUUID(), codexIdentity, randomUUID(), codexAccount)).toBe(false);
+    } finally {
+      await sql`DELETE FROM codex_auto_reset_claims WHERE left(event_key, 13) = 'renewal-test-'`;
+      await sql`DELETE FROM auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
+      await sql`DELETE FROM codex_auto_reset_settings WHERE left(name, 13) = 'renewal-test-'`;
+      await sql.close();
+    }
+  }, 10_000);
+
   test("the migration leaves stored Codex pool rules and old identity rows in place", async () => {
     await migrate(url);
     const sql = new SQL(url, { max: 2 });
