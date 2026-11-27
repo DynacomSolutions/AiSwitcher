@@ -1,3 +1,4 @@
+import { codexResetRelieved, poolResetReview, poolUtilisation } from "../../src/gateway/pool-reset.ts";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { pickIdentity } from "../../src/gateway/select.ts";
@@ -965,6 +966,41 @@ describe("direct Codex auto-reset usage", () => {
     });
     expect(await read(10, true, true, [{ ...allowed, rate_limit: { ...allowed.rate_limit, primary_window: { ...window, used_percent: "unknown" } } }])).toBeUndefined();
     expect(await read(100, false, false, [allowed])).toBeUndefined();
+  });
+
+  test("uses a Codex model window for a pool crossing, review and recovery", async () => {
+    let nowAt = now;
+    let modelUsed = 94;
+    let unknownWindow = false;
+    const fetcher = (async () => Response.json({
+      rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 604_800, reset_at: resetAt } },
+      additional_rate_limits: [{
+        normal_model_slug: "fixture-model",
+        rate_limit: {
+          allowed: true,
+          limit_reached: false,
+          primary_window: { used_percent: modelUsed, limit_window_seconds: 18_000, reset_at: resetAt },
+        },
+      }, ...(unknownWindow ? [{ normal_model_slug: "unknown-fixture-model" }] : [])],
+    })) as unknown as typeof fetch;
+    const readPool = () => fetchGatewayCodexUsage(credential, fetcher, () => nowAt, new AbortController().signal, "pool");
+    const scope = { tool: "codex" as const, pool: "sample-pool", members: [identity] };
+    const creditId = "credit-SYNTHETIC_FIXTURE-pool";
+    const inventory = [{ availableCount: 1, creditExpiries: [{ id: creditId, endsAt: new Date(now + 1_000_000).toISOString() }] }];
+    const high = await readPool();
+    expect(poolUtilisation([high], now)).toEqual({ complete: true, percent: 94 });
+    expect(poolResetReview(scope, [high], inventory, new Set(), now).candidate?.creditId).toBe(creditId);
+
+    unknownWindow = true;
+    expect(poolUtilisation([await readPool()], now)).toEqual({ complete: false, percent: 94 });
+    nowAt += 1_000;
+    modelUsed = 10;
+    expect(poolUtilisation([await readPool()], nowAt)).toEqual({ complete: false, percent: 40 });
+    unknownWindow = false;
+    const recovered = await readPool();
+    expect(poolUtilisation([recovered], nowAt)).toEqual({ complete: true, percent: 40 });
+    expect(poolResetReview(scope, [recovered], inventory, new Set(), nowAt).availability).toBe("below_threshold");
+    expect(codexResetRelieved(recovered, now, high)).toBe(true);
   });
 
   test("a direct publication survives an older upstream poll and reaches the shared cache", async () => {

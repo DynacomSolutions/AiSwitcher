@@ -1,8 +1,10 @@
+import { trySharedFileLock } from "../shared/file-lock.ts";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { POOL_RESET_THRESHOLD, poolLimitsPath, type PoolResetReview, type PoolThreshold } from "../gateway/pool-reset-view.ts";
 import type { ToolLimitResult } from "../cli/limits/types.ts";
 import { consoleWebDir } from "./state.ts";
-import { loadSubscriptions, sendToAll, type PushMessage, type SendResult } from "./web-push.ts";
+import { loadSubscriptions, persistentPushDir, sendToAll, type PushMessage, type SendResult } from "./web-push.ts";
 import type { ScanResult } from "./scan-worker.ts";
 
 /**
@@ -31,6 +33,7 @@ const STAGES: { stage: ExpiryStage; withinMs: number }[] = [
 const RANK: Record<ExpiryStage, number> = { "7d": 1, "3d": 2, "24h": 3 };
 
 export const DEFAULT_RESET_PUSH_INTERVAL_MS = 3600 * 1000;
+export const POOL_PUSH_INTERVAL_MS = 5 * 60_000;
 const FIRST_TICK_DELAY_MS = 60_000;
 
 export interface ExpiringReset {
@@ -108,7 +111,7 @@ interface SentState {
   sent: Record<string, ExpiryStage>;
 }
 
-export function resetPushStatePath(dir: string = consoleWebDir()): string {
+export function resetPushStatePath(dir: string = persistentPushDir() ?? consoleWebDir()): string {
   return join(dir, "reset-expiry-push.json");
 }
 
@@ -121,7 +124,7 @@ async function loadState(path: string): Promise<SentState> {
   }
 }
 
-async function saveState(path: string, state: SentState): Promise<void> {
+async function saveState(path: string, state: object): Promise<void> {
   await mkdir(join(path, ".."), { recursive: true });
   const tmp = `${path}.${process.pid}.partial`;
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
@@ -129,10 +132,45 @@ async function saveState(path: string, state: SentState): Promise<void> {
   await rename(tmp, path);
 }
 
+interface PoolEpisode {
+  startedAt: number;
+  recovered?: true;
+}
+
+function poolMessage(row: PoolThreshold, url: string, kind: "crossing" | "below" | "verified", canReset = false): PushMessage {
+  const percent = row.percent;
+  const usage = percent !== undefined && Number.isFinite(percent)
+    ? `${percent >= POOL_RESET_THRESHOLD ? Math.round(percent) : Math.floor(percent)}% used`
+    : undefined;
+  const detail = kind === "verified" ? ["Reset verified", usage].filter(Boolean).join(" · ") : usage;
+  const crossing = kind === "crossing";
+  return {
+    title: crossing ? `Pool usage at ${POOL_RESET_THRESHOLD}% or higher` : "Pool usage update",
+    body: `${providerName({ provider: row.tool, toolName: row.tool })} · ${row.pool} · ${detail}`,
+    tag: `pool-threshold:${url}`,
+    url: crossing ? `${url}?reset=1` : url,
+    ...(crossing ? { poolAlert: canReset ? "review" : "dismiss" } : {}),
+  };
+}
+
+async function loadPoolEpisodes(path: string): Promise<Record<string, PoolEpisode>> {
+  try {
+    const episodes = JSON.parse(await readFile(path, "utf8")) as Record<string, PoolEpisode>;
+    if (!episodes || typeof episodes !== "object" || Array.isArray(episodes)) throw new Error("Invalid pool push state.");
+    return episodes;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+}
+
 export interface ResetExpiryNotifierDeps {
   intervalMs?: number;
   /** The daemon's limits scan (shared cache with /api/limits). */
   scanLimits: () => Promise<ScanResult<{ results?: ToolLimitResult[] }>>;
+  scanPoolThresholds?: () => Promise<PoolThreshold[]>;
+  reviewPoolReset?: (tool: string, pool: string) => Promise<PoolResetReview | undefined>;
+  poolStatePath?: string;
   send?: (message: PushMessage) => Promise<SendResult>;
   hasSubscribers?: () => Promise<boolean>;
   statePath?: string;
@@ -152,7 +190,10 @@ export interface ResetExpiryStatus {
 export class ResetExpiryNotifier {
   private timer: ReturnType<typeof setInterval> | undefined;
   private bootTimer: ReturnType<typeof setTimeout> | undefined;
+  private poolTimer: ReturnType<typeof setInterval> | undefined;
+  private poolBootTimer: ReturnType<typeof setTimeout> | undefined;
   private ticking = false;
+  private checkingPools = false;
   private lastCheckAt: string | null = null;
   private lastError: string | null = null;
   private lastSent = 0;
@@ -166,11 +207,21 @@ export class ResetExpiryNotifier {
     this.bootTimer.unref?.();
     this.timer = setInterval(() => void this.tick(), interval);
     this.timer.unref?.();
+    if (this.deps.scanPoolThresholds) {
+      this.poolBootTimer = setTimeout(() => void this.tickPools(), FIRST_TICK_DELAY_MS);
+      this.poolBootTimer.unref?.();
+      this.poolTimer = setInterval(() => void this.tickPools(), POOL_PUSH_INTERVAL_MS);
+      this.poolTimer.unref?.();
+    }
   }
 
   stop(): void {
     if (this.bootTimer) clearTimeout(this.bootTimer);
     if (this.timer) clearInterval(this.timer);
+    if (this.poolBootTimer) clearTimeout(this.poolBootTimer);
+    if (this.poolTimer) clearInterval(this.poolTimer);
+    this.poolBootTimer = undefined;
+    this.poolTimer = undefined;
     this.timer = undefined;
     this.bootTimer = undefined;
   }
@@ -183,13 +234,20 @@ export class ResetExpiryNotifier {
   async tick(): Promise<number> {
     if (this.ticking) return 0;
     this.ticking = true;
+    let releaseLock: (() => Promise<void>) | undefined;
     try {
       const hasSubscribers = this.deps.hasSubscribers ?? (async () => (await loadSubscriptions()).length > 0);
       if (!(await hasSubscribers())) return 0;
+      const sharedDir = this.deps.statePath === undefined ? persistentPushDir() : undefined;
+      const path = this.deps.statePath ?? resetPushStatePath(sharedDir);
+      // Both pods see the same subscribers during a rollout. Only one sends each stage.
+      if (sharedDir) {
+        releaseLock = await trySharedFileLock(path);
+        if (!releaseLock) return 0;
+      }
       const scan = await this.deps.scanLimits();
       if (!scan.ok) throw new Error(scan.error ?? "limits scan failed");
       const now = (this.deps.now ?? Date.now)();
-      const path = this.deps.statePath ?? resetPushStatePath();
       const state = await loadState(path);
       const items = expiringResets(scan.payload?.results ?? [], now);
       const send = this.deps.send ?? ((m: PushMessage) => sendToAll(m, { log: this.log }));
@@ -222,8 +280,61 @@ export class ResetExpiryNotifier {
       this.log(`reset-expiry push: ${this.lastError}`);
       return 0;
     } finally {
-      this.lastCheckAt = new Date((this.deps.now ?? Date.now)()).toISOString();
-      this.ticking = false;
+      try {
+        await releaseLock?.();
+      } finally {
+        this.lastCheckAt = new Date((this.deps.now ?? Date.now)()).toISOString();
+        this.ticking = false;
+      }
+    }
+  }
+
+  async tickPools(): Promise<number> {
+    if (!this.deps.scanPoolThresholds || this.checkingPools) return 0;
+    this.checkingPools = true;
+    let sent = 0;
+    let releaseLock: (() => Promise<void>) | undefined;
+    try {
+      const hasSubscribers = this.deps.hasSubscribers ?? (async () => (await loadSubscriptions()).length > 0);
+      if (!await hasSubscribers()) return 0;
+      const path = this.deps.poolStatePath ?? join(persistentPushDir() ?? consoleWebDir(), "pool-threshold-push.json");
+      releaseLock = await trySharedFileLock(path);
+      if (!releaseLock) return 0;
+      const episodes = await loadPoolEpisodes(path);
+      const send = this.deps.send ?? ((message: PushMessage) => sendToAll(message, { log: this.log }));
+      for (const row of await this.deps.scanPoolThresholds()) {
+        const percent = row.percent;
+        const observed = percent !== undefined && Number.isFinite(percent);
+        const url = poolLimitsPath(row.tool, row.pool);
+        const episode = episodes[url];
+        const below = row.complete && observed && percent < POOL_RESET_THRESHOLD;
+        if (episode) {
+          const verified = (row.verifiedResetAt ?? 0) > episode.startedAt;
+          if (!below && (!verified || episode.recovered)) continue;
+          if (below) delete episodes[url];
+          else episodes[url] = { ...episode, recovered: true };
+          await saveState(path, episodes);
+          if (!episode.recovered && (await send(poolMessage(row, url, verified ? "verified" : "below"))).sent > 0) sent++;
+        } else if (observed && percent >= POOL_RESET_THRESHOLD) {
+          const review = row.tool === "codex" && this.deps.reviewPoolReset
+            ? await this.deps.reviewPoolReset(row.tool, row.pool).catch(() => undefined)
+            : undefined;
+          if (review?.availability === "below_threshold") continue;
+          episodes[url] = { startedAt: row.observedAt };
+          await saveState(path, episodes);
+          if ((await send(poolMessage(row, url, "crossing", review?.availability === "available"))).sent > 0) sent++;
+        }
+      }
+      return sent;
+    } catch (error) {
+      this.log(`pool threshold push: ${error instanceof Error ? error.message : String(error)}`);
+      return sent;
+    } finally {
+      try {
+        await releaseLock?.();
+      } finally {
+        this.checkingPools = false;
+      }
     }
   }
 

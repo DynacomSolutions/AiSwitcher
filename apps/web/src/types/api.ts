@@ -18,6 +18,35 @@ export interface Identity {
   retiredAt?: string;
 }
 
+export interface PoolResetCandidate {
+  identity: string;
+  creditId: string;
+  creditExpiresAt: number;
+  weeklyReset: number;
+}
+
+export interface PoolResetReview {
+  tool: ToolName;
+  pool: string;
+  observedAt: number;
+  percent?: number;
+  complete: boolean;
+  verifiedResetAt?: number;
+  members: string[];
+  availability: "available" | "below_threshold" | "unavailable" | "no_credit" | "unsupported";
+  candidate?: PoolResetCandidate;
+}
+
+export interface PoolResetConfirmation {
+  candidate: PoolResetCandidate;
+  redeemRequestId: string;
+}
+
+export type PoolResetResult =
+  | { status: "changed"; review: PoolResetReview }
+  | { status: "already_attempted" }
+  | { status: "pending" | "confirmed" | "declined" };
+
 export type AutoResetScope = "pool" | "identity";
 export interface AutoResetStatus {
   name: string;

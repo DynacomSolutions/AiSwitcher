@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { checkCodexRedemptionFence } from "../../src/gateway/pool-reset.ts";
 import { consumeCodexResetForIdentity } from "../../src/gateway/account.ts";
 
 const RESET_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
@@ -85,4 +86,52 @@ describe("Codex reset spend", () => {
     }
     expect(posts).toBe(refusedMethod === "POST" ? 1 : 0);
   });
+});
+
+test("the legacy Console consume checks locked inventory against retained pool attempts", async () => {
+  const creditId = "credit-SYNTHETIC_FIXTURE-fenced";
+  let any = true;
+  let pending = false;
+  let inventory: unknown = { available_count: 1, credits: [{ id: creditId, status: "available" }] };
+  let posts = 0;
+  const consume = () => consumeCodexResetForIdentity(IDENTITY, REQUEST_ID, {
+    creds: { get: async () => ({ identity: IDENTITY, accessToken: "access-SYNTHETIC_FIXTURE_member" }), refreshAfter401: async () => { throw new Error("unexpected refresh"); } },
+    fetch: (async (_input, init) => {
+      if (init?.method !== "POST") return Response.json(inventory);
+      posts++;
+      expect(JSON.parse(String(init.body))).toEqual({ redeem_request_id: REQUEST_ID });
+      return Response.json({ code: "reset" });
+    }) as typeof fetch,
+  }, undefined, (identity, context) => checkCodexRedemptionFence({
+    usedCredits: async (ids) => new Set(ids.filter((id) => id === creditId)),
+    accountOutcomePending: async () => pending,
+    inventoryFenceScope: async () => ({ any, relevant: any }),
+  }, identity, context));
+
+  await expect(consume()).rejects.toThrow("already attempted");
+  inventory = { available_count: 1 };
+  await expect(consume()).rejects.toThrow("already attempted");
+  expect(posts).toBe(0);
+  any = false;
+  pending = true;
+  await expect(consume()).rejects.toThrow("unresolved outcome");
+  expect(posts).toBe(0);
+  pending = false;
+  expect(await consume()).toMatchObject({ result: "reset" });
+  expect(posts).toBe(1);
+});
+
+test("a cancelled legacy Console preflight cannot send a POST after its fence check", async () => {
+  const controller = new AbortController();
+  let posts = 0;
+  const spend = consumeCodexResetForIdentity(IDENTITY, REQUEST_ID, {
+    creds: { get: async () => ({ identity: IDENTITY, accessToken: "access-SYNTHETIC_FIXTURE_member" }), refreshAfter401: async () => { throw new Error("unexpected refresh"); } },
+    signal: controller.signal,
+    fetch: (async (_input, init) => {
+      if (init?.method === "POST") posts++;
+      return Response.json({ available_count: 1 });
+    }) as typeof fetch,
+  }, undefined, async () => controller.abort());
+  await expect(spend).rejects.toThrow();
+  expect(posts).toBe(0);
 });

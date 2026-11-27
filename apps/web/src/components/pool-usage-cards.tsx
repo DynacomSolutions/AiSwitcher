@@ -1,4 +1,6 @@
 import { useMemo } from "react";
+import { Link } from "react-router-dom";
+import { poolLimitsPath } from "@/lib/api";
 
 import { AutoResetControl } from "@/components/auto-reset-control";
 import { AccountWarnings } from "@/components/account-line";
@@ -60,7 +62,9 @@ function PoolCard({ pool, autoReset }: { pool: PoolSummary; autoReset?: AutoRese
     <Card className="gap-4">
       <CardHeader className="space-y-0">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="min-w-0 break-words font-medium">{pool.name}</span>
+          {pool.tool === "codex" || pool.tool === "claude" || pool.tool === "kimi" ? (
+            <Link className="min-w-0 break-words font-medium underline-offset-4 hover:underline" to={poolLimitsPath(pool.tool, pool.name)}>{pool.name}</Link>
+          ) : <span className="min-w-0 break-words font-medium">{pool.name}</span>}
           <ToolBadge tool={pool.tool as ToolName} />
           <Badge variant="muted">{pool.members.length} members</Badge>
         </div>
@@ -163,7 +167,7 @@ export function PoolUsageCards({ autoResetPools }: { autoResetPools?: Array<Auto
           <Card key={`codex/${pool.name}`} className="gap-4">
             <CardHeader className="space-y-0">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="min-w-0 break-words font-medium">{pool.name}</span>
+                <Link className="min-w-0 break-words font-medium underline-offset-4 hover:underline" to={poolLimitsPath("codex", pool.name)}>{pool.name}</Link>
                 <ToolBadge tool="codex" />
                 <Badge variant="muted">{pool.members.length} members</Badge>
               </div>

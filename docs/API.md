@@ -572,10 +572,10 @@ good model, and answers 502 only when no good model exists yet.
 
 ### Push notifications
 
-The installed PWA subscribes for reset-expiry reminders. The daemon sends one
+The installed PWA subscribes for expiry reminders and pool alerts. The daemon sends one
 Web Push (VAPID, aes128gcm) when an unspent Claude grant or Codex credit is 7
 days from its end, again at 3 days and at 24 hours; each stage is sent once per
-grant and recorded in `<state dir>/reset-expiry-push.json`. The check runs hourly
+grant and recorded in `<push state dir>/reset-expiry-push.json`. The check runs hourly
 through the shared limits scan, and only when a browser has subscribed. Swap
 pool rows are skipped (their members carry the grants). `AIS_RESET_PUSH=0`
 turns the reminders off; `AIS_PUSH_SUBJECT` sets the VAPID contact (default:
@@ -592,7 +592,30 @@ deadline in the message (default `TZ`).
 - `POST /api/push/reset-expiry/check` -> `{ ok, sent, status }`: runs the hourly check now (503 without the daemon).
 
 The VAPID key pair (`push-vapid.json`) and subscriptions (`push-subscriptions.json`)
-live in the console state dir, mode 0600.
+use mode 0600. Set `AIS_WEB_PUSH_STATE_DIR` to store push keys, subscriptions and
+notification state on a persistent volume. The default is the Console state
+directory. The Kubernetes example sets a separate push directory on its AIS
+home mount. Browsers must subscribe again after a switch from an ephemeral store.
+
+With subscribers, Console checks gateway pool usage every five minutes. A
+fully observed window average of at least 90% starts a pool alert. Console
+records the crossing in `<push state dir>/pool-threshold-push.json` before delivery.
+All observed windows must have current readings to prove usage below 90%.
+A verified reset can replace an alert while usage remains above the threshold.
+The pool must fall below 90% before a new crossing. `AIS_RESET_PUSH=0` also
+turns off these pool alerts.
+
+`Dismiss` closes the notification. `Use reset` opens
+`/limits/pools/:tool/:pool?reset=1` when the gateway finds an eligible credit.
+A notification tap opens the same review on iOS Home Screen installations.
+
+`GET /api/limits/pools/:tool/:pool` reads the gateway's current review.
+`POST /api/limits/pools/codex/:pool` takes `candidate` and `redeemRequestId`.
+The candidate names the account and credit with their expiry and weekly reset
+times. A changed selection requires a new confirmation. Console sends one
+request after confirmation and the gateway records its attempt before the
+provider POST. Both routes use the Console guard. The POST also requires
+`X-AIS-Console: 1`.
 
 ### Gateway apps
 

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as wait } from "node:timers/promises";
 import type { ManualResetInfo } from "../cli/limits/types.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
+import type { CodexResetOutcome } from "./account.ts";
 import {
   canRearmClaim, type AutoResetClaim, type AutoResetClaimInput, type AutoResetClaimSummary,
   type AutoResetCreditEvidence, type AutoResetStore,
@@ -13,7 +14,7 @@ export type { AutoResetClaimSummary } from "./auto-reset-store.ts";
 
 const RECOVERY_MS = 25_000;
 const READING_MAX_AGE_MS = 45_000;
-const MIN_WEEKLY_REMAINING_MS = 5 * 60_000;
+export const MIN_WEEKLY_REMAINING_MS = 5 * 60_000;
 const NATURAL_RESET_WAIT_MS = 8_000;
 const NATURAL_RESET_VERIFY_MS = 4_000;
 const NATURAL_RESET_CREDIT_MS = 60_000;
@@ -54,6 +55,7 @@ interface SpendEvidence {
 
 interface RecoveryOptions {
   store: AutoResetStore;
+  claim?: (input: Parameters<AutoResetStore["claim"]>[0], signal: AbortSignal) => ReturnType<AutoResetStore["claim"]>;
   pools: () => Promise<AutoResetPool[]>;
   freshUsage: (identity: string, signal: AbortSignal) => Promise<AutoResetUsage | undefined>;
   readCredits: (identity: string, signal: AbortSignal) => Promise<ManualResetInfo | undefined>;
@@ -85,7 +87,7 @@ function currentReading(time: string | undefined, now: number): boolean {
   return age >= 0 && age <= READING_MAX_AGE_MS;
 }
 
-function weeklyWindow(usage: PoolUsage | undefined, now: number) {
+export function weeklyWindow(usage: PoolUsage | undefined, now: number) {
   if (!usage || usage.stale || usage.noPlan || usage.status === "unavailable" || !currentReading(usage.capturedAt, now)) return undefined;
   const windows = usage.windows?.filter((w) => w.model === undefined && /^(?:week|weekly|7d)$/i.test(w.label.trim()));
   if (windows?.length !== 1) return undefined;
@@ -109,7 +111,7 @@ export function exhaustedWeeklyReset(usage: AutoResetUsage | undefined, now: num
 }
 
 /** Keep only provider-listed credits with a usable ID and an absolute future expiry. */
-function liveCredits(info: ManualResetInfo | undefined, now: number) {
+export function liveCredits(info: ManualResetInfo | undefined, now: number) {
   if (!info || info.stale || !Number.isSafeInteger(info.availableCount) || info.availableCount < 1) return [];
   if (info.readAt !== undefined && !currentReading(info.readAt, now)) return [];
   const ids = new Map<string, number>();
@@ -161,7 +163,7 @@ function withSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 export function createAutoResetRecovery({
-  store, pools, freshUsage, readCredits, spend, now = Date.now, confirmationBudgetMs = CONFIRMATION_MS, log = console.info,
+  store, claim: claimCredit = (input) => store.claim(input), pools, freshUsage, readCredits, spend, now = Date.now, confirmationBudgetMs = CONFIRMATION_MS, log = console.info,
 }: RecoveryOptions): AutoResetRecovery {
   async function enabledPools(): Promise<AutoResetPool[]> {
     const all = await pools();
@@ -322,10 +324,10 @@ export function createAutoResetRecovery({
     };
     const redeemRequestId = randomUUID();
     signal.throwIfAborted();
-    const claim = await store.claim({
+    const claim = await claimCredit({
       eventKey, identity, pool, creditId, creditExpiresAt: iso(creditExpiresAt), startedAt: iso(decisionTime),
       redeemRequestId, provider429At, usageEvidence: evidence, creditEvidence,
-    });
+    }, signal);
     if (claim.kind === "existing") return follow(eventKey, claim.claim, input, deadline);
     if (claim.kind === "blocked") return undefined;
 
@@ -345,12 +347,13 @@ export function createAutoResetRecovery({
     audit("pending");
     let status: Exclude<AutoResetClaimSummary["status"], "pending"> = "rejected";
     let creditedId: string | undefined;
+    let knownOutcome: CodexResetOutcome | undefined;
     let outcome = "evidence_expired";
     let postAttempted: boolean | undefined;
     let finishedAt: number;
     const stillCurrent = () => {
       const at = now();
-      return !signal.aborted && at < creditExpiresAt && chosen.weeklyReset - at >= MIN_WEEKLY_REMAINING_MS &&
+      return !signal.aborted && performance.now() < deadline - REPLAY_RESERVE_MS && at < creditExpiresAt && chosen.weeklyReset - at >= MIN_WEEKLY_REMAINING_MS &&
         (provider429At === undefined || at - provider429At < RECOVERY_MS) &&
         evidence.every((row) => absoluteTime(row.resetAt) > at && currentReading(row.capturedAt, at));
     };
@@ -358,12 +361,18 @@ export function createAutoResetRecovery({
       if (stillCurrent()) {
         status = "unknown";
         outcome = "consume_unknown";
-        const spent = await withSignal(spend(identity, creditId, redeemRequestId, signal, {
+        const posting = spend(identity, creditId, redeemRequestId, signal, {
           endsAt: iso(creditExpiresAt),
           stillCurrent,
           postAttempted: (attempted) => { postAttempted = attempted; },
-        }), signal);
+        });
+        const spent = await withSignal(posting, signal).catch((error) => {
+          // The caller can leave while we record an answer to a POST already sent.
+          if (signal.aborted && postAttempted === true) return posting;
+          throw error;
+        });
         creditedId = spent.creditId;
+        knownOutcome = spent.result;
         if (creditedId === undefined || creditedId === creditId) {
           outcome = spent.result;
           status = spent.result === "reset" ? "reset" : "rejected";
@@ -374,8 +383,15 @@ export function createAutoResetRecovery({
         outcome = "cancelled_before_post";
       }
     } catch (error) {
-      const refusal = error as { status?: number; postAttempted?: boolean } | null;
-      if (postAttempted === false || refusal?.postAttempted === false) {
+      const refusal = error as { status?: number; postAttempted?: boolean; creditedId?: string; knownOutcome?: CodexResetOutcome } | null;
+      creditedId = refusal?.creditedId;
+      knownOutcome = refusal?.knownOutcome;
+      if (creditedId !== undefined && creditedId !== creditId) {
+        outcome = "credit_mismatch";
+      } else if (knownOutcome !== undefined) {
+        outcome = knownOutcome;
+        status = knownOutcome === "reset" ? "reset" : "rejected";
+      } else if (postAttempted === false || refusal?.postAttempted === false) {
         status = "rejected";
         outcome = "preflight_failed";
       } else if (refusal?.status !== undefined && refusal.status >= 400 && refusal.status < 500) {
@@ -385,7 +401,9 @@ export function createAutoResetRecovery({
     } finally {
       finishedAt = now();
       audit(status, outcome, creditedId);
-      await store.finish(eventKey, status, creditedId, { redeemRequestId, finishedAt: iso(finishedAt), outcome });
+      await store.finish(eventKey, status, creditedId, {
+        redeemRequestId, finishedAt: iso(finishedAt), outcome, knownOutcome, unsent: postAttempted === false,
+      });
     }
     if (status === "rejected" || (creditedId !== undefined && creditedId !== creditId)) return undefined;
     const mark = status === "reset" ? (at: number) => store.markRecovered(eventKey, redeemRequestId, iso(at)) : undefined;

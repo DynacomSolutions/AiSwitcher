@@ -40,6 +40,9 @@ import type {
   BrowsersResponse,
   PushStatusResponse,
   PoolsUsageResponse,
+  PoolResetConfirmation,
+  PoolResetResult,
+  PoolResetReview,
   UsageResponse,
 } from "@/types/api";
 
@@ -115,6 +118,10 @@ function withParams(path: string, params: Record<string, string | undefined>): s
   return query.length > 0 ? `${path}?${query}` : path;
 }
 
+export function poolLimitsPath(tool: string, pool: string): string {
+  return `/limits/pools/${encodeURIComponent(tool)}/${encodeURIComponent(pool)}`;
+}
+
 export const api = {
   getStatus: () => request<StatusResponse>("/api/status"),
 
@@ -171,6 +178,9 @@ export const api = {
       body: { alias },
     }),
 
+  getPoolResetReview: (tool: string, pool: string) => request<PoolResetReview>(`/api${poolLimitsPath(tool, pool)}`),
+  confirmPoolReset: (tool: string, pool: string, confirmation: PoolResetConfirmation) =>
+    request<PoolResetResult>(`/api${poolLimitsPath(tool, pool)}`, { method: "POST", body: confirmation }),
   getAutoReset: (signal?: AbortSignal) => request<AutoResetResponse>("/api/limits/codex/auto-reset", { signal }),
   setAutoReset: (kind: AutoResetScope, name: string, enabled: boolean) =>
     request<{ name: string; enabled: boolean }>(`/api/limits/codex/auto-reset/${kind}`, { method: "PUT", body: { name, enabled } }),

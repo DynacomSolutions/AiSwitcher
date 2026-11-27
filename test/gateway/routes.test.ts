@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
 import { createGatewayApp, type GatewayDeps } from "../../src/gateway/app.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
+import { checkCodexRedemptionFence } from "../../src/gateway/pool-reset.ts";
 import { noopMetrics, type GatewayMetrics } from "../../src/gateway/metrics.ts";
 import { claudeUsageBodyOf, routeFor } from "../../src/gateway/routes.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
@@ -1319,6 +1320,63 @@ describe("account API of the other providers", () => {
     expect(posts[0]!.headers.get("chatgpt-account-id")).toBe("acct");
     expect(JSON.parse(posts[0]!.body!)).toEqual({ redeem_request_id: redeemRequestId });
   });
+  test.each([false, true])("codex: a forwarded consume cannot repeat a fenced credit (explicit %s)", async (explicit) => {
+    const fenced = "credit-SYNTHETIC_FIXTURE-fenced";
+    const alternate = "credit-SYNTHETIC_FIXTURE-alternate";
+    const selected = explicit ? { credit_id: fenced } : {};
+    await addApp("c", "codex", "openai");
+    let relevant = true;
+    let outcomePending = false;
+    let ids = [fenced];
+    let count = 1;
+    deps.withCodexRedemption = async (run) => run(async (identity, context) => {
+      expect(identity).toBe("b");
+      await checkCodexRedemptionFence({
+        usedCredits: async (requested) => new Set(requested.filter((id) => id === fenced)),
+        accountOutcomePending: async () => outcomePending,
+        inventoryFenceScope: async () => ({ any: true, relevant }),
+      }, identity, context);
+    });
+    reply = (req) => req.method === "POST" ? new Response("provider body", { status: 403 }) : Response.json(
+      req.headers.get("authorization") === "Bearer tok-a" ? { available_count: 1 } :
+        { available_count: count, credits: ids.map((id) => ({ id, status: "available" })) },
+    );
+    // Rank the owner first for provider-selected requests. Explicit requests find the owner by credit ID.
+    if (!explicit) deps.poolMembers = async () => ["b", "a"];
+    const body = JSON.stringify({ redeem_request_id: crypto.randomUUID(), ...selected }, null, 2);
+    const consume = (payload = body) => call("c", "/wham/rate-limit-reset-credits/consume", { method: "POST", body: payload });
+
+    expect((await consume()).status).toBe(409);
+    expect(seen.filter((req) => req.method === "POST")).toEqual([]);
+
+    const safeBody = explicit ? body.replace(fenced, alternate) : body;
+    ids = [alternate];
+    if (!explicit) {
+      count = 2;
+      expect((await consume(safeBody)).status).toBe(409);
+      expect(seen.filter((req) => req.method === "POST")).toEqual([]);
+      count = 1;
+    }
+    outcomePending = true;
+    const pending = await consume(safeBody);
+    expect(pending.status).toBe(409);
+    expect(await pending.json()).toMatchObject({ error: { message: expect.stringContaining("unresolved outcome") } });
+    expect(seen.filter((req) => req.method === "POST")).toEqual([]);
+    outcomePending = false;
+
+    const allowed = await consume(safeBody);
+    expect(allowed.status).toBe(403);
+    expect(await allowed.text()).toBe("provider body");
+    expect(seen.filter((req) => req.method === "POST").map((req) => req.body)).toEqual([safeBody]);
+    if (!explicit) {
+      relevant = false;
+      count = 2;
+      expect((await consume(safeBody)).status).toBe(403);
+      ids = [alternate, fenced];
+      expect((await consume(safeBody)).status).toBe(409);
+    }
+  });
+
   test("codex reset preserves an upstream 403", async () => {
     await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
     reply = (s) => s.method === "GET" ? Response.json({ available_count: 1 }) : new Response("forbidden", { status: 403 });

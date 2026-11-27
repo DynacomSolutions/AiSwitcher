@@ -32,6 +32,7 @@ import { loadGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, useCod
 import { GATEWAY_USAGE_WINDOW_DAYS, mergeGatewayUsageWithHistory, usageBucketZone } from "./gateway-usage.ts";
 import * as gatewayApps from "./gateway-apps.ts";
 import { createGatewayAutoResetRequest, registerGatewayAutoReset, type GatewayAutoResetDeps } from "./gateway-auto-reset.ts";
+import { registerGatewayPoolReset } from "./gateway-pool-reset.ts";
 import { addGatewayIdentity, addGatewayPoolMember, type GatewayIdentityAddResult } from "./gateway-identities.ts";
 import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -135,7 +136,7 @@ export interface ConsoleAppDeps extends GuardDeps {
   /** Online-probe cache file for the default localModels; tests inject a temp path. */
   onlineCachePath?: string;
   /** Daemon-side reset-expiry push reminders; absent in bare-app tests. */
-  resetExpiryPush?: Pick<ResetExpiryNotifier, "status" | "tick">;
+  resetExpiryPush?: Pick<ResetExpiryNotifier, "status" | "tick"> & Partial<Pick<ResetExpiryNotifier, "tickPools">>;
   /** Web Push state dir (VAPID keys, subscriptions); tests inject a temp dir. */
   pushDir?: string;
   /** Test seam: the push service fetch for POST /api/push/test. */
@@ -451,11 +452,17 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     const requestId = body?.redeemRequestId;
     if (typeof requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) throw new HttpError(400, "a valid reset request ID is required");
     const spend = deps.codexUseReset ?? useCodexResetViaGateway;
-    return c.json(await observeReset(() => spend(identity, requestId)));
+    const result = await observeReset(() => spend(identity, requestId));
+    if (result.reconciliation?.status === "confirmed") void deps.resetExpiryPush?.tickPools?.();
+    return c.json(result);
   });
   registerGatewayAutoReset(app, autoReset, {
     read: () => events.read("codex-auto-reset"),
     changed: () => events.invalidate("codex-auto-reset"),
+  });
+  registerGatewayPoolReset(app, deps.gatewayAutoReset, (status) => {
+    resetChanged();
+    if (status === "confirmed") void deps.resetExpiryPush?.tickPools?.();
   });
   /* ------------------------------ web push -------------------------------- */
   // Loaded on first use: every ais command imports this module, and start-up reads count (sync budgets).
@@ -484,7 +491,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   // Sends a test notification to every subscribed browser.
   app.post("/api/push/test", async (c) => {
     const result = await (await pushModule()).sendToAll(
-      { title: "AIS Console", body: "Notifications are on. You will hear about resets 7 days, 3 days and 24 hours before they expire.", tag: "push-test", url: "/limits" },
+      { title: "AIS Console", body: "Notifications are on for pool usage and reset expiry.", tag: "push-test", url: "/limits" },
       { ...(deps.pushDir ? { dir: deps.pushDir } : {}), ...(deps.pushFetch ? { fetchImpl: deps.pushFetch } : {}) },
     );
     return c.json({ ok: true, ...result });

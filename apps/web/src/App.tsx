@@ -8,6 +8,7 @@ import { DashboardPage } from "@/pages/dashboard";
 import { FilesPage } from "@/pages/files";
 import { GatewayPage } from "@/pages/gateway";
 import { IdentitiesPage } from "@/pages/identities";
+import { PoolLimitsPage } from "@/pages/pool-limits";
 import { LimitsPage } from "@/pages/limits";
 import { LocalModelsPage } from "@/pages/local-models";
 import { NotFoundPage } from "@/pages/not-found";
@@ -24,6 +25,7 @@ export function AppRoutes() {
         <Route path="identities" element={<IdentitiesPage />} />
         <Route path="local-models" element={<LocalModelsPage />} />
         <Route path="local-models/:name" element={<LocalModelsPage />} />
+        <Route path="limits/pools/:tool/:pool" element={<PoolLimitsPage />} />
         <Route path="limits/:tab?" element={<LimitsPage />} />
         <Route path="usage/:tab?" element={<UsagePage />} />
         <Route path="breakdown/:tab?" element={<BreakdownPage />} />

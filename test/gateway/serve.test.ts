@@ -1651,8 +1651,9 @@ describe("single refresher: dead logins, seeded metrics and the renewal route", 
 describe("Codex reset credits", () => {
   test("reconciles past another replica's old reading and sends one consume", async () => {
     const now = new Date().toISOString();
+    const resetsAt = new Date(Date.now() + 3_600_000).toISOString();
     const shared = new MemoryUsageReadings();
-    await shared.save("codex", "codex-member", { status: "live", maxUtilization: 90, windows: [{ label: "~7d", utilization: 90 }], capturedAt: now }, 3_600_000);
+    await shared.save("codex", "codex-member", { status: "live", maxUtilization: 90, windows: [{ label: "~7d", utilization: 90, resetsAt }], capturedAt: now }, 3_600_000);
     await store.putApp({ ...app, name: "codex-reset", provider: "codex", style: "openai", target: { kind: "pin", identity: "codex-member" } });
     let freshReads = 0;
     let consumes = 0;
@@ -1662,11 +1663,11 @@ describe("Codex reset credits", () => {
       poolMembers: async (provider) => provider === "codex" ? ["codex-member"] : [],
       canonical: async (_provider, identity) => identity,
       fetchUsage: async (_provider, _identity, opts) => {
-        if (!opts?.fresh) return { status: "live", maxUtilization: 90, windows: [{ label: "~7d", utilization: 90 }], capturedAt: now };
+        if (!opts?.fresh) return { status: "live", maxUtilization: 90, windows: [{ label: "~7d", utilization: 90, resetsAt }], capturedAt: now };
         freshReads++;
         await Bun.sleep(40);
         const used = freshReads === 1 ? 90 : 42;
-        return { status: "live", maxUtilization: used, windows: [{ label: "~7d", utilization: used }], capturedAt: new Date().toISOString() };
+        return { status: "live", maxUtilization: used, windows: [{ label: "~7d", utilization: used, resetsAt }], capturedAt: new Date().toISOString() };
       },
       fetch: (async (_input, init) => {
         if (init?.method === "POST") {
@@ -2143,7 +2144,7 @@ describe("automatic Codex reset integration", () => {
     ] }, [identity])).toEqual([{ name: pool, members: [identity] }]);
   });
 
-  type Scenario = "success" | "expired" | "missing" | "logged-out" | "preflight" | "version" | "wrong-type" | "wrong-type-recheck" | "model-blocked" | "manual-race" | "generation-unavailable" | "ambiguous" | 401 | 422;
+  type Scenario = "success" | "expired" | "missing" | "logged-out" | "preflight" | "version" | "wrong-type" | "wrong-type-recheck" | "model-blocked" | "manual-race" | "generation-unavailable" | "ambiguous" | "credit-mismatch" | 401 | 422;
 
   async function setup(scenario: Scenario, advanceVersion?: () => void) {
     let clock = Date.now();
@@ -2251,7 +2252,9 @@ describe("automatic Codex reset integration", () => {
           if (typeof scenario === "number") return new Response(null, { status: scenario });
           if (scenario === "ambiguous") throw new Error("synthetic connection reset");
           served = true;
-          return Response.json({ code: "reset", windows_reset: 1, credit: { id: creditId } });
+          return Response.json({
+            code: "reset", windows_reset: 1, ...(scenario === "credit-mismatch" ? { credit: { id: otherCredit } } : {}),
+          });
         }
         if (++inferences === 2) followerQuota.resolve();
         return served ? Response.json({ accepted: true })
@@ -2263,10 +2266,62 @@ describe("automatic Codex reset integration", () => {
       headers: { authorization: `Bearer ${t.token}` },
     });
     return {
-      auto, call, entered, releasePost, followerQuota, requests, readings, invalidations,
+      auto, call, entered, releasePost, followerQuota, requests, readings, invalidations, lock,
       counts: () => ({ posts, inferences, inventories, ordinaryFresh }),
     };
   }
+
+  test("records the provider-reported credit before an automatic mismatch can release the spend lock", async () => {
+    const state = await setup("credit-mismatch");
+    let redemptionLocked = false;
+    const acquire = state.lock.acquire.bind(state.lock);
+    spyOn(state.lock, "acquire").mockImplementation(async (scope, timeout) => {
+      const handle = await acquire(scope, timeout);
+      if (scope.provider !== "internal-codex-redemption") return handle;
+      redemptionLocked = true;
+      const release = handle.release.bind(handle);
+      handle.release = () => {
+        redemptionLocked = false;
+        return release();
+      };
+      return handle;
+    });
+    const persist = state.auto.recordReportedCredit.bind(state.auto);
+    const record = spyOn(state.auto, "recordReportedCredit").mockImplementation(async (...args) => {
+      expect(redemptionLocked).toBe(true);
+      return persist(...args);
+    });
+    const answer = await state.call();
+    expect(answer.status).toBe(429);
+    expect(await answer.text()).toBe(quota);
+    expect(state.counts()).toMatchObject({ posts: 1, inferences: 1 });
+    expect(record).toHaveBeenCalledWith(state.requests[0].redeem_request_id, otherCredit, "reset");
+    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({
+      status: "unknown", creditId, creditedId: otherCredit,
+    });
+  });
+
+  test("an automatic spend cannot send if its account guard write fails", async () => {
+    const state = await setup("credit-mismatch");
+    spyOn(state.auto, "beginSpend").mockRejectedValue(new Error("synthetic failure before commit"));
+    const response = await state.call();
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe(quota);
+    expect(state.counts().posts).toBe(0);
+  });
+
+  test("an automatic mismatch leaves its account guarded if every outcome write fails", async () => {
+    const state = await setup("credit-mismatch");
+    const receipt = spyOn(state.auto, "recordReportedCredit").mockRejectedValue(new Error("synthetic failure before commit"));
+    const finish = spyOn(state.auto, "finish").mockRejectedValue(new Error("synthetic failure before commit"));
+    const response = await state.call();
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe(quota);
+    expect(state.counts().posts).toBe(1);
+    expect(receipt).toHaveBeenCalledTimes(2);
+    expect(finish).toHaveBeenCalledTimes(1);
+    expect(await state.auto.lastClaim("identity", identity)).toMatchObject({ spendPending: true });
+  });
 
   test("a follower on a locally held member gets a real 429 and joins one durable spend", async () => {
     const state = await setup("success");

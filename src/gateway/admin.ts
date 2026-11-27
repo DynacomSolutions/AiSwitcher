@@ -18,6 +18,7 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord, UsageHistoryRow } from "./types.ts";
 import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
 import { USAGE_READER_PROVIDERS } from "./usage-source.ts";
+import { registerPoolResetAdmin, type PoolResetAdmin } from "./admin-pool-reset.ts";
 import type { AutoResetStore } from "./auto-reset-store.ts";
 import type { AutoResetPool } from "./auto-reset.ts";
 import { CODEX_AUTO_RESET_PATH, type AutoResetScope, type AutoResetStatus } from "./auto-reset-view.ts";
@@ -99,7 +100,8 @@ export interface AdminDeps {
   /** Spends one Claude reset grant of a managed identity with the store's member credential (POST /limits/claude/:identity/resets/:grant); absent when the gateway cannot. Throws an error with a numeric `status` and a short message to refuse. */
   spendReset?(identity: string, grantId: string): Promise<unknown>;
   /** Spends one Codex reset on the named member and invalidates shared reset and usage reads. */
-  spendCodexReset?(identity: string, redeemRequestId: string): Promise<unknown>;
+  spendCodexReset?(identity: string, redeemRequestId: string, signal?: AbortSignal): Promise<unknown>;
+  poolReset?: PoolResetAdmin;
   autoReset?: { store: AutoResetStore; pools: () => Promise<AutoResetPool[]> };
 }
 
@@ -322,6 +324,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
   registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserHub ? { hub: deps.browserHub } : {}), ...(deps.onBindingRevoked ? { onBindingRevoked: deps.onBindingRevoked } : {}), ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
 
   registerStoreAdmin(hono, deps.storeAdmin, (status, message, extra) => Response.json({ error: message, ...extra }, { status }));
+  if (deps.poolReset) registerPoolResetAdmin(hono, deps.poolReset, LIMITS_PROVIDERS);
   registerFavouritesAdmin(hono, deps.favourites, err, deps.metrics);
   registerSessionsAdmin(hono, deps.sessions, (status, message, extra) => Response.json({ error: message, ...extra }, { status }));
 
@@ -434,8 +437,8 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const status = async (kind: AutoResetScope, name: string): Promise<AutoResetStatus> => {
       const [enabled, claim] = await Promise.all([settings.store.enabled(kind, name), settings.store.lastClaim(kind, name)]);
       if (!claim) return { name, enabled };
-      const { pool, identity, startedAt, creditExpiresAt, status } = claim;
-      return { name, enabled, lastClaim: { pool, identity, startedAt, creditExpiresAt, status } };
+      const { pool, identity, startedAt, creditExpiresAt, status, spendPending } = claim;
+      return { name, enabled, lastClaim: { pool, identity, startedAt, creditExpiresAt, status, spendPending } };
     };
     const [poolSettings, identitySettings] = await Promise.all([
       Promise.all(pools.map(async ({ name, members }) => ({ ...await status("pool", name), members }))),
@@ -484,7 +487,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
     try {
       const body = await c.req.json().catch(() => undefined) as { redeemRequestId?: unknown } | undefined;
       if (typeof body?.redeemRequestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.redeemRequestId)) return err(400, "a valid reset request ID is required");
-      return c.json(await deps.spendCodexReset(identity, body.redeemRequestId));
+      return c.json(await deps.spendCodexReset(identity, body.redeemRequestId, c.req.raw.signal));
     } catch (e) {
       const status = (e as { status?: unknown }).status;
       const known = status === 400 || status === 403 || status === 404 || status === 409 || status === 429 ? status : 502;

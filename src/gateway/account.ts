@@ -3,9 +3,11 @@ import { upstreamHeaders } from "./app.ts";
 import { GatewayCredentialError } from "./credentials.ts";
 import { GATEWAY_ERROR_HEADER, GATEWAY_UPSTREAM_HEADER, providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
+import { bounded } from "./refresh-guard.ts";
 import { availableCount, claudeUsageBody, claudeUsageBodyOf, normalisePath, orgSegmentIndex, syntheticClaudeProfile, type AccountOp } from "./routes.ts";
 import { allowedMembers, utilisationOf } from "./select.ts";
-import { CODEX_CREDITS_URL, codexResetInventory } from "./usage-source.ts";
+import { CODEX_CREDITS_URL, codexCreditIds, codexResetInventory, fetchCodexCreditInventory } from "./usage-source.ts";
+import type { ProviderCredential } from "./providers/shared.ts";
 import type { ApiStyle, GatewayApp } from "./types.ts";
 
 /**
@@ -70,10 +72,35 @@ export interface AccountResult {
   cls: string;
 }
 
-type BeforeCodexPost = (identity: string) => Promise<void>;
+export interface CodexPostContext {
+  credential: ProviderCredential;
+  creditId?: string;
+  redeemRequestId?: string;
+  inventory(): Promise<unknown>;
+  signal?: AbortSignal;
+  retryAfter401?: boolean;
+}
+
+export type BeforeCodexPost = (identity: string, context: CodexPostContext) => Promise<void>;
+
+export class CodexResetFenced extends Error {
+  readonly status = 409;
+
+  constructor(message = "This reset credit was already attempted. Check current limits.") {
+    super(message);
+  }
+}
+
+export class CodexResetOutcomePending extends CodexResetFenced {
+  constructor() {
+    super("A previous reset on this Codex account has an unresolved outcome.");
+  }
+}
+
+export type CodexResetOutcome = "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed";
 
 /** Serialises gateway redemptions and records the reset generation before the provider POST. */
-export type CodexRedemptionGuard = <T>(run: (beforePost: BeforeCodexPost) => Promise<T>) => Promise<T>;
+export type CodexRedemptionGuard = <T>(run: (beforePost: BeforeCodexPost) => Promise<T>, automatic?: boolean) => Promise<T>;
 
 export interface CodexCreditSelection {
   id: string;
@@ -83,26 +110,30 @@ export interface CodexCreditSelection {
   stillCurrent(): boolean;
   stillEligible(): Promise<boolean>;
   onPost(): void;
+  onKnownOutcome?(creditId: string, outcome: CodexResetOutcome): Promise<void>;
+  finishPostAfterDeadline?: boolean;
 }
 
 /** Spends one Codex reset on this exact stored member. The consume request is sent once. */
 export async function consumeCodexResetForIdentity(
   identity: string,
   redeemRequestId: string,
-  deps: Pick<GatewayDeps, "creds" | "fetch"> & { credential?: import("./providers/shared.ts").ProviderCredential },
+  deps: Pick<GatewayDeps, "creds" | "fetch"> & { credential?: ProviderCredential; signal?: AbortSignal },
   selection?: CodexCreditSelection,
   beforePost?: BeforeCodexPost,
-): Promise<{ identity: string; result: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number; creditId?: string }> {
+): Promise<{ identity: string; result: CodexResetOutcome; windowsReset: number; creditId?: string }> {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(redeemRequestId)) {
     throw Object.assign(new Error("A valid reset request ID is required"), { status: 400 });
   }
   const adapter = adapterFor("codex");
+  const signal = selection?.signal ?? deps.signal;
+  signal?.throwIfAborted();
   const credential = deps.credential ?? await deps.creds.get("codex", identity);
   if (credential.identity !== identity) throw Object.assign(new Error("Codex credential identity did not match the requested account"), { status: 409 });
-  const operationSignal = () => selection
-    ? AbortSignal.any([selection.signal, AbortSignal.timeout(10_000)])
+  const operationSignal = () => signal
+    ? AbortSignal.any([signal, AbortSignal.timeout(10_000)])
     : AbortSignal.timeout(10_000);
-  selection?.signal.throwIfAborted();
+  signal?.throwIfAborted();
   let credits: Response;
   try {
     credits = await deps.fetch(CODEX_CREDITS_URL, {
@@ -132,38 +163,63 @@ export async function consumeCodexResetForIdentity(
     selection.signal.throwIfAborted();
   }
 
-  await beforePost?.(identity);
+  signal?.throwIfAborted();
+  const request: RequestInit = {
+    method: "POST",
+    headers: upstreamHeaders(adapter, credential, new Headers({ accept: "application/json", "content-type": "application/json" })),
+    body: JSON.stringify({ redeem_request_id: redeemRequestId, ...(selection ? { credit_id: selection.id } : {}) }),
+    redirect: "manual",
+  };
+  await beforePost?.(identity, {
+    credential,
+    creditId: selection?.id,
+    redeemRequestId,
+    inventory: async () => inventory,
+    signal,
+  });
   if (selection && !selection.stillCurrent()) return { identity, result: "no_credit", windowsReset: 0 };
-  // Send the consume request only once.
-  selection?.onPost();
+  signal?.throwIfAborted();
+  request.signal = !selection || selection.finishPostAfterDeadline ? AbortSignal.timeout(10_000) : operationSignal();
   let spent: Response;
   try {
-    spent = await deps.fetch(`${CODEX_CREDITS_URL}/consume`, {
-      method: "POST",
-      headers: upstreamHeaders(adapter, credential, new Headers({ accept: "application/json", "content-type": "application/json" })),
-      body: JSON.stringify({ redeem_request_id: redeemRequestId, ...(selection ? { credit_id: selection.id } : {}) }),
-      signal: operationSignal(),
-      redirect: "manual",
-    });
+    selection?.onPost();
+    spent = await deps.fetch(`${CODEX_CREDITS_URL}/consume`, request);
   } catch {
     throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
   }
+  if (!spent.ok && !selection) await discard(spent);
+  const response = spent.ok || selection
+    ? await spent.json().catch(() => undefined) as { code?: unknown; windows_reset?: unknown; credit?: { id?: unknown } } | undefined
+    : undefined;
+  const rawCreditId = response?.credit?.id;
+  const reportedId = selection && typeof rawCreditId === "string" && rawCreditId.trim() ? rawCreditId : undefined;
   if (!spent.ok) {
-    if (selection) void discard(spent);
-    else await discard(spent);
     const manualStatus = [400, 403, 404, 409, 429].includes(spent.status) ? spent.status : 502;
-    throw Object.assign(new Error(`Codex refused the reset (HTTP ${spent.status})`), { status: selection ? spent.status : manualStatus });
+    throw Object.assign(new Error(`Codex refused the reset (HTTP ${spent.status})`), {
+      status: selection ? spent.status : manualStatus, creditedId: reportedId,
+    });
   }
-  const response = await spent.json().catch(() => undefined) as { code?: unknown; windows_reset?: unknown; credit?: { id?: unknown } } | undefined;
-  const { code, windows_reset: windowsReset = 0 } = response ?? {};
-  if (code !== "reset" && code !== "nothing_to_reset" && code !== "no_credit" && code !== "already_redeemed") {
-    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
+  const code = response?.code;
+  const windowsReset = response?.windows_reset === undefined && !selection ? 0 : response?.windows_reset;
+  const hasCredit = response != null && Object.hasOwn(response, "credit");
+  const unknownOutcome = () => new Error("Codex reset outcome is unknown. Refresh limits before another attempt.");
+  if ((code !== "reset" && code !== "nothing_to_reset" && code !== "no_credit" && code !== "already_redeemed") ||
+      typeof windowsReset !== "number" || !Number.isSafeInteger(windowsReset) || windowsReset < 0 ||
+      (selection && hasCredit && reportedId === undefined)) {
+    throw Object.assign(unknownOutcome(), { status: 502, creditedId: reportedId });
   }
-  if (typeof windowsReset !== "number" || !Number.isSafeInteger(windowsReset) || windowsReset < 0) {
-    throw Object.assign(new Error("Codex reset outcome is unknown. Refresh limits before another attempt."), { status: 502 });
+  // The standard response omits credit. The requested credit ID is then the effective credit ID.
+  const creditId = reportedId ?? selection?.id;
+  if (creditId !== undefined && selection?.onKnownOutcome) {
+    const record = selection.onKnownOutcome;
+    const write = () => bounded(record(creditId, code), 2_000, "Codex reset outcome journal");
+    try {
+      await write().catch(write);
+    } catch {
+      throw Object.assign(unknownOutcome(), { status: 502, creditedId: creditId, knownOutcome: code });
+    }
   }
-  const creditId = response?.credit?.id;
-  return { identity, result: code, windowsReset, ...(selection && typeof creditId === "string" ? { creditId } : {}) };
+  return { identity, result: code, windowsReset, ...(creditId === undefined ? {} : { creditId }) };
 }
 
 async function discard(res: Response): Promise<void> {
@@ -177,31 +233,33 @@ async function discard(res: Response): Promise<void> {
 const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 /** One call as `name`: the member's login, one locked refresh and retry on 401. */
-async function callAs(r: AccountRequest, name: string, init: { method: string; url: string; body?: Uint8Array }, beforePost?: BeforeCodexPost): Promise<Response> {
+async function callAs(
+  r: AccountRequest,
+  name: string,
+  init: { method: string; url: string; body?: Uint8Array },
+  beforePost?: (credential: ProviderCredential, retryAfter401: boolean) => Promise<void>,
+): Promise<Response> {
+  r.signal.throwIfAborted();
   const provider = r.app.provider;
   const adapter = adapterFor(provider);
   let cred = await r.deps.creds.get(provider, name);
-  const send = (c: typeof cred): Promise<Response> => {
-    if (r.signal.aborted) return Promise.reject(new DOMException("aborted", "AbortError"));
-    const req: RequestInit = { method: init.method, headers: upstreamHeaders(adapter, c, r.headers), signal: r.signal, redirect: "manual" };
+  const send = async (credential: ProviderCredential, retryAfter401 = false): Promise<Response> => {
+    r.signal.throwIfAborted();
+    const req: RequestInit = { method: init.method, headers: upstreamHeaders(adapter, credential, r.headers), signal: r.signal, redirect: "manual" };
     if (init.body && init.body.length > 0 && init.method !== "GET" && init.method !== "HEAD") req.body = init.body;
+    if (beforePost) await beforePost(credential, retryAfter401);
+    r.signal.throwIfAborted();
     return r.deps.fetch(init.url, req);
   };
-  if (beforePost) {
-    r.signal.throwIfAborted();
-    await beforePost(name);
+  const res = await send(cred);
+  if (res.status !== 401 || !adapter.refreshable) return res;
+  try {
+    cred = await r.deps.creds.refreshAfter401(provider, name, cred.accessToken);
+  } catch {
+    return res;
   }
-  let res = await send(cred);
-  if (res.status === 401 && adapter.refreshable) {
-    try {
-      cred = await r.deps.creds.refreshAfter401(provider, name, cred.accessToken);
-    } catch {
-      return res; // the provider's 401 goes to the client
-    }
-    await discard(res);
-    res = await send(cred);
-  }
-  return res;
+  await discard(res);
+  return send(cred, true);
 }
 
 async function canon(r: AccountRequest, name: string): Promise<string> {
@@ -251,7 +309,7 @@ async function chooseMember(r: AccountRequest, owner?: OwnerFinder): Promise<str
 }
 
 /** The first of `names` (in order) for which `test` holds on a GET of `url` as that member. */
-async function firstMemberWhere(r: AccountRequest, names: string[], url: string, test: (body: unknown) => boolean): Promise<string | undefined> {
+async function firstMemberWhere(r: AccountRequest, names: string[], url: string, test: (body: unknown) => boolean, prefer?: (body: unknown) => boolean): Promise<string | undefined> {
   const probe = new Headers(r.headers);
   probe.delete("content-type");
   const probeReq: AccountRequest = { ...r, headers: probe, body: undefined };
@@ -261,15 +319,16 @@ async function firstMemberWhere(r: AccountRequest, names: string[], url: string,
         const res = await callAs(probeReq, n, { method: "GET", url });
         if (!res.ok) {
           await discard(res);
-          return false;
+          return 0;
         }
-        return test(await res.json().catch(() => undefined));
+        const body = await res.json().catch(() => undefined);
+        return prefer?.(body) ? 2 : test(body) ? 1 : 0;
       } catch {
-        return false;
+        return 0;
       }
     }),
   );
-  const at = hits.findIndex(Boolean);
+  const at = hits.indexOf(hits.includes(2) ? 2 : 1);
   return at === -1 ? undefined : names[at];
 }
 
@@ -338,6 +397,8 @@ export async function forwardAccount(r: AccountRequest): Promise<AccountResult> 
     return await run(r, cls);
   } catch (err) {
     if (r.signal.aborted) throw err;
+    if (err instanceof CodexResetOutcomePending) return { res: providerError(r.style, 409, err.message, "reset_outcome_pending"), cls };
+    if (err instanceof CodexResetFenced) return { res: providerError(r.style, 409, err.message, "reset_already_attempted"), cls };
     // A member without a usable login is the client's case (4xx with the reason), never a server error.
     if (err instanceof GatewayCredentialError && NO_LOGIN_CODES.has(err.code)) return { res: providerError(r.style, 409, r.app.target.kind === "pin" ? err.clientMessage : "no login is available for this app", "no_login"), cls };
     return { res: providerError(r.style, 502, "the account request to the provider failed", "account_request_failed"), cls };
@@ -391,9 +452,23 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
     if (grant) owner = (names) => firstMemberWhere(r, names, CLAUDE_RESETS_PROBE, (b) => grantIds(b).includes(grant));
   } else if (r.op === "codex-consume") {
     const redeem = async (beforePost?: BeforeCodexPost): Promise<AccountResult> => {
-      const member = await chooseMember(r, (names) => firstMemberWhere(r, names, CODEX_CREDITS_URL, (b) => (availableCount(b) ?? 0) > 0));
+      r.signal.throwIfAborted();
+      const creditId = jsonField(r.body, "credit_id") || undefined;
+      const member = await chooseMember(r, (names) => firstMemberWhere(
+        r, names, CODEX_CREDITS_URL, (b) => (availableCount(b) ?? 0) > 0,
+        creditId ? (b) => codexCreditIds(b).ids.has(creditId) : undefined,
+      ));
       if (!member) return noMember();
-      const res = await callAs(r, member, { method: r.method, url: url + r.search, body: r.body }, beforePost);
+      const res = await callAs(r, member, { method: r.method, url: url + r.search, body: r.body }, beforePost && (async (credential, retryAfter401) => {
+        if (credential.identity !== member) throw new Error("Codex credential does not match the requested account");
+        await beforePost(member, {
+          credential,
+          creditId,
+          inventory: () => fetchCodexCreditInventory(credential, r.deps.fetch, r.signal),
+          signal: r.signal,
+          retryAfter401,
+        });
+      }));
       return { res: relay(res, r.app.provider), identity: member, cls };
     };
     return r.deps.withCodexRedemption ? r.deps.withCodexRedemption(redeem) : redeem();

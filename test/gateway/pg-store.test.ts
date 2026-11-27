@@ -2,6 +2,8 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
 import { readdir } from "node:fs/promises";
 import { isDataError } from "../../src/gateway/ledger-buffer.ts";
+import { checkCodexRedemptionFence, PgPoolResetJournal, poolWindowKey } from "../../src/gateway/pool-reset.ts";
+import { PgResetCreditInvalidations } from "../../src/gateway/reset-credit-cache.ts";
 import { PgUsageReadings } from "../../src/gateway/usage-readings.ts";
 import { migrate, PgGatewayStore } from "../../src/gateway/pg-store.ts";
 import { CachedGatewayStore } from "../../src/gateway/cache-store.ts";
@@ -72,6 +74,73 @@ if (!url && process.env.CI && !optOut) {
       await sql.close();
     }
   }
+
+  test("pool reset journal blocks duplicate attempts and verifies a later usage reading once", async () => {
+    await migrate(url);
+    const sql = new SQL(url);
+    const identity = `sample-journal-${crypto.randomUUID()}`;
+    const credit = `credit-SYNTHETIC_FIXTURE-${crypto.randomUUID()}`;
+    const request = crypto.randomUUID();
+    const reservation = crypto.randomUUID();
+    const reported = credit;
+    const accountId = `account-SYNTHETIC_FIXTURE-${crypto.randomUUID()}`;
+    const journal = new PgPoolResetJournal(sql);
+    const invalidations = new PgResetCreditInvalidations(sql);
+    const consumedAt = Date.now() - 1_000;
+    const capturedAt = new Date(consumedAt - 1).toISOString();
+    const baseline = { status: "live" as const, capturedAt, windows: [{ label: "week", utilization: 98, resetsAt: new Date(consumedAt + 1_000).toISOString() }] };
+    try {
+      expect(await journal.recordAttempt(credit, request, identity, reservation, accountId)).toBe(true);
+      expect(await journal.recordAttempt(credit, crypto.randomUUID(), identity, crypto.randomUUID())).toBe(false);
+      expect(await journal.recordAttempt(`${credit}-different`, request, identity, crypto.randomUUID())).toBe(false);
+      expect(await journal.inventoryFenceScope(identity)).toEqual({ any: true, relevant: true });
+      expect(await journal.inventoryFenceScope(`${identity}-alias`, accountId)).toEqual({ any: true, relevant: true });
+      expect(await journal.inventoryFenceScope(`${identity}-alias`)).toEqual({ any: true, relevant: true });
+      expect(await journal.inventoryFenceScope(`${identity}-unrelated`, `${accountId}-unrelated`)).toEqual({ any: true, relevant: false });
+      await journal.releaseAttempt(credit, crypto.randomUUID());
+      expect(await journal.usedCredits([credit])).toEqual(new Set([credit]));
+      expect(await journal.manualAttempted(credit)).toBe(true);
+      await journal.releaseAttempt(credit, reservation);
+      expect(await journal.manualAttempted(credit)).toBe(false);
+      expect(await journal.recordAttempt(credit, request, identity, reservation, accountId)).toBe(true);
+      await invalidations.invalidate(identity);
+      const version = await invalidations.version(identity);
+      await journal.recordOutcome(credit, reservation, reported, "reset", { version, baseline, consumedAt });
+      await journal.releaseAttempt(credit, reservation);
+      expect(await journal.manualAttempted(credit)).toBe(true);
+      expect(await journal.usedCredits([credit])).toEqual(new Set([credit]));
+      expect(await journal.accountOutcomePending(identity, accountId)).toBe(false);
+      const alias = `${identity}-alias`;
+      const incomplete = {
+        credential: { identity: alias, accessToken: "access-SYNTHETIC_FIXTURE-alias" },
+        inventory: async () => ({ available_count: 2, credits: [{ id: `${credit}-other`, status: "available" }] }),
+      };
+      await expect(checkCodexRedemptionFence(journal, alias, incomplete)).rejects.toThrow("already attempted");
+      const relieved = { ...baseline, windows: [{ label: "week", utilization: 20 }] };
+      await journal.reconcileReading(identity, relieved);
+      expect(await journal.verifiedAt([identity])).toBeUndefined();
+      await journal.reconcileReading(identity, { ...relieved, capturedAt: baseline.windows[0].resetsAt });
+      expect(await journal.verifiedAt([identity])).toBeUndefined();
+
+      const earlier = { ...relieved, capturedAt: new Date(consumedAt + 1).toISOString() };
+      const legacyProof = JSON.stringify({ [poolWindowKey(baseline.windows[0])]: 98 });
+      await sql`UPDATE codex_pool_reset_attempts SET baseline = ${legacyProof}::text::jsonb WHERE credit_id = ${credit}`;
+      await journal.reconcileReading(identity, earlier);
+      expect(await journal.verifiedAt([identity])).toBeUndefined();
+
+      const proof = JSON.stringify({ [poolWindowKey(baseline.windows[0])]: { utilisation: 98, resetsAt: baseline.windows[0].resetsAt } });
+      await sql`UPDATE codex_pool_reset_attempts SET baseline = ${proof}::text::jsonb WHERE credit_id = ${credit}`;
+      await journal.reconcileReading(identity, earlier);
+      const verifiedAt = await journal.verifiedAt([identity]);
+      expect(verifiedAt).toBeGreaterThan(consumedAt);
+      await journal.markVerified(identity, version);
+      expect(await journal.verifiedAt([identity])).toBe(verifiedAt);
+    } finally {
+      await sql`DELETE FROM codex_pool_reset_attempts WHERE credit_id = ${credit}`;
+      await sql`DELETE FROM reset_credit_invalidations WHERE provider = 'codex' AND identity = ${identity}`;
+      await sql.close();
+    }
+  });
 
   describe("migrate", () => {
     test("a migration that cannot get its table lock gives up quickly instead of queueing, and succeeds on retry", async () => {

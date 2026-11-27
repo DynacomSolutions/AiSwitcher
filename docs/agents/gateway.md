@@ -582,6 +582,26 @@ Each entry has `name` and `enabled`. Pool entries include `members`. An entry wi
 `pool`, `identity`, `startedAt`, `status` and `creditExpiresAt` when available. `PUT /limits/codex/auto-reset/{pool|identity}`
 takes `{"name":"example","enabled":true}` and returns the saved name and setting. Use the exact pool or canonical identity name.
 
+### Codex reset outcomes that need reconciliation
+
+Before a pool or automatic reset POST, the gateway commits an account guard in PostgreSQL under the shared redemption lock.
+All gateway reset routes check the guard by canonical identity or provider account ID.
+If either credential lacks a provider account ID, the guard blocks the spend because the gateway cannot rule out an alias.
+Pending accounts remain in pool usage calculations. The gateway excludes their credits from reset selection.
+
+A valid provider outcome records both credit IDs and clears the account guard in one write.
+If the response omits the credit field, the gateway uses the requested ID as the effective credit ID.
+The gateway retains credit-level protection for both IDs. A different credit ID does not verify the selected reset.
+The pool confirmation reports pending if the outcome write fails or the response is invalid.
+Automatic claim summaries include `spendPending: true` while the account guard remains.
+
+An exact reservation can be released when the sending process proves it never sent the POST.
+A crash or missing receipt can leave the account guard in place indefinitely.
+To reconcile it, verify the original outcome with the provider using the redemption request ID.
+Record the verified outcome and reported credit ID on the exact journal entry in the same database write that clears the guard.
+Keep the guard if no provider evidence identifies the outcome and reported credit.
+An inventory refresh, natural reset or change in usage does not clear this guard. Inference and usage reads remain available.
+
 ### Kimi uploads the provider marked as failed (`src/gateway/media-recovery.ts`)
 
 kimi-code uploads every image and video to Kimi's file service (`POST /v1/files`) and sends the returned id in the chat
