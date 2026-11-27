@@ -124,12 +124,12 @@ if (!url && process.env.CI && !optOut) {
 
       const earlier = { ...relieved, capturedAt: new Date(consumedAt + 1).toISOString() };
       const legacyProof = JSON.stringify({ [poolWindowKey(baseline.windows[0])]: 98 });
-      await sql`UPDATE codex_pool_reset_attempts SET baseline = ${legacyProof}::jsonb WHERE credit_id = ${credit}`;
+      await sql`UPDATE codex_pool_reset_attempts SET baseline = ${legacyProof}::text::jsonb WHERE credit_id = ${credit}`;
       await journal.reconcileReading(identity, earlier);
       expect(await journal.verifiedAt([identity])).toBeUndefined();
 
       const proof = JSON.stringify({ [poolWindowKey(baseline.windows[0])]: { utilisation: 98, resetsAt: baseline.windows[0].resetsAt } });
-      await sql`UPDATE codex_pool_reset_attempts SET baseline = ${proof}::jsonb WHERE credit_id = ${credit}`;
+      await sql`UPDATE codex_pool_reset_attempts SET baseline = ${proof}::text::jsonb WHERE credit_id = ${credit}`;
       await journal.reconcileReading(identity, earlier);
       const verifiedAt = await journal.verifiedAt([identity]);
       expect(verifiedAt).toBeGreaterThan(consumedAt);
