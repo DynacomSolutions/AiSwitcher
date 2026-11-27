@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { POOL_RESET_THRESHOLD, poolLimitsPath, type PoolResetReview, type PoolThreshold } from "../gateway/pool-reset-view.ts";
 import type { ToolLimitResult } from "../cli/limits/types.ts";
 import { consoleWebDir } from "./state.ts";
-import { loadSubscriptions, sendToAll, type PushMessage, type SendResult } from "./web-push.ts";
+import { loadSubscriptions, persistentPushDir, sendToAll, type PushMessage, type SendResult } from "./web-push.ts";
 import type { ScanResult } from "./scan-worker.ts";
 
 /**
@@ -111,7 +111,7 @@ interface SentState {
   sent: Record<string, ExpiryStage>;
 }
 
-export function resetPushStatePath(dir: string = consoleWebDir()): string {
+export function resetPushStatePath(dir: string = persistentPushDir() ?? consoleWebDir()): string {
   return join(dir, "reset-expiry-push.json");
 }
 
@@ -234,13 +234,20 @@ export class ResetExpiryNotifier {
   async tick(): Promise<number> {
     if (this.ticking) return 0;
     this.ticking = true;
+    let releaseLock: (() => Promise<void>) | undefined;
     try {
       const hasSubscribers = this.deps.hasSubscribers ?? (async () => (await loadSubscriptions()).length > 0);
       if (!(await hasSubscribers())) return 0;
+      const sharedDir = this.deps.statePath === undefined ? persistentPushDir() : undefined;
+      const path = this.deps.statePath ?? resetPushStatePath(sharedDir);
+      // Both pods see the same subscribers during a rollout. Only one sends each stage.
+      if (sharedDir) {
+        releaseLock = await trySharedFileLock(path);
+        if (!releaseLock) return 0;
+      }
       const scan = await this.deps.scanLimits();
       if (!scan.ok) throw new Error(scan.error ?? "limits scan failed");
       const now = (this.deps.now ?? Date.now)();
-      const path = this.deps.statePath ?? resetPushStatePath();
       const state = await loadState(path);
       const items = expiringResets(scan.payload?.results ?? [], now);
       const send = this.deps.send ?? ((m: PushMessage) => sendToAll(m, { log: this.log }));
@@ -273,8 +280,12 @@ export class ResetExpiryNotifier {
       this.log(`reset-expiry push: ${this.lastError}`);
       return 0;
     } finally {
-      this.lastCheckAt = new Date((this.deps.now ?? Date.now)()).toISOString();
-      this.ticking = false;
+      try {
+        await releaseLock?.();
+      } finally {
+        this.lastCheckAt = new Date((this.deps.now ?? Date.now)()).toISOString();
+        this.ticking = false;
+      }
     }
   }
 
@@ -286,7 +297,7 @@ export class ResetExpiryNotifier {
     try {
       const hasSubscribers = this.deps.hasSubscribers ?? (async () => (await loadSubscriptions()).length > 0);
       if (!await hasSubscribers()) return 0;
-      const path = this.deps.poolStatePath ?? join(process.env.AIS_WEB_POOL_STATE_DIR?.trim() || consoleWebDir(), "pool-threshold-push.json");
+      const path = this.deps.poolStatePath ?? join(persistentPushDir() ?? consoleWebDir(), "pool-threshold-push.json");
       releaseLock = await trySharedFileLock(path);
       if (!releaseLock) return 0;
       const episodes = await loadPoolEpisodes(path);

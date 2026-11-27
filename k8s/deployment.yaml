@@ -67,8 +67,9 @@ spec:
               # dir plus src/cli/web.ts's /proc cmdline kill-guard make
               # `ais web stop` on either side refuse to touch the other.
               value: /web/state
-            - name: AIS_WEB_POOL_STATE_DIR
-              # The node-pinned AIS home shares threshold episodes during rollouts.
+            - name: AIS_WEB_PUSH_STATE_DIR
+              # The node-pinned AIS home preserves push keys, subscriptions,
+              # threshold episodes and expiry stages across pod replacements.
               value: ${AIS_CONTAINER_HOME}/.ais/web-pool-state
           ports:
             - containerPort: ${PORT}

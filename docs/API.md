@@ -592,11 +592,14 @@ deadline in the message (default `TZ`).
 - `POST /api/push/reset-expiry/check` -> `{ ok, sent, status }`: runs the hourly check now (503 without the daemon).
 
 The VAPID key pair (`push-vapid.json`) and subscriptions (`push-subscriptions.json`)
-live in the console state dir, mode 0600.
+use mode 0600. Set `AIS_WEB_PUSH_STATE_DIR` to store push keys, subscriptions and
+notification state on a persistent volume. The default is the Console state
+directory. The Kubernetes example sets a separate push directory on its AIS
+home mount. Browsers must subscribe again after a switch from an ephemeral store.
 
 With subscribers, Console checks gateway pool usage every five minutes. A
 fully observed window average of at least 90% starts a pool alert. Console
-records the crossing in `<state dir>/pool-threshold-push.json` before delivery.
+records the crossing in `<push state dir>/pool-threshold-push.json` before delivery.
 All observed windows must have current readings to prove usage below 90%.
 A verified reset can replace an alert while usage remains above the threshold.
 The pool must fall below 90% before a new crossing. `AIS_RESET_PUSH=0` also
