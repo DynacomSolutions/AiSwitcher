@@ -5,7 +5,7 @@ import { toast } from "sonner";
 
 import { ToolBadge } from "@/components/badges";
 import { ProviderLabel } from "@/components/provider-icon";
-import { AutoResetControl } from "@/components/auto-reset-control";
+import { AutoResetMemberClaim, AutoResetUnsupported } from "@/components/auto-reset-control";
 import { PoolUsageCards } from "@/components/pool-usage-cards";
 import { ResetPushToggle } from "@/components/reset-push-toggle";
 import { ResetCountdown } from "@/components/reset-countdown";
@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
+import { autoResetProviderFor, memberClaimFor } from "@/lib/auto-reset";
 import { qk, useAutoResetQuery, useLimitsQuery, usePoolsUsageQuery, useRefreshLimits, type LimitsRefreshTarget } from "@/hooks/queries";
 import { api } from "@/lib/api";
 import { creditsNote } from "@/lib/credits-note";
@@ -40,7 +41,7 @@ import { cn } from "@/lib/utils";
 import { canSpendCodexReset, creditReadAt, creditsAreLastKnown, spendCreditSentence } from "@/lib/codex-reset";
 import { formatResetTimes } from "@/lib/reset-time";
 import { AccountWarnings } from "@/components/account-line";
-import type { AutoResetStatus, LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseCodexResetResult, UseResetResult } from "@/types/api";
+import type { AutoResetLastClaim, LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseCodexResetResult, UseResetResult } from "@/types/api";
 
 function StatusBadge({ status }: { status: LimitFetchStatus }) {
   switch (status) {
@@ -418,7 +419,8 @@ function RefreshButton({ label, onClick, busy, disabled, text }: { label: string
   );
 }
 
-function LimitCard({ result, autoReset, onRefresh, refreshing }: { result: ToolLimitResult; autoReset?: AutoResetStatus; onRefresh: (target: LimitsRefreshTarget) => void; refreshing: boolean }) {
+/** `claim` is set only for a provider with automatic reset. A member has no setting: its pool owns it. */
+function LimitCard({ result, supported, claim, onRefresh, refreshing }: { result: ToolLimitResult; supported: boolean; claim?: AutoResetLastClaim; onRefresh: (target: LimitsRefreshTarget) => void; refreshing: boolean }) {
   const unavailable = result.status === "unavailable" || result.status === "pending";
   return (
     <Card className="gap-4">
@@ -427,7 +429,7 @@ function LimitCard({ result, autoReset, onRefresh, refreshing }: { result: ToolL
         <div className="flex items-start justify-between gap-2">
           <div className="flex min-w-0 grow flex-wrap items-center gap-2">
             <div className="flex min-w-0 grow items-center gap-2">
-              <span className={cn("min-w-16 grow font-medium", autoReset ? "w-0 break-words" : "w-0 truncate")} title={result.identity.name}>
+              <span className={cn("min-w-16 grow font-medium", supported ? "w-0 break-words" : "w-0 truncate")} title={result.identity.name}>
                 {result.identity.name}
               </span>
               <ToolBadge tool={result.toolName} />
@@ -484,18 +486,20 @@ function LimitCard({ result, autoReset, onRefresh, refreshing }: { result: ToolL
           </div>
         ) : null}
         {result.manualReset ? <ManualResetBlock reset={result.manualReset} result={result} /> : null}
-        {autoReset ? <><Separator /><AutoResetControl kind="identity" setting={autoReset} /></> : null}
+        {supported ? <><Separator /><AutoResetMemberClaim claim={claim} /></> : null}
       </CardContent>
     </Card>
   );
 }
+
+/** The provider group that a member card without a limits row joins. */
+const AUTO_RESET_PROVIDER_NAME = { codex: "openai", claude: "anthropic" } as const;
 
 export function LimitsPage() {
   const query = useLimitsQuery();
   const poolsQuery = usePoolsUsageQuery();
   const settings = useAutoResetQuery();
   const autoReset = settings.data?.configured ? settings.data : undefined;
-  const identitySettings = useMemo(() => new Map(autoReset?.identities.map((identity) => [identity.name, identity])), [autoReset]);
   const { refresh, isRefreshing, anyRefreshing } = useRefreshLimits();
   // Each call has its own state: a card spins until every call that covers it ends, and each call reports its own failures.
   const runRefresh = (targets: LimitsRefreshTarget[]) => {
@@ -511,12 +515,19 @@ export function LimitsPage() {
   const poolKeys = useMemo(() => new Set((poolsQuery.data?.pools ?? []).map((p) => `${p.tool}/${p.name}`)), [poolsQuery.data]);
   const results = useMemo(() => {
     const rows = (query.data?.results ?? []).filter((r) => !poolKeys.has(`${r.toolName}/${r.identity.name}`));
-    const codexNames = new Set(rows.filter((r) => r.toolName === "codex" && r.provider === "openai").map((r) => r.identity.name));
-    for (const name of identitySettings.keys()) {
-      if (!codexNames.has(name)) rows.push({ identity: { name, label: name, configDir: "" }, provider: "openai", toolName: "codex", status: "unavailable", windows: [] });
+    // A pool member with no limits row of its own still gets a card, so its last automatic reset shows.
+    for (const row of autoReset?.providers ?? []) {
+      if (!row.supported) continue;
+      const known = new Set(rows.filter((r) => r.toolName === row.provider).map((r) => r.identity.name));
+      const provider = AUTO_RESET_PROVIDER_NAME[row.provider];
+      for (const name of new Set(row.pools.flatMap((pool) => pool.members))) {
+        if (!known.has(name) && !poolKeys.has(`${row.provider}/${name}`)) {
+          rows.push({ identity: { name, label: name, configDir: "" }, provider, toolName: row.provider, status: "unavailable", windows: [] });
+        }
+      }
     }
     return rows;
-  }, [query.data, poolKeys, identitySettings]);
+  }, [query.data, poolKeys, autoReset]);
 
   // Provider-first grouping, mirroring the CLI report: provider is the
   // grouping key, the wrapper tool is secondary info on each identity row.
@@ -563,7 +574,7 @@ export function LimitsPage() {
 
           <GlobalUsageCards title="Global usage" />
 
-          <PoolUsageCards autoResetPools={autoReset?.pools} />
+          <PoolUsageCards autoReset={autoReset?.providers} />
         </>
       ) : null}
 
@@ -593,12 +604,17 @@ export function LimitsPage() {
                 />
               </div>
             </div>
+            {[...new Set(group.map((r) => r.toolName))].map((tool) => {
+              const row = autoResetProviderFor(settings.data, tool);
+              return row && !row.supported ? <AutoResetUnsupported key={tool} provider={row.provider} reason={row.reason} /> : null;
+            })}
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
               {group.map((r) => (
                 <LimitCard
                   key={`${r.provider}/${r.toolName}/${r.identity.name}`}
                   result={r}
-                  autoReset={r.toolName === "codex" && r.provider === "openai" ? identitySettings.get(r.identity.name) : undefined}
+                  supported={autoResetProviderFor(settings.data, r.toolName)?.supported === true}
+                  claim={memberClaimFor(settings.data, r.toolName, r.identity.name)}
                   onRefresh={(target) => runRefresh([target])}
                   refreshing={isRefreshing(r.toolName, r.identity.name)}
                 />

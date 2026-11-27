@@ -227,21 +227,22 @@ function limitsAndSpendStub(answers: Record<string, unknown>): void {
 
 function autoResetSettingsStub(settings: Extract<AutoResetResponse, { configured: true }>): void {
   const previous = window.fetch.bind(window);
-  const path = "/api/limits/codex/auto-reset";
-  const calls: Array<{ scope: string; name: string; enabled: boolean; csrf: string | null }> = [];
+  const prefix = "/api/limits/";
+  const calls: Array<{ provider: string; scope: string; name: string; enabled: boolean; csrf: string | null }> = [];
   const stub = (input: RequestInfo | URL, init?: RequestInit) => {
     const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const u = new URL(raw, location.href);
-    if (u.origin !== location.origin || (u.pathname !== path && !u.pathname.startsWith(path + "/"))) return previous(input, init);
-    if (u.pathname === path && init?.method === "GET") return Promise.resolve(Response.json(settings));
-    const scope = u.pathname.slice(path.length + 1);
+    if (u.origin !== location.origin || !u.pathname.startsWith(prefix) || !u.pathname.includes("auto-reset")) return previous(input, init);
+    if (u.pathname === `${prefix}auto-reset` && init?.method === "GET") return Promise.resolve(Response.json(settings));
+    const [, provider, , scope] = u.pathname.slice(prefix.length - 1).split("/");
     const body = JSON.parse(String(init?.body)) as { name: string; enabled: boolean };
-    const rows = scope === "pool" ? settings.pools : settings.identities;
-    const row = rows.find((r) => r.name === body.name);
-    if (!row || init?.method !== "PUT") return Promise.resolve(Response.json({ error: "invalid settings request" }, { status: 400 }));
-    calls.push({ scope, ...body, csrf: new Headers(init.headers).get("X-AIS-Console") });
+    const view = settings.providers.find((row) => row.provider === provider);
+    const row = view?.supported ? view.pools.find((r) => r.name === body.name) : undefined;
+    // Automatic reset is a pool setting only. Any other scope is refused, as the console does.
+    if (!row || scope !== "pool" || init?.method !== "PUT") return Promise.resolve(Response.json({ error: "invalid settings request" }, { status: 400 }));
+    calls.push({ provider: provider!, scope, ...body, csrf: new Headers(init.headers).get("X-AIS-Console") });
     row.enabled = body.enabled;
-    return Promise.resolve(Response.json(body));
+    return Promise.resolve(Response.json({ provider, ...body }));
   };
   Object.assign(window, { __aisAutoResetSettingsCalls: calls });
   window.fetch = Object.assign(stub, { preconnect: window.fetch.preconnect });
@@ -1026,36 +1027,56 @@ describe("1280x900", () => {
 });
 
 for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 }]) {
-  test(`Codex automatic reset controls at ${viewport.width}px`, async () => {
+  test(`automatic reset controls for every provider at ${viewport.width}px`, async () => {
     await setViewport(viewport.width, viewport.height);
-    const pool = "fixture-auto-codex-pool";
+    const codexPool = "fixture-auto-codex-pool";
+    const claudePool = "claude-fixture-auto-pool";
     const unknown = "SYNTHETIC_FIXTURE-codex-unknown";
     const stale = "SYNTHETIC_FIXTURE-codex-stale";
     const zero = "SYNTHETIC_FIXTURE-codex-zero";
     const positive = "SYNTHETIC_FIXTURE-codex-credit";
+    const claudeMember = "SYNTHETIC_FIXTURE-long-plan";
     const missing = "fixture-missing-limit-row";
     const limitPoolOnly = "fixture-pool-without-usage";
     const lastClaim = {
-      pool, identity: unknown, status: "unknown" as const,
+      pool: codexPool, identity: unknown, status: "unknown" as const,
       startedAt: "2026-11-27T08:00:00.000Z", creditExpiresAt: "2026-12-01T08:00:00.000Z",
     };
-    const settings = {
-      configured: true as const,
-      pools: [{ name: pool, members: [unknown, stale, zero, positive], enabled: false, lastClaim }, { name: limitPoolOnly, members: [missing], enabled: false }],
-      identities: [unknown, stale, zero, positive, missing].map((name) => ({ name, enabled: false, ...(name === unknown ? { lastClaim } : {}) })),
+    const claudeClaim = { pool: claudePool, identity: claudeMember, status: "reset" as const, startedAt: "2026-11-27T09:00:00.000Z" };
+    const settings: Extract<AutoResetResponse, { configured: true }> = {
+      configured: true,
+      providers: [
+        {
+          provider: "codex", supported: true, memberClaims: { [unknown]: lastClaim },
+          pools: [{ name: codexPool, members: [unknown, stale, zero, positive], enabled: false, lastClaim }, { name: limitPoolOnly, members: [missing], enabled: false }],
+        },
+        { provider: "claude", supported: true, memberClaims: { [claudeMember]: claudeClaim }, pools: [{ name: claudePool, members: [claudeMember], enabled: true, lastClaim: claudeClaim }] },
+        { provider: "kimi", supported: false, reason: "This provider has no reset credit or grant API." },
+      ],
     };
+    const kimiRow = {
+      toolName: "kimi", provider: "kimi", identity: { name: "SYNTHETIC_FIXTURE-kimi", ...SYNTHETIC_IDENTITY },
+      status: "live", windows: [{ label: "Week", category: "week", usedPercent: 10, resetsAtMs: RESET_AT }],
+    } as const;
     const poolData: PoolsUsageResponse = {
       ...SYNTHETIC_POOLS,
-      pools: [{ tool: "codex", name: pool, members: settings.pools[0]!.members.map((name) => ({ name, allowed: true })) }],
+      pools: [
+        { tool: "codex", name: codexPool, members: settings.providers[0]!.supported ? settings.providers[0].pools[0]!.members.map((name) => ({ name, allowed: true })) : [] },
+        { tool: "claude", name: claudePool, members: [{ name: claudeMember, allowed: true }] },
+        { tool: "kimi", name: "fixture-kimi-pool", members: [{ name: "SYNTHETIC_FIXTURE-kimi", allowed: true }] },
+      ],
     };
+    const answers = { ...LIMITS_ANSWERS, "/api/limits": { ...SYNTHETIC_LIMITS, results: [...SYNTHETIC_LIMITS.results, kimiRow] }, "/api/pools/usage": poolData };
     const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
-      source: `(${limitsAndSpendStub.toString()})(${JSON.stringify({ ...LIMITS_ANSWERS, "/api/pools/usage": poolData })});
+      source: `(${limitsAndSpendStub.toString()})(${JSON.stringify(answers)});
         (${autoResetSettingsStub.toString()})(${JSON.stringify(settings)})`,
     });
-    const selector = (kind: string, name: string, enable = true) =>
-      `button[aria-label="${enable ? "Enable" : "Disable"} automatic resets for ${kind} ${name}"]`;
+    const selector = (provider: string, name: string, enable = true) =>
+      `button[aria-label="${enable ? "Enable" : "Disable"} automatic resets for ${provider} pool ${name}"]`;
+    const anyIdentityControl = `button[aria-label*="automatic resets for identity"], button[aria-label*="automatic resets for codex ${unknown}"]`;
     const click = (query: string) => page.eval(`document.querySelector(${JSON.stringify(query)}).click()`);
     const waitForButton = (query: string) => waitFor(query, 8_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(query)})`));
+    const waitForText = (text: string) => waitFor(text, 8_000, () => page.eval<boolean>(`document.querySelector('main').innerText.includes(${JSON.stringify(text)})`));
     const confirm = () => page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent === 'Enable automatic resets').click()`);
     const waitForDialog = () => waitFor("automatic reset confirmation", 5_000, () => page.eval<boolean>(`!!document.querySelector('[role=alertdialog]')`));
     const checkWidth = async () => {
@@ -1063,46 +1084,59 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       expect(m.scrollWidth, m.offenders.join("\n")).toBeLessThanOrEqual(m.clientWidth);
       expect(m.bodyScrollWidth, m.offenders.join("\n")).toBeLessThanOrEqual(m.clientWidth);
     };
-    const capture = async (label: string, control: string) => {
+    const capture = async (label: string, target: string) => {
       if (!evidence) return;
       await mkdir(evidence, { recursive: true });
-      await page.eval(`document.querySelector(${JSON.stringify(control)}).scrollIntoView({block:'center'})`);
-      await writeFile(join(evidence, `${viewport.width}-codex-auto-reset-${label}-verified.png`), await page.screenshot());
+      await page.eval(`document.querySelector(${JSON.stringify(target)}).scrollIntoView({block:'center'})`);
+      await writeFile(join(evidence, `${viewport.width}-auto-reset-${label}-verified.png`), await page.screenshot());
     };
     try {
+      // An account card shows the last claim that its pool made. It has no on or off control.
       await open("/limits/openai");
-      for (const name of [unknown, stale, zero, positive, missing]) await waitForButton(selector("identity", name));
+      await waitForText("Last automatic reset: unknown");
+      await waitForText("Last automatic reset: None");
+      expect(await page.eval<boolean>(`!!document.querySelector(${JSON.stringify(anyIdentityControl)})`)).toBe(false);
+      expect(await page.eval<string>(`document.querySelector('main').innerText`)).toContain("Credit expiry");
       expect(await page.eval<boolean>(`!!document.querySelector('button[aria-label="Use reset on ${positive}"]')`)).toBe(true);
-      expect(await page.eval<string>(`document.querySelector(${JSON.stringify(selector("identity", unknown))}).closest('[data-slot=card]').innerText`)).toContain("Last claim: unknown");
-      expect(await page.eval<string>(`document.querySelector(${JSON.stringify(selector("identity", unknown))}).closest('[data-slot=card]').innerText`)).toContain("Credit expiry");
       await checkWidth();
-      await capture("account", selector("identity", unknown));
-      await click(selector("identity", unknown));
+      await capture("codex-account", `[data-slot=card] [title="${unknown}"]`);
+
+      await open("/limits/anthropic");
+      await waitForText("Last automatic reset: reset");
+      expect(await page.eval<boolean>(`!!document.querySelector('button[aria-label*="automatic resets for"]')`)).toBe(false);
+      await checkWidth();
+
+      // A provider without a reset API says so. It has no toggle.
+      await open("/limits/kimi");
+      await waitFor("not supported note", 8_000, () => page.eval<boolean>(`!!document.querySelector('[data-testid="auto-reset-unsupported-kimi"]')`));
+      expect(await page.eval<boolean>(`!!document.querySelector('button[aria-label*="automatic resets for"]')`)).toBe(false);
+      expect(await page.eval<string>(`document.querySelector('[data-testid="auto-reset-unsupported-kimi"]').innerText`)).toContain("not supported");
+      await checkWidth();
+      await capture("kimi-unsupported", '[data-testid="auto-reset-unsupported-kimi"]');
+
+      // Pools carry the control. Every supported provider has one.
+      await open("/limits");
+      await waitForButton(selector("codex", codexPool));
+      await waitForButton(selector("codex", limitPoolOnly));
+      await waitForButton(selector("claude", claudePool, false));
+      await waitFor("kimi pool note", 8_000, () => page.eval<boolean>(`!!document.querySelector('[data-testid="auto-reset-unsupported-kimi"]')`));
+      await checkWidth();
+      await capture("claude-fixture-pool", selector("claude", claudePool, false));
+      await click(selector("codex", codexPool));
       await waitForDialog();
       await page.eval(`[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.textContent === 'Cancel').click()`);
       expect(await page.eval<number>(`window.__aisAutoResetSettingsCalls.length`)).toBe(0);
-      await click(selector("identity", unknown));
+      await click(selector("codex", codexPool));
       await waitForDialog();
       await confirm();
-      await waitForButton(selector("identity", unknown, false));
-      await click(selector("identity", unknown, false));
-      await waitForButton(selector("identity", unknown));
+      await waitForButton(selector("codex", codexPool, false));
+      await capture("codex-pool", selector("codex", codexPool, false));
+      await click(selector("claude", claudePool, false));
+      await waitForButton(selector("claude", claudePool));
       expect(await page.eval<unknown[]>(`window.__aisAutoResetSettingsCalls`)).toEqual([
-        { scope: "identity", name: unknown, enabled: true, csrf: "1" },
-        { scope: "identity", name: unknown, enabled: false, csrf: "1" },
+        { provider: "codex", scope: "pool", name: codexPool, enabled: true, csrf: "1" },
+        { provider: "claude", scope: "pool", name: claudePool, enabled: false, csrf: "1" },
       ]);
-      expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(0);
-
-      await open("/limits");
-      await waitForButton(selector("pool", pool));
-      await waitForButton(selector("pool", limitPoolOnly));
-      await checkWidth();
-      await click(selector("pool", pool));
-      await waitForDialog();
-      await confirm();
-      await waitForButton(selector("pool", pool, false));
-      await capture("pool", selector("pool", pool, false));
-      expect(await page.eval<unknown[]>(`window.__aisAutoResetSettingsCalls`)).toEqual([{ scope: "pool", name: pool, enabled: true, csrf: "1" }]);
       expect(await page.eval<number>(`window.__aisCodexResetCalls.length`)).toBe(0);
     } finally {
       await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
@@ -1173,7 +1207,9 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       }],
     };
     const claim = { pool, identity: identity.name, startedAt: "2026-11-27T08:00:00.000Z", status: "pending" as const };
-    const settings: AutoResetResponse = { configured: true, identities: [{ name: identity.name, enabled: false, lastClaim: claim }], pools: [] };
+    const settings: AutoResetResponse = {
+      configured: true, providers: [{ provider: "codex", supported: true, pools: [], memberClaims: { [identity.name]: claim } }],
+    };
     const usage: UsageResponse = {
       generatedAt: initial.fetchedAt,
       results: [{
@@ -1185,7 +1221,7 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       source: `(${consoleEventsStub.toString()})(${JSON.stringify({
         "/api/limits": initial,
         "/api/pools/usage": { ...SYNTHETIC_POOLS, pools: [] },
-        "/api/limits/codex/auto-reset": settings,
+        "/api/limits/auto-reset": settings,
         "/api/usage": usage,
         "/api/status": { ok: true, version: "fixture", aisHome: "synthetic" },
       })})`,
@@ -1217,7 +1253,7 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
     try {
       await open("/limits/openai");
       await waitText("Reset credits (2)");
-      await waitText("Last claim: pending");
+      await waitText("Last automatic reset: pending");
       await page.eval("document.fonts.ready.then(() => true)");
       const before = await measure();
       expect(before).toHaveLength(4);
@@ -1235,17 +1271,14 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
 
       await setQuota(50, 1, "2026-11-27T08:05:00.000Z");
       await page.eval(`
-        const rule = window.__aisLive.answers['/api/limits/codex/auto-reset'].identities[0];
-        rule.lastClaim.status = 'reset';
-        rule.enabled = true;
-        window.__aisLive.send('change', ['limits', 'codex-auto-reset']);
+        window.__aisLive.answers['/api/limits/auto-reset'].providers[0].memberClaims['fixture-codex'].status = 'reset';
+        window.__aisLive.send('change', ['limits', 'auto-reset']);
       `);
       await waitText("50.0%");
       await waitText("Reset credits (1)");
-      await waitText("Last claim: reset");
-      await waitText("Automatic reset on");
+      await waitText("Last automatic reset: reset");
       expect(await page.eval("window.__aisLive.calls['/api/limits']")).toBe(2);
-      expect(await page.eval("window.__aisLive.calls['/api/limits/codex/auto-reset']")).toBe(2);
+      expect(await page.eval("window.__aisLive.calls['/api/limits/auto-reset']")).toBe(2);
       expect(await page.eval("window.__aisLive.calls['/api/pools/usage']")).toBe(1);
       await checkStable(before);
 
@@ -1260,7 +1293,7 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       await page.eval("window.__aisLive.ready(); window.__aisLive.send('heartbeat', {})");
       await waitText("30.0%");
       await waitCalls("/api/limits", 3);
-      await waitCalls("/api/limits/codex/auto-reset", 3);
+      await waitCalls("/api/limits/auto-reset", 3);
       await waitCalls("/api/pools/usage", 2);
       await checkStable(before);
       expect(await page.eval(`!!document.querySelector(${JSON.stringify(help)})`)).toBe(false);
@@ -1273,7 +1306,7 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       await page.eval("window.__aisLive.ready()");
       await waitText("20.0%");
       await waitCalls("/api/limits", 4);
-      await waitCalls("/api/limits/codex/auto-reset", 4);
+      await waitCalls("/api/limits/auto-reset", 4);
       await waitCalls("/api/pools/usage", 3);
       await checkStable(before);
       expect(await page.eval("window.__aisLive.streamAuth")).toEqual([

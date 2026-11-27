@@ -1,6 +1,6 @@
 import type {
+  AutoResetProvider,
   AutoResetResponse,
-  AutoResetScope,
   AuthEntry,
   AuthRefreshResponse,
   AuthResponse,
@@ -181,9 +181,9 @@ export const api = {
   getPoolResetReview: (tool: string, pool: string) => request<PoolResetReview>(`/api${poolLimitsPath(tool, pool)}`),
   confirmPoolReset: (tool: string, pool: string, confirmation: PoolResetConfirmation) =>
     request<PoolResetResult>(`/api${poolLimitsPath(tool, pool)}`, { method: "POST", body: confirmation }),
-  getAutoReset: (signal?: AbortSignal) => request<AutoResetResponse>("/api/limits/codex/auto-reset", { signal }),
-  setAutoReset: (kind: AutoResetScope, name: string, enabled: boolean) =>
-    request<{ name: string; enabled: boolean }>(`/api/limits/codex/auto-reset/${kind}`, { method: "PUT", body: { name, enabled } }),
+  getAutoReset: (signal?: AbortSignal) => request<AutoResetResponse>("/api/limits/auto-reset", { signal }),
+  setAutoReset: (provider: AutoResetProvider, pool: string, enabled: boolean) =>
+    request<{ provider: string; name: string; enabled: boolean }>(`/api/limits/${provider}/auto-reset/pool`, { method: "PUT", body: { name: pool, enabled } }),
 
   getLimits: (freshCodexIdentity?: string, signal?: AbortSignal) => request<LimitsResponse>(`/api/limits?maxAge=${freshCodexIdentity ? 5 : 45}${freshCodexIdentity ? `&tool=codex&identity=${encodeURIComponent(freshCodexIdentity)}&freshCodex=${encodeURIComponent(freshCodexIdentity)}` : ""}`, { signal }),
 

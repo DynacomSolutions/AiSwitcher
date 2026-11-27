@@ -9,19 +9,35 @@ import { Button } from "@/components/ui/button";
 import { qk } from "@/hooks/queries";
 import { api } from "@/lib/api";
 import { formatResetTimes } from "@/lib/reset-time";
-import type { AutoResetResponse, AutoResetScope, AutoResetStatus } from "@/types/api";
+import type { AutoResetLastClaim, AutoResetProvider, AutoResetResponse, AutoResetStatus } from "@/types/api";
 
-export function AutoResetControl({ kind, setting }: { kind: AutoResetScope; setting: AutoResetStatus }) {
+const CREDIT_NAME: Record<AutoResetProvider, string> = { codex: "Codex reset credit", claude: "Claude reset grant" };
+
+function ClaimText({ claim, where }: { claim: AutoResetLastClaim | undefined; where: "pool" | "member" }) {
+  if (!claim) return <>None</>;
+  return (
+    <>
+      {claim.status} at <time dateTime={claim.startedAt} title={claim.startedAt}>{formatResetTimes(Date.parse(claim.startedAt), { roundUp: false })}</time>
+      {where === "pool" ? ` on ${claim.identity}` : ` in ${claim.pool}`}
+      {claim.creditExpiresAt ? <>. Credit expiry <time dateTime={claim.creditExpiresAt} title={claim.creditExpiresAt}>{formatResetTimes(Date.parse(claim.creditExpiresAt), { roundUp: false })}</time></> : null}
+    </>
+  );
+}
+
+/** The on and off control of one pool. Automatic reset is a pool setting only. */
+export function AutoResetControl({ provider, setting }: { provider: AutoResetProvider; setting: AutoResetStatus }) {
   const client = useQueryClient();
-  const claim = setting.lastClaim;
   const change = useMutation({
-    mutationFn: (enabled: boolean) => api.setAutoReset(kind, setting.name, enabled),
+    mutationFn: (enabled: boolean) => api.setAutoReset(provider, setting.name, enabled),
     onSuccess: async ({ name, enabled }) => {
       await client.cancelQueries({ queryKey: qk.autoReset });
       client.setQueryData<AutoResetResponse>(qk.autoReset, (view) => {
         if (!view?.configured) return view;
-        if (kind === "pool") return { ...view, pools: view.pools.map((p) => p.name === name ? { ...p, enabled } : p) };
-        return { ...view, identities: view.identities.map((i) => i.name === name ? { ...i, enabled } : i) };
+        return {
+          ...view,
+          providers: view.providers.map((row) => row.supported && row.provider === provider
+            ? { ...row, pools: row.pools.map((p) => p.name === name ? { ...p, enabled } : p) } : row),
+        };
       });
       await client.invalidateQueries({ queryKey: qk.autoReset });
     },
@@ -31,7 +47,7 @@ export function AutoResetControl({ kind, setting }: { kind: AutoResetScope; sett
     },
   });
   const status = `Automatic reset ${setting.enabled ? "on" : "off"}`;
-  const label = `${setting.enabled ? "Disable" : "Enable"} automatic resets for ${kind} ${setting.name}`;
+  const label = `${setting.enabled ? "Disable" : "Enable"} automatic resets for ${provider} pool ${setting.name}`;
   return (
     <div className="space-y-1 text-xs">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -49,8 +65,8 @@ export function AutoResetControl({ kind, setting }: { kind: AutoResetScope; sett
             <AlertDialogHeader>
               <AlertDialogTitle>Enable automatic resets for {setting.name}?</AlertDialogTitle>
               <AlertDialogDescription>
-                The gateway can spend a Codex reset credit automatically when its routing pool exhausts its weekly quota.
-                Both the pool rule and the identity permission must be on.
+                The gateway can spend a {CREDIT_NAME[provider]} automatically when every account of this pool reaches its weekly limit.
+                This is a pool setting. No single account has its own setting.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
@@ -60,15 +76,25 @@ export function AutoResetControl({ kind, setting }: { kind: AutoResetScope; sett
           </AlertDialogContent>
         </AlertDialog>
       </div>
-      <p className="break-words text-muted-foreground">
-        Last claim: {claim ? (
-          <>
-            {claim.status} at <time dateTime={claim.startedAt} title={claim.startedAt}>{formatResetTimes(Date.parse(claim.startedAt), { roundUp: false })}</time>
-            {kind === "pool" ? ` on ${claim.identity}` : ` in ${claim.pool}`}
-            {claim.creditExpiresAt ? <>. Credit expiry <time dateTime={claim.creditExpiresAt} title={claim.creditExpiresAt}>{formatResetTimes(Date.parse(claim.creditExpiresAt), { roundUp: false })}</time></> : null}
-          </>
-        ) : "None"}
-      </p>
+      <p className="break-words text-muted-foreground">Last claim: <ClaimText claim={setting.lastClaim} where="pool" /></p>
     </div>
+  );
+}
+
+/** The last claim that a pool made on one account. It has no control: the setting belongs to the pool. */
+export function AutoResetMemberClaim({ claim }: { claim: AutoResetLastClaim | undefined }) {
+  return (
+    <p className="break-words text-xs text-muted-foreground">
+      Last automatic reset: <ClaimText claim={claim} where="member" />
+    </p>
+  );
+}
+
+/** Shown for a provider that has no reset credit or grant API. It has no toggle. */
+export function AutoResetUnsupported({ provider, reason }: { provider: string; reason: string }) {
+  return (
+    <p className="break-words text-xs text-muted-foreground" data-testid={`auto-reset-unsupported-${provider}`}>
+      Automatic reset: not supported. {reason}
+    </p>
   );
 }
