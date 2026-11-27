@@ -34,6 +34,17 @@ export function nextRefreshSeconds(tool: string, grant: { expires_at?: number; m
   return candidates.length === 0 ? undefined : Math.min(...candidates);
 }
 
+/**
+ * A journal error belongs to an old login when it was recorded for another refresh token than the one the gateway holds now,
+ * or before the stored login was minted. After a new sign-in the old `dead` row is still the newest row, but it says nothing
+ * about the new login: it must neither show as a last error nor mark the login revoked.
+ */
+function errorBelongsToOldLogin(error: { ts: string; oldFp: string }, currentFingerprint: string | undefined, mintedAtSeconds: number | undefined): boolean {
+  if (currentFingerprint !== undefined && error.oldFp !== currentFingerprint) return true;
+  const errorSeconds = Date.parse(error.ts) / 1000;
+  return mintedAtSeconds !== undefined && Number.isFinite(errorSeconds) && mintedAtSeconds > errorSeconds;
+}
+
 export async function buildRenewalReport(deps: {
   tools: readonly string[];
   accounts: (tool: string) => Promise<Identity[]>;
@@ -53,7 +64,7 @@ export async function buildRenewalReport(deps: {
       const fingerprint = grant?.refresh_token ? grantFingerprint(grant) : undefined;
       const journalRefreshS = row?.refreshed ? Math.floor(Date.parse(row.refreshed.ts) / 1000) : undefined;
       const lastS = journalRefreshS ?? grant?.minted_at;
-      const newerError = row?.error && (!row.refreshed || row.error.id > row.refreshed.id) ? row.error : undefined;
+      const newerError = row?.error && (!row.refreshed || row.error.id > row.refreshed.id) && !errorBelongsToOldLogin(row.error, fingerprint, grant?.minted_at) ? row.error : undefined;
       const revoked = (newerError?.outcome === "dead" && fingerprint !== undefined && newerError.oldFp === fingerprint) || deps.isRevoked?.(tool, account.name, fingerprint) === true;
       const next = grant ? nextRefreshSeconds(tool, grant, lastS) : undefined;
       out.push({
