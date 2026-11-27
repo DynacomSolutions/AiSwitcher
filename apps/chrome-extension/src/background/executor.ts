@@ -191,8 +191,11 @@ export class Executor {
     this.api.debugger.onEvent((tabId, method, params, sessionId) => this.onEvent(tabId, method, params, sessionId));
     this.api.debugger.onDetach((tabId, reason) => {
       this.dropTab(tabId);
-      // The user dismissed Chrome's debugging bar: treat as Stop for everything.
-      if (reason === "canceled_by_user") void this.state.stop();
+      // Chrome's Cancel button stops the sessions marked on this tab.
+      if (reason === "canceled_by_user") {
+        this.state.stopTab(tabId);
+        this.state.abortTab(tabId);
+      }
     });
     this.api.tabs.onRemoved(tabId => { this.dropTab(tabId); this.cancelHold(tabId); void this.unmark(tabId); });
     this.api.tabs.onReplaced((added, removed) => {
@@ -231,18 +234,22 @@ export class Executor {
     if (this.tabs.touch(req.session)) {
       for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void this.markControlled(tabId, req.session);
     }
-    await this.tabs.regrant(req.session).catch(() => {});
-    await this.tabs.reclaim(req.session).catch(() => {});
-    const controller = this.state.track(id, req.session.id, req.session.identity);
+    const tabId = typeof req.args.tabId === "number" ? req.args.tabId : undefined;
+    const controller = this.state.track(id, req.session.id, req.session.identity, tabId);
     this.tabs.callStarted(req.session.id);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : tool === "request_group" ? REQUEST_GROUP_CALL_TIMEOUT_MS : this.defaultTimeout;
-    const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const aborted = new Promise<never>((_, reject) => {
       const onAbort = () => reject(new ToolError(this.abortCode(controller.signal.reason), this.abortMessage(controller.signal.reason)));
       if (controller.signal.aborted) onAbort(); else controller.signal.addEventListener("abort", onAbort, { once: true });
     });
     aborted.catch(() => {});
     try {
+      await Promise.race([this.tabs.regrant(req.session).catch(() => {}), aborted]);
+      this.throwIfAborted(controller.signal);
+      await Promise.race([this.tabs.reclaim(req.session).catch(() => {}), aborted]);
+      this.throwIfAborted(controller.signal);
+      timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
       const content = await Promise.race([this.dispatch(tool, req, controller.signal), aborted]);
       return { id, ok: true, content };
     } catch (e) {
@@ -503,7 +510,11 @@ export class Executor {
         await this.tabs.addToSession(session, tabId);
         // The owner's tab may already show a dialog, which blocks the page marker: attached first, so it is seen (or the page is found unresponsive) before the marker hangs.
         try {
-          await this.watchDialogs(tabId, tool, async () => { await this.ensureAttached(sig, tabId); await this.markControlled(tabId, session); }, sig);
+          await this.watchDialogs(tabId, tool, async () => {
+            await this.ensureAttached(sig, tabId);
+            this.throwIfAborted(sig);
+            await this.markControlled(tabId, session);
+          }, sig);
         } catch (e) {
           const d = this.dialogs.get(tabId);
           if (e instanceof PageUnresponsive) return text(`Adopted tab ${tabId}: ${tab.title}. ${e.message}`);
@@ -532,6 +543,7 @@ export class Executor {
         if (tool === "close_tab") return this.tabTool(tool, req, sig, tab);
         // Attached before anything touches the page: a page that does not answer (a dialog Chrome never reported) ends the call here.
         await this.ensureAttached(sig, tabId);
+        this.throwIfAborted(sig);
         if (open) void this.markControlled(tabId, session); else await this.markControlled(tabId, session);
         this.throwIfAborted(sig);
         if (tool !== "hover") await this.releaseHold(tabId);
@@ -901,6 +913,7 @@ export class Executor {
     if (this.attached.has(tabId)) return this.awaitEnabled(tabId);
     const current = await this.api.tabs.get(tabId);
     if (current) this.assertDrivable(current); // last guard: no path may attach the debugger to a browser or extension page
+    this.throwIfAborted(sig);
     try {
       await this.api.debugger.attach(tabId);
     } catch (e) {

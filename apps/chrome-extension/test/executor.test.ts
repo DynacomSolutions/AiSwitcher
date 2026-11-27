@@ -3,8 +3,11 @@ import type { BrowserTool, CallRequest } from "../../../src/browser/protocol.ts"
 import { base64Bytes, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, TOOL_SCHEMAS, validateToolArgs } from "../../../src/browser/tool-args.ts";
 import { capText, Executor, jpegSize } from "../src/background/executor.ts";
 import type { ExecutorDeps } from "../src/background/executor.ts";
+import { handleMessage } from "../src/background/messages.ts";
+import type { MessageDeps } from "../src/background/messages.ts";
 import { State } from "../src/background/state.ts";
 import { colorForIdentity, TabManager } from "../src/background/tabs.ts";
+import { OverlayUi } from "../src/background/ui.ts";
 import type { Ui } from "../src/background/ui.ts";
 import { FakeChrome } from "./fakes.ts";
 
@@ -139,6 +142,32 @@ describe("pause and stop", () => {
     expect(seen).toEqual([false]);
   });
 
+  test("ais-pause persists the pause and ais-resume clears it", async () => {
+    const { api, state, executor } = setup();
+    const deps: MessageDeps = {
+      runtimeId: "extension",
+      state,
+      status: async () => ({ status: "idle", paused: state.paused, inflight: state.inflightCount, signedIn: false, sessions: [] }),
+      setDisconnected: async () => {},
+      isMarked: () => false,
+      isSessionMarked: () => false,
+      grant: async () => "ok",
+      revoke: async () => {},
+    };
+    const sender = { id: deps.runtimeId, origin: `chrome-extension://${deps.runtimeId}` };
+    const replies: unknown[] = [];
+    handleMessage({ type: "ais-pause" }, sender, reply => replies.push(reply), deps);
+    expect(state.paused).toBe(true);
+    expect(api.store.paused).toBe(true);
+    expect(await executor.run(call("tabs_context"))).toMatchObject({ ok: false, error: "paused_by_user" });
+
+    handleMessage({ type: "ais-resume" }, sender, reply => replies.push(reply), deps);
+    expect(state.paused).toBe(false);
+    expect(api.store.paused).toBe(false);
+    expect(await executor.run(call("tabs_context"))).toMatchObject({ ok: true });
+    expect(replies).toEqual([{ ok: true }, { ok: true }]);
+  });
+
   test("stop aborts in-flight calls with stopped_by_user and detaches the debugger", async () => {
     const { api, state, tabs, executor } = setup();
     const tab = await tabs.create(session, "https://example.test/");
@@ -196,14 +225,133 @@ describe("pause and stop", () => {
     expect(api.cdpLog).toHaveLength(0);
   });
 
-  test("user cancelling the debugger bar acts as Stop", async () => {
-    const { api, state, tabs, executor } = setup();
+  test("user cancelling the debugger bar stops the tab without pausing the profile", async () => {
+    const ui = new OverlayUi({ call: async () => undefined, inject: async () => {} });
+    const { api, state, tabs, executor } = setup(ui, { defaultTimeoutMs: 1000 });
+    state.setSessionsOnTab(tabId => ui.sessionsOn(tabId));
+    const alsoMarked = { ...session, id: "s2" };
+    const other = { ...session, id: "s3" };
+    const fresh = { ...session, id: "s4" };
     const tab = await tabs.create(session);
-    const pending = executor.run(call("wait", { seconds: 100 }));
-    await new Promise(r => setTimeout(r, 5));
-    for (const l of api.detachListeners) l(tab.id, "canceled_by_user");
+    const otherTab = await tabs.create(other);
+    await ui.markControlled(tab.id, alsoMarked);
+    const bothEvaluating = Promise.withResolvers<void>();
+    const finishEvaluation = Promise.withResolvers<{ result: { value: number } }>();
+    let evaluations = 0;
+    api.cdpResults["Runtime.evaluate"] = () => {
+      if (++evaluations === 2) bothEvaluating.resolve();
+      return finishEvaluation.promise;
+    };
+    const pending = executor.run(call("javascript", { tabId: tab.id, code: "1" }));
+    const unaffected = executor.run(call("javascript", { tabId: otherTab.id, code: "1" }, other));
+    await Promise.race([bothEvaluating.promise, pending, unaffected]);
+    expect(evaluations).toBe(2);
+
+    api.attachedTabs.delete(tab.id);
+    for (const listener of api.detachListeners) listener(tab.id, "canceled_by_user");
+    finishEvaluation.resolve({ result: { value: 1 } });
+
     expect(await pending).toMatchObject({ ok: false, error: "stopped_by_user" });
-    expect(state.paused).toBe(true);
+    expect(await unaffected).toMatchObject({ ok: true });
+    expect(executor.attachedTabIds()).toEqual([otherTab.id]);
+    expect(state.paused).toBe(false);
+    expect(api.store).not.toHaveProperty("paused");
+    for (const stopped of [session, alsoMarked]) {
+      expect(await executor.run(call("tabs_context", {}, stopped))).toMatchObject({ ok: false, error: "stopped_by_user" });
+    }
+    expect(await executor.run(call("tabs_context", {}, fresh))).toMatchObject({ ok: true });
+    state.resumeSession(session.id);
+    expect(await executor.run(call("tabs_context"))).toMatchObject({ ok: true });
+  });
+
+  test("Chrome Cancel aborts the initial attach before the session marks the tab", async () => {
+    const ui = new OverlayUi({ call: async () => undefined, inject: async () => {} });
+    const { api, state, tabs, executor } = setup(ui);
+    state.setSessionsOnTab(tabId => ui.sessionsOn(tabId));
+    const tab = await tabs.create(session);
+    const attach = api.debugger.attach;
+    api.debugger.attach = async tabId => {
+      await attach(tabId);
+      api.attachedTabs.delete(tabId);
+      for (const listener of api.detachListeners) listener(tabId, "canceled_by_user");
+    };
+
+    expect(await executor.run(call("read_page", { tabId: tab.id }))).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(api.cdpLog).toHaveLength(0);
+    expect(ui.sessionsOn(tab.id)).toEqual([]);
+    expect(state.paused).toBe(false);
+    expect(await executor.run(call("tabs_context"))).toMatchObject({ ok: true });
+  });
+
+  test("Chrome Cancel aborts a call while it recovers its tabs", async () => {
+    const ui = new OverlayUi({ call: async () => undefined, inject: async () => {} });
+    const { api, state, tabs, executor } = setup(ui);
+    state.setSessionsOnTab(tabId => ui.sessionsOn(tabId));
+    const tab = await tabs.create(session);
+    expect(await executor.run(call("read_page", { tabId: tab.id }))).toMatchObject({ ok: true });
+    api.cdpLog.length = 0;
+    const reclaiming = Promise.withResolvers<void>();
+    const recovered = Promise.withResolvers<void>();
+    tabs.reclaim = async () => {
+      reclaiming.resolve();
+      await recovered.promise;
+      return false;
+    };
+
+    const pending = executor.run(call("read_page", { tabId: tab.id }));
+    await reclaiming.promise;
+    api.attachedTabs.delete(tab.id);
+    for (const listener of api.detachListeners) listener(tab.id, "canceled_by_user");
+    recovered.resolve();
+
+    expect(await pending).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(api.cdpLog).toHaveLength(0);
+    expect(api.attachedTabs.size).toBe(0);
+  });
+
+  test("Chrome Cancel during the attach lookup prevents a new debugger attachment", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    const get = api.tabs.get;
+    const attach = api.debugger.attach;
+    let lookups = 0;
+    let attachCalls = 0;
+    api.debugger.attach = async tabId => {
+      attachCalls++;
+      await attach(tabId);
+    };
+    api.tabs.get = async tabId => {
+      if (tabId === tab.id && ++lookups === 2) {
+        await attach(tabId);
+        api.attachedTabs.delete(tabId);
+        for (const listener of api.detachListeners) listener(tabId, "canceled_by_user");
+      }
+      return get(tabId);
+    };
+
+    expect(await executor.run(call("read_page", { tabId: tab.id }))).toMatchObject({ ok: false, error: "stopped_by_user" });
+    await Bun.sleep(0);
+    expect(lookups).toBe(2);
+    expect(attachCalls).toBe(0);
+    expect(api.cdpLog).toHaveLength(0);
+  });
+
+  test("target_closed clears the debugger attachment without stopping or pausing", async () => {
+    const ui = new OverlayUi({ call: async () => undefined, inject: async () => {} });
+    const { api, state, tabs, executor } = setup(ui);
+    state.setSessionsOnTab(tabId => ui.sessionsOn(tabId));
+    const tab = await tabs.create(session);
+    api.cdpResults["Runtime.evaluate"] = () => {
+      api.attachedTabs.delete(tab.id);
+      for (const listener of api.detachListeners) listener(tab.id, "target_closed");
+      return { result: { value: 1 } };
+    };
+
+    expect(await executor.run(call("javascript", { tabId: tab.id, code: "1" }))).toMatchObject({ ok: true });
+    expect(executor.attachedTabIds()).toEqual([]);
+    expect(state.paused).toBe(false);
+    expect(api.store).not.toHaveProperty("paused");
+    expect(await executor.run(call("tabs_context"))).toMatchObject({ ok: true });
   });
 
   test("gateway abort and call timeout yield timeout", async () => {
