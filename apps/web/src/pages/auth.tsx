@@ -1,3 +1,4 @@
+import { ProviderLabel } from "@/components/provider-icon";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ExternalLink, X } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -579,7 +580,7 @@ function AuthList({ onFlow }: { onFlow: (flowId: string) => void }) {
             </SelectItem>
             {toolNames.map((tool) => (
               <SelectItem key={tool} value={tool} className="text-xs">
-                {tool}
+                <ProviderLabel provider={tool} />
               </SelectItem>
             ))}
           </SelectContent>
