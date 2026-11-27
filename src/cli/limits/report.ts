@@ -1,3 +1,4 @@
+import { formatAutoResetStatus } from "../gateway/auto-reset.ts";
 import { bold, dim, gray } from "../colors.ts";
 import { canonicalUsageProvider, usageProviderLabel } from "../usage/providers.ts";
 import { renderBar, staleSuffix } from "./bar.ts";
@@ -206,14 +207,15 @@ function buildIdentityBlock(result: ToolLimitResult, isLast: boolean, ctx: Ctx):
   const continuation = isLast ? DETAIL_INDENT_LAST : DETAIL_INDENT;
   const branch = `${connector}${identityHeading(result)}`;
 
+  const statusRows: Row[] = result.autoReset ? [{ indent: continuation, label: "", plain: formatAutoResetStatus(result.autoReset) }] : [];
   if (isMirroredPool(result, ctx.all)) {
-    return { branch, rows: [{ indent: continuation, label: "", plain: poolPointer(result) }] };
+    return { branch, rows: [{ indent: continuation, label: "", plain: poolPointer(result) }, ...statusRows] };
   }
   if (result.status === "pending") {
     return { branch, rows: [{ indent: continuation, label: "", plain: `${ctx.spinnerFrame} loading…` }] };
   }
   if (result.status === "unavailable" || result.windows.length === 0) {
-    return { branch, rows: [{ indent: continuation, label: "", plain: result.error ?? "no data" }] };
+    return { branch, rows: [{ indent: continuation, label: "", plain: result.error ?? "no data" }, ...statusRows] };
   }
 
   const rows: Row[] = result.windows.map((w) => ({
@@ -235,7 +237,7 @@ function buildIdentityBlock(result: ToolLimitResult, isLast: boolean, ctx: Ctx):
     const text = [noun, reset.label].filter(Boolean).join(": ") + (reset.expiresAt ? ` (expires ${reset.expiresAt})` : "");
     rows.push({ indent: continuation, label: "", plain: text });
   }
-  return { branch, rows };
+  return { branch, rows: [...rows, ...statusRows] };
 }
 
 function renderRow(row: Row, prefixWidth: number, ctx: Ctx): string {
@@ -262,12 +264,13 @@ function renderRow(row: Row, prefixWidth: number, ctx: Ctx): string {
 /** `name  worst-label [bar] pct  resets …  ↺N` — one line per identity. */
 function compactLine(result: ToolLimitResult, nameWidth: number, labelWidth: number, ctx: Ctx): string {
   const name = result.identity.name.padEnd(nameWidth);
-  if (isMirroredPool(result, ctx.all)) return `  ${bold(name)}  ${gray(poolPointer(result))}`;
+  const autoReset = result.autoReset ? `  ${gray(formatAutoResetStatus(result.autoReset))}` : "";
+  if (isMirroredPool(result, ctx.all)) return `  ${bold(name)}  ${gray(poolPointer(result))}${autoReset}`;
   if (result.status === "pending") return `  ${bold(name)}  ${gray(`${ctx.spinnerFrame} loading…`)}`;
   if (result.status === "unavailable" || result.windows.length === 0) {
     const text = (result.error ?? "no data").replace(/\s+/g, " ");
     const room = Math.max(10, (ctx.columns ? Math.min(ctx.wrapWidth, 60) : ctx.wrapWidth) - nameWidth - 4);
-    return `  ${bold(name)}  ${gray(text.length > room ? `${text.slice(0, room - 1)}…` : text)}`;
+    return `  ${bold(name)}  ${gray(text.length > room ? `${text.slice(0, room - 1)}…` : text)}${autoReset}`;
   }
   const w = worstWindow(result);
   const { bar, pct } = renderBar(w.usedPercent, ctx.barWidth);
@@ -275,7 +278,7 @@ function compactLine(result: ToolLimitResult, nameWidth: number, labelWidth: num
   const reset = resetText(w.resetsAtMs, w.resetsAt, ctx.now);
   if (reset) line += `  ${reset}`;
   if (result.manualReset && result.manualReset.availableCount > 0) line += `  ↺${result.manualReset.availableCount}`;
-  return line;
+  return line + autoReset;
 }
 
 interface Widths {

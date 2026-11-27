@@ -18,6 +18,9 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord, UsageHistoryRow } from "./types.ts";
 import { TOKSCALE_TIME_ZONE_NAMES } from "../cli/usage/tokscale-zones.ts";
 import { USAGE_READER_PROVIDERS } from "./usage-source.ts";
+import type { AutoResetStore } from "./auto-reset-store.ts";
+import type { AutoResetPool } from "./auto-reset.ts";
+import { CODEX_AUTO_RESET_PATH, type AutoResetScope, type AutoResetStatus } from "./auto-reset-view.ts";
 
 export const DEFAULT_OVERLAP_MS = 24 * 3600_000;
 const MAX_OVERLAP_HOURS = 24 * 30;
@@ -97,6 +100,7 @@ export interface AdminDeps {
   spendReset?(identity: string, grantId: string): Promise<unknown>;
   /** Spends one Codex reset on the named member and invalidates shared reset and usage reads. */
   spendCodexReset?(identity: string, redeemRequestId: string): Promise<unknown>;
+  autoReset?: { store: AutoResetStore; pools: () => Promise<AutoResetPool[]> };
 }
 
 /** Longest one provider read of a manual refresh may take. The console waits 40 s for a whole refresh, so a slow read must not use it all. */
@@ -404,6 +408,58 @@ export function createAdminApp(deps: AdminDeps): Hono {
     });
     await Promise.all(workers);
     return c.json({ limits: limits.filter((row): row is AdminLimitRow => row !== undefined) });
+  });
+
+  async function isCanonicalCodexIdentity(name: string): Promise<boolean> {
+    if (!deps.identityState || !deps.canonical) throw new Error("Codex identity registry unavailable");
+    return await deps.identityState("codex", name) === "ok" && await deps.canonical("codex", name) === name;
+  }
+
+  async function autoResetIdentities(pools: AutoResetPool[]): Promise<string[]> {
+    if (!deps.identityState || !deps.canonical) throw new Error("Codex identity registry unavailable");
+    const { identityState, canonical } = deps;
+    const names = await limitsIdentities({
+      canonical,
+      poolMembers: async () => pools.flatMap((pool) => pool.members),
+    }, await read.listApps(), "codex");
+    const states = await Promise.all(names.map((name) => identityState("codex", name)));
+    return names.filter((_, i) => states[i] === "ok");
+  }
+
+  hono.get(CODEX_AUTO_RESET_PATH, async (c) => {
+    const settings = deps.autoReset;
+    if (!settings) return err(404, "Codex automatic resets are not available");
+    const pools = await settings.pools();
+    const identities = await autoResetIdentities(pools);
+    const status = async (kind: AutoResetScope, name: string): Promise<AutoResetStatus> => {
+      const [enabled, claim] = await Promise.all([settings.store.enabled(kind, name), settings.store.lastClaim(kind, name)]);
+      if (!claim) return { name, enabled };
+      const { pool, identity, startedAt, creditExpiresAt, status } = claim;
+      return { name, enabled, lastClaim: { pool, identity, startedAt, creditExpiresAt, status } };
+    };
+    const [poolSettings, identitySettings] = await Promise.all([
+      Promise.all(pools.map(async ({ name, members }) => ({ ...await status("pool", name), members }))),
+      Promise.all(identities.map((name) => status("identity", name))),
+    ]);
+    return c.json({ pools: poolSettings, identities: identitySettings }, 200, { "cache-control": "no-store" });
+  });
+
+  hono.put(`${CODEX_AUTO_RESET_PATH}/:kind`, async (c) => {
+    const settings = deps.autoReset;
+    if (!settings) return err(404, "Codex automatic resets are not available");
+    const kind = c.req.param("kind");
+    if (kind !== "pool" && kind !== "identity") return err(400, "scope must be pool or identity");
+    const body: unknown = await c.req.json().catch(() => undefined);
+    if (!isObj(body) || typeof body.name !== "string" || !body.name.trim() || typeof body.enabled !== "boolean") {
+      return err(400, "name and boolean enabled are required");
+    }
+    const name = body.name;
+    const exists = kind === "pool"
+      ? (await settings.pools()).some((pool) => pool.name === name)
+      : await isCanonicalCodexIdentity(name);
+    if (!exists) return err(404, kind === "pool" ? "no such Codex pool" : "no such canonical Codex identity");
+    await settings.store.setEnabled(kind, name, body.enabled);
+    return c.json({ name, enabled: body.enabled });
   });
 
   // Spends one reset grant at the gateway, with the member credential from the store. The console never holds that credential.

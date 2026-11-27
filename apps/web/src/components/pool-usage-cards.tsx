@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 
+import { AutoResetControl } from "@/components/auto-reset-control";
 import { AccountWarnings } from "@/components/account-line";
 import { ToolBadge } from "@/components/badges";
 import { Badge } from "@/components/ui/badge";
@@ -11,7 +12,7 @@ import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, formatTokens } from "@/lib/format";
 import { formatResetTimes } from "@/lib/reset-time";
 import { partialLabel, summarisePools, type MemberPeriod, type PeriodTotal, type PoolSummary } from "@/lib/pool-usage";
-import type { ToolName } from "@/types/api";
+import type { AutoResetStatus, ToolName } from "@/types/api";
 
 function tone(percent: number): string | undefined {
   if (percent >= 90) return "bg-red-500";
@@ -34,7 +35,7 @@ function TotalBlock({ title, total }: { title: string; total: PeriodTotal }) {
       </div>
       {partial ? (
         <div className="space-y-0.5">
-          <Badge variant="warning">{partial}</Badge>
+          <Badge variant="warning" className="max-w-full whitespace-normal">{partial}</Badge>
           {total.missing.map((m) => (
             <div key={m.member} className="text-xs text-amber-600 dark:text-amber-400">
               {m.member}: {m.reason}
@@ -54,18 +55,19 @@ function memberTokens(p: MemberPeriod): string {
   return formatTokens(p.native.tokens + p.gateway.tokens);
 }
 
-function PoolCard({ pool }: { pool: PoolSummary }) {
+function PoolCard({ pool, autoReset }: { pool: PoolSummary; autoReset?: AutoResetStatus }) {
   return (
     <Card className="gap-4">
       <CardHeader className="space-y-0">
-        <div className="flex items-center gap-2">
-          <span className="truncate font-medium">{pool.name}</span>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="min-w-0 break-words font-medium">{pool.name}</span>
           <ToolBadge tool={pool.tool as ToolName} />
           <Badge variant="muted">{pool.members.length} members</Badge>
         </div>
         <CardDescription>{pool.active ? `Active member: ${pool.active}` : "No active member"}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
+        {autoReset ? <AutoResetControl kind="pool" setting={autoReset} /> : null}
         <div className="grid grid-cols-2 gap-4">
           <TotalBlock title="Today" total={pool.today} />
           <TotalBlock title="Last 7 days" total={pool.week} />
@@ -132,7 +134,7 @@ function PoolCard({ pool }: { pool: PoolSummary }) {
 }
 
 /** Pools with summed usage and limits; shown instead of the pool's own "unavailable" mirror row. */
-export function PoolUsageCards() {
+export function PoolUsageCards({ autoResetPools }: { autoResetPools?: Array<AutoResetStatus & { members: string[] }> }) {
   const pools = usePoolsUsageQuery();
   const usage = useUsageQuery();
   const limits = useLimitsQuery();
@@ -140,8 +142,11 @@ export function PoolUsageCards() {
     () => (pools.data ? summarisePools(pools.data.pools, usage.data?.results ?? [], limits.data?.results ?? [], pools.data) : []),
     [pools.data, usage.data, limits.data],
   );
-  if (pools.isError && !pools.data) return <p className="text-sm text-muted-foreground">Pool usage could not be loaded: {pools.error.message}</p>;
-  if (summaries.length === 0) return null;
+  const poolSettings = new Map(autoResetPools?.map((pool) => [pool.name, pool]));
+  const reportedCodexPools = new Set(summaries.filter((pool) => pool.tool === "codex").map((pool) => pool.name));
+  const missingCodexPools = (autoResetPools ?? []).filter((pool) => !reportedCodexPools.has(pool.name));
+  const usageError = pools.isError && !pools.data ? pools.error.message : undefined;
+  if (summaries.length === 0 && missingCodexPools.length === 0 && !usageError) return null;
   const loading = usage.isLoading || limits.isLoading;
   return (
     <section className="space-y-3">
@@ -149,9 +154,22 @@ export function PoolUsageCards() {
         <h2 className="text-base font-semibold">Pools</h2>
         {loading ? <Badge variant="muted">loading members</Badge> : null}
       </div>
+      {usageError ? <p className="text-sm text-muted-foreground">Pool usage could not be loaded: {usageError}</p> : null}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         {summaries.map((p) => (
-          <PoolCard key={p.key} pool={p} />
+          <PoolCard key={p.key} pool={p} autoReset={p.tool === "codex" ? poolSettings.get(p.name) : undefined} />
+        ))}
+        {missingCodexPools.map((pool) => (
+          <Card key={`codex/${pool.name}`} className="gap-4">
+            <CardHeader className="space-y-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="min-w-0 break-words font-medium">{pool.name}</span>
+                <ToolBadge tool="codex" />
+                <Badge variant="muted">{pool.members.length} members</Badge>
+              </div>
+            </CardHeader>
+            <CardContent><AutoResetControl kind="pool" setting={pool} /></CardContent>
+          </Card>
         ))}
       </div>
     </section>

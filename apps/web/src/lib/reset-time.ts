@@ -13,7 +13,7 @@ function inZone(ms: number, zone: string): string {
 }
 
 /** "01:35 ICT Fri 20 Nov, 18:35 GMT Thu 19 Nov". */
-export function formatResetTimes(ms: number): string {
-  const rounded = Math.ceil(ms / 60_000) * 60_000;
-  return ZONES.map((z) => inZone(rounded, z)).join(", ");
+export function formatResetTimes(ms: number, { roundUp = true } = {}): string {
+  const displayMs = roundUp ? Math.ceil(ms / 60_000) * 60_000 : ms;
+  return ZONES.map((z) => inZone(displayMs, z)).join(", ");
 }

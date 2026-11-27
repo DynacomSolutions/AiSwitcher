@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
+import { exhaustedWeeklyReset, type AutoResetRecovery } from "./auto-reset.ts";
 import { extractToken } from "./auth.ts";
 import { BodyBudget } from "./body-budget.ts";
 import type { BrowserHub } from "./browser/hub.ts";
@@ -20,11 +21,11 @@ import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { claudeCompatibilityLimitMessage, fullWindowReset, genericLimitResponse, limitMessage, nativeLimitResponse, summariseLimit, type LimitCandidate } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
-import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
+import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState, type CodexRedemptionGuard } from "./account.ts";
 import { poolModels } from "./models-union.ts";
-import { firstEventOf, isModelCall, type FirstEvent, type RetryInfo } from "./overload.ts";
+import { codexRenewalEvents, firstEventOf, isModelCall, type FirstEvent, type RetryInfo } from "./overload.ts";
 import { collapseSlashes, PIN_FORWARD, routeFor, serveRoute, sideDailyLimitFromEnv, type AccountOp, type ResetCreditsCache } from "./routes.ts";
-import { DEFAULT_RESERVE_PERCENT, eligibleMembers, memberUsages, pickIdentity, reserveUtilisationOf, usageForModel, utilisationOf } from "./select.ts";
+import { DEFAULT_RESERVE_PERCENT, allowedMembers, eligibleMembers, memberUsages, pickIdentity, reserveUtilisationOf, usageForModel, utilisationOf } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, UsageRow } from "./types.ts";
@@ -39,6 +40,10 @@ export interface GatewayDeps {
   usageFor(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   /** Reads one member's usage from the source now and waits (single-flight); `usageFor` answers with it afterwards. */
   refreshUsage?(provider: GatewayProvider, identity: string): Promise<void>;
+  autoReset?: AutoResetRecovery;
+  withCodexRedemption?: CodexRedemptionGuard;
+  /** Encoded canonical member and reset generation pairs, in input order. */
+  codexResetGenerations?(identities: readonly string[]): Promise<string[]>;
   poolMembers(provider: GatewayProvider): Promise<string[]>;
   /** Resolves an alias to the identity's canonical name. Ledger rows, metrics and alerts use the canonical name. */
   canonical?(provider: GatewayProvider, identity: string): Promise<string>;
@@ -90,6 +95,7 @@ export function bodyBudgetFromEnv(env: Record<string, string | undefined> = proc
  * limit (32 MB), so every request the provider accepts can fail over to another member; long agent threads with screenshots run past 8 MiB.
  */
 export const REPLAY_LIMIT_BYTES = 32 * 1024 * 1024;
+const AUTO_RESET_HOLD_MS = 25_000;
 /** Quota errors (403) are only inspected up to this size; the same bound holds for the error summary in the request log. */
 export const ERROR_PEEK_BYTES = 64 * 1024;
 /** Longest all file lookups for one refused request may take together (media-recovery.ts). */
@@ -248,29 +254,63 @@ export function upstreamHeaders(adapter: ProviderAdapter, cred: ProviderCredenti
 }
 
 /** Reads at most `cap` bytes of a response body; the response is re-created unchanged. */
-export async function peek(res: Response, cap: number): Promise<{ bytes: Uint8Array; whole: boolean; res: Response }> {
+export async function peek(res: Response, cap: number, signal?: AbortSignal, preserveOnStop = false): Promise<{ bytes: Uint8Array; whole: boolean; res: Response }> {
   if (!res.body) return { bytes: new Uint8Array(0), whole: true, res };
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
   let whole = false;
-  while (size <= cap) {
-    const r = await reader.read();
-    if (r.done) {
-      whole = true;
-      break;
+  let pending: ReturnType<typeof reader.read> | undefined;
+  try {
+    while (size <= cap) {
+      const read = () => pending = reader.read();
+      const r = signal ? await untilStopped(signal, read) : await read();
+      pending = undefined;
+      if (r.done) {
+        whole = true;
+        break;
+      }
+      chunks.push(r.value);
+      size += r.value.length;
     }
-    chunks.push(r.value);
-    size += r.value.length;
+  } catch (err) {
+    if (!preserveOnStop || !signal?.aborted) {
+      void reader.cancel().catch(() => undefined);
+      throw err;
+    }
   }
-  const bytes = new Uint8Array(size);
+  const bytes = new Uint8Array(Math.min(cap, size));
   let at = 0;
-  for (const c of chunks) {
-    bytes.set(c, at);
-    at += c.length;
+  for (const chunk of chunks) {
+    const part = chunk.subarray(0, bytes.length - at);
+    bytes.set(part, at);
+    at += part.length;
   }
-  const out = whole ? new Response(bytes, { status: res.status, statusText: res.statusText, headers: res.headers }) : new Response(chainStream(chunks, reader), { status: res.status, statusText: res.statusText, headers: res.headers });
-  return { bytes, whole: whole && size <= cap, res: out };
+  const body = whole ? bytes : chainStream(chunks, {
+    read() {
+      const next = pending ?? reader.read();
+      pending = undefined;
+      return next;
+    },
+    cancel: (reason) => reader.cancel(reason),
+  });
+  const out = new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+  return { bytes, whole, res: out };
+}
+
+/** Stop waiting even when a fetch or another dependency ignores cancellation. */
+async function untilStopped<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T> {
+  signal.throwIfAborted();
+  let onAbort: () => void = () => {};
+  const stop = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([stop, work()]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 /**
@@ -278,26 +318,37 @@ export async function peek(res: Response, cap: number): Promise<{ bytes: Uint8Ar
  * decided on its first `event:` line, so it flows on without delay. The response is re-created with every byte read
  * put back in front of the rest of the body.
  */
-export async function peekFirstEvent(res: Response, cap: number): Promise<{ first: FirstEvent; res: Response }> {
-  if (!res.body) return { first: { state: "pass" }, res };
+export async function peekFirstEvent(res: Response, cap: number, signal?: AbortSignal, codexRenewal = false): Promise<{ first: FirstEvent; res: Response }> {
+  if (!res.body) return { first: { state: codexRenewal ? "pending" : "pass" }, res };
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
+  const readRenewal = codexRenewal ? codexRenewalEvents() : undefined;
   let size = 0;
   let first: FirstEvent = { state: "pending" };
-  while (first.state === "pending" && size <= cap) {
-    const r = await reader.read();
-    if (r.done) break;
-    chunks.push(r.value);
-    size += r.value.length;
-    const all = new Uint8Array(size);
-    let at = 0;
-    for (const c of chunks) {
-      all.set(c, at);
-      at += c.length;
+  try {
+    while (first.state === "pending" && (readRenewal ? size < cap : size <= cap)) {
+      const r = signal ? await untilStopped(signal, () => reader.read()) : await reader.read();
+      if (r.done) break;
+      chunks.push(r.value);
+      if (readRenewal) {
+        first = readRenewal(r.value.subarray(0, cap - size));
+        size += r.value.length;
+        continue;
+      }
+      size += r.value.length;
+      const all = new Uint8Array(size);
+      let at = 0;
+      for (const chunk of chunks) {
+        all.set(chunk, at);
+        at += chunk.length;
+      }
+      first = firstEventOf(all);
     }
-    first = firstEventOf(all);
+  } catch (err) {
+    void reader.cancel().catch(() => undefined);
+    throw err;
   }
-  if (first.state === "pending") first = { state: "pass" }; // no whole first event within the cap: the stream passes through
+  if (!readRenewal && first.state === "pending") first = { state: "pass" };
   return { first, res: new Response(chainStream(chunks, reader), { status: res.status, statusText: res.statusText, headers: res.headers }) };
 }
 
@@ -343,16 +394,30 @@ function isSubscriptionUsageBody(bytes: Uint8Array): boolean {
   }
 }
 
+/** Codex's subscription error is distinct from billing, throttling and the gateway's own 429. */
+function isCodexSubscription429(bytes: Uint8Array): boolean {
+  try {
+    const body = JSON.parse(new TextDecoder().decode(bytes)) as { type?: unknown; code?: unknown; message?: unknown; error?: { type?: unknown; code?: unknown; message?: unknown } | string } | null;
+    const error = typeof body?.error === "object" ? body.error : undefined;
+    const code = [error?.type, error?.code, body?.type, body?.code];
+    if (code.includes("usage_limit_reached")) return true;
+    const message = error?.message ?? body?.message ?? body?.error;
+    return typeof message === "string" && /(?:subscription (?:usage )?limit (?:reached|exhausted)|(?:reached|hit) (?:your |the )?subscription (?:usage )?limit)/i.test(message);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Allocation-free scan for the top-level `model` string of a JSON object. The last duplicate wins, as in
  * JSON.parse, so an allowlist cannot be dodged with `{"model":"ok","model":"other"}`. Returns `ok: false` when the
  * bytes are not a well-formed object (the caller then falls back to JSON.parse).
  */
-export function scanModel(b: Uint8Array): { ok: boolean; model?: string } {
+export function scanModel(b: Uint8Array, start = 0): { ok: boolean; model?: string } {
   const n = b.length;
-  let i = 0;
+  let i = start;
   const ws = (): void => {
-    while (i < n && (b[i] === 0x20 || b[i] === 0x0a || b[i] === 0x0d || b[i] === 0x09)) i++;
+    i = skipJsonWhitespace(b, i);
   };
   /** Skips a string starting at the opening quote; returns the index of the closing quote or -1. */
   const str = (from: number): number => {
@@ -456,13 +521,21 @@ export function scanModel(b: Uint8Array): { ok: boolean; model?: string } {
 /** A streamed body's model, when its JSON names `model` before the head ends (Claude Code sends it first). */
 const HEAD_MODEL = /^\s*\{\s*"model"\s*:\s*"([A-Za-z0-9._:\[\]\/-]{1,200})"/;
 
+function skipJsonWhitespace(bytes: Uint8Array, start: number): number {
+  let i = start;
+  while (bytes[i] === 0x20 || bytes[i] === 0x0a || bytes[i] === 0x0d || bytes[i] === 0x09) i++;
+  return i;
+}
+
 function requestModel(body: Body): string | undefined {
   if (body.kind === "stream") {
     if (!body.head) return undefined;
     return HEAD_MODEL.exec(new TextDecoder().decode(body.head))?.[1];
   }
-  if (body.kind !== "buffered" || body.bytes.length === 0 || body.bytes[0] !== 0x7b) return undefined; // only a JSON object has a model
-  const scanned = scanModel(body.bytes);
+  if (body.kind !== "buffered") return undefined;
+  const start = skipJsonWhitespace(body.bytes, 0);
+  if (body.bytes[start] !== 0x7b) return undefined;
+  const scanned = scanModel(body.bytes, start);
   if (scanned.ok) return scanned.model;
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(body.bytes));
@@ -542,6 +615,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const resetCredits: ResetCreditsCache = {};
   const accountState = newAccountState();
   const sideGate = new Gate(SIDE_COUNT_MAX_INFLIGHT);
+  const codexProbeGate = new Gate(1);
   const sideCounts = new Map<string, number>(); // fallback only, while the store is down
   /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
   const holds = new Map<string, Hold>();
@@ -551,7 +625,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const holdGate = new PoolHoldGate({ ...poolHoldFromEnv(), ...deps.poolHold });
   const hold: HoldCtl = { gate: holdGate, replay: (r) => handle(r) };
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, provenQuota, marginalQuotaRefreshes, holds, probes, resetCredits, sideCounts, sideGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "internal error while handling the request", "internal_error"));
+    proxy(req, deps, log, budget, exhausted, provenQuota, marginalQuotaRefreshes, holds, probes, resetCredits, sideCounts, sideGate, codexProbeGate, accountState, knownBad, hold).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "internal error while handling the request", "internal_error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   const chatDeps = deps.chat ? { chat: deps.chat } : {};
@@ -565,7 +639,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, provenQuota: Map<string, number>, marginalQuotaRefreshes: Map<string, { at: number; settled: boolean; promise: Promise<PoolUsage | undefined> }>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, provenQuota: Map<string, number>, marginalQuotaRefreshes: Map<string, { at: number; settled: boolean; promise: Promise<PoolUsage | undefined> }>, holds: Map<string, Hold>, probes: Map<string, number>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, codexProbeGate: Gate, accountState: AccountState, knownBad: KnownBadFiles, hold: HoldCtl): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -663,6 +737,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   req.signal.addEventListener("abort", onAbort, { once: true });
   if (req.signal.aborted) ctrl.abort(); // already gone: the listener will never fire
   let releaseBody: (() => void) | undefined;
+  let releaseAutoReset: (() => void) | undefined;
+  let releaseCodexProbe: (() => void) | undefined;
   try {
     return await run();
   } catch {
@@ -675,6 +751,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     record(identity, "error", 500, undefined, false, undefined, model);
     return providerError(style, 500, "internal error while handling the request", "internal_error");
   } finally {
+    releaseAutoReset?.();
+    releaseCodexProbe?.();
     releaseBody?.();
   }
 
@@ -907,7 +985,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const bridgeUntilReading = (name: string, key: string, until: number): void => {
     exhausted.set(key, until);
     probes.set(key, deps.now().getTime() + QUOTA_PROBE_INTERVAL_MS);
-    if (!deps.refreshUsage) return; // no source to read again: the provider's reset decides alone
+    if (!deps.refreshUsage || recoverySignal) return; // Recovery reads direct usage and publishes confirmed headroom.
     const forModel = model;
     void refreshFromSource(name).then(async () => {
       if (exhausted.get(key) !== until) return; // a newer answer replaced this hold
@@ -1136,6 +1214,31 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     return undefined;
   };
+  const autoReset = app.provider === "codex" && app.target.kind === "pool" && !side &&
+    body.kind === "buffered" && isModelCall(req.method, rest) ? deps.autoReset : undefined;
+  const autoResetSignal = deps.drainSignal ? AbortSignal.any([ctrl.signal, deps.drainSignal]) : ctrl.signal;
+  let cachedQuotaProbe = false;
+  let rulesEnabled: Promise<boolean> | undefined;
+  const enabled = () => rulesEnabled ??= Promise.resolve().then(() => autoReset?.enabled() ?? false);
+  type QuotaReceipt = { deadlineAt: number; provider429At: number };
+  const quotaReceipts = new WeakMap<Response, QuotaReceipt>();
+  let firstQuota: (QuotaReceipt & { identity: string; name: string; bytes: Uint8Array; headers: Headers; statusText: string }) | undefined;
+  let recoverySignal: AbortSignal | undefined;
+  const startRecovery = (deadlineAt: number): AbortSignal => {
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    const remaining = deadlineAt - performance.now();
+    const timer = setTimeout(stop, Math.max(0, remaining));
+    autoResetSignal.addEventListener("abort", stop, { once: true });
+    if (autoResetSignal.aborted || remaining <= 0) stop();
+    releaseAutoReset = () => {
+      clearTimeout(timer);
+      autoResetSignal.removeEventListener("abort", stop);
+      releaseAutoReset = undefined;
+    };
+    return AbortSignal.any([ctrl.signal, controller.signal]);
+  };
+
   let picked = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined, model);
   while ("reject" in picked && picked.reject === "no-headroom" && (await waitForShortHold())) picked = await pickIdentity(app, deps, await exhaustedNames(), model);
   if (replaying && "reject" in picked && picked.reject === "no-headroom" && app.target.kind === "pool") {
@@ -1162,6 +1265,33 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     const current = usageForModel(await deps.usageFor(app.provider, picked.identity).catch(() => undefined), model);
     const currentUtil = reserveUtilisationOf(current);
     if (currentUtil !== undefined && currentUtil >= (app.reservePercent ?? DEFAULT_RESERVE_PERCENT)) picked = { reject: "no-headroom" };
+  }
+  if (autoReset && "reject" in picked && picked.reject === "no-headroom" && !autoResetSignal.aborted) {
+    const fullCandidate = async (): Promise<string | undefined> => {
+      const members = await eligibleMembers(app, deps);
+      const candidate = members.find((name) => !holds.has(exKey(name)));
+      if (candidate === undefined) return undefined;
+      const configured = await allowedMembers(app, deps);
+      const readings = await Promise.all(configured.map((name) => deps.usageFor("codex", name)));
+      const checkedAt = deps.now().getTime();
+      return readings.every((reading) => exhaustedWeeklyReset(reading, checkedAt) !== undefined) ? candidate : undefined;
+    };
+    const canProbe = await untilStopped(autoResetSignal, async () =>
+      await fullCandidate() !== undefined && await enabled()).catch(() => false);
+    if (canProbe) {
+      releaseCodexProbe = await codexProbeGate.acquire(MARGINAL_QUOTA_REFRESH_BUDGET_MS, autoResetSignal);
+      if (releaseCodexProbe) {
+        const probe = await untilStopped(autoResetSignal, fullCandidate).catch(() => undefined);
+        if (probe !== undefined && !autoResetSignal.aborted) {
+          cachedQuotaProbe = true;
+          picked = { identity: probe };
+        } else {
+          releaseCodexProbe();
+          releaseCodexProbe = undefined;
+          picked = await pickIdentity(app, deps, await exhaustedNames(), model);
+        }
+      }
+    }
   }
   const pick = picked;
   if ("reject" in pick) {
@@ -1201,23 +1331,38 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
   }
 
-  const send = (cred: ProviderCredential): Promise<Response> => {
+  const send = (cred: ProviderCredential, signal = ctrl.signal): Promise<Response> => {
     // A client that is already gone gets no upstream call.
-    if (req.signal.aborted || ctrl.signal.aborted) return Promise.reject(new DOMException("aborted", "AbortError"));
+    if (req.signal.aborted || signal.aborted) return Promise.reject(new DOMException("aborted", "AbortError"));
     const headers = upstreamHeaders(adapter, cred, req.headers);
-    const init: RequestInit & { duplex?: "half" } = { method: req.method, headers, signal: ctrl.signal, redirect: "manual" };
+    const init: RequestInit & { duplex?: "half" } = { method: req.method, headers, signal, redirect: "manual" };
     if (body.kind === "buffered" && body.bytes.length > 0) init.body = body.bytes;
     else if (body.kind === "stream") {
       init.body = body.stream;
       init.duplex = "half";
     }
-    return deps.fetch(upstreamUrl, init);
+    return deps.fetch(upstreamUrl, init).then((res) => {
+      if (autoReset && res.status === 429) {
+        const receivedAt = performance.now();
+        const provider429At = deps.now().getTime();
+        quotaReceipts.set(res, { deadlineAt: receivedAt + AUTO_RESET_HOLD_MS, provider429At });
+      }
+      return res;
+    });
   };
 
   /** One attempt for `identity`, including at most one 401 refresh and retry. */
-  const attempt = async (ident: string): Promise<Response> => {
+  const attempt = async (ident: string, signal = ctrl.signal): Promise<Response> => {
     let cred = await deps.creds.get(app.provider, ident);
-    let res = await send(cred);
+    const checkedSend = async (): Promise<Response> => {
+      const res = await send(cred, signal);
+      if (signal.aborted) {
+        void discard(res);
+        signal.throwIfAborted();
+      }
+      return res;
+    };
+    let res = await checkedSend();
     if (res.status === 401 && adapter.refreshable && !side) {
       try {
         cred = await deps.creds.refreshAfter401(app.provider, ident, cred.accessToken);
@@ -1237,20 +1382,60 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       // The credential is refreshed for the next request; a streamed body cannot be sent again.
       if (!replayable) return res;
       await discard(res);
-      res = await send(cred);
+      res = await checkedSend();
     }
     return res;
   };
 
   /** 429 is quota or rate limit. 402 is a payment-required signal some providers use for exhausted credit. A 403 counts only when its (bounded) JSON body names a quota error type or code. */
-  const isQuota = async (res: Response): Promise<{ quota: boolean; res: Response }> => {
+  const isQuota = async (res: Response, name: string, signal?: AbortSignal): Promise<{ quota: boolean; res: Response; relay?: true }> => {
     if (side) return { quota: false, res }; // a side route's 402/403/429 is its own, not a sign this login is out of quota
     if (res.headers.get(SUBSCRIPTION_EXHAUSTED_HEADER) === "1") return { quota: true, res };
     if (res.status === 402 || res.status === 429) {
       if (res.status === 429 && app.provider === "claude" && provesSubscriptionExhaustion(res.headers)) return { quota: true, res };
-      const p = await peek(res, ERROR_PEEK_BYTES);
+      const receipt = quotaReceipts.get(res);
+      let initialSignal = !firstQuota && receipt ? startRecovery(receipt.deadlineAt) : undefined;
+      if (initialSignal && receipt) {
+        const active = await untilStopped(initialSignal, enabled).catch(() => undefined);
+        if (ctrl.signal.aborted) {
+          void discard(res);
+          ctrl.signal.throwIfAborted();
+        }
+        if (active === undefined || initialSignal.aborted || performance.now() >= receipt.deadlineAt) {
+          releaseAutoReset?.();
+          return { quota: false, res, relay: true };
+        }
+        if (active === false) {
+          releaseAutoReset?.();
+          initialSignal = undefined;
+        }
+      }
+      // If inspection stops, return the buffered prefix and the pending read with the rest of the body.
+      const p = await peek(res, ERROR_PEEK_BYTES, initialSignal ?? signal, initialSignal !== undefined);
+      if (ctrl.signal.aborted) {
+        void discard(p.res);
+        ctrl.signal.throwIfAborted();
+      }
+      if (initialSignal && receipt && (initialSignal.aborted || performance.now() >= receipt.deadlineAt)) {
+        releaseAutoReset?.();
+        return { quota: false, res: p.res, relay: true };
+      }
       const quota = p.whole && isSubscriptionUsageBody(p.bytes);
-      if (!quota) return { quota: false, res: p.res };
+      const codexQuota = receipt && p.whole && isCodexSubscription429(p.bytes);
+      if (codexQuota && !firstQuota && initialSignal) {
+        firstQuota = {
+          ...receipt,
+          identity: name === identity ? identity : await untilStopped(initialSignal, () => canon(name)).catch(() => name),
+          name,
+          bytes: p.bytes,
+          headers: new Headers(res.headers),
+          statusText: res.statusText,
+        };
+        recoverySignal = initialSignal;
+      } else if (initialSignal) {
+        releaseAutoReset?.();
+      }
+      if (!quota && !(codexQuota && firstQuota)) return { quota: false, res: p.res };
       const headers = new Headers(p.res.headers);
       headers.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
       const reset = subscriptionResetAt(p.bytes);
@@ -1261,7 +1446,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       return { quota: true, res: new Response(p.res.body, { status: p.res.status, statusText: p.res.statusText, headers }) };
     }
     if (res.status !== 403) return { quota: false, res };
-    const p = await peek(res, ERROR_PEEK_BYTES);
+    const p = await peek(res, ERROR_PEEK_BYTES, signal);
     const quota = p.whole && isSubscriptionUsageBody(p.bytes);
     if (!quota) return { quota: false, res: p.res };
     const headers = new Headers(p.res.headers);
@@ -1276,11 +1461,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
 
   /** A bounded stream prefix may confirm subscription exhaustion before the client sees any response event. */
-  const retryable = async (res: Response): Promise<{ retry?: RetryInfo; res: Response }> => {
+  const retryable = async (res: Response, signal?: AbortSignal): Promise<{ retry?: RetryInfo; res: Response }> => {
     if (side || !isModelCall(req.method, rest)) return { res };
     const requestId = upstreamRequestId(res.headers);
     if (res.status === 200 && (res.headers.get("content-type") ?? "").includes("text/event-stream")) {
-      const p = await peekFirstEvent(res, ERROR_PEEK_BYTES);
+      const p = await peekFirstEvent(res, ERROR_PEEK_BYTES, signal);
       if (p.first.state !== "error") return { res: p.res };
       if (isSubscriptionUsageError(p.first.errorType, p.first.errorCode, p.first.errorMessage)) {
         const headers = new Headers(p.res.headers);
@@ -1297,14 +1482,71 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
    * `retryable`, but a body that breaks while it is read gives a failed result (no `res`, a `server_error` retry) and
    * not an exception, so the next member still gets the request. A client that is gone still throws.
    */
-  const classify = async (res: Response): Promise<{ retry?: RetryInfo; res?: Response }> => {
+  const classify = async (res: Response, signal?: AbortSignal): Promise<{ retry?: RetryInfo; res?: Response }> => {
     try {
-      return await retryable(res);
+      return await retryable(res, signal);
     } catch (err) {
-      if (req.signal.aborted || ctrl.signal.aborted) throw err;
+      if (req.signal.aborted || ctrl.signal.aborted || signal?.aborted) throw err;
       // A no-op when the peek already locked the body; it frees the connection when the failure came earlier.
       await discard(res);
       return { retry: { reason: "server_error", http: res.status, errorType: "read_failed" } };
+    }
+  };
+
+  /** Recovery uses the member that supplied fresh headroom and sends one replay. */
+  const recover = async (signal: AbortSignal, { deadlineAt, provider429At }: QuotaReceipt): Promise<{ res: Response; identity: string; name: string } | undefined> => {
+    if (!autoReset) return undefined;
+    let unused: Response | undefined;
+    try {
+      return await untilStopped(signal, async () => {
+        const members = await allowedMembers(app, deps);
+        const names = new Map(await Promise.all(members.map(async (name) => [await canon(name), name] as const)));
+        signal.throwIfAborted();
+        const input = {
+          members: [...names.keys()],
+          reservePercent: app.reservePercent ?? DEFAULT_RESERVE_PERCENT,
+          model,
+          signal,
+          deadlineAt,
+          provider429At,
+        };
+        const restored = await autoReset.recover(input);
+        if (restored === undefined) return undefined;
+        const name = names.get(restored);
+        if (name === undefined) return undefined;
+        signal.throwIfAborted();
+        releaseHolds(name);
+        const credential = await deps.creds.get("codex", restored);
+        signal.throwIfAborted();
+        const res = await send(credential, signal);
+        if (signal.aborted) {
+          void discard(res);
+          return undefined;
+        }
+        unused = res;
+        if (!res.ok) return undefined;
+        if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+          const peeked = await peekFirstEvent(res, ERROR_PEEK_BYTES, signal, true);
+          if (signal.aborted) {
+            void discard(peeked.res);
+            return undefined;
+          }
+          unused = peeked.res;
+          if (peeked.first.state !== "pass") return undefined;
+        } else if (res.body) {
+          const peeked = await peek(res, REPLAY_LIMIT_BYTES, signal);
+          unused = peeked.res;
+          if (!peeked.whole) return undefined;
+        }
+        if (signal.aborted || performance.now() >= deadlineAt) return undefined;
+        const accepted = unused;
+        unused = undefined;
+        return { res: accepted, identity: restored, name };
+      });
+    } catch {
+      return undefined;
+    } finally {
+      if (unused) void discard(unused);
     }
   };
 
@@ -1348,7 +1590,25 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     let first: Response | undefined;
     let credErr: unknown;
     try {
-      first = await attempt(identity);
+      if (cachedQuotaProbe) {
+        // Limit the probe's wait for headers. Accepted responses keep their normal stream lifetime.
+        const probeController = new AbortController();
+        const abortProbe = () => probeController.abort();
+        autoResetSignal.addEventListener("abort", abortProbe, { once: true });
+        const timer = setTimeout(abortProbe, 5_000);
+        const signal = AbortSignal.any([ctrl.signal, probeController.signal]);
+        try {
+          if (autoResetSignal.aborted) abortProbe();
+          first = await untilStopped(signal, () => attempt(identity, signal));
+        } finally {
+          clearTimeout(timer);
+          autoResetSignal.removeEventListener("abort", abortProbe);
+          releaseCodexProbe?.();
+          releaseCodexProbe = undefined;
+        }
+      } else {
+        first = await attempt(identity);
+      }
     } catch (err) {
       if (!poolReplay || ctrl.signal.aborted || req.signal.aborted || !isCredentialFailure(err)) throw err;
       credErr = err;
@@ -1358,7 +1618,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (!poolReplay && app.target.kind === "pool" && cur) {
       // A body that cannot be replayed (streamed, over the replay cap) gets no failover, but its quota answer still holds
       // the member back, so the next request does not land on the same full member.
-      const q = await isQuota(cur);
+      const q = await isQuota(cur, pick.identity);
       cur = q.res;
       if (q.quota) holdQuota(pick.identity, cur);
     }
@@ -1369,11 +1629,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       /** Members that answered an overload or server error: not asked again for this request, whatever a short-hold wait clears. */
       const overloaded = new Set<string>();
       if (cur) {
-        const q = await isQuota(cur);
+        const q = await isQuota(cur, pick.identity);
         cur = q.res;
         quota = q.quota;
         if (quota) holdQuota(pick.identity, cur);
-        else {
+        else if (!q.relay) {
           const o = await classify(cur);
           cur = o.res;
           retry = o.retry;
@@ -1390,89 +1650,123 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       // until one answers or none is left (the last answer then stands, or the credential error if there was none).
       const tried = new Set<string>();
       let name = pick.identity;
-      while (quota || !cur || retry) {
-        tried.add(name);
-        const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried, ...overloaded]), model);
-        if (!("identity" in next)) {
-          // Everyone left is only briefly held: wait for the first to free, then try the pool again from the top.
-          if (quota && cur && (await waitForShortHold())) {
-            tried.clear();
-            name = "";
+      const whileRecovering = <T>(work: () => Promise<T>): Promise<T> => recoverySignal ? untilStopped(recoverySignal, work) : work();
+      try {
+        while (quota || !cur || retry) {
+          tried.add(name);
+          const next = await whileRecovering(async () => pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried, ...overloaded]), model));
+          if (!("identity" in next)) {
+            // Everyone left is only briefly held: wait for the first to free, then try the pool again from the top.
+            if (quota && cur && !cachedQuotaProbe && !recoverySignal && (await waitForShortHold())) {
+              tried.clear();
+              name = "";
+              continue;
+            }
+            break;
+          }
+          name = next.identity;
+          // If the next identity cannot even be tried, it is skipped; the client keeps the last upstream answer.
+          let second: Response;
+          try {
+            second = await whileRecovering(() => attempt(next.identity, recoverySignal));
+          } catch (err) {
+            if (req.signal.aborted || ctrl.signal.aborted) {
+              if (cur) void discard(cur);
+              throw new DOMException("aborted", "AbortError");
+            }
+            if (recoverySignal?.aborted) throw err;
+            if (isCredentialFailure(err)) {
+              credErr = err;
+              await whileRecovering(() => holdCredentialFailure(name, err));
+            }
+            tried.add(name);
             continue;
           }
-          break;
-        }
-        name = next.identity;
-        // If the next identity cannot even be tried, it is skipped; the client keeps the last upstream answer.
-        let second: Response;
-        try {
-          second = await attempt(next.identity);
-        } catch (err) {
-          if (req.signal.aborted || ctrl.signal.aborted) {
-            if (cur) await discard(cur);
-            throw new DOMException("aborted", "AbortError");
+          // The new answer is read before the old one goes: a body that breaks (in `isQuota` or `classify`) leaves the old answer standing.
+          let sq: Awaited<ReturnType<typeof isQuota>>;
+          let o: { retry?: RetryInfo; res?: Response };
+          try {
+            sq = await isQuota(second, name, recoverySignal);
+            o = sq.quota || sq.relay ? { res: sq.res, retry: undefined } : await classify(sq.res, recoverySignal);
+            if (o.retry?.quota && o.res) sq = { quota: true, res: o.res };
+          } catch (err) {
+            if (req.signal.aborted || ctrl.signal.aborted) {
+              if (cur) void discard(cur);
+              throw err;
+            }
+            if (recoverySignal?.aborted) {
+              void discard(second);
+              throw err;
+            }
+            await discard(second);
+            sq = { quota: false, res: second };
+            o = { retry: { reason: "server_error", http: second.status, errorType: "read_failed" } };
           }
-          if (isCredentialFailure(err)) {
-            credErr = err;
-            await holdCredentialFailure(name, err);
+          if (!o.res) {
+            overloaded.add(name);
+            credErr = credErr ?? new Error("upstream answer unreadable");
+            if (!cur) retry = o.retry;
+            continue;
           }
-          tried.add(name);
-          continue;
-        }
-        // The new answer is read before the old one goes: a body that breaks (in `isQuota` or `classify`) leaves the old answer standing.
-        let sq: { quota: boolean; res: Response };
-        let o: { retry?: RetryInfo; res?: Response };
-        try {
-          sq = await isQuota(second);
-          o = sq.quota ? { res: sq.res, retry: undefined } : await classify(sq.res);
-          if (o.retry?.quota && o.res) sq = { quota: true, res: o.res };
-        } catch (err) {
-          if (req.signal.aborted || ctrl.signal.aborted) {
-            if (cur) await discard(cur);
-            throw err;
+          if (!sq.quota && !o.retry) {
+            releaseAutoReset?.();
+            recoverySignal = undefined;
           }
-          await discard(second);
-          sq = { quota: false, res: second };
-          o = { retry: { reason: "server_error", http: second.status, errorType: "read_failed" } };
-        }
-        if (!o.res) {
-          overloaded.add(name);
-          credErr = credErr ?? new Error("upstream answer unreadable");
-          if (!cur) retry = o.retry;
-          continue;
-        }
-        if (quota && !sq.quota && o.res.status >= 400) {
-          // Once one member is exhausted, a real error from the next member is the useful answer.
-          // Do not hide it by trying another login or by synthesising a whole-pool limit.
-          if (cur) await discard(cur);
+          if (quota && !sq.quota && o.res.status >= 400) {
+            // Once one member is exhausted, a real error from the next member is the useful answer.
+            // Do not hide it by trying another login or by synthesising a whole-pool limit.
+            if (cur) void discard(cur);
+            cur = o.res;
+            quota = false;
+            retry = undefined;
+            identity = await whileRecovering(() => canon(next.identity)).catch(() => next.identity);
+            servedBy = next.identity;
+            break;
+          }
+          const left = quota ? "quota" : retry ? retry.reason : "credential";
+          const from = identity;
+          const to = await whileRecovering(() => canon(next.identity)).catch(() => next.identity);
+          if (cur) void discard(cur);
+          deps.metrics.failover(app.name, left);
+          try {
+            log(JSON.stringify({ event: "failover", app: app.name, reason: left, from, to, ...(retry ? { http: retry.http, ...(retry.errorType ? { errorType: retry.errorType } : {}), ...(retry.requestId ? { requestId: retry.requestId } : {}) } : {}) }));
+          } catch {
+            // Observation must never affect the response.
+          }
           cur = o.res;
-          quota = false;
-          retry = undefined;
-          identity = await canon(next.identity);
+          identity = to;
           servedBy = next.identity;
-          break;
+          quota = sq.quota;
+          retry = o.retry;
+          if (quota) holdQuota(name, cur);
+          else if (retry) overloaded.add(name);
         }
-        const left = quota ? "quota" : retry ? retry.reason : "credential";
-        const from = identity;
-        const to = await canon(next.identity);
-        if (cur) await discard(cur);
-        deps.metrics.failover(app.name, left);
-        try {
-          log(JSON.stringify({ event: "failover", app: app.name, reason: left, from, to, ...(retry ? { http: retry.http, ...(retry.errorType ? { errorType: retry.errorType } : {}), ...(retry.requestId ? { requestId: retry.requestId } : {}) } : {}) }));
-        } catch {
-          // Observation must never affect the response.
+      } catch (err) {
+        if (!recoverySignal?.aborted || ctrl.signal.aborted) {
+          if (cur) void discard(cur);
+          throw err;
         }
-        cur = o.res;
-        identity = to;
-        servedBy = next.identity;
-        quota = sq.quota;
-        retry = o.retry;
-        if (quota) holdQuota(name, cur);
-        else if (retry) overloaded.add(name);
       }
       if (!cur) throw credErr;
-      // A credential failure is not evidence that the remaining pool is out of subscription usage.
-      if (quota && credErr) throw credErr;
+      // An enabled recovery still needs fresh proof from members with failed credentials.
+      if (quota && credErr && !firstQuota) {
+        void discard(cur);
+        throw credErr;
+      }
+      if (quota && firstQuota && recoverySignal) {
+        const original = firstQuota;
+        void discard(cur);
+        const restored = await recover(recoverySignal, original);
+        releaseAutoReset?.();
+        ctrl.signal.throwIfAborted();
+        cur = restored?.res ?? new Response(original.bytes, { status: 429, statusText: original.statusText, headers: original.headers });
+        servedBy = restored?.name ?? original.name;
+        identity = restored?.identity ?? original.identity;
+        quota = false;
+      } else {
+        releaseAutoReset?.();
+      }
+      firstQuota = undefined;
       if (quota) {
         // No member is left: the client gets the pool's own out-of-capacity answer, not the last member's 429.
         quietRefusals = replaying || holdable();

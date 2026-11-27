@@ -8,6 +8,7 @@ import { annotateWithSpendGuard } from "../../spend/annotate.ts";
 import { loadSpendGuardCache } from "../../spend/cache.ts";
 import type { ToolLimitResult } from "./types.ts";
 import { runWatch } from "./watch.ts";
+import { applyLimitsAutoReset, loadLimitsAutoReset } from "./auto-reset.ts";
 
 const DEFAULT_INTERVAL_SECONDS = 30;
 
@@ -49,6 +50,8 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
     return runWatch(identityFilter, flags, explicitTool, parseIntervalSeconds(flags) * 1000, compact);
   }
 
+  const autoReset = loadLimitsAutoReset(flags);
+
   // Live per-row-spinner render: only when there's an actual TTY to redraw
   // in place (an in-place redraw is meaningless piped/redirected — same
   // requirement watch.ts already has) and only for the plain report (--json
@@ -84,11 +87,12 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
       // pending here anymore, so the report's spinner frame never renders.
       { eraseOnFinish: true },
     );
-    console.log(formatLimitsReport(aggregateLimitResults(annotate(slots.flat())), new Date(), undefined, { compact }));
+    const results = applyLimitsAutoReset(aggregateLimitResults(annotate(slots.flat())), await autoReset, identityFilter);
+    console.log(formatLimitsReport(results, new Date(), undefined, { compact }));
     return;
   }
 
-  const results = await runLimitsQuery(identityFilter, flags, cached);
+  const results = applyLimitsAutoReset(await runLimitsQuery(identityFilter, flags, cached), await autoReset, identityFilter);
   if (json) {
     console.log(JSON.stringify(results, null, 2));
     return;

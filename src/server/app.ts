@@ -30,6 +30,7 @@ import { loadGatewayModelUsage, loadGatewayUsage, loadGatewayUsageHistory, type 
 import { loadGatewayLimits, mergeGatewayLimits, useClaudeResetViaGateway, useCodexResetViaGateway, type GatewayLimitsView } from "./gateway-limits.ts";
 import { GATEWAY_USAGE_WINDOW_DAYS, mergeGatewayUsageWithHistory, usageBucketZone } from "./gateway-usage.ts";
 import * as gatewayApps from "./gateway-apps.ts";
+import { registerGatewayAutoReset, type GatewayAutoResetDeps } from "./gateway-auto-reset.ts";
 import { addGatewayIdentity, addGatewayPoolMember, type GatewayIdentityAddResult } from "./gateway-identities.ts";
 import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -93,6 +94,7 @@ export interface ConsoleAppDeps extends GuardDeps {
   gatewayUsage?: (days: number) => Promise<GatewayUsageView>;
   /** Test seam for the gateway limits merge on GET /api/limits; defaults to the gateway admin API. */
   gatewayLimits?: () => Promise<GatewayLimitsView>;
+  gatewayAutoReset?: GatewayAutoResetDeps;
   /** Test seam for the gateway usage merge on GET /api/usage; defaults to the gateway admin API. */
   gatewayModelUsage?: () => Promise<GatewayModelUsageView>;
   /** Test seam for the imported host history on GET /api/usage; defaults to the gateway admin API. */
@@ -415,6 +417,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     (deps.invalidateLimits ?? invalidateLimitsCache)();
     return c.json(result);
   });
+  registerGatewayAutoReset(app, deps.gatewayAutoReset);
   /* ------------------------------ web push -------------------------------- */
   // Loaded on first use: every ais command imports this module, and start-up reads count (sync budgets).
   const pushModule = () => import("./web-push.ts");

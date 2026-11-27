@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import { ToolBadge } from "@/components/badges";
 import { ProviderLabel } from "@/components/provider-icon";
+import { AutoResetControl } from "@/components/auto-reset-control";
 import { PoolUsageCards } from "@/components/pool-usage-cards";
 import { ResetPushToggle } from "@/components/reset-push-toggle";
 import { ResetCountdown } from "@/components/reset-countdown";
@@ -31,7 +32,7 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
-import { qk, useLimitsQuery, usePoolsUsageQuery, useRefreshLimits, type LimitsRefreshTarget } from "@/hooks/queries";
+import { qk, useAutoResetQuery, useLimitsQuery, usePoolsUsageQuery, useRefreshLimits, type LimitsRefreshTarget } from "@/hooks/queries";
 import { api } from "@/lib/api";
 import { creditsNote } from "@/lib/credits-note";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
@@ -39,7 +40,7 @@ import { cn } from "@/lib/utils";
 import { canSpendCodexReset, creditReadAt, creditsAreLastKnown, spendCreditSentence } from "@/lib/codex-reset";
 import { formatResetTimes } from "@/lib/reset-time";
 import { AccountWarnings } from "@/components/account-line";
-import type { LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseCodexResetResult, UseResetResult } from "@/types/api";
+import type { AutoResetStatus, LimitFetchStatus, LimitsResponse, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult, UseCodexResetResult, UseResetResult } from "@/types/api";
 
 function StatusBadge({ status }: { status: LimitFetchStatus }) {
   switch (status) {
@@ -417,7 +418,7 @@ function RefreshButton({ label, onClick, busy, disabled, text }: { label: string
   );
 }
 
-function LimitCard({ result, onRefresh, refreshing }: { result: ToolLimitResult; onRefresh: (target: LimitsRefreshTarget) => void; refreshing: boolean }) {
+function LimitCard({ result, autoReset, onRefresh, refreshing }: { result: ToolLimitResult; autoReset?: AutoResetStatus; onRefresh: (target: LimitsRefreshTarget) => void; refreshing: boolean }) {
   const unavailable = result.status === "unavailable" || result.status === "pending";
   return (
     <Card className="gap-4">
@@ -426,7 +427,7 @@ function LimitCard({ result, onRefresh, refreshing }: { result: ToolLimitResult;
         <div className="flex items-start justify-between gap-2">
           <div className="flex min-w-0 grow flex-wrap items-center gap-2">
             <div className="flex min-w-0 grow items-center gap-2">
-              <span className="w-0 min-w-16 grow truncate font-medium" title={result.identity.name}>
+              <span className={cn("min-w-16 grow font-medium", autoReset ? "w-0 break-words" : "w-0 truncate")} title={result.identity.name}>
                 {result.identity.name}
               </span>
               <ToolBadge tool={result.toolName} />
@@ -483,6 +484,7 @@ function LimitCard({ result, onRefresh, refreshing }: { result: ToolLimitResult;
           </div>
         ) : null}
         {result.manualReset ? <ManualResetBlock reset={result.manualReset} result={result} /> : null}
+        {autoReset ? <><Separator /><AutoResetControl kind="identity" setting={autoReset} /></> : null}
       </CardContent>
     </Card>
   );
@@ -491,6 +493,9 @@ function LimitCard({ result, onRefresh, refreshing }: { result: ToolLimitResult;
 export function LimitsPage() {
   const query = useLimitsQuery();
   const poolsQuery = usePoolsUsageQuery();
+  const settings = useAutoResetQuery();
+  const autoReset = settings.data?.configured ? settings.data : undefined;
+  const identitySettings = useMemo(() => new Map(autoReset?.identities.map((identity) => [identity.name, identity])), [autoReset]);
   const { refresh, isRefreshing, anyRefreshing } = useRefreshLimits();
   // Each call has its own state: a card spins until every call that covers it ends, and each call reports its own failures.
   const runRefresh = (targets: LimitsRefreshTarget[]) => {
@@ -504,8 +509,14 @@ export function LimitsPage() {
   // A pool mirrors its active member's token, so its own limits row only ever
   // says "not fetched"; the pool cards above carry the real figures instead.
   const poolKeys = useMemo(() => new Set((poolsQuery.data?.pools ?? []).map((p) => `${p.tool}/${p.name}`)), [poolsQuery.data]);
-  const allResults = query.data?.results ?? [];
-  const results = useMemo(() => allResults.filter((r) => !poolKeys.has(`${r.toolName}/${r.identity.name}`)), [allResults, poolKeys]);
+  const results = useMemo(() => {
+    const rows = (query.data?.results ?? []).filter((r) => !poolKeys.has(`${r.toolName}/${r.identity.name}`));
+    const codexNames = new Set(rows.filter((r) => r.toolName === "codex" && r.provider === "openai").map((r) => r.identity.name));
+    for (const name of identitySettings.keys()) {
+      if (!codexNames.has(name)) rows.push({ identity: { name, label: name, configDir: "" }, provider: "openai", toolName: "codex", status: "unavailable", windows: [] });
+    }
+    return rows;
+  }, [query.data, poolKeys, identitySettings]);
 
   // Provider-first grouping, mirroring the CLI report: provider is the
   // grouping key, the wrapper tool is secondary info on each identity row.
@@ -530,7 +541,7 @@ export function LimitsPage() {
   );
   const { active, invalid } = usePageTab(tabs);
   // A provider tab is unknown until the limits have loaded: only redirect once they have.
-  if (invalid && query.data) return <PageTabRedirect to="/limits" />;
+  if (invalid && query.data && !settings.isPending) return <PageTabRedirect to="/limits" />;
   const activeGroup = providerGroups.find(([provider]) => provider === active);
 
   return (
@@ -543,6 +554,8 @@ export function LimitsPage() {
       />
 
       <PageTabs tabs={tabs} active={active} base="/limits" />
+      {settings.isError ? <ErrorBanner message={`Automatic reset settings could not be loaded. ${settings.error.message}`} /> : null}
+      {query.isError && !query.data && active !== "overview" ? <ErrorBanner message={query.error.message} /> : null}
 
       {active === "overview" ? (
         <>
@@ -550,19 +563,17 @@ export function LimitsPage() {
 
           <GlobalUsageCards title="Global usage" />
 
-          <PoolUsageCards />
+          <PoolUsageCards autoResetPools={autoReset?.pools} />
         </>
       ) : null}
 
-      {active === "overview" ? null : query.isLoading ? (
+      {active === "overview" ? null : query.isLoading && !activeGroup ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {Array.from({ length: 6 }).map((_, i) => (
             <div key={i} className="h-52 animate-pulse rounded-xl bg-muted" />
           ))}
         </div>
-      ) : query.isError && !query.data ? (
-        <ErrorBanner message={query.error.message} />
-      ) : results.length === 0 ? (
+      ) : query.isError && !query.data && !activeGroup ? null : results.length === 0 ? (
         <EmptyState
           title="No limit data"
           description="Add identities with configured credentials; quotas appear once the server can fetch them."
@@ -587,6 +598,7 @@ export function LimitsPage() {
                 <LimitCard
                   key={`${r.provider}/${r.toolName}/${r.identity.name}`}
                   result={r}
+                  autoReset={r.toolName === "codex" && r.provider === "openai" ? identitySettings.get(r.identity.name) : undefined}
                   onRefresh={(target) => runRefresh([target])}
                   refreshing={isRefreshing(r.toolName, r.identity.name)}
                 />

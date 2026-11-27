@@ -18,6 +18,24 @@ export interface Identity {
   retiredAt?: string;
 }
 
+export type AutoResetScope = "pool" | "identity";
+export interface AutoResetStatus {
+  name: string;
+  enabled: boolean;
+  lastClaim?: {
+    pool: string;
+    identity: string;
+    startedAt: string;
+    creditExpiresAt?: string;
+    status: "pending" | "reset" | "rejected" | "unknown";
+  };
+}
+export type AutoResetResponse = { configured: false } | {
+  configured: true;
+  pools: Array<AutoResetStatus & { members: string[] }>;
+  identities: AutoResetStatus[];
+};
+
 /* Status */
 
 export interface ToolStatus {

@@ -12,6 +12,7 @@ export const qk = {
   identities: ["identities"] as const,
   permissions: ["permissions"] as const,
   limits: ["limits"] as const,
+  autoReset: ["codex-auto-reset"] as const,
   localModels: ["local-models"] as const,
   usage: ["usage"] as const,
   poolsUsage: ["pools-usage"] as const,
@@ -95,6 +96,10 @@ export function useLocalModelsQuery() {
     queryFn: api.getLocalModels,
     refetchInterval: POLL.registry,
   });
+}
+
+export function useAutoResetQuery() {
+  return useQuery({ queryKey: qk.autoReset, queryFn: api.getAutoReset, refetchInterval: POLL.registry });
 }
 
 export function useLimitsQuery() {

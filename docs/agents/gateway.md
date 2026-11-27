@@ -562,6 +562,26 @@ so Codex and `codex app-server` show real limits. It reads the app from the fold
 token); a failure there is reported and never hides the minted-token message. `--check` writes nothing and reports each
 folder (`ok` or the problem).
 
+### Automatic Codex resets
+
+An automatic reset requires both a named Codex pool rule and permission for its member identity. Both settings default to off.
+The gateway can spend a credit when the Codex routing pool exhausts weekly quota. Settings changes do not spend credits.
+
+```sh
+ais gateway auto-reset list [--json]
+ais gateway auto-reset set pool <pool-name> on
+ais gateway auto-reset set identity <canonical-name> on
+ais gateway auto-reset set identity <canonical-name> off
+```
+
+The commands use `AIS_GATEWAY_ADMIN_URL` and `AIS_GATEWAY_ADMIN_TOKEN`. The console has controls on Limits account and pool cards.
+`ais limits --tool=codex` shows the settings and last claim.
+
+Send the admin bearer token with both requests. `GET /limits/codex/auto-reset` lists named Codex pools, managed members and active pins.
+Each entry has `name` and `enabled`. Pool entries include `members`. An entry with history includes `lastClaim` with
+`pool`, `identity`, `startedAt`, `status` and `creditExpiresAt` when available. `PUT /limits/codex/auto-reset/{pool|identity}`
+takes `{"name":"example","enabled":true}` and returns the saved name and setting. Use the exact pool or canonical identity name.
+
 ### Kimi uploads the provider marked as failed (`src/gateway/media-recovery.ts`)
 
 kimi-code uploads every image and video to Kimi's file service (`POST /v1/files`) and sends the returned id in the chat

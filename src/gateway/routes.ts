@@ -255,7 +255,7 @@ function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, pat
 const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 export interface ResetCreditsCache {
-  [app: string]: { until: number; status: number; body: string } | undefined;
+  [app: string]: { generation: string; until: number; status: number; body: string } | undefined;
 }
 
 export interface ServeContext {
@@ -484,26 +484,41 @@ export function availableCount(body: unknown): number | undefined {
   return typeof n === "number" && Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
 }
 
-/** Reset credits, remembered per app for RESET_CREDITS_TTL_MS so an app polling it cannot drive one upstream call per member per poll. */
+/** Reuse a pooled reset-credit answer only while every routed member keeps the same generation. */
 async function codexResetCredits(ctx: ServeContext): Promise<Response> {
-  const nowMs = ctx.deps.now().getTime();
-  const hit = ctx.cache[ctx.app.name];
-  if (hit && hit.until > nowMs) return new Response(hit.body, { status: hit.status, headers: { "content-type": "application/json" } });
-  const res = await readResetCredits(ctx);
-  const body = await res.clone().text();
-  ctx.cache[ctx.app.name] = { until: nowMs + (res.ok ? RESET_CREDITS_TTL_MS : RESET_CREDITS_FAILURE_TTL_MS), status: res.status, body };
-  return res;
-}
-
-/** Sums the unspent reset credits over the members the app may use. Each is read by the gateway with its own login; only the total is returned. */
-async function readResetCredits(ctx: ServeContext): Promise<Response> {
-  const adapter = adapterFor("codex");
+  const unavailable = () => providerError(ctx.style, 502, "reset credit figures are not available for this app", "reset_credits_unavailable");
   let names: string[];
   try {
     names = await allowedMembers(ctx.app, ctx.deps);
   } catch {
-    return providerError(ctx.style, 502, "reset credit figures are not available for this app", "reset_credits_unavailable");
+    return unavailable();
   }
+  const generation = () => ctx.deps.codexResetGenerations?.(names)
+    .then((versions) => JSON.stringify(versions.sort()), () => undefined);
+  let before = await generation();
+  if (before === undefined) return readResetCredits(ctx, names);
+  const nowMs = ctx.deps.now().getTime();
+  const hit = ctx.cache[ctx.app.name];
+  if (hit?.generation === before && hit.until > nowMs) {
+    return new Response(hit.body, { status: hit.status, headers: { "content-type": "application/json" } });
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await readResetCredits(ctx, names);
+    const after = await generation();
+    if (after === before) {
+      const body = await res.clone().text();
+      ctx.cache[ctx.app.name] = { generation: before, until: nowMs + (res.ok ? RESET_CREDITS_TTL_MS : RESET_CREDITS_FAILURE_TTL_MS), status: res.status, body };
+      return res;
+    }
+    if (after === undefined) break;
+    before = after;
+  }
+  return unavailable();
+}
+
+/** Sums the unspent reset credits over the members the app may use. Each is read by the gateway with its own login; only the total is returned. */
+async function readResetCredits(ctx: ServeContext, names: string[]): Promise<Response> {
+  const adapter = adapterFor("codex");
   let total = 0;
   let known = 0;
   await Promise.all(
