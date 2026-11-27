@@ -71,6 +71,8 @@ export interface AutoResetStore {
   findClaim(eventKey: string, generation?: number): Promise<AutoResetClaim | undefined>;
   claim(input: AutoResetClaimInput): Promise<ClaimResult>;
   beginSpend(redeemRequestId: string, identity: string, accountId?: string): Promise<boolean>;
+  /** True while a claim on this member has a POST with no recorded outcome. A manual spend must wait for it. */
+  spendPending(provider: AutoResetProvider, identity: string): Promise<boolean>;
   recordReportedCredit(redeemRequestId: string, creditId: string, knownOutcome?: CodexResetOutcome): Promise<void>;
   finish(eventKey: string, status: TerminalStatus, creditedId?: string, result?: ClaimFinish): Promise<void>;
   markRecovered(eventKey: string, redeemRequestId: string, recoveredAt: string): Promise<void>;
@@ -171,6 +173,13 @@ export class MemoryAutoResetStore implements AutoResetStore {
     this.claims.set(input.eventKey, generations);
     this.claimedCredits.add(creditId);
     return { kind: "created" };
+  }
+
+  async spendPending(provider: AutoResetProvider, identity: string): Promise<boolean> {
+    for (const claims of this.claims.values()) {
+      if (claims.some(({ input, summary }) => input.provider === provider && summary.identity === identity && summary.spendPending === true)) return true;
+    }
+    return false;
   }
 
   async beginSpend(redeemRequestId: string, identity: string): Promise<boolean> {
@@ -343,6 +352,12 @@ export class PgAutoResetStore implements AutoResetStore {
         ON CONFLICT DO NOTHING RETURNING event_key`;
       return rows.length === 1 ? { kind: "created" } : { kind: "blocked" };
     });
+  }
+
+  async spendPending(provider: AutoResetProvider, identity: string): Promise<boolean> {
+    const rows = await this.sql`SELECT 1 FROM codex_auto_reset_claims
+      WHERE provider = ${provider} AND identity = ${identity} AND spend_pending LIMIT 1`;
+    return rows.length === 1;
   }
 
   async beginSpend(redeemRequestId: string, identity: string, accountId?: string): Promise<boolean> {

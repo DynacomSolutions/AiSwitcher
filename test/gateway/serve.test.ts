@@ -2519,6 +2519,63 @@ describe("automatic Claude reset integration", () => {
     }
   });
 
+  describe("the manual spend", () => {
+    const manual = async (over: Partial<GatewayHooks>) => {
+      const g = await boot({
+        poolMembers: async () => [identity], canonical: async (_provider, member) => member, keepAliveAccounts: async () => [], ...over,
+      });
+      return (member = identity) => fetch(`http://127.0.0.1:${g.adminPort}/limits/claude/${member}/resets/${grantId}`, {
+        method: "POST", headers: { authorization: `Bearer ${ADMIN}` },
+      });
+    };
+    const pendingClaim = async (auto: MemoryAutoResetStore) => {
+      const requestId = crypto.randomUUID();
+      await auto.setEnabled("claude", pool, true);
+      expect(await auto.claim({
+        provider: "claude", eventKey: "manual-spend-fence", pool, identity, creditId: grantId,
+        creditExpiresAt: new Date(Date.now() + 600_000).toISOString(), startedAt: new Date().toISOString(), redeemRequestId: requestId,
+        usageEvidence: [{ identity, resetAt: new Date(Date.now() + 3_600_000).toISOString(), capturedAt: new Date().toISOString(), weeklyUtilisation: 100 }],
+        creditEvidence: { reason: "only_candidate", inventories: [] },
+      })).toEqual({ kind: "created" });
+      expect(await auto.beginSpend(requestId, identity)).toBe(true);
+      return requestId;
+    };
+
+    test("it waits while an automatic Claude spend on the same member has no outcome", async () => {
+      const auto = new MemoryAutoResetStore();
+      let spent = 0;
+      const call = await manual({
+        autoReset: { store: auto, pools: async () => [] },
+        claudeReset: async (member, grant) => { spent++; return { identity: member, grantId: grant, result: "reset", cleared: [] }; },
+      });
+      const requestId = await pendingClaim(auto);
+      const refused = await call();
+      expect(refused.status).toBe(409);
+      expect(spent).toBe(0);
+      // A known outcome clears the fence. The member then accepts the manual spend again.
+      await auto.recordReportedCredit(requestId, grantId, "reset");
+      expect((await call()).status).toBe(200);
+      expect(spent).toBe(1);
+    });
+
+    test("it runs inside the redemption lock, one spend at a time", async () => {
+      let running = 0;
+      let overlap = 0;
+      const call = await manual({
+        autoReset: { store: new MemoryAutoResetStore(), pools: async () => [] },
+        claudeReset: async (member, grant) => {
+          overlap = Math.max(overlap, ++running);
+          await Bun.sleep(30);
+          running--;
+          return { identity: member, grantId: grant, result: "reset", cleared: [] };
+        },
+      });
+      const answers = await Promise.all([call(), call("fixture-claude-other"), call()]);
+      expect(answers.map((answer) => answer.status)).toEqual([200, 200, 200]);
+      expect(overlap).toBe(1);
+    });
+  });
+
   test("a refused usage read is not proof of a full week, so nothing is spent", async () => {
     const state = await setup("claude", { usageStatus: 429 });
     const answer = await state.call();

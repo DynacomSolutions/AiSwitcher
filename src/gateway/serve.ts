@@ -129,6 +129,8 @@ export interface GatewayHooks {
   usageFor?: GatewayDeps["usageFor"];
   /** Tests: replaces the reset spend behind POST /limits/claude/:identity/resets/:grant. */
   spendReset?(identity: string, grantId: string): Promise<unknown>;
+  /** Tests: replaces the Claude POST inside the redemption lock, so the lock and the claim fence still apply. */
+  claudeReset?(identity: string, grantId: string): Promise<unknown>;
   /** Tests: replaces the one Codex consume behind POST /limits/codex/:identity/resets/use. */
   spendCodexReset?(identity: string, redeemRequestId: string, signal?: AbortSignal): Promise<unknown>;
   autoReset?: { store: AutoResetStore; pools: (provider: AutoResetProvider) => Promise<AutoResetPool[]> };
@@ -1351,11 +1353,15 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     poolMembers,
     canonical,
     // The member's stored credential spends the grant; never refreshed here (the keep-alive owns rotation).
-    spendReset: hooks.spendReset ?? (async (identity, grantId) => {
-      const out = await useClaudeReset(identity, grantId, { noRefresh: true });
+    // It shares the redemption lock with the automatic spend, and it waits for an unresolved automatic POST on the same member.
+    spendReset: hooks.spendReset ?? ((identity, grantId) => withRedemptionLock(async () => {
+      if (autoResetConfig && await bounded(autoResetConfig.store.spendPending("claude", identity), 2_000, "Claude reset outcome")) {
+        throw Object.assign(new Error("An automatic Claude reset on this account has no recorded outcome yet"), { status: 409 });
+      }
+      const out = await (hooks.claudeReset ?? ((name, grant) => useClaudeReset(name, grant, { noRefresh: true })))(identity, grantId);
       void usage.refreshNow("claude", identity).catch(() => {});
       return out;
-    }),
+    })),
     spendCodexReset: hooks.spendCodexReset ?? (async (identity, redeemRequestId, signal) => {
       const before = await usage.get("codex", identity).catch(() => undefined);
       const beforeAt = before ? Date.parse(before.capturedAt) : Number.NaN;
