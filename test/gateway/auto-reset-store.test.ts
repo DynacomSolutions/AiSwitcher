@@ -316,10 +316,11 @@ if (!url && process.env.CI && !optOut) {
       ]);
 
       const target = claim("disabled-during-claim", ["delta"]);
+      await a.setEnabled("codex", target.pool, true);
       const updated = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
       const disable = sqlA.begin(async (tx) => {
-        await tx`UPDATE codex_auto_reset_settings SET enabled = false WHERE kind = 'identity' AND name = ${target.identity}`;
+        await tx`UPDATE auto_reset_settings SET enabled = false WHERE provider = 'codex' AND name = ${target.pool}`;
         updated.resolve();
         await release.promise;
       });
