@@ -982,7 +982,7 @@ describe("direct Codex auto-reset usage", () => {
           primary_window: { used_percent: modelUsed, limit_window_seconds: 18_000, reset_at: resetAt },
         },
       }, ...(unknownWindow ? [{ normal_model_slug: "unknown-fixture-model" }] : [])],
-    })) as typeof fetch;
+    })) as unknown as typeof fetch;
     const readPool = () => fetchGatewayCodexUsage(credential, fetcher, () => nowAt, new AbortController().signal, "pool");
     const scope = { tool: "codex" as const, pool: "sample-pool", members: [identity] };
     const creditId = "credit-SYNTHETIC_FIXTURE-pool";
