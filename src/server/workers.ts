@@ -98,7 +98,7 @@ async function cachedScan<T>(
     if (!result.ok) throw new Error(result.error ?? `${kind} scan failed`);
     return result;
   };
-  const maxAgeMs = kind === "limits" && typeof params.maxAgeS === "number" ? Math.max(5, params.maxAgeS) * 1000 : undefined;
+  const maxAgeMs = kind === "limits" && typeof params.maxAgeS === "number" ? (params.maxAgeS <= 0 ? 0 : Math.max(5, params.maxAgeS)) * 1000 : undefined;
   // usage/breakdown/tree/sessions are the slow scans (tokscale can run for
   // minutes; tree/sessions walk every transcript): serve the last-good value
   // immediately and refresh in the background. Only usage/breakdown have a

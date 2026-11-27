@@ -78,3 +78,64 @@ test("GET /api/limits serves the gateway rows over the host scan and falls back 
     await rm(home, { recursive: true, force: true });
   }
 }, 45_000);
+test("GET /api/limits?refresh=1 skips the scan cache and asks the gateway for fresh reads of that tool", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ais-limits-refresh-"));
+  const asked: string[] = [];
+  const gateway = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch(req) {
+      asked.push(new URL(req.url).pathname + new URL(req.url).search);
+      return Response.json({ limits: [{ provider: "codex", identity: "c1", status: "live", stale: true, error: "OpenAI rejected this Codex login", capturedAt: "2026-11-19T08:00:00.000Z", windows: [{ label: "week", utilization: 15 }] }] });
+    },
+  });
+  try {
+    await Bun.write(join(home, ".secrets"), `AIS_GATEWAY_ADMIN_URL=http://127.0.0.1:${gateway.port}\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n`);
+    const child = Bun.spawn([process.execPath, "--eval", `
+      import { mock } from "bun:test";
+      const workersPath = ${JSON.stringify(new URL("../../src/server/workers.ts", import.meta.url).pathname)};
+      const workers = await import(workersPath);
+      const scans = [];
+      mock.module(workersPath, () => ({
+        ...workers,
+        runScanIsolated: async (kind, params) => {
+          scans.push({ kind, ...params });
+          return { ok: true, payload: { results: [], cached: false, fetchedAt: "2026-11-19T08:00:00.000Z" } };
+        },
+      }));
+      const { createApp } = await import(${JSON.stringify(new URL("../../src/server/app.ts", import.meta.url).pathname)});
+      const base = { token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1", peerPort: 50000, peerUid: () => process.getuid?.() };
+      const app = createApp(base);
+      const get = async (path) => {
+        const res = await app.request(path, { headers: { Host: "127.0.0.1:47129" } });
+        return { status: res.status, body: await res.json() };
+      };
+      const out = {};
+      out.one = await get("/api/limits?refresh=1&tool=codex&identity=c1");
+      out.tab = await get("/api/limits?refresh=1&tool=codex");
+      out.noTool = await get("/api/limits?refresh=1");
+      out.plain = await get("/api/limits?tool=codex");
+      out.scans = scans;
+      console.log(JSON.stringify(out));
+    `], { env: { ...process.env, HOME: home, AIS_SECRETS_FILE: join(home, ".secrets") }, stdout: "pipe", stderr: "pipe", timeout: 30_000 });
+    const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect({ exitCode, stderr: exitCode ? stderr : "" }).toEqual({ exitCode: 0, stderr: "" });
+    const out = JSON.parse(stdout) as {
+      one: { status: number; body: { results: Array<{ status: string; error?: string }> } };
+      tab: { status: number };
+      noTool: { status: number };
+      plain: { status: number };
+      scans: Array<{ tool?: string; identity?: string; maxAgeS?: number }>;
+    };
+    expect(out.one.status).toBe(200);
+    expect(out.one.body.results[0]).toMatchObject({ status: "cached", error: "OpenAI rejected this Codex login" });
+    expect(out.tab.status).toBe(200);
+    expect(out.noTool.status).toBe(400);
+    // A refresh reads with no cache age at the scan and asks the gateway with fresh=1. A plain read keeps the 45 second age and no fresh.
+    expect(out.scans.map((x) => x.maxAgeS)).toEqual([0, 0, 45]);
+    expect(asked).toEqual(["/limits?provider=codex&identity=c1&fresh=1", "/limits?provider=codex&fresh=1", "/limits"]);
+  } finally {
+    gateway.stop(true);
+    await rm(home, { recursive: true, force: true });
+  }
+}, 45_000);

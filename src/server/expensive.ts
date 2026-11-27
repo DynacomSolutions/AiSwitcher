@@ -191,7 +191,7 @@ export async function limitsEnvelope(
   maxAgeS: number,
 ): Promise<LimitsEnvelope> {
   const key = `limits:${tool ?? "*"}:${identity ?? "*"}`;
-  const { value, cached } = await cache.get(key, () => runLimitsQuery(identity, flagsFor(tool, identity), false), Math.max(5, maxAgeS) * 1000);
+  const { value, cached } = await cache.get(key, () => runLimitsQuery(identity, flagsFor(tool, identity), false), (maxAgeS <= 0 ? 0 : Math.max(5, maxAgeS)) * 1000);
   return { results: value as unknown[], cached, fetchedAt: new Date().toISOString() };
 }
 

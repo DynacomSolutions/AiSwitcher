@@ -396,6 +396,13 @@ Returns the exact `ToolLimitResult[]` shape the CLI's JSON mode emits
 min 5) controls staleness tolerance. Concurrent identical requests share one
 upstream fetch.
 
+`GET /api/limits?refresh=1&tool=&identity=` is a manual refresh. `tool` is
+required. It skips every 45 second cache for this fetch: the host scan runs with
+no cache age, and the gateway reads the provider again for that tool (or for
+that one identity, when `identity` is set), including the Codex reset credits.
+A read that fails does not fail the answer. The row stays `cached` and its
+`error` says why, for example that the login needs a new sign-in.
+
 A row carries `plan` (short display label, e.g. `"Max 20x"`, `"Pro"`,
 `"Team"`, `"Plus"`, `"Standard"`, `"Max"`, `"Go"`, `"Promax"`) only when
 real wire data names the account plan: claude's profile plan (type and
