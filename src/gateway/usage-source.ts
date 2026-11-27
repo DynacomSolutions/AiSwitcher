@@ -11,12 +11,20 @@ import { usageFromLimits } from "../identities/pool/grant-file-adapter.ts";
 import type { GatewayProvider } from "./types.ts";
 import { bounded } from "./refresh-guard.ts";
 import type { SharedReading, UsageReadings } from "./usage-readings.ts";
+import { redactText } from "./upstream-error.ts";
 
 export const USAGE_TTL_MS = 45_000;
+/** A manual refresh keeps the reading of an upstream read younger than this. */
+export const MANUAL_REFRESH_MIN_AGE_MS = 15_000;
 
 export interface CodexResetSource {
   (identity: string): Promise<ManualResetInfo | undefined>;
+  /** A spend: drops the cached credits here and on every replica, so no old count shows. */
   invalidate(identity: string): Promise<void>;
+  /** A manual refresh: the next read asks OpenAI again, and a failed read keeps the last known credits (marked stale). No shared write. */
+  expire(identity: string): void;
+  /** The cached credits now, marked stale, with no read. Undefined when none are cached. */
+  peek(identity: string): ManualResetInfo | undefined;
 }
 
 /** Reads the provider's manual reset inventory with the same account-scoped headers as Codex traffic. */
@@ -48,6 +56,7 @@ export async function fetchCodexResetCredits(
   });
   return {
     availableCount,
+    readAt: new Date().toISOString(),
     ...(typeof available[0]?.title === "string" ? { label: available[0].title } : {}),
     ...(creditExpiries[0] ? { expiresAt: new Date(creditExpiries[0].endsAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) } : {}),
     ...(creditExpiries.length ? { creditExpiries } : {}),
@@ -110,6 +119,14 @@ export function createCodexResetSource(opts: {
     async invalidate(identity: string): Promise<void> {
       entries.delete(identity);
       await opts.invalidations?.invalidate(identity);
+    },
+    peek(identity: string): ManualResetInfo | undefined {
+      const entry = entries.get(identity);
+      return entry ? { ...entry.value, stale: true } : undefined;
+    },
+    expire(identity: string): void {
+      const entry = entries.get(identity);
+      if (entry) entries.set(identity, { ...entry, at: Number.NEGATIVE_INFINITY });
     },
   });
 }
@@ -198,9 +215,18 @@ export function createUsageSource(opts: {
   let sharedDown = false;
   /** The last upstream read state per member (`ok` or `failed`), so a change is logged once, not every poll. */
   const lastState = new Map<string, "ok" | "failed">();
+  /** The newest failed read per member, until a read works again. */
+  const lastFailure = new Map<string, { error: string; at: string }>();
+  /** When the newest upstream read of each member ended (a shared reading is not one). */
+  const lastUpstream = new Map<string, number>();
   /** Logs when a member's usage read starts or stops failing: a stale figure is otherwise silent. The error text goes in the log line only. */
   const setState = (provider: GatewayProvider, identity: string, state: "ok" | "failed", error?: string): void => {
     const key = keyOf(provider, identity);
+    // The text is redacted before it is stored or logged: a parse error can repeat part of the input (a token header, for example).
+    if (error !== undefined) error = redactText(error);
+    // The newest failure text stays for the Limits page, which shows why a card is cached. A good read clears it.
+    if (state === "failed") lastFailure.set(key, { error: error ?? "no reading", at: new Date(now()).toISOString() });
+    else lastFailure.delete(key);
     const before = lastState.get(key);
     if (before === state || (before === undefined && state === "ok")) return;
     lastState.set(key, state);
@@ -287,7 +313,12 @@ export function createUsageSource(opts: {
           }
         }
         opts.onRead?.(provider, "upstream");
-        const u = await opts.fetchUsage(provider, identity, fresh ? { fresh: true } : undefined);
+        let u: PoolUsage | undefined;
+        try {
+          u = await opts.fetchUsage(provider, identity, fresh ? { fresh: true } : undefined);
+        } finally {
+          lastUpstream.set(key, now());
+        }
         // A reading with no figure (the usage API answered 429, as Anthropic's does for an account at its limit, or was
         // unavailable) keeps the last figure: answering "no limits" for a full account is wrong (T3 showed "No limits reported").
         const prev = entries.get(key)?.value;
@@ -346,6 +377,36 @@ export function createUsageSource(opts: {
     refreshNowAfterInflight: (provider: GatewayProvider, identity: string): Promise<void> => {
       const running = freshInflight.get(keyOf(provider, identity));
       return running ? running.then(() => refresh(provider, identity, true)) : refresh(provider, identity, true);
+    },
+    /**
+     * A manual refresh. Many clicks must not become many upstream reads: a read in flight is joined, and a member whose last
+     * upstream read is younger than `minAgeMs` keeps that reading. Answers true when it started a new read.
+     */
+    async refreshManual(provider: GatewayProvider, identity: string, minAgeMs = MANUAL_REFRESH_MIN_AGE_MS): Promise<boolean> {
+      const key = keyOf(provider, identity);
+      const runningFresh = freshInflight.get(key);
+      if (runningFresh) {
+        await runningFresh;
+        return false;
+      }
+      const runningPlain = inflight.get(key);
+      if (runningPlain) {
+        await runningPlain;
+        // A plain read may have answered from a shared reading up to one ttl old: a refresh needs one under `minAgeMs`.
+        if (now() - capturedMs(entries.get(key)?.value) < minAgeMs) return false;
+      }
+      const last = lastUpstream.get(key);
+      if (last !== undefined && now() - last < minAgeMs) return false;
+      await refresh(provider, identity, true);
+      return true;
+    },
+    /** A new sign-in landed for this member: its old read no longer counts, so the next manual refresh reads again. */
+    forgetUpstream(provider: GatewayProvider, identity: string): void {
+      lastUpstream.delete(keyOf(provider, identity));
+    },
+    /** Why the newest upstream read of this member failed, or undefined when the last read worked. The text carries no token. */
+    lastFailure(provider: GatewayProvider, identity: string): { error: string; at: string } | undefined {
+      return lastFailure.get(keyOf(provider, identity));
     },
     /** Waits for fetches in flight (tests). */
     async idle(): Promise<void> {

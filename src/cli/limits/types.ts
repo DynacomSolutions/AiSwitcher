@@ -92,6 +92,8 @@ export interface ManualResetInfo {
   stale?: boolean;
   /** Codex only: each available credit with its exact expiry (ISO), for the reset-expiry push. */
   creditExpiries?: { id: string; label?: string; endsAt: string }[];
+  /** Codex only: when the gateway read the credit list from OpenAI (ISO). A stale list keeps the time of its own read. */
+  readAt?: string;
 }
 
 /** What one reset grant clears: every limit, only the Fable model's weekly limit, or something not recognised. */
@@ -152,6 +154,8 @@ export interface ToolLimitResult {
   manualReset?: ManualResetInfo;
   /** True when the Gateway credential store owns this provider identity. */
   gatewayManaged?: boolean;
+  /** True when the gateway reports the stored login dead (the provider refused its refresh token): only a new sign-in helps. */
+  loginRevoked?: true;
   /** See ExtraUsageInfo. Present only on a live fetch that reported it. */
   extraUsage?: ExtraUsageInfo;
   /** Short human-readable account plan label, e.g. "Max 20x", "Pro", "Team",

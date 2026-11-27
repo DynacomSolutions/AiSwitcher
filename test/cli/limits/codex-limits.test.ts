@@ -139,6 +139,43 @@ describe("the plan on each limits path", () => {
   });
 });
 
+describe("a rejected store login", () => {
+  test("the usage read says the Codex login is dead when the gateway API reports it, and keeps the plain text otherwise", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ais-codex-revoked-"));
+    try {
+      const dir = join(root, "codex", "member");
+      await mkdir(dir, { recursive: true });
+      const auth = JSON.stringify({ tokens: { access_token: "SYNTHETIC_FIXTURE-access", refresh_token: "SYNTHETIC_FIXTURE-refresh" } });
+      await writeFile(join(dir, "auth.json"), auth);
+      const secretsPath = join(root, "secrets");
+      await writeFile(secretsPath, "AIS_GATEWAY_ADMIN_URL=http://gw.invalid\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n");
+      const identity = { name: "member", label: "member", configDir: join(root, "identity") };
+      const rejected = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
+      const gatewayAnswering = (row: Record<string, unknown> | undefined) => ({
+        secretsPath,
+        fetch: (async () => Response.json({ limits: row ? [{ provider: "codex", identity: "member", status: "unavailable", windows: [], ...row }] : [] })) as unknown as typeof fetch,
+      });
+
+      const plain = await fetchCodexLimitsViaStore(identity, { fetchImpl: rejected, memberRoot: root, gateway: gatewayAnswering({}) });
+      expect(plain.error).toContain("HTTP 401");
+
+      const dead = await fetchCodexLimitsViaStore(identity, { fetchImpl: rejected, memberRoot: root, gateway: gatewayAnswering({ loginRevoked: true }) });
+      expect(dead.status).toBe("unavailable");
+      expect(dead.error).toBe("OpenAI rejected this Codex login. Sign in again in the AIS portal, Identities tab.");
+
+      // The marker file is no source: this code never opens it. A marker that matches the login changes nothing.
+      const { refreshFingerprint, refreshOf } = await import("../../../src/identities/gateway-routed.ts");
+      const fingerprint = refreshFingerprint(refreshOf("codex", auth)!);
+      await writeFile(join(dir, "login-revoked.json"), JSON.stringify({ at: "2026-11-26T22:56:00.000Z", code: "refresh_token_invalidated", fingerprint }));
+      expect((await fetchCodexLimitsViaStore(identity, { fetchImpl: rejected, memberRoot: root, gateway: gatewayAnswering({}) })).error).toContain("HTTP 401");
+      // A gateway that cannot be read leaves the plain text too.
+      expect((await fetchCodexLimitsViaStore(identity, { fetchImpl: rejected, memberRoot: root, gateway: { secretsPath: join(root, "none") } })).error).toContain("HTTP 401");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("extraUsageFromCredits", () => {
   test("maps the credits block", () => {
     expect(extraUsageFromCredits({})).toBeUndefined();

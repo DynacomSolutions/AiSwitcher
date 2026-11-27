@@ -157,16 +157,19 @@ async function registryPoolKeys(): Promise<Set<string>> {
 }
 
 /** The `/api/limits` answer: the host scan merged with the gateway limits, with accounts per row. */
-async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string; identity?: string }, maxAgeS: number, onGateway?: (view: GatewayLimitsView | undefined) => void, freshCodexIdentity?: string): Promise<unknown> {
+async function loadLimitsPayload(deps: ConsoleAppDeps, filters: { tool?: string; identity?: string }, maxAgeS: number, onGateway?: (view: GatewayLimitsView | undefined) => void, freshCodexIdentity?: string, refresh = false): Promise<unknown> {
   // The cluster gateway is the source of truth for the limits of the identities it manages; the host scan covers the rest.
   // Both reads run together; a gateway failure keeps the host scan unchanged (never blank the page).
   const [result, gateway] = await Promise.all([
-    runScanIsolated("limits", { ...filters, maxAgeS }, 45_000),
+    runScanIsolated("limits", { ...filters, maxAgeS, ...(refresh ? { noCache: true } : {}) }, 45_000),
     (deps.gatewayLimits
       ? deps.gatewayLimits()
-      : freshCodexIdentity
-        ? loadGatewayLimits({ provider: "codex", identity: freshCodexIdentity, fresh: true })
-        : loadGatewayLimits()).catch(() => undefined),
+      : refresh && filters.tool
+        // A manual refresh reads the provider again for the named tool (and identity), past the gateway's 45 second caches.
+        ? loadGatewayLimits({ provider: filters.tool, ...(filters.identity ? { identity: filters.identity } : {}), fresh: true, timeoutMs: 40_000 })
+        : freshCodexIdentity
+          ? loadGatewayLimits({ provider: "codex", identity: freshCodexIdentity, fresh: true })
+          : loadGatewayLimits()).catch(() => undefined),
   ]);
   onGateway?.(gateway);
   if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "limits scan failed");
@@ -353,7 +356,10 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
     };
     const freshCodexIdentity = queryValue(c, "freshCodex");
-    return c.json(await loadLimitsPayload(deps, filters, numberQuery(c, "maxAge", 45), undefined, freshCodexIdentity));
+    // `refresh=1` (a manual refresh button) bypasses every 45 second cache for this fetch. It needs a tool, so it never fans out over all providers.
+    const refresh = queryValue(c, "refresh") === "1";
+    if (refresh && !filters.tool) throw new HttpError(400, "a refresh needs a tool");
+    return c.json(await loadLimitsPayload(deps, filters, numberQuery(c, "maxAge", 45), undefined, freshCodexIdentity, refresh));
   });
   app.get("/api/usage", async (c) => {
     const filters = {

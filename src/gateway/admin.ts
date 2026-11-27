@@ -71,10 +71,24 @@ export interface AdminDeps {
   sessions?: SessionsAdminDeps & { token: string };
   /** One identity's cached subscription usage (GET /limits); absent when the gateway has no usage source. */
   usageFor?(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
-  /** Forces one account-scoped, read-only usage refresh for an explicit limits recheck. */
-  refreshUsageFor?(provider: GatewayProvider, identity: string): Promise<void>;
+  /**
+   * Forces one account-scoped, read-only usage refresh for an explicit limits recheck. Answers false when no read ran because the
+   * identity was read a moment ago or a read was already in flight (the recent reading stands). No answer counts as a read.
+   */
+  refreshUsageFor?(provider: GatewayProvider, identity: string): Promise<boolean | void>;
+  /** Test hooks: the longest one read and the longest a whole manual refresh may take. */
+  freshReadMs?: number;
+  freshBudgetMs?: number;
+  /** Whether the stored login of one identity is dead (the provider refused its refresh token): only a new sign-in helps. */
+  loginRevokedFor?(provider: GatewayProvider, identity: string): Promise<boolean>;
+  /** Why the newest usage read of one identity failed, or undefined when it worked (GET /limits shows it on a cached row). */
+  usageFailureFor?(provider: GatewayProvider, identity: string): Promise<{ error: string; at: string } | undefined>;
+  /** Expires the cached Codex reset credits of one identity, so the next read asks OpenAI. A failed read keeps the last known credits. */
+  refreshResetCreditsFor?(identity: string): Promise<void>;
   /** Codex reset credits for one managed identity. Undefined means the provider read failed. */
   resetCreditsFor?(identity: string): Promise<import("../cli/limits/types.ts").ManualResetInfo | undefined>;
+  /** The cached Codex reset credits now (marked stale), with no read. A row uses them when its credit read is not done in time. */
+  cachedResetCreditsFor?(identity: string): import("../cli/limits/types.ts").ManualResetInfo | undefined;
   /** The member accounts of every swap pool of one provider (GET /limits). */
   poolMembers?(provider: GatewayProvider): Promise<string[]>;
   /** Resolves an alias to the identity's canonical name (GET /limits). */
@@ -85,8 +99,17 @@ export interface AdminDeps {
   spendCodexReset?(identity: string, redeemRequestId: string): Promise<unknown>;
 }
 
+/** Longest one provider read of a manual refresh may take. The console waits 40 s for a whole refresh, so a slow read must not use it all. */
+const FRESH_READ_MS = 12_000;
+/** How many identities one manual refresh reads at the same time. */
+const FRESH_PARALLEL = 8;
+/** Longest a whole manual refresh waits. Reads still running then go on in the background and the answer holds the cached rows. */
+const FRESH_BUDGET_MS = 25_000;
+/** The least time the row phase keeps, so a row whose credits are cached in memory still answers when the reads used the budget. */
+const ROW_PHASE_FLOOR_MS = 250;
+
 /** One GET /limits row: a managed identity plus the usage source's reading of it (no reading yet: unavailable). */
-type AdminLimitRow = { provider: GatewayProvider; identity: string } & Omit<PoolUsage, "capturedAt"> & { capturedAt?: string };
+type AdminLimitRow = { provider: GatewayProvider; identity: string } & Omit<PoolUsage, "capturedAt"> & { capturedAt?: string; loginRevoked?: true };
 
 /** Constant-time comparison: both sides are hashed first so lengths never leak. */
 function sameSecret(given: string, expected: string): boolean {
@@ -314,14 +337,40 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const apps = await read.listApps();
     const providers = LIMITS_PROVIDERS.filter((provider) => providerFilter === undefined || provider === providerFilter);
     const namesByProvider = await Promise.all(providers.map(async (provider) => ({ provider, names: await limitsIdentities(deps, apps, provider) })));
+    const answerStarted = Date.now();
+    const budgetMs = deps.freshBudgetMs ?? FRESH_BUDGET_MS;
     const identities = namesByProvider.flatMap(({ provider, names }) => names
       .filter((identity) => identityFilter === undefined || identity === identityFilter)
       .map((identity) => ({ provider, identity })));
+    // A manual refresh (`fresh=1`) reads the provider again for every matching identity, past the 45 second caches. It needs a
+    // provider, and an identity when one is named must be managed. Each read is bounded, and a failed read never fails the answer:
+    // the row then carries the failure text.
     if (c.req.query("fresh") === "1") {
-      if (providerFilter !== "codex" || !identityFilter || !deps.refreshUsageFor || !identities.some((item) => item.provider === "codex" && item.identity === identityFilter)) {
-        return err(400, "fresh limits reads require one managed Codex identity");
+      if (providerFilter === undefined || !deps.refreshUsageFor || (identityFilter !== undefined && identities.length === 0)) {
+        return err(400, "fresh limits reads require a provider, and an identity when one is named must be managed");
       }
-      await deps.refreshUsageFor("codex", identityFilter);
+      let nextFresh = 0;
+      const freshWorkers = Array.from({ length: Math.min(FRESH_PARALLEL, identities.length) }, async () => {
+        while (nextFresh < identities.length) {
+          const { provider, identity } = identities[nextFresh++]!;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          // The read decides whether it ran: a read in flight is joined and a young reading stands, so a burst of clicks is one read.
+          const ran = await Promise.race([
+            deps.refreshUsageFor!(provider, identity).then((r) => r !== false, () => true),
+            new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), deps.freshReadMs ?? FRESH_READ_MS); }),
+          ]);
+          if (timer) clearTimeout(timer);
+          // The reset credits are asked again only after a real read. A failed credit read keeps the last known credits.
+          if (ran && provider === "codex") await deps.refreshResetCreditsFor?.(identity).catch(() => undefined);
+        }
+      });
+      // The answer never waits past the budget: a slow read goes on in the background, and its identity keeps its cached row.
+      let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.all(freshWorkers),
+        new Promise<void>((resolve) => { budgetTimer = setTimeout(resolve, budgetMs); }),
+      ]);
+      if (budgetTimer) clearTimeout(budgetTimer);
     }
     const limits = new Array<AdminLimitRow>();
     let next = 0;
@@ -330,12 +379,27 @@ export function createAdminApp(deps: AdminDeps): Hono {
         const index = next++;
         const { provider, identity } = identities[index]!;
         const usage = await deps.usageFor!(provider, identity).catch(() => undefined);
-        const fetchedReset = provider === "codex" ? await deps.resetCreditsFor?.(identity).catch(() => undefined) : undefined;
+        // The whole answer stays inside the budget, this phase included: a credit read still running at the end of the budget
+        // gives way to the cached credits (stale) and goes on in the background.
+        let fetchedReset: Awaited<ReturnType<NonNullable<AdminDeps["resetCreditsFor"]>>> | undefined;
+        if (provider === "codex" && deps.resetCreditsFor) {
+          const left = Math.max(ROW_PHASE_FLOOR_MS, budgetMs - (Date.now() - answerStarted));
+          let rowTimer: ReturnType<typeof setTimeout> | undefined;
+          fetchedReset = await Promise.race([
+            deps.resetCreditsFor(identity).catch(() => undefined),
+            new Promise<undefined>((resolve) => { rowTimer = setTimeout(() => resolve(undefined), left); }).then(() => deps.cachedResetCreditsFor?.(identity)),
+          ]);
+          if (rowTimer) clearTimeout(rowTimer);
+        }
         const manualReset = fetchedReset ?? usage?.manualReset;
         const hasFigure = (usage?.windows?.length ?? 0) > 0 || typeof usage?.maxUtilization === "number";
         const shouldShowNoFigure = USAGE_READER_PROVIDERS.has(provider) && usage?.noPlan !== true;
         if (!hasFigure && !manualReset && !shouldShowNoFigure) continue;
-        limits[index] = { provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }), ...(manualReset ? { manualReset } : {}) };
+        // A reading that is not fresh says why: the newest failed read of this identity (a rejected login, a rate limit).
+        const failure = await deps.usageFailureFor?.(provider, identity).catch(() => undefined);
+        // A login the provider refused for good: the host reads this flag from here and never opens a login file itself.
+        const loginRevoked = failure || !hasFigure ? await deps.loginRevokedFor?.(provider, identity).catch(() => false) : false;
+        limits[index] = { provider, identity, ...(usage ?? { status: "unavailable" as const, windows: [] }), ...(failure && (usage?.stale === true || !hasFigure) ? { error: failure.error } : {}), ...(manualReset ? { manualReset } : {}), ...(loginRevoked ? { loginRevoked: true as const } : {}) };
       }
     });
     await Promise.all(workers);

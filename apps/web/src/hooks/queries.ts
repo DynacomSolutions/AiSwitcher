@@ -1,6 +1,7 @@
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { api } from "@/lib/api";
-import { limitsRefetchInterval, POLL, reconcileLimits } from "@/lib/limits-reconciliation";
+import { adjustRefreshCounts, applyRefreshedLimits, isIdentityRefreshing, limitsRefetchInterval, POLL, reconcileLimits } from "@/lib/limits-reconciliation";
 import type { LimitsResponse, LoginFlowStatus } from "@/types/api";
 
 export { POLL, reconcileLimits, limitsRefetchInterval } from "@/lib/limits-reconciliation";
@@ -118,6 +119,49 @@ export function useLimitsQuery() {
     },
     refetchInterval: (query) => limitsRefetchInterval(query.state.data),
   });
+}
+
+export interface LimitsRefreshTarget {
+  tool: string;
+  /** Absent: every identity of the tool. */
+  identity?: string;
+}
+
+export interface LimitsRefreshFailure {
+  target: LimitsRefreshTarget;
+  message: string;
+}
+
+/**
+ * Manual refresh of limits. Each target reads the provider again on the server, past its 45 second caches. A target that fails
+ * does not stop the others: `refresh` answers with the failures, and the rows that did read replace the rows on screen.
+ *
+ * Each call keeps its own state. Calls may overlap: a card spins until every call that covers it has ended, and each call
+ * answers with its own failures (a shared mutation would lose them).
+ */
+export function useRefreshLimits() {
+  const client = useQueryClient();
+  const [pending, setPending] = useState<ReadonlyMap<string, number>>(() => new Map());
+  const change = (targets: LimitsRefreshTarget[], delta: 1 | -1): void => setPending((current) => adjustRefreshCounts(current, targets, delta));
+  const refresh = async (targets: LimitsRefreshTarget[]): Promise<{ failures: LimitsRefreshFailure[] }> => {
+    change(targets, 1);
+    try {
+      const settled = await Promise.allSettled(targets.map((target) => api.refreshLimits(target.tool, target.identity)));
+      const responses = settled.flatMap((entry) => (entry.status === "fulfilled" ? [entry.value] : []));
+      const failures = settled.flatMap((entry, index) => (entry.status === "rejected"
+        ? [{ target: targets[index]!, message: entry.reason instanceof Error ? entry.reason.message : String(entry.reason) }]
+        : []));
+      // Drop older poll work first, so it cannot overwrite the fresh rows.
+      await client.cancelQueries({ queryKey: qk.limits });
+      client.setQueryData<LimitsResponse>(qk.limits, (current) => applyRefreshedLimits(current, responses));
+      return { failures };
+    } finally {
+      change(targets, -1);
+    }
+  };
+  /** True while a call that covers this identity runs: its own target, or a target for the whole tool. */
+  const isRefreshing = (tool: string, identity: string): boolean => isIdentityRefreshing(pending, tool, identity);
+  return { refresh, isRefreshing, anyRefreshing: pending.size > 0 };
 }
 
 export function useUsageQuery() {

@@ -627,7 +627,15 @@ export async function fetchCodexLimitsViaStore(identity: Identity, deps: CodexSt
       headers: { Authorization: `Bearer ${token}`, Accept: "application/json", ...(account ? { "chatgpt-account-id": account } : {}) },
       signal: AbortSignal.timeout(STORE_USAGE_TIMEOUT_MS),
     });
-    if (res.status === 401 || res.status === 403) return { ...base, windows: [], status: "unavailable", error: `usage endpoint answered HTTP ${res.status} for the gateway member store login; the AIS gateway renews it (is the gateway running?)` };
+    if (res.status === 401 || res.status === 403) {
+      // A login the gateway found dead (the provider refused its refresh token) is never renewed: only a new sign-in helps.
+      // The gateway API says so. This code never opens a login file to find out.
+      const view = await loadGatewayLimits({ provider: "codex", identity: identity.name, ...deps.gateway });
+      if (view.rows.some((row) => row.toolName === "codex" && row.identity.name === identity.name && row.loginRevoked === true)) {
+        return { ...base, windows: [], status: "unavailable", error: "OpenAI rejected this Codex login. Sign in again in the AIS portal, Identities tab." };
+      }
+      return { ...base, windows: [], status: "unavailable", error: `usage endpoint answered HTTP ${res.status} for the gateway member store login; the AIS gateway renews it (is the gateway running?)` };
+    }
     if (!res.ok) return { ...base, windows: [], status: "unavailable", error: `usage endpoint answered HTTP ${res.status}` };
     const nowMs = deps.now?.() ?? Date.now();
     const snapshot = snapshotFromWham(await res.json(), nowMs);

@@ -63,7 +63,7 @@ import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
 import { enableMemberStore, hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreEnabled, setLocalWriteHook } from "../identities/gateway-members.ts";
-import { clearLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
+import { clearLoginRevoked, readLoginRevoked, recordLoginRevoked } from "../identities/gateway-revoked.ts";
 import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { buildRenewalReport } from "./renewal.ts";
 import { useClaudeReset } from "../server/claude-resets.ts";
@@ -694,6 +694,15 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const inflightRefreshes = new Set<Promise<unknown>>();
   /** Logins diagnosed dead, by "tool/name": the refresh-token fingerprint the provider rejected and its OAuth code. Cleared when a new login lands. */
   const deadLogins = new Map<string, { fingerprint: string; code: string }>();
+  /** The newest refresh-token fingerprint seen per login. A change is a new sign-in: the quiet period after a failed usage read ends. */
+  const seenGrant = new Map<string, string>();
+  const noteGrant = (provider: string, identity: string, fingerprint: string | undefined): void => {
+    if (fingerprint === undefined) return;
+    const key = `${provider}/${identity}`;
+    const before = seenGrant.get(key);
+    seenGrant.set(key, fingerprint);
+    if (before !== undefined && before !== fingerprint) usage.forgetUpstream(provider as GatewayProvider, identity);
+  };
   const markRevokedMarker = async (tool: string, name: string, code: string, rejected: string | undefined): Promise<void> => {
     if (memberStoreEnabled()) await recordLoginRevoked(tool, name, code, rejected).catch(() => undefined);
   };
@@ -715,6 +724,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       if (fingerprint) void markRevokedMarker(account.provider, account.identity, code, fingerprint);
     },
     onGrantSeen: (account, fingerprint) => {
+      noteGrant(account.provider, account.identity, fingerprint);
       const key = `${account.provider}/${account.identity}`;
       const dead = deadLogins.get(key);
       if (!dead || dead.fingerprint === fingerprint) return;
@@ -927,8 +937,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     identityState: hooks.identityState ?? defaultIdentityState,
     // The same cached usage reads the proxy selects on: the console Limits page shows them through GET /limits.
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
-    refreshUsageFor: async (provider, identity) => usage.refreshNow(provider, await canonical(provider, identity)),
+    refreshUsageFor: async (provider, identity) => usage.refreshManual(provider, await canonical(provider, identity)),
+    usageFailureFor: async (provider, identity) => usage.lastFailure(provider, await canonical(provider, identity)),
+    loginRevokedFor: async (provider, identity) => (memberStoreEnabled() && isMemberStoreTool(provider) ? readLoginRevoked(provider, await canonical(provider, identity)) !== undefined : false),
+    refreshResetCreditsFor: async (identity) => resetCredits.expire(await canonical("codex", identity)),
     resetCreditsFor: resetCredits,
+    cachedResetCreditsFor: (identity) => resetCredits.peek(identity),
 
     poolMembers,
     canonical,
@@ -1316,6 +1330,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     if (!grant) return;
     const key = `${tool}/${account.name}`;
     const fingerprint = grant.refresh_token !== undefined ? grantFingerprint(grant) : undefined;
+    noteGrant(tool, account.name, fingerprint);
     const dead = deadLogins.get(key);
     if (dead && fingerprint !== undefined && dead.fingerprint !== fingerprint) {
       // A new login landed (here or on another replica): the alert and the marker clear.

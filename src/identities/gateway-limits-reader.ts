@@ -23,6 +23,8 @@ export interface GatewayLimitRow {
   windows?: Array<{ label: string; utilization: number; resetsAt?: string; model?: string }>;
   extraUsage?: ExtraUsageInfo;
   manualReset?: ManualResetInfo;
+  /** The gateway found the stored login dead (the provider refused its refresh token). */
+  loginRevoked?: boolean;
   /** Claude: the profile plan the gateway reads hourly (type and rate-limit tier). */
   plan?: { type: string; tier?: string; checkedAt?: string; stale?: boolean };
   /** Other providers: the short plan display label from the limits fetch. */
@@ -134,6 +136,7 @@ function parseCodexReset(raw: unknown): ManualResetInfo | undefined {
     ...(typeof m.label === "string" ? { label: m.label } : {}),
     ...(typeof m.expiresAt === "string" ? { expiresAt: m.expiresAt } : {}),
     ...(creditExpiries ? { creditExpiries } : {}),
+    ...(typeof m.readAt === "string" && Number.isFinite(Date.parse(m.readAt)) ? { readAt: new Date(m.readAt).toISOString() } : {}),
     ...(m.stale === true ? { stale: true } : {}),
   };
 }
@@ -165,7 +168,7 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
   if (!r || typeof r.provider !== "string" || !LIMIT_TOOLS.has(r.provider) || typeof r.identity !== "string" || r.identity === "") return undefined;
   const toolName = r.provider as ToolConfig["toolName"];
   const identity: Identity = { name: r.identity, label: r.identity, configDir: "" };
-  const base = { toolName, provider: providerForTool(toolName), identity, gatewayManaged: true };
+  const base = { toolName, provider: providerForTool(toolName), identity, gatewayManaged: true, ...(r.loginRevoked === true ? { loginRevoked: true as const } : {}) };
   const windows: LimitWindow[] = [];
   for (const rawWindow of Array.isArray(r.windows) ? r.windows : []) {
     const w = rawWindow as Record<string, unknown> | null;
@@ -203,6 +206,8 @@ export function mapGatewayLimitRow(raw: unknown): ToolLimitResult | undefined {
     ...(plan ? { plan } : {}),
     // "rate-limited" with a figure is a live reading at 100% (codex/kimi/zai) or a stale claude backoff (stale: true).
     status: r.stale === true ? "cached" : "live",
+    // A cached reading says why it is not fresh (the gateway's newest failed read), so the card does not hide it.
+    ...(r.stale === true && typeof r.error === "string" && r.error ? { error: r.error } : {}),
     ...(capturedAt ? { capturedAt } : {}),
     ...(extraUsage ? { extraUsage, ...(r.provider === "codex" ? {} : { overage: overageFromExtraUsage(extraUsage) }) } : {}),
   };

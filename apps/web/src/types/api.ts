@@ -276,8 +276,12 @@ export interface ManualResetInfo {
   grantsCapturedAt?: string;
   /** Codex: each currently available credit with its exact provider expiry. */
   creditExpiries?: { id: string; label?: string; endsAt: string }[];
+  /** Codex: when the gateway read this credit list from OpenAI. */
+  readAt?: string;
   /** True when prior reset data remains after the latest read failed or omitted it. */
   stale?: boolean;
+  /** Local query state: when this console spent a Codex reset. The use button stays hidden for a short time. */
+  spentAt?: number;
 }
 
 export interface UseResetResult {

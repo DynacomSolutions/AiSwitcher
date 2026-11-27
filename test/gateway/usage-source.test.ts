@@ -82,7 +82,8 @@ describe("Codex reset source", () => {
     ]);
     expect(first).toMatchObject({ availableCount: 2, creditExpiries: [{ id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_002", endsAt: "2026-12-01T22:27:07.649Z" }] });
     expect(first).not.toHaveProperty("grants");
-    expect(second).toEqual({ availableCount: 0 });
+    expect(second).toMatchObject({ availableCount: 0 });
+    expect(Date.parse(second!.readAt!)).toBeGreaterThan(0);
   });
   test.each([null, {}, { credits: [] }, { available_count: "0", credits: [] }])("treats invalid inventory %j as unknown", async (body) => {
     const result = await fetchCodexResetCredits({ identity: "codex-a", accessToken: "access-SYNTHETIC_FIXTURE_A" }, async () => Response.json(body));
@@ -112,6 +113,15 @@ describe("Codex reset source", () => {
     expect(calls).toBe(2);
     expect(await source("codex-b")).toBeUndefined();
     expect(calls).toBe(3);
+  });
+
+  test("peek answers the cached credits as stale at once, whatever their age, and nothing when none are cached", async () => {
+    let now = 1_000;
+    const source = createCodexResetSource({ ttlMs: 100, now: () => now, fetchCredits: async () => ({ availableCount: 3, readAt: "2026-11-27T09:00:00.000Z" }) });
+    expect(source.peek("codex-a")).toBeUndefined();
+    await source("codex-a");
+    now += 10_000;
+    expect(source.peek("codex-a")).toEqual({ availableCount: 3, readAt: "2026-11-27T09:00:00.000Z", stale: true });
   });
 
   test("a spend invalidation clears reset counts on every replica", async () => {
@@ -738,5 +748,163 @@ describe("usage read log", () => {
     t += 60_000;
     await src.prefill("claude", "id1");
     expect(events(logs).map((e) => e.outcome)).toEqual(["failed", "recovered"]);
+  });
+});
+
+describe("lastFailure", () => {
+  test("keeps the newest read failure until a read works again", async () => {
+    let fail = true;
+    const src = createUsageSource({
+      ttlMs: 45_000,
+      fetchUsage: async () => (fail ? { status: "unavailable", error: "usage endpoint answered HTTP 401", capturedAt: "" } as PoolUsage : live(10)),
+    });
+    expect(src.lastFailure("codex", "a")).toBeUndefined();
+    await src.refreshNow("codex", "a");
+    expect(src.lastFailure("codex", "a")?.error).toBe("usage endpoint answered HTTP 401");
+    expect(src.lastFailure("codex", "b")).toBeUndefined();
+    fail = false;
+    await src.refreshNow("codex", "a");
+    expect(src.lastFailure("codex", "a")).toBeUndefined();
+  });
+});
+
+describe("refreshManual", () => {
+  test("parallel manual refreshes join one upstream read, and a young reading is kept", async () => {
+    let clock = 1_000_000;
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const src = createUsageSource({
+      now: () => clock,
+      fetchUsage: async () => {
+        calls++;
+        await gate;
+        return live(10);
+      },
+    });
+    const first = Promise.all([src.refreshManual("codex", "a"), src.refreshManual("codex", "a"), src.refreshManual("codex", "a")]);
+    await Promise.resolve();
+    release();
+    const ran = await first;
+    expect(calls).toBe(1);
+    expect(ran.filter(Boolean)).toHaveLength(1);
+    // Under 15 seconds later: no new read.
+    clock += 14_000;
+    expect(await src.refreshManual("codex", "a")).toBe(false);
+    expect(calls).toBe(1);
+    // Past 15 seconds: a new read.
+    clock += 2_000;
+    expect(await src.refreshManual("codex", "a")).toBe(true);
+    expect(calls).toBe(2);
+    // Another identity has its own age.
+    expect(await src.refreshManual("codex", "b")).toBe(true);
+    expect(calls).toBe(3);
+  });
+
+  test("a failed read also starts the quiet period, so a failing login is not hammered", async () => {
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => { calls++; throw new Error("boom"); } });
+    expect(await src.refreshManual("codex", "a")).toBe(true);
+    expect(await src.refreshManual("codex", "a")).toBe(false);
+    expect(calls).toBe(1);
+  });
+});
+
+describe("refreshManual age and sign-in", () => {
+  test("a refresh that joins a plain read with an old shared reading starts its own read", async () => {
+    let clock = Date.parse("2026-11-27T10:00:00.000Z");
+    const shared = new MemoryUsageReadings(() => clock);
+    // A shared reading 40 s old is young for the 45 s cache, so the plain read stands on it.
+    const old: PoolUsage = { status: "live", maxUtilization: 10, capturedAt: new Date(clock - 40_000).toISOString() };
+    await shared.save("codex", "a", old, 40_000);
+    const reads: Array<boolean | undefined> = [];
+    const src = createUsageSource({
+      now: () => clock,
+      shared,
+      fetchUsage: async (_p, _i, opts) => { reads.push(opts?.fresh); return { status: "live", maxUtilization: 20, capturedAt: new Date(clock).toISOString() }; },
+    });
+    void src.get("codex", "a"); // starts the plain read, which answers from the shared reading
+    const ran = await src.refreshManual("codex", "a");
+    expect(ran).toBe(true);
+    expect(reads).toEqual([true]);
+    expect(await src.get("codex", "a")).toMatchObject({ maxUtilization: 20 });
+  });
+
+  test("a refresh that joins a plain read with a young reading keeps it", async () => {
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => { calls++; return { status: "live", maxUtilization: 20, capturedAt: new Date().toISOString() }; } });
+    void src.get("codex", "a");
+    expect(await src.refreshManual("codex", "a")).toBe(false);
+    expect(calls).toBe(1);
+  });
+
+  test("a new sign-in ends the quiet period after a failed read", async () => {
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => { calls++; throw new Error("login rejected"); } });
+    expect(await src.refreshManual("codex", "a")).toBe(true);
+    expect(await src.refreshManual("codex", "a")).toBe(false);
+    src.forgetUpstream("codex", "a");
+    expect(await src.refreshManual("codex", "a")).toBe(true);
+    expect(calls).toBe(2);
+    // Another identity keeps its own quiet period.
+    expect(await src.refreshManual("codex", "b")).toBe(true);
+    src.forgetUpstream("codex", "a");
+    expect(await src.refreshManual("codex", "b")).toBe(false);
+  });
+});
+
+describe("failure text", () => {
+  test("a token in a read error is redacted before it is stored or logged", async () => {
+    const jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJTWU5USEVUSUMifQ.SYNTHETIC_FIXTURE_signature_0123456789";
+    const logs: string[] = [];
+    const src = createUsageSource({
+      log: (line) => logs.push(line),
+      fetchUsage: async (provider) => {
+        if (provider === "kimi") return { status: "unavailable", error: `could not read the credential file: Bearer ${jwt}`, capturedAt: "" } as PoolUsage;
+        throw new SyntaxError(`JSON Parse error: Unexpected identifier "${jwt}"`);
+      },
+    });
+    await src.refreshNow("codex", "a");
+    await src.refreshNow("kimi", "k");
+    for (const failure of [src.lastFailure("codex", "a"), src.lastFailure("kimi", "k")]) {
+      expect(failure?.error).toBeTruthy();
+      expect(failure?.error).not.toContain(jwt);
+      expect(failure?.error).not.toContain("SYNTHETIC_FIXTURE_signature");
+    }
+    expect(logs.join("\n")).not.toContain("SYNTHETIC_FIXTURE_signature");
+  });
+});
+
+describe("codex reset credits on a manual refresh", () => {
+  const credits = { availableCount: 2 };
+
+  test("a failed read after expire keeps the last known credits as stale, and a spend drops them", async () => {
+    let fail = false;
+    const source = createCodexResetSource({
+      invalidations: new MemoryResetCreditInvalidations(),
+      fetchCredits: async () => {
+        if (fail) throw new Error("OpenAI refused");
+        return credits;
+      },
+    });
+    expect(await source("a")).toEqual(credits);
+    fail = true;
+    source.expire("a");
+    expect(await source("a")).toEqual({ availableCount: 2, stale: true });
+    // A spend still drops the cache: no old count may show.
+    await source.invalidate("a");
+    expect(await source("a")).toBeUndefined();
+  });
+
+  test("expire makes the next read ask OpenAI again, and writes nothing shared", async () => {
+    let calls = 0;
+    const shared = new MemoryResetCreditInvalidations();
+    const source = createCodexResetSource({ invalidations: shared, fetchCredits: async () => { calls++; return { availableCount: calls }; } });
+    expect((await source("a"))?.availableCount).toBe(1);
+    expect((await source("a"))?.availableCount).toBe(1);
+    const version = await shared.version("a");
+    source.expire("a");
+    expect((await source("a"))?.availableCount).toBe(2);
+    expect(await shared.version("a")).toBe(version);
   });
 });
