@@ -145,28 +145,31 @@ test("overlapping Console processes keep one VAPID key and every subscription", 
   const webState = tempDirectory();
   const pushModule = new URL("../../src/server/web-push.ts", import.meta.url).pathname;
   const subs = Array.from({ length: 4 }, (_, index) => subscription(`ROLLOUT_${index}`));
-  const startConsole = (sub?: ReturnType<typeof subscription>) => Bun.spawn(
-    [process.execPath, "-e", `
+  const runConsole = async (index: number, sub?: ReturnType<typeof subscription>) => {
+    const keyPath = join(webState, `public-key-${index}`);
+    const child = Bun.spawn([process.execPath, "-e", `
+      import { writeFileSync } from "node:fs";
       import { addSubscription, loadVapid } from ${JSON.stringify(pushModule)};
-      const sub = JSON.parse(await Bun.stdin.text());
+      const sub = JSON.parse(process.env.SYNTHETIC_SUBSCRIPTION);
       const { publicKey } = await loadVapid();
       if (sub) await addSubscription(sub);
-      console.log(publicKey);
-    `],
-    {
-      env: { PATH: process.env.PATH ?? "", AIS_WEB_PUSH_STATE_DIR: pushState, AIS_WEB_STATE_DIR: webState },
-      stdin: new Blob([JSON.stringify(sub ?? null)]),
-      stdout: "pipe",
-    },
-  );
-  const result = async (child: ReturnType<typeof startConsole>) => {
-    const [exitCode, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-    return { exitCode, key: output.trim() };
+      writeFileSync(${JSON.stringify(keyPath)}, publicKey);
+    `], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        AIS_WEB_PUSH_STATE_DIR: pushState,
+        AIS_WEB_STATE_DIR: webState,
+        SYNTHETIC_SUBSCRIPTION: JSON.stringify(sub ?? null),
+      },
+      stdin: "ignore",
+      stdout: "ignore",
+    });
+    expect(await child.exited).toBe(0);
+    return readFileSync(keyPath, "utf8");
   };
-  const concurrent = await Promise.all(subs.map((sub) => result(startConsole(sub))));
-  const restarted = await result(startConsole());
-  expect(restarted.exitCode).toBe(0);
-  expect(restarted.key).not.toBe("");
+  const concurrent = await Promise.all(subs.map((sub, index) => runConsole(index, sub)));
+  const restarted = await runConsole(subs.length);
+  expect(restarted).not.toBe("");
   expect(concurrent).toEqual(subs.map(() => restarted));
   expect((await loadSubscriptions(pushState)).map((sub) => sub.endpoint).sort()).toEqual(subs.map((sub) => sub.endpoint).sort());
 });
