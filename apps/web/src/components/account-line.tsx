@@ -1,5 +1,6 @@
 import { TriangleAlert } from "lucide-react";
 
+import { ProviderLabel } from "@/components/provider-icon";
 import { Badge } from "@/components/ui/badge";
 import type { AccountInfo } from "@/types/api";
 
@@ -24,7 +25,7 @@ export function AccountLine({ account }: { account?: AccountInfo }) {
         <div className="space-y-0.5 text-[11px] text-muted-foreground">
           {account.logins.map((l) => (
             <div key={l.provider} className="break-all">
-              {l.provider}: {l.email ?? l.label ?? l.accountId ?? "-"}
+              <ProviderLabel provider={l.provider} size={11} className="align-middle" />: {l.email ?? l.label ?? l.accountId ?? "-"}
             </div>
           ))}
         </div>
