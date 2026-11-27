@@ -572,10 +572,10 @@ good model, and answers 502 only when no good model exists yet.
 
 ### Push notifications
 
-The installed PWA subscribes for reset-expiry reminders. The daemon sends one
+The installed PWA subscribes for expiry reminders and pool alerts. The daemon sends one
 Web Push (VAPID, aes128gcm) when an unspent Claude grant or Codex credit is 7
 days from its end, again at 3 days and at 24 hours; each stage is sent once per
-grant and recorded in `<state dir>/reset-expiry-push.json`. The check runs hourly
+grant and recorded in `<push state dir>/reset-expiry-push.json`. The check runs hourly
 through the shared limits scan, and only when a browser has subscribed. Swap
 pool rows are skipped (their members carry the grants). `AIS_RESET_PUSH=0`
 turns the reminders off; `AIS_PUSH_SUBJECT` sets the VAPID contact (default:
