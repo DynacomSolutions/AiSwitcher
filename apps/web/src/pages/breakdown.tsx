@@ -1,3 +1,4 @@
+import { ProviderIcon } from "@/components/provider-icon";
 import { useMemo, useState } from "react";
 
 import { ToolBadge } from "@/components/badges";
@@ -240,6 +241,7 @@ export function BreakdownPage() {
           <SelectContent>
             {pairs.map((pair) => (
               <SelectItem key={`${pair.tool}:${pair.identity}`} value={`${pair.tool}:${pair.identity}`} className="text-xs">
+                <ProviderIcon provider={pair.tool} />
                 {pair.identity} ({pair.tool}){pair.retired ? " (retired)" : ""}
               </SelectItem>
             ))}

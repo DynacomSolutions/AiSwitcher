@@ -43,12 +43,30 @@ const PROVIDER_ICONS: Record<string, IconEntry> = {
   perplexity: { icon: siPerplexity, color: "#1fb8cd" },
   openrouter: { icon: siOpenrouter, color: "#93c5fd" },
   ollama: { icon: siOllama, color: "#e4e4e7" },
+  // No libre mark exists for these tools: monogram chip, like xAI.
+  pi: { monogram: "π", color: "#f472b6" },
+  opencode: { monogram: "O", color: "#2dd4bf" },
+};
+
+/** Tool name (as the console and the CLI use it) to the provider whose mark it
+ * carries. Tools not listed here resolve by their own name. */
+export const TOOL_PROVIDER: Record<string, string> = {
+  claude: "anthropic",
+  codex: "openai",
+  grok: "xai",
+  kimi: "kimi",
+  zai: "zai",
+  zcode: "zai",
+  ali: "alibaba",
+  pi: "pi",
+  opencode: "opencode",
 };
 
 const MONOGRAM_COLOR = "#a1a1aa";
 
 function entryFor(provider: string): { key: string; entry: IconEntry | undefined } {
-  const key = provider.trim().toLowerCase();
+  const raw = provider.trim().toLowerCase();
+  const key = TOOL_PROVIDER[raw] ?? raw;
   const entry = PROVIDER_ICONS[key];
   if (entry) return { key, entry };
   // Model-flavoured provider strings ("anthropic/claude-...", "openai/gpt-...")
@@ -90,6 +108,11 @@ export function ProviderIcon({ provider, size = 14, className }: { provider: str
       <path d={path} />
     </svg>
   );
+}
+
+/** Tool name plus its provider mark: the same icon and spacing as ProviderLabel. */
+export function ToolLabel({ tool, size = 14, className }: { tool: string; size?: number; className?: string }) {
+  return <ProviderLabel provider={tool} size={size} className={className} />;
 }
 
 /** Provider name plus its real mark, for table cells and chips. */
