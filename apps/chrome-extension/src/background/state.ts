@@ -8,6 +8,7 @@ export class State {
   private _paused = false;
   private readonly inflight = new Map<string, AbortController>();
   private readonly sessionOf = new Map<string, string>();
+  private readonly tabOf = new Map<string, number>();
   /** Stopped sessions, with the identity that was known when the user stopped them. Oldest entries go first at the cap. */
   private readonly stopped = new Map<string, string | undefined>();
   private readonly identityOf = new Map<string, string>();
@@ -43,10 +44,11 @@ export class State {
   }
 
   /** Register an in-flight call. The signal aborts with reason "stopped" on stop() or "aborted" on abort(). */
-  track(id: string, sessionId?: string, identity?: string): AbortController {
+  track(id: string, sessionId?: string, identity?: string, tabId?: number): AbortController {
     const controller = new AbortController();
     this.inflight.set(id, controller);
     if (sessionId !== undefined) this.sessionOf.set(id, sessionId);
+    if (tabId !== undefined) this.tabOf.set(id, tabId);
     if (sessionId !== undefined && identity !== undefined) {
       this.identityOf.delete(sessionId);
       this.identityOf.set(sessionId, identity);
@@ -55,7 +57,11 @@ export class State {
     return controller;
   }
 
-  untrack(id: string): void { this.inflight.delete(id); this.sessionOf.delete(id); }
+  untrack(id: string): void {
+    this.inflight.delete(id);
+    this.sessionOf.delete(id);
+    this.tabOf.delete(id);
+  }
 
   /** True after the user stopped this session and until it resumes or ends. The executor rejects its new calls. */
   isStopped(sessionId: string): boolean { return this.stopped.has(sessionId); }
@@ -82,13 +88,19 @@ export class State {
     for (const [id, c] of [...this.inflight]) {
       if (this.sessionOf.get(id) !== sessionId) continue;
       c.abort("stopped");
-      this.inflight.delete(id);
-      this.sessionOf.delete(id);
+      this.untrack(id);
     }
   }
 
   /** Abort the calls of every session marked on the tab. */
   stopTab(tabId: number): void { for (const s of this.sessionsOnTab(tabId)) this.stopSession(s); }
+
+  /** Chrome can detach before the call marks its tab. End those calls too. */
+  abortTab(tabId: number): void {
+    for (const [id, target] of this.tabOf) {
+      if (target === tabId) this.inflight.get(id)?.abort("stopped");
+    }
+  }
 
   /** Gateway asked to abort one call. */
   abort(id: string): void { this.inflight.get(id)?.abort("aborted"); }
@@ -98,6 +110,7 @@ export class State {
     for (const c of this.inflight.values()) c.abort("stopped");
     this.inflight.clear();
     this.sessionOf.clear();
+    this.tabOf.clear();
     this.pause();
     await Promise.all([...this.stopListeners].map(async l => { try { await l(); } catch { /* best effort */ } }));
   }
