@@ -36,9 +36,9 @@ export function nextRefreshSeconds(tool: string, grant: { expires_at?: number; m
 
 /**
  * A journal error belongs to an old login when it was recorded for another refresh token than the one the gateway holds now.
- * After a new sign-in the old `dead` row is still the newest row, but it says nothing about the new login: it must neither
+ * After a new sign-in the old `dead` row is still the newest row, but it says nothing about the new login. It must neither
  * show as a last error nor mark the login revoked. When the grant and the row both have a fingerprint, only the fingerprint
- * decides: a row for the current refresh token always counts, whatever the mint time says (clock skew, or a store rewrite
+ * decides. A row for the current refresh token always counts, whatever the mint time says (clock skew, or a store rewrite
  * that keeps the same refresh token). The mint time is the fallback only when a fingerprint is missing.
  */
 function errorBelongsToOldLogin(error: { ts: string; oldFp: string }, currentFingerprint: string | undefined, mintedAtSeconds: number | undefined): boolean {
@@ -62,7 +62,7 @@ export async function buildRenewalReport(deps: {
     // A registry that cannot be read throws: a partial list must never read as a complete one.
     for (const account of await deps.accounts(tool)) {
       const grant = (await readEffectiveGrant(tool as RefreshableTool, account).catch(() => undefined))?.grant;
-      const row = rows.get(`${tool}/${account.name}`)
+      const row = rows.get(`${tool}/${account.name}`);
       const fingerprint = grant?.refresh_token ? grantFingerprint(grant) : undefined;
       const journalRefreshS = row?.refreshed ? Math.floor(Date.parse(row.refreshed.ts) / 1000) : undefined;
       const lastS = journalRefreshS ?? grant?.minted_at;
