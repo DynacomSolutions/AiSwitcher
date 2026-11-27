@@ -87,6 +87,8 @@ export interface AdminDeps {
   refreshResetCreditsFor?(identity: string): Promise<void>;
   /** Codex reset credits for one managed identity. Undefined means the provider read failed. */
   resetCreditsFor?(identity: string): Promise<import("../cli/limits/types.ts").ManualResetInfo | undefined>;
+  /** The cached Codex reset credits now (marked stale), with no read. A row uses them when its credit read is not done in time. */
+  cachedResetCreditsFor?(identity: string): import("../cli/limits/types.ts").ManualResetInfo | undefined;
   /** The member accounts of every swap pool of one provider (GET /limits). */
   poolMembers?(provider: GatewayProvider): Promise<string[]>;
   /** Resolves an alias to the identity's canonical name (GET /limits). */
@@ -103,6 +105,8 @@ const FRESH_READ_MS = 12_000;
 const FRESH_PARALLEL = 8;
 /** Longest a whole manual refresh waits. Reads still running then go on in the background and the answer holds the cached rows. */
 const FRESH_BUDGET_MS = 25_000;
+/** The least time the row phase keeps, so a row whose credits are cached in memory still answers when the reads used the budget. */
+const ROW_PHASE_FLOOR_MS = 250;
 
 /** One GET /limits row: a managed identity plus the usage source's reading of it (no reading yet: unavailable). */
 type AdminLimitRow = { provider: GatewayProvider; identity: string } & Omit<PoolUsage, "capturedAt"> & { capturedAt?: string; loginRevoked?: true };
@@ -333,6 +337,8 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const apps = await read.listApps();
     const providers = LIMITS_PROVIDERS.filter((provider) => providerFilter === undefined || provider === providerFilter);
     const namesByProvider = await Promise.all(providers.map(async (provider) => ({ provider, names: await limitsIdentities(deps, apps, provider) })));
+    const answerStarted = Date.now();
+    const budgetMs = deps.freshBudgetMs ?? FRESH_BUDGET_MS;
     const identities = namesByProvider.flatMap(({ provider, names }) => names
       .filter((identity) => identityFilter === undefined || identity === identityFilter)
       .map((identity) => ({ provider, identity })));
@@ -362,7 +368,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
       let budgetTimer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
         Promise.all(freshWorkers),
-        new Promise<void>((resolve) => { budgetTimer = setTimeout(resolve, deps.freshBudgetMs ?? FRESH_BUDGET_MS); }),
+        new Promise<void>((resolve) => { budgetTimer = setTimeout(resolve, budgetMs); }),
       ]);
       if (budgetTimer) clearTimeout(budgetTimer);
     }
@@ -373,7 +379,18 @@ export function createAdminApp(deps: AdminDeps): Hono {
         const index = next++;
         const { provider, identity } = identities[index]!;
         const usage = await deps.usageFor!(provider, identity).catch(() => undefined);
-        const fetchedReset = provider === "codex" ? await deps.resetCreditsFor?.(identity).catch(() => undefined) : undefined;
+        // The whole answer stays inside the budget, this phase included: a credit read still running at the end of the budget
+        // gives way to the cached credits (stale) and goes on in the background.
+        let fetchedReset: Awaited<ReturnType<NonNullable<AdminDeps["resetCreditsFor"]>>> | undefined;
+        if (provider === "codex" && deps.resetCreditsFor) {
+          const left = Math.max(ROW_PHASE_FLOOR_MS, budgetMs - (Date.now() - answerStarted));
+          let rowTimer: ReturnType<typeof setTimeout> | undefined;
+          fetchedReset = await Promise.race([
+            deps.resetCreditsFor(identity).catch(() => undefined),
+            new Promise<undefined>((resolve) => { rowTimer = setTimeout(() => resolve(undefined), left); }).then(() => deps.cachedResetCreditsFor?.(identity)),
+          ]);
+          if (rowTimer) clearTimeout(rowTimer);
+        }
         const manualReset = fetchedReset ?? usage?.manualReset;
         const hasFigure = (usage?.windows?.length ?? 0) > 0 || typeof usage?.maxUtilization === "number";
         const shouldShowNoFigure = USAGE_READER_PROVIDERS.has(provider) && usage?.noPlan !== true;

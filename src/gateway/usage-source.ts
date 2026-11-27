@@ -23,6 +23,8 @@ export interface CodexResetSource {
   invalidate(identity: string): Promise<void>;
   /** A manual refresh: the next read asks OpenAI again, and a failed read keeps the last known credits (marked stale). No shared write. */
   expire(identity: string): void;
+  /** The cached credits now, marked stale, with no read. Undefined when none are cached. */
+  peek(identity: string): ManualResetInfo | undefined;
 }
 
 /** Reads the provider's manual reset inventory with the same account-scoped headers as Codex traffic. */
@@ -54,6 +56,7 @@ export async function fetchCodexResetCredits(
   });
   return {
     availableCount,
+    readAt: new Date().toISOString(),
     ...(typeof available[0]?.title === "string" ? { label: available[0].title } : {}),
     ...(creditExpiries[0] ? { expiresAt: new Date(creditExpiries[0].endsAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) } : {}),
     ...(creditExpiries.length ? { creditExpiries } : {}),
@@ -116,6 +119,10 @@ export function createCodexResetSource(opts: {
     async invalidate(identity: string): Promise<void> {
       entries.delete(identity);
       await opts.invalidations?.invalidate(identity);
+    },
+    peek(identity: string): ManualResetInfo | undefined {
+      const entry = entries.get(identity);
+      return entry ? { ...entry.value, stale: true } : undefined;
     },
     expire(identity: string): void {
       const entry = entries.get(identity);
@@ -377,15 +384,25 @@ export function createUsageSource(opts: {
      */
     async refreshManual(provider: GatewayProvider, identity: string, minAgeMs = MANUAL_REFRESH_MIN_AGE_MS): Promise<boolean> {
       const key = keyOf(provider, identity);
-      const running = freshInflight.get(key) ?? inflight.get(key);
-      if (running) {
-        await running;
+      const runningFresh = freshInflight.get(key);
+      if (runningFresh) {
+        await runningFresh;
         return false;
+      }
+      const runningPlain = inflight.get(key);
+      if (runningPlain) {
+        await runningPlain;
+        // A plain read may have answered from a shared reading up to one ttl old: a refresh needs one under `minAgeMs`.
+        if (now() - capturedMs(entries.get(key)?.value) < minAgeMs) return false;
       }
       const last = lastUpstream.get(key);
       if (last !== undefined && now() - last < minAgeMs) return false;
       await refresh(provider, identity, true);
       return true;
+    },
+    /** A new sign-in landed for this member: its old read no longer counts, so the next manual refresh reads again. */
+    forgetUpstream(provider: GatewayProvider, identity: string): void {
+      lastUpstream.delete(keyOf(provider, identity));
     },
     /** Why the newest upstream read of this member failed, or undefined when the last read worked. The text carries no token. */
     lastFailure(provider: GatewayProvider, identity: string): { error: string; at: string } | undefined {

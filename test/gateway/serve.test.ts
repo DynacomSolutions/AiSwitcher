@@ -1550,6 +1550,32 @@ describe("single refresher: dead logins, seeded metrics and the renewal route", 
     await waitFor(async () => (await metricsText(g)).includes('ais_gateway_login_revoked{provider="claude",identity="ka1"} 0'));
   });
 
+  test("a new sign-in ends the quiet period after a failed usage read, so the next manual refresh reads again", async () => {
+    let refresh = "r-one";
+    const grant = () => ({ access_token: "a", refresh_token: refresh, expires_at: 4_000_000_000 });
+    let reads = 0;
+    const g = await boot({
+      keepAliveMs: 3_600_000,
+      gaugeMs: 20,
+      keepAliveAccounts: async (tool: string) => (tool === "codex" ? [acct] : []),
+      readGrant: async () => grant(),
+      usageFor: undefined,
+      poolMembers: async (provider) => (provider === "codex" ? ["ka1"] : []),
+      canonical: async (_provider, identity) => identity,
+      fetchUsage: async () => { reads++; throw new Error("login rejected"); },
+    });
+    const refreshOnce = () => fetch(`http://127.0.0.1:${g.adminPort}/limits?provider=codex&fresh=1`, { headers: { authorization: `Bearer ${ADMIN}` } });
+    await waitFor(async () => (await metricsText(g)).includes('ais_gateway_login_expiry_timestamp_seconds{provider="codex",identity="ka1"}'));
+    expect((await refreshOnce()).status).toBe(200);
+    const afterFirst = reads;
+    expect((await refreshOnce()).status).toBe(200);
+    expect(reads).toBe(afterFirst); // the quiet period holds
+    refresh = "r-two"; // the owner signed in again
+    await Bun.sleep(150); // several gauge ticks see the new grant
+    expect((await refreshOnce()).status).toBe(200);
+    expect(reads).toBe(afterFirst + 1);
+  });
+
   test("the last-success gauge is seeded from the shared journal at start", async () => {
     const backend = new MemoryRefreshBackend();
     const ts = "2026-11-18T13:07:22.000Z";

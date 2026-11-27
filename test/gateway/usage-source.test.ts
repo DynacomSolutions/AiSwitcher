@@ -82,7 +82,8 @@ describe("Codex reset source", () => {
     ]);
     expect(first).toMatchObject({ availableCount: 2, creditExpiries: [{ id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_002", endsAt: "2026-12-01T22:27:07.649Z" }] });
     expect(first).not.toHaveProperty("grants");
-    expect(second).toEqual({ availableCount: 0 });
+    expect(second).toMatchObject({ availableCount: 0 });
+    expect(Date.parse(second!.readAt!)).toBeGreaterThan(0);
   });
   test.each([null, {}, { credits: [] }, { available_count: "0", credits: [] }])("treats invalid inventory %j as unknown", async (body) => {
     const result = await fetchCodexResetCredits({ identity: "codex-a", accessToken: "access-SYNTHETIC_FIXTURE_A" }, async () => Response.json(body));
@@ -112,6 +113,15 @@ describe("Codex reset source", () => {
     expect(calls).toBe(2);
     expect(await source("codex-b")).toBeUndefined();
     expect(calls).toBe(3);
+  });
+
+  test("peek answers the cached credits as stale at once, whatever their age, and nothing when none are cached", async () => {
+    let now = 1_000;
+    const source = createCodexResetSource({ ttlMs: 100, now: () => now, fetchCredits: async () => ({ availableCount: 3, readAt: "2026-11-27T09:00:00.000Z" }) });
+    expect(source.peek("codex-a")).toBeUndefined();
+    await source("codex-a");
+    now += 10_000;
+    expect(source.peek("codex-a")).toEqual({ availableCount: 3, readAt: "2026-11-27T09:00:00.000Z", stale: true });
   });
 
   test("a spend invalidation clears reset counts on every replica", async () => {
@@ -797,6 +807,49 @@ describe("refreshManual", () => {
     expect(await src.refreshManual("codex", "a")).toBe(true);
     expect(await src.refreshManual("codex", "a")).toBe(false);
     expect(calls).toBe(1);
+  });
+});
+
+describe("refreshManual age and sign-in", () => {
+  test("a refresh that joins a plain read with an old shared reading starts its own read", async () => {
+    let clock = Date.parse("2026-11-27T10:00:00.000Z");
+    const shared = new MemoryUsageReadings(() => clock);
+    // A shared reading 40 s old is young for the 45 s cache, so the plain read stands on it.
+    const old: PoolUsage = { status: "live", maxUtilization: 10, capturedAt: new Date(clock - 40_000).toISOString() };
+    await shared.save("codex", "a", old, 40_000);
+    const reads: Array<boolean | undefined> = [];
+    const src = createUsageSource({
+      now: () => clock,
+      shared,
+      fetchUsage: async (_p, _i, opts) => { reads.push(opts?.fresh); return { status: "live", maxUtilization: 20, capturedAt: new Date(clock).toISOString() }; },
+    });
+    void src.get("codex", "a"); // starts the plain read, which answers from the shared reading
+    const ran = await src.refreshManual("codex", "a");
+    expect(ran).toBe(true);
+    expect(reads).toEqual([true]);
+    expect(await src.get("codex", "a")).toMatchObject({ maxUtilization: 20 });
+  });
+
+  test("a refresh that joins a plain read with a young reading keeps it", async () => {
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => { calls++; return { status: "live", maxUtilization: 20, capturedAt: new Date().toISOString() }; } });
+    void src.get("codex", "a");
+    expect(await src.refreshManual("codex", "a")).toBe(false);
+    expect(calls).toBe(1);
+  });
+
+  test("a new sign-in ends the quiet period after a failed read", async () => {
+    let calls = 0;
+    const src = createUsageSource({ fetchUsage: async () => { calls++; throw new Error("login rejected"); } });
+    expect(await src.refreshManual("codex", "a")).toBe(true);
+    expect(await src.refreshManual("codex", "a")).toBe(false);
+    src.forgetUpstream("codex", "a");
+    expect(await src.refreshManual("codex", "a")).toBe(true);
+    expect(calls).toBe(2);
+    // Another identity keeps its own quiet period.
+    expect(await src.refreshManual("codex", "b")).toBe(true);
+    src.forgetUpstream("codex", "a");
+    expect(await src.refreshManual("codex", "b")).toBe(false);
   });
 });
 

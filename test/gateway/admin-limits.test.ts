@@ -142,6 +142,26 @@ describe("admin GET /limits", () => {
     expect(((await response.json()) as { limits: Array<{ identity: string }> }).limits.map((r) => r.identity).sort()).toEqual(["c1", "c2"]);
   });
 
+  test("the row phase stays inside the budget: a credit read still running gives way to the cached credits", async () => {
+    const cached = { availableCount: 2, stale: true, readAt: "2026-11-27T09:00:00.000Z" };
+    const app = appWith({
+      poolMembers: async (provider) => (provider === "codex" ? ["c1"] : []),
+      refreshUsageFor: async () => true,
+      refreshResetCreditsFor: async () => {},
+      resetCreditsFor: () => new Promise(() => {}), // the credit read hangs
+      cachedResetCreditsFor: () => cached,
+      freshReadMs: 10_000,
+      freshBudgetMs: 200,
+    });
+    const started = Date.now();
+    const response = await call(app, "/limits?provider=codex&fresh=1");
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { limits: Array<{ identity: string; manualReset?: unknown }> };
+    expect(body.limits).toHaveLength(1);
+    expect(body.limits[0]?.manualReset).toEqual(cached);
+  });
+
   test("a row carries loginRevoked when the gateway found the stored login dead", async () => {
     const app = appWith({
       poolMembers: async (provider) => (provider === "codex" ? ["c1", "c2"] : []),

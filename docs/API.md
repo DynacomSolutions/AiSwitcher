@@ -403,8 +403,12 @@ a separate no-cache flag, and the gateway reads the provider again for that tool
 credits. A `maxAge` of 0 or less is no refresh: the 5 second minimum stays.
 The gateway keeps the load on the provider low. A read already in flight is
 joined, and an identity whose last upstream read is under 15 seconds old keeps
-that reading. One refresh waits at most 25 seconds. A read still running then
-goes on in the background and its identity keeps the cached row.
+that reading. A refresh that joins a plain read with an older reading starts its
+own read. A new sign-in ends the 15 second wait for that identity. The whole answer
+(the reads and the rows) takes at most 25 seconds. A read still running then
+goes on in the background and its identity keeps the cached row. A Codex row
+whose credit read is not done then uses the cached credits, marked `stale`.
+On the console, a refresh never replaces a gateway card with a host-scan row.
 A read that fails does not fail the answer. A row with a last known reading stays
 `cached` and its `error` says why, for example that the login needs a new
 sign-in. A row with no reading is `unavailable` and carries the same `error`.
@@ -463,7 +467,8 @@ updates the cached grant list. Swap pools and retired identities are refused
 confirmation first.
 
 Codex `manualReset` also carries `creditExpiries[]` (`{ id, label?, endsAt }`,
-ISO) for each available reset credit.
+ISO) for each available reset credit, and `readAt` (ISO), the time the gateway
+read that credit list from OpenAI. A stale list keeps the `readAt` of its own read.
 
 ### Widget panels
 
