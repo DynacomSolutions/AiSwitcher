@@ -66,7 +66,7 @@ The server caches expensive reads.
 `GET /api/events` uses the same authentication as the JSON API. It returns `text/event-stream`.
 
 - `ready` opens the stream. `heartbeat` confirms that the connection is active every 15 seconds.
-- `change` carries a JSON array of topics. Topics are `limits`, `usage`, `pools-usage`, `gateway-usage`, `usage-projects`, and `codex-auto-reset`.
+- `change` carries a JSON array of topics. Topics are `limits`, `usage`, `pools-usage`, `gateway-usage`, `usage-projects`, and `auto-reset`.
 - `rollover` ends the response after approximately 25 seconds, before the 30-second public ingress timeout.
 - The WebUI opens one stream per tab. It keeps the last results visible during a reconnect and refreshes active queries once when the stream resumes.
 - Scoped limit rechecks after a manual Codex reset continue until reconciliation ends.
@@ -403,10 +403,10 @@ read time); unknown extra fields around it are still preserved.
 
 ### Limits
 
-`GET /api/limits/codex/auto-reset` reads automatic reset settings through the gateway admin API.
-It returns `configured: true` with the gateway's `pools` and `identities`, or `configured: false` when the feature is unavailable.
-`PUT /api/limits/codex/auto-reset/{pool|identity}` accepts `name` and boolean `enabled` and requires `X-AIS-Console: 1`.
-The gateway validates both scopes. See [Automatic Codex resets](agents/gateway.md#automatic-codex-resets) for the fields.
+`GET /api/limits/auto-reset` reads the automatic reset settings of every provider through the gateway admin API. `GET /api/limits/{provider}/auto-reset` reads one provider.
+It returns `configured: true` with the gateway's `providers`, or `configured: false` when the feature is unavailable.
+`PUT /api/limits/{provider}/auto-reset/pool` accepts `name` and boolean `enabled` and requires `X-AIS-Console: 1`. Automatic reset is a pool setting only: the `identity` form answers 410.
+The gateway validates the pool. See [Automatic resets for every pool](agents/gateway.md#automatic-resets-for-every-pool) for the fields.
 
 `GET /api/limits?tool=&identity=&maxAge=S`
 

@@ -562,25 +562,42 @@ so Codex and `codex app-server` show real limits. It reads the app from the fold
 token); a failure there is reported and never hides the minted-token message. `--check` writes nothing and reports each
 folder (`ok` or the problem).
 
-### Automatic Codex resets
+### Automatic resets for every pool
 
-An automatic reset requires both a named Codex pool rule and permission for its member identity. Both settings default to off.
-The gateway can spend a credit when the Codex routing pool exhausts weekly quota. Settings changes do not spend credits.
+Automatic reset is a setting of a named pool, for every provider that has a reset credit or grant API.
+Today these are Codex (reset credits) and Claude (reset grants, the `cedar_ember` list behind Claude Code `/limit-reset`).
+Kimi, Z.ai, Grok, Ali and OpenCode have no reset API. The console and the CLI list them as not supported and give them no toggle.
+No account has its own setting. An account card shows only the last claim that its pool made on it.
+The setting defaults to off. A setting change never spends a credit.
 
 ```sh
 ais gateway auto-reset list [--json]
-ais gateway auto-reset set pool <pool-name> on
-ais gateway auto-reset set identity <canonical-name> on
-ais gateway auto-reset set identity <canonical-name> off
+ais gateway auto-reset set pool <pool-name> on|off [--provider codex|claude]
 ```
 
-The commands use `AIS_GATEWAY_ADMIN_URL` and `AIS_GATEWAY_ADMIN_TOKEN`. The console has controls on Limits account and pool cards.
-`ais limits --tool=codex` shows the settings and last claim.
+The commands use `AIS_GATEWAY_ADMIN_URL` and `AIS_GATEWAY_ADMIN_TOKEN`. Add `--provider` when two providers use one pool name.
+The console has the control on each pool card of the Limits page. `ais limits` shows the pool settings and the last claims.
 
-Send the admin bearer token with both requests. `GET /limits/codex/auto-reset` lists named Codex pools, managed members and active pins.
-Each entry has `name` and `enabled`. Pool entries include `members`. An entry with history includes `lastClaim` with
-`pool`, `identity`, `startedAt`, `status` and `creditExpiresAt` when available. `PUT /limits/codex/auto-reset/{pool|identity}`
-takes `{"name":"example","enabled":true}` and returns the saved name and setting. Use the exact pool or canonical identity name.
+The gateway spends a reset only when all of these are true:
+- The pool setting is on for the provider of the request.
+- The provider sent a subscription 429 for the whole account (Claude: a rejected `5h`, `7d` or unified status header, not a rejection of one model window).
+- A live usage read of every routed member proves a full weekly window with no paid headroom. Codex names it `week` and Claude names it `seven-day`.
+- A live grant or credit read lists a usable credit. For Claude only a `full` grant counts, with an absolute expiry. A grant read again just before the POST must still match.
+- One durable claim wins the race in PostgreSQL. Only one claim spends at a time, across all gateway replicas.
+
+Claude spends the named grant with the stored gateway credential and the claude-cli User-Agent. A grant ID is used once by the automatic path.
+An unclear answer is an unknown outcome and the gateway never sends a second POST for that claim.
+
+Send the admin bearer token with every request.
+- `GET /limits/auto-reset` lists every provider: `{ providers: [...] }`. A supported entry has `provider`, `supported: true`, `pools` and `memberClaims`.
+  A pool has `name`, `enabled`, `members` and `lastClaim` when it has history. `memberClaims` maps a member to the last claim that a pool made on it.
+  An unsupported entry has `supported: false` and a `reason`.
+- `GET /limits/{provider}/auto-reset` returns one entry. `GET /limits/codex/auto-reset` is the path that Codex used first, and it still works.
+- `PUT /limits/{provider}/auto-reset/pool` takes `{"name":"example","enabled":true}`. A provider without a reset API answers 400.
+- `PUT /limits/{provider}/auto-reset/identity` answers 410. The identity setting was removed (27 Nov 2026) and the route writes nothing.
+
+The migration `0022_auto_reset_every_pool` copies the Codex pool settings to the new table `auto_reset_settings` and deletes the old identity settings.
+It records each deleted identity setting in `auto_reset_dropped_identity_settings`. A dropped setting never becomes a pool setting.
 
 ### Codex reset outcomes that need reconciliation
 
