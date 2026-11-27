@@ -85,6 +85,7 @@ async function acquireSharedPushLock(path: string, waitMs: number, retryMs: numb
     if (release) return release;
     await Bun.sleep(retryMs);
   } while (Date.now() < deadline);
+  return undefined;
 }
 
 async function withPushLock<T>(path: string, update: () => Promise<T>): Promise<T> {
@@ -112,6 +113,7 @@ async function readVapid(path: string): Promise<VapidFile | undefined> {
   } catch (error) {
     if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+  return undefined;
 }
 
 /** The daemon's VAPID key pair, created on first use. */
