@@ -398,10 +398,18 @@ upstream fetch.
 
 `GET /api/limits?refresh=1&tool=&identity=` is a manual refresh. `tool` is
 required. It skips every 45 second cache for this fetch: the host scan runs with
-no cache age, and the gateway reads the provider again for that tool (or for
-that one identity, when `identity` is set), including the Codex reset credits.
-A read that fails does not fail the answer. The row stays `cached` and its
-`error` says why, for example that the login needs a new sign-in.
+a separate no-cache flag, and the gateway reads the provider again for that tool
+(or for that one identity, when `identity` is set), including the Codex reset
+credits. A `maxAge` of 0 or less is no refresh: the 5 second minimum stays.
+The gateway keeps the load on the provider low. A read already in flight is
+joined, and an identity whose last upstream read is under 15 seconds old keeps
+that reading. One refresh waits at most 25 seconds. A read still running then
+goes on in the background and its identity keeps the cached row.
+A read that fails does not fail the answer. A row with a last known reading stays
+`cached` and its `error` says why, for example that the login needs a new
+sign-in. A row with no reading is `unavailable` and carries the same `error`.
+The last known Codex reset credits stay on the row, marked `stale`, until a
+spend drops them.
 
 A row carries `plan` (short display label, e.g. `"Max 20x"`, `"Pro"`,
 `"Team"`, `"Plus"`, `"Standard"`, `"Max"`, `"Go"`, `"Promax"`) only when
