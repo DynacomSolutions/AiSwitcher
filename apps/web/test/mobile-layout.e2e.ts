@@ -1026,6 +1026,19 @@ describe("1280x900", () => {
   }, 40_000);
 });
 
+// The Identities page header holds the updated label and two buttons: it must wrap, not overflow, at every width.
+for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 }]) {
+  test(`/identities has no horizontal page overflow at ${viewport.width}px`, async () => {
+    await setViewport(viewport.width, viewport.height);
+    await open("/identities");
+    await sleep(500);
+    const m = await page.eval<{ scrollWidth: number; clientWidth: number; bodyScrollWidth: number; offenders: string[] }>(MEASURE);
+    const detail = `/identities: scrollWidth ${m.scrollWidth} > clientWidth ${m.clientWidth}\n${m.offenders.join("\n")}`;
+    expect(m.scrollWidth <= m.clientWidth, detail).toBe(true);
+    expect(m.bodyScrollWidth <= m.clientWidth, detail).toBe(true);
+  }, 40_000);
+}
+
 for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 }]) {
   test(`Codex automatic reset controls at ${viewport.width}px`, async () => {
     await setViewport(viewport.width, viewport.height);

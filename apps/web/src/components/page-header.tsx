@@ -25,7 +25,7 @@ export function PageHeader({
           <p className="text-sm text-muted-foreground">{description}</p>
         ) : null}
       </div>
-      <div className="flex items-center gap-3">
+      <div className="flex max-w-full flex-wrap items-center gap-x-3 gap-y-2">
         <UpdatedAgo updatedAt={updatedAt} />
         {actions}
       </div>
