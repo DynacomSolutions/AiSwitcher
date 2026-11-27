@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { canSpendCodexReset, creditReadAt, creditsAreLastKnown, spendCreditSentence, SPEND_LOCK_MS } from "../src/lib/codex-reset.ts";
-import { adjustRefreshCounts, applyRefreshedLimits, isIdentityRefreshing, limitsRefetchInterval, POLL, reconcileLimits } from "../src/lib/limits-reconciliation.ts";
+import { adjustRefreshCounts, applyRefreshedLimits, isIdentityRefreshing, limitsRefetchInterval, reconcileLimits } from "../src/lib/limits-reconciliation.ts";
 import type { LimitsResponse, ToolLimitResult } from "../src/types/api.ts";
 
 const capturedAt = (seconds: number) => new Date(seconds * 1_000).toISOString();
@@ -23,14 +23,14 @@ describe("limits query reset reconciliation", () => {
     expect(limitsRefetchInterval(unchanged, 3_000)).toBe(2_000);
     const relieved = reconcileLimits(unchanged, payload(codexRow("member-a", 2, 5)), 5_000);
     expect(relieved.results[0]?.windows[0]?.usedPercent).toBe(2);
-    expect(limitsRefetchInterval(relieved, 5_000)).toBe(POLL.slow);
+    expect(limitsRefetchInterval(relieved, 5_000)).toBe(false);
   });
 
-  test("returns to ordinary polling after the 30 second accelerated window", () => {
+  test("ends scoped polling after the 30 second window", () => {
     const cached = payload(codexRow("member-a", 90, 1, 30_000));
 
     expect(limitsRefetchInterval(cached, 29_999)).toBe(2_000);
-    expect(limitsRefetchInterval(cached, 31_000)).toBe(POLL.slow);
+    expect(limitsRefetchInterval(cached, 31_000)).toBe(false);
     const ordinary = reconcileLimits(cached, payload(codexRow("member-a", 90, 1)), 31_000);
     expect(ordinary.results[0]).not.toHaveProperty("resetPendingUntil");
     expect(ordinary.results[0]?.windows[0]?.usedPercent).toBe(90);

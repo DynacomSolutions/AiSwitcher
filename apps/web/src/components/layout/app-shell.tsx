@@ -12,6 +12,7 @@ import {
   Menu,
   Network,
   PieChart,
+  RefreshCw,
   ShieldCheck,
 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -23,6 +24,7 @@ import { Sheet, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { UpdatedAgo } from "@/components/updated-ago";
 import { useStatusQuery } from "@/hooks/queries";
+import { useConsoleEvents } from "@/hooks/use-console-events";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
@@ -101,6 +103,7 @@ export function MobileNav() {
 
 function TopBar() {
   const status = useStatusQuery();
+  const live = useConsoleEvents();
   const connected = !status.isError && status.data?.ok !== false;
 
   return (
@@ -119,13 +122,16 @@ function TopBar() {
       </div>
 
       <div className="flex shrink-0 items-center gap-2.5">
-        <span
-          aria-hidden
-          className={cn(
-            "size-2 rounded-full",
-            connected ? "animate-pulse bg-emerald-500" : "bg-red-500",
+        <span role="status" title={live ? undefined : "Updating live data"} className="relative size-2 shrink-0">
+          {live ? (
+            <span aria-hidden className={cn("block size-2 rounded-full", connected ? "bg-emerald-500" : "bg-red-500")} />
+          ) : (
+            <>
+              <RefreshCw aria-hidden className="absolute -inset-0.5 size-3 text-muted-foreground motion-safe:animate-spin" />
+              <span className="sr-only">Updating live data</span>
+            </>
           )}
-        />
+        </span>
         <span className="text-sm text-muted-foreground">
           {connected ? "Connected" : "Disconnected"}
         </span>

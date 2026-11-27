@@ -12,8 +12,6 @@ export const POLL = {
   transcript: 3_000,
   slow: 60_000,
   breakdown: 300_000,
-  /** /api/usage/projects: a file read; the collector rewrites it each cycle. */
-  projects: 120_000,
 } as const;
 
 type LimitRow = LimitsResponse["results"][number];
@@ -53,9 +51,9 @@ export function reconcileLimits(current: LimitsResponse | undefined, incoming: L
   return { ...incoming, results };
 }
 
-export function limitsRefetchInterval(data: LimitsResponse | undefined, now = Date.now()): number {
+export function limitsRefetchInterval(data: LimitsResponse | undefined, now = Date.now()): number | false {
   const pending = data?.results.some((row) => row.toolName === "codex" && row.resetPendingUntil && row.resetPendingUntil > now);
-  return pending ? 2_000 : POLL.slow;
+  return pending ? 2_000 : false;
 }
 
 /**

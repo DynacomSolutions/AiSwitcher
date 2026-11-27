@@ -99,27 +99,27 @@ export function useLocalModelsQuery() {
 }
 
 export function useAutoResetQuery() {
-  return useQuery({ queryKey: qk.autoReset, queryFn: api.getAutoReset, refetchInterval: POLL.registry });
+  return useQuery({ queryKey: qk.autoReset, queryFn: ({ signal }) => api.getAutoReset(signal) });
 }
 
 export function useLimitsQuery() {
   const client = useQueryClient();
   return useQuery({
     queryKey: qk.limits,
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const current = client.getQueryData<LimitsResponse>(qk.limits);
       const pending = current?.results.find((row) => row.toolName === "codex" && row.resetPendingUntil && row.resetPendingUntil > Date.now());
       if (pending) {
-        const scoped = await api.getLimits(pending.identity.name);
+        const scoped = await api.getLimits(pending.identity.name, signal);
         const authoritative = scoped.results.find((row) => row.toolName === "codex" && row.identity.name === pending.identity.name && row.gatewayManaged);
         const latest = client.getQueryData<LimitsResponse>(qk.limits) ?? current;
-        if (!latest) return api.getLimits();
+        if (!latest) return api.getLimits(undefined, signal);
         if (!authoritative) return latest;
         const results = latest.results.map((row) => row.toolName === "codex" && row.identity.name === pending.identity.name
           ? { ...authoritative, identity: row.identity } : row);
         return reconcileLimits(latest, { ...latest, results });
       }
-      const incoming = await api.getLimits();
+      const incoming = await api.getLimits(undefined, signal);
       return reconcileLimits(client.getQueryData<LimitsResponse>(qk.limits), incoming);
     },
     refetchInterval: (query) => limitsRefetchInterval(query.state.data),
@@ -172,13 +172,12 @@ export function useRefreshLimits() {
 export function useUsageQuery() {
   return useQuery({
     queryKey: qk.usage,
-    queryFn: api.getUsage,
-    refetchInterval: (q) => (q.state.data?.pending ? 3000 : POLL.slow),
+    queryFn: ({ signal }) => api.getUsage(signal),
   });
 }
 
 export function usePoolsUsageQuery() {
-  return useQuery({ queryKey: qk.poolsUsage, queryFn: () => api.getPoolsUsage(), refetchInterval: POLL.slow });
+  return useQuery({ queryKey: qk.poolsUsage, queryFn: ({ signal }) => api.getPoolsUsage(signal) });
 }
 
 export function useBrowsersQuery() {
@@ -192,8 +191,8 @@ export function useGatewayAppsQuery() {
 export function useGatewayUsageQuery(days: number) {
   return useQuery({
     queryKey: qk.gatewayUsage(days),
-    queryFn: () => api.getGatewayUsage(days),
-    refetchInterval: POLL.slow,
+    queryFn: ({ signal }) => api.getGatewayUsage(days, signal),
+    refetchInterval: days === 7 ? false : POLL.slow,
   });
 }
 
@@ -210,15 +209,12 @@ export function useBreakdownQuery(identity: string, tool: string, days: number) 
   });
 }
 
-/** Per-project usage rows from the host collector's native-store aggregate.
- * The server only reads a file, so this is a cheap poll; filtering by
- * provider, identity and period happens in the page. */
+/** The server reads the host collector's aggregate. The page filters by provider, identity and period. */
 export function useUsageProjectsQuery(enabled: boolean) {
   return useQuery({
     queryKey: qk.usageProjects,
-    queryFn: api.getUsageProjects,
+    queryFn: ({ signal }) => api.getUsageProjects(signal),
     enabled,
-    refetchInterval: (q) => (q.state.data?.pending ? 5_000 : POLL.projects),
     placeholderData: keepPreviousData,
   });
 }

@@ -3,6 +3,7 @@
 // Not picked up by plain `bun test` (the file name has no .test. part). Run from the repo root with:
 //   (cd apps/web && pnpm install --frozen-lockfile && pnpm build) && bun run test:e2e:web
 // Env: AIS_E2E_CHROMIUM (binary), AIS_E2E_EVIDENCE (dir for screenshots).
+// Use AIS_E2E_LIVE_BASELINE=1 with the pre-change build to capture baseline screenshots for the live update cases.
 //
 // Asserts, for every route of apps/web/src/App.tsx at 360x740 and 390x844:
 //   document.documentElement.scrollWidth <= clientWidth (no horizontal page overflow);
@@ -18,13 +19,14 @@ import { tmpdir } from "node:os";
 import { Cdp, type Session } from "../../chrome-extension/test/e2e/cdp.ts";
 import { countdownUntil } from "../src/lib/format.ts";
 import { formatResetTimes } from "../src/lib/reset-time.ts";
-import type { AutoResetResponse, LimitsResponse, PoolsUsageResponse } from "../src/types/api.ts";
+import type { AutoResetResponse, LimitsResponse, PoolsUsageResponse, UsageResponse } from "../src/types/api.ts";
 
 const repoRoot = join(import.meta.dir, "../../..");
 const distDir = process.env.AIS_WEB_DIST ?? join(repoRoot, "apps/web/dist");
 const chromium = process.env.AIS_E2E_CHROMIUM
   ?? ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"].find(p => existsSync(p));
 const evidence = process.env.AIS_E2E_EVIDENCE;
+const liveBaseline = process.env.AIS_E2E_LIVE_BASELINE === "1";
 const scratchRoot = process.env.AIS_WEB_E2E_SCRATCH ?? tmpdir();
 
 const ROUTES = [
@@ -1106,4 +1108,197 @@ for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 
       await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
     }
   }, 60_000);
+}
+
+/** Browser-side fixtures for the REST replies and a controllable streaming connection. */
+function consoleEventsStub(answers: Record<string, unknown>): void {
+  const real = window.fetch.bind(window);
+  const calls: Record<string, number> = {};
+  const streamAuth: Array<string | null> = [];
+  const mutations: string[] = [];
+  const encoder = new TextEncoder();
+  const ready = () => send("ready", {});
+  let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+  function send(event: string, data: unknown) {
+    if (!stream) throw new Error("No synthetic event stream");
+    stream.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  }
+  function drop() {
+    const current = stream;
+    stream = undefined;
+    current?.error(new Error("Synthetic disconnection"));
+  }
+  localStorage.setItem("ais_console_token", "SYNTHETIC_FIXTURE_e2e_token");
+  Object.assign(window, { __aisLive: { answers, calls, streamAuth, mutations, ready, send, drop } });
+  const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const { origin, pathname } = new URL(raw, location.href);
+    if (origin !== location.origin || !pathname.startsWith("/api/")) return real(input, init);
+    const method = init?.method ?? "GET";
+    if (method !== "GET") {
+      mutations.push(`${method} ${pathname}`);
+      return Response.json({ error: "Fixture is read-only" }, { status: 405 });
+    }
+    calls[pathname] = (calls[pathname] ?? 0) + 1;
+    if (pathname === "/api/events") {
+      streamAuth.push(new Headers(init?.headers).get("Authorization"));
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          stream = controller;
+          init?.signal?.addEventListener("abort", () => { if (stream === controller) drop(); }, { once: true });
+        },
+      }), { headers: { "content-type": "text/event-stream" } });
+    }
+    return Object.hasOwn(answers, pathname)
+      ? Response.json(answers[pathname])
+      : Response.json({ error: "No fixture for this read" }, { status: 404 });
+  };
+  window.fetch = Object.assign(stub, { preconnect: window.fetch.preconnect });
+}
+
+for (const viewport of [{ width: 360, height: 740 }, { width: 1280, height: 900 }]) {
+  test(`Console live updates keep visible cards stable at ${viewport.width}px`, async () => {
+    await setViewport(viewport.width, viewport.height);
+    await page.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
+    const identity = { name: "fixture-codex", label: "Fixture Codex", configDir: "synthetic" };
+    const pool = "fixture-pool";
+    const initial: LimitsResponse = {
+      cached: false,
+      fetchedAt: "2026-11-27T08:00:00.000Z",
+      results: [{
+        ...SYNTHETIC_LIMITS.results[2]!,
+        identity,
+        capturedAt: "2026-11-27T08:00:00.000Z",
+        manualReset: { availableCount: 2, label: "Full reset" },
+      }],
+    };
+    const claim = { pool, identity: identity.name, startedAt: "2026-11-27T08:00:00.000Z", status: "pending" as const };
+    const settings: AutoResetResponse = { configured: true, identities: [{ name: identity.name, enabled: false, lastClaim: claim }], pools: [] };
+    const usage: UsageResponse = {
+      generatedAt: initial.fetchedAt,
+      results: [{
+        identity, provider: "openai", sourceTool: "codex",
+        report: { entries: [], totalInput: 20, totalOutput: 10, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 1, totalCost: 0 },
+      }],
+    };
+    const { identifier } = await page.send<{ identifier: string }>("Page.addScriptToEvaluateOnNewDocument", {
+      source: `(${consoleEventsStub.toString()})(${JSON.stringify({
+        "/api/limits": initial,
+        "/api/pools/usage": { ...SYNTHETIC_POOLS, pools: [] },
+        "/api/limits/codex/auto-reset": settings,
+        "/api/usage": usage,
+        "/api/status": { ok: true, version: "fixture", aisHome: "synthetic" },
+      })})`,
+    });
+    const help = "header [title='Updating live data']";
+    const waitText = (value: string) => waitFor(value, 5_000, () => page.eval<boolean>(`document.querySelector('main').innerText.includes(${JSON.stringify(value)})`));
+    const waitCalls = (path: string, count: number) => waitFor(`${path} request ${count}`, 6_000, () => page.eval<boolean>(`window.__aisLive.calls[${JSON.stringify(path)}] === ${count}`));
+    const setQuota = (value: number, credits: number, capturedAt: string) => page.eval(`(() => {
+      const row = window.__aisLive.answers['/api/limits'].results[0];
+      row.capturedAt = ${JSON.stringify(capturedAt)};
+      row.windows[0].usedPercent = ${value};
+      row.manualReset.availableCount = ${credits};
+    })()`);
+    const measure = () => page.eval<number[][]>(`[...document.querySelectorAll('header, main h1, main nav, main [data-slot="card"]')].map((node) => {
+      const { x, y, width, height } = node.getBoundingClientRect();
+      return [x, y, width, height];
+    })`);
+    const checkStable = async (before: number[][]) => {
+      expect(await measure()).toEqual(before);
+      const metrics = await page.eval<{ scrollWidth: number; clientWidth: number }>(MEASURE);
+      expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.clientWidth);
+      expect(await page.eval<boolean>("window.__aisLiveCard === document.querySelector('main [data-slot=card]')")).toBe(true);
+    };
+    const capture = async (label: string) => {
+      if (!evidence) return;
+      await mkdir(evidence, { recursive: true });
+      await writeFile(join(evidence, `sse-${viewport.width}-${label}.png`), await page.screenshot());
+    };
+    try {
+      await open("/limits/openai");
+      await waitText("Reset credits (2)");
+      await waitText("Last claim: pending");
+      await page.eval("document.fonts.ready.then(() => true)");
+      const before = await measure();
+      expect(before).toHaveLength(4);
+      console.log(`Console limits at ${viewport.width}px: ${JSON.stringify(before)}`);
+      if (liveBaseline) {
+        expect(await page.eval("window.__aisLive.calls['/api/events'] ?? 0")).toBe(0);
+        await capture("before");
+        return;
+      }
+
+      await waitCalls("/api/events", 1);
+      expect(await page.eval(`!!document.querySelector(${JSON.stringify(help)})`)).toBe(true);
+      await page.eval("window.__aisLiveCard = document.querySelector('main [data-slot=card]'); window.__aisLive.ready()");
+      await waitFor("live connection", 5_000, () => page.eval<boolean>(`!document.querySelector(${JSON.stringify(help)})`));
+
+      await setQuota(50, 1, "2026-11-27T08:05:00.000Z");
+      await page.eval(`
+        const rule = window.__aisLive.answers['/api/limits/codex/auto-reset'].identities[0];
+        rule.lastClaim.status = 'reset';
+        rule.enabled = true;
+        window.__aisLive.send('change', ['limits', 'codex-auto-reset']);
+      `);
+      await waitText("50.0%");
+      await waitText("Reset credits (1)");
+      await waitText("Last claim: reset");
+      await waitText("Automatic reset on");
+      expect(await page.eval("window.__aisLive.calls['/api/limits']")).toBe(2);
+      expect(await page.eval("window.__aisLive.calls['/api/limits/codex/auto-reset']")).toBe(2);
+      expect(await page.eval("window.__aisLive.calls['/api/pools/usage']")).toBe(1);
+      await checkStable(before);
+
+      await page.eval("window.__aisLive.drop()");
+      await waitFor("updating signal on loss", 5_000, () => page.eval<boolean>(`!!document.querySelector(${JSON.stringify(help)})`));
+      await waitText("50.0%");
+      await checkStable(before);
+      await capture("reconnecting");
+
+      await setQuota(30, 1, "2026-11-27T08:08:00.000Z");
+      await waitCalls("/api/events", 2);
+      await page.eval("window.__aisLive.ready(); window.__aisLive.send('heartbeat', {})");
+      await waitText("30.0%");
+      await waitCalls("/api/limits", 3);
+      await waitCalls("/api/limits/codex/auto-reset", 3);
+      await waitCalls("/api/pools/usage", 2);
+      await checkStable(before);
+      expect(await page.eval(`!!document.querySelector(${JSON.stringify(help)})`)).toBe(false);
+      await setQuota(20, 1, "2026-11-27T08:10:00.000Z");
+      await page.eval("window.__aisLive.send('rollover', {})");
+      await waitCalls("/api/events", 3);
+      expect(await page.eval(`!!document.querySelector(${JSON.stringify(help)})`)).toBe(false);
+      await waitText("30.0%");
+      await checkStable(before);
+      await page.eval("window.__aisLive.ready()");
+      await waitText("20.0%");
+      await waitCalls("/api/limits", 4);
+      await waitCalls("/api/limits/codex/auto-reset", 4);
+      await waitCalls("/api/pools/usage", 3);
+      await checkStable(before);
+      expect(await page.eval("window.__aisLive.streamAuth")).toEqual([
+        "Bearer SYNTHETIC_FIXTURE_e2e_token", "Bearer SYNTHETIC_FIXTURE_e2e_token", "Bearer SYNTHETIC_FIXTURE_e2e_token",
+      ]);
+      await capture("after");
+
+      await page.eval(`document.querySelector('main a[href="/limits"]').click()`);
+      await waitFor("initial usage figure", 5_000, () => page.eval<boolean>(`
+        Array.from(document.querySelectorAll('main [data-slot=card-title]')).some(node => node.textContent === '30')
+      `));
+      const usageReads = await page.eval<number>("window.__aisLive.calls['/api/usage']");
+      await page.eval(`
+        window.__aisLive.answers['/api/usage'].results[0].report.totalInput = 40;
+        window.__aisLive.send('change', ['usage']);
+      `);
+      await waitFor("updated usage figure", 5_000, () => page.eval<boolean>(`
+        Array.from(document.querySelectorAll('main [data-slot=card-title]')).some(node => node.textContent === '50')
+      `));
+      expect(await page.eval("window.__aisLive.calls['/api/usage']")).toBe(usageReads + 1);
+      expect(await page.eval("window.__aisLive.calls['/api/events']")).toBe(3);
+      expect(await page.eval("window.__aisLive.mutations")).toEqual([]);
+    } finally {
+      await page.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+      await page.send("Emulation.setEmulatedMedia", { features: [] });
+    }
+  }, 40_000);
 }

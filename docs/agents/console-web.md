@@ -8,10 +8,10 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 12
   limits FETCHERS, usage/run.ts's provider-first aggregation, resume's
   READERS, zai-auth/ali-auth for key writes), so a behaviour fixed once is
   fixed for CLI, web, and TUI together. The two frontends (apps/web: Vite +
-  React + shadcn/ui + TanStack Query; apps/tui: Rust ratatui) are LIVE views:
-  both poll on documented intervals (docs/API.md), which is why
-  server/expensive.ts exists — a TTL + in-flight-dedupe cache so N polling
-  clients share one upstream fetch instead of hammering provider quota APIs.
+  React + shadcn/ui + TanStack Query; apps/tui: Rust ratatui) use the same JSON API.
+  The WebUI uses one authenticated stream for limits, usage and reset settings.
+  The stream observer and JSON routes share cached reads across clients.
+  Other WebUI queries and the TUI poll at the intervals in docs/API.md.
   Security model, decided up front because this server can write real
   identity state: binds loopback only; Host header must be loopback-shaped
   (DNS-rebinding guard); requests authenticate via the per-boot bearer token

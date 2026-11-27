@@ -197,7 +197,9 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
 
   const browserAuth = await browserAuthFromEnv();
   const token = newConsoleToken();
+  const consoleEvents = new AbortController();
   const deps: ConsoleAppDeps = {
+    consoleEventSignal: consoleEvents.signal,
     token,
     port,
     ...(isIP(host) && host !== "0.0.0.0" && host !== "::" ? { serverAddress: host } : {}),
@@ -307,6 +309,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
       shutdownStarted = true;
       stopUsageSnapshotSampler();
       lifecycle.beginDrain();
+      consoleEvents.abort();
       scheduler.stop();
       spendGuard?.stop();
       herdrBridge?.stop();
@@ -335,7 +338,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     }
   }
 
-  return { port: server.port ?? port, token, stop: () => { stopUsageSnapshotSampler(); scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); claudeSwap?.stop(); resetExpiryPush?.stop(); loginFlows.stop(); void widgetsServer?.stop(true); server.stop(true); } };
+  return { port: server.port ?? port, token, stop: () => { consoleEvents.abort(); stopUsageSnapshotSampler(); scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); claudeSwap?.stop(); resetExpiryPush?.stop(); loginFlows.stop(); void widgetsServer?.stop(true); server.stop(true); } };
 }
 
 /** Starts the widgets-only listener when AIS_WIDGETS_PORT is valid. A bad value logs an error and starts nothing; the main server is not affected. */

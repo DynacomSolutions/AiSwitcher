@@ -68,20 +68,27 @@ export class ApiError extends Error {
 interface RequestOptions {
   method?: string;
   body?: unknown;
+  signal?: AbortSignal;
+}
+
+export function consoleHeaders(): Headers {
+  const headers = new Headers();
+  const token = getStoredToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  return headers;
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const method = options.method ?? "GET";
-  const headers = new Headers();
+  const headers = consoleHeaders();
   if (options.body !== undefined) headers.set("Content-Type", "application/json");
-  const token = getStoredToken();
-  if (token) headers.set("Authorization", `Bearer ${token}`);
   // CSRF guard required by the server on every mutating request.
   if (method !== "GET" && method !== "HEAD") headers.set("X-AIS-Console", "1");
 
   const response = await fetch(path, {
     method,
     headers,
+    signal: options.signal,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });
 
@@ -164,21 +171,21 @@ export const api = {
       body: { alias },
     }),
 
-  getAutoReset: () => request<AutoResetResponse>("/api/limits/codex/auto-reset"),
+  getAutoReset: (signal?: AbortSignal) => request<AutoResetResponse>("/api/limits/codex/auto-reset", { signal }),
   setAutoReset: (kind: AutoResetScope, name: string, enabled: boolean) =>
     request<{ name: string; enabled: boolean }>(`/api/limits/codex/auto-reset/${kind}`, { method: "PUT", body: { name, enabled } }),
 
-  getLimits: (freshCodexIdentity?: string) => request<LimitsResponse>(`/api/limits?maxAge=${freshCodexIdentity ? 5 : 45}${freshCodexIdentity ? `&tool=codex&identity=${encodeURIComponent(freshCodexIdentity)}&freshCodex=${encodeURIComponent(freshCodexIdentity)}` : ""}`),
+  getLimits: (freshCodexIdentity?: string, signal?: AbortSignal) => request<LimitsResponse>(`/api/limits?maxAge=${freshCodexIdentity ? 5 : 45}${freshCodexIdentity ? `&tool=codex&identity=${encodeURIComponent(freshCodexIdentity)}&freshCodex=${encodeURIComponent(freshCodexIdentity)}` : ""}`, { signal }),
 
   /** A manual refresh: the server reads the provider again for this tool (and identity), past its 45 second caches. */
   refreshLimits: (tool: string, identity?: string) =>
     request<LimitsResponse>(`/api/limits?refresh=1&tool=${encodeURIComponent(tool)}${identity ? `&identity=${encodeURIComponent(identity)}` : ""}`),
 
-  getUsage: () => request<UsageResponse>("/api/usage"),
+  getUsage: (signal?: AbortSignal) => request<UsageResponse>("/api/usage", { signal }),
 
-  getPoolsUsage: () => request<PoolsUsageResponse>("/api/pools/usage"),
+  getPoolsUsage: (signal?: AbortSignal) => request<PoolsUsageResponse>("/api/pools/usage", { signal }),
 
-  getGatewayUsage: (days: number) => request<GatewayUsageResponse>(`/api/gateway/usage?days=${days}`),
+  getGatewayUsage: (days: number, signal?: AbortSignal) => request<GatewayUsageResponse>(`/api/gateway/usage?days=${days}`, { signal }),
 
   getGatewayApps: () => request<GatewayAppsResponse>("/api/gateway/apps"),
 
@@ -216,7 +223,7 @@ export const api = {
       days: days !== undefined ? String(days) : undefined,
     })),
 
-  getUsageProjects: () => request<UsageProjectsResponse>("/api/usage/projects"),
+  getUsageProjects: (signal?: AbortSignal) => request<UsageProjectsResponse>("/api/usage/projects", { signal }),
 
   getSessions: (cwd?: string) => request<SessionsResponse>(withParams("/api/sessions", { cwd })),
 
