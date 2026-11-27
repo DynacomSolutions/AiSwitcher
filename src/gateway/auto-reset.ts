@@ -167,7 +167,7 @@ export function createAutoResetRecovery({
 }: RecoveryOptions): AutoResetRecovery {
   async function enabledPools(): Promise<AutoResetPool[]> {
     const all = await pools();
-    const rules = await Promise.all(all.map(async (pool) => ({ pool, enabled: await store.enabled("pool", pool.name) })));
+    const rules = await Promise.all(all.map(async (pool) => ({ pool, enabled: await store.enabled(pool.name) })));
     return rules.filter((rule) => rule.enabled).map((rule) => rule.pool);
   }
 
@@ -279,7 +279,7 @@ export function createAutoResetRecovery({
     signal.throwIfAborted();
     const inventories = await Promise.all(evidence.map(async ({ identity, resetAt }) => {
       const poolNames = poolsByMember.get(identity);
-      if (!poolNames || !await store.enabled("identity", identity) || signal.aborted) return undefined;
+      if (!poolNames || signal.aborted) return undefined;
       const info = await readCredits(identity, signal).catch(() => undefined);
       return { identity, poolNames, weeklyResetAt: resetAt, info };
     }));

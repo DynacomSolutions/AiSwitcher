@@ -6,26 +6,24 @@ import { connect, type GatewayCliDeps } from "./apps.ts";
 export async function runAutoResetCommand(args: string[], json: boolean, deps: GatewayCliDeps): Promise<void> {
   const [action = "list", kind, name, value, ...extra] = args;
   const list = action === "list" && args.length <= 1;
-  if (!list && (action !== "set" || (kind !== "pool" && kind !== "identity") || !name ||
+  if (!list && (action !== "set" || kind !== "pool" || !name ||
     (value !== "on" && value !== "off") || extra.length > 0)) {
-    throw new CliUsageError("Usage: ais gateway auto-reset list [--json] | set pool|identity <name> on|off");
+    throw new CliUsageError("Usage: ais gateway auto-reset list [--json] | set pool <name> on|off");
   }
   const { admin } = await connect(deps);
   if (list) {
     const response = await admin.call("GET", CODEX_AUTO_RESET_PATH);
+    const { pools } = response.json as unknown as AutoResetView;
     if (json) {
-      deps.out(JSON.stringify(response.json, null, 2));
+      deps.out(JSON.stringify({ pools }, null, 2));
       return;
     }
-    const settings = response.json as unknown as AutoResetView;
-    if (settings.pools.length === 0 && settings.identities.length === 0) deps.out("No managed Codex pools or identities.");
-    for (const [scope, rows] of [["pool", settings.pools], ["identity", settings.identities]] as const) {
-      for (const row of rows) deps.out(`${scope} ${row.name}  ${formatAutoResetStatus(row)}`);
-    }
+    if (pools.length === 0) deps.out("No managed Codex pools.");
+    for (const row of pools) deps.out(`pool ${row.name}  ${formatAutoResetStatus(row)}`);
     return;
   }
-  const response = await admin.call("PUT", `${CODEX_AUTO_RESET_PATH}/${kind}`, { name, enabled: value === "on" });
-  deps.out(json ? JSON.stringify(response.json) : `${kind} ${name}  automatic reset ${value}`);
+  const response = await admin.call("PUT", `${CODEX_AUTO_RESET_PATH}/pool`, { name, enabled: value === "on" });
+  deps.out(json ? JSON.stringify(response.json) : `pool ${name}  automatic reset ${value}`);
 }
 
 export function formatAutoResetStatus(setting: AutoResetStatus): string {

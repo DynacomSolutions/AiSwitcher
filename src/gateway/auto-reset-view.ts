@@ -1,7 +1,5 @@
 export const CODEX_AUTO_RESET_PATH = "/limits/codex/auto-reset";
 
-export type AutoResetScope = "pool" | "identity";
-
 export interface AutoResetStatus {
   name: string;
   enabled: boolean;
@@ -17,5 +15,4 @@ export interface AutoResetStatus {
 
 export interface AutoResetView {
   pools: Array<AutoResetStatus & { members: string[] }>;
-  identities: AutoResetStatus[];
 }

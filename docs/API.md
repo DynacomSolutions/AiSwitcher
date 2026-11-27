@@ -404,9 +404,9 @@ read time); unknown extra fields around it are still preserved.
 ### Limits
 
 `GET /api/limits/codex/auto-reset` reads automatic reset settings through the gateway admin API.
-It returns `configured: true` with the gateway's `pools` and `identities`, or `configured: false` when the feature is unavailable.
-`PUT /api/limits/codex/auto-reset/{pool|identity}` accepts `name` and boolean `enabled` and requires `X-AIS-Console: 1`.
-The gateway validates both scopes. See [Automatic Codex resets](agents/gateway.md#automatic-codex-resets) for the fields.
+It returns `configured: true` with the gateway's `pools`, or `configured: false` when the feature is unavailable.
+`PUT /api/limits/codex/auto-reset/pool` accepts `name` and boolean `enabled` and requires `X-AIS-Console: 1`.
+The gateway validates the pool name. See [Automatic Codex resets](agents/gateway.md#automatic-codex-resets) for the fields.
 
 `GET /api/limits?tool=&identity=&maxAge=S`
 

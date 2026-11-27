@@ -47,7 +47,6 @@ export type PoolResetResult =
   | { status: "already_attempted" }
   | { status: "pending" | "confirmed" | "declined" };
 
-export type AutoResetScope = "pool" | "identity";
 export interface AutoResetStatus {
   name: string;
   enabled: boolean;
@@ -62,7 +61,6 @@ export interface AutoResetStatus {
 export type AutoResetResponse = { configured: false } | {
   configured: true;
   pools: Array<AutoResetStatus & { members: string[] }>;
-  identities: AutoResetStatus[];
 };
 
 /* Status */

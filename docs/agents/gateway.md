@@ -564,23 +564,23 @@ folder (`ok` or the problem).
 
 ### Automatic Codex resets
 
-An automatic reset requires both a named Codex pool rule and permission for its member identity. Both settings default to off.
-The gateway can spend a credit when the Codex routing pool exhausts weekly quota. Settings changes do not spend credits.
+A named Codex pool rule controls automatic resets. Each rule defaults to off.
+After the gateway verifies weekly exhaustion for every routed member, it selects the best eligible credit from the enabled pools.
+A rule change only saves the setting.
 
 ```sh
 ais gateway auto-reset list [--json]
 ais gateway auto-reset set pool <pool-name> on
-ais gateway auto-reset set identity <canonical-name> on
-ais gateway auto-reset set identity <canonical-name> off
+ais gateway auto-reset set pool <pool-name> off
 ```
 
-The commands use `AIS_GATEWAY_ADMIN_URL` and `AIS_GATEWAY_ADMIN_TOKEN`. The console has controls on Limits account and pool cards.
+The commands use `AIS_GATEWAY_ADMIN_URL` and `AIS_GATEWAY_ADMIN_TOKEN`. The console has controls on the Limits pool cards.
 `ais limits --tool=codex` shows the settings and last claim.
 
-Send the admin bearer token with both requests. `GET /limits/codex/auto-reset` lists named Codex pools, managed members and active pins.
-Each entry has `name` and `enabled`. Pool entries include `members`. An entry with history includes `lastClaim` with
-`pool`, `identity`, `startedAt`, `status` and `creditExpiresAt` when available. `PUT /limits/codex/auto-reset/{pool|identity}`
-takes `{"name":"example","enabled":true}` and returns the saved name and setting. Use the exact pool or canonical identity name.
+Send the admin bearer token with both requests. `GET /limits/codex/auto-reset` lists named Codex pools.
+Each entry has `name`, `enabled` and `members`. If a claim exists, `lastClaim` includes `pool`, `identity`, `startedAt` and `status`.
+It also includes `creditExpiresAt` when available.
+`PUT /limits/codex/auto-reset/pool` takes `{"name":"example","enabled":true}` and returns the saved name and setting. Use the exact pool name.
 
 ### Codex reset outcomes that need reconciliation
 

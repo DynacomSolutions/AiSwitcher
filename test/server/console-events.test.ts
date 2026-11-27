@@ -102,7 +102,10 @@ test("manual reset results and rule writes immediately invalidate their shared J
       enabled = (JSON.parse(String(init.body)) as { enabled: boolean }).enabled;
       return Response.json({ name: "fixture", enabled });
     }
-    return Response.json({ pools: [], identities: [{ name: "fixture", enabled }] });
+    return Response.json({
+      pools: [{ name: "fixture", enabled, members: [] }],
+      identities: [{ name: "legacy-fixture", enabled: true }],
+    });
   }, { preconnect: fetch.preconnect });
   const app = createApp({
     ...credentials,
@@ -140,13 +143,13 @@ test("manual reset results and rule writes immediately invalidate their shared J
     expect(await readFrame(reader)).toBe("event: ready\ndata: {}\n\n");
     expect(await get("/api/limits?maxAge=45")).toMatchObject({ pendingCredits: 2 });
     expect(reads).toBe(1);
-    expect(await get(settings)).toMatchObject({ identities: [{ enabled: false }] });
-    const rule = await app.request(`${settings}/identity`, {
+    expect(await get(settings)).toEqual({ configured: true, pools: [{ name: "fixture", enabled: false, members: [] }] });
+    const rule = await app.request(`${settings}/pool`, {
       method: "PUT", headers: mutationHeaders, body: JSON.stringify({ name: "fixture", enabled: true }),
     });
     expect(rule.status).toBe(200);
     expect(await readFrame(reader)).toBe(changeFrame("codex-auto-reset"));
-    expect(await get(settings)).toMatchObject({ identities: [{ enabled: true }] });
+    expect(await get(settings)).toMatchObject({ pools: [{ enabled: true }] });
 
     expect((await consume()).status).toBe(200);
     expect(await readFrame(reader)).toBe(changeFrame("limits", "pools-usage"));

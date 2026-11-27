@@ -13,7 +13,7 @@ export async function loadLimitsAutoReset(flags: ParsedArgs["flags"]): Promise<A
       fetch: ((url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(5_000) })) as typeof fetch,
     });
     const { json } = await admin.call("GET", CODEX_AUTO_RESET_PATH);
-    if (Array.isArray(json.pools) && Array.isArray(json.identities)) return json as unknown as AutoResetView;
+    if (Array.isArray(json.pools)) return json as unknown as AutoResetView;
   } catch {
     // Limits still works on hosts without an admin token and with older gateways.
   }
@@ -23,9 +23,9 @@ export async function loadLimitsAutoReset(flags: ParsedArgs["flags"]): Promise<A
 export function applyLimitsAutoReset(results: ToolLimitResult[], view: AutoResetView | undefined, identityFilter?: string): ToolLimitResult[] {
   if (!view) return results;
   const provider = providerForTool("codex");
-  const settings = new Map([...view.pools, ...view.identities].map((setting) => [setting.name, setting]));
+  const settings = new Map(view.pools.map((setting) => [setting.name, setting]));
   const applied = results.map((row) => {
-    if (row.provider !== provider) return row;
+    if (row.provider !== provider || !row.identity.swapPool) return row;
     const autoReset = settings.get(row.identity.name);
     if (!autoReset) return row;
     settings.delete(row.identity.name);
