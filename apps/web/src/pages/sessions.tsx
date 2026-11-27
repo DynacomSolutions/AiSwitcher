@@ -411,7 +411,7 @@ export function SessionsPage() {
             </SelectItem>
             {identityOptions.map((name) => (
               <SelectItem key={name} value={name} className="text-xs">
-                <ProviderLabel provider={name} />
+                {name}
               </SelectItem>
             ))}
           </SelectContent>

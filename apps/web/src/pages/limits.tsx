@@ -4,7 +4,7 @@ import { useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { ToolBadge } from "@/components/badges";
-import { ProviderLabel } from "@/components/provider-icon";
+import { ProviderIcon, ProviderLabel } from "@/components/provider-icon";
 import { AutoResetMemberClaim, AutoResetUnsupported } from "@/components/auto-reset-control";
 import { PoolUsageCards } from "@/components/pool-usage-cards";
 import { ResetPushToggle } from "@/components/reset-push-toggle";
@@ -546,7 +546,15 @@ export function LimitsPage() {
   const tabs = useMemo<PageTab[]>(
     () => [
       { segment: "overview", label: "Overview" },
-      ...providerGroups.map(([provider]) => ({ segment: provider, label: provider })),
+      ...providerGroups.map(([provider]) => ({
+        segment: provider,
+        label: (
+          <>
+            <ProviderIcon provider={provider} size={13} />
+            {provider}
+          </>
+        ),
+      })),
     ],
     [providerGroups],
   );
