@@ -1507,7 +1507,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       return new Response(null, { status: 499 });
     }
     if (err instanceof GatewayCredentialError) {
-      record(identity, "credential_error", 502, undefined, false, undefined, model);
+      // The stable code (login-dead, refresh-failed, ...) goes in the log row, so a 502 names its cause.
+      record(identity, "credential_error", 502, undefined, false, undefined, model, `credential:${err.code}`);
       return providerError(style, 502, err.clientMessage, "credential_unavailable");
     }
     // Never echo the error: it may carry paths or provider text.

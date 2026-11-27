@@ -1281,6 +1281,19 @@ describe("failover and refresh", () => {
     const r = await rows();
     expect(r.length).toBe(1);
     expect(r[0]).toMatchObject({ httpStatus: 502, status: "credential_error" });
+    // The request log row names the stable code, never the cause.
+    expect(logs.find((l) => l.includes('"event":"request"') && l.includes('"credential_error"'))).toContain('"reason":"credential:refresh-failed"');
+  });
+
+  test("a dead login logs its code in the credential_error row", async () => {
+    const t = await addApp(baseApp({}));
+    handler = () => new Response("{}", { status: 401 });
+    refreshImpl = async () => {
+      throw new GatewayCredentialError("login-dead", "claude", "id1");
+    };
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(502);
+    expect(logs.find((l) => l.includes('"event":"request"') && l.includes('"credential_error"'))).toContain('"reason":"credential:login-dead"');
   });
 });
 
