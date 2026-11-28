@@ -22,6 +22,37 @@ export interface UsageCounts {
   cacheWriteTokens: number;
 }
 
+/** Most distinct tool names kept for one response, and the longest kept name. Names are labels only: no tool input or result is read. */
+export const MAX_TOOL_NAMES = 32;
+export const MAX_TOOL_NAME_CHARS = 64;
+/** Longest kept stop reason. It is a provider enum (`end_turn`, `tool_use`, `stop`, `completed`), never model text. */
+export const MAX_STOP_REASON_CHARS = 64;
+/** Most distinct tool calls remembered for de-duplication. Past it the count still grows but repeats may be counted twice. */
+const MAX_TOOL_KEYS = 4096;
+
+/**
+ * Metadata of one upstream response, without any content: why the model stopped and which tools it called.
+ * `toolCalls` counts every call; `toolNames` holds the distinct names, at most MAX_TOOL_NAMES of MAX_TOOL_NAME_CHARS each.
+ */
+export interface ResponseMeta {
+  stopReason?: string;
+  toolCalls: number;
+  toolNames: string[];
+}
+
+/** A short label from provider data: control characters removed, cut to `max` characters. Undefined when nothing is left. */
+export function cleanLabel(v: unknown, max: number): string | undefined {
+  if (typeof v !== "string") return undefined;
+  let s = v.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  if (s.length > max) {
+    s = s.slice(0, max);
+    // Do not end on half of a surrogate pair.
+    const last = s.charCodeAt(s.length - 1);
+    if (last >= 0xd800 && last <= 0xdbff) s = s.slice(0, -1);
+  }
+  return s === "" ? undefined : s;
+}
+
 /** Largest JSON body held for parsing; beyond it the result is zero counts. */
 const MAX_JSON_BYTES = 4 * 1024 * 1024;
 /** Largest single SSE event held; a bigger event is skipped. */
@@ -86,6 +117,11 @@ export class UsageTap {
   private eventTooBig = false;
   private eventName = "";
   private streamErr: StreamErrorEvent | undefined;
+  // Response metadata (never content)
+  private stopReason: string | undefined;
+  private toolCalls = 0;
+  private readonly toolNames: string[] = [];
+  private readonly toolKeys = new Set<string>();
 
   constructor(private readonly style: UsageStyle, contentType: string) {
     const ct = contentType.toLowerCase();
@@ -111,6 +147,12 @@ export class UsageTap {
   streamError(): StreamErrorEvent | undefined {
     this.result();
     return this.streamErr;
+  }
+
+  /** Why the model stopped and which tools it called. Call after the body ends (it flushes pending input, like result()). */
+  meta(): ResponseMeta {
+    this.result();
+    return { ...(this.stopReason ? { stopReason: this.stopReason } : {}), toolCalls: this.toolCalls, toolNames: [...this.toolNames] };
   }
 
   /** True when the body is being read as SSE (named by the upstream or sniffed). */
@@ -318,6 +360,7 @@ export class UsageTap {
   private applyAnthropic(root: Obj): void {
     const msg = isObj(root.message) ? root.message : root;
     this.setModel(msg.model);
+    this.noteAnthropicMeta(root, msg);
     const u = isObj(msg.usage) ? msg.usage : isObj(root.usage) ? root.usage : undefined;
     if (!u) return;
     // Values are cumulative, so keep the max: a compat provider sending
@@ -333,6 +376,7 @@ export class UsageTap {
   private applyResponses(root: Obj): void {
     const r = isObj(root.response) ? root.response : root;
     this.setModel(r.model);
+    this.noteResponsesMeta(root, r);
     const u = r.usage;
     if (!isObj(u)) return;
     const prompt = num(u.input_tokens);
@@ -342,11 +386,86 @@ export class UsageTap {
 
   private applyChat(root: Obj): void {
     this.setModel(root.model);
+    this.noteChatMeta(root);
     const u = root.usage;
     if (!isObj(u)) return;
     const prompt = num(u.prompt_tokens);
     if (prompt === undefined) return;
     this.setOpenAi(prompt, num(u.completion_tokens), isObj(u.prompt_tokens_details) ? num(u.prompt_tokens_details.cached_tokens) : undefined);
+  }
+
+  private noteStop(v: unknown): void {
+    const s = cleanLabel(v, MAX_STOP_REASON_CHARS);
+    if (s) this.stopReason = s;
+  }
+
+  /** Counts a tool call once per `key` (when given) and keeps its name, distinct and bounded. */
+  private noteTool(name: unknown, key?: string): void {
+    if (key !== undefined) {
+      if (this.toolKeys.has(key)) return;
+      if (this.toolKeys.size < MAX_TOOL_KEYS) this.toolKeys.add(key);
+    }
+    this.toolCalls += 1;
+    const n = cleanLabel(name, MAX_TOOL_NAME_CHARS);
+    if (n && this.toolNames.length < MAX_TOOL_NAMES && !this.toolNames.includes(n)) this.toolNames.push(n);
+  }
+
+  /** Anthropic Messages: `stop_reason` (body, or `message_delta.delta` in a stream) and `tool_use` blocks (body, or `content_block_start`). Only the block type and name are read. */
+  private noteAnthropicMeta(root: Obj, msg: Obj): void {
+    this.noteStop(msg.stop_reason);
+    if (isObj(root.delta)) this.noteStop(root.delta.stop_reason);
+    if (root.type === "content_block_start") this.noteAnthropicBlock(root.content_block, num(root.index));
+    if (Array.isArray(msg.content)) for (const b of msg.content) this.noteAnthropicBlock(b, undefined);
+  }
+
+  /** A block is counted once by its id (or, in a stream without one, by its index), so a compat upstream that repeats it in a final message adds no second call. */
+  private noteAnthropicBlock(b: unknown, index: number | undefined): void {
+    if (!isObj(b)) return;
+    if (b.type !== "tool_use" && b.type !== "server_tool_use" && b.type !== "mcp_tool_use") return;
+    const id = text(b.id);
+    this.noteTool(b.name, id !== undefined ? `a:${id}` : index !== undefined ? `a:#${index}` : undefined);
+  }
+
+  /**
+   * OpenAI Responses and Codex: the terminal `status` (or the reason of an `incomplete` one), and tool calls as output
+   * items (`function_call`, `custom_tool_call`, `web_search_call`, ...). A call seen in `output_item.added`, `.done` and the
+   * final `output` list is counted once, by item id, call id or output index.
+   */
+  private noteResponsesMeta(root: Obj, r: Obj): void {
+    const status = text(r.status);
+    if (status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled") {
+      const reason = status === "incomplete" && isObj(r.incomplete_details) ? text(r.incomplete_details.reason) : undefined;
+      this.noteStop(reason ?? status);
+    }
+    if ((root.type === "response.output_item.added" || root.type === "response.output_item.done") && isObj(root.item)) this.noteResponsesItem(root.item, num(root.output_index));
+    if (Array.isArray(r.output)) r.output.forEach((item, i) => this.noteResponsesItem(item, i));
+  }
+
+  private noteResponsesItem(item: unknown, index: number | undefined): void {
+    if (!isObj(item)) return;
+    const type = text(item.type);
+    if (!type || !type.endsWith("_call")) return; // reasoning and message items are not tool calls
+    const id = text(item.id) ?? text(item.call_id);
+    this.noteTool(text(item.name) ?? type, id !== undefined ? `r:${id}` : `r:#${index ?? this.toolCalls}`);
+  }
+
+  /** Chat Completions: `finish_reason`, and `tool_calls` of a message (body) or a delta (stream, counted once per choice and call index). */
+  private noteChatMeta(root: Obj): void {
+    if (!Array.isArray(root.choices)) return;
+    root.choices.forEach((choice, ci) => {
+      if (!isObj(choice)) return;
+      this.noteStop(choice.finish_reason);
+      const m = isObj(choice.delta) ? choice.delta : isObj(choice.message) ? choice.message : undefined;
+      if (!m || !Array.isArray(m.tool_calls)) return;
+      const choiceIndex = num(choice.index) ?? ci;
+      m.tool_calls.forEach((tc, j) => {
+        if (!isObj(tc)) return;
+        // Some compatible providers leave out `index`: their calls are told apart by id, then by position.
+        const at = num(tc.index);
+        const id = text(tc.id);
+        this.noteTool(isObj(tc.function) ? tc.function.name : undefined, `c:${choiceIndex}:${at !== undefined ? at : id !== undefined ? `id:${id}` : j}`);
+      });
+    });
   }
 
   private setOpenAi(prompt: number, output: number | undefined, cached: number | undefined): void {
