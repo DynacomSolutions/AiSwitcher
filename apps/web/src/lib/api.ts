@@ -40,6 +40,8 @@ import type {
   BrowsersResponse,
   PushStatusResponse,
   PoolsUsageResponse,
+  ResetLogQuery,
+  ResetLogResponse,
   PoolResetConfirmation,
   PoolResetResult,
   PoolResetReview,
@@ -190,6 +192,18 @@ export const api = {
   /** A manual refresh: the server reads the provider again for this tool (and identity), past its 45 second caches. */
   refreshLimits: (tool: string, identity?: string) =>
     request<LimitsResponse>(`/api/limits?refresh=1&tool=${encodeURIComponent(tool)}${identity ? `&identity=${encodeURIComponent(identity)}` : ""}`),
+
+  getResetLog: (query: ResetLogQuery, signal?: AbortSignal) =>
+    request<ResetLogResponse>(withParams("/api/logs/resets", {
+      identity: query.identity,
+      provider: query.provider,
+      trigger: query.trigger,
+      outcome: query.outcome,
+      from: query.from,
+      to: query.to,
+      limit: query.limit !== undefined ? String(query.limit) : undefined,
+      before: query.before,
+    }), { signal }),
 
   getUsage: (signal?: AbortSignal) => request<UsageResponse>("/api/usage", { signal }),
 

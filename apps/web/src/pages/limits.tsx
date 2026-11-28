@@ -7,6 +7,7 @@ import { ToolBadge } from "@/components/badges";
 import { ProviderIcon, ProviderLabel } from "@/components/provider-icon";
 import { AutoResetMemberClaim, AutoResetUnsupported } from "@/components/auto-reset-control";
 import { PoolUsageCards } from "@/components/pool-usage-cards";
+import { ResetLogLink } from "@/components/reset-log-link";
 import { ResetPushToggle } from "@/components/reset-push-toggle";
 import { ResetCountdown } from "@/components/reset-countdown";
 import { GlobalUsageCards } from "@/components/usage-counter";
@@ -442,6 +443,7 @@ function LimitCard({ result, supported, claim, onRefresh, refreshing }: { result
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <StatusBadge status={result.status} />
+            <ResetLogLink identity={result.identity.name} />
             <RefreshButton
               label={`Refresh ${result.identity.name}`}
               busy={refreshing}
