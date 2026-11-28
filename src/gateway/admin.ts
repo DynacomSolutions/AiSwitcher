@@ -21,6 +21,7 @@ import { USAGE_READER_PROVIDERS } from "./usage-source.ts";
 import { registerPoolResetAdmin, type PoolResetAdmin } from "./admin-pool-reset.ts";
 import type { AutoResetStore } from "./auto-reset-store.ts";
 import type { AutoResetPool } from "./auto-reset.ts";
+import { claudeManualOutcome, codexResultOutcome, failureOutcome, parseResetLogQuery, resetActor, type ResetLogger, type ResetLogStore } from "./reset-log.ts";
 import {
   AUTO_RESET_PATH, AUTO_RESET_PROVIDERS, AUTO_RESET_UNSUPPORTED, AUTO_RESET_UNSUPPORTED_REASON, isAutoResetProvider,
   type AutoResetLastClaim, type AutoResetPoolStatus, type AutoResetProvider, type AutoResetProviderView, type AutoResetUnsupportedProvider,
@@ -106,6 +107,10 @@ export interface AdminDeps {
   /** Spends one Codex reset on the named member and invalidates shared reset and usage reads. */
   spendCodexReset?(identity: string, redeemRequestId: string, signal?: AbortSignal): Promise<unknown>;
   poolReset?: PoolResetAdmin;
+  /** Writes one reset log row for each manual reset (reset-log.ts). Absent: the routes write no row. */
+  resetLog?: ResetLogger;
+  /** Reads the reset log (GET /reset-log). Absent: the route answers 404. */
+  resetLogStore?: ResetLogStore;
   autoReset?: { store: AutoResetStore; pools: (provider: AutoResetProvider) => Promise<AutoResetPool[]> };
 }
 
@@ -492,9 +497,18 @@ export function createAdminApp(deps: AdminDeps): Hono {
     if (!deps.spendReset) return err(404, "reset spending is not available");
     const requested = decodeURIComponent(c.req.param("identity"));
     const identity = (await deps.canonical?.("claude", requested).catch(() => requested)) ?? requested;
+    const grant = decodeURIComponent(c.req.param("grant"));
+    // The log keeps only a well-formed grant ID. Anything else is refused by the spend and is not logged as an ID.
+    const attempt = await deps.resetLog?.begin({
+      provider: "claude", trigger: "manual", actor: resetActor(c.req.raw, "user"), identity, grantId: /^[A-Za-z0-9._:-]{1,128}$/.test(grant) ? grant : null,
+    });
     try {
-      return c.json(await deps.spendReset(identity, decodeURIComponent(c.req.param("grant"))));
+      const out = await deps.spendReset(identity, grant);
+      const body = (typeof out === "object" && out !== null ? out : {}) as { result?: unknown; cleared?: unknown; resetsLeft?: unknown; grantId?: unknown };
+      await attempt?.finish({ ...claudeManualOutcome(body), ...(typeof body.grantId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(body.grantId) ? { grantId: body.grantId } : {}) });
+      return c.json(out);
     } catch (e) {
+      await attempt?.finish(failureOutcome(e));
       const status = (e as { status?: unknown }).status;
       const known = status === 400 || status === 404 || status === 409 || status === 429 ? status : 502;
       return Response.json({ error: e instanceof Error ? e.message.slice(0, 300) : "reset failed" }, { status: known });
@@ -506,15 +520,31 @@ export function createAdminApp(deps: AdminDeps): Hono {
     if (!deps.spendCodexReset) return err(404, "Codex reset spending is not available");
     const requested = decodeURIComponent(c.req.param("identity"));
     const identity = (await deps.canonical?.("codex", requested).catch(() => requested)) ?? requested;
+    const body = await c.req.json().catch(() => undefined) as { redeemRequestId?: unknown } | undefined;
+    if (typeof body?.redeemRequestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.redeemRequestId)) return err(400, "a valid reset request ID is required");
+    const attempt = await deps.resetLog?.begin({ provider: "codex", trigger: "manual", actor: resetActor(c.req.raw, "user"), identity });
     try {
-      const body = await c.req.json().catch(() => undefined) as { redeemRequestId?: unknown } | undefined;
-      if (typeof body?.redeemRequestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.redeemRequestId)) return err(400, "a valid reset request ID is required");
-      return c.json(await deps.spendCodexReset(identity, body.redeemRequestId, c.req.raw.signal));
+      const out = await deps.spendCodexReset(identity, body.redeemRequestId, c.req.raw.signal);
+      const result = (typeof out === "object" && out !== null ? out : {}) as { result?: unknown; creditId?: unknown };
+      await attempt?.finish({
+        ...codexResultOutcome(typeof result.result === "string" ? result.result : ""),
+        ...(typeof result.creditId === "string" ? { grantId: result.creditId } : {}),
+      });
+      return c.json(out);
     } catch (e) {
+      await attempt?.finish(failureOutcome(e));
       const status = (e as { status?: unknown }).status;
       const known = status === 400 || status === 403 || status === 404 || status === 409 || status === 429 ? status : 502;
       return Response.json({ error: e instanceof Error ? e.message.slice(0, 300) : "reset failed" }, { status: known });
     }
+  });
+
+  // The reset log: every reset attempt, newest first (reset-log.ts). The console serves it as GET /api/logs/resets.
+  hono.get("/reset-log", async (c) => {
+    if (!deps.resetLogStore) return err(404, "the reset log is not available");
+    const filters = parseResetLogQuery((name) => c.req.query(name));
+    if (typeof filters === "string") return err(400, filters);
+    return c.json(await deps.resetLogStore.list(filters), 200, { "cache-control": "no-store" });
   });
 
   hono.get("/apps", async (c) => {

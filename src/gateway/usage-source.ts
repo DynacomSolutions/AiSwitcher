@@ -348,6 +348,8 @@ export function createUsageSource(opts: {
   onRead?: (provider: GatewayProvider, source: "upstream" | "shared") => void;
   /** Counts a failed shared store call. */
   onSharedError?: () => void;
+  /** Called with every reading that the cache stores as a current figure (not stale, not unavailable). Never awaited. A throw is ignored. */
+  onReading?: (provider: GatewayProvider, identity: string, reading: PoolUsage) => void;
   log?: (line: string) => void;
   /** Longest one shared store call may take (default 1500 ms). A slower call counts as an error. */
   sharedTimeoutMs?: number;
@@ -418,6 +420,15 @@ export function createUsageSource(opts: {
       return fallback;
     }
   };
+  /** Tells the reset log about a stored current reading. A stale or unavailable one is no new figure. */
+  const notifyReading = (provider: GatewayProvider, identity: string, reading: PoolUsage | undefined): void => {
+    if (!opts.onReading || !reading || reading.stale || reading.status === "unavailable") return;
+    try {
+      opts.onReading(provider, identity, reading);
+    } catch {
+      // The reset log never fails a read.
+    }
+  };
   const loadShared = (provider: GatewayProvider, identity: string): Promise<SharedReading | undefined> => guarded((s) => s.load(provider, identity), undefined);
 
   const refresh = (provider: GatewayProvider, identity: string, fresh = false): Promise<void> => {
@@ -430,6 +441,7 @@ export function createUsageSource(opts: {
     const write = (value: PoolUsage | undefined, at: number) => {
       const publishedAt = entries.get(key)?.publishedAt;
       entries.set(key, { value, at, publishedAt });
+      notifyReading(provider, identity, value);
     };
     const newerPublication = () => (entries.get(key)?.publishedAt ?? -Infinity) >= started;
     const outdated = (reading: PoolUsage | undefined) => {
@@ -539,6 +551,7 @@ export function createUsageSource(opts: {
       const age = now() - capturedMs(reading);
       if (age < 0 || age >= ttl) return;
       entries.set(key, { value: reading, at: now() - age, publishedAt: performance.now() });
+      notifyReading(provider, identity, reading);
       lastUpstream.set(key, now() - age);
       opts.onRead?.(provider, "upstream");
       noteOutcome(provider, identity, reading, false);

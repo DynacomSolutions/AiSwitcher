@@ -33,6 +33,7 @@ import { GATEWAY_USAGE_WINDOW_DAYS, mergeGatewayUsageWithHistory, usageBucketZon
 import * as gatewayApps from "./gateway-apps.ts";
 import { createGatewayAutoResetRequest, registerGatewayAutoReset, type GatewayAutoResetDeps } from "./gateway-auto-reset.ts";
 import { registerGatewayPoolReset } from "./gateway-pool-reset.ts";
+import { registerGatewayResetLog, type GatewayResetLogDeps } from "./gateway-reset-log.ts";
 import { addGatewayIdentity, addGatewayPoolMember, type GatewayIdentityAddResult } from "./gateway-identities.ts";
 import { buildRenewalRows, loadGatewayRenewal, type GatewayRenewalView } from "./gateway-renewal.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
@@ -99,6 +100,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   /** Test seam for the gateway limits merge on GET /api/limits; defaults to the gateway admin API. */
   gatewayLimits?: () => Promise<GatewayLimitsView>;
   gatewayAutoReset?: GatewayAutoResetDeps;
+  /** Test seam for GET /api/logs/resets; defaults to the gateway admin API. */
+  gatewayResetLog?: GatewayResetLogDeps;
   /** Test seam for the gateway usage merge on GET /api/usage; defaults to the gateway admin API. */
   gatewayModelUsage?: () => Promise<GatewayModelUsageView>;
   /** Test seam for the imported host history on GET /api/usage; defaults to the gateway admin API. */
@@ -460,6 +463,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     read: () => events.read("auto-reset"),
     changed: () => events.invalidate("auto-reset"),
   });
+  registerGatewayResetLog(app, deps.gatewayResetLog);
   registerGatewayPoolReset(app, deps.gatewayAutoReset, (status) => {
     resetChanged();
     if (status === "confirmed") void deps.resetExpiryPush?.tickPools?.();

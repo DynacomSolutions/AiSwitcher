@@ -74,6 +74,10 @@ export interface GatewayMetrics {
   poolHeadroom?(provider: string, threshold: number, withHeadroom: number, withReading: number): void;
   /** Seconds a request waited for body budget (0 when it did not have to wait). */
   bodyBudgetWait?(seconds: number): void;
+  /** One reset attempt, written to the reset log. The three labels come from fixed sets (reset-log.ts). */
+  resetAttempt?(provider: string, trigger: string, outcome: string): void;
+  /** A reset log row that could not be written. The reset itself was not blocked. */
+  resetLogWriteFailure?(provider: string): void;
 }
 
 export const noopMetrics: GatewayMetrics = {
@@ -89,6 +93,8 @@ export const noopMetrics: GatewayMetrics = {
   chatTurn() {},
   chatError() {},
   chatPodStart() {},
+  resetAttempt() {},
+  resetLogWriteFailure() {},
 };
 
 const BUCKETS = [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300];
@@ -165,6 +171,8 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly refreshes = new Counter("ais_gateway_refresh_total", "Login refresh attempts by outcome.");
   private readonly usageReads = new Counter("ais_gateway_usage_reads_total", "Usage readings taken, by provider and source (upstream or the shared database row).");
   private readonly usageSharedErrors = new Counter("ais_gateway_usage_shared_errors_total", "Shared usage reading database calls that failed.");
+  private readonly resets = new Counter("ais_gateway_resets_total", "Reset attempts written to the reset log, by provider, trigger and outcome.");
+  private readonly resetLogWriteFailures = new Counter("ais_gateway_reset_log_write_failures_total", "Reset log rows that could not be written, by provider. The reset was not blocked.");
   private readonly heartbeatWrites = new Counter("ais_gateway_heartbeat_writes_total", "Gateway ownership heartbeat writes, by outcome.");
   private readonly keepAlives = new Counter("ais_gateway_keepalive_total", "Idle keep-alive refresh passes over managed logins, by outcome.");
   private readonly refreshAttempts = new Counter("ais_gateway_refresh_attempts_total", "Login refresh attempts reaching the refresh guard, per account.");
@@ -391,6 +399,14 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.usageSharedErrors.inc({});
   }
 
+  resetAttempt(provider: string, trigger: string, outcome: string): void {
+    this.resets.inc({ provider, trigger, outcome });
+  }
+
+  resetLogWriteFailure(provider: string): void {
+    this.resetLogWriteFailures.inc({ provider });
+  }
+
   heartbeatWrite(outcome: string): void {
     this.heartbeatWrites.inc({ outcome });
   }
@@ -436,7 +452,7 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.poolHolds, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors, this.favourites, this.sessionsRequests, this.sessionsRecords, this.sessionsPartsTotal, this.sessionsBytes, this.sessionsErrors]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.resets, this.resetLogWriteFailures, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.poolHolds, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors, this.favourites, this.sessionsRequests, this.sessionsRecords, this.sessionsPartsTotal, this.sessionsBytes, this.sessionsErrors]) out.push(...c.render());
     out.push(...this.sessionsSeconds.render(), ...this.sessionsLagSeconds.render());
     for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge, this.poolHeadroomGauge, this.poolReadingsGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");

@@ -78,6 +78,7 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 12
   static server marks only Vite's hashed `/assets/` as immutable; every other file (index.html, sw.js, the manifest,
   icons) is `no-cache` so installs pick up new releases. Static files sit outside the `/api` guard, so the browser can
   fetch the manifest and worker without the token.
+- Reset log: `GET /api/logs/resets` (`src/server/gateway-reset-log.ts`) is a read-only proxy of the gateway `GET /reset-log`. It checks the query with `parseResetLogQuery`, passes only known keys and answers an empty page when no gateway admin is set. The console sends `X-AIS-Actor: console` on reset calls so the gateway row names the console. Contract in `docs/API.md`; design in `docs/agents/gateway.md`.
 - Reset-expiry push (`src/server/reset-expiry-push.ts`, `src/server/web-push.ts`): the worker also handles `push` and
   `notificationclick` (still no Cache API). Web Push is implemented with `node:crypto` only (RFC 8291 aes128gcm, RFC 8292
   VAPID; a test pins the RFC 8291 Appendix A vector), no web-push dependency. The daemon checks hourly through the shared

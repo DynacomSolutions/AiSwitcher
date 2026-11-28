@@ -403,6 +403,32 @@ read time); unknown extra fields around it are still preserved.
 
 ### Limits
 
+`GET /api/logs/resets` reads the reset log: one row for every reset attempt, manual or automatic, Claude or Codex.
+Rows are newest first. The log is append-only and never pruned.
+The console checks the query, then asks the gateway admin API (`GET /reset-log`). Without a gateway admin it answers an empty page with `configured: false`.
+Query keys (all optional): `identity`, `provider` (`claude`, `codex`), `trigger` (`manual`, `auto`), `outcome` (`reset`, `no_credit`, `already_redeemed`, `rejected`, `error`),
+`from` and `to` (ISO date or date-time, UTC; both inclusive, and a date-only `to` ends at the end of that day), `limit` (default 100, largest 500) and `before` (cursor: a row `id`).
+A bad value answers 400.
+
+```json
+{
+  "rows": [{
+    "id": "123", "at": "2026-11-27T08:00:00.000Z", "provider": "claude", "trigger": "manual",
+    "actor": "user:console", "identity": "name", "account": null, "pool": null, "grantId": "grant-id",
+    "before": [{ "key": "weekly", "label": "seven-day", "percent": 100, "resetsAt": "2026-11-28T08:00:00.000Z" }],
+    "outcome": "reset", "message": null, "resetsLeftAfter": 2,
+    "after": [{ "key": "weekly", "label": "seven-day", "percent": 2, "resetsAt": "2026-12-04T08:00:00.000Z" }],
+    "afterAt": "2026-11-27T08:01:00.000Z"
+  }],
+  "nextBefore": "122",
+  "identities": ["name"]
+}
+```
+
+`nextBefore` is the `id` to send as `before` for the next page, or `null` on the last page. `identities` lists every identity in the table, for a filter menu.
+A window `key` is `five_hour`, `weekly`, `weekly_<model>` or another slug. `after` and `afterAt` are `null` until the first usage reading that follows the row arrives. They are set once.
+A row holds no token, cookie or secret.
+
 `GET /api/limits/auto-reset` reads the automatic reset settings of every provider through the gateway admin API. `GET /api/limits/{provider}/auto-reset` reads one provider.
 It returns `configured: true` with the gateway's `providers`, or `configured: false` when the feature is unavailable.
 `PUT /api/limits/{provider}/auto-reset/pool` accepts `name` and boolean `enabled` and requires `X-AIS-Console: 1`. Automatic reset is a pool setting only: the `identity` form answers 410.
