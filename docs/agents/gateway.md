@@ -600,6 +600,27 @@ Codex pool rules stay in `codex_auto_reset_settings`. The new table `auto_reset_
 The migration `0022_auto_reset_every_pool` copies and rewrites no stored rule. Old identity rows stay in `codex_auto_reset_settings`.
 No query reads them, so they have no effect and never become pool settings.
 
+### Reset log (`src/gateway/reset-log.ts`, table `reset_log`, migration 0023)
+
+Every reset attempt writes one row, on every path: manual Claude (`POST /limits/claude/:identity/resets/:grant`), manual Codex (`POST /limits/codex/:identity/resets/use`),
+the Codex pool route (`confirmPoolReset`) and the automatic engine for Claude and Codex (`createAutoResetRecovery`, option `resetLog`).
+The row is written in the same code path as the reset. No path can skip it. The table is append-only and never pruned. Nothing else in the gateway deletes from it.
+Each row is updated once, to fill `after` and `after_at` from the first stored usage reading that is newer than the row (`createUsageSource` option `onReading`).
+A failed write never blocks or fails a reset. It counts in `ais_gateway_reset_log_write_failures_total{provider}` and logs one short line with no secret.
+`ais_gateway_resets_total{provider,trigger,outcome}` counts every attempt, also when the write fails.
+`before` holds every window of the latest cached reading before the reset (the decision reading for the pool route and the automatic engine).
+Free text goes through `redactText`. `grant_id` is a credit or grant ID only.
+
+| Path | actor | outcome mapping |
+| --- | --- | --- |
+| Manual Claude (admin route) | `user`, or `user:<name>` from the `X-AIS-Actor` header (the console sends `console`) | `reset`, `no_credit`, `already_redeemed` by the answer. `nothing_to_reset` and a refusal before the POST (400, 403, 404, 409, 429) are `rejected`. A lost or unclear answer is `error`. |
+| Manual Codex (admin route) | same | the same mapping |
+| Codex pool route | `pool-route`, or `pool-route:<name>` | POST answered `reset` is `reset`, also while the relief check is pending. `already_attempted` is `already_redeemed`. A declined or changed pool is `no_credit` or `rejected`. A sent POST with no recorded answer is `error`. |
+| Automatic Claude and Codex | `auto-reset-worker` | claim `reset` is `reset`. Provider `no_credit` or `already_redeemed` keep their names. A claim `rejected` is `rejected`. A claim `unknown` is `error`. |
+
+`account` is set only where the credential is in hand (the pool route). It is `null` on the other paths. `pool` is set for automatic and pool-route rows.
+`GET /reset-log` on the gateway admin API reads the log (same admin token as the other routes). The console serves it as `GET /api/logs/resets`. See `docs/API.md`.
+
 ### Codex reset outcomes that need reconciliation
 
 Before a pool or automatic reset POST, the gateway commits an account guard in PostgreSQL under the shared redemption lock.

@@ -2,6 +2,7 @@ import type { Hono } from "hono";
 import {
   GATEWAY_POOL_CONFIRM_MS, withPoolResetDeadline, POOL_LIMITS_ROUTE, POOL_THRESHOLDS_PATH, validPoolRoute, type PoolResetConfirmation, type PoolResetResult, type PoolResetReview, type PoolThreshold,
 } from "./pool-reset-view.ts";
+import { resetActor } from "./reset-log.ts";
 import type { GatewayProvider } from "./types.ts";
 
 export interface PoolResetAdmin {
@@ -9,7 +10,7 @@ export interface PoolResetAdmin {
   review(tool: GatewayProvider, pool: string, signal: AbortSignal): Promise<PoolResetReview | undefined>;
   activationEnabled?: boolean;
   confirmTimeoutMs?: number;
-  confirm(pool: string, selection: PoolResetConfirmation, signal: AbortSignal, deadlineAt: number): Promise<PoolResetResult | undefined>;
+  confirm(pool: string, selection: PoolResetConfirmation, signal: AbortSignal, deadlineAt: number, actor?: string): Promise<PoolResetResult | undefined>;
 }
 
 function validConfirmation(value: unknown): value is PoolResetConfirmation {
@@ -51,7 +52,7 @@ export function registerPoolResetAdmin(hono: Hono, deps: PoolResetAdmin, provide
       const signal = AbortSignal.any([c.req.raw.signal, deadline]);
       try {
         signal.throwIfAborted();
-        const result = await deps.confirm(c.req.param("pool"), confirmation, signal, deadlineAt);
+        const result = await deps.confirm(c.req.param("pool"), confirmation, signal, deadlineAt, resetActor(c.req.raw, "pool-route"));
         return result ? json(result) : missing();
       } catch (error) {
         if (signal.aborted) return json({ status: "pending" } satisfies PoolResetResult);

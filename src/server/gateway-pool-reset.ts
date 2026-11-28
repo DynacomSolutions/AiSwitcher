@@ -12,7 +12,7 @@ async function request(path: string, deps: GatewayPoolDeps, body?: unknown, sign
     signal.throwIfAborted();
     return await (deps.fetch ?? fetch)(`${admin.url}${path}`, {
       method: body === undefined ? "GET" : "POST",
-      headers: { authorization: `Bearer ${admin.token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      headers: { authorization: `Bearer ${admin.token}`, ...(body === undefined ? {} : { "content-type": "application/json", "x-ais-actor": "console" }) },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
       redirect: "error",

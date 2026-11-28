@@ -2564,7 +2564,10 @@ describe("automatic Claude reset integration", () => {
       method: "POST", body: '{"model":"claude-fixture","max_tokens":1,"messages":[]}',
       headers: { authorization: `Bearer ${t.token}`, "content-type": "application/json" },
     });
-    return { auto, call, posts, inferences, agents };
+    const resetLog = async () => (await (await fetch(`http://127.0.0.1:${g.adminPort}/reset-log`, { headers: { authorization: `Bearer ${ADMIN}` } })).json()) as {
+      rows: Array<Record<string, unknown>>; identities: string[];
+    };
+    return { auto, call, posts, inferences, agents, resetLog, metrics: () => fetch(`${base(g)}/metrics`).then((r) => r.text()) };
   }
 
   test("a pool setting spends one grant with fakes and replays the request", async () => {
@@ -2579,6 +2582,15 @@ describe("automatic Claude reset integration", () => {
     expect(await state.auto.lastClaim("claude", pool)).toMatchObject({ identity, status: "reset" });
     // The same member name under Codex has no claim.
     expect(await state.auto.lastMemberClaim("codex", identity)).toBeUndefined();
+    // The reset log holds the attempt, with the windows of the reading from before it.
+    const log = await state.resetLog();
+    expect(log.identities).toEqual([identity]);
+    expect(log.rows).toHaveLength(1);
+    expect(log.rows[0]).toMatchObject({
+      provider: "claude", trigger: "auto", actor: "auto-reset-worker", identity, pool, grantId, outcome: "reset",
+      before: [{ key: "five_hour", percent: 20 }, { key: "weekly", percent: 100 }],
+    });
+    expect(await state.metrics()).toContain('ais_gateway_resets_total{provider="claude",trigger="auto",outcome="reset"} 1');
   });
 
   test("the setting is off by default and a Codex pool setting never spends a Claude grant", async () => {
@@ -2629,6 +2641,24 @@ describe("automatic Claude reset integration", () => {
       await auto.recordReportedCredit(requestId, grantId, "reset");
       expect((await call()).status).toBe(200);
       expect(spent).toBe(1);
+    });
+
+    test("it writes a reset log row that the admin API lists", async () => {
+      const g = await boot({
+        poolMembers: async () => [identity], canonical: async (_provider, member) => member, keepAliveAccounts: async () => [],
+        usageFor: async () => ({ status: "live", capturedAt: new Date().toISOString(), windows: [{ label: "seven-day", utilization: 100 }] }),
+        claudeReset: async (member, grant) => ({ identity: member, grantId: grant, result: "reset", resetsLeft: 3, cleared: ["seven_day"] }),
+      });
+      const headers = { authorization: `Bearer ${ADMIN}` };
+      const spent = await fetch(`http://127.0.0.1:${g.adminPort}/limits/claude/${identity}/resets/${grantId}`, { method: "POST", headers });
+      expect(spent.status).toBe(200);
+      const log = await (await fetch(`http://127.0.0.1:${g.adminPort}/reset-log?trigger=manual`, { headers })).json() as { rows: Array<Record<string, unknown>> };
+      expect(log.rows).toHaveLength(1);
+      expect(log.rows[0]).toMatchObject({
+        provider: "claude", trigger: "manual", actor: "user", identity, grantId, outcome: "reset", resetsLeftAfter: 3,
+        before: [{ key: "weekly", percent: 100 }],
+      });
+      expect(await (await fetch(`http://127.0.0.1:${g.adminPort}/reset-log?trigger=auto`, { headers })).json()).toMatchObject({ rows: [] });
     });
 
     test("it runs inside the redemption lock, one spend at a time", async () => {

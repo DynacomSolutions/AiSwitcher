@@ -9,6 +9,7 @@ import {
 } from "./auto-reset-store.ts";
 import type { AutoResetProvider } from "./auto-reset-view.ts";
 import { bounded } from "./refresh-guard.ts";
+import { autoResetOutcome, type ResetLogger } from "./reset-log.ts";
 import { reserveUtilisationOf, usageForModel } from "./select.ts";
 
 export type { AutoResetClaimSummary } from "./auto-reset-store.ts";
@@ -28,6 +29,9 @@ const WEEKLY_LABEL: Record<AutoResetProvider, RegExp> = {
   codex: /^(?:week|weekly|7d)$/i,
   claude: /^seven-day$/i,
 };
+
+/** The actor of a reset log row that this engine writes. */
+export const AUTO_RESET_ACTOR = "auto-reset-worker";
 
 const PROVIDER_LABEL: Record<AutoResetProvider, string> = { codex: "Codex", claude: "Claude" };
 
@@ -75,6 +79,8 @@ interface RecoveryOptions {
   now?: () => number;
   confirmationBudgetMs?: number;
   log?: (line: string) => void;
+  /** Writes one reset log row for every claim that this engine makes and tries. Absent: no row. */
+  resetLog?: ResetLogger;
 }
 
 export interface AutoResetCandidate {
@@ -176,7 +182,7 @@ function withSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 export function createAutoResetRecovery({
-  provider = "codex", store, claim: claimCredit = (input) => store.claim(input), pools, freshUsage, readCredits, spend, now = Date.now, confirmationBudgetMs = CONFIRMATION_MS, log = console.info,
+  provider = "codex", store, claim: claimCredit = (input) => store.claim(input), pools, freshUsage, readCredits, spend, now = Date.now, confirmationBudgetMs = CONFIRMATION_MS, log = console.info, resetLog,
 }: RecoveryOptions): AutoResetRecovery {
   async function enabledPools(): Promise<AutoResetPool[]> {
     const all = await pools();
@@ -360,6 +366,12 @@ export function createAutoResetRecovery({
       }
     };
     audit("pending");
+    // The windows come from the reading that proved the limit, before the POST.
+    const attempt = await resetLog?.begin({
+      provider, trigger: "auto", actor: AUTO_RESET_ACTOR, identity, pool, grantId: creditId,
+      before: { windows: readings[names.indexOf(identity)]?.windows },
+    });
+    let failure: string | undefined;
     let status: Exclude<AutoResetClaimSummary["status"], "pending"> = "rejected";
     let creditedId: string | undefined;
     let knownOutcome: CodexResetOutcome | undefined;
@@ -398,6 +410,7 @@ export function createAutoResetRecovery({
         outcome = "cancelled_before_post";
       }
     } catch (error) {
+      failure = error instanceof Error ? error.message : undefined;
       const refusal = error as { status?: number; postAttempted?: boolean; creditedId?: string; knownOutcome?: CodexResetOutcome } | null;
       creditedId = refusal?.creditedId;
       knownOutcome = refusal?.knownOutcome;
@@ -416,9 +429,14 @@ export function createAutoResetRecovery({
     } finally {
       finishedAt = now();
       audit(status, outcome, creditedId);
-      await store.finish(eventKey, status, creditedId, {
-        redeemRequestId, finishedAt: iso(finishedAt), outcome, knownOutcome, unsent: postAttempted === false,
-      });
+      try {
+        await store.finish(eventKey, status, creditedId, {
+          redeemRequestId, finishedAt: iso(finishedAt), outcome, knownOutcome, unsent: postAttempted === false,
+        });
+      } finally {
+        // The row is written in the same path as the reset. A failed write never changes the result.
+        await attempt?.finish({ ...autoResetOutcome(status, outcome, failure), grantId: creditedId ?? creditId });
+      }
     }
     if (status === "rejected" || (creditedId !== undefined && creditedId !== creditId)) return undefined;
     const mark = status === "reset" ? (at: number) => store.markRecovered(eventKey, redeemRequestId, iso(at)) : undefined;
