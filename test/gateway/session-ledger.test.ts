@@ -172,6 +172,7 @@ describe("admin GET /usage/sessions", () => {
     expect(await keys("&prefix=task-9f3a")).toEqual([TASK_A, TASK_B]);
     expect(await keys(`&prefix=${TASK_A}`)).toEqual([TASK_A]);
     expect(await keys("&prefix=%25")).toEqual([]);
+    expect(((await (await call(`/usage/sessions?days=1&prefix=${TASK_A}`)).json()) as any).prefix).toBe(TASK_A);
     expect((await call(`/usage/sessions?days=1&prefix=${"x".repeat(129)}`)).status).toBe(400);
   });
 

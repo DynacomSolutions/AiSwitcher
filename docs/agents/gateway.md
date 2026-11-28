@@ -1325,6 +1325,8 @@ The same route also answers the cost view. No new route, table or query path exi
   summed. Older rows hold null and add 0. Tool names are never returned.
 - Optional filter `prefix=<text>` (at most 128 characters, no control character) keeps the sessions whose key starts
   with the text. It is a plain prefix test (`starts_with`), never a pattern, so `%` and `_` match only themselves.
+  The answer echoes `prefix`. The CLI refuses an answer without the echo or without `estCostUsd` (an older gateway), because
+  it would print a wrong task total or zero costs. The Postgres store reads its three queries in one read-only snapshot.
 - `session_key` is the client's own session id (see above). The ledger holds no task id and no T3 thread id, and the
   keys are UUIDs, so a prefix has no meaning of its own. A "task" is therefore a set of sessions that the caller chooses:
   `--session=<id,id>` (ids from the agent's transcript or `ais sessions`) or `--prefix=<text>` for ids that share a

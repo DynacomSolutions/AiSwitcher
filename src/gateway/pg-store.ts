@@ -398,7 +398,9 @@ export class PgGatewayStore implements GatewayStore {
     const prefix = filter.sessionPrefix ? filter.sessionPrefix : null;
     const from = since.toISOString();
     // One bounded read of the ledger window; starts_with is a plain prefix test, so a prefix never acts as a pattern.
-    const rows = await this.sql`
+    // One snapshot for the three reads, so a row that lands between them never sits in cost without its tokens.
+    const [rows, nulls, fails] = await this.sql.begin("isolation level repeatable read read only", async (tx) => {
+    const rows = await tx`
       SELECT session_key, provider, app, identity, max(client) AS client,
         COUNT(*) AS turns,
         COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -408,7 +410,7 @@ export class PgGatewayStore implements GatewayStore {
         COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd,
         COALESCE(SUM(tool_calls), 0) AS tool_calls,
         COALESCE(SUM(tool_errors), 0) AS tool_errors,
-        COALESCE(array_agg(DISTINCT model) FILTER (WHERE model IS NOT NULL), '{}') AS models,
+        COALESCE(array_agg(DISTINCT model) FILTER (WHERE model IS NOT NULL AND model <> ''), '{}') AS models,
         MIN(ts) AS first_ts,
         MAX(ts) AS last_ts
       FROM gateway_usage
@@ -420,7 +422,7 @@ export class PgGatewayStore implements GatewayStore {
         AND (${prefix}::text IS NULL OR starts_with(session_key, ${prefix}::text))
       GROUP BY session_key, provider, app, identity ORDER BY session_key, provider, app, identity`;
     // Served rows stored without a cost are priced from tokens and model at read time, like usageByModel does.
-    const nulls = await this.sql`
+    const nulls = await tx`
       SELECT session_key, provider, app, identity, model,
         COALESCE(SUM(input_tokens), 0) AS input_tokens,
         COALESCE(SUM(output_tokens), 0) AS output_tokens,
@@ -435,7 +437,7 @@ export class PgGatewayStore implements GatewayStore {
         AND (${keys}::text[] IS NULL OR session_key = ANY(${keys}::text[]))
         AND (${prefix}::text IS NULL OR starts_with(session_key, ${prefix}::text))
       GROUP BY session_key, provider, app, identity, model`;
-    const fails = await this.sql`
+    const fails = await tx`
       SELECT session_key, provider, app, identity, COUNT(*) AS failed
       FROM gateway_usage
       WHERE status <> 'ok' AND ts >= ${from}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
@@ -445,6 +447,8 @@ export class PgGatewayStore implements GatewayStore {
         AND (${keys}::text[] IS NULL OR session_key = ANY(${keys}::text[]))
         AND (${prefix}::text IS NULL OR starts_with(session_key, ${prefix}::text))
       GROUP BY session_key, provider, app, identity`;
+    return [rows, nulls, fails] as const;
+    });
     const gkey = (r: Row): string => `${String(r.session_key)}\u0000${String(r.provider)}\u0000${String(r.app)}\u0000${String(r.identity)}`;
     const extra = new Map<string, { cost: number; unpriced: number }>();
     for (const n of nulls as Row[]) {

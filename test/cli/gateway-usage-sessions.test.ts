@@ -101,7 +101,7 @@ describe("ais gateway usage sessions", () => {
     writeFileSync(secrets, "AIS_GATEWAY_ADMIN_URL=http://admin.test\nAIS_GATEWAY_ADMIN_TOKEN='adm-1'\n", { mode: 0o600 });
     out = [];
     urls = [];
-    respond = () => Response.json(body);
+    respond = () => Response.json({ ...body, prefix: new URL(urls[urls.length - 1]!).searchParams.get("prefix") ?? undefined });
     return () => rmSync(dir, { recursive: true, force: true });
   });
 
@@ -118,6 +118,20 @@ describe("ais gateway usage sessions", () => {
     const many = Array.from({ length: 501 }, (_, i) => `id-${String(i).padStart(8, "0")}`).join(",");
     await run(`gateway usage sessions --session=${many}`);
     expect(urls).toHaveLength(2);
+  });
+
+  test("a repeated id counts once, an empty prefix is refused", async () => {
+    await run("gateway usage sessions --session=id-aaaaaaaa,id-aaaaaaaa");
+    expect(urls[0]).toBe("http://admin.test/usage/sessions?days=7&session=id-aaaaaaaa");
+    await expect(run("gateway usage sessions --prefix=")).rejects.toThrow(/--prefix/);
+  });
+
+  test("an older gateway that ignores the prefix or sends no cost is refused, never a wrong total", async () => {
+    respond = () => Response.json(body);
+    await expect(run("gateway usage sessions --prefix=task-")).rejects.toThrow(/older than this CLI.*prefix/);
+    const noCost = { sessions: [{ ...body.sessions[0]!, identities: [{ identity: "alice", turns: 1, firstTs: "2026-11-20T01:00:00.000Z", lastTs: "2026-11-20T02:00:00.000Z" }] }] };
+    respond = () => Response.json(noCost);
+    await expect(run("gateway usage sessions")).rejects.toThrow(/no cost fields/);
   });
 
   test("json output keeps the estimate label and the raw sessions", async () => {

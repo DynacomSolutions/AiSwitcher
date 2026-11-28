@@ -344,7 +344,10 @@ async function runSessionCostCommand(flags: Flags, deps: GatewayCliDeps): Promis
     const v = stringFlag(flags, name);
     if (v !== undefined) q.set(name, v);
   }
-  const sessionIds = (stringFlag(flags, "session") ?? "").split(",").map((v) => v.trim()).filter((v) => v !== "");
+  const prefix = stringFlag(flags, "prefix");
+  if (prefix === "") throw new CliUsageError("--prefix must not be empty");
+  // A repeated id would count its session twice when the list splits into several calls.
+  const sessionIds = [...new Set((stringFlag(flags, "session") ?? "").split(",").map((v) => v.trim()).filter((v) => v !== ""))];
   const limit = intFlag(flags, "limit") ?? 50;
   if (!Number.isInteger(limit) || limit < 1) throw new CliUsageError("--limit must be a whole number of at least 1");
   // The admin takes at most 500 ids a call; a longer list goes in several calls and the answers are joined.
@@ -353,11 +356,15 @@ async function runSessionCostCommand(flags: Flags, deps: GatewayCliDeps): Promis
     const p = new URLSearchParams(q);
     for (const id of sessionIds.slice(at, at + 500)) p.append("session", id);
     const { json } = await admin.call("GET", `/usage/sessions?${p.toString()}`);
+    // An older gateway ignores `prefix` and sends no cost fields. Both would give a wrong total with no warning, so refuse them.
+    if (prefix !== undefined && json.prefix !== prefix) throw new Error("gateway admin is older than this CLI: it ignores --prefix. Update the gateway or use --session");
+    const list = Array.isArray(json.sessions) ? (json.sessions as Array<{ identities?: Array<Record<string, unknown>> }>) : [];
+    if (list.some((s) => (s.identities ?? []).some((i) => typeof i.estCostUsd !== "number"))) throw new Error("gateway admin is older than this CLI: it sends no cost fields. Update the gateway");
     sessions.push(...mapGatewaySessions(json));
   }
   const report = buildSessionCost(sessions);
   if (boolFlag(flags, "json")) return deps.out(JSON.stringify({ estimate: true, costUnit: "USD", sessions, ...report }, null, 2));
-  deps.out(formatSessionCost(report, { limit, task: sessionIds.length > 0 || stringFlag(flags, "prefix") !== undefined }));
+  deps.out(formatSessionCost(report, { limit, task: sessionIds.length > 0 || prefix !== undefined }));
 }
 
 const str = (v: unknown): string => (v === undefined || v === null ? "" : String(v));

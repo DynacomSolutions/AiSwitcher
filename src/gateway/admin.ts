@@ -700,7 +700,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
   // Client sessions with the split of their served requests over accounts: the account of the latest request is `activeIdentity`,
   // `identities` lists each account the session used with its turns, tokens by type and first and last time. Only requests that carry
   // a session id count. Same window rules as /usage/models. `session` (repeatable or comma separated, at most 500) limits it to those sessions;
-  // `prefix` keeps the sessions whose id starts with that text. Each account entry and each session also carry the ESTIMATED cost
+  // `prefix` keeps the sessions whose id starts with that text (the answer echoes it, so a client can tell an older gateway that ignores it). Each account entry and each session also carry the ESTIMATED cost
   // (never a bill), `unpricedRequests`, `failedRequests` (not ok, not counted in turns, tokens or cost), tool-call and tool-error counts, and `models`.
   hono.get("/usage/sessions", async (c) => {
     const win = usageWindow((n) => c.req.query(n), deps.now());
@@ -713,7 +713,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
     const prefix = c.req.query("prefix");
     if (prefix !== undefined && (prefix.length > 128 || /[\u0000-\u001f]/.test(prefix))) return err(400, "prefix must be at most 128 characters with no control character");
     const rows = await store.usageBySession(win.since, win.until, { ...(provider ? { provider } : {}), ...(app ? { app } : {}), ...(prefix ? { sessionPrefix: prefix } : {}), ...(sessionKeys && sessionKeys.length > 0 ? { sessionKeys } : {}) });
-    return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), sessions: foldSessionUsage(rows) });
+    return c.json({ since: win.since.toISOString(), ...(win.until ? { until: win.until.toISOString() } : {}), sessions: foldSessionUsage(rows), ...(prefix ? { prefix } : {}) });
   });
 
   // Per-day split of the same ledger (apps summed), bucketed in the IANA zone `tz` (default UTC), so the console can chart days.
