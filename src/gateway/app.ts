@@ -33,6 +33,7 @@ import type { ApiStyle, GatewayApp, GatewayProvider, UsageRow } from "./types.ts
 import { ErrorPeek, failureName, redactText, summariseUpstreamError, type UpstreamErrorSummary } from "./upstream-error.ts";
 import { estimateCostWarn, UsageTap } from "./usage.ts";
 import type { ResponseMeta, UsageCounts } from "./usage.ts";
+import type { ResetLogger } from "./reset-log.ts";
 import { countToolErrors } from "./request-meta.ts";
 
 export interface GatewayDeps {
@@ -47,6 +48,8 @@ export interface GatewayDeps {
   /** The automatic reset recovery of each provider with a reset API. */
   autoResets?: Partial<Record<GatewayProvider, AutoResetRecovery>>;
   withCodexRedemption?: CodexRedemptionGuard;
+  /** Writes one reset log row for each reset that an app sends through the account routes. Absent: no row. */
+  resetLog?: ResetLogger;
   /** Encoded canonical member and reset generation pairs, in input order. */
   codexResetGenerations?(identities: readonly string[]): Promise<string[]>;
   poolMembers(provider: GatewayProvider): Promise<string[]>;

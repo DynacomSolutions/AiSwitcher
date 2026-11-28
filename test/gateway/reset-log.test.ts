@@ -8,7 +8,7 @@ import { createAutoResetRecovery, type AutoResetUsage } from "../../src/gateway/
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 import { migrate } from "../../src/gateway/pg-store.ts";
 import {
-  createResetLogger, MemoryResetLog, parseResetLogQuery, PgResetLog, resetLogWindows, type ResetLogEntry, type ResetLogPage, type ResetLogProvider, type ResetLogStore,
+  createResetLogger, decodeResetLogCursor, encodeResetLogCursor, MemoryResetLog, parseResetLogQuery, PgResetLog, resetLogWindows, type ResetLogEntry, type ResetLogPage, type ResetLogProvider, type ResetLogStore,
 } from "../../src/gateway/reset-log.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { createUsageSource } from "../../src/gateway/usage-source.ts";
@@ -40,7 +40,7 @@ const codexUsage = (used = 100, capturedAt = NOW): AutoResetUsage => ({
 
 function entry(over: Partial<ResetLogEntry> = {}): ResetLogEntry {
   return {
-    at: iso(NOW), provider: "claude", trigger: "manual", actor: "user", identity: "fixture-account", account: null, pool: null,
+    at: iso(NOW), startedAt: iso(NOW - 1_000), provider: "claude", trigger: "manual", actor: "user", identity: "fixture-account", account: null, pool: null,
     grantId: GRANT, before: resetLogWindows(claudeUsage()), outcome: "reset", message: null, resetsLeftAfter: null, ...over,
   };
 }
@@ -72,10 +72,10 @@ describe("query", () => {
   test("accepts the filters, makes a date-only end inclusive and caps the limit", () => {
     expect(parse({})).toEqual({});
     expect(parse({
-      identity: "a", provider: "claude", trigger: "auto", outcome: "error", from: "2026-11-01", to: "2026-11-02", limit: "9999", before: "42",
+      identity: "a", provider: "claude", trigger: "auto", outcome: "error", from: "2026-11-01", to: "2026-11-02", limit: "9999", before: encodeResetLogCursor({ at: "2026-11-27T08:00:00.000Z", id: "42" }),
     })).toEqual({
       identity: "a", provider: "claude", trigger: "auto", outcome: "error", from: "2026-11-01T00:00:00.000Z",
-      toExclusive: "2026-11-03T00:00:00.000Z", limit: 500, before: "42",
+      toExclusive: "2026-11-03T00:00:00.000Z", limit: 500, before: { at: "2026-11-27T08:00:00.000Z", id: "42" },
     });
     expect(parse({ from: "2026-11-01T10:00:00Z", to: "2026-11-02T10:00:00.000Z" })).toEqual({
       from: "2026-11-01T10:00:00.000Z", toExclusive: "2026-11-02T10:00:00.001Z",
@@ -123,8 +123,8 @@ describe("memory store", () => {
     const store = await seeded();
     const first = await store.list({ limit: 3 });
     expect(first.rows.map((row) => row.id)).toEqual(["4", "3", "2"]);
-    expect(first.nextBefore).toBe("2");
-    const second = await store.list({ limit: 3, before: first.nextBefore! });
+    expect(decodeResetLogCursor(first.nextBefore!)).toEqual({ at: iso(NOW + 1_000), id: "2" });
+    const second = await store.list({ limit: 3, before: decodeResetLogCursor(first.nextBefore!)! });
     expect(second.rows.map((row) => row.id)).toEqual(["1"]);
     expect(second.nextBefore).toBeNull();
     // A page of exactly the limit has no next page.
@@ -151,7 +151,7 @@ describe("logger", () => {
     const logs: string[] = [];
     let now = NOW;
     const logger = createResetLogger({
-      store, metrics, now: () => now, log: (line) => logs.push(line),
+      store, metrics, now: () => now, log: (line) => logs.push(line), retryBackoffMs: [0, 0],
       usageFor: async () => claudeUsage(),
     });
     return { store, metrics, logs, logger, tick: (ms: number) => { now += ms; } };
@@ -190,7 +190,7 @@ describe("logger", () => {
     const hung: ResetLogStore = { ...new MemoryResetLog(), insert: () => new Promise(() => {}) } as unknown as ResetLogStore;
     const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
     const logger = createResetLogger({
-      store: hung, metrics, storeTimeoutMs: 20, log: () => {}, usageFor: async () => { throw new Error("synthetic usage failure"); },
+      store: hung, metrics, storeTimeoutMs: 20, retryBackoffMs: [], log: () => {}, usageFor: async () => { throw new Error("synthetic usage failure"); },
     });
     const attempt = await logger.begin({ provider: "claude", trigger: "manual", actor: "user", identity: "x" });
     await attempt.finish({ outcome: "reset" });
@@ -204,7 +204,7 @@ describe("logger", () => {
     const [row] = (await store.list({})).rows;
     expect(Object.keys(row!).sort()).toEqual([
       "account", "actor", "after", "afterAt", "at", "before", "grantId", "id", "identity", "message", "outcome", "pool",
-      "provider", "resetsLeftAfter", "trigger",
+      "provider", "resetsLeftAfter", "startedAt", "trigger",
     ]);
     expect(JSON.stringify(row)).not.toMatch(/SYNTHETIC_FIXTURE-(abcdefgh|12345678)|token-|bearer [a-z]/i);
     expect(row?.message).toContain("[redacted]");
@@ -233,7 +233,7 @@ describe("logger", () => {
   test("a new replica loads the members that still wait for a reading", async () => {
     const store = new MemoryResetLog();
     await store.insert(entry({ at: iso(NOW) }));
-    const logger = createResetLogger({ store, now: () => NOW + 60_000, log: () => {} });
+    const logger = createResetLogger({ retryBackoffMs: [0, 0], store, now: () => NOW + 60_000, log: () => {} });
     await logger.warm();
     logger.onReading("claude", "fixture-account", claudeUsage(1, NOW + 30_000));
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -243,7 +243,7 @@ describe("logger", () => {
   test("the usage cache hands every stored current reading to the log", async () => {
     const store = new MemoryResetLog();
     await store.insert(entry({ at: iso(NOW) }));
-    const logger = createResetLogger({ store, now: () => NOW, log: () => {} });
+    const logger = createResetLogger({ retryBackoffMs: [0, 0], store, now: () => NOW, log: () => {} });
     await logger.warm();
     const source = createUsageSource({
       log: () => {},
@@ -261,7 +261,7 @@ describe("manual resets through the gateway admin API", () => {
     const store = new MemoryResetLog();
     const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
     const logger = createResetLogger({
-      store, metrics, now: () => NOW, log: () => {},
+      retryBackoffMs: [0, 0], store, metrics, now: () => NOW, log: () => {},
       usageFor: async (provider: ResetLogProvider) => (provider === "claude" ? claudeUsage() : codexUsage()),
     });
     const app = createAdminApp({
@@ -271,7 +271,7 @@ describe("manual resets through the gateway admin API", () => {
     const call = (path: string, init: RequestInit = {}, token = ADMIN) => app.request(path, {
       ...init, headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...init.headers },
     });
-    return { store, metrics, app, call };
+    return { store, metrics, app, call, logger };
   }
 
   test("a manual Claude reset writes one row with the windows from before it", async () => {
@@ -309,11 +309,12 @@ describe("manual resets through the gateway admin API", () => {
   });
 
   test("a reset that the log cannot record still works", async () => {
-    const { call, store, metrics } = fixture({ spendReset: async () => ({ result: "reset", cleared: ["x"] }) });
+    const { call, store, metrics, logger } = fixture({ spendReset: async () => ({ result: "reset", cleared: ["x"] }) });
     store.failInserts = true;
     const response = await call(`/limits/claude/fixture-account/resets/${GRANT}`, { method: "POST" });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ result: "reset" });
+    await logger.drain();
     expect(metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="claude"} 1');
   });
 
@@ -350,9 +351,9 @@ describe("manual resets through the gateway admin API", () => {
     }
     const page = await (await call("/reset-log?limit=2")).json() as ResetLogPage;
     expect(page.rows.map((row) => row.id)).toEqual(["5", "4"]);
-    expect(page.nextBefore).toBe("4");
+    expect(decodeResetLogCursor(page.nextBefore!)?.id).toBe("4");
     expect(page.identities).toEqual(["even", "odd"]);
-    const next = await (await call(`/reset-log?limit=2&before=${page.nextBefore}`)).json() as ResetLogPage;
+    const next = await (await call(`/reset-log?limit=2&before=${encodeURIComponent(page.nextBefore!)}`)).json() as ResetLogPage;
     expect(next.rows.map((row) => row.id)).toEqual(["3", "2"]);
     const odd = await (await call("/reset-log?identity=odd&outcome=reset")).json() as ResetLogPage;
     expect(odd.rows.map((row) => row.id)).toEqual(["4", "2"]);
@@ -409,7 +410,7 @@ describe("automatic resets", () => {
     await autoStore.setEnabled(provider, "fixture-pool", true);
     const store = new MemoryResetLog();
     const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
-    const resetLog = createResetLogger({ store, metrics, now: () => NOW, log: () => {} });
+    const resetLog = createResetLogger({ retryBackoffMs: [0, 0], store, metrics, now: () => NOW, log: () => {} });
     let recovered = false;
     const reading = (full: boolean): AutoResetUsage => {
       const used = full ? 100 : 4;
@@ -480,11 +481,12 @@ describe("automatic resets", () => {
     const store = new MemoryResetLog();
     store.failInserts = true;
     const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const failing = createResetLogger({ retryBackoffMs: [0, 0], store, metrics, now: () => NOW, log: () => {} });
     let spent = 0;
     let recovered = false;
     const recovery = createAutoResetRecovery({
       provider: "claude", store: autoStore, now: () => NOW, confirmationBudgetMs: 55, log: () => {},
-      resetLog: createResetLogger({ store, metrics, now: () => NOW, log: () => {} }),
+      resetLog: failing,
       pools: async () => [{ name: "fixture-pool", members: ["alpha", "beta"] }],
       freshUsage: async () => ({
         status: recovered ? "live" : "rate-limited", capturedAt: iso(NOW),
@@ -495,7 +497,191 @@ describe("automatic resets", () => {
     });
     expect(await recovery.recover(input())).toBe("alpha");
     expect(spent).toBe(1);
+    await failing.drain();
     expect(metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="claude"} 1');
+  });
+});
+
+describe("write path", () => {
+  const start = { provider: "claude", trigger: "manual", actor: "user", identity: "fixture-account" } as const;
+  const metricsOf = () => new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+
+  test("a row keeps when the attempt started next to when it ended", async () => {
+    const store = new MemoryResetLog();
+    let now = NOW;
+    const logger = createResetLogger({ store, now: () => now, log: () => {} });
+    const attempt = await logger.begin(start);
+    now += 4_000;
+    await attempt.finish({ outcome: "reset" });
+    expect((await store.list({})).rows[0]).toMatchObject({ startedAt: iso(NOW), at: iso(NOW + 4_000) });
+  });
+
+  test("the counter moves at once, and a slow store never delays the caller", async () => {
+    const hung: ResetLogStore = { ...new MemoryResetLog(), insert: () => new Promise(() => {}) } as unknown as ResetLogStore;
+    const metrics = metricsOf();
+    const logger = createResetLogger({ store: hung, metrics, now: () => NOW, log: () => {}, storeTimeoutMs: 50, retryBackoffMs: [] });
+    const attempt = await logger.begin(start);
+    const write = attempt.finish({ outcome: "reset" });
+    // The counter is already there, before the write ends.
+    expect(metrics.render()).toContain('ais_gateway_resets_total{provider="claude",trigger="manual",outcome="reset"} 1');
+    const started = performance.now();
+    await logger.drain();
+    await write;
+    expect(performance.now() - started).toBeGreaterThanOrEqual(40);
+    expect(metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="claude"} 1');
+  });
+
+  test("a failed write is tried three times, with a wait between, and a later success counts no failure", async () => {
+    class Flaky extends MemoryResetLog {
+      calls = 0;
+      override async insert(entryToWrite: ResetLogEntry): Promise<void> {
+        this.calls += 1;
+        if (this.calls < 3) throw new Error("synthetic outage");
+        await super.insert(entryToWrite);
+      }
+    }
+    const store = new Flaky();
+    const metrics = metricsOf();
+    const waits: number[] = [];
+    const logger = createResetLogger({ store, metrics, now: () => NOW, log: () => {}, sleep: async (ms) => { waits.push(ms); } });
+    await (await logger.begin(start)).finish({ outcome: "reset" });
+    expect(store.calls).toBe(3);
+    expect(waits).toEqual([250, 1_000]);
+    expect((await store.list({})).rows).toHaveLength(1);
+    expect(metrics.render()).not.toMatch(/reset_log_write_failures_total\{/);
+  });
+
+  test("a write that fails every try is counted once", async () => {
+    const store = new MemoryResetLog();
+    store.failInserts = true;
+    const metrics = metricsOf();
+    const logger = createResetLogger({ store, metrics, now: () => NOW, log: () => {}, sleep: async () => {} });
+    await (await logger.begin(start)).finish({ outcome: "reset" });
+    expect(metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="claude"} 1');
+  });
+
+  test("a full queue drops the write and counts it", async () => {
+    const release = Promise.withResolvers<void>();
+    const slow: ResetLogStore = { ...new MemoryResetLog(), insert: () => release.promise } as unknown as ResetLogStore;
+    const metrics = metricsOf();
+    const logger = createResetLogger({ store: slow, metrics, now: () => NOW, log: () => {}, queueLimit: 2, retryBackoffMs: [] });
+    const attempts = await Promise.all([1, 2, 3, 4, 5].map(() => logger.begin(start)));
+    const writes = attempts.map((attempt) => attempt.finish({ outcome: "reset" }));
+    // Three writes fit (the limit is checked before a write joins), so the other two are dropped.
+    expect(metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="claude"} 2');
+    release.resolve();
+    await Promise.all(writes);
+  });
+
+  test("only a reset row waits for an `after` reading", async () => {
+    const store = new MemoryResetLog();
+    const logger = createResetLogger({ store, now: () => NOW, log: () => {} });
+    for (const outcome of ["no_credit", "already_redeemed", "rejected", "error"] as const) await (await logger.begin(start)).finish({ outcome });
+    logger.onReading("claude", "fixture-account", claudeUsage(2, NOW + 5_000));
+    await Bun.sleep(5);
+    expect((await store.list({})).rows.every((row) => row.after === null)).toBe(true);
+    expect(await store.pendingMembers()).toEqual([]);
+    await (await logger.begin(start)).finish({ outcome: "reset" });
+    expect(await store.pendingMembers()).toEqual([{ provider: "claude", identity: "fixture-account" }]);
+  });
+
+  test("a row that lands during a fill keeps its member in the waiting list", async () => {
+    // The fill reads the table, then a new reset row lands, then the fill answers `pending: false`.
+    const store = new MemoryResetLog();
+    const gate = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const original = store.fillAfter.bind(store);
+    let held = false;
+    store.fillAfter = async (...args) => {
+      const result = await original(...args);
+      if (!held) {
+        held = true;
+        entered.resolve();
+        await gate.promise;
+        return { ...result, pending: false };
+      }
+      return result;
+    };
+    const logger = createResetLogger({ store, now: () => NOW + 10_000, log: () => {} });
+    await (await logger.begin(start)).finish({ outcome: "reset" });
+    logger.onReading("claude", "fixture-account", claudeUsage(2, NOW + 5_000));
+    await entered.promise;
+    await (await logger.begin(start)).finish({ outcome: "reset" });
+    gate.resolve();
+    await Bun.sleep(5);
+    // The second row has no `after` yet: the next reading must still fill it.
+    logger.onReading("claude", "fixture-account", claudeUsage(3, NOW + 20_000));
+    await Bun.sleep(5);
+    expect((await store.list({})).rows.map((row) => row.after !== null)).toEqual([true, true]);
+  });
+});
+
+describe("list order and cursor", () => {
+  test("rows with the same time keep a stable order, and the cursor never skips or repeats a row", async () => {
+    const store = new MemoryResetLog();
+    // Rows are not inserted in time order: the ID order and the time order differ.
+    for (const ms of [5, 1, 5, 3, 5, 1]) await store.insert(entry({ at: iso(NOW + ms) }));
+    const seenIds: string[] = [];
+    let before: ReturnType<typeof decodeResetLogCursor>;
+    for (let guard = 0; guard < 10; guard++) {
+      const result = await store.list({ limit: 2, ...(before ? { before } : {}) });
+      seenIds.push(...result.rows.map((row) => row.id));
+      if (!result.nextBefore) break;
+      before = decodeResetLogCursor(result.nextBefore);
+      expect(before).toBeDefined();
+    }
+    // `at` descending, then `id` descending.
+    expect(seenIds).toEqual(["5", "3", "1", "4", "6", "2"]);
+  });
+
+  test("a cursor is an opaque string, and anything else is refused", () => {
+    const cursor = encodeResetLogCursor({ at: "2026-11-27T08:00:00.123456Z", id: "9" });
+    expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(decodeResetLogCursor(cursor)).toEqual({ at: "2026-11-27T08:00:00.123456Z", id: "9" });
+    for (const text of ["42", "abc", "", "!!", Buffer.from("x|1").toString("base64url"), Buffer.from("2026-11-27T08:00:00Z|1;drop").toString("base64url")]) {
+      expect(decodeResetLogCursor(text)).toBeUndefined();
+    }
+  });
+
+  test("the identity list is read at most once a minute, and a new identity shows at once", async () => {
+    let reads = 0;
+    let t = 0;
+    const sql = ((strings: TemplateStringsArray) => {
+      const text = strings.join("?");
+      if (text.includes("SELECT DISTINCT identity")) { reads += 1; return Promise.resolve([{ identity: "alpha" }]); }
+      if (text.includes("INSERT INTO reset_log")) return Promise.resolve([]);
+      return Promise.resolve([]);
+    }) as unknown as SQL;
+    const store = new PgResetLog(sql, { now: () => t });
+    expect((await store.list({})).identities).toEqual(["alpha"]);
+    t += 59_000;
+    await store.list({});
+    expect(reads).toBe(1);
+    await store.insert(entry({ identity: "beta" }));
+    expect((await store.list({})).identities).toEqual(["alpha", "beta"]);
+    expect(reads).toBe(1);
+    t += 2_000;
+    await store.list({});
+    expect(reads).toBe(2);
+  });
+});
+
+describe("admin route paths", () => {
+  test("a stray percent sign in a path parameter does not throw", async () => {
+    const store = new MemoryResetLog();
+    const logger = createResetLogger({ store, now: () => NOW, log: () => {}, retryBackoffMs: [0] });
+    const seenGrants: string[] = [];
+    const app = createAdminApp({
+      store: new MemoryGatewayStore(), adminToken: ADMIN, now: () => new Date(NOW), instances: { namespaces: [], log() {} },
+      resetLog: logger, resetLogStore: store,
+      spendReset: async (_identity, grant) => { seenGrants.push(grant); throw Object.assign(new Error("invalid grant id"), { status: 400 }); },
+    });
+    const response = await app.request("/limits/claude/fixture-account/resets/%25ZZ", { method: "POST", headers: { authorization: `Bearer ${ADMIN}` } });
+    expect(response.status).toBe(400);
+    expect(seenGrants).toEqual(["%ZZ"]);
+    await logger.drain();
+    // A grant that is not a well-formed ID is never stored as one.
+    expect((await store.list({})).rows[0]).toMatchObject({ outcome: "rejected", grantId: null });
   });
 });
 
@@ -520,8 +706,8 @@ if (!url) {
       expect(all.rows[1]).toMatchObject({ ...a, after: null, afterAt: null });
       expect(all.identities).toContain(identity);
       const first = await store.list({ identity, limit: 1 });
-      expect(first.nextBefore).toBe(first.rows[0]?.id as string);
-      expect((await store.list({ identity, limit: 1, before: first.nextBefore! })).rows.map((row) => row.outcome)).toEqual(["reset"]);
+      expect(decodeResetLogCursor(first.nextBefore!)?.id).toBe(first.rows[0]?.id as string);
+      expect((await store.list({ identity, limit: 1, before: decodeResetLogCursor(first.nextBefore!)! })).rows.map((row) => row.outcome)).toEqual(["reset"]);
       expect((await store.list({ identity, trigger: "auto" })).rows).toHaveLength(1);
       expect((await store.list({ identity, from: iso(NOW + 500), toExclusive: iso(NOW + 2_000) })).rows).toHaveLength(1);
       const after = resetLogWindows(claudeUsage(1));

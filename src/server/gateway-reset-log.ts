@@ -43,6 +43,6 @@ export function registerGatewayResetLog(app: Hono, deps: GatewayResetLogDeps = {
       throw new HttpError(status, typeof body?.error === "string" ? body.error.slice(0, 300) : `gateway admin answered ${response.status}`);
     }
     if (!body || !Array.isArray(body.rows) || !Array.isArray(body.identities)) throw new HttpError(502, "the gateway reset log answer was invalid");
-    return c.json({ rows: body.rows, nextBefore: body.nextBefore ?? null, identities: body.identities }, 200, headers);
+    return c.json({ rows: body.rows, nextBefore: body.nextBefore ?? null, identities: body.identities, configured: true }, 200, headers);
   });
 }

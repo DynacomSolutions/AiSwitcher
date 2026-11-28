@@ -3,7 +3,10 @@
 -- It holds no token, cookie or secret: `grant_id` is a credit or grant ID only.
 CREATE TABLE IF NOT EXISTS reset_log (
   id bigserial PRIMARY KEY,
+  -- When the attempt ended and the row was made.
   at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  -- When the attempt started. Null when unknown.
+  started_at timestamptz,
   provider text NOT NULL CHECK (provider IN ('claude', 'codex')),
   trigger text NOT NULL CHECK (trigger IN ('manual', 'auto')),
   actor text NOT NULL,
@@ -23,5 +26,5 @@ CREATE TABLE IF NOT EXISTS reset_log (
 
 CREATE INDEX IF NOT EXISTS reset_log_at ON reset_log (at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS reset_log_identity_at ON reset_log (identity, at DESC, id DESC);
--- A partial index keeps the fill of `after` cheap.
-CREATE INDEX IF NOT EXISTS reset_log_pending_after ON reset_log (provider, identity) WHERE after IS NULL;
+-- A partial index keeps the fill of `after` cheap. Only `reset` rows get an `after`.
+CREATE INDEX IF NOT EXISTS reset_log_pending_after ON reset_log (provider, identity) WHERE after IS NULL AND outcome = 'reset';

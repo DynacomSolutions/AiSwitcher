@@ -51,6 +51,9 @@ async function reason(res: Response): Promise<string> {
   return text ? `: ${text.slice(0, 200)}` : "";
 }
 
+/** An error from before the reset POST: nothing was sent, so the reset log records it as rejected. */
+const unsent = (status: number, message: string): HttpError => Object.assign(new HttpError(status, message), { postAttempted: false as const });
+
 export async function useClaudeReset(identityName: string, grantId: string, deps: UseResetDeps = {}): Promise<UseResetResult> {
   if (!GRANT_ID.test(grantId)) throw new HttpError(400, "invalid grant id");
   const identity = await (deps.resolveIdentity ?? registryIdentity)(identityName);
@@ -71,11 +74,11 @@ export async function useClaudeReset(identityName: string, grantId: string, deps
   try {
     profile = await doFetch(CLAUDE_PROFILE_URL, { headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
   } catch {
-    throw new HttpError(502, "Anthropic profile endpoint unreachable");
+    throw unsent(502, "Anthropic profile endpoint unreachable");
   }
-  if (!profile.ok) throw new HttpError(502, `Anthropic profile answered HTTP ${profile.status}${await reason(profile)}`);
+  if (!profile.ok) throw unsent(502, `Anthropic profile answered HTTP ${profile.status}${await reason(profile)}`);
   const org = ((await profile.json().catch(() => undefined)) as { organization?: { uuid?: unknown } } | undefined)?.organization?.uuid;
-  if (typeof org !== "string" || org === "") throw new HttpError(502, "Anthropic profile has no organization uuid");
+  if (typeof org !== "string" || org === "") throw unsent(502, "Anthropic profile has no organization uuid");
 
   let res: Response;
   try {

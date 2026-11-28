@@ -27,7 +27,10 @@ export interface ResetLogWindow {
 }
 
 export interface ResetLogEntry {
+  /** When the attempt ended and the row was made. */
   at: string;
+  /** When the attempt started (the call to `begin`). Null for a row from before this column existed. */
+  startedAt: string | null;
   provider: ResetLogProvider;
   trigger: ResetLogTrigger;
   actor: string;
@@ -58,14 +61,40 @@ export interface ResetLogFilters {
   /** Exclusive upper bound (ISO instant). `parseResetLogQuery` turns an inclusive `to` into this. */
   toExclusive?: string;
   limit?: number;
-  /** Cursor: only rows with an ID below this one. */
-  before?: string;
+  /** Cursor: only rows older than this position in the order (`at` then `id`, both descending). */
+  before?: ResetLogCursor;
+}
+
+/** The position of one row in the list order. The API shows it as one opaque string (`encodeResetLogCursor`). */
+export interface ResetLogCursor {
+  /** ISO instant, up to microsecond precision. */
+  at: string;
+  /** Row ID, decimal digits. */
+  id: string;
 }
 
 export interface ResetLogPage {
   rows: ResetLogRow[];
+  /** Opaque cursor for the next page (pass it as `before`), or null at the end. */
   nextBefore: string | null;
   identities: string[];
+}
+
+const CURSOR_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
+const CURSOR_ID = /^\d{1,18}$/;
+
+/** Packs a list position into the opaque string that the API gives as `nextBefore` and takes as `before`. */
+export function encodeResetLogCursor(cursor: ResetLogCursor): string {
+  return Buffer.from(`${cursor.at}|${cursor.id}`, "utf8").toString("base64url");
+}
+
+/** The reverse of `encodeResetLogCursor`. Undefined for any text that is not a cursor. */
+export function decodeResetLogCursor(text: string): ResetLogCursor | undefined {
+  if (text.length > 120 || !/^[A-Za-z0-9_-]+$/.test(text)) return undefined;
+  const [at, id, ...rest] = Buffer.from(text, "base64url").toString("utf8").split("|");
+  if (rest.length || at === undefined || id === undefined || !CURSOR_AT.test(at) || !CURSOR_ID.test(id)) return undefined;
+  if (!Number.isFinite(Date.parse(at))) return undefined;
+  return { at, id };
 }
 
 export const RESET_LOG_DEFAULT_LIMIT = 100;
@@ -74,9 +103,9 @@ export const RESET_LOG_MAX_LIMIT = 500;
 export interface ResetLogStore {
   insert(entry: ResetLogEntry): Promise<void>;
   list(filters: ResetLogFilters): Promise<ResetLogPage>;
-  /** Sets `after` and `after_at` on the rows of this member that have none and are older than `readingAt`. One fill per row. */
+  /** Sets `after` and `after_at` on the `reset` rows of this member that have none and are older than `readingAt`. One fill per row. */
   fillAfter(provider: ResetLogProvider, identity: string, after: ResetLogWindow[], readingAt: string): Promise<{ filled: number; pending: boolean }>;
-  /** The members that have a row with no `after`. */
+  /** The members that have a `reset` row with no `after`. */
   pendingMembers(): Promise<Array<{ provider: ResetLogProvider; identity: string }>>;
 }
 
@@ -191,17 +220,28 @@ export function parseResetLogQuery(query: (name: string) => string | undefined):
   }
   const before = text("before");
   if (before !== undefined) {
-    if (!/^\d{1,18}$/.test(before)) return "before must be a row ID";
-    filters.before = before;
+    const cursor = decodeResetLogCursor(before);
+    if (!cursor) return "before must be a cursor from nextBefore";
+    filters.before = cursor;
   }
   return filters;
 }
 
 /** Placement of the page: one extra row tells whether another page follows. */
-function page(rows: ResetLogRow[], limit: number, identities: string[]): ResetLogPage {
+function page(rows: ResetLogRow[], limit: number, identities: string[], cursorOf: (row: ResetLogRow) => ResetLogCursor): ResetLogPage {
   const more = rows.length > limit;
   const shown = more ? rows.slice(0, limit) : rows;
-  return { rows: shown, nextBefore: more ? (shown[shown.length - 1]?.id ?? null) : null, identities };
+  const last = shown[shown.length - 1];
+  return { rows: shown, nextBefore: more && last ? encodeResetLogCursor(cursorOf(last)) : null, identities };
+}
+
+/** Newest first: `at` descending, then `id` descending. */
+function newerFirst(a: { at: string; id: string }, b: { at: string; id: string }): number {
+  const byTime = Date.parse(b.at) - Date.parse(a.at);
+  if (byTime !== 0) return byTime;
+  const x = BigInt(a.id);
+  const y = BigInt(b.id);
+  return x === y ? 0 : y > x ? 1 : -1;
 }
 
 /* ---------------------------------- stores -------------------------------- */
@@ -222,6 +262,7 @@ export class MemoryResetLog implements ResetLogStore {
     const limit = filters.limit ?? RESET_LOG_DEFAULT_LIMIT;
     const from = filters.from === undefined ? undefined : Date.parse(filters.from);
     const to = filters.toExclusive === undefined ? undefined : Date.parse(filters.toExclusive);
+    const cursor = filters.before;
     const matches = this.rows
       .filter((row) =>
         (filters.identity === undefined || row.identity === filters.identity) &&
@@ -230,28 +271,28 @@ export class MemoryResetLog implements ResetLogStore {
         (filters.outcome === undefined || row.outcome === filters.outcome) &&
         (from === undefined || Date.parse(row.at) >= from) &&
         (to === undefined || Date.parse(row.at) < to) &&
-        (filters.before === undefined || BigInt(row.id) < BigInt(filters.before)))
-      .sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1))
+        (cursor === undefined || newerFirst(row, { at: cursor.at, id: cursor.id }) > 0))
+      .sort(newerFirst)
       .slice(0, limit + 1)
       .map((row) => structuredClone(row));
-    return page(matches, limit, [...new Set(this.rows.map((row) => row.identity))].sort());
+    return page(matches, limit, [...new Set(this.rows.map((row) => row.identity))].sort(), (row) => ({ at: new Date(row.at).toISOString(), id: row.id }));
   }
 
   async fillAfter(provider: ResetLogProvider, identity: string, after: ResetLogWindow[], readingAt: string): Promise<{ filled: number; pending: boolean }> {
     let filled = 0;
     for (const row of this.rows) {
-      if (row.provider !== provider || row.identity !== identity || row.after !== null) continue;
+      if (row.provider !== provider || row.identity !== identity || row.outcome !== "reset" || row.after !== null) continue;
       if (!(Date.parse(row.at) < Date.parse(readingAt))) continue;
       row.after = structuredClone(after);
       row.afterAt = new Date(readingAt).toISOString();
       filled += 1;
     }
-    return { filled, pending: this.rows.some((row) => row.provider === provider && row.identity === identity && row.after === null) };
+    return { filled, pending: this.rows.some((row) => row.provider === provider && row.identity === identity && row.outcome === "reset" && row.after === null) };
   }
 
   async pendingMembers(): Promise<Array<{ provider: ResetLogProvider; identity: string }>> {
     const seen = new Map<string, { provider: ResetLogProvider; identity: string }>();
-    for (const row of this.rows) if (row.after === null) seen.set(`${row.provider}\u0000${row.identity}`, { provider: row.provider, identity: row.identity });
+    for (const row of this.rows) if (row.outcome === "reset" && row.after === null) seen.set(`${row.provider}\u0000${row.identity}`, { provider: row.provider, identity: row.identity });
     return [...seen.values()];
   }
 
@@ -264,6 +305,9 @@ export class MemoryResetLog implements ResetLogStore {
 interface DbRow {
   id: string | number | bigint;
   at: Date | string;
+  /** `at` as text with microseconds, for the cursor. */
+  at_cursor: string;
+  started_at: Date | string | null;
   provider: ResetLogProvider;
   trigger: ResetLogTrigger;
   actor: string;
@@ -286,6 +330,7 @@ function mapRow(row: DbRow): ResetLogRow {
   return {
     id: String(row.id),
     at: iso(row.at),
+    startedAt: row.started_at === null || row.started_at === undefined ? null : iso(row.started_at),
     provider: row.provider,
     trigger: row.trigger,
     actor: row.actor,
@@ -302,21 +347,47 @@ function mapRow(row: DbRow): ResetLogRow {
   };
 }
 
+/** How long the list of known identities stays cached (the filter menu does not need more). */
+const IDENTITIES_TTL_MS = 60_000;
+
 /** PostgreSQL table `reset_log` (migration 0024). Only inserts, reads and one `after` fill per row. */
 export class PgResetLog implements ResetLogStore {
-  constructor(private readonly sql: SQL) {}
+  private names: { at: number; list: string[] } | undefined;
+  private readonly now: () => number;
+
+  constructor(private readonly sql: SQL, options: { now?: () => number } = {}) {
+    this.now = options.now ?? Date.now;
+  }
 
   async insert(entry: ResetLogEntry): Promise<void> {
     await this.sql`INSERT INTO reset_log
-      (at, provider, "trigger", actor, identity, account, pool, grant_id, "before", outcome, message, resets_left_after)
-      VALUES (${entry.at}::text::timestamptz, ${entry.provider}, ${entry.trigger}, ${entry.actor}, ${entry.identity},
+      (at, started_at, provider, "trigger", actor, identity, account, pool, grant_id, "before", outcome, message, resets_left_after)
+      VALUES (${entry.at}::text::timestamptz, ${entry.startedAt}::text::timestamptz, ${entry.provider}, ${entry.trigger}, ${entry.actor}, ${entry.identity},
         ${entry.account}, ${entry.pool}, ${entry.grantId}, ${JSON.stringify(entry.before)}::text::jsonb,
         ${entry.outcome}, ${entry.message}, ${entry.resetsLeftAfter})`;
+    // A new identity shows in the filter menu at once, without a second read of the table.
+    if (this.names && !this.names.list.includes(entry.identity)) this.names.list = [...this.names.list, entry.identity].sort();
+  }
+
+  /** The distinct identities, read at most once a minute. A failed read keeps the last list. */
+  private async identities(): Promise<string[]> {
+    const cached = this.names;
+    if (cached && this.now() - cached.at < IDENTITIES_TTL_MS) return cached.list;
+    try {
+      const rows: Array<{ identity: string }> = await this.sql`SELECT DISTINCT identity FROM reset_log ORDER BY identity`;
+      this.names = { at: this.now(), list: rows.map((row) => row.identity) };
+      return this.names.list;
+    } catch (error) {
+      if (cached) return cached.list;
+      throw error;
+    }
   }
 
   async list(filters: ResetLogFilters): Promise<ResetLogPage> {
     const limit = filters.limit ?? RESET_LOG_DEFAULT_LIMIT;
-    const rows: DbRow[] = await this.sql`SELECT id::text AS id, at, provider, "trigger", actor, identity, account, pool, grant_id,
+    const cursor = filters.before;
+    const rows: DbRow[] = await this.sql`SELECT id::text AS id, at, to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"."US"Z"') AS at_cursor,
+        started_at, provider, "trigger", actor, identity, account, pool, grant_id,
         "before", outcome, message, resets_left_after, "after", after_at
       FROM reset_log
       WHERE (${filters.identity ?? null}::text IS NULL OR identity = ${filters.identity ?? null})
@@ -325,27 +396,27 @@ export class PgResetLog implements ResetLogStore {
         AND (${filters.outcome ?? null}::text IS NULL OR outcome = ${filters.outcome ?? null})
         AND (${filters.from ?? null}::text IS NULL OR at >= ${filters.from ?? null}::text::timestamptz)
         AND (${filters.toExclusive ?? null}::text IS NULL OR at < ${filters.toExclusive ?? null}::text::timestamptz)
-        AND (${filters.before ?? null}::text IS NULL OR id < ${filters.before ?? null}::text::bigint)
-      ORDER BY id DESC
+        AND (${cursor?.at ?? null}::text IS NULL OR (at, id) < (${cursor?.at ?? null}::text::timestamptz, ${cursor?.id ?? null}::text::bigint))
+      ORDER BY at DESC, id DESC
       LIMIT ${limit + 1}`;
-    const names: Array<{ identity: string }> = await this.sql`SELECT DISTINCT identity FROM reset_log ORDER BY identity`;
-    return page(rows.map(mapRow), limit, names.map((row) => row.identity));
+    const cursors = new Map(rows.map((row) => [String(row.id), row.at_cursor]));
+    return page(rows.map(mapRow), limit, await this.identities(), (row) => ({ at: cursors.get(row.id) ?? row.at, id: row.id }));
   }
 
   async fillAfter(provider: ResetLogProvider, identity: string, after: ResetLogWindow[], readingAt: string): Promise<{ filled: number; pending: boolean }> {
     const filled: unknown[] = await this.sql`UPDATE reset_log
       SET "after" = ${JSON.stringify(after)}::text::jsonb, after_at = ${readingAt}::text::timestamptz
-      WHERE provider = ${provider} AND identity = ${identity} AND "after" IS NULL AND at < ${readingAt}::text::timestamptz
+      WHERE provider = ${provider} AND identity = ${identity} AND outcome = 'reset' AND "after" IS NULL AND at < ${readingAt}::text::timestamptz
       RETURNING id`;
     const [left] = await this.sql`SELECT EXISTS (
-      SELECT 1 FROM reset_log WHERE provider = ${provider} AND identity = ${identity} AND "after" IS NULL
+      SELECT 1 FROM reset_log WHERE provider = ${provider} AND identity = ${identity} AND outcome = 'reset' AND "after" IS NULL
     ) AS pending`;
     return { filled: filled.length, pending: left?.pending === true };
   }
 
   async pendingMembers(): Promise<Array<{ provider: ResetLogProvider; identity: string }>> {
     const rows: Array<{ provider: ResetLogProvider; identity: string }> =
-      await this.sql`SELECT DISTINCT provider, identity FROM reset_log WHERE "after" IS NULL`;
+      await this.sql`SELECT DISTINCT provider, identity FROM reset_log WHERE outcome = 'reset' AND "after" IS NULL`;
     return rows.map(({ provider, identity }) => ({ provider, identity }));
   }
 }
@@ -378,7 +449,10 @@ export interface ResetAttemptResult {
 }
 
 export interface ResetAttempt {
-  /** Writes the row once. It never rejects: a failed write is counted and logged. */
+  /**
+   * Writes the row once. It never rejects: a failed write is retried, then counted and logged.
+   * A caller on a response path does not await it: the logger tracks the write, and `drain` waits for it.
+   */
   finish(result: ResetAttemptResult): Promise<void>;
 }
 
@@ -389,6 +463,8 @@ export interface ResetLogger {
   onReading(provider: string, identity: string, reading: PoolUsage): void;
   /** Loads the members that have rows with no `after`. Call once at start. */
   warm(): Promise<void>;
+  /** Waits until every started write has ended (written, or given up). Never rejects. Call at stop. */
+  drain(): Promise<void>;
 }
 
 export interface ResetLoggerOptions {
@@ -402,8 +478,16 @@ export interface ResetLoggerOptions {
   storeTimeoutMs?: number;
   /** How long a replica trusts its list of members with rows to fill (default 5 minutes). */
   resyncMs?: number;
+  /** The waits between the tries of one write (default 250 ms, then 1 s: three tries in all). */
+  retryBackoffMs?: readonly number[];
+  /** Most writes that may be waiting at once (default 1000). A write over the limit is dropped and counted. */
+  queueLimit?: number;
+  /** Replaces the wait between two tries (tests). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
+const RETRY_BACKOFF_MS: readonly number[] = [250, 1_000];
+const QUEUE_LIMIT = 1_000;
 const MESSAGE_MAX = 300;
 const FIELD_MAX = 256;
 
@@ -426,9 +510,16 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
   const log = options.log ?? ((line: string) => console.warn(line));
   const timeoutMs = options.storeTimeoutMs ?? 2_000;
   const resyncMs = options.resyncMs ?? 5 * 60_000;
+  const backoff = options.retryBackoffMs ?? RETRY_BACKOFF_MS;
+  const queueLimit = options.queueLimit ?? QUEUE_LIMIT;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const key = (provider: string, identity: string): string => `${provider}\u0000${identity}`;
   const waiting = new Map<string, { provider: ResetLogProvider; identity: string }>();
   const filling = new Set<string>();
+  /** Writes that have started and not ended. `drain` waits for them. */
+  const pending = new Set<Promise<void>>();
+  /** Counts the rows that this replica has inserted for one member. A fill that overlaps an insert must keep the member in `waiting`. */
+  const generation = new Map<string, number>();
   let syncedAt = Number.NEGATIVE_INFINITY;
   let syncing = false;
 
@@ -448,12 +539,60 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
     }
   }
 
+  const reportFailure = (entry: ResetLogEntry, error: unknown, note: string): void => {
+    try {
+      metrics?.resetLogWriteFailure?.(entry.provider);
+    } catch {
+      // Counted nowhere else.
+    }
+    const reason = clean(error instanceof Error ? error.message : String(error), 120) ?? "unknown error";
+    try {
+      log(`gateway: reset log write failed${note} (${entry.provider} ${entry.trigger} ${entry.outcome}): ${reason}`);
+    } catch {
+      // A logger failure never blocks the reset.
+    }
+  };
+
+  /** Inserts one row: three tries with a short wait between them. Never rejects. */
+  async function writeEntry(entry: ResetLogEntry): Promise<void> {
+    if (pending.size > queueLimit) {
+      reportFailure(entry, new Error("the reset log write queue is full"), " (dropped)");
+      return;
+    }
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= backoff.length; attempt += 1) {
+      try {
+        await bounded(store.insert(entry), timeoutMs, "reset log write");
+        const id = key(entry.provider, entry.identity);
+        generation.set(id, (generation.get(id) ?? 0) + 1);
+        // Only a reset row has an `after` to fill.
+        if (entry.outcome === "reset") waiting.set(id, { provider: entry.provider, identity: entry.identity });
+        return;
+      } catch (error) {
+        lastError = error;
+        const wait = backoff[attempt];
+        if (wait === undefined) break;
+        try {
+          await sleep(wait);
+        } catch {
+          break;
+        }
+      }
+    }
+    reportFailure(entry, lastError, "");
+  }
+
   return {
     async warm() {
       await resync();
     },
 
+    async drain() {
+      while (pending.size > 0) await Promise.allSettled([...pending]);
+    },
+
     async begin(start) {
+      const startedAt = new Date(now()).toISOString();
       let windows: ResetLogWindow[] = [];
       try {
         const reading = start.before !== undefined
@@ -470,6 +609,7 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
           written = true;
           const entry: ResetLogEntry = {
             at: new Date(now()).toISOString(),
+            startedAt,
             provider: start.provider,
             trigger: start.trigger,
             actor: field(start.actor, FIELD_MAX) ?? "unknown",
@@ -487,21 +627,12 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
           } catch {
             // A metric failure never blocks the reset.
           }
+          const write = writeEntry(entry);
+          pending.add(write);
           try {
-            await bounded(store.insert(entry), timeoutMs, "reset log write");
-            waiting.set(key(entry.provider, entry.identity), { provider: entry.provider, identity: entry.identity });
-          } catch (error) {
-            try {
-              metrics?.resetLogWriteFailure?.(entry.provider);
-            } catch {
-              // Counted nowhere else.
-            }
-            const reason = clean(error instanceof Error ? error.message : String(error), 120) ?? "unknown error";
-            try {
-              log(`gateway: reset log write failed (${entry.provider} ${entry.trigger} ${entry.outcome}): ${reason}`);
-            } catch {
-              // A logger failure never blocks the reset.
-            }
+            await write;
+          } finally {
+            pending.delete(write);
           }
         },
       };
@@ -518,8 +649,10 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
         const readingAt = Date.parse(reading.capturedAt);
         if (!after.length || !Number.isFinite(readingAt)) return;
         filling.add(id);
+        const seen = generation.get(id) ?? 0;
         void bounded(store.fillAfter(provider, identity, after, new Date(readingAt).toISOString()), timeoutMs, "reset log fill")
-          .then(({ pending }) => { if (!pending) waiting.delete(id); })
+          // A row inserted during the fill may have missed it: the member then stays in the list.
+          .then((filled) => { if (!filled.pending && (generation.get(id) ?? 0) === seen) waiting.delete(id); })
           .catch(() => undefined)
           .finally(() => filling.delete(id));
       } catch {

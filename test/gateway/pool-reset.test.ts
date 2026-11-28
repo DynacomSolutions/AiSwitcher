@@ -424,8 +424,9 @@ describe("pool reset log", () => {
     const store = new MemoryResetLog();
     store.failInserts = over.failInserts === true;
     const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
-    h.state.resetLog = createResetLogger({ store, metrics, now: () => NOW, log: () => {} });
-    return { ...h, store, metrics };
+    const resetLog = createResetLogger({ retryBackoffMs: [0, 0], store, metrics, now: () => NOW, log: () => {} });
+    h.state.resetLog = resetLog;
+    return { ...h, store, metrics, resetLog };
   }
 
   test("a confirmed reset writes one row with the windows of the reading that the decision used", async () => {
@@ -456,6 +457,8 @@ describe("pool reset log", () => {
     const rows = (await store.list({})).rows.reverse();
     expect(rows.map((row) => row.outcome)).toEqual(["error", "already_redeemed"]);
     expect(rows[0]?.message).toContain("no recorded outcome");
+    // The repeat has no provider answer: the row says that the local journal held the earlier attempt.
+    expect(rows[1]?.message).toBe("repeat confirmation of an earlier attempt (local journal)");
   });
 
   test("a changed candidate and a changed membership write a rejected or no credit row and send nothing", async () => {
@@ -474,14 +477,17 @@ describe("pool reset log", () => {
 
   test("a failure that stops the confirmation still writes its row, and a failed write never blocks the reset", async () => {
     const aborted = logged();
-    const controller = new AbortController();
-    aborted.state.afterJournal = () => controller.abort();
-    await aborted.run(aborted.confirmation, controller.signal);
-    expect((await aborted.store.list({})).rows).toHaveLength(1);
+    aborted.state.afterJournal = () => { throw new Error("synthetic journal failure"); };
+    await expect(aborted.run()).rejects.toThrow("synthetic journal failure");
+    await aborted.resetLog.drain();
+    // A failure before the POST sent nothing, so the row is `rejected`, not `error`.
+    expect((await aborted.store.list({})).rows.map((row) => [row.outcome, row.message])).toEqual([["rejected", "synthetic journal failure"]]);
+    expect(aborted.posts).toEqual([]);
 
     const broken = logged({ failInserts: true });
     expect(await broken.run()).toEqual({ status: "confirmed" });
     expect(broken.posts).toHaveLength(1);
+    await broken.resetLog.drain();
     expect(broken.metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="codex"} 1');
   });
 });

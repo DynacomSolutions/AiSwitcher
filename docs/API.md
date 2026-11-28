@@ -57,6 +57,7 @@ The server caches expensive reads.
 | `/api/spend-guard`, `/api/herdr-bridge` | 60s |
 | `/api/usage/breakdown` | 300s (server caches 60s; heavy local JSONL scan) |
 | `/api/gateway/usage`, `/api/gateway/apps` | 60s |
+| `/api/logs/resets` | 60s, first page only (a page opened with "Load more" stops the poll) |
 | `/api/usage/projects` | 120s (file read only; the host collector rewrites it each cycle) |
 
 ## Endpoints
@@ -405,27 +406,34 @@ read time); unknown extra fields around it are still preserved.
 
 `GET /api/logs/resets` reads the reset log: one row for every reset attempt, manual or automatic, Claude or Codex.
 Rows are newest first. The log is append-only and never pruned.
-The console checks the query, then asks the gateway admin API (`GET /reset-log`). Without a gateway admin it answers an empty page with `configured: false`.
+Only resets that go through the gateway write a row. The local console with no gateway admin writes none.
+The console checks the query, then asks the gateway admin API (`GET /reset-log`). `configured` is `true` when it asked the gateway.
+Without a gateway admin it answers an empty page with `configured: false`, and the web page says that the log is unavailable.
 Query keys (all optional): `identity`, `provider` (`claude`, `codex`), `trigger` (`manual`, `auto`), `outcome` (`reset`, `no_credit`, `already_redeemed`, `rejected`, `error`),
-`from` and `to` (ISO date or date-time, UTC; both inclusive, and a date-only `to` ends at the end of that day), `limit` (default 100, largest 500) and `before` (cursor: a row `id`).
-A bad value answers 400.
+`from` and `to` (ISO date or date-time; both inclusive, and a date-only `to` ends at the end of that day, UTC), `limit` (default 100; a larger value is cut to 500) and `before` (the opaque cursor from `nextBefore`).
+The web page sends the dates as ICT (UTC+07:00) day bounds: `from` is `<date>T00:00:00+07:00` and `to` is `<date>T23:59:59.999+07:00`. Its URL keeps `YYYY-MM-DD`.
+A bad value answers 400. The web page polls the first page only (see the polling table).
 
 ```json
 {
   "rows": [{
-    "id": "123", "at": "2026-11-27T08:00:00.000Z", "provider": "claude", "trigger": "manual",
+    "id": "123", "at": "2026-11-27T08:00:00.000Z", "startedAt": "2026-11-27T07:59:59.200Z", "provider": "claude", "trigger": "manual",
     "actor": "user:console", "identity": "name", "account": null, "pool": null, "grantId": "grant-id",
     "before": [{ "key": "weekly", "label": "seven-day", "percent": 100, "resetsAt": "2026-11-28T08:00:00.000Z" }],
     "outcome": "reset", "message": null, "resetsLeftAfter": 2,
     "after": [{ "key": "weekly", "label": "seven-day", "percent": 2, "resetsAt": "2026-12-04T08:00:00.000Z" }],
     "afterAt": "2026-11-27T08:01:00.000Z"
   }],
-  "nextBefore": "122",
-  "identities": ["name"]
+  "nextBefore": "MjAyNi0xMS0yN1QwODowMDowMC4wMDAwMDBafDEyMg",
+  "identities": ["name"],
+  "configured": true
 }
 ```
 
-`nextBefore` is the `id` to send as `before` for the next page, or `null` on the last page. `identities` lists every identity in the table, for a filter menu.
+`at` is when the attempt ended and the row was made. `startedAt` is when it started (`null` for a row that has no start time).
+Rows are ordered by `at` descending, then `id` descending. `nextBefore` is an opaque cursor: send it back as `before` for the next page. It is `null` on the last page. Do not parse it.
+`identities` lists every identity in the table, for a filter menu. The gateway caches the list for 60 seconds.
+`after` is set only for a row with outcome `reset`. Every other row keeps `after` and `afterAt` `null`.
 A window `key` is `five_hour`, `weekly`, `weekly_<model>` or another slug. `after` and `afterAt` are `null` until the first usage reading that follows the row arrives. They are set once.
 A row holds no token, cookie or secret.
 

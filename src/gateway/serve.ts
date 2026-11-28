@@ -1279,6 +1279,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const drainCtrl = new AbortController();
   const appDeps: GatewayDeps = {
     drainSignal: drainCtrl.signal,
+    resetLog: resetLogger,
     autoReset,
     autoResets: { ...(autoReset ? { codex: autoReset } : {}), ...(claudeAutoReset ? { claude: claudeAutoReset } : {}) },
     withCodexRedemption,
@@ -2077,6 +2078,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       await Promise.allSettled([...inflightRefreshes]);
       // The ledger flush, the relay and the leader lock do not wait for chat turns: a long turn must not hold them until the kill ceiling.
       await ledger.close();
+      // Reset log rows that are still being written (the writes are fired, not awaited) end before the database closes.
+      await bounded(resetLogger.drain(), 5_000, "reset log writes").catch(() => undefined);
       await relay?.stop().catch(() => undefined);
       await sessionsEnrich?.enricher.stop().catch(() => undefined);
       await leader?.stop().catch(() => undefined);

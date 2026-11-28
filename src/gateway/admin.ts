@@ -495,9 +495,10 @@ export function createAdminApp(deps: AdminDeps): Hono {
   // Spends one reset grant at the gateway, with the member credential from the store. The console never holds that credential.
   hono.post("/limits/claude/:identity/resets/:grant", async (c) => {
     if (!deps.spendReset) return err(404, "reset spending is not available");
-    const requested = decodeURIComponent(c.req.param("identity"));
+    // Hono has decoded the path parameters already. A second decode would throw on a stray `%`.
+    const requested = c.req.param("identity");
     const identity = (await deps.canonical?.("claude", requested).catch(() => requested)) ?? requested;
-    const grant = decodeURIComponent(c.req.param("grant"));
+    const grant = c.req.param("grant");
     // The log keeps only a well-formed grant ID. Anything else is refused by the spend and is not logged as an ID.
     const attempt = await deps.resetLog?.begin({
       provider: "claude", trigger: "manual", actor: resetActor(c.req.raw, "user"), identity, grantId: /^[A-Za-z0-9._:-]{1,128}$/.test(grant) ? grant : null,
@@ -505,10 +506,11 @@ export function createAdminApp(deps: AdminDeps): Hono {
     try {
       const out = await deps.spendReset(identity, grant);
       const body = (typeof out === "object" && out !== null ? out : {}) as { result?: unknown; cleared?: unknown; resetsLeft?: unknown; grantId?: unknown };
-      await attempt?.finish({ ...claudeManualOutcome(body), ...(typeof body.grantId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(body.grantId) ? { grantId: body.grantId } : {}) });
+      // The write is not awaited: the log never delays or changes the answer. The logger tracks it, and `drain` waits at stop.
+      void attempt?.finish({ ...claudeManualOutcome(body), ...(typeof body.grantId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(body.grantId) ? { grantId: body.grantId } : {}) });
       return c.json(out);
     } catch (e) {
-      await attempt?.finish(failureOutcome(e));
+      void attempt?.finish(failureOutcome(e));
       const status = (e as { status?: unknown }).status;
       const known = status === 400 || status === 404 || status === 409 || status === 429 ? status : 502;
       return Response.json({ error: e instanceof Error ? e.message.slice(0, 300) : "reset failed" }, { status: known });
@@ -518,7 +520,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
   // A Codex consume has no grant id. The identity path pins the stored login used for its one POST.
   hono.post("/limits/codex/:identity/resets/use", async (c) => {
     if (!deps.spendCodexReset) return err(404, "Codex reset spending is not available");
-    const requested = decodeURIComponent(c.req.param("identity"));
+    const requested = c.req.param("identity");
     const identity = (await deps.canonical?.("codex", requested).catch(() => requested)) ?? requested;
     const body = await c.req.json().catch(() => undefined) as { redeemRequestId?: unknown } | undefined;
     if (typeof body?.redeemRequestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.redeemRequestId)) return err(400, "a valid reset request ID is required");
@@ -526,13 +528,13 @@ export function createAdminApp(deps: AdminDeps): Hono {
     try {
       const out = await deps.spendCodexReset(identity, body.redeemRequestId, c.req.raw.signal);
       const result = (typeof out === "object" && out !== null ? out : {}) as { result?: unknown; creditId?: unknown };
-      await attempt?.finish({
+      void attempt?.finish({
         ...codexResultOutcome(typeof result.result === "string" ? result.result : ""),
         ...(typeof result.creditId === "string" ? { grantId: result.creditId } : {}),
       });
       return c.json(out);
     } catch (e) {
-      await attempt?.finish(failureOutcome(e));
+      void attempt?.finish(failureOutcome(e));
       const status = (e as { status?: unknown }).status;
       const known = status === 400 || status === 403 || status === 404 || status === 409 || status === 429 ? status : 502;
       return Response.json({ error: e instanceof Error ? e.message.slice(0, 300) : "reset failed" }, { status: known });

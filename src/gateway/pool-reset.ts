@@ -221,7 +221,10 @@ function poolOutcome(result: PoolResetResult | undefined, trace: PoolResetTrace)
   if (trace.reconciled) return { outcome: "reset" };
   switch (result.status) {
     case "confirmed": return { outcome: "reset" };
-    case "already_attempted": return { outcome: "already_redeemed", message: "The credit was already attempted" };
+    case "already_attempted": return trace.providerResult === "already_redeemed"
+      ? { outcome: "already_redeemed", message: "The provider reported the credit as already redeemed" }
+      // No provider answer in this call: the local journal holds an earlier attempt, for example one that ended as `pending`.
+      : { outcome: "already_redeemed", message: "repeat confirmation of an earlier attempt (local journal)" };
     case "declined": return codexResultOutcome(trace.providerResult ?? "no_credit");
     case "changed": return { outcome: "rejected", message: "The pool or the credit changed. Nothing was sent" };
     default: return trace.postStarted
@@ -244,15 +247,18 @@ export async function confirmPoolReset(
   });
   try {
     const result = await confirmPoolResetInner(pool, confirmation, signal, deps, trace);
-    await attempt?.finish({
+    // Not awaited: the log never delays the answer. The logger tracks the write.
+    void attempt?.finish({
       ...poolOutcome(result, trace),
       ...(trace.baseline ? { before: trace.baseline } : {}),
       ...(trace.account ? { account: trace.account } : {}),
     });
     return result;
   } catch (error) {
-    await attempt?.finish({
-      ...(trace.postStarted ? { outcome: "error" as const, message: error instanceof Error ? error.message : "reset failed" } : failureOutcome(error)),
+    const message = error instanceof Error ? error.message : "reset failed";
+    void attempt?.finish({
+      // A refusal before the POST sent nothing, so it is `rejected`. After the POST the outcome is not known.
+      ...(trace.postStarted ? failureOutcome(error) : { outcome: "rejected" as const, message }),
       ...(trace.baseline ? { before: trace.baseline } : {}),
       ...(trace.account ? { account: trace.account } : {}),
     });

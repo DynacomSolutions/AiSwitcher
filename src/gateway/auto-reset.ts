@@ -435,7 +435,7 @@ export function createAutoResetRecovery({
         });
       } finally {
         // The row is written in the same path as the reset. A failed write never changes the result.
-        await attempt?.finish({ ...autoResetOutcome(status, outcome, failure), grantId: creditedId ?? creditId });
+        void attempt?.finish({ ...autoResetOutcome(status, outcome, failure), grantId: creditedId ?? creditId });
       }
     }
     if (status === "rejected" || (creditedId !== undefined && creditedId !== creditId)) return undefined;
