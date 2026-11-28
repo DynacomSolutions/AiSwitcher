@@ -28,7 +28,8 @@ import codexPoolResetAccount0019 from "./migrations/0019_codex_pool_reset_accoun
 import codexResetFence0020 from "./migrations/0020_codex_reset_fence.sql" with { type: "text" };
 import codexResetPending0021 from "./migrations/0021_codex_reset_pending.sql" with { type: "text" };
 import autoResetEveryPool0022 from "./migrations/0022_auto_reset_every_pool.sql" with { type: "text" };
-import resetLog0023 from "./migrations/0023_reset_log.sql" with { type: "text" };
+import usageToolMetadata0023 from "./migrations/0023_usage_tool_metadata.sql" with { type: "text" };
+import resetLog0024 from "./migrations/0024_reset_log.sql" with { type: "text" };
 import type { PgListener } from "./pg-listen.ts";
 import { pgPoolOptions } from "./pg-pool.ts";
 
@@ -57,7 +58,8 @@ const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0020_codex_reset_fence", sql: codexResetFence0020 },
   { version: "0021_codex_reset_pending", sql: codexResetPending0021 },
   { version: "0022_auto_reset_every_pool", sql: autoResetEveryPool0022 },
-  { version: "0023_reset_log", sql: resetLog0023 },
+  { version: "0023_usage_tool_metadata", sql: usageToolMetadata0023 },
+  { version: "0024_reset_log", sql: resetLog0024 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
@@ -383,6 +385,11 @@ export class PgGatewayStore implements GatewayStore {
       streamed: r.streamed,
       session_key: r.sessionKey ?? null,
       client: r.client ?? null,
+      ttfb_ms: r.ttfbMs ?? null,
+      stop_reason: r.stopReason ?? null,
+      tool_calls: r.toolCalls ?? null,
+      tool_names: r.toolNames && r.toolNames.length > 0 ? JSON.stringify(r.toolNames) : null,
+      tool_errors: r.toolErrors ?? null,
     }));
     await this.sql`INSERT INTO gateway_usage ${this.sql(values)}`;
   }

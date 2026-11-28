@@ -302,7 +302,7 @@ function mapRow(row: DbRow): ResetLogRow {
   };
 }
 
-/** PostgreSQL table `reset_log` (migration 0023). Only inserts, reads and one `after` fill per row. */
+/** PostgreSQL table `reset_log` (migration 0024). Only inserts, reads and one `after` fill per row. */
 export class PgResetLog implements ResetLogStore {
   constructor(private readonly sql: SQL) {}
 

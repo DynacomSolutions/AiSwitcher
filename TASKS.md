@@ -547,3 +547,16 @@ ETA: 2026-12-03 18:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 343 | ZCode question cards keep their options | done | claude | | | | Merged #844 (30b4d3ed), released v0.5.125 (#845).<br>Live 26 Nov 18:51 ICT: a restarted ZCode session showed option buttons plus skip.<br>The owner's picks reached the agent. |
+
+## 23. Agent traffic observability at the AIS gateway
+ETA: 2026-12-12 18:00 ICT
+- Metadata-only telemetry from the TruLens spike (28 Nov 2026). The gateway never stores prompt or response content.
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 407 | Record TTFB, stop reason and tool-call metadata in the gateway ledger and metrics | done | claude-20261128-gateway-ledger-metadata | gateway-ledger-metadata | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/933 (1c8fbe6), CI green, Opus 5.5 review fixed.<br>Migration 0023, `UsageTap.meta()`, `countToolErrors()`, metrics `ais_gateway_ttfb_seconds`, `ais_gateway_tool_calls_total`, `ais_gateway_tool_errors_total`.<br>Docs: `docs/agents/gateway.md`. |
+| 408 | Alert on runaway agent sessions | todo | | | 23.407 | | Alert on tokens or requests per minute for one session.<br>No per-session metric labels (cardinality): use a bounded counter or a ledger check.<br>The alert rule goes in the .cluster watchdog. |
+| 409 | Show cost per session and per task (`ais` query or Grafana panel) | todo | | | | | The data is already in `gateway_usage`: sessionKey, identity, model and cost. |
+| 410 | Move gateway metrics to the HoardDB VictoriaMetrics engine | todo | | | | | Waits on .cluster 187.848 (open PR https://github.com/DynacomSolutions/.cluster/pull/3665).<br>Same write and query API, so only the scrape target changes. |
+| 411 | Emit metadata-only OTLP GenAI spans with traceparent from the gateway | todo | | | 23.407 | | Async and bounded, drop-counted like `LedgerBuffer`. Never block a stream.<br>Target: the HoardDB VictoriaTraces engine (new HoardDB epic, added 28 Nov).<br>Add a child span for each failover attempt. |
+| 412 | Run sampled LLM-judge evals over the encrypted session transcripts | todo | | | | | Arize Phoenix on CNPG Postgres, internal ClusterIP only.<br>Batch job, about 5% sample. Redact before the judge.<br>Judge calls go through ais-gateway. Thomas sets the judge budget before start. |

@@ -2763,3 +2763,115 @@ describe("automatic Claude pool reset proxy", () => {
     await response.arrayBuffer();
   });
 });
+
+describe("ledger metadata: TTFB, stop reason and tool calls", () => {
+  const sseResponse = (parts: string[], delayMs = 0): Response => {
+    const stream = new ReadableStream<Uint8Array>({
+      async start(c) {
+        for (const p of parts) {
+          if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+          c.enqueue(enc.encode(p));
+        }
+        c.close();
+      },
+    });
+    return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+  };
+
+  test("anthropic non-streamed: stop reason, tool names, request tool errors; no content reaches the row", async () => {
+    const t = await addApp(baseApp({}));
+    const answer = JSON.stringify({
+      type: "message", model: "claude-sonnet-4-5", stop_reason: "tool_use",
+      content: [{ type: "text", text: "CANARY_RESPONSE_TEXT" }, { type: "tool_use", id: "toolu_1", name: "Read", input: { p: "CANARY_TOOL_INPUT" } }],
+      usage: { input_tokens: 12, output_tokens: 34 },
+    });
+    handler = () => new Response(answer, { headers: { "content-type": "application/json" } });
+    const request = JSON.stringify({
+      model: "claude-sonnet-4-5",
+      messages: [
+        { role: "user", content: "CANARY_PROMPT_TEXT" },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_0", name: "Bash", input: {} }, { type: "tool_use", id: "toolu_00", name: "Bash", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_0", is_error: true, content: "CANARY_TOOL_RESULT" }, { type: "tool_result", tool_use_id: "toolu_00", content: "fine" }] },
+      ],
+    });
+    await call("/pin/v1/messages", t, { method: "POST", body: request });
+    const r = await rows();
+    expect(r).toHaveLength(1);
+    expect(r[0]).toMatchObject({ stopReason: "tool_use", toolCalls: 1, toolNames: ["Read"], toolErrors: 1 });
+    expect(typeof r[0]!.ttfbMs).toBe("number");
+    expect(r[0]!.ttfbMs!).toBeLessThanOrEqual(r[0]!.latencyMs);
+    expect(JSON.stringify(r[0])).not.toContain("CANARY");
+    expect(logs.join("\n")).not.toContain("CANARY");
+  });
+
+  test("anthropic streamed: TTFB is the first upstream byte, before the stream ends; bytes pass through unchanged", async () => {
+    const t = await addApp(baseApp({}));
+    const parts = [
+      'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-4-5","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Edit","input":{}}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}\n\n',
+    ];
+    handler = () => sseResponse(parts, 60);
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: JSON.stringify({ model: "claude-sonnet-4-5", stream: true, messages: [{ role: "user", content: "hi" }] }) });
+    expect(await res.text()).toBe(parts.join(""));
+    const r = await rows();
+    expect(r[0]).toMatchObject({ streamed: true, stopReason: "tool_use", toolCalls: 1, toolNames: ["Edit"], toolErrors: 0, outputTokens: 42 });
+    expect(r[0]!.ttfbMs!).toBeGreaterThanOrEqual(50);
+    expect(r[0]!.latencyMs - r[0]!.ttfbMs!).toBeGreaterThanOrEqual(80);
+  });
+
+  test("codex responses stream: status, calls counted once, names only; tool errors stay unknown", async () => {
+    const t = await addApp(baseApp({ name: "cx", provider: "codex", style: "openai", target: { kind: "pin", identity: "id1" } }));
+    const call1 = { type: "function_call", id: "fc_1", call_id: "call_1", name: "shell", arguments: "{\"cmd\":\"CANARY_TOOL_INPUT\"}" };
+    const ev = (e: string, d: unknown): string => `event: ${e}\ndata: ${JSON.stringify(d)}\n\n`;
+    const parts = [
+      ev("response.created", { type: "response.created", response: { model: "gpt-5", status: "in_progress" } }),
+      ev("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: call1 }),
+      ev("response.completed", { type: "response.completed", response: { model: "gpt-5", status: "completed", output: [call1], usage: { input_tokens: 10, output_tokens: 2 } } }),
+    ];
+    handler = () => sseResponse(parts);
+    await call("/cx/v1/responses", t, { method: "POST", body: JSON.stringify({ model: "gpt-5", input: [{ type: "function_call_output", call_id: "call_0", output: "CANARY_TOOL_RESULT" }] }) });
+    const r = await rows();
+    expect(r[0]).toMatchObject({ stopReason: "completed", toolCalls: 1, toolNames: ["shell"] });
+    expect(r[0]!.toolErrors).toBeUndefined();
+    expect(JSON.stringify(r[0])).not.toContain("CANARY");
+  });
+
+  test("chat completions non-streamed: finish_reason and tool names", async () => {
+    const t = await addApp(baseApp({ name: "oa", provider: "kimi", style: "openai", target: { kind: "pin", identity: "id1" } }));
+    handler = () => new Response(JSON.stringify({ model: "gpt-5", choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", tool_calls: [{ id: "c1", type: "function", function: { name: "lookup", arguments: "{}" } }] } }], usage: { prompt_tokens: 5, completion_tokens: 3 } }), { headers: { "content-type": "application/json" } });
+    await call("/oa/v1/chat/completions", t, { method: "POST", body: JSON.stringify({ model: "gpt-5", messages: [{ role: "user", content: "hi" }] }) });
+    const r = await rows();
+    expect(r[0]).toMatchObject({ stopReason: "tool_calls", toolCalls: 1, toolNames: ["lookup"] });
+  });
+
+  test("a failed or refused request does not count its tool errors, and an error body has no tool metadata", async () => {
+    const t = await addApp(baseApp({}));
+    const request = JSON.stringify({ model: "claude-sonnet-4-5", messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_0", is_error: true, content: "x" }] }] });
+    handler = () => new Response('{"type":"error","error":{"type":"overloaded_error","message":"busy"}}', { status: 529, headers: { "content-type": "application/json" } });
+    await call("/pin/v1/messages", t, { method: "POST", body: request });
+    const failed = (await rows())[0]!;
+    expect(failed.status).toBe("upstream_error");
+    expect(failed.toolErrors).toBeUndefined();
+    expect(failed.toolCalls).toBeUndefined();
+    expect(failed.stopReason).toBeUndefined();
+  });
+
+  test("count_tokens requests do not count tool errors", async () => {
+    const t = await addApp(baseApp({}));
+    handler = () => new Response('{"input_tokens":5}', { headers: { "content-type": "application/json" } });
+    const request = JSON.stringify({ model: "claude-sonnet-4-5", messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_0", is_error: true, content: "x" }] }] });
+    await call("/pin/v1/messages/count_tokens", t, { method: "POST", body: request });
+    expect((await rows())[0]!.toolErrors).toBeUndefined();
+  });
+
+  test("a rejected request records no response metadata", async () => {
+    const t = await addApp(baseApp({ models: ["claude-sonnet-4-5"] }));
+    await call("/pin/v1/messages", t, { method: "POST", body: JSON.stringify({ model: "other-model", messages: [{ role: "user", content: "hi" }] }) });
+    const r = await rows();
+    expect(r[0]).toMatchObject({ status: "rejected" });
+    expect(r[0]!.ttfbMs).toBeUndefined();
+    expect(r[0]!.toolCalls).toBeUndefined();
+    expect(r[0]!.stopReason).toBeUndefined();
+  });
+});
