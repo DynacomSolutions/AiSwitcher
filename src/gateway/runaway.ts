@@ -28,7 +28,7 @@ export interface RunawayConfig {
 export const DEFAULT_RUNAWAY: RunawayConfig = {
   enabled: true,
   windowMs: 10 * 60_000,
-  requests: 300,
+  requests: 600,
   tokens: 3_000_000,
   toolErrorStreak: 20,
   maxSessions: 5_000,
@@ -84,6 +84,8 @@ export interface RunawayEvent {
 }
 
 const BUCKETS = 10;
+/** A running-away session leaves that state only below this share of each limit. Without the gap, a session that hovers at a limit would fire once for each bucket turn. */
+const CLEAR_RATIO = 0.8;
 
 interface State {
   provider: string;
@@ -143,12 +145,13 @@ export class RunawayTracker {
         this.sessions.delete(oldest);
         this.evictedTotal += 1;
       }
-      const reasons = this.reasons(s);
-      if (reasons.length === 0) {
-        s.active = false;
+      if (s.active) {
+        // Hysteresis: a session that hovers at a limit stays one event until it falls well under every limit.
+        if (this.cleared(s)) s.active = false;
         return undefined;
       }
-      if (s.active) return undefined;
+      const reasons = this.reasons(s);
+      if (reasons.length === 0) return undefined;
       s.active = true;
       this.events.set(s.provider, (this.events.get(s.provider) ?? 0) + 1);
       return {
@@ -175,8 +178,8 @@ export class RunawayTracker {
     let n = 0;
     for (const s of this.sessions.values()) {
       this.advance(s, nowMs);
-      if (this.reasons(s).length > 0) n += 1;
-      else s.active = false;
+      if (s.active && this.cleared(s)) s.active = false;
+      if (s.active) n += 1;
     }
     return n;
   }
@@ -231,6 +234,12 @@ export class RunawayTracker {
       }
     }
     s.head = idx;
+  }
+
+  /** True once every figure is under `CLEAR_RATIO` of its limit (the streak under its limit). A session that stays above it keeps its one event. */
+  private cleared(s: State): boolean {
+    const under = (value: number, limit: number): boolean => limit <= 0 || value < limit * CLEAR_RATIO;
+    return under(sum(s.requests), this.cfg.requests) && under(sum(s.tokens), this.cfg.tokens) && (this.cfg.toolErrorStreak <= 0 || s.streak < this.cfg.toolErrorStreak);
   }
 
   private reasons(s: State): RunawayReason[] {

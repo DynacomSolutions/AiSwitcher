@@ -1346,7 +1346,9 @@ results fail many times in a row. It is detection only: `RunawayTracker.observe`
   `maxSessions` entries: the least recently seen one is evicted first, and a session idle for longer than the window
   is dropped. A request with no session key (no Claude Code or Codex session header or body id) is not tracked.
 - A session is "running away" while any limit is met inside the window. It counts as one event when it starts (an edge).
-  It leaves the gauge when it falls back under every limit or ages out. Falling back and going over again is a new event.
+  It leaves the gauge when every figure falls under 80% of its limit (the tool error streak: under its limit), or when it
+  ages out. This gap stops a session that hovers at a limit from firing once for each bucket turn. Falling clear and going
+  over again is a new event.
 - Tokens are input, output and cache write. Cache reads are left out: a normal long session re-reads its whole context
   on each turn, so they would trip a token limit on healthy work. Tool errors come from the same `toolErrors` figure as
   the ledger, so they exist for Anthropic-style apps only. A request that cannot tell leaves the streak unchanged.
@@ -1357,7 +1359,7 @@ results fail many times in a row. It is detection only: `RunawayTracker.observe`
 |---|---|---|
 | `AIS_GATEWAY_RUNAWAY` | on | `off`, `0` or `false` turns the tracker off. |
 | `AIS_GATEWAY_RUNAWAY_WINDOW_S` | `600` | Window in seconds. |
-| `AIS_GATEWAY_RUNAWAY_REQUESTS` | `300` | Requests from one session inside the window (30 a minute). `0` turns the check off. |
+| `AIS_GATEWAY_RUNAWAY_REQUESTS` | `600` | Requests from one session inside the window (60 a minute). `0` turns the check off. Claude Code subagents and fan-outs may share the parent's session id, so the default leaves room for them. |
 | `AIS_GATEWAY_RUNAWAY_TOKENS` | `3000000` | Input, output and cache write tokens inside the window. `0` turns the check off. |
 | `AIS_GATEWAY_RUNAWAY_TOOL_ERROR_STREAK` | `20` | Consecutive served requests that each carry a tool error. `0` turns the check off. |
 | `AIS_GATEWAY_RUNAWAY_MAX_SESSIONS` | `5000` | Sessions tracked at once. |

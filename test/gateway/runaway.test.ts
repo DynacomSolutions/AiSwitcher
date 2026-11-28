@@ -70,6 +70,23 @@ describe("runaway tracker", () => {
     expect(line(t, "ais_gateway_runaway_events_total")).toBe('ais_gateway_runaway_events_total{provider="claude"} 2');
   });
 
+  test("a session that hovers at the limit is one event, and clears only well under it", () => {
+    const { clock, t } = clocked({ requests: 100, tokens: 0, toolErrorStreak: 0, windowMs: 600_000 });
+    let events = 0;
+    // 11 requests a minute for 40 minutes: the window sum swings between about 100 and 110 as buckets turn.
+    for (let i = 0; i < 440; i++) {
+      clock.ms += 60_000 / 11;
+      if (t.observe(obs())) events += 1;
+    }
+    expect(events).toBe(1);
+    expect(t.runawaySessions()).toBe(1);
+    // Quiet for the whole window: back under 80%, then a new burst is a second event.
+    clock.ms += 601_000;
+    expect(t.runawaySessions()).toBe(0);
+    for (let i = 0; i < 100; i++) t.observe(obs());
+    expect(line(t, "ais_gateway_runaway_events_total")).toBe('ais_gateway_runaway_events_total{provider="claude"} 2');
+  });
+
   test("memory is bounded: the oldest session is evicted and idle sessions expire", () => {
     const { clock, t } = clocked({ maxSessions: 3, requests: 0, tokens: 0, toolErrorStreak: 0 });
     for (let i = 0; i < 5; i++) t.observe(obs({ sessionKey: `session-key-${i}` }));
