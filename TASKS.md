@@ -554,7 +554,7 @@ ETA: 2026-12-12 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 407 | Record TTFB, stop reason and tool-call metadata in the gateway ledger and metrics | in_review | claude-20261128-gateway-ledger-metadata | gateway-ledger-metadata | | 2026-11-28 17:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/933 waits on CI and Opus review.<br>Metadata only: tool count, names and error flags. No content.<br>Parse in `UsageTap` (`src/gateway/usage.ts`). Set at `record()` in `src/gateway/app.ts`.<br>New migration for the ledger columns. |
+| 407 | Record TTFB, stop reason and tool-call metadata in the gateway ledger and metrics | done | claude-20261128-gateway-ledger-metadata | gateway-ledger-metadata | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/933 (1c8fbe6), CI green, Opus 5.5 review fixed.<br>Migration 0023, `UsageTap.meta()`, `countToolErrors()`, metrics `ais_gateway_ttfb_seconds`, `ais_gateway_tool_calls_total`, `ais_gateway_tool_errors_total`.<br>Docs: `docs/agents/gateway.md`. |
 | 408 | Alert on runaway agent sessions | todo | | | 23.407 | | Alert on tokens or requests per minute for one session.<br>No per-session metric labels (cardinality): use a bounded counter or a ledger check.<br>The alert rule goes in the .cluster watchdog. |
 | 409 | Show cost per session and per task (`ais` query or Grafana panel) | todo | | | | | The data is already in `gateway_usage`: sessionKey, identity, model and cost. |
 | 410 | Move gateway metrics to the HoardDB VictoriaMetrics engine | todo | | | | | Waits on .cluster 187.848 (open PR https://github.com/DynacomSolutions/.cluster/pull/3665).<br>Same write and query API, so only the scrape target changes. |
