@@ -61,6 +61,7 @@ import { CachedGatewayStore } from "./cache-store.ts";
 import { CredentialCache, GatewayCredentialError, loginCommand, type RefreshFn } from "./credentials.ts";
 import { GATEWAY_ERROR_HEADER, providerError } from "./errors.ts";
 import { errorTag, LedgerBuffer } from "./ledger-buffer.ts";
+import { RunawayTracker, runawayFromEnv } from "./runaway.ts";
 import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
@@ -703,6 +704,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const publicHosts = hooks.publicHosts ?? publicHostsFromEnv();
   const ledger = new LedgerBuffer(store, hooks.ledger ?? { max: 50_000, flushMs: 2_000 });
   const metrics = new PrometheusMetrics({ ledgerDepth: () => ledger.depth, ledgerDropped: () => ledger.dropped });
+  const runaway = new RunawayTracker(runawayFromEnv(process.env));
+  metrics.sections.push(() => runaway.render(LIMITS_PROVIDERS));
   metrics.publicHostsConfigured(publicHosts.length);
   metrics.appNoticesUp = () => (store.listening ? 1 : 0);
   if (publicHosts.length === 0) console.warn("gateway: AIS_GATEWAY_PUBLIC_HOSTS is empty, so /metrics, /healthz, /readyz and /browser/pair answer on every host, including a public tunnel; set it to the public host names");
@@ -1270,6 +1273,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     codexResetGenerations,
     store,
     ledger,
+    runaway,
     creds,
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
     ...(hooks.usageFor ? {} : { refreshUsage: async (provider: GatewayProvider, identity: string) => usage.refreshNow(provider, await canonical(provider, identity)) }),

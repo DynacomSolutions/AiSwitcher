@@ -14,6 +14,7 @@ import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type
 import { GATEWAY_ERROR_HEADER, GATEWAY_UPSTREAM_HEADER, limitError, markGatewayError, providerError } from "./errors.ts";
 import { CLIENT_RETRY_AFTER_CAP_SECONDS, PoolHoldGate, confirmedPoolAnswers, fullPoolAnswers, heldReplays, heldStreamResponse, poolHoldFromEnv, visiblePoolErrors, wantsStream } from "./pool-hold.ts";
 import type { LedgerBuffer } from "./ledger-buffer.ts";
+import type { RunawayTracker } from "./runaway.ts";
 import { clientFamily, sessionKeyFromBodyTail, sessionKeyFromHeaders } from "./session-key.ts";
 import { badFiles, fileIds, filesBase, fileVerdict, isChatRequest, isUploadRequest, KnownBadFiles, MAX_FILE_CHECKS, MEDIA_REMOVED_HEADER, mediaAware, mentionedFileIds, rejectedUpload, withoutFiles, type FileVerdict } from "./media-recovery.ts";
 import type { GatewayMetrics } from "./metrics.ts";
@@ -81,6 +82,8 @@ export interface GatewayDeps {
   drainSignal?: AbortSignal;
   /** Limits of the full-pool hold (pool-hold.ts). Defaults come from AIS_GATEWAY_POOL_HOLD_* variables. */
   poolHold?: Partial<import("./pool-hold.ts").PoolHoldLimits>;
+  /** Detects runaway sessions (runaway.ts). Detection only: it never blocks, slows or refuses a request. Absent in most tests. */
+  runaway?: RunawayTracker;
 }
 
 /** Side-count database calls in flight at once for the whole gateway process (all apps share one gate); the rest queue for a slot. */
@@ -739,6 +742,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       deps.ledger.push(row);
       deps.metrics.request({ app: app.name, provider: app.provider, identity, status, httpStatus, latencyMs, ...(counts ? { tokens: c } : {}), ...(served ? { ...(row.model ? { model: row.model } : {}), ...(ttfbMs !== undefined ? { ttfbMs } : {}), ...(meta ? { toolCalls: meta.toolCalls } : {}), ...(toolErrors ? { toolErrors } : {}) } : {}) });
       log(JSON.stringify({ event: "request", app: app.name, provider: app.provider, identity, status, http: httpStatus, ...(tap ? { tap } : {}), ...(reason ? { reason } : {}), ...(upstream ? { upstream } : {}) }));
+      // Detection only. One JSON line when a session starts to run away: its key and identity, never any content.
+      const runaway = deps.runaway?.observe({ sessionKey, provider: app.provider, app: app.name, identity, tokens: c.inputTokens + c.outputTokens + c.cacheWriteTokens, toolErrors, served });
+      if (runaway) log(JSON.stringify({ event: "runaway_session", session: runaway.sessionKey, app: runaway.app, provider: runaway.provider, identity: runaway.identity, reasons: runaway.reasons, requests: runaway.requests, tokens: runaway.tokens, toolErrorStreak: runaway.toolErrorStreak, windowSeconds: runaway.windowSeconds }));
     } catch {
       // Observation must never affect the response.
     }

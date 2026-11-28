@@ -1335,6 +1335,47 @@ adds five nullable columns to `gateway_usage` with no index (the same reason as 
   client retries do not skew them or use up model labels.
 - Do not add a content field here, and do not add a per-session or per-tool-name metric label (cardinality and privacy).
 
+## Runaway session alert (`src/gateway/runaway.ts`)
+
+Board row 23.408. The gateway flags one agent session that burns requests or tokens far above normal, or whose tool
+results fail many times in a row. It is detection only: `RunawayTracker.observe` runs after the request ends (in
+`record()`), is synchronous and never throws. It never blocks, slows, throttles or refuses a request.
+
+- Per session: a sliding window of 10 buckets (window divided by 10) holding request and token counts, plus a streak of
+  consecutive served requests that each report a tool error. Memory is fixed for each session. The map holds at most
+  `maxSessions` entries: the least recently seen one is evicted first, and a session idle for longer than the window
+  is dropped. A request with no session key (no Claude Code or Codex session header or body id) is not tracked.
+- A session is "running away" while any limit is met inside the window. It counts as one event when it starts (an edge).
+  It leaves the gauge when every figure falls under 80% of its limit (the tool error streak: under its limit), or when it
+  ages out. This gap stops a session that hovers at a limit from firing once for each bucket turn. Falling clear and going
+  over again is a new event.
+- Tokens are input, output and cache write. Cache reads are left out: a normal long session re-reads its whole context
+  on each turn, so they would trip a token limit on healthy work. Tool errors come from the same `toolErrors` figure as
+  the ledger, so they exist for Anthropic-style apps only. A request that cannot tell leaves the streak unchanged.
+- One tracker for each replica. A session whose requests reach several replicas (pool apps) is counted on each one
+  separately, so the real figure can be higher than a replica shows. Sizes below are per replica and per window.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AIS_GATEWAY_RUNAWAY` | on | `off`, `0` or `false` turns the tracker off. |
+| `AIS_GATEWAY_RUNAWAY_WINDOW_S` | `600` | Window in seconds. |
+| `AIS_GATEWAY_RUNAWAY_REQUESTS` | `600` | Requests from one session inside the window (60 a minute). `0` turns the check off. Claude Code subagents and fan-outs may share the parent's session id, so the default leaves room for them. |
+| `AIS_GATEWAY_RUNAWAY_TOKENS` | `3000000` | Input, output and cache write tokens inside the window. `0` turns the check off. |
+| `AIS_GATEWAY_RUNAWAY_TOOL_ERROR_STREAK` | `20` | Consecutive served requests that each carry a tool error. `0` turns the check off. |
+| `AIS_GATEWAY_RUNAWAY_MAX_SESSIONS` | `5000` | Sessions tracked at once. |
+
+A bad or negative value falls back to its default.
+
+- Metrics (no session, app, identity or model label): `ais_gateway_runaway_sessions` (gauge, sessions over a limit now),
+  `ais_gateway_runaway_events_total{provider}` (counter, one for each start), `ais_gateway_runaway_tracked_sessions`
+  (gauge) and `ais_gateway_runaway_evicted_total` (counter, a full tracker dropped a live session).
+- Log: one JSON line `{"event":"runaway_session","session","app","provider","identity","reasons","requests","tokens",
+  "toolErrorStreak","windowSeconds"}` when a session starts to run away. It has the session key and the identity, never
+  content. Read it to find which session to stop.
+- Alert: `ais-gateway-runaway-session` in the .cluster watchdog values (`watchdog/k8s/values.yaml`), next to
+  `ais-gateway-ledger-dropped`. It reads the events counter, not the gauge, so a short loop that ends is still reported.
+- Do not add a per-session metric label, and do not turn this into throttling without a new owner decision.
+
 ## Session store enrichment (`src/gateway/sessions/enrich*.ts`)
 
 The shipper stores transcript parts (gzip, then age) in object storage and the ingest routes record them in
