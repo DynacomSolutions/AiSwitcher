@@ -222,6 +222,26 @@ if (!url && process.env.CI && !optOut) {
     });
   });
 
+  describe("ledger metadata columns", () => {
+    test("TTFB, stop reason, tool counts and names round-trip; older and plain rows keep null", async () => {
+      const store = await fresh();
+      const base = { app: "meta-app", provider: "claude" as const, identity: "meta-id", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, status: "ok", httpStatus: 200, latencyMs: 900, streamed: true };
+      await store.appendUsage([
+        { ...base, ts: "2026-11-02T10:00:00.000Z", ttfbMs: 310, stopReason: "tool_use", toolCalls: 2, toolNames: ["Read", "Bash"], toolErrors: 1 },
+        { ...base, ts: "2026-11-02T10:00:01.000Z" },
+      ]);
+      const sql = new SQL(url as string);
+      try {
+        const got = await sql`SELECT ttfb_ms, stop_reason, tool_calls, tool_names, tool_errors FROM gateway_usage WHERE app = 'meta-app' ORDER BY ts`;
+        expect(got[0]).toMatchObject({ ttfb_ms: 310, stop_reason: "tool_use", tool_calls: 2, tool_errors: 1 });
+        expect(JSON.parse(got[0].tool_names)).toEqual(["Read", "Bash"]);
+        expect(got[1]).toEqual({ ttfb_ms: null, stop_reason: null, tool_calls: null, tool_names: null, tool_errors: null });
+      } finally {
+        await sql.close();
+      }
+    });
+  });
+
   describe("usage rollup", () => {
     const DAY = 86_400_000;
     const start = Date.UTC(2026, 9, 20); // 20 Oct 2026

@@ -131,6 +131,16 @@ export interface UsageRow {
   sessionKey?: string;
   /** The client tool family from its user agent, for example `claude-cli` or `codex_exec`. */
   client?: string;
+  /** Milliseconds from the request's arrival to the first upstream body byte. Absent when no upstream body byte arrived. */
+  ttfbMs?: number;
+  /** Why the model stopped: Anthropic `stop_reason`, Chat Completions `finish_reason`, or the Responses terminal `status` (the reason when `incomplete`). */
+  stopReason?: string;
+  /** Tool calls in the answer. Absent when the response was not read; 0 when it held none. */
+  toolCalls?: number;
+  /** Distinct tool names of the answer: at most 32, each at most 64 characters. Names only, never tool input or output. */
+  toolNames?: string[];
+  /** `tool_result` blocks with `is_error: true` in the last message of the request (Anthropic Messages only). */
+  toolErrors?: number;
 }
 
 /** One imported history figure. A null `day` is an all-time figure; a null `model` covers every model of the day. */

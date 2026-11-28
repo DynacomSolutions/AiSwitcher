@@ -32,7 +32,8 @@ import { verifyToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, UsageRow } from "./types.ts";
 import { ErrorPeek, failureName, redactText, summariseUpstreamError, type UpstreamErrorSummary } from "./upstream-error.ts";
 import { estimateCostWarn, UsageTap } from "./usage.ts";
-import type { UsageCounts } from "./usage.ts";
+import type { ResponseMeta, UsageCounts } from "./usage.ts";
+import { countToolErrors } from "./request-meta.ts";
 
 export interface GatewayDeps {
   store: GatewayStore;
@@ -693,9 +694,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   let sessionKey: string | undefined = sessionKeyFromHeaders(req.headers);
   const client = clientFamily(req.headers.get("user-agent"));
   let recorded = false;
+  /** Milliseconds from the request's arrival to the first upstream body byte; set once by the response pump. */
+  let ttfbMs: number | undefined;
+  /** `tool_result` blocks with `is_error: true` in the last message of the request body (Anthropic Messages only). */
+  let toolErrors: number | undefined;
   /** True for a replay of a held request, and for a request that may be held: its 429 refusals write no row (see `startHold`). */
   let quietRefusals = false;
-  const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string, reason?: string, upstream?: UpstreamErrorSummary): void => {
+  const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string, reason?: string, upstream?: UpstreamErrorSummary, meta?: ResponseMeta): void => {
     if (recorded) return;
     // A replay of a held request, and a request that is about to be held, write no refusal row: the hold writes one row when it ends.
     if (quietRefusals && status === "rejected" && httpStatus === 429) return;
@@ -720,10 +725,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       streamed,
       ...(sessionKey ? { sessionKey } : {}),
       ...(client ? { client } : {}),
+      ...(ttfbMs !== undefined ? { ttfbMs } : {}),
+      ...(meta?.stopReason ? { stopReason: meta.stopReason } : {}),
+      ...(meta ? { toolCalls: meta.toolCalls, ...(meta.toolNames.length > 0 ? { toolNames: meta.toolNames } : {}) } : {}),
+      ...(toolErrors !== undefined ? { toolErrors } : {}),
     };
     try {
       deps.ledger.push(row);
-      deps.metrics.request({ app: app.name, provider: app.provider, identity, status, httpStatus, latencyMs, ...(counts ? { tokens: c } : {}) });
+      deps.metrics.request({ app: app.name, provider: app.provider, identity, status, httpStatus, latencyMs, ...(counts ? { tokens: c } : {}), ...(row.model ? { model: row.model } : {}), ...(ttfbMs !== undefined ? { ttfbMs } : {}), ...(meta ? { toolCalls: meta.toolCalls } : {}), ...(toolErrors ? { toolErrors } : {}) });
       log(JSON.stringify({ event: "request", app: app.name, provider: app.provider, identity, status, http: httpStatus, ...(tap ? { tap } : {}), ...(reason ? { reason } : {}), ...(upstream ? { upstream } : {}) }));
     } catch {
       // Observation must never affect the response.
@@ -883,6 +892,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return reject(400, "request body could not be read", identityForRow, undefined, undefined, "body_unreadable");
   }
   model = requestModel(body);
+  if (body.kind === "buffered" && adapter.usageStyle(style) === "anthropic") toolErrors = countToolErrors(body.bytes);
   if (!sessionKey && body.kind === "buffered") sessionKey = sessionKeyFromBodyTail(body.bytes);
   if (!side && app.models && app.models.length > 0 && body.kind === "stream") {
     deps.metrics.rejection(app.name, "model");
@@ -1887,7 +1897,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         // Observation must never affect the response.
       }
     }
-    record(identity, inBody && status === "ok" ? "stream_error" : status, httpStatus, counts, tap.isSse(), tap.status(), model, mediaRemoved > 0 ? "media_removed" : undefined, errorPeek?.summary());
+    record(identity, inBody && status === "ok" ? "stream_error" : status, httpStatus, counts, tap.isSse(), tap.status(), model, mediaRemoved > 0 ? "media_removed" : undefined, errorPeek?.summary(), tap.meta());
   };
 
   if (!up.body) {
@@ -1904,6 +1914,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
           c.close();
           return;
         }
+        if (ttfbMs === undefined && r.value.length > 0) ttfbMs = Math.round(performance.now() - started);
         tap.write(r.value);
         errorPeek?.write(r.value);
         c.enqueue(r.value);

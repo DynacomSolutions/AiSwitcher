@@ -26,6 +26,13 @@ export interface GatewayMetrics {
     httpStatus: number;
     latencyMs: number;
     tokens?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
+    /** The model, for the TTFB and tool metrics. Bounded to 64 distinct values; the rest count as `other`. */
+    model?: string;
+    /** Milliseconds from arrival to the first upstream body byte. */
+    ttfbMs?: number;
+    /** Tool calls in the answer, and tool errors the request reported back. Counts only: never a tool name. */
+    toolCalls?: number;
+    toolErrors?: number;
   }): void;
   /** `app` is only given when the app exists (bounded); unknown apps are counted under "-". */
   authFailure(reason: "unknown-app" | "bad-token" | "auth-error", app?: string): void;
@@ -129,7 +136,7 @@ class Histogram {
   private readonly counts: number[];
   private count = 0;
   private sum = 0;
-  constructor(readonly name: string, readonly help: string, private readonly buckets: readonly number[]) {
+  constructor(readonly name: string, readonly help: string, private readonly buckets: readonly number[], private readonly fixed: Record<string, string> = {}) {
     this.counts = buckets.map(() => 0);
   }
   observe(v: number): void {
@@ -139,17 +146,23 @@ class Histogram {
       if (v <= b) this.counts[i] = (this.counts[i] ?? 0) + 1;
     });
   }
-  render(): string[] {
+  /** `header` false leaves out HELP and TYPE, for the second and later series of one labelled histogram. */
+  render(header = true): string[] {
+    const l = (le?: string): string => labels(le === undefined ? this.fixed : { ...this.fixed, le });
     return [
-      `# HELP ${this.name} ${this.help}`,
-      `# TYPE ${this.name} histogram`,
-      ...this.buckets.map((b, i) => `${this.name}_bucket{le="${b}"} ${this.counts[i]}`),
-      `${this.name}_bucket{le="+Inf"} ${this.count}`,
-      `${this.name}_sum ${this.sum}`,
-      `${this.name}_count ${this.count}`,
+      ...(header ? [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} histogram`] : []),
+      ...this.buckets.map((b, i) => `${this.name}_bucket${l(String(b))} ${this.counts[i]}`),
+      `${this.name}_bucket${l("+Inf")} ${this.count}`,
+      `${this.name}_sum${l()} ${this.sum}`,
+      `${this.name}_count${l()} ${this.count}`,
     ];
   }
 }
+
+/** Seconds buckets for the time to first byte: from a warm cache hit to a slow reasoning start. */
+const TTFB_BUCKETS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60];
+/** Most distinct model names kept as a label. */
+const MAX_MODEL_LABELS = 64;
 
 /** Seconds buckets for the ingest lag: from a quick flush to a long backfill. */
 const LAG_BUCKETS = [1, 5, 15, 30, 60, 120, 300, 900, 3600, 21600, 86400];
@@ -162,6 +175,10 @@ const LAG_BUCKETS = [1, 5, 15, 30, 60, 120, 300, 900, 3600, 21600, 86400];
 export class PrometheusMetrics implements GatewayMetrics {
   private readonly requests = new Counter("ais_gateway_requests_total", "Proxied requests by outcome.");
   private readonly tokens = new Counter("ais_gateway_tokens_total", "Tokens used by proxied requests.");
+  private readonly toolCalls = new Counter("ais_gateway_tool_calls_total", "Tool calls the model made in answers, by provider and model.");
+  private readonly toolErrors = new Counter("ais_gateway_tool_errors_total", "Tool results flagged as errors in requests, by provider and model.");
+  private readonly ttfb = new Map<string, { l: Record<string, string>; h: Histogram }>();
+  private readonly metricModels = new Set<string>();
   private readonly refreshes = new Counter("ais_gateway_refresh_total", "Login refresh attempts by outcome.");
   private readonly usageReads = new Counter("ais_gateway_usage_reads_total", "Usage readings taken, by provider and source (upstream or the shared database row).");
   private readonly usageSharedErrors = new Counter("ais_gateway_usage_shared_errors_total", "Shared usage reading database calls that failed.");
@@ -244,12 +261,46 @@ export class PrometheusMetrics implements GatewayMetrics {
       this.tokens.inc({ ...base, kind: "cache_read" }, e.tokens.cacheReadTokens);
       this.tokens.inc({ ...base, kind: "cache_write" }, e.tokens.cacheWriteTokens);
     }
+    this.requestMeta(e);
     const s = e.latencyMs / 1000;
     this.durationCount += 1;
     this.durationSum += s;
     BUCKETS.forEach((b, i) => {
       if (s <= b) this.bucketCounts[i] = (this.bucketCounts[i] ?? 0) + 1;
     });
+  }
+
+  /** TTFB, tool calls and tool errors, labelled by provider and model only (no session, app, identity or tool name). */
+  private requestMeta(e: Parameters<GatewayMetrics["request"]>[0]): void {
+    if (e.ttfbMs === undefined && !e.toolCalls && !e.toolErrors) return;
+    const l = { provider: e.provider, model: this.modelLabel(e.model) };
+    if (e.toolCalls) this.toolCalls.inc(l, e.toolCalls);
+    if (e.toolErrors) this.toolErrors.inc(l, e.toolErrors);
+    if (e.ttfbMs !== undefined) {
+      const key = JSON.stringify(l);
+      let cur = this.ttfb.get(key);
+      if (!cur) {
+        cur = { l, h: new Histogram("ais_gateway_ttfb_seconds", "Time from request arrival to the first upstream body byte.", TTFB_BUCKETS, l) };
+        this.ttfb.set(key, cur);
+      }
+      cur.h.observe(e.ttfbMs / 1000);
+    }
+  }
+
+  private renderTtfb(): string[] {
+    const out = ["# HELP ais_gateway_ttfb_seconds Time from request arrival to the first upstream body byte.", "# TYPE ais_gateway_ttfb_seconds histogram"];
+    for (const { h } of this.ttfb.values()) out.push(...h.render(false));
+    return out;
+  }
+
+  /** A model name as a label: unknown is `-`, and past 64 distinct names every new one is `other`, so a client cannot grow the series. */
+  private modelLabel(model: string | undefined): string {
+    if (!model) return "-";
+    const m = model.slice(0, 80);
+    if (this.metricModels.has(m)) return m;
+    if (this.metricModels.size >= MAX_MODEL_LABELS) return "other";
+    this.metricModels.add(m);
+    return m;
   }
 
   authFailure(reason: "unknown-app" | "bad-token" | "auth-error", app?: string): void {
@@ -436,7 +487,8 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.poolHolds, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors, this.favourites, this.sessionsRequests, this.sessionsRecords, this.sessionsPartsTotal, this.sessionsBytes, this.sessionsErrors]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.usageReads, this.usageSharedErrors, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.deadGrants, this.rejections, this.poolHolds, this.failovers, this.failOpens, this.mediaRemovals, this.streamErrors, this.unreadable, this.browserCalls, this.browserMcpRequests, this.browserPairings, this.chatSessions, this.chatTurns, this.chatErrors, this.favourites, this.sessionsRequests, this.sessionsRecords, this.sessionsPartsTotal, this.sessionsBytes, this.sessionsErrors, this.toolCalls, this.toolErrors]) out.push(...c.render());
+    out.push(...this.renderTtfb());
     out.push(...this.sessionsSeconds.render(), ...this.sessionsLagSeconds.render());
     for (const g of [this.lastSuccess, this.loginExpiry, this.loginLifetime, this.loginRevokedGauge, this.poolHeadroomGauge, this.poolReadingsGauge]) out.push(...g.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
