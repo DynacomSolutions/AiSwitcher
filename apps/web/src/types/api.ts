@@ -1042,7 +1042,11 @@ export interface ResetLogWindow {
 
 export interface ResetLogRow {
   id: string;
+  /** When the attempt ended and the row was made. */
   at: string;
+  /** When the attempt started. Null for a row that has no start time. */
+  startedAt: string | null;
+
   provider: ResetLogProvider;
   trigger: ResetLogTrigger;
   actor: string;
@@ -1061,10 +1065,12 @@ export interface ResetLogRow {
 
 export interface ResetLogResponse {
   rows: ResetLogRow[];
-  /** The cursor for the next (older) page, or null on the last page. */
+  /** The opaque cursor for the next (older) page, or null on the last page. Send it back as `before`. */
   nextBefore: string | null;
   /** Every identity that has a log row, for the identity filter. */
   identities: string[];
+  /** False when no gateway admin is configured: the log is unavailable, not empty. Absent from an older console. */
+  configured?: boolean;
 }
 
 export interface ResetLogQuery {
@@ -1072,9 +1078,9 @@ export interface ResetLogQuery {
   provider?: ResetLogProvider;
   trigger?: ResetLogTrigger;
   outcome?: ResetLogOutcome;
-  /** YYYY-MM-DD */
+  /** First instant, ICT day start: `<date>T00:00:00+07:00`. */
   from?: string;
-  /** YYYY-MM-DD */
+  /** Last instant, ICT day end: `<date>T23:59:59.999+07:00`. */
   to?: string;
   limit?: number;
   before?: string;

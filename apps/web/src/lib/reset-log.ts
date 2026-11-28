@@ -45,6 +45,12 @@ export function isIsoDate(value: string): boolean {
   return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === value;
 }
 
+/**
+ * A date that a person has finished typing. A date field reports "0002-11-28" while the year "2026" is half typed,
+ * so a year below 1000 is still being typed.
+ */
+export const isCompleteDate = (value: string): boolean => isIsoDate(value) && value >= "1000-01-01";
+
 const oneOf = <T extends string>(allowed: readonly T[], value: string | null): T | "" => (value !== null && (allowed as readonly string[]).includes(value) ? (value as T) : "");
 
 /**
@@ -94,18 +100,30 @@ export function hasResetLogFilters(filters: ResetLogFilters): boolean {
   return RESET_LOG_FILTER_KEYS.some((key) => filters[key] !== "");
 }
 
-/** The request of one page of the log. `before` is the cursor of the page. */
+/** Bangkok time (ICT) is UTC+07:00. The date filters are ICT days, as the page shows every time in ICT first. */
+const ICT_OFFSET = "+07:00";
+
+/** The first instant of an ICT day. */
+export const ictDayStart = (date: string): string => `${date}T00:00:00${ICT_OFFSET}`;
+
+/** The last millisecond of an ICT day. The gateway reads an inclusive date-time end. */
+export const ictDayEnd = (date: string): string => `${date}T23:59:59.999${ICT_OFFSET}`;
+
+/** The request of one page of the log. `before` is the opaque cursor of the page. */
 export function resetLogRequest(filters: ResetLogFilters, before?: string, limit: number = RESET_LOG_PAGE_SIZE): ResetLogQuery {
   const query: ResetLogQuery = { limit };
   if (filters.identity) query.identity = filters.identity;
   if (filters.provider) query.provider = filters.provider;
   if (filters.trigger) query.trigger = filters.trigger;
   if (filters.outcome) query.outcome = filters.outcome;
-  if (filters.from) query.from = filters.from;
-  if (filters.to) query.to = filters.to;
+  if (filters.from) query.from = ictDayStart(filters.from);
+  if (filters.to) query.to = ictDayEnd(filters.to);
   if (before) query.before = before;
   return query;
 }
+
+/** The poll interval of the log: the first page only. A refetch asks for every loaded page, so the poll stops once an older page is open. */
+export const resetLogPollMs = (loadedPages: number, interval: number): number | false => (loadedPages > 1 ? false : interval);
 
 /** The link of the Limits page to the log of one identity. */
 export function resetLogPath(identity?: string): string {

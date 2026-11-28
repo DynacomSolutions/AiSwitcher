@@ -31,7 +31,7 @@ const scratchRoot = process.env.AIS_WEB_E2E_SCRATCH ?? tmpdir();
 
 const ROUTES = [
   "/", "/identities", "/local-models", "/local-models/example", "/limits", "/usage", "/usage/gateway", "/gateway", "/usage/models", "/usage/sources", "/usage/projects", "/usage/repos", "/usage/orgs", "/dashboard/herdr", "/dashboard/processes", "/breakdown", "/breakdown/consumers",
-  "/sessions", "/auth", "/browsers", "/permissions", "/files", "/no-such-page",
+  "/sessions", "/auth", "/browsers", "/permissions", "/files", "/logs/resets", "/no-such-page",
 ];
 const VIEWPORTS = [{ width: 360, height: 740 }, { width: 390, height: 844 }];
 const LONG = "VeryLongUnbrokenTokenVeryLongUnbrokenTokenVeryLongUnbrokenTokenVeryLong";
@@ -872,7 +872,7 @@ for (const vp of VIEWPORTS) {
 
       await page.eval(`${q(button)}.click()`);
       await waitFor("nav dialog", 5_000, () => page.eval<boolean>(`!!${q('[role=dialog] nav[aria-label=Main]')}`));
-      expect(await page.eval<number>(`document.querySelectorAll('[role=dialog] nav a').length`)).toBe(12);
+      expect(await page.eval<number>(`document.querySelectorAll('[role=dialog] nav a').length`)).toBe(13);
       expect(await page.eval<string>(`${q(button)}.getAttribute('aria-expanded')`)).toBe("true");
 
       await page.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });

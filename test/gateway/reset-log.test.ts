@@ -82,6 +82,16 @@ describe("query", () => {
     });
   });
 
+  test("ICT day bounds from the web page: the first and last instants of the day belong to it", () => {
+    const filters = parse({ from: "2026-11-28T00:00:00+07:00", to: "2026-11-28T23:59:59.999+07:00" });
+    expect(filters).toEqual({ from: "2026-11-27T17:00:00.000Z", toExclusive: "2026-11-28T17:00:00.000Z" });
+    const inDay = (at: string) => typeof filters !== "string" && Date.parse(at) >= Date.parse(filters.from!) && Date.parse(at) < Date.parse(filters.toExclusive!);
+    expect(inDay("2026-11-27T16:59:59.999Z")).toBe(false);
+    expect(inDay("2026-11-27T17:00:00.000Z")).toBe(true);
+    expect(inDay("2026-11-28T16:59:59.999Z")).toBe(true);
+    expect(inDay("2026-11-28T17:00:00.000Z")).toBe(false);
+  });
+
   test("names the first bad value", () => {
     for (const [query, text] of [
       [{ provider: "kimi" }, "provider"], [{ trigger: "x" }, "trigger"], [{ outcome: "x" }, "outcome"], [{ from: "yesterday" }, "from"],

@@ -12,7 +12,6 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
-import { tmpdir } from "node:os";
 import { Cdp, type Session } from "../../chrome-extension/test/e2e/cdp.ts";
 import type { LimitsResponse, ResetLogResponse, ResetLogRow, ResetLogWindow, ToolLimitResult } from "../src/types/api.ts";
 
@@ -21,7 +20,8 @@ const distDir = process.env.AIS_WEB_DIST ?? join(repoRoot, "apps/web/dist");
 const chromium = process.env.AIS_E2E_CHROMIUM
   ?? ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/local/bin/chromium"].find(p => existsSync(p));
 const evidence = process.env.AIS_E2E_EVIDENCE;
-const scratchRoot = process.env.AIS_WEB_E2E_SCRATCH ?? tmpdir();
+// The run folder never defaults to the system temp folder: set AIS_WEB_E2E_SCRATCH, or it goes in the web cache folder (removed with node_modules).
+const scratchRoot = process.env.AIS_WEB_E2E_SCRATCH ?? join(repoRoot, "apps/web/node_modules/.cache/ais-web-e2e");
 
 const NOW = Date.now();
 const iso = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
@@ -34,11 +34,15 @@ const B = "SYNTHETIC_FIXTURE-member-b";
 const C = "SYNTHETIC_FIXTURE-codex-a";
 const UNUSED = "SYNTHETIC_FIXTURE-never-reset";
 const BOOM = "SYNTHETIC_FIXTURE-boom";
+const NO_ADMIN = "SYNTHETIC_FIXTURE-no-admin";
+/** The query text of an ICT day bound, as the page sends it. */
+const ictFrom = (date: string) => encodeURIComponent(`${date}T00:00:00+07:00`);
+const ictTo = (date: string) => encodeURIComponent(`${date}T23:59:59.999+07:00`);
 
 const win = (key: string, percent: number, resetsAt: string | null, label: string | null = null): ResetLogWindow => ({ key, label, percent, resetsAt });
 const row = (id: number, over: Partial<ResetLogRow>): ResetLogRow => ({
   id: `SYNTHETIC_FIXTURE-row-${id}`, at: iso(-id * H), provider: "claude", trigger: "manual", actor: "console", identity: A, account: null, pool: null, grantId: null,
-  before: [], outcome: "reset", message: null, resetsLeftAfter: null, after: null, afterAt: null, ...over,
+  startedAt: null, before: [], outcome: "reset", message: null, resetsLeftAfter: null, after: null, afterAt: null, ...over,
 });
 /** Newest first. The first page holds three rows, so "Load more" has two more pages to fetch. */
 const ROWS: ResetLogRow[] = [
@@ -50,7 +54,9 @@ const ROWS: ResetLogRow[] = [
   row(6, { at: iso(-3 * D), trigger: "auto", actor: "auto-reset daemon", identity: B, before: [win("five_hour", 100, iso(H))], outcome: "already_redeemed" }),
   row(7, { at: iso(-10 * D), before: [win("weekly", 97, iso(D), "week (all)")], resetsLeftAfter: 1, after: [win("weekly", 2, iso(7 * D), "week (all)")], afterAt: iso(-10 * D + H) }),
 ];
-const IDENTITIES = [A, B, C];
+// An identity may be named like the "no filter" menu item of an older page: "all".
+const NAMED_ALL = "all";
+const IDENTITIES = [A, B, C, NAMED_ALL];
 
 const LIMIT_ROW = (identity: string): ToolLimitResult => ({
   toolName: "claude", provider: "anthropic", identity: { name: identity, label: identity, configDir: "synthetic" },
@@ -61,14 +67,15 @@ const LIMITS: LimitsResponse = { results: [LIMIT_ROW(A), LIMIT_ROW(B)], cached: 
 /** The answer of the stub API to one log request: the filters of the contract, the cursor, and a page size cap. */
 function answer(params: URLSearchParams): { status: number; body: unknown } {
   if (params.get("identity") === BOOM) return { status: 500, body: { error: "SYNTHETIC_FIXTURE the log store is down" } };
-  const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  if (params.get("identity") === NO_ADMIN) return { status: 200, body: { rows: [], nextBefore: null, identities: [], configured: false } satisfies ResetLogResponse };
   const matches = ROWS.filter((r) =>
     (!params.get("identity") || r.identity === params.get("identity"))
     && (!params.get("provider") || r.provider === params.get("provider"))
     && (!params.get("trigger") || r.trigger === params.get("trigger"))
     && (!params.get("outcome") || r.outcome === params.get("outcome"))
-    && (!params.get("from") || day(Date.parse(r.at)) >= params.get("from")!)
-    && (!params.get("to") || day(Date.parse(r.at)) <= params.get("to")!));
+    // The page sends ICT day bounds as date-times with an offset. Both bounds are inclusive.
+    && (!params.get("from") || Date.parse(r.at) >= Date.parse(params.get("from")!))
+    && (!params.get("to") || Date.parse(r.at) <= Date.parse(params.get("to")!)));
   const before = params.get("before");
   const start = before ? matches.findIndex((r) => r.id === before) + 1 : 0;
   const limit = Math.min(Number(params.get("limit") ?? PAGE_CAP), PAGE_CAP);
@@ -176,7 +183,8 @@ beforeAll(async () => {
   base = `http://127.0.0.1:${server.port}`;
   await mkdir(scratchRoot, { recursive: true });
   runDir = await mkdtemp(join(scratchRoot, "ais-web-reset-log-e2e-"));
-  shortTmp = await mkdtemp(join(existsSync("/dev/shm") ? "/dev/shm" : tmpdir(), "ais-rl-"));
+  // The short folder is in RAM when there is one, else beside the run folder. It never falls back to the system temp folder.
+  shortTmp = await mkdtemp(join(existsSync("/dev/shm") ? "/dev/shm" : scratchRoot, "ais-rl-"));
   chrome = Bun.spawn([
     chromium, "--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
     `--user-data-dir=${join(runDir, "profile")}`, "--remote-debugging-port=0", "about:blank",
@@ -256,8 +264,8 @@ describe("Reset log page", () => {
     await choose("Provider", "Codex");
     await choose("Trigger", "Manual");
     await waitFor("every key", 5_000, async () => (await search()) === `?identity=${C}&provider=codex&trigger=manual&outcome=rejected`);
-    await setDate("From date", iso(-3 * D).slice(0, 10));
-    await setDate("To date", iso(0).slice(0, 10));
+    await setDate("From date (ICT)", iso(-3 * D).slice(0, 10));
+    await setDate("To date (ICT)", iso(0).slice(0, 10));
     await waitFor("the date URL", 5_000, async () => (await search()).includes("&from=") && (await search()).includes("&to="));
     expect(await historyLength()).toBe(before);
     expect(requests.at(-1)).toContain("&from=");
@@ -274,14 +282,14 @@ describe("Reset log page", () => {
   test("the URL alone rebuilds the view: the controls show the filters and the request uses them", async () => {
     const query = `?identity=${A}&provider=claude&trigger=manual&outcome=reset&from=2026-01-01&to=2099-12-31`;
     await open(`/logs/resets${query}`, 2);
-    expect(requests).toEqual([`?identity=${A}&provider=claude&trigger=manual&outcome=reset&from=2026-01-01&to=2099-12-31&limit=50`]);
+    expect(requests).toEqual([`?identity=${A}&provider=claude&trigger=manual&outcome=reset&from=${ictFrom("2026-01-01")}&to=${ictTo("2099-12-31")}&limit=50`]);
     expect(await search()).toBe(query);
     expect(await selectText("Identity")).toBe(A);
     expect(await selectText("Provider")).toBe("Claude");
     expect(await selectText("Trigger")).toBe("Manual");
     expect(await selectText("Outcome")).toBe("Reset");
-    expect(await page.eval<string>(`document.querySelector('input[aria-label="From date"]').value`)).toBe("2026-01-01");
-    expect(await page.eval<string>(`document.querySelector('input[aria-label="To date"]').value`)).toBe("2099-12-31");
+    expect(await page.eval<string>(`document.querySelector('input[aria-label="From date (ICT)"]').value`)).toBe("2026-01-01");
+    expect(await page.eval<string>(`document.querySelector('input[aria-label="To date (ICT)"]').value`)).toBe("2099-12-31");
     expect(await rowIds()).toEqual(["1", "7"]);
     await shot("reset-log-2-filtered.png");
   }, 60_000);
@@ -334,6 +342,52 @@ describe("Reset log page", () => {
     expect(await rowIds()).toEqual([]);
     expect(await mainText()).not.toMatch(/\b0 resets/);
     await shot("reset-log-3-empty.png", false);
+  }, 60_000);
+
+  test("an identity named all is a real filter, and the menu item for every identity still clears it", async () => {
+    await open(`/logs/resets?identity=${NAMED_ALL}`, null);
+    await waitFor("the request for that identity", 10_000, async () => requests.at(-1) === `?identity=${NAMED_ALL}&limit=50`);
+    expect(await selectText("Identity")).toBe(NAMED_ALL);
+    await choose("Identity", "All identities");
+    await waitFor("a plain URL", 5_000, async () => (await search()) === "");
+    await waitFor("every row again", 10_000, async () => (await rowIds()).length === 3);
+    await choose("Identity", NAMED_ALL);
+    await waitFor("the identity URL", 5_000, async () => (await search()) === `?identity=${NAMED_ALL}`);
+  }, 60_000);
+
+  test("a half-written date does not touch the URL or the request, and a whole date does", async () => {
+    await open("/logs/resets", 3);
+    const before = await historyLength();
+    const asked = requests.length;
+    // A click on the left end of the field lands in its first part (the month).
+    const box = await page.eval<{ x: number; y: number }>(`(() => { const r = document.querySelector('input[aria-label="From date (ICT)"]').getBoundingClientRect(); return { x: r.x + 14, y: r.y + r.height / 2 }; })()`);
+    await page.send("Input.dispatchMouseEvent", { type: "mousePressed", x: box.x, y: box.y, button: "left", clickCount: 1 });
+    await page.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: box.x, y: box.y, button: "left", clickCount: 1 });
+    const type = async (text: string) => {
+      for (const ch of text) {
+        await page.send("Input.dispatchKeyEvent", { type: "keyDown", key: ch, code: `Digit${ch}`, text: ch, windowsVirtualKeyCode: 48 + Number(ch) });
+        await page.send("Input.dispatchKeyEvent", { type: "keyUp", key: ch, code: `Digit${ch}`, windowsVirtualKeyCode: 48 + Number(ch) });
+      }
+    };
+    await type("11");
+    await sleep(500);
+    expect(await search()).toBe("");
+    expect(requests.length).toBe(asked);
+    await type("282026");
+    await waitFor("the date URL", 5_000, async () => (await search()) === "?from=2026-11-28");
+    await waitFor("the request", 5_000, async () => requests.at(-1)?.includes(`from=${ictFrom("2026-11-28")}`) === true);
+    expect(await historyLength()).toBe(before);
+    expect(await page.eval<string>(`document.querySelector('input[aria-label="From date (ICT)"]').value`)).toBe("2026-11-28");
+    // The visible labels name the zone.
+    expect(await mainText()).toContain("From (ICT)");
+    expect(await mainText()).toContain("To (ICT)");
+  }, 60_000);
+
+  test("with no gateway admin the page says that the log is unavailable, not that it is empty", async () => {
+    await open(`/logs/resets?identity=${NO_ADMIN}`, null);
+    await waitFor("the notice", 10_000, async () => (await mainText()).includes("Reset log unavailable: no gateway admin configured"));
+    expect(await mainText()).not.toContain("No resets");
+    expect(await rowIds()).toEqual([]);
   }, 60_000);
 
   test("a failed request shows the error and no row", async () => {

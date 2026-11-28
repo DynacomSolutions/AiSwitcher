@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Navigate, useLocation, useSearchParams } from "react-router-dom";
 
 import { ToolBadge } from "@/components/badges";
@@ -13,6 +13,7 @@ import { relTime } from "@/lib/format";
 import {
   afterView,
   hasResetLogFilters,
+  isCompleteDate,
   isoMs,
   needsCanonicalSearch,
   percentText,
@@ -34,7 +35,8 @@ import { formatResetTimes } from "@/lib/reset-time";
 import { cn } from "@/lib/utils";
 import type { ResetLogRow, ResetLogWindow } from "@/types/api";
 
-const ALL = "all";
+// An identity may be named "all", so the "no filter" item uses a value that no identity name can have.
+const ALL = "__all__";
 
 /** `/logs` is not a page of its own: it opens the reset log and keeps the query string. */
 export function LogsIndexRedirect() {
@@ -177,6 +179,36 @@ function FilterSelect<T extends string>({
   );
 }
 
+/**
+ * A date filter. The address changes only for a whole valid date, or when the field is emptied on purpose.
+ * While the user types, a half-written date stays in the field and the address and the query keep the last good value.
+ * Leaving the field drops a half-written date.
+ */
+function DateFilter({ label, value, min, max, onCommit }: { label: string; value: string; min?: string | undefined; max?: string | undefined; onCommit: (value: string) => void }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  return (
+    <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+      {label} (ICT)
+      <Input
+        type="date"
+        value={draft ?? value}
+        min={min}
+        max={max}
+        aria-label={`${label} date (ICT)`}
+        className="h-8 w-36 text-xs"
+        onChange={(e) => {
+          const next = e.target.value;
+          if (isCompleteDate(next) || (next === "" && !e.target.validity.badInput)) {
+            setDraft(null);
+            onCommit(next);
+          } else setDraft(next);
+        }}
+        onBlur={() => setDraft(null)}
+      />
+    </label>
+  );
+}
+
 function ResetLog({ filters }: { filters: ResetLogFilters }) {
   const [params, setParams] = useSearchParams();
   const query = useResetLogQuery(filters);
@@ -199,6 +231,8 @@ function ResetLog({ filters }: { filters: ResetLogFilters }) {
   const loading = query.isPending;
   const stale = query.isPlaceholderData;
   const failedFirst = query.isError && !query.data;
+  // No gateway admin: the log is unavailable. That is not the same as an empty log.
+  const unavailable = query.data?.pages[0]?.configured === false;
 
   return (
     <div className="space-y-5">
@@ -241,14 +275,8 @@ function ResetLog({ filters }: { filters: ResetLogFilters }) {
           onChange={(v) => setFilter("outcome", v)}
           width="w-44"
         />
-        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          From
-          <Input type="date" value={filters.from} max={filters.to || undefined} onChange={(e) => setFilter("from", e.target.value)} aria-label="From date" className="h-8 w-36 text-xs" />
-        </label>
-        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          To
-          <Input type="date" value={filters.to} min={filters.from || undefined} onChange={(e) => setFilter("to", e.target.value)} aria-label="To date" className="h-8 w-36 text-xs" />
-        </label>
+        <DateFilter label="From" value={filters.from} max={filters.to || undefined} onCommit={(v) => setFilter("from", v)} />
+        <DateFilter label="To" value={filters.to} min={filters.from || undefined} onCommit={(v) => setFilter("to", v)} />
         {filtered ? (
           <Button variant="outline" size="sm" onClick={() => setParams(new URLSearchParams(), { replace: true })}>
             Clear filters
@@ -261,7 +289,9 @@ function ResetLog({ filters }: { filters: ResetLogFilters }) {
 
       {loading ? (
         <div className="h-64 animate-pulse rounded-xl bg-muted" />
-      ) : failedFirst ? null : rows.length === 0 ? (
+      ) : failedFirst ? null : unavailable ? (
+        <EmptyState title="Reset log unavailable: no gateway admin configured" description="The reset log lives in the gateway. Configure a gateway admin for the console to read it." />
+      ) : rows.length === 0 ? (
         filtered ? (
           <EmptyState title="No resets match these filters" description="Change or clear the filters to see more of the log." />
         ) : (

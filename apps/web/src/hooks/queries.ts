@@ -2,7 +2,7 @@ import { keepPreviousData, useInfiniteQuery, useQuery, useQueryClient } from "@t
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { adjustRefreshCounts, applyRefreshedLimits, isIdentityRefreshing, limitsRefetchInterval, POLL, reconcileLimits } from "@/lib/limits-reconciliation";
-import { resetLogRequest, type ResetLogFilters } from "@/lib/reset-log";
+import { resetLogPollMs, resetLogRequest, type ResetLogFilters } from "@/lib/reset-log";
 import type { LimitsResponse, LoginFlowStatus, ResetLogResponse } from "@/types/api";
 
 export { POLL, reconcileLimits, limitsRefetchInterval } from "@/lib/limits-reconciliation";
@@ -324,9 +324,10 @@ export function useResetLogQuery(filters: ResetLogFilters) {
     queryFn: ({ pageParam, signal }) => api.getResetLog(resetLogRequest(filters, pageParam), signal),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last: ResetLogResponse) => last.nextBefore ?? undefined,
-    // A log must not show an old copy: ask again on mount, and every minute while the page is open.
+    // A log must not show an old copy: ask again on mount. The poll refreshes the first page only: a refetch of an
+    // infinite query asks for every loaded page, one after the other, so the poll stops once "Load more" opened an older page.
     staleTime: 0,
-    refetchInterval: POLL.slow,
+    refetchInterval: (query) => resetLogPollMs(query.state.data?.pages.length ?? 0, POLL.slow),
     placeholderData: keepPreviousData,
   });
 }

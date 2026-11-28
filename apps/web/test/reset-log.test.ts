@@ -3,11 +3,13 @@ import {
   afterView,
   EMPTY_RESET_LOG_FILTERS,
   hasResetLogFilters,
+  isCompleteDate,
   isIsoDate,
   needsCanonicalSearch,
   percentText,
   readResetLogFilters,
   resetLogPath,
+  resetLogPollMs,
   resetLogRequest,
   resetLogSearch,
   windowName,
@@ -29,7 +31,33 @@ describe("reset log filters in the URL", () => {
     expect(filters).toEqual({ identity: "SYNTHETIC_FIXTURE-member-a", provider: "claude", trigger: "auto", outcome: "error", from: "2026-11-01", to: "2026-11-28" });
     expect(resetLogSearch(filters).toString()).toBe(search);
     expect(needsCanonicalSearch(url(search))).toBe(false);
-    expect(resetLogRequest(filters)).toEqual({ limit: 50, identity: "SYNTHETIC_FIXTURE-member-a", provider: "claude", trigger: "auto", outcome: "error", from: "2026-11-01", to: "2026-11-28" });
+    expect(resetLogRequest(filters)).toEqual({ limit: 50, identity: "SYNTHETIC_FIXTURE-member-a", provider: "claude", trigger: "auto", outcome: "error", from: "2026-11-01T00:00:00+07:00", to: "2026-11-28T23:59:59.999+07:00" });
+  });
+
+  test("the date filters are ICT days: a boundary instant falls on the right day", () => {
+    const query = resetLogRequest({ ...EMPTY_RESET_LOG_FILTERS, from: "2026-11-28", to: "2026-11-28" });
+    // 2026-11-28 00:00 ICT is 2026-11-27 17:00 UTC. The day ends one millisecond before the next ICT midnight.
+    expect(query.from).toBe("2026-11-28T00:00:00+07:00");
+    expect(Date.parse(query.from!)).toBe(Date.parse("2026-11-27T17:00:00.000Z"));
+    expect(Date.parse(query.to!)).toBe(Date.parse("2026-11-28T16:59:59.999Z"));
+    expect(Date.parse(query.to!) + 1).toBe(Date.parse("2026-11-28T17:00:00.000Z"));
+    // The URL keeps the plain date.
+    expect(resetLogSearch({ ...EMPTY_RESET_LOG_FILTERS, from: "2026-11-28" }).toString()).toBe("from=2026-11-28");
+  });
+
+  test("a date still being typed is not complete", () => {
+    // A date field reports a year such as 0002 while "2026" is half typed.
+    expect(isCompleteDate("0002-11-28")).toBe(false);
+    expect(isCompleteDate("0202-11-28")).toBe(false);
+    expect(isCompleteDate("2026-11-28")).toBe(true);
+    expect(isCompleteDate("2026-02-30")).toBe(false);
+    expect(isCompleteDate("")).toBe(false);
+  });
+
+  test("the poll covers the first page only", () => {
+    expect(resetLogPollMs(0, 60_000)).toBe(60_000);
+    expect(resetLogPollMs(1, 60_000)).toBe(60_000);
+    expect(resetLogPollMs(2, 60_000)).toBe(false);
   });
 
   test("an invalid or unknown value is dropped, and the address is corrected", () => {
