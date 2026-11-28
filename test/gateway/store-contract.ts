@@ -212,7 +212,7 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     const got = await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"));
     expect(got).toEqual([
       { sessionKey: sid, provider: "codex", app: "a", client: "claude-cli", identity: "m1", turns: 2, inputTokens: 13, outputTokens: 24, cacheReadTokens: 5, cacheWriteTokens: 0, estCostUsd: 0.75, unpricedRequests: 0, failedRequests: 1, toolCalls: 3, toolErrors: 1, models: ["ma", "mb"], firstTs: "2026-11-02T01:00:00.000Z", lastTs: "2026-11-02T02:00:00.000Z" },
-      { sessionKey: sid, provider: "codex", app: "a", client: null, identity: "m2", turns: 1, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 2, estCostUsd: 0, unpricedRequests: 1, failedRequests: 0, toolCalls: 0, toolErrors: 0, models: [], firstTs: "2026-11-02T03:00:00.000Z", lastTs: "2026-11-02T03:00:00.000Z" },
+      { sessionKey: sid, provider: "codex", app: "a", client: null, identity: "m2", turns: 1, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 2, estCostUsd: 0, unpricedRequests: 1, failedRequests: 1, toolCalls: 0, toolErrors: 0, models: [], firstTs: "2026-11-02T03:00:00.000Z", lastTs: "2026-11-02T03:00:00.000Z" },
     ]);
     expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), new Date("2026-11-02T02:00:00.000Z"))).toHaveLength(1);
     expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { sessionKeys: ["other-session-id"] })).toEqual([]);
