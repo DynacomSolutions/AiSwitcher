@@ -2845,6 +2845,26 @@ describe("ledger metadata: TTFB, stop reason and tool calls", () => {
     expect(r[0]).toMatchObject({ stopReason: "tool_calls", toolCalls: 1, toolNames: ["lookup"] });
   });
 
+  test("a failed or refused request does not count its tool errors, and an error body has no tool metadata", async () => {
+    const t = await addApp(baseApp({}));
+    const request = JSON.stringify({ model: "claude-sonnet-4-5", messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_0", is_error: true, content: "x" }] }] });
+    handler = () => new Response('{"type":"error","error":{"type":"overloaded_error","message":"busy"}}', { status: 529, headers: { "content-type": "application/json" } });
+    await call("/pin/v1/messages", t, { method: "POST", body: request });
+    const failed = (await rows())[0]!;
+    expect(failed.status).toBe("upstream_error");
+    expect(failed.toolErrors).toBeUndefined();
+    expect(failed.toolCalls).toBeUndefined();
+    expect(failed.stopReason).toBeUndefined();
+  });
+
+  test("count_tokens requests do not count tool errors", async () => {
+    const t = await addApp(baseApp({}));
+    handler = () => new Response('{"input_tokens":5}', { headers: { "content-type": "application/json" } });
+    const request = JSON.stringify({ model: "claude-sonnet-4-5", messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_0", is_error: true, content: "x" }] }] });
+    await call("/pin/v1/messages/count_tokens", t, { method: "POST", body: request });
+    expect((await rows())[0]!.toolErrors).toBeUndefined();
+  });
+
   test("a rejected request records no response metadata", async () => {
     const t = await addApp(baseApp({ models: ["claude-sonnet-4-5"] }));
     await call("/pin/v1/messages", t, { method: "POST", body: JSON.stringify({ model: "other-model", messages: [{ role: "user", content: "hi" }] }) });

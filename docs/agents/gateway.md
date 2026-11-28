@@ -1319,17 +1319,20 @@ adds five nullable columns to `gateway_usage` with no index (the same reason as 
 |---|---|
 | `ttfb_ms` (`ttfbMs`) | Milliseconds from the request's arrival to the first non-empty upstream body byte, as one number with `latency_ms`. Set in the response pump with one `undefined` check per chunk. Null when no body byte arrived (rejections, upstream failures). |
 | `stop_reason` (`stopReason`) | Anthropic `stop_reason` (body, or `message_delta.delta`). Chat Completions `finish_reason`. Responses and Codex: the terminal `status` (`completed`, `incomplete`, `failed`, `cancelled`), or the `incomplete_details.reason` when `incomplete`. At most 64 characters, control characters removed. |
-| `tool_calls` (`toolCalls`) | Tool calls in the answer. 0 when the answer was read and held none; null when no answer was read. Anthropic `tool_use`, `server_tool_use`, `mcp_tool_use` blocks. Responses items whose type ends in `_call` (`function_call`, `custom_tool_call`, `web_search_call`, ...), counted once by item id, call id or output index across `output_item.added`, `.done` and the final `output`. Chat Completions `tool_calls`, once per choice and call index. |
+| `tool_calls` (`toolCalls`) | Tool calls in the answer. 0 when the answer was read whole and held none; null when no answer was read, or when it was an error body (HTTP 400 and above), too large or not parseable. Anthropic `tool_use`, `server_tool_use`, `mcp_tool_use` blocks. Responses items whose type ends in `_call` (`function_call`, `custom_tool_call`, `web_search_call`, ...), counted once by item id, call id or output index across `output_item.added`, `.done` and the final `output`. Chat Completions `tool_calls`, once per choice and call index. |
 | `tool_names` (`toolNames`) | JSON array (stored as text, read with `tool_names::jsonb`) of the distinct tool names: at most 32 names, each at most 64 characters. `tool_calls` stays exact when the list is full. |
-| `tool_errors` (`toolErrors`) | `tool_result` blocks with `is_error: true` in the LAST message of the request. Anthropic-style apps only (`claude`, `ali`, Kimi and Z.AI in Anthropic style); null elsewhere because OpenAI bodies carry no such flag. Only the last message counts, because older messages repeat on every turn. |
+| `tool_errors` (`toolErrors`) | `tool_result` blocks with `is_error: true` in the LAST message of the request. Anthropic-style apps only (`claude`, `ali`, Kimi and Z.AI in Anthropic style); null elsewhere because OpenAI bodies carry no such flag. Only the last message counts, because older messages repeat on every turn. Only `status = ok` rows on a `…/messages` path carry it (not `count_tokens`), because a client resends the same body after a refusal or a failure. |
 
 - Response fields come from `UsageTap.meta()` (`src/gateway/usage.ts`). The tap reads the same events it already parses
   for usage, so the streaming path stays pass-through and adds no per-chunk work beyond the existing tap. The request
-  scan is `countToolErrors()` in `src/gateway/request-meta.ts`. It parses the body only when its bytes contain
-  `is_error` and the body is at most 16 MiB; a body without the marker costs one byte search.
+  scan is `countToolErrors()` in `src/gateway/request-meta.ts`. It walks the bytes to the last element of `messages`
+  (no objects built, like `scanModel`) and parses only that element, and only when it contains `is_error`. A long
+  session costs a byte walk, never a parse of its whole history. Bodies over 16 MiB are not read.
 - Metrics (`metrics.ts`), labelled by `provider` and `model` only, never by app, identity, session or tool name:
   `ais_gateway_ttfb_seconds` (histogram), `ais_gateway_tool_calls_total` and `ais_gateway_tool_errors_total`. The model
-  label holds at most 64 distinct names per process; later names count as `other`. An unknown model is `-`.
+  label holds at most 64 distinct names per process; later names count as `other`. An unknown model is `-`. Only
+  `status = ok` requests feed these metrics (the ledger row keeps the values of every request), so error bodies and
+  client retries do not skew them or use up model labels.
 - Do not add a content field here, and do not add a per-session or per-tool-name metric label (cardinality and privacy).
 
 ## Session store enrichment (`src/gateway/sessions/enrich*.ts`)

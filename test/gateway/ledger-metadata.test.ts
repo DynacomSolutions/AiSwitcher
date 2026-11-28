@@ -111,6 +111,26 @@ describe("openai chat completions metadata", () => {
   });
 });
 
+describe("repeated blocks", () => {
+  test("an anthropic tool_use block repeated in a final message counts once", () => {
+    const block = { type: "tool_use", id: "toolu_1", name: "Read", input: {} };
+    const body = sse([
+      ["content_block_start", { type: "content_block_start", index: 0, content_block: block }],
+      ["message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" } }],
+      [null, { type: "message", content: [block], stop_reason: "tool_use" }],
+    ]);
+    expect(meta("anthropic", "text/event-stream", body).toolCalls).toBe(1);
+  });
+
+  test("chat deltas without an index are told apart by call id", () => {
+    const body = sse([
+      [null, { choices: [{ index: 0, delta: { tool_calls: [{ id: "call_a", function: { name: "one" } }] } }] }],
+      [null, { choices: [{ index: 0, delta: { tool_calls: [{ id: "call_b", function: { name: "two" } }] } }] }],
+    ]);
+    expect(meta("openai-chat", "text/event-stream", body)).toMatchObject({ toolCalls: 2, toolNames: ["one", "two"] });
+  });
+});
+
 describe("bounds", () => {
   test("names are distinct, at most 32, each at most 64 characters; the count stays exact", () => {
     const content = Array.from({ length: 50 }, (_, i) => ({ type: "tool_use", id: `t${i}`, name: `tool_${i}_${"x".repeat(100)}` }));
@@ -161,6 +181,26 @@ describe("request tool errors", () => {
 
   test("text that only looks like a flag does not count", () => {
     expect(countToolErrors(body([{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: '"is_error":true' }] }]))).toBe(0);
+  });
+
+  test("a long history that mentions is_error is walked by bytes, and only the last message is parsed", () => {
+    const filler = "x".repeat(1024 * 1024);
+    const history = Array.from({ length: 5 }, () => [{ role: "user", content: [result(true, filler)] }, { role: "assistant", content: [{ type: "text", text: filler }] }]).flat();
+    const plain = body([...history, { role: "user", content: [result(false)] }]);
+    const started = performance.now();
+    expect(countToolErrors(plain)).toBe(0);
+    expect(performance.now() - started).toBeLessThan(150);
+    expect(countToolErrors(body([...history, { role: "user", content: [result(true), result(true)] }]))).toBe(2);
+  });
+
+  test("the scan follows JSON rules: strings holding braces or a fake messages key, key order, duplicate keys", () => {
+    const system = JSON.stringify('has "messages": [ {"is_error":true} ] and }{');
+    const tricky = `{"system":${system},"messages":[{"role":"user","content":"a ] , b"},{"role":"user","content":[{"type":"tool_result","is_error":true,"content":"} ] ,"}]}],"max_tokens":1}`;
+    expect(countToolErrors(enc.encode(tricky))).toBe(1);
+    const first = '{"messages":[{"role":"user","content":[{"type":"tool_result","is_error":true}]}],"model":"m","messages":[{"role":"user","content":"hi"}]}';
+    expect(countToolErrors(enc.encode(first))).toBe(0);
+    expect(countToolErrors(enc.encode('{"messages":[],"model":"m"}'))).toBe(0);
+    expect(countToolErrors(enc.encode('{ "model" : "m" , "messages" : [ { "role" : "user" , "content" : [ { "type" : "tool_result" , "is_error" : true } ] } ] }'))).toBe(1);
   });
 
   test("a body that is not a Messages request is unknown", () => {

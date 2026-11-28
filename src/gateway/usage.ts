@@ -414,13 +414,16 @@ export class UsageTap {
   private noteAnthropicMeta(root: Obj, msg: Obj): void {
     this.noteStop(msg.stop_reason);
     if (isObj(root.delta)) this.noteStop(root.delta.stop_reason);
-    if (root.type === "content_block_start") this.noteAnthropicBlock(root.content_block);
-    if (Array.isArray(msg.content)) for (const b of msg.content) this.noteAnthropicBlock(b);
+    if (root.type === "content_block_start") this.noteAnthropicBlock(root.content_block, num(root.index));
+    if (Array.isArray(msg.content)) for (const b of msg.content) this.noteAnthropicBlock(b, undefined);
   }
 
-  private noteAnthropicBlock(b: unknown): void {
+  /** A block is counted once by its id (or, in a stream without one, by its index), so a compat upstream that repeats it in a final message adds no second call. */
+  private noteAnthropicBlock(b: unknown, index: number | undefined): void {
     if (!isObj(b)) return;
-    if (b.type === "tool_use" || b.type === "server_tool_use" || b.type === "mcp_tool_use") this.noteTool(b.name);
+    if (b.type !== "tool_use" && b.type !== "server_tool_use" && b.type !== "mcp_tool_use") return;
+    const id = text(b.id);
+    this.noteTool(b.name, id !== undefined ? `a:${id}` : index !== undefined ? `a:#${index}` : undefined);
   }
 
   /**
@@ -457,7 +460,10 @@ export class UsageTap {
       const choiceIndex = num(choice.index) ?? ci;
       m.tool_calls.forEach((tc, j) => {
         if (!isObj(tc)) return;
-        this.noteTool(isObj(tc.function) ? tc.function.name : undefined, `c:${choiceIndex}:${num(tc.index) ?? j}`);
+        // Some compatible providers leave out `index`: their calls are told apart by id, then by position.
+        const at = num(tc.index);
+        const id = text(tc.id);
+        this.noteTool(isObj(tc.function) ? tc.function.name : undefined, `c:${choiceIndex}:${at !== undefined ? at : id !== undefined ? `id:${id}` : j}`);
       });
     });
   }
