@@ -233,6 +233,23 @@ async function discard(res: Response): Promise<void> {
 
 const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
+/**
+ * Throws when the client has left. No POST is on the wire yet at these points (or the only one got a 401 and reset nothing),
+ * so the error says `postAttempted: false` and the reset log writes `rejected`, not `error`.
+ */
+function ensureLive(signal: AbortSignal): void {
+  try {
+    signal.throwIfAborted();
+  } catch (error) {
+    throw tagUnsent(error);
+  }
+}
+
+function tagUnsent(error: unknown): unknown {
+  if (error !== null && typeof error === "object") return Object.assign(error, { postAttempted: false });
+  return Object.assign(new Error(String(error)), { postAttempted: false });
+}
+
 /** One call as `name`: the member's login, one locked refresh and retry on 401. */
 async function callAs(
   r: AccountRequest,
@@ -240,16 +257,16 @@ async function callAs(
   init: { method: string; url: string; body?: Uint8Array },
   beforePost?: (credential: ProviderCredential, retryAfter401: boolean) => Promise<void>,
 ): Promise<Response> {
-  r.signal.throwIfAborted();
+  ensureLive(r.signal);
   const provider = r.app.provider;
   const adapter = adapterFor(provider);
   let cred = await r.deps.creds.get(provider, name);
   const send = async (credential: ProviderCredential, retryAfter401 = false): Promise<Response> => {
-    r.signal.throwIfAborted();
+    ensureLive(r.signal);
     const req: RequestInit = { method: init.method, headers: upstreamHeaders(adapter, credential, r.headers), signal: r.signal, redirect: "manual" };
     if (init.body && init.body.length > 0 && init.method !== "GET" && init.method !== "HEAD") req.body = init.body;
     if (beforePost) await beforePost(credential, retryAfter401);
-    r.signal.throwIfAborted();
+    ensureLive(r.signal);
     return r.deps.fetch(init.url, req);
   };
   const res = await send(cred);
@@ -398,11 +415,29 @@ async function beginAppReset(r: AccountRequest, member: string, grantId: string 
   }
 }
 
+/** An app-driven reset that found no member to spend it: one `rejected` row, against the pinned identity or the app's pool. */
+async function logNoMemberReset(r: AccountRequest, grantId: string | undefined): Promise<void> {
+  try {
+    const pinned = r.app.target.kind === "pin" ? r.app.target.identity : undefined;
+    const attempt = await r.deps.resetLog?.begin({
+      provider: r.app.provider === "codex" ? "codex" : "claude", trigger: "manual", actor: `app:${r.app.name}`,
+      identity: pinned ?? `pool:${r.app.name}`, pool: pinned ? null : r.app.name,
+      grantId: grantId && RESET_ID.test(grantId) ? grantId : null,
+      // No member means no reading: skip the cache read.
+      before: { windows: [] },
+    });
+    void attempt?.finish({ outcome: "rejected", message: "no pool member owns this grant" });
+  } catch {
+    // The log never changes what the app receives.
+  }
+}
+
 /** Logs the provider's answer to an app-driven reset. `res` is read from a clone: the app gets `res` untouched. */
 function logAppReset(attempt: ResetAttempt | undefined, res: Response, outcomeOf: (body: unknown) => ResetAttemptResult): void {
   if (!attempt) return;
   if (!res.ok) {
-    void attempt.finish(failureOutcome(Object.assign(new Error(`The provider answered HTTP ${res.status}`), { status: res.status })));
+    // A 401 means the provider refused the login (also after a failed refresh). It spent nothing, so the row is `rejected`.
+    void attempt.finish(failureOutcome(Object.assign(new Error(`The provider answered HTTP ${res.status}`), { status: res.status, ...(res.status === 401 ? { postAttempted: false } : {}) })));
     return;
   }
   let body: Promise<unknown>;
@@ -507,7 +542,10 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
         r, names, CODEX_CREDITS_URL, (b) => (availableCount(b) ?? 0) > 0,
         creditId ? (b) => codexCreditIds(b).ids.has(creditId) : undefined,
       ));
-      if (!member) return noMember();
+      if (!member) {
+        await logNoMemberReset(r, creditId);
+        return noMember();
+      }
       const attempt = await beginAppReset(r, member, creditId);
       let res: Response;
       try {
@@ -537,7 +575,10 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
   }
 
   const member = await chooseMember(r, owner);
-  if (!member) return noMember();
+  if (!member) {
+    if (claudeReset) await logNoMemberReset(r, claudeResetGrant);
+    return noMember();
+  }
 
   const resetAttempt = claudeReset ? await beginAppReset(r, member, claudeResetGrant) : undefined;
   if (orgAt >= 0) {

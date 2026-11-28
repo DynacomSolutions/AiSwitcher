@@ -1378,7 +1378,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     // The member's stored credential spends the grant; never refreshed here (the keep-alive owns rotation).
     // It shares the redemption lock with the automatic spend, and it waits for an unresolved automatic POST on the same member.
     spendReset: hooks.spendReset ?? ((identity, grantId) => withRedemptionLock(async () => {
-      if (autoResetConfig && await bounded(autoResetConfig.store.spendPending("claude", identity), 2_000, "Claude reset outcome")) {
+      // A failed or slow check ends before any POST: it is a refusal, not an unknown outcome.
+      const pendingAuto = autoResetConfig
+        ? await bounded(autoResetConfig.store.spendPending("claude", identity), 2_000, "Claude reset outcome").catch((error: unknown) => { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { postAttempted: false }); })
+        : false;
+      if (pendingAuto) {
         throw Object.assign(new Error("An automatic Claude reset on this account has no recorded outcome yet"), { status: 409 });
       }
       const out = await (hooks.claudeReset ?? ((name, grant) => useClaudeReset(name, grant, { noRefresh: true })))(identity, grantId);

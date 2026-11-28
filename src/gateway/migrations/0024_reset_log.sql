@@ -3,6 +3,8 @@
 -- It holds no token, cookie or secret: `grant_id` is a credit or grant ID only.
 CREATE TABLE IF NOT EXISTS reset_log (
   id bigserial PRIMARY KEY,
+  -- One ID for each attempt, made once by the logger. A retry of the write uses the same ID, so it adds no second row.
+  attempt_id uuid NOT NULL UNIQUE,
   -- When the attempt ended and the row was made.
   at timestamptz NOT NULL DEFAULT clock_timestamp(),
   -- When the attempt started. Null when unknown.

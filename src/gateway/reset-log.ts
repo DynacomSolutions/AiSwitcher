@@ -101,7 +101,11 @@ export const RESET_LOG_DEFAULT_LIMIT = 100;
 export const RESET_LOG_MAX_LIMIT = 500;
 
 export interface ResetLogStore {
-  insert(entry: ResetLogEntry): Promise<void>;
+  /**
+   * Appends one row. `attemptId` names one reset attempt: the logger makes it once and sends it again with every retry,
+   * so a retry after a timeout (the first insert may still land) never writes a second row. A store without one makes its own.
+   */
+  insert(entry: ResetLogEntry, attemptId?: string): Promise<void>;
   list(filters: ResetLogFilters): Promise<ResetLogPage>;
   /** Sets `after` and `after_at` on the `reset` rows of this member that have none and are older than `readingAt`. One fill per row. */
   fillAfter(provider: ResetLogProvider, identity: string, after: ResetLogWindow[], readingAt: string): Promise<{ filled: number; pending: boolean }>;
@@ -250,11 +254,15 @@ function newerFirst(a: { at: string; id: string }, b: { at: string; id: string }
 export class MemoryResetLog implements ResetLogStore {
   private readonly rows: ResetLogRow[] = [];
   private nextId = 1;
+  private readonly attempts = new Set<string>();
   /** Test hook: the next `insert` calls fail while this holds. */
   failInserts = false;
 
-  async insert(entry: ResetLogEntry): Promise<void> {
+  async insert(entry: ResetLogEntry, attemptId: string = crypto.randomUUID()): Promise<void> {
     if (this.failInserts) throw new Error("reset log store unavailable");
+    // The same attempt writes one row, like the unique `attempt_id` of the table.
+    if (this.attempts.has(attemptId)) return;
+    this.attempts.add(attemptId);
     this.rows.push({ ...structuredClone(entry), id: String(this.nextId++), after: null, afterAt: null });
   }
 
@@ -359,13 +367,15 @@ export class PgResetLog implements ResetLogStore {
     this.now = options.now ?? Date.now;
   }
 
-  async insert(entry: ResetLogEntry): Promise<void> {
+  async insert(entry: ResetLogEntry, attemptId: string = crypto.randomUUID()): Promise<void> {
+    // A retry of the same attempt hits the unique `attempt_id` and writes nothing.
     await this.sql`INSERT INTO reset_log
-      (at, started_at, provider, "trigger", actor, identity, account, pool, grant_id, "before", outcome, message, resets_left_after)
-      VALUES (${entry.at}::text::timestamptz, ${entry.startedAt}::text::timestamptz, ${entry.provider}, ${entry.trigger}, ${entry.actor}, ${entry.identity},
+      (attempt_id, at, started_at, provider, "trigger", actor, identity, account, pool, grant_id, "before", outcome, message, resets_left_after)
+      VALUES (${attemptId}::text::uuid, ${entry.at}::text::timestamptz, ${entry.startedAt}::text::timestamptz, ${entry.provider}, ${entry.trigger}, ${entry.actor}, ${entry.identity},
         ${entry.account}, ${entry.pool}, ${entry.grantId}, ${JSON.stringify(entry.before)}::text::jsonb,
-        ${entry.outcome}, ${entry.message}, ${entry.resetsLeftAfter})`;
-    // A new identity shows in the filter menu at once, without a second read of the table.
+        ${entry.outcome}, ${entry.message}, ${entry.resetsLeftAfter})
+      ON CONFLICT (attempt_id) DO NOTHING`;
+    // A new identity shows in the filter menu at once on this replica only. Other replicas read the table again within a minute.
     if (this.names && !this.names.list.includes(entry.identity)) this.names.list = [...this.names.list, entry.identity].sort();
   }
 
@@ -463,7 +473,7 @@ export interface ResetLogger {
   onReading(provider: string, identity: string, reading: PoolUsage): void;
   /** Loads the members that have rows with no `after`. Call once at start. */
   warm(): Promise<void>;
-  /** Waits until every started write has ended (written, or given up). Never rejects. Call at stop. */
+  /** Waits until every started write has ended (written, or given up). Never rejects. Call at stop. A write that waits to retry retries at once. */
   drain(): Promise<void>;
 }
 
@@ -512,7 +522,10 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
   const resyncMs = options.resyncMs ?? 5 * 60_000;
   const backoff = options.retryBackoffMs ?? RETRY_BACKOFF_MS;
   const queueLimit = options.queueLimit ?? QUEUE_LIMIT;
-  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms).unref?.(); }));
+  /** Set by `drain`: from then on a write does not wait between its tries. */
+  const draining = Promise.withResolvers<void>();
+  let isDraining = false;
   const key = (provider: string, identity: string): string => `${provider}\u0000${identity}`;
   const waiting = new Map<string, { provider: ResetLogProvider; identity: string }>();
   const filling = new Set<string>();
@@ -554,15 +567,16 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
   };
 
   /** Inserts one row: three tries with a short wait between them. Never rejects. */
-  async function writeEntry(entry: ResetLogEntry): Promise<void> {
-    if (pending.size > queueLimit) {
+  async function writeEntry(entry: ResetLogEntry, attemptId: string): Promise<void> {
+    // `pending` holds the writes that came before this one: the limit is exact.
+    if (pending.size >= queueLimit) {
       reportFailure(entry, new Error("the reset log write queue is full"), " (dropped)");
       return;
     }
     let lastError: unknown;
     for (let attempt = 0; attempt <= backoff.length; attempt += 1) {
       try {
-        await bounded(store.insert(entry), timeoutMs, "reset log write");
+        await bounded(store.insert(entry, attemptId), timeoutMs, "reset log write");
         const id = key(entry.provider, entry.identity);
         generation.set(id, (generation.get(id) ?? 0) + 1);
         // Only a reset row has an `after` to fill.
@@ -572,8 +586,10 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
         lastError = error;
         const wait = backoff[attempt];
         if (wait === undefined) break;
+        // At stop the waits go: the next try starts at once, so the writes end inside the drain ceiling.
+        if (isDraining) continue;
         try {
-          await sleep(wait);
+          await Promise.race([sleep(wait), draining.promise]);
         } catch {
           break;
         }
@@ -588,11 +604,15 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
     },
 
     async drain() {
+      isDraining = true;
+      draining.resolve();
       while (pending.size > 0) await Promise.allSettled([...pending]);
     },
 
     async begin(start) {
       const startedAt = new Date(now()).toISOString();
+      // One ID for the whole attempt. Every retry of the write sends it again.
+      const attemptId = crypto.randomUUID();
       let windows: ResetLogWindow[] = [];
       try {
         const reading = start.before !== undefined
@@ -627,7 +647,7 @@ export function createResetLogger(options: ResetLoggerOptions): ResetLogger {
           } catch {
             // A metric failure never blocks the reset.
           }
-          const write = writeEntry(entry);
+          const write = writeEntry(entry, attemptId);
           pending.add(write);
           try {
             await write;

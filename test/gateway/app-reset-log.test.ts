@@ -127,6 +127,27 @@ describe("a Claude reset through the proxy", () => {
     expect((await logStore.list({})).rows.map((row) => row.outcome)).toEqual(["rejected"]);
   });
 
+  test("a pool app with no member writes one rejected row, and the app still gets its 409", async () => {
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pool" } });
+    deps = { ...deps, poolMembers: async () => [] };
+    const res = await call("cl", "/api/organizations/org-of-a/reset_rate_limits", { method: "POST", body: claudeBody("grant-a") });
+    expect(res.status).toBe(409);
+    await logger.drain();
+    expect(seen).toHaveLength(0);
+    const rows = (await logStore.list({})).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ provider: "claude", trigger: "manual", actor: "app:cl", identity: "pool:cl", pool: "cl", grantId: "grant-a", outcome: "rejected", message: "no pool member owns this grant" });
+  });
+
+  test("a 401 after a failed token refresh is rejected, not an error", async () => {
+    await addApp("cl", "claude", "anthropic");
+    deps = { ...deps, creds: { ...(deps.creds as object), refreshAfter401: async () => { throw new Error("synthetic refresh failure"); } } as unknown as GatewayDeps["creds"] };
+    reply = (s) => (isProfile(s) ? Response.json({ organization: { uuid: "org-of-a" } }) : new Response("{}", { status: 401 }));
+    expect((await call("cl", "/api/organizations/org-of-a/reset_rate_limits", { method: "POST", body: claudeBody("grant-a") })).status).toBe(401);
+    await logger.drain();
+    expect((await logStore.list({})).rows.map((row) => row.outcome)).toEqual(["rejected"]);
+  });
+
   test("is the only Claude call that logs: a usage read writes no row", async () => {
     await addApp("cl", "claude", "anthropic");
     reply = () => Response.json({ organization: { uuid: "org-of-a" } });
@@ -182,6 +203,18 @@ describe("a Codex consume through the proxy", () => {
     // The guard threw before the member was chosen, so there is no second row.
     await logger.drain();
     expect((await logStore.list({})).rows).toHaveLength(1);
+  });
+
+  test("a pool app with no member writes one rejected row", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pool" } });
+    deps = { ...deps, poolMembers: async () => [] };
+    const credit = "credit-SYNTHETIC_FIXTURE-one";
+    const res = await call("c", CONSUME, { method: "POST", body: JSON.stringify({ redeem_request_id: crypto.randomUUID(), credit_id: credit }) });
+    expect(res.status).toBe(409);
+    await logger.drain();
+    const rows = (await logStore.list({})).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ provider: "codex", actor: "app:c", identity: "pool:c", pool: "c", grantId: credit, outcome: "rejected", message: "no pool member owns this grant" });
   });
 
   test("never changes the answer when the log cannot write", async () => {

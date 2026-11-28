@@ -609,12 +609,14 @@ The row is written in the same code path as the reset. No path can skip it. The 
 Only a row with outcome `reset` is updated, once, to fill `after` and `after_at` from the first stored usage reading that is newer than the row (`createUsageSource` option `onReading`).
 A row of any other outcome keeps `after` null for good, because no window changed.
 The write is never awaited on a response path. `finish` counts the attempt in the metric at once, then writes in the background. The logger keeps each write in a set, and `drain()` (called by `stop()`) waits for them.
-A failed write is tried three times (waits of 250 ms and 1 s). At most 1000 writes may wait. A write over that limit is dropped. A write that fails every try, and a dropped write, count in
+A failed write is tried three times (waits of 250 ms and 1 s). At drain, the waits are skipped and each try starts at once. At most 1000 writes may wait. A write over that limit is dropped.
+The logger makes one `attempt_id` (a UUID) in `begin`. Every try of the write sends it. The column is unique and the insert uses `ON CONFLICT (attempt_id) DO NOTHING`.
+A try that timed out may still land later, so a retry never adds a second row. A write that fails every try, and a dropped write, count in
 `ais_gateway_reset_log_write_failures_total{provider}` and log one short line with no secret. A failed write never blocks or fails a reset.
 `ais_gateway_resets_total{provider,trigger,outcome}` counts every attempt, also when the write fails.
 Each row has `at` (the attempt ended, the row was made) and `started_at` (the attempt started, null for an old row).
 The list order is `at` descending, then `id` descending. `nextBefore` and `before` are one opaque cursor (base64url of the `at` and `id` of the last row), not a row ID.
-The list of distinct identities is cached for 60 seconds. A new identity joins it at once on insert.
+The list of distinct identities is cached for 60 seconds. A new identity joins the list at once only on the replica that wrote it. Other replicas show it within 60 seconds.
 `before` holds every window of the latest cached reading before the reset (the decision reading for the pool route and the automatic engine).
 Free text goes through `redactText`. `grant_id` is a credit or grant ID only.
 
@@ -622,7 +624,7 @@ Free text goes through `redactText`. `grant_id` is a credit or grant ID only.
 | --- | --- | --- |
 | Manual Claude (admin route) | `user`, or `user:<name>` from the `X-AIS-Actor` header (the console sends `console`) | `reset`, `no_credit`, `already_redeemed` by the answer. `nothing_to_reset` and a refusal before the POST (400, 403, 404, 409, 429; the profile endpoint unreachable or without an organisation; `postAttempted: false`) are `rejected`. A lost or unclear answer is `error`. |
 | Manual Codex (admin route) | same | the same mapping |
-| Claude reset from an app (`POST /api/organizations/<org>/reset_rate_limits` through the proxy, `account.ts`) | `app:<app name>` | the relayed answer goes through `claudeManualOutcome`. A refusal status (400, 403, 404, 409, 429) is `rejected`. Another status or an unreadable answer is `error`. A missing organisation or login, before the POST, is `rejected`. |
+| Claude reset from an app (`POST /api/organizations/<org>/reset_rate_limits` through the proxy, `account.ts`) | `app:<app name>` | the relayed answer goes through `claudeManualOutcome`. A refusal status (400, 403, 404, 409, 429) is `rejected`. Another status or an unreadable answer is `error`. A missing organisation or login, a client that left before the POST, a 401 and a reset that finds no pool member (message "no pool member owns this grant", identity `pool:<app name>` for a pool app) are `rejected`. |
 | Codex consume from an app (`POST .../rate-limit-reset-credits/consume` through the proxy, `account.ts`) | `app:<app name>` | the relayed `code` goes through `codexResultOutcome`. A status or a thrown error goes through `failureOutcome`. A fence or a missing login is `rejected`. |
 | Codex pool route | `pool-route`, or `pool-route:<name>` | POST answered `reset` is `reset`, also while the relief check is pending. `already_attempted` is `already_redeemed`: the message says "repeat confirmation of an earlier attempt (local journal)" when the local journal holds the attempt (for example one that ended as `pending`), and says that the provider reported it when the provider answered `already_redeemed`. An error before the POST is `rejected`. A declined or changed pool is `no_credit` or `rejected`. A sent POST with no recorded answer is `error`. |
 | Automatic Claude and Codex | `auto-reset-worker` | claim `reset` is `reset`. Provider `no_credit` or `already_redeemed` keep their names. A claim `rejected` is `rejected`. A claim `unknown` is `error`. |

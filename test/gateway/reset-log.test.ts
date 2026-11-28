@@ -570,6 +570,57 @@ describe("write path", () => {
     expect(metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="claude"} 1');
   });
 
+  test("a retry after a timeout writes one row, because every try carries the same attempt ID", async () => {
+    // The first insert is too slow for its timeout and is not cancelled: it lands later. The retry lands first.
+    class Late extends MemoryResetLog {
+      calls = 0;
+      readonly ids: Array<string | undefined> = [];
+      override async insert(entryToWrite: ResetLogEntry, attemptId?: string): Promise<void> {
+        this.calls += 1;
+        this.ids.push(attemptId);
+        if (this.calls === 1) {
+          await Bun.sleep(60);
+          await super.insert(entryToWrite, attemptId);
+          return;
+        }
+        await super.insert(entryToWrite, attemptId);
+      }
+    }
+    const store = new Late();
+    const logger = createResetLogger({ store, now: () => NOW, log: () => {}, storeTimeoutMs: 20, sleep: async () => {} });
+    await (await logger.begin(start)).finish({ outcome: "reset" });
+    await Bun.sleep(100);
+    expect(store.calls).toBe(2);
+    expect(store.ids[0]).toBeDefined();
+    expect(store.ids[1]).toBe(store.ids[0]);
+    expect((await store.list({})).rows).toHaveLength(1);
+    // A second attempt gets a new ID and a new row.
+    await (await logger.begin(start)).finish({ outcome: "reset" });
+    expect((await store.list({})).rows).toHaveLength(2);
+    expect(store.ids[2]).not.toBe(store.ids[0]);
+  });
+
+  test("drain skips the waits between tries, so a failing store ends inside the ceiling", async () => {
+    const store = new MemoryResetLog();
+    store.failInserts = true;
+    const waits: number[] = [];
+    const release = Promise.withResolvers<void>();
+    const logger = createResetLogger({
+      store, now: () => NOW, log: () => {}, retryBackoffMs: [60_000, 60_000],
+      // A real wait would hold the write for a minute.
+      sleep: (ms) => { waits.push(ms); return release.promise; },
+    });
+    const write = (await logger.begin(start)).finish({ outcome: "reset" });
+    await Bun.sleep(5);
+    // The write waits for its first retry. Drain ends the wait.
+    const started = performance.now();
+    await logger.drain();
+    await write;
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(waits).toEqual([60_000]);
+    release.resolve();
+  });
+
   test("a full queue drops the write and counts it", async () => {
     const release = Promise.withResolvers<void>();
     const slow: ResetLogStore = { ...new MemoryResetLog(), insert: () => release.promise } as unknown as ResetLogStore;
@@ -577,8 +628,8 @@ describe("write path", () => {
     const logger = createResetLogger({ store: slow, metrics, now: () => NOW, log: () => {}, queueLimit: 2, retryBackoffMs: [] });
     const attempts = await Promise.all([1, 2, 3, 4, 5].map(() => logger.begin(start)));
     const writes = attempts.map((attempt) => attempt.finish({ outcome: "reset" }));
-    // Three writes fit (the limit is checked before a write joins), so the other two are dropped.
-    expect(metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="claude"} 2');
+    // Exactly the limit fits: two writes wait, and the other three are dropped.
+    expect(metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="claude"} 3');
     release.resolve();
     await Promise.all(writes);
   });
@@ -709,22 +760,32 @@ if (!url) {
       const store = new PgResetLog(sql);
       const a = entry({ at: iso(NOW), identity });
       const b = entry({ at: iso(NOW + 1_000), identity, trigger: "auto", outcome: "error", message: "synthetic failure" });
-      await store.insert(a);
+      // Only a `reset` row gets an `after`. Row b is an error: it never waits for one.
+      const c = entry({ at: iso(NOW + 1_500), identity });
+      const attempt = crypto.randomUUID();
+      await store.insert(a, attempt);
+      // The same attempt again (a retry after a timeout) writes no second row.
+      await store.insert(a, attempt);
       await store.insert(b);
+      await store.insert(c);
       const all = await store.list({ identity });
-      expect(all.rows.map((row) => row.outcome)).toEqual(["error", "reset"]);
-      expect(all.rows[1]).toMatchObject({ ...a, after: null, afterAt: null });
+      expect(all.rows.map((row) => row.outcome)).toEqual(["reset", "error", "reset"]);
+      expect(all.rows[2]).toMatchObject({ ...a, after: null, afterAt: null });
       expect(all.identities).toContain(identity);
       const first = await store.list({ identity, limit: 1 });
       expect(decodeResetLogCursor(first.nextBefore!)?.id).toBe(first.rows[0]?.id as string);
-      expect((await store.list({ identity, limit: 1, before: decodeResetLogCursor(first.nextBefore!)! })).rows.map((row) => row.outcome)).toEqual(["reset"]);
+      expect((await store.list({ identity, limit: 1, before: decodeResetLogCursor(first.nextBefore!)! })).rows.map((row) => row.outcome)).toEqual(["error"]);
       expect((await store.list({ identity, trigger: "auto" })).rows).toHaveLength(1);
-      expect((await store.list({ identity, from: iso(NOW + 500), toExclusive: iso(NOW + 2_000) })).rows).toHaveLength(1);
+      expect((await store.list({ identity, from: iso(NOW + 500), toExclusive: iso(NOW + 2_000) })).rows).toHaveLength(2);
       const after = resetLogWindows(claudeUsage(1));
+      // At NOW + 500 only row a is older than the reading. Row c still waits.
       expect(await store.fillAfter("claude", identity, after, iso(NOW + 500))).toEqual({ filled: 1, pending: true });
       expect(await store.fillAfter("claude", identity, after, iso(NOW + 2_000))).toEqual({ filled: 1, pending: false });
       expect(await store.fillAfter("claude", identity, after, iso(NOW + 3_000))).toEqual({ filled: 0, pending: false });
-      expect((await store.list({ identity })).rows.map((row) => row.afterAt)).toEqual([iso(NOW + 2_000), iso(NOW + 500)]);
+      const filled = (await store.list({ identity })).rows;
+      expect(filled.map((row) => row.afterAt)).toEqual([iso(NOW + 2_000), null, iso(NOW + 500)]);
+      // The error row b keeps `after` and `after_at` null for good.
+      expect(filled[1]).toMatchObject({ outcome: "error", after: null, afterAt: null });
     } finally {
       await sql.close();
     }
