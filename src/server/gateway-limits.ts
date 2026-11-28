@@ -84,7 +84,8 @@ export async function useClaudeResetViaGateway(
   try {
     res = await (deps.fetch ?? fetch)(`${cfg.url}/limits/claude/${encodeURIComponent(identity)}/resets/${encodeURIComponent(grantId)}`, {
       method: "POST",
-      headers: { authorization: `Bearer ${cfg.token}` },
+      // The gateway adds the name to the actor of its reset log row.
+      headers: { authorization: `Bearer ${cfg.token}`, "x-ais-actor": "console" },
       signal: AbortSignal.timeout(deps.timeoutMs ?? 30_000),
     });
   } catch {
@@ -115,7 +116,7 @@ export async function useCodexResetViaGateway(
   try {
     res = await (deps.fetch ?? fetch)(`${cfg.url}/limits/codex/${encodeURIComponent(identity)}/resets/use`, {
       method: "POST",
-      headers: { authorization: `Bearer ${cfg.token}`, "content-type": "application/json" },
+      headers: { authorization: `Bearer ${cfg.token}`, "content-type": "application/json", "x-ais-actor": "console" },
       body: JSON.stringify({ redeemRequestId }),
       signal: AbortSignal.timeout(deps.timeoutMs ?? 30_000),
     });

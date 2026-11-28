@@ -66,6 +66,7 @@ import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
 import { MemoryUsageReadings, PgUsageReadings, type UsageReadings } from "./usage-readings.ts";
+import { createResetLogger, MemoryResetLog, PgResetLog, type ResetLogStore } from "./reset-log.ts";
 import { createCodexResetSource, createUsageSource, fetchCodexResetCredits, fetchGatewayCodexUsage, fetchPoolUsage, withOpencodeUsage, USAGE_READER_PROVIDERS, type FetchUsage } from "./usage-source.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
@@ -190,6 +191,8 @@ export interface GatewayHooks {
   ping?(): Promise<void>;
   /** Usage readings shared by the replicas (default: the gateway database; in memory when openStore or ping is replaced). */
   usageReadings?: UsageReadings;
+  /** The reset log (reset-log.ts). Default: the gateway database; in memory when openStore, ping or usageReadings is replaced. */
+  resetLogStore?: ResetLogStore;
   pingMs?: number;
   /** How often every replica re-reads its logins for the expiry, lifetime and revoked gauges (default 60 s). */
   gaugeMs?: number;
@@ -913,9 +916,19 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     if (credential.identity !== identity) throw new Error("Codex credential does not match the requested account");
     return credential;
   }
+  // The reset log: one row for every reset attempt on every path. A failed write is counted and never blocks a reset.
+  const resetLogStore: ResetLogStore = hooks.resetLogStore ?? (readingsSql ? new PgResetLog(readingsSql) : new MemoryResetLog());
+  const resetLogger = createResetLogger({
+    store: resetLogStore,
+    // The same cached reading that GET /limits shows and the proxy selects on.
+    usageFor: async (provider, identity) => hooks.usageFor ? hooks.usageFor(provider, identity) : usage.get(provider, await canonical(provider, identity)),
+    metrics,
+    now: () => now().getTime(),
+  });
   const usage = createUsageSource({
     fetchUsage: hooks.fetchUsage ?? withOpencodeUsage(creds, fetchPoolUsage),
     shared: sharedReadings,
+    onReading: (provider, identity, reading) => resetLogger.onReading(provider, identity, reading),
     onRead: (provider, source) => metrics.usageRead(provider, source),
     onSharedError: () => metrics.usageSharedError(),
   });
@@ -941,6 +954,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     const clock = () => now().getTime();
     const recovery = createAutoResetRecovery({
       provider: "codex",
+      resetLog: resetLogger,
       store: autoResetConfig.store,
       pools: () => autoResetConfig.pools("codex"),
       now: clock,
@@ -1021,6 +1035,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     };
     const recovery = createAutoResetRecovery({
       provider: "claude",
+      resetLog: resetLogger,
       store: autoResetConfig.store,
       pools: () => autoResetConfig.pools("claude"),
       now: clock,
@@ -1267,6 +1282,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const drainCtrl = new AbortController();
   const appDeps: GatewayDeps = {
     drainSignal: drainCtrl.signal,
+    resetLog: resetLogger,
     autoReset,
     autoResets: { ...(autoReset ? { codex: autoReset } : {}), ...(claudeAutoReset ? { claude: claudeAutoReset } : {}) },
     withCodexRedemption,
@@ -1302,6 +1318,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const admin = createAdminApp({
     store,
     autoReset: autoResetConfig,
+    resetLog: resetLogger,
+    resetLogStore,
     ...(poolResetJournal && reservationCleanup ? { poolReset: {
       thresholds: async () => {
         const groups = await Promise.all([...USAGE_READER_PROVIDERS].map((provider) => namedPools(provider)));
@@ -1312,7 +1330,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         signal.throwIfAborted();
         return (await assessPoolReset(provider, pool, signal))?.review;
       },
-      confirm: (pool, confirmation, signal, deadlineAt) => confirmPoolReset(pool, confirmation, signal, {
+      confirm: (pool, confirmation, signal, deadlineAt, actor) => confirmPoolReset(pool, confirmation, signal, {
+        resetLog: resetLogger,
+        ...(actor ? { actor } : {}),
         journal: poolResetJournal,
         cleanup: reservationCleanup,
         guard: withCodexRedemption,
@@ -1362,7 +1382,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     // The member's stored credential spends the grant; never refreshed here (the keep-alive owns rotation).
     // It shares the redemption lock with the automatic spend, and it waits for an unresolved automatic POST on the same member.
     spendReset: hooks.spendReset ?? ((identity, grantId) => withRedemptionLock(async () => {
-      if (autoResetConfig && await bounded(autoResetConfig.store.spendPending("claude", identity), 2_000, "Claude reset outcome")) {
+      // A failed or slow check ends before any POST: it is a refusal, not an unknown outcome.
+      const pendingAuto = autoResetConfig
+        ? await bounded(autoResetConfig.store.spendPending("claude", identity), 2_000, "Claude reset outcome").catch((error: unknown) => { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { postAttempted: false }); })
+        : false;
+      if (pendingAuto) {
         throw Object.assign(new Error("An automatic Claude reset on this account has no recorded outcome yet"), { status: 409 });
       }
       const out = await (hooks.claudeReset ?? ((name, grant) => useClaudeReset(name, grant, { noRefresh: true })))(identity, grantId);
@@ -1530,6 +1554,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     // Seed from the readings the other replicas took, so a fresh replica shows figures even when upstream answers 429. A failure skips it.
     const seedMs = Math.max(1, Math.min(hooks.usageWarmTimeoutMs ?? 90_000, 5_000));
     await bounded(sharedReadings.loadAll(), seedMs, "shared usage readings").then((rows) => usage.seed(rows), () => metrics.usageSharedError());
+    // Rows that still wait for an `after` reading, from before this replica started. A failure only delays the fill.
+    await resetLogger.warm();
     const result = await usageGate.run(keys, (key) => {
       const slash = key.indexOf("/");
       return usage.prefill(key.slice(0, slash) as GatewayProvider, key.slice(slash + 1));
@@ -2060,6 +2086,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       await Promise.allSettled([...inflightRefreshes]);
       // The ledger flush, the relay and the leader lock do not wait for chat turns: a long turn must not hold them until the kill ceiling.
       await ledger.close();
+      // Reset log rows that are still being written (the writes are fired, not awaited) end before the database closes.
+      await bounded(resetLogger.drain(), 5_000, "reset log writes").catch(() => undefined);
       await relay?.stop().catch(() => undefined);
       await sessionsEnrich?.enricher.stop().catch(() => undefined);
       await leader?.stop().catch(() => undefined);

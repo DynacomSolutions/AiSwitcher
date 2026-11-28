@@ -1026,3 +1026,62 @@ export interface PushStatusResponse {
   subscriptions: number;
   resetExpiry: { running: boolean; lastCheckAt: string | null; lastError: string | null; lastSent: number } | null;
 }
+
+/** GET /api/logs/resets: the full reset log (manual and automatic), newest first. */
+export type ResetLogProvider = "claude" | "codex";
+export type ResetLogTrigger = "manual" | "auto";
+export type ResetLogOutcome = "reset" | "no_credit" | "already_redeemed" | "rejected" | "error";
+
+/** One usage window as read before or after a reset. `key` is a stable name such as five_hour, weekly or weekly_opus. */
+export interface ResetLogWindow {
+  key: string;
+  label: string | null;
+  percent: number;
+  resetsAt: string | null;
+}
+
+export interface ResetLogRow {
+  id: string;
+  /** When the attempt ended and the row was made. */
+  at: string;
+  /** When the attempt started. Null for a row that has no start time. */
+  startedAt: string | null;
+
+  provider: ResetLogProvider;
+  trigger: ResetLogTrigger;
+  actor: string;
+  identity: string;
+  account: string | null;
+  pool: string | null;
+  grantId: string | null;
+  before: ResetLogWindow[];
+  outcome: ResetLogOutcome | (string & {});
+  message: string | null;
+  resetsLeftAfter: number | null;
+  /** Null until the next reading after the reset arrives. */
+  after: ResetLogWindow[] | null;
+  afterAt: string | null;
+}
+
+export interface ResetLogResponse {
+  rows: ResetLogRow[];
+  /** The opaque cursor for the next (older) page, or null on the last page. Send it back as `before`. */
+  nextBefore: string | null;
+  /** Every identity that has a log row, for the identity filter. */
+  identities: string[];
+  /** False when no gateway admin is configured: the log is unavailable, not empty. Absent from an older console. */
+  configured?: boolean;
+}
+
+export interface ResetLogQuery {
+  identity?: string;
+  provider?: ResetLogProvider;
+  trigger?: ResetLogTrigger;
+  outcome?: ResetLogOutcome;
+  /** First instant, ICT day start: `<date>T00:00:00+07:00`. */
+  from?: string;
+  /** Last instant, ICT day end: `<date>T23:59:59.999+07:00`. */
+  to?: string;
+  limit?: number;
+  before?: string;
+}

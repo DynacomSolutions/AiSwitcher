@@ -29,6 +29,7 @@ function fixture(options: {
   confirmWait?: Promise<void>;
   confirmStarted?: () => void;
   stallFetch?: boolean;
+  actors?: Array<string | undefined>;
 } = {}) {
   let spendCalls = 0;
   let forwarded = 0;
@@ -43,7 +44,8 @@ function fixture(options: {
       review: async (tool, name) => tool === "codex" && name === pool ? review : undefined,
       activationEnabled: options.activationEnabled,
       confirmTimeoutMs: options.gatewayMs,
-      confirm: async (name, selection, signal) => {
+      confirm: async (name, selection, signal, _deadlineAt, actor) => {
+        options.actors?.push(actor);
         expect(name).toBe(pool);
         expect(selection).toEqual(confirmation);
         options.confirmStarted?.();
@@ -165,4 +167,19 @@ test("console returns pending and invalidates once when the gateway does not res
   expect(response.status).toBe(200);
   expect(await response.json()).toEqual({ status: "pending" });
   expect(state()).toEqual({ spendCalls: 0, forwarded: 1, invalidateCalls: 1 });
+});
+
+test("the pool route names its actor for the reset log, with the console name when it is sent", async () => {
+  const actors: Array<string | undefined> = [];
+  const { admin, consoleApp } = fixture({ actors });
+  const headers = { authorization: `Bearer ${ADMIN}` };
+  const body = JSON.stringify(confirmation);
+  expect((await admin.request(path, { method: "POST", headers, body })).status).toBe(200);
+  expect((await admin.request(path, { method: "POST", headers: { ...headers, "x-ais-actor": "console" }, body })).status).toBe(200);
+  expect((await admin.request(path, { method: "POST", headers: { ...headers, "x-ais-actor": "bad actor; drop" }, body })).status).toBe(200);
+  const viaConsole = await consoleApp.request(`/api${path}`, {
+    method: "POST", body, headers: { Host: "localhost:47129", Authorization: `Bearer ${CONSOLE}`, "X-AIS-Console": "1" },
+  });
+  expect(viaConsole.status).toBe(200);
+  expect(actors).toEqual(["pool-route", "pool-route:console", "pool-route", "pool-route:console"]);
 });

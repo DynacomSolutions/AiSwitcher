@@ -13,6 +13,7 @@ import {
   Network,
   PieChart,
   RefreshCw,
+  ScrollText,
   ShieldCheck,
 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -32,6 +33,7 @@ const NAV_ITEMS = [
   { to: "/identities", label: "Identities", icon: IdCard, end: false },
   { to: "/local-models", label: "Local Models", icon: Cpu, end: false },
   { to: "/limits", label: "Limits", icon: Gauge, end: false },
+  { to: "/logs", label: "Logs", icon: ScrollText, end: false },
   { to: "/usage", label: "Usage", icon: BarChart3, end: false },
   { to: "/breakdown", label: "Breakdown", icon: PieChart, end: false },
   { to: "/sessions", label: "Sessions", icon: History, end: false },

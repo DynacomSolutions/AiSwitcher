@@ -8,6 +8,7 @@ import { availableCount, claudeUsageBody, claudeUsageBodyOf, normalisePath, orgS
 import { allowedMembers, utilisationOf } from "./select.ts";
 import { CODEX_CREDITS_URL, codexCreditIds, codexResetInventory, fetchCodexCreditInventory } from "./usage-source.ts";
 import type { ProviderCredential } from "./providers/shared.ts";
+import { claudeManualOutcome, codexResultOutcome, failureOutcome, type ResetAttempt, type ResetAttemptResult } from "./reset-log.ts";
 import type { ApiStyle, GatewayApp } from "./types.ts";
 
 /**
@@ -232,6 +233,23 @@ async function discard(res: Response): Promise<void> {
 
 const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
+/**
+ * Throws when the client has left. No POST is on the wire yet at these points (or the only one got a 401 and reset nothing),
+ * so the error says `postAttempted: false` and the reset log writes `rejected`, not `error`.
+ */
+function ensureLive(signal: AbortSignal): void {
+  try {
+    signal.throwIfAborted();
+  } catch (error) {
+    throw tagUnsent(error);
+  }
+}
+
+function tagUnsent(error: unknown): unknown {
+  if (error !== null && typeof error === "object") return Object.assign(error, { postAttempted: false });
+  return Object.assign(new Error(String(error)), { postAttempted: false });
+}
+
 /** One call as `name`: the member's login, one locked refresh and retry on 401. */
 async function callAs(
   r: AccountRequest,
@@ -239,16 +257,16 @@ async function callAs(
   init: { method: string; url: string; body?: Uint8Array },
   beforePost?: (credential: ProviderCredential, retryAfter401: boolean) => Promise<void>,
 ): Promise<Response> {
-  r.signal.throwIfAborted();
+  ensureLive(r.signal);
   const provider = r.app.provider;
   const adapter = adapterFor(provider);
   let cred = await r.deps.creds.get(provider, name);
   const send = async (credential: ProviderCredential, retryAfter401 = false): Promise<Response> => {
-    r.signal.throwIfAborted();
+    ensureLive(r.signal);
     const req: RequestInit = { method: init.method, headers: upstreamHeaders(adapter, credential, r.headers), signal: r.signal, redirect: "manual" };
     if (init.body && init.body.length > 0 && init.method !== "GET" && init.method !== "HEAD") req.body = init.body;
     if (beforePost) await beforePost(credential, retryAfter401);
-    r.signal.throwIfAborted();
+    ensureLive(r.signal);
     return r.deps.fetch(init.url, req);
   };
   const res = await send(cred);
@@ -372,6 +390,68 @@ async function memberOrg(r: AccountRequest, name: string): Promise<string | unde
   }
 }
 
+const RESET_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/** Maps an error thrown before or during an app-driven reset. A refusal that sent nothing is `rejected`. */
+function thrownResetOutcome(error: unknown): ResetAttemptResult {
+  if (error instanceof CodexResetFenced || error instanceof GatewayCredentialError) {
+    return { outcome: "rejected", message: error instanceof Error ? error.message : "reset refused" };
+  }
+  return failureOutcome(error);
+}
+
+/**
+ * Starts the reset log row of an app-driven reset (a reset sent through the proxy, trigger "manual", actor `app:<name>`).
+ * The log never changes what the app receives: every write is fired and not awaited, and the answer is read from a clone.
+ */
+async function beginAppReset(r: AccountRequest, member: string, grantId: string | undefined): Promise<ResetAttempt | undefined> {
+  try {
+    return await r.deps.resetLog?.begin({
+      provider: r.app.provider === "codex" ? "codex" : "claude", trigger: "manual", actor: `app:${r.app.name}`, identity: member,
+      grantId: grantId && RESET_ID.test(grantId) ? grantId : null,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/** An app-driven reset that found no member to spend it: one `rejected` row, against the pinned identity or the app's pool. */
+async function logNoMemberReset(r: AccountRequest, grantId: string | undefined): Promise<void> {
+  try {
+    const pinned = r.app.target.kind === "pin" ? r.app.target.identity : undefined;
+    const attempt = await r.deps.resetLog?.begin({
+      provider: r.app.provider === "codex" ? "codex" : "claude", trigger: "manual", actor: `app:${r.app.name}`,
+      identity: pinned ?? `pool:${r.app.name}`, pool: pinned ? null : r.app.name,
+      grantId: grantId && RESET_ID.test(grantId) ? grantId : null,
+      // No member means no reading: skip the cache read.
+      before: { windows: [] },
+    });
+    void attempt?.finish({ outcome: "rejected", message: "no pool member owns this grant" });
+  } catch {
+    // The log never changes what the app receives.
+  }
+}
+
+/** Logs the provider's answer to an app-driven reset. `res` is read from a clone: the app gets `res` untouched. */
+function logAppReset(attempt: ResetAttempt | undefined, res: Response, outcomeOf: (body: unknown) => ResetAttemptResult): void {
+  if (!attempt) return;
+  if (!res.ok) {
+    // A 401 means the provider refused the login (also after a failed refresh). It spent nothing, so the row is `rejected`.
+    void attempt.finish(failureOutcome(Object.assign(new Error(`The provider answered HTTP ${res.status}`), { status: res.status, ...(res.status === 401 ? { postAttempted: false } : {}) })));
+    return;
+  }
+  let body: Promise<unknown>;
+  try {
+    body = res.clone().json();
+  } catch {
+    void attempt.finish({ outcome: "error", message: "The reset answer could not be read" });
+    return;
+  }
+  void bounded(body, 5_000, "reset answer")
+    .then((body) => attempt.finish(outcomeOf(body)), () => attempt.finish({ outcome: "error", message: "The reset answer could not be read" }))
+    .catch(() => undefined);
+}
+
 /** The provider's answer, without its connection-level headers. */
 function relay(res: Response, provider: string): Response {
   const headers = new Headers({ [GATEWAY_UPSTREAM_HEADER]: provider });
@@ -442,6 +522,8 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
 
   let orgAt = -1;
   let segs: string[] = [];
+  let claudeResetGrant: string | undefined;
+  let claudeReset = false;
   if (r.op === "claude-org") {
     const u = new URL(url);
     const n = normalisePath(u.pathname);
@@ -449,6 +531,8 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
     if (!n || orgAt < 0) return { res: providerError(r.style, 502, "the account organisation could not be found", "account_org_unavailable"), cls }; // fail closed
     segs = n.segs;
     const grant = r.method === "POST" && n.nsegs[orgAt + 1] === "reset_rate_limits" && n.nsegs.length === orgAt + 2 ? jsonField(r.body, "grant_id") : undefined;
+    claudeReset = r.method === "POST" && n.nsegs[orgAt + 1] === "reset_rate_limits" && n.nsegs.length === orgAt + 2;
+    claudeResetGrant = grant;
     if (grant) owner = (names) => firstMemberWhere(r, names, CLAUDE_RESETS_PROBE, (b) => grantIds(b).includes(grant));
   } else if (r.op === "codex-consume") {
     const redeem = async (beforePost?: BeforeCodexPost): Promise<AccountResult> => {
@@ -458,29 +542,58 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
         r, names, CODEX_CREDITS_URL, (b) => (availableCount(b) ?? 0) > 0,
         creditId ? (b) => codexCreditIds(b).ids.has(creditId) : undefined,
       ));
-      if (!member) return noMember();
-      const res = await callAs(r, member, { method: r.method, url: url + r.search, body: r.body }, beforePost && (async (credential, retryAfter401) => {
-        if (credential.identity !== member) throw new Error("Codex credential does not match the requested account");
-        await beforePost(member, {
-          credential,
-          creditId,
-          inventory: () => fetchCodexCreditInventory(credential, r.deps.fetch, r.signal),
-          signal: r.signal,
-          retryAfter401,
-        });
-      }));
-      return { res: relay(res, r.app.provider), identity: member, cls };
+      if (!member) {
+        await logNoMemberReset(r, creditId);
+        return noMember();
+      }
+      const attempt = await beginAppReset(r, member, creditId);
+      let res: Response;
+      try {
+        res = await callAs(r, member, { method: r.method, url: url + r.search, body: r.body }, beforePost && (async (credential, retryAfter401) => {
+          if (credential.identity !== member) throw new Error("Codex credential does not match the requested account");
+          await beforePost(member, {
+            credential,
+            creditId,
+            inventory: () => fetchCodexCreditInventory(credential, r.deps.fetch, r.signal),
+            signal: r.signal,
+            retryAfter401,
+          });
+        }));
+      } catch (error) {
+        void attempt?.finish(thrownResetOutcome(error));
+        throw error;
+      }
+      const relayed = relay(res, r.app.provider);
+      logAppReset(attempt, relayed, (body) => {
+        const answer = body as { code?: unknown; credit?: { id?: unknown } } | null;
+        const credit = answer?.credit?.id;
+        return { ...codexResultOutcome(typeof answer?.code === "string" ? answer.code : ""), ...(typeof credit === "string" && RESET_ID.test(credit) ? { grantId: credit } : {}) };
+      });
+      return { res: relayed, identity: member, cls };
     };
     return r.deps.withCodexRedemption ? r.deps.withCodexRedemption(redeem) : redeem();
   }
 
   const member = await chooseMember(r, owner);
-  if (!member) return noMember();
+  if (!member) {
+    if (claudeReset) await logNoMemberReset(r, claudeResetGrant);
+    return noMember();
+  }
 
+  const resetAttempt = claudeReset ? await beginAppReset(r, member, claudeResetGrant) : undefined;
   if (orgAt >= 0) {
     // The organisation sent upstream is always the member's own; if it cannot be read, nothing is sent.
-    const org = await memberOrg(r, member);
-    if (!org) return { res: providerError(r.style, 502, "the account organisation could not be found", "account_org_unavailable"), identity: member, cls };
+    let org: string | undefined;
+    try {
+      org = await memberOrg(r, member);
+    } catch (error) {
+      void resetAttempt?.finish(thrownResetOutcome(error));
+      throw error;
+    }
+    if (!org) {
+      void resetAttempt?.finish({ outcome: "rejected", message: "The account organisation could not be found" });
+      return { res: providerError(r.style, 502, "the account organisation could not be found", "account_org_unavailable"), identity: member, cls };
+    }
     const out = [...segs];
     out[1] = "api";
     if (orgAt === 4) out[2] = "oauth";
@@ -490,8 +603,22 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
   }
   if (r.op === "claude-usage") return pinnedUsage(r, member, url, cls);
   if (r.op === "forward" && r.method === "GET" && r.app.target.kind === "pin" && normalisePath(new URL(url).pathname)?.norm === "/api/oauth/profile") return pinnedProfile(r, member, url, cls);
-  const res = await callAs(r, member, { method: r.method, url: url + r.search, ...(r.body ? { body: r.body } : {}) });
-  return { res: relay(res, r.app.provider), identity: member, cls };
+  let res: Response;
+  try {
+    res = await callAs(r, member, { method: r.method, url: url + r.search, ...(r.body ? { body: r.body } : {}) });
+  } catch (error) {
+    void resetAttempt?.finish(thrownResetOutcome(error));
+    throw error;
+  }
+  const relayed = relay(res, r.app.provider);
+  logAppReset(resetAttempt, relayed, (body) => {
+    const answer = body as { result?: unknown; cleared?: unknown; resets_left?: unknown; grant_id?: unknown } | null;
+    return {
+      ...claudeManualOutcome({ result: answer?.result, cleared: answer?.cleared, resetsLeft: answer?.resets_left }),
+      ...(typeof answer?.grant_id === "string" && RESET_ID.test(answer.grant_id) ? { grantId: answer.grant_id } : {}),
+    };
+  });
+  return { res: relayed, identity: member, cls };
 }
 
 /**

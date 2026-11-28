@@ -11,6 +11,7 @@ import { IdentitiesPage } from "@/pages/identities";
 import { PoolLimitsPage } from "@/pages/pool-limits";
 import { LimitsPage } from "@/pages/limits";
 import { LocalModelsPage } from "@/pages/local-models";
+import { LogsIndexRedirect, ResetLogPage } from "@/pages/logs";
 import { NotFoundPage } from "@/pages/not-found";
 import { PermissionsPage } from "@/pages/permissions";
 import { SessionsPage } from "@/pages/sessions";
@@ -27,6 +28,8 @@ export function AppRoutes() {
         <Route path="local-models/:name" element={<LocalModelsPage />} />
         <Route path="limits/pools/:tool/:pool" element={<PoolLimitsPage />} />
         <Route path="limits/:tab?" element={<LimitsPage />} />
+        <Route path="logs" element={<LogsIndexRedirect />} />
+        <Route path="logs/resets" element={<ResetLogPage />} />
         <Route path="usage/:tab?" element={<UsagePage />} />
         <Route path="breakdown/:tab?" element={<BreakdownPage />} />
         <Route path="sessions" element={<SessionsPage />} />

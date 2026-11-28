@@ -1,8 +1,9 @@
-import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { adjustRefreshCounts, applyRefreshedLimits, isIdentityRefreshing, limitsRefetchInterval, POLL, reconcileLimits } from "@/lib/limits-reconciliation";
-import type { LimitsResponse, LoginFlowStatus } from "@/types/api";
+import { resetLogPollMs, resetLogRequest, type ResetLogFilters } from "@/lib/reset-log";
+import type { LimitsResponse, LoginFlowStatus, ResetLogResponse } from "@/types/api";
 
 export { POLL, reconcileLimits, limitsRefetchInterval } from "@/lib/limits-reconciliation";
 
@@ -21,6 +22,7 @@ export const qk = {
   gatewayApps: ["gateway-apps"] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
   usageProjects: ["usage", "projects"] as const,
+  resetLog: (filters: ResetLogFilters) => ["reset-log", filters] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
   sessionTree: (tool: string, identity: string, days: number, active: boolean) =>
     ["sessions", "tree", tool, identity, days, active] as const,
@@ -312,5 +314,20 @@ export function useFileContentQuery(root: string, path: string | null) {
     queryKey: qk.fileContent(root, path ?? ""),
     queryFn: () => api.getFileContent(root, path as string),
     enabled: root !== "" && path !== null,
+  });
+}
+
+/** The reset log, one page at a time: each page asks for the rows older than the cursor of the page before. */
+export function useResetLogQuery(filters: ResetLogFilters) {
+  return useInfiniteQuery({
+    queryKey: qk.resetLog(filters),
+    queryFn: ({ pageParam, signal }) => api.getResetLog(resetLogRequest(filters, pageParam), signal),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last: ResetLogResponse) => last.nextBefore ?? undefined,
+    // A log must not show an old copy: ask again on mount. The poll refreshes the first page only: a refetch of an
+    // infinite query asks for every loaded page, one after the other, so the poll stops once "Load more" opened an older page.
+    staleTime: 0,
+    refetchInterval: (query) => resetLogPollMs(query.state.data?.pages.length ?? 0, POLL.slow),
+    placeholderData: keepPreviousData,
   });
 }

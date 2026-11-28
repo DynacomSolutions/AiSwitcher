@@ -5,6 +5,8 @@ import { consumeCodexResetForIdentity, type CodexRedemptionGuard } from "../../s
 import { codexResetRelieved, checkCodexRedemptionFence, confirmPoolReset, PgPoolResetJournal, PoolResetReservationCleanup, poolResetReview, poolUtilisation, poolWindowKey } from "../../src/gateway/pool-reset.ts";
 import type { PoolResetConfirmation } from "../../src/gateway/pool-reset-view.ts";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
+import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
+import { createResetLogger, MemoryResetLog, type ResetLogger } from "../../src/gateway/reset-log.ts";
 
 const NOW = Date.parse("2026-01-01T00:00:00Z");
 const DAY = 86_400_000;
@@ -81,6 +83,7 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
   const state = {
     waitForPost: Promise.resolve(), waitForAssess: Promise.resolve(), afterJournal: () => {}, review, ambiguous: false,
     releaseFailures: 0, outcomeFailures: 0, windowsReset: 1 as number | undefined, reportedCredit: creditA as string | null | undefined, verified: true, members: review.members, now: NOW, refreshReview: false, deadlineAt: Infinity,
+    resetLog: undefined as ResetLogger | undefined,
   };
   const cleanup = new PoolResetReservationCleanup(async (id, reservation) => {
     expect(locked).toBe(true);
@@ -115,6 +118,7 @@ function harness(readings = [usage(94, 92), usage(98, 90)]) {
   const run = (selection = confirmation, signal = new AbortController().signal) => confirmPoolReset(pool.pool, selection, signal, {
     now: () => state.now,
     get deadlineAt() { return state.deadlineAt; },
+    get resetLog() { return state.resetLog; },
     guard,
     cleanup,
     journal: {
@@ -412,4 +416,78 @@ test("an elapsed preflight deadline stops the POST even before the timeout signa
   expect(await run()).toEqual({ status: "declined" });
   expect(steps).toEqual([]);
   expect(posts).toHaveLength(0);
+});
+
+describe("pool reset log", () => {
+  function logged(over: { failInserts?: boolean } = {}) {
+    const h = harness();
+    const store = new MemoryResetLog();
+    store.failInserts = over.failInserts === true;
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const resetLog = createResetLogger({ retryBackoffMs: [0, 0], store, metrics, now: () => NOW, log: () => {} });
+    h.state.resetLog = resetLog;
+    return { ...h, store, metrics, resetLog };
+  }
+
+  test("a confirmed reset writes one row with the windows of the reading that the decision used", async () => {
+    const { run, store, metrics, confirmation } = logged();
+    expect(await run()).toEqual({ status: "confirmed" });
+    const rows = (await store.list({})).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      provider: "codex", trigger: "manual", actor: "pool-route", identity: "sample-a", pool: "sample-pool",
+      grantId: confirmation.candidate.creditId, account: "account-SYNTHETIC_FIXTURE", outcome: "reset",
+    });
+    expect(rows[0]?.before.map((window) => [window.key, window.percent])).toEqual([["five_hour", 94], ["weekly", 92]]);
+    expect(metrics.render()).toContain('ais_gateway_resets_total{provider="codex",trigger="manual",outcome="reset"} 1');
+  });
+
+  test("a reset that the provider accepted is a reset even while the relief check is pending", async () => {
+    const { run, state, store } = logged();
+    state.verified = false;
+    expect(await run()).toEqual({ status: "pending" });
+    expect((await store.list({})).rows.map((row) => row.outcome)).toEqual(["reset"]);
+  });
+
+  test("a lost answer is an error row, and a repeat is an already redeemed row", async () => {
+    const { run, state, store } = logged();
+    state.ambiguous = true;
+    expect(await run()).toEqual({ status: "pending" });
+    expect(await run()).toEqual({ status: "already_attempted" });
+    const rows = (await store.list({})).rows.reverse();
+    expect(rows.map((row) => row.outcome)).toEqual(["error", "already_redeemed"]);
+    expect(rows[0]?.message).toContain("no recorded outcome");
+    // The repeat has no provider answer: the row says that the local journal held the earlier attempt.
+    expect(rows[1]?.message).toBe("repeat confirmation of an earlier attempt (local journal)");
+  });
+
+  test("a changed candidate and a changed membership write a rejected or no credit row and send nothing", async () => {
+    const changed = logged();
+    changed.state.review = { ...changed.state.review, candidate: { ...changed.state.review.candidate!, identity: "sample-b", creditId: creditB } };
+    expect(await changed.run()).toMatchObject({ status: "changed" });
+    expect((await changed.store.list({})).rows.map((row) => row.outcome)).toEqual(["rejected"]);
+    expect(changed.posts).toEqual([]);
+
+    const members = logged();
+    members.state.members = ["sample-b"];
+    expect(await members.run()).toEqual({ status: "declined" });
+    expect((await members.store.list({})).rows.map((row) => row.outcome)).toEqual(["no_credit"]);
+    expect(members.posts).toEqual([]);
+  });
+
+  test("a failure that stops the confirmation still writes its row, and a failed write never blocks the reset", async () => {
+    const aborted = logged();
+    aborted.state.afterJournal = () => { throw new Error("synthetic journal failure"); };
+    await expect(aborted.run()).rejects.toThrow("synthetic journal failure");
+    await aborted.resetLog.drain();
+    // A failure before the POST sent nothing, so the row is `rejected`, not `error`.
+    expect((await aborted.store.list({})).rows.map((row) => [row.outcome, row.message])).toEqual([["rejected", "synthetic journal failure"]]);
+    expect(aborted.posts).toEqual([]);
+
+    const broken = logged({ failInserts: true });
+    expect(await broken.run()).toEqual({ status: "confirmed" });
+    expect(broken.posts).toHaveLength(1);
+    await broken.resetLog.drain();
+    expect(broken.metrics.render()).toContain('ais_gateway_reset_log_write_failures_total{provider="codex"} 1');
+  });
 });

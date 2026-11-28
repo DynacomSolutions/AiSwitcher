@@ -3,6 +3,7 @@ import type { ManualResetInfo } from "../cli/limits/types.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import { CodexResetFenced, CodexResetOutcomePending, type CodexResetOutcome, type BeforeCodexPost, type CodexCreditSelection, type CodexPostContext, type CodexRedemptionGuard, type consumeCodexResetForIdentity } from "./account.ts";
 import { bounded } from "./refresh-guard.ts";
+import { codexResultOutcome, failureOutcome, type ResetAttemptResult, type ResetLogger } from "./reset-log.ts";
 import { chooseAutoResetCandidate, liveCredits, MIN_WEEKLY_REMAINING_MS, weeklyWindow } from "./auto-reset.ts";
 import { POOL_RESET_THRESHOLD, type PoolResetCandidate, type PoolResetConfirmation, type PoolResetResult, type PoolResetReview, type PoolThreshold } from "./pool-reset-view.ts";
 import type { GatewayProvider } from "./types.ts";
@@ -194,17 +195,83 @@ interface ConfirmPoolDeps {
   reconcile: (identity: string, baseline: PoolUsage | undefined, consumedAt: number, version?: string) => Promise<{ status: "confirmed" | "pending" }>;
   now: () => number;
   deadlineAt?: number;
+  /** Writes one reset log row for every confirmation. Absent: no row. */
+  resetLog?: ResetLogger;
+  /** The actor of the row (default `pool-route`). */
+  actor?: string;
+}
+
+/** What one confirmation saw, for its reset log row. */
+interface PoolResetTrace {
+  baseline?: PoolUsage;
+  account?: string;
+  postStarted?: boolean;
+  /** The provider's answer, when the POST answered. */
+  providerResult?: CodexResetOutcome;
+  reconciled?: boolean;
 }
 
 type LockedPoolResult = PoolResetResult
   | { status: "refresh"; review: PoolResetReview }
   | { status: "reconcile"; baseline: PoolUsage | undefined; version: string | undefined; consumedAt: number };
 
+/** Maps the end of one confirmation to a reset log outcome. */
+function poolOutcome(result: PoolResetResult | undefined, trace: PoolResetTrace): ResetAttemptResult {
+  if (!result) return { outcome: "rejected", message: "The pool was not found" };
+  if (trace.reconciled) return { outcome: "reset" };
+  switch (result.status) {
+    case "confirmed": return { outcome: "reset" };
+    case "already_attempted": return trace.providerResult === "already_redeemed"
+      ? { outcome: "already_redeemed", message: "The provider reported the credit as already redeemed" }
+      // No provider answer in this call: the local journal holds an earlier attempt, for example one that ended as `pending`.
+      : { outcome: "already_redeemed", message: "repeat confirmation of an earlier attempt (local journal)" };
+    case "declined": return codexResultOutcome(trace.providerResult ?? "no_credit");
+    case "changed": return { outcome: "rejected", message: "The pool or the credit changed. Nothing was sent" };
+    default: return trace.postStarted
+      ? { outcome: "error", message: "The reset was sent and has no recorded outcome yet" }
+      : { outcome: "rejected", message: "The reset was not sent" };
+  }
+}
+
 export async function confirmPoolReset(
   pool: string,
   confirmation: PoolResetConfirmation,
   signal: AbortSignal,
   deps: ConfirmPoolDeps,
+): Promise<PoolResetResult | undefined> {
+  const trace: PoolResetTrace = {};
+  const { candidate } = confirmation;
+  // The row is written in this function, so no exit of a confirmation can skip it.
+  const attempt = await deps.resetLog?.begin({
+    provider: "codex", trigger: "manual", actor: deps.actor ?? "pool-route", identity: candidate.identity, pool, grantId: candidate.creditId,
+  });
+  try {
+    const result = await confirmPoolResetInner(pool, confirmation, signal, deps, trace);
+    // Not awaited: the log never delays the answer. The logger tracks the write.
+    void attempt?.finish({
+      ...poolOutcome(result, trace),
+      ...(trace.baseline ? { before: trace.baseline } : {}),
+      ...(trace.account ? { account: trace.account } : {}),
+    });
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "reset failed";
+    void attempt?.finish({
+      // A refusal before the POST sent nothing, so it is `rejected`. After the POST the outcome is not known.
+      ...(trace.postStarted ? failureOutcome(error) : { outcome: "rejected" as const, message }),
+      ...(trace.baseline ? { before: trace.baseline } : {}),
+      ...(trace.account ? { account: trace.account } : {}),
+    });
+    throw error;
+  }
+}
+
+async function confirmPoolResetInner(
+  pool: string,
+  confirmation: PoolResetConfirmation,
+  signal: AbortSignal,
+  deps: ConfirmPoolDeps,
+  trace: PoolResetTrace,
 ): Promise<PoolResetResult | undefined> {
   const { candidate, redeemRequestId } = confirmation;
   const { identity, creditId } = candidate;
@@ -217,6 +284,7 @@ export async function confirmPoolReset(
     if (!current) return undefined;
     if (!samePoolResetCandidate(current.review.candidate, candidate)) return { status: "changed" as const, review: current.review };
     const baseline = current.readings[current.review.members.indexOf(identity)];
+    trace.baseline = baseline;
     let crossingExpired = false;
     const stillCurrent = () => {
       const now = deps.now();
@@ -247,6 +315,7 @@ export async function confirmPoolReset(
         version = await deps.version(identity);
         if (!stillCurrent()) return;
         if (!await stillEligible() || !stillCurrent()) return;
+        trace.account = context.credential.accountId;
         if (deps.cleanup.full) throw new Error("The pool reset journal could not clear unsent reservations");
         attempt = deps.journal.recordAttempt(creditId, redeemRequestId, identity, reservationId, context.credential.accountId);
         reserved = await bounded(attempt, 2_000, "pool reset journal");
@@ -258,7 +327,7 @@ export async function confirmPoolReset(
         now: deps.now,
         stillCurrent: () => stillCurrent() && reserved,
         stillEligible,
-        onPost: () => { postStarted = true; },
+        onPost: () => { postStarted = true; trace.postStarted = true; },
         onKnownOutcome: (reportedId, outcome) => {
           consumedAt ??= deps.now();
           const recovery = outcome === "reset" && reportedId === creditId && baseline && version !== undefined
@@ -293,6 +362,7 @@ export async function confirmPoolReset(
       return { status: "refresh", review: fallback };
     }
     if (postStarted && result.creditId !== creditId) return { status: "pending" as const };
+    trace.providerResult = result.result;
     if (result.result === "already_redeemed") return { status: "already_attempted" as const };
     if (result.result !== "reset") return { status: "declined" as const };
     return { status: "reconcile", baseline, version, consumedAt: consumedAt ?? deps.now() };
@@ -306,6 +376,8 @@ export async function confirmPoolReset(
     return { status: "changed", review: fresh?.review ?? spend.review };
   }
   if (spend.status !== "reconcile") return spend;
+  // The provider answered `reset`: the row says reset even when the relief check is still pending.
+  trace.reconciled = true;
   const reconciled = await deps.reconcile(identity, spend.baseline, spend.consumedAt, spend.version)
     .catch(() => ({ status: "pending" as const }));
   return { status: reconciled.status };

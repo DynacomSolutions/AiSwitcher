@@ -6,6 +6,7 @@ import { clearSpentWindows, fetchClaudeLimits, loadLastGood, saveLastGood } from
 import type { LimitWindow } from "../../src/cli/limits/types.ts";
 import { createApp } from "../../src/server/app.ts";
 import { CLAUDE_PROFILE_URL, claudeResetUrl, useClaudeReset } from "../../src/server/claude-resets.ts";
+import { failureOutcome } from "../../src/gateway/reset-log.ts";
 import { HttpError } from "../../src/server/types.ts";
 import type { Identity } from "../../src/identities/types.ts";
 
@@ -119,6 +120,25 @@ describe("useClaudeReset", () => {
     expect(pct(clearSpentWindows(w, [], "full"))).toEqual([0, 0, 0]);
     expect(pct(clearSpentWindows(w, ["something_new"], "fable"))).toEqual([50, 90, 0]);
     expect(clearSpentWindows(w, [], "other")).toBe(w);
+  });
+
+  test("a failure before the reset POST is marked unsent, so the reset log records it as rejected", async () => {
+    const { identity, cacheDir, claudeRegistryPath } = setup();
+    const run = (answer: (url: string) => Response | Promise<Response>) => useClaudeReset("acct", GRANT, {
+      resolveIdentity: async () => identity, cacheDir, claudeRegistryPath,
+      fetchImpl: (async (url: unknown) => answer(String(url))) as unknown as typeof fetch,
+    }).then(() => undefined, (error: unknown) => error);
+    const unreachable = await run((url) => { if (url === CLAUDE_PROFILE_URL) throw new Error("synthetic network failure"); return Response.json({}); });
+    const noOrg = await run((url) => (url === CLAUDE_PROFILE_URL ? Response.json({}) : Response.json({ result: "reset" })));
+    const refused = await run((url) => (url === CLAUDE_PROFILE_URL ? new Response("{}", { status: 503 }) : Response.json({})));
+    for (const error of [unreachable, noOrg, refused]) {
+      expect(error).toMatchObject({ status: 502, postAttempted: false });
+      expect(failureOutcome(error).outcome).toBe("rejected");
+    }
+    // A lost POST answer is not known, so it stays an error.
+    const lost = await run((url) => { if (url === CLAUDE_PROFILE_URL) return Response.json({ organization: { uuid: ORG } }); throw new Error("synthetic network failure"); });
+    expect(lost).toMatchObject({ status: 502 });
+    expect(failureOutcome(lost).outcome).toBe("error");
   });
 
   test("refusals are honest and never reach Anthropic for a bad grant id, pool or retired identity", async () => {

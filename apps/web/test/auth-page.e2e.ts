@@ -308,10 +308,12 @@ for (const vp of [{ width: 360, height: 740 }, { width: 1280, height: 900 }, { w
       await openAuth();
       const total = await page.eval<number>(`document.querySelectorAll('main input, main button:not([disabled]), main [role=combobox]').length`);
       expect(total).toBeGreaterThan(8);
+      // The Tab order starts at the top of the page, so every focusable element outside main (nav, header) costs one press.
+      const outside = await page.eval<number>(`[...document.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [role=combobox], [tabindex]:not([tabindex="-1"])')].filter((el) => !el.closest('main')).length`);
       await page.eval(`document.querySelector('main').scrollIntoView(); document.activeElement && document.activeElement.blur()`);
       const seen = new Set<string>();
       const unfocused: string[] = [];
-      for (let i = 0; i < total + 12; i++) {
+      for (let i = 0; i < total + outside + 4; i++) {
         await page.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
         await page.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
         const f = await page.eval<{ inMain: boolean; label: string; ring: boolean; visible: boolean } | null>(`(() => {

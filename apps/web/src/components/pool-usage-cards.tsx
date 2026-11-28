@@ -5,6 +5,7 @@ import { poolLimitsPath } from "@/lib/api";
 import { AutoResetControl, AutoResetUnsupported } from "@/components/auto-reset-control";
 import { AccountWarnings } from "@/components/account-line";
 import { ToolBadge } from "@/components/badges";
+import { ResetLogLink } from "@/components/reset-log-link";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
@@ -109,10 +110,13 @@ function PoolCard({ pool, autoReset }: { pool: PoolSummary; autoReset?: AutoRese
           </div>
           {pool.members.map((m) => (
             <div key={m.name} className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-baseline gap-x-3 text-sm">
-              <span className="truncate" title={m.name}>
-                {m.name}
-                {m.name === pool.active ? " (active)" : ""}
-                {m.allowed ? "" : " (excluded)"}
+              <span className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate" title={m.name}>
+                  {m.name}
+                  {m.name === pool.active ? " (active)" : ""}
+                  {m.allowed ? "" : " (excluded)"}
+                </span>
+                <ResetLogLink identity={m.name} className="size-6" />
               </span>
               <span className="tabular-nums">{memberTokens(m.week)}</span>
               <span className="tabular-nums" title={m.worstLabel ?? m.limitMissing}>
