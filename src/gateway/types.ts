@@ -65,6 +65,17 @@ export interface SessionIdentityUsageRow {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  /** ESTIMATED cost of the served requests in USD (the same price table as `/usage/models`). Never a provider bill. */
+  estCostUsd: number;
+  /** Served requests with tokens but no price (unknown model): `estCostUsd` is a floor when above zero. */
+  unpricedRequests: number;
+  /** Requests of the group that did not end `ok` (rejected, upstream error, client abort). Their tokens and cost are not counted. */
+  failedRequests: number;
+  /** Tool calls the answers held, and `tool_result` error blocks the requests carried. Counts only: no tool name, input or output. */
+  toolCalls: number;
+  toolErrors: number;
+  /** Distinct models of the served requests, sorted. A request without a model adds none. */
+  models: string[];
   firstTs: string;
   lastTs: string;
 }
@@ -77,6 +88,12 @@ export interface SessionIdentityUse {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  estCostUsd: number;
+  unpricedRequests: number;
+  failedRequests: number;
+  toolCalls: number;
+  toolErrors: number;
+  models: string[];
   firstTs: string;
   lastTs: string;
 }
@@ -92,6 +109,17 @@ export interface SessionUsage {
   /** Every account the session used, newest first. */
   identities: SessionIdentityUse[];
   turns: number;
+  /** Sums over every account of the session. `estCostUsd` is an ESTIMATE from tokens and the price table, never a bill. */
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  estCostUsd: number;
+  unpricedRequests: number;
+  failedRequests: number;
+  toolCalls: number;
+  toolErrors: number;
+  models: string[];
   firstTs: string;
   lastTs: string;
 }

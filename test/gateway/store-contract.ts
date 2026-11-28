@@ -201,8 +201,9 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     const s = await makeStore();
     const sid = "6cc07c23-4501-42cb-ba6e-3c14d864219e";
     await s.appendUsage([
-      { ...row("a", "2026-11-02T01:00:00.000Z", 10, 20), identity: "m1", sessionKey: sid, client: "claude-cli", cacheReadTokens: 5 },
-      { ...row("a", "2026-11-02T02:00:00.000Z", 3, 4), identity: "m1", sessionKey: sid },
+      { ...row("a", "2026-11-02T01:00:00.000Z", 10, 20), identity: "m1", sessionKey: sid, client: "claude-cli", cacheReadTokens: 5, model: "ma", estCostUsd: 0.5, toolCalls: 2, toolErrors: 1 },
+      { ...row("a", "2026-11-02T02:00:00.000Z", 3, 4), identity: "m1", sessionKey: sid, model: "mb", estCostUsd: 0.25, toolCalls: 1 },
+      { ...row("a", "2026-11-02T02:30:00.000Z", 0, 0), identity: "m1", sessionKey: sid, status: "upstream_error", httpStatus: 502 },
       { ...row("a", "2026-11-02T03:00:00.000Z", 1, 1), identity: "m2", sessionKey: sid, cacheWriteTokens: 2 },
       { ...row("a", "2026-11-02T04:00:00.000Z", 9, 9), identity: "m2" },
       { ...row("a", "2026-11-02T05:00:00.000Z", 0, 0), identity: "-", sessionKey: sid, status: "rejected" },
@@ -210,12 +211,15 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     ]);
     const got = await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"));
     expect(got).toEqual([
-      { sessionKey: sid, provider: "codex", app: "a", client: "claude-cli", identity: "m1", turns: 2, inputTokens: 13, outputTokens: 24, cacheReadTokens: 5, cacheWriteTokens: 0, firstTs: "2026-11-02T01:00:00.000Z", lastTs: "2026-11-02T02:00:00.000Z" },
-      { sessionKey: sid, provider: "codex", app: "a", client: null, identity: "m2", turns: 1, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 2, firstTs: "2026-11-02T03:00:00.000Z", lastTs: "2026-11-02T03:00:00.000Z" },
+      { sessionKey: sid, provider: "codex", app: "a", client: "claude-cli", identity: "m1", turns: 2, inputTokens: 13, outputTokens: 24, cacheReadTokens: 5, cacheWriteTokens: 0, estCostUsd: 0.75, unpricedRequests: 0, failedRequests: 1, toolCalls: 3, toolErrors: 1, models: ["ma", "mb"], firstTs: "2026-11-02T01:00:00.000Z", lastTs: "2026-11-02T02:00:00.000Z" },
+      { sessionKey: sid, provider: "codex", app: "a", client: null, identity: "m2", turns: 1, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 2, estCostUsd: 0, unpricedRequests: 1, failedRequests: 0, toolCalls: 0, toolErrors: 0, models: [], firstTs: "2026-11-02T03:00:00.000Z", lastTs: "2026-11-02T03:00:00.000Z" },
     ]);
     expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), new Date("2026-11-02T02:00:00.000Z"))).toHaveLength(1);
     expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { sessionKeys: ["other-session-id"] })).toEqual([]);
     expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { provider: "claude" })).toEqual([]);
+    expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { sessionPrefix: sid.slice(0, 8) })).toHaveLength(2);
+    expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { sessionPrefix: "%" })).toEqual([]);
+    expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { sessionPrefix: `${sid.slice(0, 8)}x` })).toEqual([]);
     expect(await s.usageBySession(new Date("2026-11-02T00:00:00.000Z"), undefined, { app: "a", sessionKeys: [sid] })).toHaveLength(2);
   });
 

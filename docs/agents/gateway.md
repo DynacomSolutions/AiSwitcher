@@ -42,6 +42,7 @@ Other commands:
 ```sh
 ais gateway app list | show <name> | update <name> [flags] | rotate <name> | revoke <name>
 ais gateway usage [--app=billing] [--provider=claude] [--days=7] [--json]
+ais gateway usage sessions [--session=<id,id>] [--prefix=<text>] [--days=7] [--limit=50] [--json]
 ais gateway usage-history import [--snapshot=<path>] [--zone=<IANA zone>] [--batch-size=500] [--dry-run] [--verify-only]
 ```
 
@@ -1308,6 +1309,35 @@ block ledger writes; reads are bound by time and by `session_key IS NOT NULL`). 
   inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, firstTs, lastTs }], turns, firstTs, lastTs }] }`.
   Only served requests (`status = ok`) with a key and a real identity count. `activeIdentity` is the account of the latest
   request. `identities` is newest first. A pool that swaps member in the middle of a session shows both accounts.
+
+### Cost per session and per task (`ais gateway usage sessions`, board row 23.409)
+
+The same route also answers the cost view. No new route, table or query path exists: the CLI reads `/usage/sessions`.
+
+- Each `identities` entry and each session also carry `estCostUsd`, `unpricedRequests`, `failedRequests`, `toolCalls`,
+  `toolErrors` and `models` (sorted, distinct). A session also carries the token sums. `estCostUsd` is an ESTIMATE from
+  the ledger's `est_cost_usd`. A served row stored without a cost is priced at read time from tokens and model, as in
+  `/usage/models`. A row with tokens and no price counts in `unpricedRequests` and makes the figure a floor. It is never
+  a provider bill, and it never joins a real-spend column.
+- `failedRequests` counts rows with a real identity and a session key whose status is not `ok` (rejected, upstream
+  error, client abort), in the same account group. They add no tokens and no cost and are not in `turns`. A group with
+  no served request is not listed, because it has nothing to cost. `tool_calls` and `tool_errors` (migration 0023) are
+  summed. Older rows hold null and add 0. Tool names are never returned.
+- Optional filter `prefix=<text>` (at most 128 characters, no control character) keeps the sessions whose key starts
+  with the text. It is a plain prefix test (`starts_with`), never a pattern, so `%` and `_` match only themselves.
+- `session_key` is the client's own session id (see above). The ledger holds no task id and no T3 thread id, and the
+  keys are UUIDs, so a prefix has no meaning of its own. A "task" is therefore a set of sessions that the caller chooses:
+  `--session=<id,id>` (ids from the agent's transcript or `ais sessions`) or `--prefix=<text>` for ids that share a
+  prefix. The CLI adds one task total over the chosen set. Linking a T3 thread to its session ids needs a ledger or
+  header change and is not done.
+- CLI: `ais gateway usage sessions [--days=7] [--app=] [--provider=] [--session=<id,id>] [--prefix=<text>] [--limit=50]
+  [--json]`. One row per provider, account and session (a session that swapped account has one row for each account),
+  newest first inside a provider. Totals per provider come after the table. A task total is added when `--session` or
+  `--prefix` is set, and an all-providers total when more than one provider shows. The admin takes 500 ids per call, so
+  a longer `--session` list goes in several calls. An admin or network failure is an error, never an empty table.
+  `--json` adds `estimate: true` and `costUnit: "USD"`. Code: `src/cli/gateway/session-cost.ts`,
+  `src/cli/gateway/apps.ts` (`runSessionCostCommand`). Tests: `test/cli/gateway-usage-sessions.test.ts`,
+  `test/gateway/session-ledger.test.ts`, `test/gateway/store-contract.ts`.
 
 ## Ledger metadata: TTFB, stop reason and tool calls
 

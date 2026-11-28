@@ -26,7 +26,7 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   const [sub, ...rest] = positionals;
   const merged: GatewayCliDeps = { ...defaultDeps(), ...deps };
   if (sub === "app") return runAppCommand(rest[0], rest.slice(1), flags, merged);
-  if (sub === "usage") return runUsageCommand(flags, merged);
+  if (sub === "usage") return runUsageCommand(flags, merged, rest);
   if (sub === "auto-reset") {
     const { runAutoResetCommand } = await import("./auto-reset.ts");
     return runAutoResetCommand(rest, boolFlag(flags, "json"), merged, stringFlag(flags, "provider"));

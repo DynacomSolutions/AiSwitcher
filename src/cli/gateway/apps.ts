@@ -5,6 +5,9 @@ import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/
 import { boolFlag, listFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { refreshRegisteredCodexHomes } from "../../identities/codex-gateway-home.ts";
+import type { SessionUsage } from "../../gateway/types.ts";
+import { mapGatewaySessions } from "../../gateway/usage-view.ts";
+import { buildSessionCost, formatSessionCost } from "./session-cost.ts";
 import { writeAppSecret, type KubectlRunner } from "./kube-secret.ts";
 import { appTokenKey, appendSecretsFile, readSecretsKey } from "./secrets-file.ts";
 
@@ -315,7 +318,9 @@ export async function runAppCommand(action: string | undefined, positionals: str
   }
 }
 
-export async function runUsageCommand(flags: Flags, deps: GatewayCliDeps): Promise<void> {
+export async function runUsageCommand(flags: Flags, deps: GatewayCliDeps, positionals: string[] = []): Promise<void> {
+  if (positionals[0] === "sessions") return runSessionCostCommand(flags, deps);
+  if (positionals.length > 0) throw new CliUsageError("Usage: ais gateway usage [sessions] [flags]");
   const { admin } = await connect(deps);
   const q = new URLSearchParams();
   q.set("days", String(intFlag(flags, "days") ?? 7));
@@ -328,6 +333,31 @@ export async function runUsageCommand(flags: Flags, deps: GatewayCliDeps): Promi
   const rows = (json.usage as Record<string, unknown>[]) ?? [];
   if (rows.length === 0) return deps.out("no usage");
   deps.out(table(["APP", "PROVIDER", "DAYS", "TOKENS"], rows.map((r) => [str(r.app), str(r.provider), str(r.days), Number(r.tokens ?? 0).toLocaleString("en-GB")])));
+}
+
+/** `ais gateway usage sessions`: cost per session from the ledger (admin `GET /usage/sessions`). See session-cost.ts for the session and task rules. */
+async function runSessionCostCommand(flags: Flags, deps: GatewayCliDeps): Promise<void> {
+  const { admin } = await connect(deps);
+  const q = new URLSearchParams();
+  q.set("days", String(intFlag(flags, "days") ?? 7));
+  for (const name of ["app", "provider", "prefix"] as const) {
+    const v = stringFlag(flags, name);
+    if (v !== undefined) q.set(name, v);
+  }
+  const sessionIds = (stringFlag(flags, "session") ?? "").split(",").map((v) => v.trim()).filter((v) => v !== "");
+  const limit = intFlag(flags, "limit") ?? 50;
+  if (!Number.isInteger(limit) || limit < 1) throw new CliUsageError("--limit must be a whole number of at least 1");
+  // The admin takes at most 500 ids a call; a longer list goes in several calls and the answers are joined.
+  const sessions: SessionUsage[] = [];
+  for (let at = 0; at === 0 || at < sessionIds.length; at += 500) {
+    const p = new URLSearchParams(q);
+    for (const id of sessionIds.slice(at, at + 500)) p.append("session", id);
+    const { json } = await admin.call("GET", `/usage/sessions?${p.toString()}`);
+    sessions.push(...mapGatewaySessions(json));
+  }
+  const report = buildSessionCost(sessions);
+  if (boolFlag(flags, "json")) return deps.out(JSON.stringify({ estimate: true, costUnit: "USD", sessions, ...report }, null, 2));
+  deps.out(formatSessionCost(report, { limit, task: sessionIds.length > 0 || stringFlag(flags, "prefix") !== undefined }));
 }
 
 const str = (v: unknown): string => (v === undefined || v === null ? "" : String(v));

@@ -168,8 +168,8 @@ describe("agent identity: session ledger of a gateway pool", () => {
   const SID = "6cc07c23-4501-42cb-ba6e-3c14d864219e";
   const routed = (pid: number) => proc(pid, { identity: "example-pool-home", wrapped: true, identityEnv: { CLAUDE_CONFIG_DIR: `${HOME}/.claude/identities/swap` } });
   const iso = (ms: number) => new Date(T0.getTime() - ms).toISOString();
-  const use = (identity: string, turns: number, firstMs: number, lastMs: number) => ({ identity, turns, inputTokens: turns * 10, outputTokens: turns, cacheReadTokens: turns * 100, cacheWriteTokens: 0, firstTs: iso(firstMs), lastTs: iso(lastMs) });
-  const session = (key: string, identities: SessionUsage["identities"]): SessionUsage => ({ sessionKey: key, provider: "claude", app: "agents-claude", client: "claude-cli", activeIdentity: identities[0]!.identity, identities, turns: identities.reduce((n, i) => n + i.turns, 0), firstTs: identities[identities.length - 1]!.firstTs, lastTs: identities[0]!.lastTs });
+  const use = (identity: string, turns: number, firstMs: number, lastMs: number) => ({ identity, turns, inputTokens: turns * 10, outputTokens: turns, cacheReadTokens: turns * 100, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, failedRequests: 0, toolCalls: 0, toolErrors: 0, models: [], firstTs: iso(firstMs), lastTs: iso(lastMs) });
+  const session = (key: string, identities: SessionUsage["identities"]): SessionUsage => ({ sessionKey: key, provider: "claude", app: "agents-claude", client: "claude-cli", activeIdentity: identities[0]!.identity, identities, turns: identities.reduce((n, i) => n + i.turns, 0), inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, failedRequests: 0, toolCalls: 0, toolErrors: 0, models: [], firstTs: identities[identities.length - 1]!.firstTs, lastTs: identities[0]!.lastTs });
   const common = { routedApp: async () => "agents-claude", ledger: async () => [ledgerRow("alice", iso(1000))] };
 
   test("one session on one member: that member is active and holds the whole split", async () => {

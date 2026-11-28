@@ -20,6 +20,8 @@ export interface SessionUsageFilter {
   provider?: string;
   app?: string;
   sessionKeys?: string[];
+  /** Keeps only sessions whose key starts with this text (plain prefix, never a pattern). Empty means no limit. */
+  sessionPrefix?: string;
 }
 
 export interface GatewayStore {
@@ -224,14 +226,20 @@ export class MemoryGatewayStore implements GatewayStore {
     const to = until?.getTime() ?? Infinity;
     const keys = filter.sessionKeys && filter.sessionKeys.length > 0 ? new Set(filter.sessionKeys) : undefined;
     const by = new Map<string, SessionIdentityUsageRow>();
+    const failed = new Map<string, number>();
     for (const r of this.usage) {
       const t = Date.parse(r.ts);
-      if (t < from || t >= to || !r.sessionKey || r.status !== "ok" || r.identity === "-") continue;
+      if (t < from || t >= to || !r.sessionKey || r.identity === "-") continue;
       if ((filter.provider && r.provider !== filter.provider) || (filter.app && r.app !== filter.app) || (keys && !keys.has(r.sessionKey))) continue;
+      if (filter.sessionPrefix && !r.sessionKey.startsWith(filter.sessionPrefix)) continue;
       const key = `${r.sessionKey}\u0000${r.provider}\u0000${r.app}\u0000${r.identity}`;
+      if (r.status !== "ok") {
+        failed.set(key, (failed.get(key) ?? 0) + 1);
+        continue;
+      }
       let a = by.get(key);
       if (!a) {
-        a = { sessionKey: r.sessionKey, provider: r.provider, app: r.app, client: r.client ?? null, identity: r.identity, turns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, firstTs: r.ts, lastTs: r.ts };
+        a = { sessionKey: r.sessionKey, provider: r.provider, app: r.app, client: r.client ?? null, identity: r.identity, turns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, failedRequests: 0, toolCalls: 0, toolErrors: 0, models: [], firstTs: r.ts, lastTs: r.ts };
         by.set(key, a);
       }
       a.turns += 1;
@@ -239,10 +247,26 @@ export class MemoryGatewayStore implements GatewayStore {
       a.outputTokens += r.outputTokens;
       a.cacheReadTokens += r.cacheReadTokens;
       a.cacheWriteTokens += r.cacheWriteTokens;
+      a.toolCalls += r.toolCalls ?? 0;
+      a.toolErrors += r.toolErrors ?? 0;
+      if (r.model && !a.models.includes(r.model)) a.models.push(r.model);
+      if (r.estCostUsd !== undefined) a.estCostUsd += r.estCostUsd;
+      else {
+        // Stored without a cost: price from tokens and model now (the ledger is not rewritten).
+        const priced = priceNullCostGroup({ provider: r.provider, identity: r.identity, app: r.app, model: r.model ?? null, inputTokens: r.inputTokens, outputTokens: r.outputTokens, cacheReadTokens: r.cacheReadTokens, cacheWriteTokens: r.cacheWriteTokens, requests: 1 });
+        a.estCostUsd += priced.cost;
+        a.unpricedRequests += priced.unpriced;
+      }
       if (!a.client && r.client) a.client = r.client;
       if (t < Date.parse(a.firstTs)) a.firstTs = r.ts;
       if (t > Date.parse(a.lastTs)) a.lastTs = r.ts;
     }
+    // A group with no served request is not listed: it has no cost or tokens to show. Failures count only inside a listed group.
+    for (const [key, n] of failed) {
+      const a = by.get(key);
+      if (a) a.failedRequests = n;
+    }
+    for (const a of by.values()) a.models.sort();
     return [...by.values()].sort((x, y) => x.sessionKey.localeCompare(y.sessionKey) || x.identity.localeCompare(y.identity));
   }
 

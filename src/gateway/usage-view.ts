@@ -221,9 +221,26 @@ export function mapGatewaySessions(json: unknown): SessionUsage[] {
     for (const rawId of r.identities) {
       const i = rawId as Record<string, unknown> | null;
       if (!i || typeof i.identity !== "string" || i.identity === "" || typeof i.firstTs !== "string" || typeof i.lastTs !== "string") continue;
-      identities.push({ identity: i.identity, turns: n(i.turns), inputTokens: n(i.inputTokens), outputTokens: n(i.outputTokens), cacheReadTokens: n(i.cacheReadTokens), cacheWriteTokens: n(i.cacheWriteTokens), firstTs: i.firstTs, lastTs: i.lastTs });
+      identities.push({
+        identity: i.identity,
+        turns: n(i.turns),
+        inputTokens: n(i.inputTokens),
+        outputTokens: n(i.outputTokens),
+        cacheReadTokens: n(i.cacheReadTokens),
+        cacheWriteTokens: n(i.cacheWriteTokens),
+        estCostUsd: n(i.estCostUsd),
+        unpricedRequests: n(i.unpricedRequests),
+        failedRequests: n(i.failedRequests),
+        toolCalls: n(i.toolCalls),
+        toolErrors: n(i.toolErrors),
+        models: Array.isArray(i.models) ? i.models.filter((m): m is string => typeof m === "string" && m !== "") : [],
+        firstTs: i.firstTs,
+        lastTs: i.lastTs,
+      });
     }
     if (identities.length === 0) continue;
+    // Totals are re-derived from the account entries, so a stray session figure never disagrees with them.
+    const sum = (pick: (i: SessionUsage["identities"][number]) => number): number => identities.reduce((t, i) => t + pick(i), 0);
     out.push({
       sessionKey: r.sessionKey,
       provider: r.provider,
@@ -233,6 +250,16 @@ export function mapGatewaySessions(json: unknown): SessionUsage[] {
       activeIdentity: identities[0]!.identity,
       identities,
       turns: n(r.turns),
+      inputTokens: sum((i) => i.inputTokens),
+      outputTokens: sum((i) => i.outputTokens),
+      cacheReadTokens: sum((i) => i.cacheReadTokens),
+      cacheWriteTokens: sum((i) => i.cacheWriteTokens),
+      estCostUsd: sum((i) => i.estCostUsd),
+      unpricedRequests: sum((i) => i.unpricedRequests),
+      failedRequests: sum((i) => i.failedRequests),
+      toolCalls: sum((i) => i.toolCalls),
+      toolErrors: sum((i) => i.toolErrors),
+      models: [...new Set(identities.flatMap((i) => i.models))].sort(),
       firstTs: typeof r.firstTs === "string" ? r.firstTs : identities[0]!.firstTs,
       lastTs: typeof r.lastTs === "string" ? r.lastTs : identities[0]!.lastTs,
     });

@@ -395,6 +395,9 @@ export class PgGatewayStore implements GatewayStore {
   async usageBySession(since: Date, until?: Date, filter: SessionUsageFilter = {}): Promise<SessionIdentityUsageRow[]> {
     const to = until ? until.toISOString() : null;
     const keys = filter.sessionKeys && filter.sessionKeys.length > 0 ? filter.sessionKeys : null;
+    const prefix = filter.sessionPrefix ? filter.sessionPrefix : null;
+    const from = since.toISOString();
+    // One bounded read of the ledger window; starts_with is a plain prefix test, so a prefix never acts as a pattern.
     const rows = await this.sql`
       SELECT session_key, provider, app, identity, max(client) AS client,
         COUNT(*) AS turns,
@@ -402,15 +405,67 @@ export class PgGatewayStore implements GatewayStore {
         COALESCE(SUM(output_tokens), 0) AS output_tokens,
         COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
         COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd,
+        COALESCE(SUM(tool_calls), 0) AS tool_calls,
+        COALESCE(SUM(tool_errors), 0) AS tool_errors,
+        COALESCE(array_agg(DISTINCT model) FILTER (WHERE model IS NOT NULL), '{}') AS models,
         MIN(ts) AS first_ts,
         MAX(ts) AS last_ts
       FROM gateway_usage
-      WHERE ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+      WHERE ts >= ${from}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
         AND session_key IS NOT NULL AND status = 'ok' AND identity <> '-'
         AND (${filter.provider ?? null}::text IS NULL OR provider = ${filter.provider ?? null}::text)
         AND (${filter.app ?? null}::text IS NULL OR app = ${filter.app ?? null}::text)
         AND (${keys}::text[] IS NULL OR session_key = ANY(${keys}::text[]))
+        AND (${prefix}::text IS NULL OR starts_with(session_key, ${prefix}::text))
       GROUP BY session_key, provider, app, identity ORDER BY session_key, provider, app, identity`;
+    // Served rows stored without a cost are priced from tokens and model at read time, like usageByModel does.
+    const nulls = await this.sql`
+      SELECT session_key, provider, app, identity, model,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COUNT(*) AS requests
+      FROM gateway_usage
+      WHERE est_cost_usd IS NULL AND ts >= ${from}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+        AND session_key IS NOT NULL AND status = 'ok' AND identity <> '-'
+        AND (${filter.provider ?? null}::text IS NULL OR provider = ${filter.provider ?? null}::text)
+        AND (${filter.app ?? null}::text IS NULL OR app = ${filter.app ?? null}::text)
+        AND (${keys}::text[] IS NULL OR session_key = ANY(${keys}::text[]))
+        AND (${prefix}::text IS NULL OR starts_with(session_key, ${prefix}::text))
+      GROUP BY session_key, provider, app, identity, model`;
+    const fails = await this.sql`
+      SELECT session_key, provider, app, identity, COUNT(*) AS failed
+      FROM gateway_usage
+      WHERE status <> 'ok' AND ts >= ${from}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+        AND session_key IS NOT NULL AND identity <> '-'
+        AND (${filter.provider ?? null}::text IS NULL OR provider = ${filter.provider ?? null}::text)
+        AND (${filter.app ?? null}::text IS NULL OR app = ${filter.app ?? null}::text)
+        AND (${keys}::text[] IS NULL OR session_key = ANY(${keys}::text[]))
+        AND (${prefix}::text IS NULL OR starts_with(session_key, ${prefix}::text))
+      GROUP BY session_key, provider, app, identity`;
+    const gkey = (r: Row): string => `${String(r.session_key)}\u0000${String(r.provider)}\u0000${String(r.app)}\u0000${String(r.identity)}`;
+    const extra = new Map<string, { cost: number; unpriced: number }>();
+    for (const n of nulls as Row[]) {
+      const priced = priceNullCostGroup({
+        provider: String(n.provider) as GatewayProvider,
+        identity: String(n.identity),
+        app: String(n.app),
+        model: n.model === null || n.model === undefined ? null : String(n.model),
+        inputTokens: Number(n.input_tokens),
+        outputTokens: Number(n.output_tokens),
+        cacheReadTokens: Number(n.cache_read_tokens),
+        cacheWriteTokens: Number(n.cache_write_tokens),
+        requests: Number(n.requests),
+      });
+      const e = extra.get(gkey(n)) ?? { cost: 0, unpriced: 0 };
+      e.cost += priced.cost;
+      e.unpriced += priced.unpriced;
+      extra.set(gkey(n), e);
+    }
+    const failed = new Map<string, number>();
+    for (const f of fails as Row[]) failed.set(gkey(f), Number(f.failed));
     return rows.map((r: Row) => ({
       sessionKey: String(r.session_key),
       provider: String(r.provider),
@@ -422,6 +477,12 @@ export class PgGatewayStore implements GatewayStore {
       outputTokens: Number(r.output_tokens),
       cacheReadTokens: Number(r.cache_read_tokens),
       cacheWriteTokens: Number(r.cache_write_tokens),
+      estCostUsd: Number(r.est_cost_usd) + (extra.get(gkey(r))?.cost ?? 0),
+      unpricedRequests: extra.get(gkey(r))?.unpriced ?? 0,
+      failedRequests: failed.get(gkey(r)) ?? 0,
+      toolCalls: Number(r.tool_calls),
+      toolErrors: Number(r.tool_errors),
+      models: (Array.isArray(r.models) ? (r.models as unknown[]).map(String) : []).sort(),
       firstTs: iso(r.first_ts),
       lastTs: iso(r.last_ts),
     }));

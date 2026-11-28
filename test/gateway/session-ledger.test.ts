@@ -12,6 +12,8 @@ import { noopMetrics } from "../../src/gateway/metrics.ts";
 
 const SID = "6cc07c23-4501-42cb-ba6e-3c14d864219e";
 const CODEX_SID = "01a1ff70-ad7f-7a20-9516-b226a8f39380";
+const TASK_A = "task-9f3a-0001-synthetic";
+const TASK_B = "task-9f3a-0002-synthetic";
 
 describe("session key", () => {
   test("Claude Code header, Codex header and a plain request", () => {
@@ -60,7 +62,7 @@ describe("session ledger: the split over accounts", () => {
     ]);
     const [s] = await sessions();
     expect(s).toMatchObject({ sessionKey: SID, provider: "claude", client: "claude-cli", activeIdentity: "alice", turns: 2, firstTs: at(1), lastTs: at(2) });
-    expect(s!.identities).toEqual([{ identity: "alice", turns: 2, inputTokens: 30, outputTokens: 12, cacheReadTokens: 100, cacheWriteTokens: 3, firstTs: at(1), lastTs: at(2) }]);
+    expect(s!.identities).toEqual([{ identity: "alice", turns: 2, inputTokens: 30, outputTokens: 12, cacheReadTokens: 100, cacheWriteTokens: 3, estCostUsd: 0, unpricedRequests: 2, failedRequests: 0, toolCalls: 0, toolErrors: 0, models: ["m"], firstTs: at(1), lastTs: at(2) }]);
   });
 
   test("a swap in mid-session: two accounts, each with its own share, the latest one active", async () => {
@@ -143,7 +145,34 @@ describe("admin GET /usage/sessions", () => {
     const s = body.sessions.find((x) => x.sessionKey === SID)!;
     expect(s.activeIdentity).toBe("bob");
     expect(s.identities.map((i: any) => i.identity)).toEqual(["bob", "alice"]);
-    expect(Object.keys(s.identities[0]).sort()).toEqual(["cacheReadTokens", "cacheWriteTokens", "firstTs", "identity", "inputTokens", "lastTs", "outputTokens", "turns"]);
+    expect(Object.keys(s.identities[0]).sort()).toEqual(["cacheReadTokens", "cacheWriteTokens", "estCostUsd", "failedRequests", "firstTs", "identity", "inputTokens", "lastTs", "models", "outputTokens", "toolCalls", "toolErrors", "turns", "unpricedRequests"]);
+  });
+
+  test("cost, tool counts, failed requests and models of a session, never a prompt", async () => {
+    await inner.appendUsage([
+      { ...base, ts: at(5), identity: "bob", sessionKey: TASK_A, model: "ma", inputTokens: 100, outputTokens: 10, estCostUsd: 0.5, toolCalls: 3, toolErrors: 1, toolNames: ["Bash"] },
+      { ...base, ts: at(6), identity: "bob", sessionKey: TASK_A, model: "mb", inputTokens: 50, outputTokens: 5, estCostUsd: 0.25, toolCalls: 1 },
+      { ...base, ts: at(7), identity: "bob", sessionKey: TASK_A, status: "upstream_error", httpStatus: 502, inputTokens: 0, outputTokens: 0 },
+      { ...base, ts: at(8), identity: "dave", sessionKey: TASK_A, model: "ma", inputTokens: 10, outputTokens: 1, estCostUsd: 0.125 },
+    ]);
+    const body = (await (await call(`/usage/sessions?days=1&session=${TASK_A}`)).json()) as { sessions: Array<Record<string, any>> };
+    const s = body.sessions[0]!;
+    expect(s).toMatchObject({ sessionKey: TASK_A, turns: 3, inputTokens: 160, outputTokens: 16, estCostUsd: 0.875, unpricedRequests: 0, failedRequests: 1, toolCalls: 4, toolErrors: 1, models: ["ma", "mb"] });
+    const bob = s.identities.find((i: any) => i.identity === "bob");
+    expect(bob).toMatchObject({ turns: 2, estCostUsd: 0.75, failedRequests: 1, toolCalls: 4, toolErrors: 1, models: ["ma", "mb"] });
+    expect(JSON.stringify(body)).not.toContain("Bash");
+  });
+
+  test("a key prefix keeps only the sessions that start with it, as plain text", async () => {
+    await inner.appendUsage([
+      { ...base, ts: at(5), identity: "bob", sessionKey: TASK_A, inputTokens: 1, outputTokens: 1 },
+      { ...base, ts: at(6), identity: "bob", sessionKey: TASK_B, inputTokens: 1, outputTokens: 1 },
+    ]);
+    const keys = async (q: string) => ((await (await call(`/usage/sessions?days=1${q}`)).json()) as any).sessions.map((s: any) => s.sessionKey).sort();
+    expect(await keys("&prefix=task-9f3a")).toEqual([TASK_A, TASK_B]);
+    expect(await keys(`&prefix=${TASK_A}`)).toEqual([TASK_A]);
+    expect(await keys("&prefix=%25")).toEqual([]);
+    expect((await call(`/usage/sessions?days=1&prefix=${"x".repeat(129)}`)).status).toBe(400);
   });
 
   test("filters by provider and by session id", async () => {
